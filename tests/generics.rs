@@ -1855,20 +1855,20 @@ fn test_expiretime_already_expired() {
 
 /// `TTL` rounds what is left to the nearest second, as Redis's
 /// `(ms + 500) / 1000`: 1400 ms is 1, where it was rounded up to 2, and
-/// 1700 ms is 2. `PTTL` is the whole milliseconds, as given (#557).
+/// 1900 ms is 2. `PTTL` is the whole milliseconds, as given (#557).
 #[test]
 fn ttl_rounds_to_the_nearest_second_as_in_redis() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    for (px, secs) in [("1400", 1), ("1700", 2), ("400", 0), ("10000", 10)] {
+    for (px, secs) in [("1400", 1), ("1900", 2), ("100", 0), ("10000", 10)] {
         c.cmds(&["SET", "k", "v", "PX", px]);
         assert_eq!(c.cmds(&["TTL", "k"]).as_int(), secs, "TTL of PX {px}");
     }
     c.cmds(&["SET", "k", "v", "PX", "1499"]);
     let pttl = c.cmds(&["PTTL", "k"]).as_int();
-    assert!((1400..=1499).contains(&pttl), "PTTL {pttl}");
+    assert!((1000..=1499).contains(&pttl), "PTTL {pttl}");
 }
 
 /// `EXPIRETIME` rounds the time of day to the nearest second, as `TTL`

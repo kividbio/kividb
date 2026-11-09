@@ -149,8 +149,7 @@ pub fn system_time_from_unix_millis_i128(ms: i128) -> Option<SystemTime> {
 /// `PTTL`: what is left of a time to live that ends at `at` (Unix ms), in
 /// milliseconds, as Redis's `ttlGenericCommand` has it: the end less now,
 /// both whole milliseconds, and 0, never less, for a key still there in the
-/// millisecond it ends in. Now cut to the millisecond first, as Redis's
-/// clock is: `SET k v PX 1499` reads back 1499 at once, not 1498.
+/// millisecond it ends in.
 #[inline]
 pub fn ttl_remaining_ms(at: u64) -> i64 {
     i64::try_from(at.saturating_sub(now_ms())).unwrap_or(i64::MAX)

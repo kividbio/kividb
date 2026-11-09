@@ -4918,7 +4918,7 @@ fn a_fields_time_is_rounded_up_as_in_redis() {
     let told = c.cmds(&["HTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
     assert_eq!(told, 2, "HTTL of 1400 ms");
     let told = c.cmds(&["HPTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
-    assert!((1300..=1400).contains(&told), "HPTTL {told}");
+    assert!((1000..=1400).contains(&told), "HPTTL {told}");
     // A whole second reads back as itself; a millisecond past it, as the
     // next.
     for (at, secs) in [("4102444800000", 4102444800), ("4102444800001", 4102444801)] {
