@@ -30,6 +30,7 @@ pub(crate) mod key_specs;
 pub mod latency;
 mod list_move;
 mod lists;
+pub(crate) mod login;
 #[cfg(feature = "lua")]
 mod lua;
 #[cfg(feature = "lua")]

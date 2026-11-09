@@ -172,7 +172,17 @@ fn free_port() -> u16 {
     }
 }
 
+/// A server on `port`, on the connection loop `KIVIDB_TEST_IO_MODEL` names
+/// (`tokio`, the default, or `uring`).
 fn start_server(port: u16) {
+    let io_model = match std::env::var("KIVIDB_TEST_IO_MODEL").as_deref() {
+        Ok("uring") => kividb::config::IoModel::Uring,
+        _ => kividb::config::IoModel::Tokio,
+    };
+    start_server_on(port, io_model);
+}
+
+fn start_server_on(port: u16, io_model: kividb::config::IoModel) {
     thread::spawn(move || {
         let config = kividb::config::Config {
             port,
@@ -182,7 +192,7 @@ fn start_server(port: u16) {
             databases: 16,
             maxmemory: 0,
             loglevel: "error".to_string(),
-            io_model: kividb::config::IoModel::Tokio,
+            io_model,
             replicaof: None,
             replica_announced_port: 0,
             requirepass: String::new(),
@@ -675,4 +685,234 @@ fn test_a_plain_write_cannot_slip_into_a_watched_transaction() {
         plain_increments + 3 * 150,
         "an increment was lost: a transaction ran over a write it had not seen"
     );
+}
+
+// ── Inside MULTI, only the transaction's own commands act at once (#550) ─────
+//
+// In Redis, inside MULTI only EXEC, DISCARD, MULTI, WATCH, QUIT and RESET act
+// at once; every other command is queued. UNWATCH, AUTH, HELLO, MONITOR, WAIT
+// and WAITAOF were answered by the connection loop before it looked at the
+// transaction, so they ran at once. Each test runs on both connection loops.
+
+/// The I/O models to run each of these tests on: both, where io_uring
+/// exists, or the one `KIVIDB_TEST_IO_MODEL` names.
+fn io_models() -> Vec<kividb::config::IoModel> {
+    use kividb::config::IoModel;
+    match std::env::var("KIVIDB_TEST_IO_MODEL").as_deref() {
+        Ok("tokio") => vec![IoModel::Tokio],
+        Ok("uring") => vec![IoModel::Uring],
+        _ if cfg!(target_os = "linux") => vec![IoModel::Tokio, IoModel::Uring],
+        _ => vec![IoModel::Tokio],
+    }
+}
+
+/// A server of its own for `run`, on each I/O model in turn.
+fn on_each_io_model(run: impl Fn(u16)) {
+    for io_model in io_models() {
+        let port = free_port();
+        start_server_on(port, io_model);
+        run(port);
+    }
+}
+
+/// An UNWATCH sent inside MULTI is queued. Run at once, it dropped the
+/// watches, and EXEC ran over a write to a watched key: the other client's
+/// write was lost.
+#[test]
+fn test_unwatch_inside_multi_is_queued_and_a_changed_watch_still_aborts() {
+    on_each_io_model(|port| {
+        let mut a = Conn::connect(port);
+        let mut b = Conn::connect(port);
+
+        assert!(a.cmds(&["WATCH", "uw:k"]).is_ok());
+        assert!(a.cmds(&["MULTI"]).is_ok());
+        assert_eq!(a.cmds(&["SET", "uw:k", "from-a"]).as_str(), "QUEUED");
+        assert_eq!(a.cmds(&["UNWATCH"]).as_str(), "QUEUED");
+
+        assert!(b.cmds(&["SET", "uw:k", "from-b"]).is_ok());
+
+        let exec = a.cmds(&["EXEC"]);
+        assert!(
+            exec.is_nil(),
+            "EXEC ran after a watched key changed: {exec:?}"
+        );
+        assert_eq!(a.cmds(&["GET", "uw:k"]).as_str(), "from-b");
+    });
+}
+
+/// A queued UNWATCH answers OK when EXEC runs it, and changes nothing else.
+#[test]
+fn test_a_queued_unwatch_answers_ok_in_exec() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["WATCH", "uw2:k"]).is_ok());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["UNWATCH"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["SET", "uw2:k", "v"]).as_str(), "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0].is_ok());
+        assert!(replies[1].is_ok());
+        assert_eq!(c.cmds(&["GET", "uw2:k"]).as_str(), "v");
+    });
+}
+
+/// AUTH inside MULTI is queued, and the connection becomes the user only
+/// when EXEC runs it; the commands after it in the transaction run as that
+/// user. A wrong password is EXEC's reply for it.
+#[test]
+fn test_auth_inside_multi_is_queued() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "txuser", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["AUTH", "txuser", "pw"]).as_str(), "QUEUED");
+        assert!(c.cmds(&["DISCARD"]).is_ok());
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "default");
+
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["AUTH", "txuser", "pw"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["AUTH", "txuser", "wrong"]).as_str(), "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 4);
+        assert_eq!(replies[0].as_str(), "default");
+        assert!(replies[1].is_ok());
+        assert_eq!(replies[2].as_str(), "txuser");
+        assert!(
+            replies[3].error_msg().starts_with("WRONGPASS"),
+            "{:?}",
+            replies[3]
+        );
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "txuser");
+    });
+}
+
+/// HELLO inside MULTI is queued: the protocol and the name change only when
+/// EXEC runs it.
+#[test]
+fn test_hello_inside_multi_is_queued() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["HELLO", "3"]).as_str(), "QUEUED");
+        assert!(c.cmds(&["DISCARD"]).is_ok());
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" resp=2 "), "{}", info.as_str());
+
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(
+            c.cmds(&["HELLO", "2", "SETNAME", "txname"]).as_str(),
+            "QUEUED"
+        );
+        assert!(c.cmds(&["CLIENT", "GETNAME"]).as_str() == "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 2);
+        let hello = replies[0].as_array();
+        assert_eq!(hello[0].as_str(), "server");
+        assert_eq!(replies[1].as_str(), "txname");
+    });
+}
+
+/// MONITOR inside MULTI is queued, and refused when EXEC runs it, as Redis
+/// refuses it there: the connection does not start monitoring.
+#[test]
+fn test_monitor_inside_multi_is_queued_and_refused_in_exec() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["MONITOR"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            replies[0].error_msg(),
+            "ERR MONITOR isn't allowed for DENY BLOCKING client"
+        );
+        assert_eq!(replies[1].as_str(), "PONG");
+        // Not a monitor: a command is answered, not echoed.
+        assert!(c.cmds(&["SET", "mon:k", "v"]).is_ok());
+        assert_eq!(c.cmds(&["GET", "mon:k"]).as_str(), "v");
+    });
+}
+
+/// WAIT and WAITAOF inside MULTI are queued, and EXEC answers them without
+/// waiting (#499).
+#[test]
+fn test_wait_and_waitaof_inside_multi_are_queued() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["SET", "wait:k", "v"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["WAIT", "1", "0"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["WAITAOF", "0", "0", "0"]).as_str(), "QUEUED");
+        let started = std::time::Instant::now();
+        let exec = c.cmds(&["EXEC"]);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 3);
+        assert!(replies[0].is_ok());
+        assert_eq!(replies[1].as_int(), 0);
+        assert_eq!(
+            replies[2],
+            RespValue::Array(vec![RespValue::Int(0), RespValue::Int(0)])
+        );
+    });
+}
+
+/// The transaction's own commands with the wrong number of arguments are
+/// refused, as in Redis, and inside MULTI the transaction with them. An EXEC
+/// so refused ends the transaction.
+#[test]
+fn test_transaction_commands_check_their_arguments() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        let wrong = |name: &str| format!("ERR wrong number of arguments for '{name}' command");
+
+        assert_eq!(c.cmds(&["UNWATCH", "x"]).error_msg(), wrong("unwatch"));
+        assert_eq!(c.cmds(&["DISCARD", "x"]).error_msg(), wrong("discard"));
+        assert_eq!(c.cmds(&["MULTI", "x"]).error_msg(), wrong("multi"));
+
+        // UNWATCH, DISCARD, WATCH, MULTI: refused, the transaction goes on,
+        // and EXEC refuses it.
+        for refused in [
+            &["UNWATCH", "x"][..],
+            &["DISCARD", "x"],
+            &["WATCH"],
+            &["MULTI", "x"],
+        ] {
+            assert!(c.cmds(&["MULTI"]).is_ok());
+            assert_eq!(c.cmds(&["SET", "arity:k", "v"]).as_str(), "QUEUED");
+            let name = refused[0].to_ascii_lowercase();
+            assert_eq!(c.cmds(refused).error_msg(), wrong(&name));
+            assert_eq!(c.cmds(&["SET", "arity:k", "w"]).as_str(), "QUEUED");
+            assert!(
+                c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"),
+                "{refused:?}"
+            );
+            assert!(c.cmds(&["GET", "arity:k"]).is_nil(), "{refused:?}");
+        }
+
+        // EXEC: refused, and the transaction with it.
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["SET", "arity:k", "v"]).as_str(), "QUEUED");
+        assert_eq!(
+            c.cmds(&["EXEC", "x"]).error_msg(),
+            "EXECABORT Transaction discarded because of: ERR wrong number of arguments for 'exec' command"
+        );
+        assert!(c.cmds(&["EXEC"]).error_msg().contains("EXEC without MULTI"));
+        assert!(c.cmds(&["GET", "arity:k"]).is_nil());
+    });
 }
