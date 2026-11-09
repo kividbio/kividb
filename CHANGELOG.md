@@ -145,6 +145,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`HSET` is no longer slowed down by a lock every worker shared
+  (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
+  `HINCRBYFLOAT` took the search indexes' lock twice to find out whether
+  there was any index to update, even with no index defined. Taking that
+  lock writes to it, so with many workers its cache line moved between
+  cores on every write to a hash. How much this cost depended on where the
+  allocator put the lock: after an unrelated change, `HSET` at pipeline 16
+  on 16 vCPUs ran at 4.0M ops/s, against 4.46M in 1.2.0. Writes now check
+  a flag that is changed only when an index is created or dropped, and
+  take the lock only when an index exists. On the same machines `HSET`
+  runs at about 4.9M ops/s, faster than in 1.2.0. Writes to indexed
+  hashes behave as before.
+
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
   losing precision. They now fail with `ERR numeric overflow` and the
