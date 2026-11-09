@@ -145,6 +145,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`TTL`, `PTTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does
+  (#557).** `TTL` rounded what was left up to the next second: `SET k v PX
+  1499` then `TTL k` gave 2 where Redis gives 1. It is now rounded to the
+  nearest second, a half up (`(ms + 500) / 1000`), and `EXPIRETIME` rounds
+  the time of day the same way, where it cut it. `PTTL` counted from a
+  clock not cut to the millisecond, so it was often 1 ms short (1498 for
+  `PX 1499`), and a key in the last millisecond of its life read as gone
+  (-2); it now gives 0 there, as Redis does. A hash field's time is
+  rounded as Redis rounds it, which differs from a key's: `HTTL` up to the
+  next second, as before, and now `HEXPIRETIME` up too, where it cut it
+  (`HPEXPIREAT h 4102444800001` reads back as 4102444801). Checked against
+  Redis 8.4's `ttlGenericCommand` and `httlGenericCommand`.
+
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
   losing precision. They now fail with `ERR numeric overflow` and the
