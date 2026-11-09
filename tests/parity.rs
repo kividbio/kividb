@@ -368,6 +368,42 @@ fn commandstats_count_every_call() {
     assert!(cmdstat(&mut c, "nosuchcommand").is_none());
 }
 
+/// The commands a connection answers itself, without `execute_command`, are
+/// counted too: `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`, `RESET` and `AUTH`.
+/// A server of its own, so that no other test adds to the counts.
+#[test]
+fn commandstats_count_the_connection_commands() {
+    let mut c = Conn::connect(start("secret"));
+    assert!(c.cmd(&["AUTH", "wrong"]).err().starts_with("WRONGPASS"));
+    assert!(c.cmd(&["AUTH", "secret"]).ok());
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+
+    assert!(c.cmd(&["WATCH", "cc:k"]).ok());
+    assert!(c.cmd(&["UNWATCH"]).ok());
+    assert!(matches!(c.cmd(&["HELLO", "2"]), V::Arr(_)));
+    assert!(matches!(c.cmd(&["HELLO", "9"]), V::Err(_)));
+    assert!(c.cmd(&["MULTI"]).ok());
+    assert!(c.cmd(&["DISCARD"]).ok());
+    assert!(matches!(c.cmd(&["DISCARD"]), V::Err(_)));
+    assert!(matches!(c.cmd(&["AUTH", "wrong"]), V::Err(_)));
+    assert_eq!(c.cmd(&["RESET"]).s(), "RESET");
+
+    // RESET drops the authentication: the connection has to log in again to
+    // read the statistics, and that is a second call of AUTH.
+    assert!(c.cmd(&["AUTH", "secret"]).ok());
+    let mut calls = |name: &str| {
+        let stats = cmdstat(&mut c, name).unwrap_or_else(|| panic!("no cmdstat_{name} line"));
+        (stats["calls"], stats["failed_calls"])
+    };
+    assert_eq!(calls("watch"), (1.0, 0.0));
+    assert_eq!(calls("unwatch"), (1.0, 0.0));
+    assert_eq!(calls("hello"), (2.0, 1.0));
+    assert_eq!(calls("multi"), (1.0, 0.0));
+    assert_eq!(calls("discard"), (2.0, 1.0));
+    assert_eq!(calls("auth"), (2.0, 1.0));
+    assert_eq!(calls("reset"), (1.0, 0.0));
+}
+
 // ── Expiry: notifications, and hash fields ────────────────────────────────────
 
 /// A subscriber to every keyspace and keyevent channel of database 0.
