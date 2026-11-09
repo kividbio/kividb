@@ -1474,6 +1474,7 @@ pub async fn handle_client(
                 matches!(cmd_name.as_str(), "MULTI" | "EXEC").then(|| cmd[0].to_vec());
 
             // ── Transaction + Auth commands ───────────────────────────────
+            let started = Instant::now();
             let response = match cmd_name.as_str() {
                 "MULTI" => {
                     if tx.active {
@@ -2120,6 +2121,7 @@ pub async fn handle_client(
                 "HELLO" => {
                     // HELLO [protover [AUTH username password] [SETNAME clientname]]
 
+                    let hello_started = Instant::now();
                     let reply_from = out_buf.len();
                     let mut i = 1usize; // index into cmd, past "HELLO"
 
@@ -2137,7 +2139,7 @@ pub async fn handle_client(
                                 "HELLO",
                                 &cmd,
                                 &out_buf[reply_from..],
-                                std::time::Duration::ZERO,
+                                hello_started.elapsed(),
                             );
                             parse_offset += consumed;
                             continue;
@@ -2186,7 +2188,7 @@ pub async fn handle_client(
                                         "HELLO",
                                         &cmd,
                                         &out_buf[reply_from..],
-                                        std::time::Duration::ZERO,
+                                        hello_started.elapsed(),
                                     );
                                     parse_offset += consumed;
                                     continue;
@@ -2220,7 +2222,7 @@ pub async fn handle_client(
                                     "HELLO",
                                     &cmd,
                                     &out_buf[reply_from..],
-                                    std::time::Duration::ZERO,
+                                    hello_started.elapsed(),
                                 );
                                 parse_offset += consumed;
                                 continue;
@@ -2242,7 +2244,7 @@ pub async fn handle_client(
                             "HELLO",
                             &cmd,
                             &out_buf[reply_from..],
-                            std::time::Duration::ZERO,
+                            hello_started.elapsed(),
                         );
                         parse_offset += consumed;
                         continue;
@@ -2300,7 +2302,7 @@ pub async fn handle_client(
                         "HELLO",
                         &cmd,
                         &out_buf[reply_from..],
-                        std::time::Duration::ZERO,
+                        hello_started.elapsed(),
                     );
                     parse_offset += consumed;
                     continue;
@@ -2636,18 +2638,19 @@ pub async fn handle_client(
                 }
             };
             // The other commands answered here, and not by `execute_command`,
-            // are counted as well (`HELLO` counts itself, as it replies in
-            // several places).
+            // are counted as well, with the time they took (`WAIT` and
+            // `WAITAOF` are the time they waited). `HELLO` counts itself, as
+            // it replies in several places.
             if matches!(
                 cmd_name.as_str(),
-                "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH"
+                "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH" | "WAIT" | "WAITAOF"
             ) {
                 // None of them has subcommands, so the name is all `record` needs.
                 crate::cmdstats::record(
                     &cmd_name,
                     &[cmd_name.as_bytes()],
                     &response,
-                    std::time::Duration::ZERO,
+                    started.elapsed(),
                 );
             }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —

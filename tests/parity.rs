@@ -369,7 +369,8 @@ fn commandstats_count_every_call() {
 }
 
 /// The commands a connection answers itself, without `execute_command`, are
-/// counted too: `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`, `RESET` and `AUTH`.
+/// counted too: `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`, `RESET`, `AUTH`, `WAIT`
+/// and `WAITAOF`.
 /// A server of its own, so that no other test adds to the counts.
 #[test]
 fn commandstats_count_the_connection_commands() {
@@ -391,6 +392,9 @@ fn commandstats_count_the_connection_commands() {
     // RESET drops the authentication: the connection has to log in again to
     // read the statistics, and that is a second call of AUTH.
     assert!(c.cmd(&["AUTH", "secret"]).ok());
+    assert_eq!(c.cmd(&["WAIT", "0", "0"]).i(), 0);
+    assert!(matches!(c.cmd(&["WAIT", "0"]), V::Err(_)));
+    assert!(matches!(c.cmd(&["WAITAOF", "0", "0", "0"]), V::Arr(_)));
     let mut calls = |name: &str| {
         let stats = cmdstat(&mut c, name).unwrap_or_else(|| panic!("no cmdstat_{name} line"));
         (stats["calls"], stats["failed_calls"])
@@ -402,6 +406,9 @@ fn commandstats_count_the_connection_commands() {
     assert_eq!(calls("discard"), (2.0, 1.0));
     assert_eq!(calls("auth"), (2.0, 1.0));
     assert_eq!(calls("reset"), (1.0, 0.0));
+    // The wrong number of arguments is a rejected call, not a failed one.
+    assert_eq!(calls("wait"), (2.0, 0.0));
+    assert_eq!(calls("waitaof"), (1.0, 0.0));
 }
 
 // ── Expiry: notifications, and hash fields ────────────────────────────────────
