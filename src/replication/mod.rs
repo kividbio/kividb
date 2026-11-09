@@ -1031,6 +1031,15 @@ impl ReplState {
         self.role.read().clone()
     }
 
+    /// The role as `HELLO` names it: Redis says `replica` there, where `ROLE`
+    /// and `INFO` still say `slave`.
+    pub fn hello_role(&self) -> String {
+        match self.role().as_str() {
+            "slave" => "replica".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     /// The current replication epoch. A `start_replica` task whose claimed epoch
     /// no longer equals this has been superseded and must stop.
     #[inline]

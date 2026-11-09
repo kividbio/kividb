@@ -5842,7 +5842,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "standalone"
                 }),
                 resp_bulk_str("role"),
-                resp_bulk_str(&ctx.repl_state.role()),
+                resp_bulk_str(&ctx.repl_state.hello_role()),
                 resp_bulk_str("modules"),
                 module_list_reply(proto as u8),
             ];

@@ -2119,7 +2119,7 @@ where
                     // changed to protocol 3) expect the HELLO reply itself encoded as a `%`
                     // map once RESP3 is negotiated; RESP2 stays a flat `*` array of pairs.
                     use crate::resp::write::{resp_array, resp_bulk_str, resp_integer, resp_map};
-                    let role = repl_state.role();
+                    let role = repl_state.hello_role();
                     // The Redis release this server follows, as `INFO`'s
                     // `redis_version` says: clients read these two to know
                     // what they may use (#451). KiviDB's own release
