@@ -752,8 +752,12 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
 
     // Unknown-command message must match Redis's wording (Tcl tests use glob `*Unknown Redis*`).
     let started = std::time::Instant::now();
+    // What the command records of its effects is read below whether or not
+    // the write is observed (`script_feed::effects_begin_if_read`).
+    let script_call = replication::script_feed::ScriptCall::enter();
     let result = dispatch_command_handlers(ctx, name2)
         .unwrap_or_else(|| resp_error("ERR Unknown Redis command called from script"));
+    drop(script_call);
     // Counted for `INFO commandstats`, like a command a client sends.
     crate::cmdstats::record(name2, &ctx.cmd, &result, started.elapsed());
 

@@ -1396,7 +1396,7 @@ fn apply_field_expire(
     flag: HfeFlag,
     is_past: bool,
 ) -> Vec<Vec<u8>> {
-    crate::replication::script_feed::effects_begin();
+    crate::replication::script_feed::effects_begin_if_read(ctx);
     let results = apply_field_expire_inner(ctx, key, fields, new_exp, flag, is_past);
     // One result per field when the command ran; a lone error otherwise.
     if results.len() == fields.len() {
@@ -1535,7 +1535,7 @@ fn absolute_deadline(at_ms: u64, past: bool) -> (Instant, bool) {
 /// `command key [at] FIELDS n field…`, or `HDEL key field…`. `fields` are
 /// names as a hash keeps them. Nothing for no fields.
 fn record_field_effect(command: &[u8], key: &[u8], at_ms: Option<u64>, fields: &[&[u8]]) {
-    if fields.is_empty() {
+    if fields.is_empty() || !crate::replication::script_feed::recording() {
         return;
     }
     let name = |f: &&[u8]| {
@@ -1775,7 +1775,7 @@ fn run_hpersist(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Err(e) => return Some(e),
     };
 
-    crate::replication::script_feed::effects_begin();
+    crate::replication::script_feed::effects_begin_if_read(ctx);
     expire_before(ctx, &key);
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, &key);
@@ -2052,7 +2052,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
         other => other,
     };
-    crate::replication::script_feed::effects_begin();
+    crate::replication::script_feed::effects_begin_if_read(ctx);
     let now = expire_before(ctx, &key);
 
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -2584,83 +2584,101 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         i += 2;
     }
 
-    crate::replication::script_feed::effects_begin();
-    expire_before(ctx, &key);
+    let fields_at = idx;
+    let record = crate::replication::script_feed::effects_begin_if_read(ctx);
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, &key);
-    let mut map = write_lock!(shard);
+    // The fields of the hash due now go first, where this node removes them
+    // ([`expire_first`]): found under the same lookup as the write, not by
+    // one of their own before it (#543). The write holds its key's order
+    // throughout, so nothing else writes the hash between the two.
+    let mut now: Option<Instant> = None;
+    let mut tried = false;
+    let expiring: Vec<&[u8]> = loop {
+        let mut map = write_lock!(shard);
 
-    // Get or upgrade-or-create a HashEx for this key.
-    let hx = match map.get(key.as_slice()) {
-        Some(ValueRef::HashEx(h)) => Arc::clone(h),
-        Some(ValueRef::Hash(plain)) => {
-            // Upgrade in place
-            let plain = Arc::clone(plain);
-            let mut plain_w = plain.write();
-            let mut new_inner = crate::types::HashInner::new();
-            new_inner.fields = std::mem::take(&mut *plain_w);
-            drop(plain_w);
-            let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
-            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
-            new_arc
-        }
-        Some(_) => {
-            return Some(resp_error(
-                "WRONGTYPE Operation against a key holding the wrong kind of value",
-            ));
-        }
-        None => {
-            // FXX can never be satisfied on a key that does not exist; do not
-            // leave an empty hash behind for having asked.
-            if fxx {
-                return Some(resp_integer(0));
+        // Get or upgrade-or-create a HashEx for this key.
+        let (hx, had_ttls) = match map.get(key.as_slice()) {
+            Some(ValueRef::HashEx(h)) => (Arc::clone(h), true),
+            Some(ValueRef::Hash(plain)) => {
+                // Upgrade in place
+                let plain = Arc::clone(plain);
+                let mut plain_w = plain.write();
+                let mut new_inner = crate::types::HashInner::new();
+                new_inner.fields = std::mem::take(&mut *plain_w);
+                drop(plain_w);
+                let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
+                map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
+                (new_arc, false)
             }
-            let new_arc = Arc::new(parking_lot::RwLock::new(crate::types::HashInner::new()));
-            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
-            new_arc
+            Some(_) => {
+                return Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+            None => {
+                // FXX can never be satisfied on a key that does not exist; do not
+                // leave an empty hash behind for having asked.
+                if fxx {
+                    return Some(resp_integer(0));
+                }
+                let new_arc = Arc::new(parking_lot::RwLock::new(crate::types::HashInner::new()));
+                map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
+                (new_arc, false)
+            }
+        };
+        drop(map);
+
+        let mut inner = hx.write();
+        if had_ttls {
+            let now = *now.get_or_insert_with(Instant::now);
+            if expire_first(ctx, &inner, now, &mut tried) {
+                drop(inner);
+                expire_fields(ctx, &key, now);
+                continue;
+            }
         }
-    };
-    drop(map);
 
-    let mut inner = hx.write();
+        // FNX / FXX precheck (atomic: all-or-nothing).
+        if fnx && pairs.iter().any(|(f, _)| inner.fields.contains_key(f)) {
+            return Some(resp_integer(0));
+        }
+        if fxx && !pairs.iter().all(|(f, _)| inner.fields.contains_key(f)) {
+            return Some(resp_integer(0));
+        }
 
-    // FNX / FXX precheck (atomic: all-or-nothing).
-    if fnx && pairs.iter().any(|(f, _)| inner.fields.contains_key(f)) {
-        return Some(resp_integer(0));
-    }
-    if fxx && !pairs.iter().all(|(f, _)| inner.fields.contains_key(f)) {
-        return Some(resp_integer(0));
-    }
-
-    // Apply all writes.
-    let mut expiring: Vec<&[u8]> = Vec::new();
-    for (f, v) in &pairs {
-        inner.fields.insert(f.clone(), Arc::clone(v));
-        match ttl {
-            HsetexTtl::Clear => {
-                inner.expiries.remove(f);
-            }
-            HsetexTtl::Keep => {}
-            HsetexTtl::Set(at, _) => {
-                inner.expiries.insert(f.clone(), at);
-                expiring.push(f.as_bytes());
-            }
-            HsetexTtl::KeepOrSet(at, _) => {
-                if !inner.expiries.contains_key(f) {
+        // Apply all writes.
+        let mut expiring: Vec<&[u8]> = Vec::new();
+        for (f, v) in &pairs {
+            inner.fields.insert(f.clone(), Arc::clone(v));
+            match ttl {
+                HsetexTtl::Clear => {
+                    inner.expiries.remove(f);
+                }
+                HsetexTtl::Keep => {}
+                HsetexTtl::Set(at, _) => {
                     inner.expiries.insert(f.clone(), at);
                     expiring.push(f.as_bytes());
                 }
-            }
-            HsetexTtl::Past(_) => {
-                inner.evict_field(f);
+                HsetexTtl::KeepOrSet(at, _) => {
+                    if !inner.expiries.contains_key(f) {
+                        inner.expiries.insert(f.clone(), at);
+                        expiring.push(f.as_bytes());
+                    }
+                }
+                HsetexTtl::Past(_) => {
+                    inner.evict_field(f);
+                }
             }
         }
-    }
-    drop(inner);
+        break expiring;
+    };
 
     let db = *ctx.selected_db;
     let all_fields = || pairs.iter().map(|(f, _)| f.as_bytes());
-    record_hsetex_effect(&key, &pairs, ttl, &expiring);
+    if record {
+        record_hsetex_effect(&key, &cmd[fields_at..], &pairs, ttl, &expiring);
+    }
     if matches!(ttl, HsetexTtl::Past(_)) {
         // Set and expired in one step: the set, then the deletion, as Redis
         // 8.10 announces them.
@@ -2690,18 +2708,26 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
 /// `HSETEX`'s effect, its `FNX`/`FXX` decided here: the fields set, with
 /// the deadline they were given as a moment; or, for a moment already past,
 /// their deletion.
+///
+/// Only when the record is read (`script_feed::effects_begin_if_read`).
+/// `args` are the command's own field-value pairs, as the client sent them:
+/// copied once, straight into the record, not from the names the hash
+/// keeps them under.
 fn record_hsetex_effect(
     key: &[u8],
+    args: &[&[u8]],
     pairs: &[(String, Arc<[u8]>)],
     ttl: HsetexTtl,
     expiring: &[&[u8]],
 ) {
-    let names: Vec<&[u8]> = pairs.iter().map(|(f, _)| f.as_bytes()).collect();
     if let HsetexTtl::Past(_) = ttl {
+        let names: Vec<&[u8]> = pairs.iter().map(|(f, _)| f.as_bytes()).collect();
         record_field_effect(b"HDEL", key, None, &names);
         return;
     }
-    let mut parts = vec![b"HSETEX".to_vec(), key.to_vec()];
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(6 + args.len());
+    parts.push(b"HSETEX".to_vec());
+    parts.push(key.to_vec());
     match ttl {
         HsetexTtl::Set(_, at_ms) => {
             parts.push(b"PXAT".to_vec());
@@ -2712,10 +2738,7 @@ fn record_hsetex_effect(
     }
     parts.push(b"FIELDS".to_vec());
     parts.push(pairs.len().to_string().into_bytes());
-    for (field, value) in pairs {
-        parts.push(crate::commands::helpers::name_to_bytes(field).into_owned());
-        parts.push(value.to_vec());
-    }
+    parts.extend(args.iter().map(|arg| arg.to_vec()));
     crate::replication::script_feed::effect(parts);
     if let HsetexTtl::KeepOrSet(_, at_ms) = ttl {
         record_field_effect(b"HPEXPIREAT", key, Some(at_ms), expiring);
