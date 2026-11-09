@@ -225,9 +225,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replayed, keep the field until that `HDEL`; a replica hides it from its
   readers meanwhile. A master says it does this with
   `kividb_expired_fields_propagated:1` in `INFO`.
-  - *Mixed versions:* a 1.2.1 replica of a 1.2.0 master, which sends no
-    `HDEL` for a field, still removes fields by its own clock, and the gap
-    above stays until the master is upgraded too.
+  - *Mixed versions:* a 1.2.0 node, master or replica, still removes
+    fields by its own clock. A 1.2.0 master sends no `HDEL` for a field,
+    so a 1.2.1 replica of it removes fields by its own clock too, and a
+    1.2.0 replica of a 1.2.1 master removes a field at its time without
+    waiting for the master's `HDEL`. The gap above stays while any node of
+    the set is 1.2.0, and closes once the master, upgraded after its
+    replicas, is 1.2.1 too.
   - *AOFs from 1.2.0* hold no `HDEL` for the fields that expired, so a
     replay of one need not give back what 1.2.0 held where a write came
     after a field's time. Run `BGREWRITEAOF` once after upgrading, so that
@@ -388,8 +392,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rid of the alias, or given the synonyms. A 1.2.1 replica of a 1.2.0
   master, or 1.2.1 started on a 1.2.0 AOF, can so be without a field, an
   alias or synonyms its master has, or keep an alias its master deleted.
-  Upgrade the master first, and, where it matters, check such an index
-  with `FT.INFO` from its own database afterwards and repeat what is
+  Upgrade replicas before their master, as always (a 1.2.0 replica cannot
+  full-sync from a 1.2.1 master that holds a key that is not UTF-8 or the
+  empty key). Once the master is upgraded too, where it matters, check
+  such an index with `FT.INFO` from its own database and repeat what is
   missing there. `FT.DROPINDEX` is not affected: 1.2.0 wrote it under the
   index's own database, so 1.2.1 drops the index as 1.2.0 did.
 

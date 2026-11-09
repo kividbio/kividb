@@ -176,7 +176,10 @@ other files:
 - `client-output-buffer-limit` isn't configurable.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica
   of a KiviDB master older than 1.1.3 expires keys by its own clock (such a
-  master sends no `DEL` for the keys it expires).
+  master sends no `DEL` for the keys it expires). A replica of a 1.2.0
+  master, and a 1.2.0 replica, expire hash fields by their own clock (1.2.0
+  sends no `HDEL` for the fields it expires, and a 1.2.0 replica does not
+  wait for one).
 
 **Cluster**
 - `FT.SPELLCHECK`, `FT.PROFILE`, `FT.HYBRID` and `FT.SYNDUMP` answer from the
