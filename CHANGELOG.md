@@ -248,6 +248,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `lua-parallel-scripts` gets an error for a `SORT` or `SORT_RO` whose
     `BY` or `GET` pattern can name keys outside its tag, as it already did
     for `KEYS` and `SCAN`.
+  - *Cost:* `HSETEX` no longer builds the form it is replicated in
+    (`HSETEX key PXAT <ms> FIELDS …`, a copy of every field and value)
+    when no replica, AOF or backup reads the write stream, and finds the
+    fields due under the lookup it writes under rather than a lookup of
+    its own (#543). `HSETEX` of a field with a TTL costs 22% fewer
+    instructions a command than without this (14,392 against 18,600, one
+    worker thread, pipeline 16), and as many in KiviDB's own code as in
+    1.2.0; 7-9% fewer with an AOF or a replica. `HSET` and `HGET` are
+    unchanged.
 
 - **The `MEMORY USAGE` accuracy tests no longer fail now and then with
   `Connection reset by peer`.** They found a free port for each server with
