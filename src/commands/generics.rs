@@ -1066,11 +1066,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // A key picked at random: from a shard picked at random, and,
             // if that one is empty, from the ones after it. A key whose
             // time has run out is not a key: it is removed, and another
-            // picked.
+            // picked, for as long as it takes, as in Redis (#566): each
+            // pick that removes one leaves one fewer to pick.
+            //
+            // An expired key that stays (on a replica, while writes are
+            // paused, or while loading) could be picked again and again:
+            // after 100 of those, as in Redis, the answer is one of them.
             let db = *ctx.selected_db;
             let shards = ctx.store[db].len();
-            let mut expired = None;
-            for _ in 0..64 {
+            let expired_keys_stay = crate::pause::expiry_deferred()
+                || crate::expiry::held()
+                || crate::expiry::of(ctx.store)
+                    .as_ref()
+                    .is_some_and(crate::expiry::Target::on_replica);
+            let mut kept_expired = 0;
+            loop {
                 let start = rand::random::<usize>() % shards.max(1);
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
@@ -1078,19 +1088,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         .map(|(key, _)| crate::store::Key::new(key))
                 });
                 match picked {
-                    None => break,
+                    None => break Some(resp_null_bulk()),
                     Some(key) if lazy_expire_on_read(ctx.store, db, &key) => {
-                        expired = Some(key);
+                        if expired_keys_stay {
+                            kept_expired += 1;
+                            if kept_expired == 100 {
+                                break Some(resp_bulk(&key));
+                            }
+                        }
                     }
-                    Some(key) => return Some(resp_bulk(&key)),
+                    Some(key) => break Some(resp_bulk(&key)),
                 }
-            }
-            // While writes are paused an expired key is not removed, so
-            // every pick could land on one again: as in Redis, the answer is
-            // then one of them, not nil.
-            match expired {
-                Some(key) if crate::pause::expiry_deferred() => Some(resp_bulk(&key)),
-                _ => Some(resp_null_bulk()),
             }
         }
 

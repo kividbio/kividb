@@ -4029,6 +4029,25 @@ fn is_write_command_reference(name: &str) -> bool {
     )
 }
 
+/// `WAIT numreplicas timeout`'s arguments, or the error Redis gives for
+/// them (#561): both integers, the timeout in milliseconds and not negative
+/// (0 waits for ever). Each used to read as 0 when it was not a number, and
+/// a negative timeout as 0, which waited for ever.
+pub fn wait_args(cmd: &[&[u8]]) -> Result<(i64, u64), Vec<u8>> {
+    if cmd.len() != 3 {
+        return Err(b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec());
+    }
+    let int = |arg: &[u8]| std::str::from_utf8(arg).ok()?.parse::<i64>().ok();
+    let replicas =
+        int(cmd[1]).ok_or_else(|| b"-ERR value is not an integer or out of range\r\n".to_vec())?;
+    let timeout = int(cmd[2])
+        .ok_or_else(|| b"-ERR timeout is not an integer or out of range\r\n".to_vec())?;
+    if timeout < 0 {
+        return Err(b"-ERR timeout is negative\r\n".to_vec());
+    }
+    Ok((replicas, timeout as u64))
+}
+
 /// True if this command may not run on a read-only replica (READONLY reply).
 #[inline]
 pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
@@ -4048,7 +4067,9 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // before it runs. Every script was, the ones that only read too
         // (#145).
         "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        // Write commands in Redis, refused on a replica whether or not they
+        // store: `GEORADIUS_RO` and `GEORADIUSBYMEMBER_RO` are the reads.
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => true,
         // Only TODENSE and RESET rewrite the value; GETREG, DECODE and
         // ENCODING are diagnostics, deliberately read-only here.
         "PFDEBUG" => pfdebug_mutates(cmd),
@@ -4645,7 +4666,8 @@ mod replication_invariants_tests {
         }
     }
 
-    /// GEORADIUS is a read until it is asked to store its result.
+    /// GEORADIUS replicates only when it stores its result, but is refused on
+    /// a replica either way, as in Redis.
     #[test]
     fn georadius_is_a_write_only_with_store() {
         let read: Vec<&[u8]> = vec![b"GEORADIUS", b"k", b"0", b"0", b"1", b"km"];
@@ -4660,7 +4682,7 @@ mod replication_invariants_tests {
             b"d",
         ];
         assert!(!super::command_mutates_for_replication("GEORADIUS", &read));
-        assert!(!super::is_denied_on_readonly_replica("GEORADIUS", &read));
+        assert!(super::is_denied_on_readonly_replica("GEORADIUS", &read));
         assert!(super::command_mutates_for_replication("GEORADIUS", &store));
         assert!(super::is_denied_on_readonly_replica("GEORADIUS", &store));
         assert!(super::command_mutates_for_replication(

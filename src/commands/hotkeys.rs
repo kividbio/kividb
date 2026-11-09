@@ -362,15 +362,23 @@ fn start(ctx: &Ctx) -> Vec<u8> {
     resp_simple("OK")
 }
 
+/// `HOTKEYS STOP`: `OK` if a session was collecting, a nil if none was, as
+/// in Redis 8.10. A session past its `DURATION` stopped then, whether or
+/// not a command has run since to notice (#566).
 fn stop() -> Vec<u8> {
     let mut guard = SESSION.lock();
     match guard.as_mut() {
         Some(session) if session.stopped_after.is_none() => {
+            let expired = session.expired();
             session.stop();
             ACTIVE.store(false, Ordering::Relaxed);
-            resp_simple("OK")
+            if expired {
+                resp_null_bulk()
+            } else {
+                resp_simple("OK")
+            }
         }
-        _ => resp_error("ERR hotkeys tracking is not active"),
+        _ => resp_null_bulk(),
     }
 }
 

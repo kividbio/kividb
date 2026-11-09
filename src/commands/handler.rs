@@ -362,6 +362,21 @@ fn not_allowed_from_script(name: &str, sub: Option<&[u8]>) -> bool {
     }
 }
 
+/// The `BUSY` reply to a command refused while a script runs: it names
+/// `FUNCTION KILL` while a function runs, as Redis's does (#562).
+fn busy_reply() -> Vec<u8> {
+    #[cfg(feature = "lua")]
+    {
+        crate::commands::lua::busy_reply()
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        resp_error(
+            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+        )
+    }
+}
+
 /// The rest of [`execute_command_from_script`], with the command in `ctx.cmd`.
 /// Why a script on a cluster node may not run `ctx.cmd`, or `None` when it
 /// may: as in Redis, its keys must be ones this node serves, and, unless the
@@ -1115,9 +1130,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     #[cfg(feature = "lua")]
     if crate::commands::lua::lua_server_busy_for_command(ctx.cmd.as_slice()) {
-        return resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        );
+        return busy_reply();
     }
 
     // Masters skip `is_write_command` entirely here — hot path for standalone read benchmarks.
@@ -1324,9 +1337,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
     };
     let Some((_command_gate, _alone)) = gates else {
-        return resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        );
+        return busy_reply();
     };
 
     // A write under a script or an `EXEC` that already holds the gate is part

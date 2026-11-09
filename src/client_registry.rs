@@ -625,6 +625,9 @@ impl ClientInfo {
         if self.tracking {
             flags.push('t');
         }
+        if self.no_evict {
+            flags.push('e');
+        }
         if flags.is_empty() {
             flags.push('N');
         }

@@ -1278,6 +1278,43 @@ const BUSY_WITH_SCRIPT: &str =
     "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
 const BUSY_WITH_FUNCTION: &str =
     "BUSY Redis is busy running a script. You can only call FUNCTION KILL or SHUTDOWN NOSAVE.";
+/// `SCRIPT KILL` or `FUNCTION KILL` with nothing running.
+const NOT_BUSY: &str = "NOTBUSY No scripts in execution right now.";
+
+/// The `BUSY` reply to a command refused while a script runs: it names the
+/// command that stops what is running, `FUNCTION KILL` for a function and
+/// `SCRIPT KILL` for a script, as Redis's does.
+pub(crate) fn busy_reply() -> Vec<u8> {
+    if RUNNING_FUNCTION.lock().is_some() {
+        resp_error(BUSY_WITH_FUNCTION)
+    } else {
+        resp_error(BUSY_WITH_SCRIPT)
+    }
+}
+
+/// Whether `source` compiles, as `SCRIPT LOAD` asks before it keeps a
+/// script: Redis compiles it there and refuses one that does not. Checked
+/// in a VM of its own, so that a script running in the shared one is not
+/// waited for. As `EVAL` runs it: an expression (`1 + 1`) is taken too.
+fn script_compiles(source: &str) -> Result<(), String> {
+    let (body, _) = preprocess_eval_script(source).map_err(|e| format!("ERR {e}"))?;
+    let lua = Lua::new();
+    if lua
+        .load(format!("return {body}"))
+        .set_name("=user_script")
+        .into_function()
+        .is_ok()
+    {
+        return Ok(());
+    }
+    match lua.load(body).set_name("=user_script").into_function() {
+        Ok(_) => Ok(()),
+        Err(LuaError::SyntaxError { message, .. }) => Err(format!(
+            "ERR Error compiling script (new function): {message}"
+        )),
+        Err(e) => Err(format!("ERR Error compiling script (new function): {e}")),
+    }
+}
 
 /// `SCRIPT KILL` (`function == false`) or `FUNCTION KILL`: each stops what
 /// its own kind of call started, and is refused while the other kind runs.
@@ -1293,7 +1330,7 @@ fn kill_running(function: bool) -> Vec<u8> {
         return resp_simple("OK");
     }
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
-        return resp_error("ERR No scripts in execution.");
+        return resp_error(NOT_BUSY);
     }
     match (function, RUNNING_FUNCTION.lock().is_some()) {
         (false, true) => resp_error(BUSY_WITH_FUNCTION),
@@ -1304,7 +1341,7 @@ fn kill_running(function: bool) -> Vec<u8> {
 
 fn dispatch_lua_script_kill() -> Vec<u8> {
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
-        return resp_error("ERR No scripts in execution.");
+        return resp_error(NOT_BUSY);
     }
     if LUA_HOLDER_WROTE.load(Ordering::SeqCst) {
         return resp_error(
@@ -5459,7 +5496,7 @@ fn redis_function_dispatch(ctx: &mut Ctx) -> Vec<u8> {
             ],
         ),
         _ => resp_error(&format!(
-            "ERR unknown subcommand '{}'",
+            "ERR unknown subcommand '{}'. Try FUNCTION HELP.",
             String::from_utf8_lossy(ctx.cmd[1])
         )),
     }
@@ -5479,6 +5516,9 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 Ok(s) => s,
                 Err(_) => return resp_error("ERR script is not valid UTF-8"),
             };
+            if let Err(e) = script_compiles(source) {
+                return resp_error(&e);
+            }
             let sha = sha1_hex(source);
             // Loaded again, it stays the copy that is already compiled.
             script_store()
@@ -5528,7 +5568,16 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
             ),
         },
         "KILL" => kill_running(false),
-        "DEBUG" => resp_simple("OK"),
+        "DEBUG" => match ctx.cmd.get(2) {
+            Some(mode)
+                if [&b"YES"[..], b"SYNC", b"NO"]
+                    .iter()
+                    .any(|m| mode.eq_ignore_ascii_case(m)) =>
+            {
+                resp_simple("OK")
+            }
+            _ => resp_error("ERR Use SCRIPT DEBUG YES/SYNC/NO"),
+        },
         "HELP" => resp_array(
             [
                 "SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -5554,8 +5603,8 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
             .collect(),
         ),
         _ => resp_error(&format!(
-            "ERR unknown subcommand '{}' for SCRIPT",
-            sub.to_lowercase()
+            "ERR unknown subcommand '{}'. Try SCRIPT HELP.",
+            String::from_utf8_lossy(ctx.cmd[1])
         )),
     }
 }

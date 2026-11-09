@@ -620,6 +620,14 @@ fn open_subscriptions(
     subs
 }
 
+/// The address a client connected to: `laddr` in `CLIENT LIST`.
+fn local_address(stream: &TcpStream) -> Option<std::net::SocketAddr> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
+    // SAFETY: `stream` owns `fd` and outlives this borrow of it.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    socket2::SockRef::from(&fd).local_addr().ok()?.as_socket()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
     stream: TcpStream,
@@ -658,7 +666,12 @@ pub async fn handle_client(
     let client_id = crate::client_registry::next_client_id();
     let (mut client_info, mut kill_rx) =
         crate::client_registry::ClientInfo::new(client_id, peer_addr.clone());
-    client_info.laddr = format!("{}:{}", config.bind, config.port);
+    // The socket's own address, as Redis shows it (#566): not the bind
+    // setting, which can be 0.0.0.0.
+    client_info.laddr = local_address(&stream).map_or_else(
+        || format!("{}:{}", config.bind, config.port),
+        |a| a.to_string(),
+    );
     let activity = Arc::clone(&client_info.activity);
     let query_buffer = Arc::clone(&client_info.query_buffer);
     // `CLIENT REPLY`.
@@ -1601,7 +1614,10 @@ pub async fn handle_client(
                     }
                     tracking_table.unregister_client(client_id);
                     monitoring = None;
+                    // `HIMPORT` fieldsets are the connection's state (#566).
+                    crate::commands::hash_import::forget_client(client_id);
                     client_registry.update(client_id, |info| {
+                        info.no_evict = false;
                         info.resp = 2;
                         info.name = String::new();
                         info.tracking = false;
@@ -2270,26 +2286,20 @@ pub async fn handle_client(
                 }
 
                 "WAIT" if !tx.active => {
-                    if cmd.len() < 3 {
-                        b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec()
+                    let wait_args = crate::replication::wait_args(&cmd);
+                    if let Err(refusal) = &wait_args {
+                        refusal.clone()
                     } else {
-                        let num_replicas: i64 =
-                            std::str::from_utf8(cmd.get(1).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-
-                        let timeout_ms: u64 =
-                            std::str::from_utf8(cmd.get(2).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
+                        let (num_replicas, timeout_ms) = wait_args.unwrap_or_default();
 
                         let connected = repl_state
                             .connected_replicas
                             .load(std::sync::atomic::Ordering::Relaxed);
 
-                        if num_replicas == 0 || connected == 0 {
+                        // Without replicas, as in Redis, the wait lasts its
+                        // timeout and the answer is 0 (#566): nothing is
+                        // acknowledged.
+                        if num_replicas <= 0 {
                             crate::resp::write::resp_integer(connected).to_vec()
                         } else {
                             // See the tokio loop in server.rs: per-replica
