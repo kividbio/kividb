@@ -28,6 +28,29 @@ use std::sync::Arc;
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 const NEW_AT_ROOT: &str = "ERR new objects must be created at the root";
 const NOT_A_SELECTION: &str = "ERR the path must select values, not compute one";
+const PATH_MISSING: &str = "ERR Path does not exist";
+
+/// What a read through a legacy path answers when the path matches nothing
+/// (`missing`), or matches a value the command does not work on
+/// (`wrong_type`): the error RedisJSON 8.10 gives there, or nil for `None`.
+/// Each command has its own, as in RedisJSON.
+#[derive(Clone, Copy)]
+struct LegacyMiss {
+    missing: Option<&'static str>,
+    wrong_type: Option<&'static str>,
+}
+
+/// Nil both ways: `JSON.TYPE`, and a JSONPath, which never asks.
+const LEGACY_NIL: LegacyMiss = LegacyMiss {
+    missing: None,
+    wrong_type: None,
+};
+
+impl LegacyMiss {
+    fn reply(error: Option<&'static str>) -> Vec<u8> {
+        error.map_or_else(resp_null_bulk, resp_error)
+    }
+}
 
 fn arg<'a>(cmd: &[&'a [u8]], index: usize) -> Option<&'a str> {
     cmd.get(index).and_then(|bytes| parse_utf8(bytes))
@@ -89,19 +112,21 @@ fn write_doc(
 
 /// The reply of a command that reads: `f` for every value the path matches,
 /// or for the first if the path is a legacy one. `f` is `None` for a value of
-/// the wrong type.
+/// the wrong type. A legacy path that matches nothing, or a value of the
+/// wrong type, answers as `legacy` says.
 fn each_value(
     resp: u8,
     query: &Query,
     root: &Value,
+    legacy: LegacyMiss,
     f: impl Fn(&Value) -> Option<Vec<u8>>,
 ) -> Vec<u8> {
     let values = query.values(root);
     if query.is_legacy() {
-        values
-            .first()
-            .and_then(|value| f(value))
-            .unwrap_or_else(resp_null_bulk)
+        match values.first() {
+            Some(value) => f(value).unwrap_or_else(|| LegacyMiss::reply(legacy.wrong_type)),
+            None => LegacyMiss::reply(legacy.missing),
+        }
     } else {
         resp_array(
             values
@@ -604,6 +629,37 @@ fn clamp_index(index: i64, len: usize) -> usize {
     at.clamp(0, len) as usize
 }
 
+/// The bytes `value` takes in memory: its own node, and what it owns on the
+/// heap, its children included. What `JSON.DEBUG MEMORY` reports, as
+/// RedisJSON reports it of its own representation. An object's members are
+/// counted as an `IndexMap` holds them: the key, the value, the hash and a
+/// slot of the index table each.
+fn value_memory(value: &Value) -> usize {
+    std::mem::size_of::<Value>() + value_heap(value)
+}
+
+fn value_heap(value: &Value) -> usize {
+    const VALUE: usize = std::mem::size_of::<Value>();
+    match value {
+        Value::String(s) => s.capacity(),
+        Value::Array(items) => {
+            items.capacity() * VALUE + items.iter().map(value_heap).sum::<usize>()
+        }
+        Value::Object(members) => members
+            .iter()
+            .map(|(key, member)| {
+                std::mem::size_of::<String>()
+                    + VALUE
+                    + 2 * std::mem::size_of::<usize>()
+                    + 1
+                    + key.capacity()
+                    + value_heap(member)
+            })
+            .sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
 fn not_an_array<T>() -> Result<T, &'static str> {
     Err("ERR path is not an array")
 }
@@ -871,7 +927,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let (key, query) = key_and_path!(2);
             read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| {
+                each_value(resp, &query, root, LEGACY_NIL, |value| {
                     Some(resp_bulk_str(type_name(value)))
                 })
             })
@@ -883,8 +939,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
+            let legacy = match name {
+                "JSON.STRLEN" => LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: Some("WRONGTYPE wrong type of path value - expected string"),
+                },
+                "JSON.OBJLEN" => LegacyMiss {
+                    missing: None,
+                    wrong_type: Some("WRONGTYPE wrong type of path value - expected object"),
+                },
+                _ => LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: Some("ERR Path does not exist or not an array"),
+                },
+            };
             read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| {
+                each_value(resp, &query, root, legacy, |value| {
                     let len = match (name, value) {
                         ("JSON.STRLEN", Value::String(s)) => s.len(),
                         ("JSON.OBJLEN", Value::Object(members)) => members.len(),
@@ -902,8 +972,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
+            let legacy = LegacyMiss {
+                missing: None,
+                wrong_type: Some("ERR Path does not exist or not an object"),
+            };
             read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| {
+                each_value(resp, &query, root, legacy, |value| {
                     let members = value.as_object()?;
                     Some(resp_array(
                         members.keys().map(|key| resp_bulk_str(key)).collect(),
@@ -1124,16 +1198,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         .map_or(-1, |at| (at + from) as i64);
                     Some(found)
                 };
-                if query.is_legacy() {
-                    return match query.values(root).first() {
-                        Some(value) => match search(value) {
-                            Some(found) => resp_integer(found),
-                            None => resp_error("ERR path is not an array"),
-                        },
-                        None => resp_null_bulk(),
-                    };
-                }
-                each_value(resp, &query, root, |value| search(value).map(resp_integer))
+                let legacy = LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: Some("WRONGTYPE wrong type of path value - expected array"),
+                };
+                each_value(resp, &query, root, legacy, |value| {
+                    search(value).map(resp_integer)
+                })
             })
         }
 
@@ -1241,8 +1312,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         // ── JSON.DEBUG MEMORY key [path] ─────────────────────────────────────
-        // The size of the value's JSON text, as an approximation of the
-        // memory it takes.
+        // The bytes the value takes in memory (see `value_memory`). A key
+        // that does not exist is 0, or no values for a JSONPath.
         "JSON.DEBUG" => {
             let sub = arg(cmd, 1).unwrap_or("").to_ascii_uppercase();
             match sub.as_str() {
@@ -1261,9 +1332,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Ok(query) => query,
                         Err(e) => return Some(e),
                     };
-                    read_doc(ctx, key, resp_null_bulk(), |root| {
-                        each_value(resp, &query, root, |value| {
-                            Some(resp_integer(json_text(value).len() as i64))
+                    let missing = if query.is_legacy() {
+                        resp_integer(0)
+                    } else {
+                        resp_array(Vec::new())
+                    };
+                    let legacy = LegacyMiss {
+                        missing: Some(PATH_MISSING),
+                        wrong_type: None,
+                    };
+                    read_doc(ctx, key, missing, |root| {
+                        each_value(resp, &query, root, legacy, |value| {
+                            Some(resp_integer(value_memory(value) as i64))
                         })
                     })
                 }
@@ -1278,7 +1358,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let (key, query) = key_and_path!(2);
             read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| Some(as_resp(resp, value)))
+                let legacy = LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: None,
+                };
+                each_value(resp, &query, root, legacy, |value| {
+                    Some(as_resp(resp, value))
+                })
             })
         }
 

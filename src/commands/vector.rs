@@ -1072,7 +1072,7 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Resolve the index and the field: where its value is stored, and how it
     // is split into tags. Cloned out, so the store lock is not held while the
     // shards are scanned.
-    let (prefixes, tag_field, doc_on, doc_schema) = {
+    let (prefixes, tag_field, doc_on, doc_schema, db) = {
         let store = ctx.index_store.read();
         let def = match store.get(index_name) {
             Some(d) => d,
@@ -1097,6 +1097,7 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
             tag_field,
             def.on.clone(),
             def.fields.clone(),
+            def.db_index,
         )
     };
     let Some((stored_as, separator, case_sensitive)) = tag_field else {
@@ -1105,9 +1106,9 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     };
 
-    // Scan all shards and collect distinct tag values.
+    // Scan all shards of the index's database and collect distinct tag values.
     let mut distinct: ahash::AHashSet<String> = ahash::AHashSet::new();
-    let db_ref = &ctx.store[*ctx.selected_db];
+    let db_ref = &ctx.store[db];
 
     for shard in db_ref.iter() {
         let map = shard.read();
@@ -1476,7 +1477,11 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
 
-    // Merge INCLUDE dicts into vocabulary
+    // Merge INCLUDE dicts into vocabulary. The words of the EXCLUDE dicts
+    // are spelled right: a query word among them gets no entry, as in
+    // RediSearch. (They used to be taken out of the vocabulary, which made
+    // a word of both the index and the dictionary misspelled.)
+    let mut excluded: BTreeSet<String> = BTreeSet::new();
     {
         let dict_store = ctx.dict_store.read();
         for dict_name in &include_dicts {
@@ -1484,12 +1489,9 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 vocab.extend(dict.iter().cloned());
             }
         }
-        // Remove EXCLUDE dict words from vocabulary
         for dict_name in &exclude_dicts {
             if let Some(dict) = dict_store.get(dict_name) {
-                for word in dict.iter() {
-                    vocab.remove(word);
-                }
+                excluded.extend(dict.iter().cloned());
             }
         }
     }
@@ -1506,7 +1508,8 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // The query's words as the index has them, so that `world_x` and
     // `users\.u_1` are the words the vocabulary holds.
     for token_clean in crate::vector::tokenize_for_vocab(&query) {
-        if token_clean.is_empty() || vocab.contains(&token_clean) {
+        if token_clean.is_empty() || vocab.contains(&token_clean) || excluded.contains(&token_clean)
+        {
             continue; // correctly spelled — skip
         }
 
