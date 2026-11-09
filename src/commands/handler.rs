@@ -2,7 +2,7 @@
 
 use crate::commands::*;
 use crate::replication;
-use crate::resp::write::{resp_array, resp_error, resp_integer, resp_null_bulk};
+use crate::resp::write::{resp_array, resp_error, resp_integer};
 use ctx::Ctx;
 use std::sync::atomic::Ordering;
 
@@ -238,12 +238,15 @@ pub(crate) fn execute_command_from_script(
         return resp_error("ERR This Redis command is not allowed from script");
     }
 
-    // Purely blocking commands — return fixed sentinel values instead of blocking the Lua thread.
-    // Redis's behaviour: BLPOP/BRPOP/… → nil;  WAIT → 0;  WAITAOF → {0 0}.
+    // A script never waits. `BLPOP`, `BZPOPMIN`, `BLMOVE` and the other
+    // blocking pops run as their non-blocking form, as in Redis, where a
+    // script's client is `CLIENT_DENY_BLOCKING`: the element if there is
+    // one, their empty reply if not. The `Ctx` a script runs commands with
+    // has `blocking: None`, which is what makes them so
+    // (`blocking::wait_for_keys`). They used to answer nil here without
+    // running, whatever the key held (#558).
+    // `WAIT` → 0 and `WAITAOF` → {0 0}, as in Redis.
     match name {
-        "BLPOP" | "BRPOP" | "BLMOVE" | "BLMPOP" | "BZPOPMIN" | "BZPOPMAX" | "BZMPOP"
-        | "BRPOPLPUSH" => return resp_null_bulk(),
-
         "WAIT" => return resp_integer(0),
 
         "WAITAOF" => return resp_array(vec![resp_integer(0), resp_integer(0)]),
@@ -1740,6 +1743,37 @@ fn moved_nothing(name: &str, result: &[u8]) -> bool {
     matches!(name, "MOVE" | "COPY") && result == b":0\r\n"
 }
 
+/// After a `SWAPDB` (`ctx.cmd`): the watches on keys of the two swapped
+/// databases are dirty, if the key is in either of them — its value changed
+/// or it appeared or went. A key in neither, and every key of another
+/// database, is unchanged; a database swapped with itself changes nothing
+/// (Redis's `touchAllWatchedKeysInDb`).
+fn touch_swapped_watches(ctx: &Ctx) {
+    let db = |i: usize| {
+        ctx.cmd
+            .get(i)
+            .and_then(|arg| std::str::from_utf8(arg).ok())
+            .and_then(|arg| arg.parse::<usize>().ok())
+    };
+    let (Some(db1), Some(db2)) = (db(1), db(2)) else {
+        return;
+    };
+    if db1 == db2 {
+        return;
+    }
+    let present = |db: usize, key: &[u8]| {
+        ctx.store.get(db).is_some_and(|shards| {
+            crate::read_lock!(crate::store::get_shard(shards, key)).contains_key(key)
+        })
+    };
+    for (watched, other) in [(db1, db2), (db2, db1)] {
+        ctx.watch_registry
+            .notify_existing(Some(watched), &|_, key| {
+                present(watched, key) || present(other, key)
+            });
+    }
+}
+
 /// Mark every `WATCH` on a key this write touched as dirty.
 ///
 /// It used to notify `cmd[1]` and nothing else. So `MSET a 1 b 2` left a
@@ -1756,7 +1790,7 @@ fn notify_watchers(ctx: &Ctx, name: &str) {
         // The flush has said which watched keys it removed, before it
         // removed them (`touch_watched_keys`).
         "FLUSHDB" | "FLUSHALL" => return,
-        "SWAPDB" => return ctx.watch_registry.notify_db(None),
+        "SWAPDB" => return touch_swapped_watches(ctx),
         _ => {}
     }
     let keys = crate::keyspec::key_positions(name, &ctx.cmd);

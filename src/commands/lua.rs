@@ -4949,23 +4949,33 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
             );
         }
     }
+    let asynchronous = ctx.cmd.len() == 3 && ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC");
+    match flush_functions(asynchronous) {
+        Ok(()) => resp_simple("OK"),
+        Err(LuaVmBusy) => resp_error(BUSY_RUNNING_A_SCRIPT),
+    }
+}
+
+/// Drop every library, unless a script holds the VM.
+///
+/// Refused before anything is taken: a refused flush changes nothing. It
+/// used to empty the store first, and its BUSY reply then left the
+/// libraries gone here while the replicas, which are not sent a refused
+/// command, kept them (#559). A call that comes in between finds the
+/// libraries, as if it had come before the flush; one that comes after
+/// finds none of their functions, whatever its VM holds (`fcall_inner`
+/// looks a function up by name first).
+fn flush_functions(asynchronous: bool) -> Result<(), LuaVmBusy> {
+    let vm = lua_vms_renew_for_admin(&[Vm::Functions])?;
     let libraries = std::mem::take(&mut *function_store().write());
     let names = std::mem::take(&mut *fn_name_to_library().write());
-    let vm = match lua_vms_renew_for_admin(&[Vm::Functions]) {
-        Ok(vm) => vm,
-        Err(LuaVmBusy) => {
-            return resp_error(
-                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-            );
-        }
-    };
     // `ASYNC`: the VM and the libraries are freed in the background, and
     // counted as Redis counts them, a function each and one for the VM.
-    if ctx.cmd.len() == 3 && ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC") {
+    if asynchronous {
         let functions: u64 = libraries.values().map(|l| l.functions.len() as u64).sum();
         crate::lazyfree::free_later((vm, libraries, names), functions + 1);
     }
-    resp_simple("OK")
+    Ok(())
 }
 
 /// Take each of `vms` out under one hold of the lock, for the next script
@@ -5572,5 +5582,40 @@ mod lua_busy_allow_tests {
         assert!(lua_command_allowed_while_busy(&[b"SCRIPT", b"KILL"]));
         assert!(!lua_command_allowed_while_busy(&[b"FUNCTION", b"LIST"]));
         assert!(!lua_command_allowed_while_busy(&[b"PING"]));
+    }
+
+    /// A `FUNCTION FLUSH` refused because a script holds the VM leaves the
+    /// libraries where they were (#559).
+    #[test]
+    fn a_refused_function_flush_keeps_the_libraries() {
+        let (lib, function) = ("flush_refused_559", "flush_refused_559_f");
+        let held = LUA_VM.lock();
+        function_store().write().insert(
+            lib.to_string(),
+            FunctionLibrary {
+                name: lib.to_string(),
+                engine: "LUA".to_string(),
+                body: String::new(),
+                functions: vec![function.to_string()],
+                registered: Vec::new(),
+            },
+        );
+        fn_name_to_library()
+            .write()
+            .insert(function.to_string(), lib.to_string());
+
+        let refused = flush_functions(false);
+        let kept = function_store().read().contains_key(lib);
+        let named = fn_name_to_library().read().contains_key(function);
+        function_store().write().remove(lib);
+        fn_name_to_library().write().remove(function);
+        drop(held);
+
+        assert!(refused.is_err());
+        assert!(kept, "the library was taken out by a refused flush");
+        assert!(
+            named,
+            "the function's name was taken out by a refused flush"
+        );
     }
 }

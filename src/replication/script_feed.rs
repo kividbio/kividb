@@ -207,6 +207,9 @@ pub fn commands_for_propagation(
         // AOF replay) has: send the hash it produced instead.
         "HIMPORT" => crate::commands::hash_import::propagation(ctx.client_id, cmd),
         "BLMOVE" => blocking_move_feed(cmd, resp, "LMOVE", 5),
+        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" | "BLMPOP" | "BZMPOP" => {
+            blocking_pop_feed(name, cmd, resp)
+        }
         "BRPOPLPUSH" => blocking_move_feed(cmd, resp, "RPOPLPUSH", 3),
         _ => {
             if cmd.is_empty() {
@@ -291,6 +294,76 @@ fn blocking_move_feed(
     }
     parts[0] = plain_name.as_bytes().to_vec();
     vec![parts]
+}
+
+/// `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BLMPOP` and `BZMPOP` propagate
+/// as the pop they made, as in Redis: `LPOP key`, `ZPOPMIN key`, and for the
+/// `M` forms `LPOP key count` / `ZPOPMIN key count` with the number taken,
+/// all for the key the reply names. A replica, or the AOF replayed, then
+/// takes the same elements from the same key: the blocking form, run there,
+/// looks at its keys in order and could take from another one than the
+/// master did (the master leaves a key to a client that has waited longer).
+/// Nothing is sent when nothing was popped.
+fn blocking_pop_feed(name: &str, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    let verbatim = || vec![cmd.iter().map(|b| b.to_vec()).collect::<Vec<Vec<u8>>>()];
+    let Some((elements, header)) = array_header(resp) else {
+        // A null reply, or none (a client that has parked): nothing popped.
+        if resp.is_empty() || resp.starts_with(b"*-1") || resp.starts_with(b"_") {
+            return Vec::new();
+        }
+        return verbatim();
+    };
+    if elements < 2 {
+        return Vec::new();
+    }
+    let Some((used, Some(key))) = parse_bulk(&resp[header..]) else {
+        return verbatim();
+    };
+    let plain: &[u8] = match name {
+        "BLPOP" => b"LPOP",
+        "BRPOP" => b"RPOP",
+        "BZPOPMIN" => b"ZPOPMIN",
+        "BZPOPMAX" => b"ZPOPMAX",
+        // BLMPOP / BZMPOP timeout numkeys key [key ...] LEFT|RIGHT|MIN|MAX ...
+        _ => {
+            let numkeys = cmd
+                .get(2)
+                .and_then(|n| std::str::from_utf8(n).ok())
+                .and_then(|n| n.parse::<usize>().ok());
+            let side = numkeys
+                .and_then(|n| 3usize.checked_add(n))
+                .and_then(|i| cmd.get(i));
+            let plain: &[u8] = match side.map(|s| s.to_ascii_uppercase()).as_deref() {
+                Some(b"LEFT") => b"LPOP",
+                Some(b"RIGHT") => b"RPOP",
+                Some(b"MIN") => b"ZPOPMIN",
+                Some(b"MAX") => b"ZPOPMAX",
+                _ => return verbatim(),
+            };
+            let Some((count, _)) = array_header(&resp[header + used..]) else {
+                return verbatim();
+            };
+            if count == 0 {
+                return Vec::new();
+            }
+            return vec![vec![plain.to_vec(), key, count.to_string().into_bytes()]];
+        }
+    };
+    vec![vec![plain.to_vec(), key]]
+}
+
+/// The element count of the array whose header starts `resp`, and the
+/// header's length; `None` for anything else, a null array among them.
+fn array_header(resp: &[u8]) -> Option<(usize, usize)> {
+    if resp.first()? != &b'*' {
+        return None;
+    }
+    let line_end = resp.windows(2).position(|w| w == b"\r\n")?;
+    let count = std::str::from_utf8(resp.get(1..line_end)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    Some((count, line_end + 2))
 }
 
 /// `TS.ADD key * value`: the `*` is the master's clock at the moment it ran.
@@ -834,6 +907,47 @@ mod tests {
             blocking_move_feed(&refs(&c), &bulk("a"), "RPOPLPUSH", 3),
             vec![cmd(&["RPOPLPUSH", "s", "d"])]
         );
+    }
+
+    #[test]
+    fn blocking_pops_propagate_as_the_pop_they_made() {
+        let c = cmd(&["BLPOP", "a", "b", "0"]);
+        let popped = b"*2\r\n$1\r\nb\r\n$1\r\nx\r\n";
+        assert_eq!(
+            blocking_pop_feed("BLPOP", &refs(&c), popped),
+            vec![cmd(&["LPOP", "b"])]
+        );
+        assert!(blocking_pop_feed("BLPOP", &refs(&c), b"*-1\r\n").is_empty());
+        assert!(blocking_pop_feed("BLPOP", &refs(&c), b"_\r\n").is_empty());
+        assert!(blocking_pop_feed("BLPOP", &refs(&c), b"").is_empty());
+
+        let c = cmd(&["BRPOP", "a", "0"]);
+        assert_eq!(
+            blocking_pop_feed("BRPOP", &refs(&c), b"*2\r\n$1\r\na\r\n$1\r\nx\r\n"),
+            vec![cmd(&["RPOP", "a"])]
+        );
+
+        let c = cmd(&["BZPOPMAX", "z1", "z2", "1.5"]);
+        let popped = b"*3\r\n$2\r\nz2\r\n$1\r\nm\r\n$1\r\n3\r\n";
+        assert_eq!(
+            blocking_pop_feed("BZPOPMAX", &refs(&c), popped),
+            vec![cmd(&["ZPOPMAX", "z2"])]
+        );
+
+        let c = cmd(&["BLMPOP", "0", "2", "a", "b", "right", "COUNT", "5"]);
+        let popped = b"*2\r\n$1\r\nb\r\n*2\r\n$1\r\nx\r\n$1\r\ny\r\n";
+        assert_eq!(
+            blocking_pop_feed("BLMPOP", &refs(&c), popped),
+            vec![cmd(&["RPOP", "b", "2"])]
+        );
+
+        let c = cmd(&["BZMPOP", "0", "1", "z", "MIN", "COUNT", "3"]);
+        let popped = b"*2\r\n$1\r\nz\r\n*1\r\n*2\r\n$1\r\nm\r\n$1\r\n1\r\n";
+        assert_eq!(
+            blocking_pop_feed("BZMPOP", &refs(&c), popped),
+            vec![cmd(&["ZPOPMIN", "z", "1"])]
+        );
+        assert!(blocking_pop_feed("BZMPOP", &refs(&c), b"*-1\r\n").is_empty());
     }
 
     #[test]

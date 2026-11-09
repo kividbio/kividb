@@ -1508,6 +1508,83 @@ fn test_previously_unpropagated_writes_reach_the_replica() {
     assert_eq!(replica.cmds(&["LLEN", "dst"]).as_int(), 1);
 }
 
+/// A blocking pop is sent to replicas and the AOF as the pop it made, as in
+/// Redis: `BLPOP` as `LPOP` of the key it took from, `BLMPOP` as `LPOP key
+/// count`, `BZPOPMIN` as `ZPOPMIN`, from a client that did not wait, one
+/// that did and one in a transaction; and as nothing when it took nothing
+/// (#558).
+#[test]
+fn test_blocking_pops_are_sent_as_the_pop_they_made() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let mut tap = attach_stream_reader(master_port);
+
+    assert_eq!(
+        master.cmds(&["RPUSH", "l1", "a", "b", "c", "d"]).as_int(),
+        4
+    );
+    assert_eq!(
+        master
+            .cmds(&["ZADD", "z", "1", "m1", "2", "m2", "3", "m3", "4", "m4"])
+            .as_int(),
+        4
+    );
+    master.cmds(&["BLPOP", "none", "l1", "0"]);
+    master.cmds(&["BRPOP", "l1", "0"]);
+    master.cmds(&["BLMPOP", "0", "2", "none", "l1", "LEFT", "COUNT", "5"]);
+    master.cmds(&["BZPOPMIN", "z", "0"]);
+    master.cmds(&["BZPOPMAX", "z", "0"]);
+    master.cmds(&["BZMPOP", "0", "1", "z", "MAX", "COUNT", "9"]);
+    assert_eq!(master.cmds(&["BLPOP", "none", "0.01"]), RespValue::Nil);
+
+    assert_eq!(master.cmds(&["RPUSH", "l2", "x"]).as_int(), 1);
+    assert!(master.cmds(&["MULTI"]).is_ok());
+    master.cmds(&["BLPOP", "l2", "0"]);
+    master.cmds(&["BLPOP", "l2", "0"]);
+    assert_eq!(master.cmds(&["EXEC"]).as_array().len(), 2);
+
+    // One that waits, and is given an element.
+    let mut waiter = Conn::connect(master_port);
+    waiter
+        .stream
+        .write_all(b"*3\r\n$5\r\nBLPOP\r\n$2\r\nlw\r\n$1\r\n0\r\n")
+        .unwrap();
+    wait_until("the client is blocked", Duration::from_secs(10), || {
+        master
+            .cmds(&["INFO", "clients"])
+            .as_str()
+            .contains("blocked_clients:1")
+    });
+    assert_eq!(master.cmds(&["RPUSH", "lw", "v"]).as_int(), 1);
+    assert_eq!(waiter.read_value().as_array().len(), 2);
+    assert!(master.cmds(&["SET", "end", "1"]).is_ok());
+
+    let seen = stream_until(&mut tap, |command| command.starts_with("SET end"));
+    assert!(
+        !seen.iter().any(|command| command.starts_with('B')),
+        "a blocking command was sent: {seen:?}"
+    );
+    let pops: Vec<&str> = seen
+        .iter()
+        .map(String::as_str)
+        .filter(|command| command.contains("POP"))
+        .collect();
+    assert_eq!(
+        pops,
+        [
+            "LPOP l1",
+            "RPOP l1",
+            "LPOP l1 2",
+            "ZPOPMIN z",
+            "ZPOPMAX z",
+            "ZPOPMAX z 2",
+            "LPOP l2",
+            "LPOP lw",
+        ],
+        "{seen:?}"
+    );
+}
+
 /// A replica attached while the master is taking non-idempotent writes must
 /// end up identical to it. The full-sync payload and the stream used to
 /// overlap — a write landing during the dump was in both — so `INCR` counters
