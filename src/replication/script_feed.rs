@@ -823,7 +823,15 @@ mod tests {
             (
                 &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "c"],
                 &[
-                    "TS.INCRBY", "k", "2", "TIMESTAMP", "42", "LABELS", "a", "b", "c",
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "c",
                 ],
             ),
             (

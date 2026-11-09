@@ -2210,7 +2210,8 @@ fn time_series_options_reach_a_replica() {
     m.cmd(&["TS.CREATE", "rp:ts:d", "DUPLICATE_POLICY", "BLOCK"]);
     m.cmd(&["TS.ADD", "rp:ts:d", "1", "1"]);
     assert_eq!(
-        m.cmd(&["TS.ADD", "rp:ts:d", "1", "5", "ON_DUPLICATE", "SUM"]).i(),
+        m.cmd(&["TS.ADD", "rp:ts:d", "1", "5", "ON_DUPLICATE", "SUM"])
+            .i(),
         1
     );
     assert_eq!(m.cmd(&["WAIT", "1", "5000"]).i(), 1);
@@ -2267,10 +2268,7 @@ fn time_series_options_reach_a_replica() {
         r.cmd(&["TS.RANGE", "rp:ts:d", "-", "+"]),
         m.cmd(&["TS.RANGE", "rp:ts:d", "-", "+"])
     );
-    assert_eq!(
-        r.cmd(&["TS.GET", "rp:ts:d"]).arr()[1].s(),
-        "6"
-    );
+    assert_eq!(r.cmd(&["TS.GET", "rp:ts:d"]).arr()[1].s(), "6");
     assert_eq!(
         r.cmd(&["TS.INFO", "rp:ts:d"]).field("duplicatePolicy").s(),
         "block"

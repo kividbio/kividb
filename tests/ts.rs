@@ -1885,14 +1885,31 @@ fn test_ts_labels_end_at_a_two_word_option_only() {
     let mut c = Conn::connect(port);
 
     c.cmds(&[
-        "TS.CREATE", "opt:l", "LABELS", "on", "x", "chunk", "y", "duplicate", "z",
+        "TS.CREATE",
+        "opt:l",
+        "LABELS",
+        "on",
+        "x",
+        "chunk",
+        "y",
+        "duplicate",
+        "z",
     ]);
     assert_eq!(query_index(&mut c, "on=x"), ["opt:l"]);
     assert_eq!(query_index(&mut c, "chunk=y"), ["opt:l"]);
     assert_eq!(query_index(&mut c, "duplicate=z"), ["opt:l"]);
 
     c.cmds(&[
-        "TS.CREATE", "opt:m", "LABELS", "a", "b", "CHUNK", "SIZE", "128", "ON", "DUPLICATE",
+        "TS.CREATE",
+        "opt:m",
+        "LABELS",
+        "a",
+        "b",
+        "CHUNK",
+        "SIZE",
+        "128",
+        "ON",
+        "DUPLICATE",
         "MAX",
     ]);
     assert_eq!(query_index(&mut c, "a=b"), ["opt:m"]);
