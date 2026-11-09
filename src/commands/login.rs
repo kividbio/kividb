@@ -115,23 +115,13 @@ impl Login<'_> {
             if ver != "0" && ver != "1" && ver != "2" && ver != "3" {
                 return b"-ERR Protocol version is not an integer or out of range\r\n".to_vec();
             }
-            proto_reply = match ver {
-                "3" => {
-                    *resp_version = 3;
-                    self.client_registry
-                        .update(self.client_id, |info| info.resp = 3);
-                    3
-                }
-                _ => {
-                    // "0", "1", "2" — Redis resets/alternate protos to RESP2 wire.
-                    *resp_version = 2;
-                    self.client_registry
-                        .update(self.client_id, |info| info.resp = 2);
-                    2
-                }
-            };
+            // "0", "1", "2" — Redis resets/alternate protos to RESP2 wire.
+            proto_reply = if ver == "3" { 3 } else { 2 };
             i += 1;
         }
+        // The protocol changes only once the rest of the command has been
+        // accepted, as in Redis: a HELLO 3 whose AUTH fails leaves the
+        // connection on the protocol it had.
 
         // Optional AUTH username password
         if cmd
@@ -188,6 +178,10 @@ impl Login<'_> {
                     .update(self.client_id, |info| info.name = name);
             }
         }
+
+        *resp_version = proto_reply as u8;
+        self.client_registry
+            .update(self.client_id, |info| info.resp = proto_reply as u8);
 
         // Build the response — RESP3 clients (e.g. modern redis-py, whose
         // default changed to protocol 3) expect the HELLO reply itself encoded
