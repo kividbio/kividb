@@ -145,6 +145,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Cluster admin commands answer as Redis does (#552, #553, #563).**
+  - `CLUSTER FLUSHSLOTS` gives up only this node's own slots, and refuses
+    with `ERR DB must be empty to perform CLUSTER FLUSHSLOTS.` while the node
+    holds keys. It used to unassign every slot in the node's view, the other
+    masters' too, and the node went to `cluster_state:fail`.
+  - `CLUSTER ADDSLOTS` and `ADDSLOTSRANGE` check every slot first and
+    claim none if one is busy or named twice. The slots before the busy one
+    used to stay claimed, without being saved to `nodes.conf` or counted in
+    `CLUSTER INFO`. `ADDSLOTSRANGE` with a start above its end now says
+    `ERR start slot number N is greater than end slot number M`.
+    A slot they claim is no longer `IMPORTING`, as in Redis.
+  - `CLUSTER BUMPEPOCH` gives this node a config epoch above every other
+    one, and replies `STILL <n>` when it has the highest already. It used to
+    raise only the current epoch, and always said `BUMPED`.
+  - `CLUSTER SET-CONFIG-EPOCH` is refused on a node that knows other nodes,
+    and a negative epoch with `ERR Invalid config epoch specified`.
+  - `CLUSTER COUNT-FAILURE-REPORTS` of a node this one does not know is
+    `ERR Unknown node <id>`, not 0.
+  - `CLUSTER GETKEYSINSLOT` with a count of 0 returns an empty array, not
+    one key; a negative count is `ERR Invalid slot or number of keys`.
+  - With `cluster-enabled no`, `CLUSTER MYID`, `COUNTKEYSINSLOT`,
+    `GETKEYSINSLOT`, `READONLY`, `READWRITE` and `ASKING` reply
+    `ERR This instance has cluster support disabled`.
+
 - **`UNWATCH` inside `MULTI` is queued, and no longer lets `EXEC` run
   after a watched key changed (#550).** It ran at once and dropped the
   watches, so `WATCH k`, `MULTI`, ..., `UNWATCH`, then `EXEC` ran even
