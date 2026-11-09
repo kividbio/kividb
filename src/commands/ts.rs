@@ -123,9 +123,11 @@ struct TsOptions {
     /// RedisTimeSeries. The series keeps its own.
     on_duplicate: Option<DuplicatePolicy>,
     labels: Option<Vec<(String, String)>>,
-    /// `TIMESTAMP` (`TS.INCRBY`, `TS.DECRBY`): where the word is among the
-    /// options, and the time it gives (`*`, the clock).
-    timestamp: Option<(usize, u64)>,
+    /// `TIMESTAMP` (`TS.INCRBY`, `TS.DECRBY`): the time the last one gives
+    /// (`*`, the clock).
+    timestamp: Option<u64>,
+    /// Where each `TIMESTAMP` option is among the options.
+    timestamp_at: Vec<usize>,
 }
 
 /// RedisTimeSeries's error for a `CHUNK_SIZE` out of its bounds.
@@ -162,20 +164,29 @@ fn option_policy(value: &[u8]) -> Result<DuplicatePolicy, Vec<u8>> {
         .ok_or_else(|| resp_error("ERR invalid DUPLICATE POLICY"))
 }
 
-/// Whether `word` is an option's name, which ends a `LABELS` list.
-fn ends_labels(word: &[u8], of: OptionsOf) -> bool {
-    const NAMES: [&[u8]; 9] = [
+/// Whether `tokens[at]` starts an option, which ends a `LABELS` list: its
+/// name, or the first of `CHUNK SIZE`, `ON DUPLICATE` and `DUPLICATE
+/// POLICY` followed by the second (1.2.0 ended the list at the first word
+/// alone).
+///
+/// Not RedisTimeSeries's way: it takes every word after `LABELS` as label
+/// pairs and finds options anywhere, so its `LABELS a b RETENTION 5` has the
+/// labels `a=b` and `RETENTION=5`, and a retention of 5. Here the list ends
+/// at `RETENTION`, as in 1.2.0, which a log 1.2.0 wrote replays by.
+fn ends_labels(tokens: &[&[u8]], at: usize, of: OptionsOf) -> bool {
+    const NAMES: [&[u8]; 6] = [
         b"RETENTION",
         b"CHUNK_SIZE",
-        b"CHUNK",
         b"ENCODING",
         b"DUPLICATE_POLICY",
-        b"ON",
-        b"DUPLICATE",
         b"ON_DUPLICATE",
         b"IGNORE",
     ];
+    let word = tokens[at];
     NAMES.iter().any(|name| word.eq_ignore_ascii_case(name))
+        || (word.eq_ignore_ascii_case(b"CHUNK") && second_word(tokens, at, b"SIZE"))
+        || (word.eq_ignore_ascii_case(b"ON") && second_word(tokens, at, b"DUPLICATE"))
+        || (word.eq_ignore_ascii_case(b"DUPLICATE") && second_word(tokens, at, b"POLICY"))
         || (of == OptionsOf::IncrBy && word.eq_ignore_ascii_case(b"TIMESTAMP"))
 }
 
@@ -206,7 +217,8 @@ fn second_word(tokens: &[&[u8]], at: usize, second: &[u8]) -> bool {
 /// parse goes on, as RedisTimeSeries, which looks for each option by name,
 /// passes it over. It used to end the parse, with no error, dropping the
 /// options after it: `CHUNK_SIZE`, unknown then, dropped `LABELS` (#565).
-/// `IGNORE` is not supported, and says so.
+/// `IGNORE` is not supported, and says so. Where a `LABELS` list ends is
+/// not as in RedisTimeSeries: see [`ends_labels`].
 fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsOptions, Vec<u8>> {
     let mut options = TsOptions::default();
     let mut i = 0;
@@ -272,14 +284,15 @@ fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsO
                 } else {
                     option_number(value).ok_or_else(|| resp_error("ERR invalid TIMESTAMP"))?
                 };
-                options.timestamp = Some((i, at));
+                options.timestamp = Some(at);
+                options.timestamp_at.push(i);
                 i += 2;
             }
             b"LABELS" => {
                 i += 1;
                 let mut labels = Vec::new();
                 // Pairs, up to the next option.
-                while i + 1 < tokens.len() && !ends_labels(tokens[i], of) {
+                while i + 1 < tokens.len() && !ends_labels(tokens, i, of) {
                     let text = |t: &[u8]| std::str::from_utf8(t).unwrap_or("").to_string();
                     labels.push((text(tokens[i]), text(tokens[i + 1])));
                     i += 2;
@@ -313,12 +326,17 @@ fn configure_new(ts: &mut TsInner, options: &TsOptions) {
 }
 
 /// Where a `TS.INCRBY` or `TS.DECRBY` (the whole command) has its
-/// `TIMESTAMP` option, as the command reads it: for the replication feed,
-/// which sends the timestamp the command used in its place. A `TIMESTAMP`
-/// that is a label's value is not it.
-pub(crate) fn incrby_timestamp_at(cmd: &[&[u8]]) -> Option<usize> {
-    let options = parse_ts_options(cmd.get(3..)?, OptionsOf::IncrBy, false).ok()?;
-    options.timestamp.map(|(at, _)| 3 + at)
+/// `TIMESTAMP` options, as the command reads them: for the replication
+/// feed, which gives each the timestamp the command used. A `TIMESTAMP`
+/// that is a label's value is not one.
+pub(crate) fn incrby_timestamp_options(cmd: &[&[u8]]) -> Vec<usize> {
+    match cmd
+        .get(3..)
+        .map(|tokens| parse_ts_options(tokens, OptionsOf::IncrBy, false))
+    {
+        Some(Ok(options)) => options.timestamp_at.iter().map(|at| 3 + at).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Update the label index for a key. Clears old labels for this key and
@@ -678,11 +696,25 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     let result = {
         let mut ts = series.write();
+        // The policy the sample is added under: `ON_DUPLICATE`'s, or the
+        // series' as the options leave it. A sample it refuses fails the
+        // command before anything changes: a failed command is not sent to
+        // replicas or the AOF, so the options must not stay applied.
+        let policy = options
+            .on_duplicate
+            .clone()
+            .or_else(|| options.duplicate_policy.clone())
+            .unwrap_or_else(|| ts.duplicate_policy.clone());
+        if policy == DuplicatePolicy::Block && ts.samples.contains_key(&timestamp) {
+            return Some(resp_error("TSDB: Duplicate sample in BLOCK policy"));
+        }
         if created {
             configure_new(&mut ts, &options);
         } else {
-            // As 1.2.0 did: a retention, and a duplicate policy, given to
-            // an existing series are its own from now on.
+            // As 1.2.0 did, which a log it wrote replays by: a retention, and
+            // a duplicate policy (`DUPLICATE_POLICY`, `ON DUPLICATE`), given
+            // to an existing series are its own from now on. RedisTimeSeries
+            // passes them over there.
             if let Some(retention) = options.retention.filter(|&r| r > 0) {
                 ts.retention = retention;
             }
@@ -690,10 +722,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 ts.duplicate_policy = dp.clone();
             }
         }
-        match &options.on_duplicate {
-            Some(policy) => ts.add_sample_as(timestamp, value, policy),
-            None => ts.add_sample(timestamp, value),
-        }
+        ts.add_sample_as(timestamp, value, &policy)
     };
     if created {
         let labels = options.labels.unwrap_or_default();
@@ -809,10 +838,7 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
         Ok(v) => v,
         Err(e) => return Some(e),
     };
-    let timestamp = options
-        .timestamp
-        .map(|(_, at)| at)
-        .unwrap_or_else(TsInner::now_ms);
+    let timestamp = options.timestamp.unwrap_or_else(TsInner::now_ms);
 
     let (series, created) = match series_for_append(ctx, &key) {
         Ok(found) => found,

@@ -338,19 +338,23 @@ fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     let Some(ts) = parse_resp_integer(resp) else {
         return verbatim();
     };
-    // The `TIMESTAMP` option the command read, dropped here and added back
-    // below with the time it used. Not a word `TIMESTAMP` that is a label's
-    // value, which the command now applies (#555).
-    let given = crate::commands::ts::incrby_timestamp_at(cmd);
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() + 2);
-    for (i, part) in cmd.iter().enumerate() {
-        if given.is_some_and(|at| i == at || i == at + 1) {
-            continue;
+    // Each `TIMESTAMP` option the command read is given the time it used, in
+    // its place, so every other word is where it was and reads as it did; a
+    // word `TIMESTAMP` that is a label's value is left alone. With none, one
+    // goes right after the value, before any option: added at the end, it
+    // made a label of a word left over from `LABELS` (#555).
+    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
+    let ts = ts.to_string().into_bytes();
+    let given = crate::commands::ts::incrby_timestamp_options(cmd);
+    if given.is_empty() {
+        let at = parts.len().min(3);
+        parts.insert(at, ts);
+        parts.insert(at, b"TIMESTAMP".to_vec());
+    } else {
+        for at in given {
+            parts[at + 1] = ts.clone();
         }
-        parts.push(part.to_vec());
     }
-    parts.push(b"TIMESTAMP".to_vec());
-    parts.push(ts.to_string().into_bytes());
     vec![parts]
 }
 
@@ -796,56 +800,97 @@ mod tests {
                 "TS.DECRBY",
                 "k",
                 "2",
-                "RETENTION",
-                "9",
                 "TIMESTAMP",
-                "42"
+                "42",
+                "RETENTION",
+                "9"
             ])]
         );
     }
 
-    /// The `TIMESTAMP` option the command read is the one replaced: not a
-    /// label's value `TIMESTAMP`, which a series `TS.INCRBY` makes now has
-    /// (#555).
+    /// Each `TIMESTAMP` option the command read is given the time, where it
+    /// is; with none, one goes right after the value. Not after a `LABELS`
+    /// list, where a word left over from the list, which the command passed
+    /// over, became a label with it on a replica. A label's value
+    /// `TIMESTAMP` is not an option (#555).
     #[test]
-    fn ts_incrby_feed_replaces_the_timestamp_option_alone() {
-        let c = cmd(&["TS.INCRBY", "k", "2", "LABELS", "kind", "TIMESTAMP"]);
-        assert_eq!(
-            ts_incrby_feed(&refs(&c), b":42\r\n"),
-            vec![cmd(&[
-                "TS.INCRBY",
-                "k",
-                "2",
-                "LABELS",
-                "kind",
-                "TIMESTAMP",
-                "TIMESTAMP",
-                "42"
-            ])]
-        );
-        let c = cmd(&[
-            "TS.INCRBY",
-            "k",
-            "2",
-            "TIMESTAMP",
-            "7",
-            "LABELS",
-            "a",
-            "TIMESTAMP",
-        ]);
-        assert_eq!(
-            ts_incrby_feed(&refs(&c), b":7\r\n"),
-            vec![cmd(&[
-                "TS.INCRBY",
-                "k",
-                "2",
-                "LABELS",
-                "a",
-                "TIMESTAMP",
-                "TIMESTAMP",
-                "7"
-            ])]
-        );
+    fn ts_incrby_feed_gives_the_time_without_moving_a_word() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a"],
+                &["TS.INCRBY", "k", "2", "TIMESTAMP", "42", "LABELS", "a"],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "c"],
+                &[
+                    "TS.INCRBY", "k", "2", "TIMESTAMP", "42", "LABELS", "a", "b", "c",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "UNCOMPRESSED"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "UNCOMPRESSED",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "TIMESTAMP", "*"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "TIMESTAMP",
+                    "*",
+                ],
+            ),
+            (
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "5",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "*",
+                    "c",
+                ],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "42",
+                    "c",
+                ],
+            ),
+        ];
+        for (given, sent) in cases {
+            let c = cmd(given);
+            assert_eq!(
+                ts_incrby_feed(&refs(&c), b":42\r\n"),
+                vec![cmd(sent)],
+                "{given:?}"
+            );
+        }
     }
 
     #[test]

@@ -151,21 +151,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   labels. They now apply when the command creates the series, as in
   RedisTimeSeries, and the sample is added as `TS.ADD` adds one, so the
   series is trimmed to its retention; it never was.
-- **The time series options are read as RedisTimeSeries spells them, and
-  a word that is not one no longer drops the options after it (#565).**
+- **The time series options take RedisTimeSeries's spellings, and a word
+  that is not one no longer drops the options after it (#565).**
   `TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.INCRBY` and `TS.DECRBY` took
   `CHUNK SIZE` but not `CHUNK_SIZE`, and a word they did not know ended the
   options with no error: `CHUNK_SIZE` and everything after it, `LABELS`
   too, was dropped. `CHUNK_SIZE` is read now, and a word that is no option
-  is passed over and the options after it read, as in RedisTimeSeries. A
-  chunk size must be a multiple of 8 from 48 to 1048576, an `ENCODING` must
-  be `COMPRESSED` or `UNCOMPRESSED`, and `IGNORE`, which KiviDB does not
-  support, is refused. `TS.ADD … ON_DUPLICATE policy` applies to that sample
-  alone. `CHUNK SIZE`, `ON DUPLICATE` and `DUPLICATE POLICY` are still
-  accepted. `TS.ALTER` sets what it is given: `RETENTION 0`,
-  `CHUNK_SIZE 4096` and `LABELS` with no pairs were ignored. A command
+  is passed over and the options after it read, as RedisTimeSeries passes
+  it over. A chunk size must be a multiple of 8 from 48 to 1048576, an
+  `ENCODING` must be `COMPRESSED` or `UNCOMPRESSED`, and `IGNORE`, which
+  KiviDB does not support, is refused. `CHUNK SIZE`, `ON DUPLICATE` and
+  `DUPLICATE POLICY` are still accepted. `TS.ADD … ON_DUPLICATE policy`
+  applies to that one sample, as in RedisTimeSeries, while KiviDB's older
+  `ON DUPLICATE policy` still makes `policy` the series' own for good, as
+  it did in 1.2.0. `TS.ALTER` sets what it is given: `RETENTION 0`,
+  `CHUNK_SIZE 4096` and `LABELS` with no pairs were ignored. A `LABELS`
+  list still ends at the next option's name, as in 1.2.0, where
+  RedisTimeSeries takes every word after `LABELS` as a label: its
+  `LABELS a b RETENTION 5` has a label `RETENTION=5` as well; `ON`,
+  `CHUNK` and `DUPLICATE` end the list only when the word after them makes
+  the option. A `TS.ADD` its duplicate policy refuses no longer changes the
+  series' retention or policy, or trims it, on the master alone. A command
   replayed from an AOF, or sent by a master, is not refused for what 1.2.0
-  accepted, so a log written by 1.2.0 replays whole.
+  accepted, so a log written by 1.2.0 replays whole; it replays under these
+  rules, so after the first restart a series can differ from what 1.2.0
+  held in memory: `TS.CREATE k FOO RETENTION 10` now has the retention, and
+  trims, and `ON_DUPLICATE SUM` is now applied.
 
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and

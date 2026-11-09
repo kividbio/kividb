@@ -2193,13 +2193,36 @@ fn time_series_options_reach_a_replica() {
         ])
         .ok()
     );
+    // A word left over from `LABELS` is passed over, on the replica too:
+    // the timestamp the master used is sent before the list, not after it,
+    // where the word became a label with it.
+    for (key, labels) in [
+        ("rp:ts:o1", &["a"][..]),
+        ("rp:ts:o2", &["a", "b", "c"]),
+        ("rp:ts:o3", &["a", "b", "UNCOMPRESSED"]),
+        ("rp:ts:o4", &["a", "TIMESTAMP", "*"]),
+    ] {
+        let mut cmd = vec!["TS.INCRBY", key, "2", "LABELS"];
+        cmd.extend_from_slice(labels);
+        assert!(m.cmd(&cmd).i() > 0, "{cmd:?}");
+    }
+    // `ON_DUPLICATE`: for the sample; the series keeps `BLOCK`.
+    m.cmd(&["TS.CREATE", "rp:ts:d", "DUPLICATE_POLICY", "BLOCK"]);
+    m.cmd(&["TS.ADD", "rp:ts:d", "1", "1"]);
+    assert_eq!(
+        m.cmd(&["TS.ADD", "rp:ts:d", "1", "5", "ON_DUPLICATE", "SUM"]).i(),
+        1
+    );
     assert_eq!(m.cmd(&["WAIT", "1", "5000"]).i(), 1);
 
-    for key in ["rp:ts:c", "rp:ts:r", "rp:ts:a"] {
+    for key in [
+        "rp:ts:c", "rp:ts:r", "rp:ts:a", "rp:ts:o1", "rp:ts:o2", "rp:ts:o3", "rp:ts:o4", "rp:ts:d",
+    ] {
         let (on_master, on_replica) = (m.cmd(&["TS.INFO", key]), r.cmd(&["TS.INFO", key]));
         for field in [
             "retentionTime",
             "chunkSize",
+            "duplicatePolicy",
             "labels",
             "lastTimestamp",
             "totalSamples",
@@ -2228,6 +2251,30 @@ fn time_series_options_reach_a_replica() {
     assert_eq!(altered.field("retentionTime").s(), "0");
     assert_eq!(altered.field("chunkSize").s(), "4096");
     assert_eq!(altered.field("labels"), &V::Arr(vec![]));
+    // The labels `TS.ALTER` took away are out of the index, on both.
+    for c in [&mut m, &mut r] {
+        assert!(c.cmd(&["TS.QUERYINDEX", "x=y"]).arr().is_empty());
+    }
+    assert_eq!(
+        r.cmd(&["TS.QUERYINDEX", "a=b"]).strings(),
+        ["rp:ts:o2", "rp:ts:o3"]
+    );
+    assert_eq!(
+        r.cmd(&["TS.QUERYINDEX", "a=TIMESTAMP"]).strings(),
+        ["rp:ts:o4"]
+    );
+    assert_eq!(
+        r.cmd(&["TS.RANGE", "rp:ts:d", "-", "+"]),
+        m.cmd(&["TS.RANGE", "rp:ts:d", "-", "+"])
+    );
+    assert_eq!(
+        r.cmd(&["TS.GET", "rp:ts:d"]).arr()[1].s(),
+        "6"
+    );
+    assert_eq!(
+        r.cmd(&["TS.INFO", "rp:ts:d"]).field("duplicatePolicy").s(),
+        "block"
+    );
 }
 
 /// Writes that give a TTL as "this long from now", in every spelling, and the

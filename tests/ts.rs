@@ -1838,3 +1838,64 @@ fn test_ts_add_on_duplicate_is_for_the_sample() {
     assert!(c.cmds(&["TS.ADD", "opt:d", "1", "2"]).is_error());
     assert_eq!(info_field(&mut c, "opt:d", "duplicatePolicy"), "block");
 }
+
+/// A `TS.ADD` the duplicate policy refuses changes nothing: not the
+/// retention or the policy it gives, and the retention does not trim. A
+/// failed command is not sent to replicas or the AOF, so a change left
+/// behind was the master's alone.
+#[test]
+fn test_ts_add_refused_changes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["TS.CREATE", "opt:b", "DUPLICATE_POLICY", "BLOCK"]);
+    c.cmds(&["TS.ADD", "opt:b", "1", "1"]);
+    c.cmds(&["TS.ADD", "opt:b", "100", "1"]);
+    assert!(c.cmds(&["TS.ALTER", "opt:b", "RETENTION", "10"]).is_ok());
+    // Its trim would take the sample at 1.
+    assert!(c.cmds(&["TS.ADD", "opt:b", "100", "5"]).is_error());
+    assert!(
+        c.cmds(&["TS.ADD", "opt:b", "100", "5", "RETENTION", "50"])
+            .is_error()
+    );
+    assert!(
+        c.cmds(&["TS.ADD", "opt:b", "100", "5", "ON", "DUPLICATE", "BLOCK"])
+            .is_error()
+    );
+    assert_eq!(c.cmds(&["TS.RANGE", "opt:b", "-", "+"]).as_array().len(), 2);
+    assert_eq!(info_field(&mut c, "opt:b", "retentionTime"), "10");
+
+    // A policy given that takes the sample: added, and the series' own
+    // from now on, as in 1.2.0.
+    assert_eq!(
+        c.cmds(&["TS.ADD", "opt:b", "100", "5", "DUPLICATE_POLICY", "SUM"])
+            .as_int(),
+        100
+    );
+    assert_eq!(info_field(&mut c, "opt:b", "duplicatePolicy"), "sum");
+}
+
+/// `ON`, `CHUNK` and `DUPLICATE` end a `LABELS` list only when the word
+/// after them makes the option; otherwise they are labels.
+#[test]
+fn test_ts_labels_end_at_a_two_word_option_only() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "TS.CREATE", "opt:l", "LABELS", "on", "x", "chunk", "y", "duplicate", "z",
+    ]);
+    assert_eq!(query_index(&mut c, "on=x"), ["opt:l"]);
+    assert_eq!(query_index(&mut c, "chunk=y"), ["opt:l"]);
+    assert_eq!(query_index(&mut c, "duplicate=z"), ["opt:l"]);
+
+    c.cmds(&[
+        "TS.CREATE", "opt:m", "LABELS", "a", "b", "CHUNK", "SIZE", "128", "ON", "DUPLICATE",
+        "MAX",
+    ]);
+    assert_eq!(query_index(&mut c, "a=b"), ["opt:m"]);
+    assert_eq!(info_field(&mut c, "opt:m", "chunkSize"), "128");
+    assert_eq!(info_field(&mut c, "opt:m", "duplicatePolicy"), "max");
+}

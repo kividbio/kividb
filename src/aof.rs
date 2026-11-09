@@ -4476,8 +4476,44 @@ mod backlog_tests {
 /// out of bounds, `IGNORE`: replayed, rather than the series lost.
 #[cfg(test)]
 mod ts_option_replay_tests {
-    use super::past_deadline_replay_tests::replayed;
+    use super::past_deadline_replay_tests::{replayed, replayed_with_index};
     use crate::store::ValueRef;
+
+    /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
+    /// `TS.INCRBY` as the feed writes it, with a word left over from
+    /// `LABELS`: replayed as they ran.
+    #[test]
+    fn options_replay_as_they_ran() {
+        let (store, index) = replayed_with_index(&[
+            vec!["TS.CREATE", "k", "LABELS", "a", "b"],
+            vec!["TS.ALTER", "k", "LABELS"],
+            vec!["TS.CREATE", "d", "DUPLICATE_POLICY", "BLOCK"],
+            vec!["TS.ADD", "d", "1", "1"],
+            vec!["TS.ADD", "d", "1", "5", "ON_DUPLICATE", "SUM"],
+            vec!["TS.INCRBY", "c", "2", "TIMESTAMP", "9", "LABELS", "x"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert!(series("k").labels.is_empty());
+        let indexed = |entry: &str| {
+            crate::read_lock!(index)
+                .get(entry)
+                .is_some_and(|keys| !keys.is_empty())
+        };
+        assert!(!indexed("a=b"));
+        let d = series("d");
+        assert_eq!(d.samples.get(&1), Some(&6.0));
+        assert_eq!(d.duplicate_policy, crate::types::DuplicatePolicy::Block);
+        let c = series("c");
+        assert_eq!(c.samples.get(&9), Some(&2.0));
+        assert!(c.labels.is_empty());
+    }
 
     #[test]
     fn words_an_older_version_passed_over_are_passed_over_again() {
@@ -4529,6 +4565,13 @@ mod past_deadline_replay_tests {
 
     /// `records`, written to an AOF and replayed into a new store.
     pub(super) fn replayed(records: &[Vec<&str>]) -> Store {
+        replayed_with_index(records).0
+    }
+
+    /// [`replayed`], and the time series label index the replay built.
+    pub(super) fn replayed_with_index(
+        records: &[Vec<&str>],
+    ) -> (Store, crate::store::SharedTsIndex) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("appendonly.aof");
         let log: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
@@ -4555,7 +4598,7 @@ mod past_deadline_replay_tests {
         )
         .expect("replay");
         assert_eq!(stats.errors, 0, "every record applied");
-        store
+        (store, ts_index)
     }
 
     fn expires(store: &Store, key: &str) -> Option<u64> {

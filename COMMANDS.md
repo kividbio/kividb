@@ -659,18 +659,25 @@ KiviDB implements the RedisTimeSeries command surface. Time series are stored na
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap. Without `DUPLICATE_POLICY`, a series (made here or by `TS.ADD`) takes `ts-duplicate-policy`: `last` unless set; RedisTimeSeries's default is `block` |
-| `TS.ALTER` | `TS.ALTER key [RETENTION ms] [CHUNK SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Update retention, chunk size, duplicate policy, or labels. Updating labels atomically rebuilds the label index |
+| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK_SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap. `CHUNK_SIZE` is a multiple of 8 from 48 to 1048576; it is reported by `TS.INFO`. Without `DUPLICATE_POLICY`, a series (made here or by `TS.ADD`) takes `ts-duplicate-policy`: `last` unless set; RedisTimeSeries's default is `block`. See [Time series options](#time-series-options) |
+| `TS.ALTER` | `TS.ALTER key [RETENTION ms] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Update retention, chunk size, duplicate policy, or labels; what is given is set, `RETENTION 0` and `LABELS` with no pairs too. Updating labels atomically rebuilds the label index |
 | `TS.DEL` | `TS.DEL key fromTimestamp toTimestamp` | Delete all samples in the inclusive timestamp range. Returns the count of deleted samples |
 
 ### Adding samples
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `TS.ADD` | `TS.ADD key timestamp value [RETENTION ms] [ENCODING ...] [CHUNK SIZE size] [ON DUPLICATE policy] [LABELS label value ...]` | Append a sample. Use `*` for current time. Auto-creates the key if absent. Returns the stored timestamp |
+| `TS.ADD` | `TS.ADD key timestamp value [RETENTION ms] [ENCODING ...] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [ON_DUPLICATE policy] [LABELS label value ...]` | Append a sample. Use `*` for current time. Auto-creates the key if absent, with the options given. `ON_DUPLICATE` is the policy for this sample alone; KiviDB's older `ON DUPLICATE policy`, and `DUPLICATE_POLICY`, make it the series' own. A sample the policy refuses changes nothing. Returns the stored timestamp |
 | `TS.MADD` | `TS.MADD key timestamp value [key timestamp value ...]` | Append samples to one or more series in a single call. Auto-creates missing series. Returns an array of stored timestamps |
-| `TS.INCRBY` | `TS.INCRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK SIZE size] [LABELS label value ...]` | Add a new sample equal to the last sample's value plus the given increment. Creates the series at 0 if absent |
-| `TS.DECRBY` | `TS.DECRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK SIZE size] [LABELS label value ...]` | Add a new sample equal to the last sample's value minus the given decrement |
+| `TS.INCRBY` | `TS.INCRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Add a new sample equal to the last sample's value plus the given increment, at or after the last one, replacing its value at the same timestamp. Creates the series at 0 if absent, with the options given; an existing series keeps its own. Trims to the retention |
+| `TS.DECRBY` | `TS.DECRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Add a new sample equal to the last sample's value minus the given decrement; as `TS.INCRBY` |
+
+#### Time series options
+
+- `CHUNK SIZE size`, `ON DUPLICATE policy` and `DUPLICATE POLICY policy`, KiviDB's spellings before 1.2.1, are still accepted.
+- A word that is no option is passed over, and the options after it are read, as in RedisTimeSeries.
+- `IGNORE` is refused: KiviDB does not support it.
+- A `LABELS` list ends at the next option's name (`ON`, `CHUNK` and `DUPLICATE` only when followed by their second word). RedisTimeSeries takes every word after `LABELS` as a label, and finds options anywhere: its `LABELS a b RETENTION 5` has the labels `a=b` and `RETENTION=5` and a retention of 5; KiviDB's has the label `a=b` and a retention of 5.
 
 ### Querying
 

@@ -610,6 +610,10 @@ impl TsInner {
         value: f64,
         policy: &DuplicatePolicy,
     ) -> Result<u64, &'static str> {
+        // Refused before anything changes: the trim below is a change too.
+        if *policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
+            return Err("TSDB: Duplicate sample in BLOCK policy");
+        }
         // Enforce retention: trim samples older than (ts - retention)
         if self.retention > 0 && ts >= self.retention {
             let cutoff = ts - self.retention;
