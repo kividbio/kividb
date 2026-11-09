@@ -1725,33 +1725,61 @@ fn test_ts_chunk_size_keyword() {
     assert_eq!(info_field(&mut c, "opt:k", "chunkSize"), "512");
 }
 
-/// A word that is no option is an error, and the command does nothing. It
-/// used to end the parse, with `OK` (#565).
+/// A word that is no option is passed over, and the options after it are
+/// read, as RedisTimeSeries does. It used to end the parse, with `OK`, and
+/// the options after it were dropped (#565).
 #[test]
-fn test_ts_unknown_option_is_an_error() {
+fn test_ts_unknown_option_is_passed_over() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    assert!(c.cmds(&["TS.CREATE", "opt:u", "RETENTION", "100"]).is_ok());
-    let refused: &[&[&str]] = &[
-        &["TS.ALTER", "opt:u", "FOO", "1"],
-        &["TS.ALTER", "opt:u", "RETENTION", "0", "FOO"],
+    assert!(c.cmds(&["TS.CREATE", "opt:u", "FOO", "RETENTION", "10"]).is_ok());
+    assert_eq!(info_field(&mut c, "opt:u", "retentionTime"), "10");
+    for cmd in [
+        &["TS.ALTER", "opt:u", "FOO", "1"][..],
         &["TS.ALTER", "opt:u", "CHUNK", "FOO", "128"],
-        &["TS.ALTER", "opt:u", "ENCODING", "FOO"],
-        &["TS.ALTER", "opt:u", "LABELS", "a", "b", "c"],
+        &["TS.ALTER", "opt:u", "ON", "FOO", "SUM"],
         &["TS.ALTER", "opt:u", "TIMESTAMP", "5"],
         &["TS.ALTER", "opt:u", "ON_DUPLICATE", "SUM"],
-        &["TS.CREATE", "opt:new", "FOO"],
+    ] {
+        assert!(c.cmds(cmd).is_ok(), "{cmd:?}");
+    }
+    assert_eq!(info_field(&mut c, "opt:u", "retentionTime"), "10");
+    assert_eq!(info_field(&mut c, "opt:u", "chunkSize"), "4096");
+    assert_eq!(info_field(&mut c, "opt:u", "duplicatePolicy"), "last");
+
+    // A label with no value is passed over too.
+    assert!(
+        c.cmds(&["TS.ALTER", "opt:u", "LABELS", "a", "b", "c"])
+            .is_ok()
+    );
+    assert_eq!(query_index(&mut c, "a=b"), ["opt:u"]);
+
+    assert_eq!(
+        c.cmds(&["TS.ADD", "opt:add", "1", "1", "BOGUS", "LABELS", "e", "f"])
+            .as_int(),
+        1
+    );
+    assert_eq!(query_index(&mut c, "e=f"), ["opt:add"]);
+    assert_eq!(
+        c.cmds(&["TS.INCRBY", "opt:inc", "1", "BOGUS", "TIMESTAMP", "7"])
+            .as_int(),
+        7
+    );
+
+    // What is refused, with nothing done: an option with no value, an
+    // ENCODING that is neither, and IGNORE, which KiviDB does not support.
+    let refused: &[&[&str]] = &[
+        &["TS.ALTER", "opt:u", "RETENTION"],
+        &["TS.ALTER", "opt:u", "RETENTION", "0", "ENCODING", "FOO"],
         &["TS.CREATE", "opt:new", "IGNORE", "5", "0.5"],
-        &["TS.ADD", "opt:new", "1", "1", "BOGUS"],
-        &["TS.INCRBY", "opt:new", "1", "BOGUS"],
         &["TS.DECRBY", "opt:new", "1", "TIMESTAMP"],
     ];
     for cmd in refused {
         assert!(c.cmds(cmd).is_error(), "{cmd:?} was accepted");
     }
-    assert_eq!(info_field(&mut c, "opt:u", "retentionTime"), "100");
+    assert_eq!(info_field(&mut c, "opt:u", "retentionTime"), "10");
     assert_eq!(c.cmds(&["EXISTS", "opt:new"]).as_int(), 0);
 }
 

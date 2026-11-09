@@ -4471,9 +4471,9 @@ mod backlog_tests {
     }
 }
 
-/// Time series commands an AOF written by 1.2.0 holds, with words that
-/// version passed over and 1.2.1 refuses from a client (#565): replayed,
-/// the words passed over again, rather than the series lost.
+/// Time series commands an AOF written by 1.2.0 holds, with what that
+/// version accepted and 1.2.1 refuses from a client (#565), a chunk size
+/// out of bounds, `IGNORE`: replayed, rather than the series lost.
 #[cfg(test)]
 mod ts_option_replay_tests {
     use super::past_deadline_replay_tests::replayed;
@@ -4492,7 +4492,7 @@ mod ts_option_replay_tests {
                 "a",
                 "b",
             ],
-            vec!["TS.ALTER", "k", "CHUNK", "BAR", "100"],
+            vec!["TS.ALTER", "k", "CHUNK", "SIZE", "100"],
             vec!["TS.INCRBY", "c", "1", "BOGUS", "TIMESTAMP", "7"],
             vec!["TS.ADD", "k", "10", "1.5", "IGNORE", "5", "0.5"],
         ]);

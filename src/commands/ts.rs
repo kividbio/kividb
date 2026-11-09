@@ -179,12 +179,21 @@ fn ends_labels(word: &[u8], of: OptionsOf) -> bool {
         || (of == OptionsOf::IncrBy && word.eq_ignore_ascii_case(b"TIMESTAMP"))
 }
 
-/// Whether a command's options are held to the rules: a word that is no
-/// option is an error (#565). Not for a command from a master, or replayed
-/// from the AOF: one an older version accepted is applied as it was, the
-/// words it passed over passed over again, rather than lost.
+/// Whether the checks 1.2.0 did not make apply: `CHUNK_SIZE`'s bounds, an
+/// `ENCODING` value, `IGNORE`. Not to a command from a master, or replayed
+/// from the AOF: one an older version accepted is applied, rather than
+/// refused and the series it made lost.
 fn strict_options(ctx: &Ctx) -> bool {
     !(ctx.apply_replication || crate::expiry::replaying())
+}
+
+/// Whether the word after `tokens[at]` is `second`: `CHUNK SIZE`, `ON
+/// DUPLICATE`, `DUPLICATE POLICY`. Not followed by it, the first word is
+/// one RedisTimeSeries does not know, and passed over.
+fn second_word(tokens: &[&[u8]], at: usize, second: &[u8]) -> bool {
+    tokens
+        .get(at + 1)
+        .is_some_and(|word| word.eq_ignore_ascii_case(second))
 }
 
 /// Parse the options of a TS command.
@@ -193,8 +202,10 @@ fn strict_options(ctx: &Ctx) -> bool {
 /// `ENCODING`, `UNCOMPRESSED`, `COMPRESSED`, `DUPLICATE_POLICY`,
 /// `ON_DUPLICATE` (`TS.ADD`), `TIMESTAMP` (`TS.INCRBY`, `TS.DECRBY`) and
 /// `LABELS`; and KiviDB's own of 1.2.0, `CHUNK SIZE`, `ON DUPLICATE` and
-/// `DUPLICATE POLICY`. `CHUNK_SIZE` used to end the parse without an error,
-/// dropping the options after it, as any word it did not know did (#565).
+/// `DUPLICATE POLICY`. A word that is none of these is passed over and the
+/// parse goes on, as RedisTimeSeries, which looks for each option by name,
+/// passes it over. It used to end the parse, with no error, dropping the
+/// options after it: `CHUNK_SIZE`, unknown then, dropped `LABELS` (#565).
 /// `IGNORE` is not supported, and says so.
 fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsOptions, Vec<u8>> {
     let mut options = TsOptions::default();
@@ -216,22 +227,21 @@ fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsO
             }
             // `CHUNK SIZE n`, `ON DUPLICATE policy` and `DUPLICATE POLICY
             // policy`: KiviDB's spellings, kept. 1.2.0 took any second word.
-            b"CHUNK" => {
-                if strict && !option_value(tokens, i + 1)?.eq_ignore_ascii_case(b"SIZE") {
-                    return Err(resp_error("ERR syntax error"));
-                }
+            b"CHUNK" if second_word(tokens, i, b"SIZE") => {
                 options.chunk_size = Some(option_chunk_size(option_value(tokens, i + 2)?, strict)?);
                 i += 3;
             }
-            b"ON" | b"DUPLICATE" => {
-                let second: &[u8] = if word == b"ON" {
-                    b"DUPLICATE"
-                } else {
-                    b"POLICY"
-                };
-                if strict && !option_value(tokens, i + 1)?.eq_ignore_ascii_case(second) {
-                    return Err(resp_error("ERR syntax error"));
-                }
+            b"ON" | b"DUPLICATE"
+                if second_word(
+                    tokens,
+                    i,
+                    if word == b"ON" {
+                        &b"DUPLICATE"[..]
+                    } else {
+                        &b"POLICY"[..]
+                    },
+                ) =>
+            {
                 options.duplicate_policy = Some(option_policy(option_value(tokens, i + 2)?)?);
                 i += 3;
             }
@@ -279,7 +289,7 @@ fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsO
             b"IGNORE" if strict => {
                 return Err(resp_error("TSDB: IGNORE is not supported"));
             }
-            _ if strict => return Err(resp_error("ERR syntax error")),
+            // Passed over, as RedisTimeSeries does.
             _ => i += 1,
         }
     }
