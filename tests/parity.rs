@@ -220,6 +220,15 @@ fn info(c: &mut Conn, section: &str, field: &str) -> Option<String> {
 }
 
 /// The `name=value` fields of one `cmdstat_…` line.
+/// `INFO commandstats` counts for the whole process, and every server these
+/// tests start runs in it. A test that reads the counts, and one that sends a
+/// command they count (`HELLO`, `RESET`, `AUTH` ...), take this lock, so that
+/// neither adds to the other's counts while it runs.
+fn stats_lock() -> std::sync::MutexGuard<'static, ()> {
+    static STATS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    STATS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn cmdstat(c: &mut Conn, command: &str) -> Option<std::collections::HashMap<String, f64>> {
     let line = info(c, "commandstats", &format!("cmdstat_{command}"))?;
     Some(
@@ -234,6 +243,7 @@ fn cmdstat(c: &mut Conn, command: &str) -> Option<std::collections::HashMap<Stri
 
 #[test]
 fn reset_puts_a_connection_back_as_it_was_opened() {
+    let _stats = stats_lock();
     let mut c = conn();
     let mut other = conn();
     assert!(c.cmd(&["SELECT", "3"]).ok());
@@ -264,6 +274,7 @@ fn reset_puts_a_connection_back_as_it_was_opened() {
 /// connection unauthenticated.
 #[test]
 fn reset_forgets_who_the_connection_was() {
+    let _stats = stats_lock();
     let port = start("secret");
     let mut c = Conn::connect(port);
     assert!(c.cmd(&["GET", "k"]).err().starts_with("NOAUTH"));
@@ -299,6 +310,7 @@ fn info_reports_the_release_it_follows() {
 /// follows, as Dragonfly's does. Under RESP2 and RESP3.
 #[test]
 fn hello_reports_the_release_it_follows() {
+    let _stats = stats_lock();
     let mut c = conn();
     let fields = |reply: V| -> Vec<(String, V)> {
         match reply {
@@ -337,6 +349,7 @@ fn hello_reports_the_release_it_follows() {
 /// command, and per subcommand.
 #[test]
 fn commandstats_count_every_call() {
+    let _stats = stats_lock();
     let mut c = conn();
     let before = cmdstat(&mut c, "lolwut").map_or(0.0, |s| s["calls"]);
     for _ in 0..25 {
@@ -370,9 +383,11 @@ fn commandstats_count_every_call() {
 
 /// The commands a connection answers itself, without `execute_command`, are
 /// counted too: `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`, `RESET` and `AUTH`.
-/// A server of its own, so that no other test adds to the counts.
+/// A server of its own, and [`stats_lock`], so that no other test adds to
+/// the counts.
 #[test]
 fn commandstats_count_the_connection_commands() {
+    let _stats = stats_lock();
     let mut c = Conn::connect(start("secret"));
     assert!(c.cmd(&["AUTH", "wrong"]).err().starts_with("WRONGPASS"));
     assert!(c.cmd(&["AUTH", "secret"]).ok());
