@@ -889,7 +889,88 @@ impl IndexDef {
         self.vector_fields().next()
     }
 }
-pub type IndexStore = Arc<RwLock<AHashMap<String, IndexDef>>>;
+/// The search indexes of a store, and their aliases, by name.
+pub type IndexStore = Arc<Indexes>;
+
+/// [`IndexStore`]: the indexes behind their lock, and whether there may be
+/// any, which a write can ask without the lock ([`Indexes::none`]).
+///
+/// Every `HSET` used to ask the lock whether it had an index to bring up to
+/// date, twice (`handler::atomic_under_its_shard`, [`maybe_index`]). A
+/// shared lock taken is a write to the lock's cache line, and every worker
+/// took the one lock, so that line went from core to core with each write
+/// of a hash: `HSET` at pipeline 16 lost 10% of its rate on 14 workers, as
+/// much or as little as where the allocator put the lock decided (#544).
+/// With no index, as nearly always, a write now loads a line that nothing
+/// writes to.
+///
+/// [`Indexes::write`] makes [`Indexes::none`] false while it holds the
+/// lock, and true again before it lets go if the map is empty then. A
+/// write that finds it true is ordered before the holder of the lock as
+/// one that took the shared lock before it would be: what the holder does
+/// to the keyspace after taking the lock (a new index's backfill, under
+/// the shards' locks) sees that write's key.
+#[derive(Default)]
+pub struct Indexes {
+    /// Whether the map may have anything in it. On a cache line of its own.
+    any: OwnLine,
+    map: RwLock<AHashMap<String, IndexDef>>,
+}
+
+#[derive(Default)]
+#[repr(align(128))]
+struct OwnLine(AtomicBool);
+
+impl Indexes {
+    /// The indexes, shared.
+    #[inline]
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, AHashMap<String, IndexDef>> {
+        self.map.read()
+    }
+
+    /// The indexes, to change.
+    pub fn write(&self) -> IndexesWriteGuard<'_> {
+        let map = self.map.write();
+        self.any.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        IndexesWriteGuard {
+            map,
+            any: &self.any.0,
+        }
+    }
+
+    /// Whether there is no index, nor alias, without taking the lock: what
+    /// a write asks before it looks for indexes to bring up to date.
+    #[inline]
+    pub fn none(&self) -> bool {
+        !self.any.0.load(Acquire)
+    }
+}
+
+/// [`Indexes::write`]'s hold of the lock.
+pub struct IndexesWriteGuard<'a> {
+    map: parking_lot::RwLockWriteGuard<'a, AHashMap<String, IndexDef>>,
+    any: &'a AtomicBool,
+}
+
+impl std::ops::Deref for IndexesWriteGuard<'_> {
+    type Target = AHashMap<String, IndexDef>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for IndexesWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl Drop for IndexesWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Before the lock is let go of (`map` is dropped after this).
+        self.any.store(!self.map.is_empty(), Release);
+    }
+}
 
 // ── Aliases ──────────────────────────────────────────────────────────────────
 //
@@ -968,7 +1049,7 @@ pub fn remove_index(store: &mut AHashMap<String, IndexDef>, index: &str) -> bool
 }
 
 pub fn new_index_store() -> IndexStore {
-    Arc::new(RwLock::new(AHashMap::new()))
+    Arc::new(Indexes::default())
 }
 
 /// Drop every search index, including HNSW/FLAT graphs, inverted indexes,
@@ -2016,7 +2097,7 @@ pub fn maybe_index_json(
     doc: &serde_json::Value,
 ) {
     let key = key.as_ref();
-    if indexing_deferred() {
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let store = index_store.read();
@@ -2047,6 +2128,7 @@ pub fn reindex_json_key(
 ) {
     let key = key.as_ref();
     if indexing_deferred()
+        || index_store.none()
         || !index_store
             .read()
             .values()
@@ -2082,7 +2164,7 @@ pub fn reindex_key(
     how: Write,
 ) {
     let key = key.as_ref();
-    if indexing_deferred() {
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let indexes = index_store.read();
@@ -2157,7 +2239,7 @@ pub fn maybe_index(
     how: Write,
 ) {
     let key = key.as_ref();
-    if indexing_deferred() {
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let store = index_store.read();
@@ -2395,7 +2477,7 @@ static LEAVING: parking_lot::Mutex<Vec<(usize, usize, Box<str>)>> =
 /// Whether `index_store` has an index of database `db`: whether a key of it
 /// that expires is marked leaving ([`mark_leaving`]).
 pub fn has_index_of(index_store: &IndexStore, db: usize) -> bool {
-    index_store.read().values().any(|def| def.db_index == db)
+    !index_store.none() && index_store.read().values().any(|def| def.db_index == db)
 }
 
 /// The index store of the store at address `id` ([`store_id`]), if it has an
@@ -2461,6 +2543,63 @@ mod leaving_tests {
         unmark_leaving(id, 1, "a");
         assert!(leaving(id, 0).is_empty());
         assert!(leaving(id, 1).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod indexes_tests {
+    use super::*;
+
+    fn schema(name: &str) -> IndexDef {
+        IndexSchema {
+            name: name.into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: Vec::new(),
+            fields: Vec::new(),
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        }
+        .into_def()
+    }
+
+    /// `none` is what the map holds whenever the lock is free, and false
+    /// for as long as anything holds it to change it (#544).
+    #[test]
+    fn none_follows_the_map_and_is_false_while_it_is_changed() {
+        let store = new_index_store();
+        assert!(store.none());
+        {
+            let mut indexes = store.write();
+            assert!(!store.none(), "held to change: not none");
+            indexes.insert("idx".into(), schema("idx"));
+        }
+        assert!(!store.none());
+        set_alias(&mut store.write(), "al", &schema("idx"));
+        assert!(!store.none());
+        {
+            let indexes = store.write();
+            assert!(!store.none());
+            drop(indexes);
+        }
+        assert!(!store.none(), "still has its index");
+        assert!(remove_index(&mut store.write(), "idx"));
+        assert!(store.none(), "the index and its alias are gone");
+        assert!(store.read().is_empty());
+        {
+            let _held = store.write();
+            assert!(!store.none());
+        }
+        assert!(store.none(), "nothing was added");
+        store.write().insert("other".into(), schema("other"));
+        assert!(has_index_of(&store, 0));
+        assert_eq!(drop_all_indexes(&store), 1);
+        assert!(store.none());
+        assert!(!has_index_of(&store, 0));
     }
 }
 
@@ -3553,7 +3692,7 @@ const DEADLINE_EXPANSIONS: usize = 64;
 /// the same name out of an index of another.
 pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
     let key = key.as_ref();
-    if indexing_deferred() {
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let store = index_store.read();
@@ -3798,6 +3937,9 @@ pub fn maybe_request_compaction(
     let deleted_key = deleted_key.as_ref();
     use std::sync::atomic::Ordering::Relaxed;
 
+    if index_store.none() {
+        return;
+    }
     let store = index_store.read();
     for (name, def) in store.iter() {
         if is_alias(name, def) {
