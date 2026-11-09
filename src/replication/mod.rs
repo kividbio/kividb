@@ -803,21 +803,33 @@ impl ReplState {
         std::time::Duration::from_secs(self.repl_timeout_secs.load(Ordering::Relaxed).max(1))
     }
 
-    /// Whether replica `replica_id` is online and has sent no `REPLCONF ACK`
-    /// for longer than `repl-timeout`.
-    fn replica_is_silent(&self, replica_id: u64) -> bool {
+    /// Whether replica `replica_id`'s connection is to be closed: it is
+    /// online and has sent no `REPLCONF ACK` for longer than `repl-timeout`
+    /// (`Some(true)`), or the hub has let go of it (`Some(false)`).
+    fn replica_is_done(&self, replica_id: u64) -> Option<bool> {
         let timeout_ms = self.repl_timeout().as_millis() as u64;
-        self.replica_progress
-            .lock()
-            .get(&replica_id)
-            .is_some_and(|p| {
-                p.state() == ReplicaState::Online
-                    && unix_ms().saturating_sub(p.last_ack_ms.load(Ordering::Relaxed)) > timeout_ms
-            })
+        match self.replica_progress.lock().get(&replica_id) {
+            None => Some(false),
+            Some(p)
+                if p.state() == ReplicaState::Online
+                    && unix_ms().saturating_sub(p.last_ack_ms.load(Ordering::Relaxed))
+                        > timeout_ms =>
+            {
+                Some(true)
+            }
+            Some(_) => None,
+        }
     }
 
-    /// Resolves once replica `replica_id` has gone silent (see
-    /// [`Self::replica_is_silent`]); its connection is then to be closed.
+    /// Resolves once replica `replica_id` has gone silent (`true`), or once
+    /// the hub has let go of it (`false`): its connection is then to be
+    /// closed.
+    ///
+    /// Let go of, for its queue limit, a replica that reads nothing (a
+    /// stopped process, whose kernel still answers) kept its connection, and
+    /// its queue, for good: its forwarder waited on a write that never
+    /// finished, and the hub, having forgotten it, no longer timed it out
+    /// (#542).
     ///
     /// A replica sends an ACK every second. One whose host is gone without
     /// closing the connection (a terminated VM, a lost network path, a paused
@@ -828,11 +840,11 @@ impl ReplState {
     /// `connected_slaves`, until the master restarted. Redis drops it after
     /// `repl-timeout`, as this does. Only once online: a replica sends no ACK
     /// while it loads the dataset.
-    pub async fn replica_timed_out(&self, replica_id: u64) {
+    pub async fn replica_timed_out(&self, replica_id: u64) -> bool {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if self.replica_is_silent(replica_id) {
-                return;
+            if let Some(silent) = self.replica_is_done(replica_id) {
+                return silent;
             }
         }
     }
@@ -4656,6 +4668,34 @@ mod replication_invariants_tests {
         barrier(&hub).await;
         assert_eq!(state.replica_queued_memory.load(Ordering::Relaxed), 0);
         assert_eq!(pending.memory(), 0);
+    }
+
+    /// A replica's connection ends once the hub has let go of it, not only
+    /// once it is silent for `repl-timeout`: one let go of for its queue
+    /// limit while it read nothing kept its connection, and its queue, for
+    /// good (#542).
+    #[tokio::test]
+    async fn the_connection_of_a_replica_let_go_of_ends() {
+        let state = Arc::new(ReplState::new_master());
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        state.register_replica(9008, "127.0.0.1".into(), 9008, 0);
+        let _rx = register_syncing(&hub, 9008, &pending);
+        await_connected(&state, 1).await;
+        // Registered and not silent: the watch goes on.
+        let watch = tokio::time::timeout(
+            std::time::Duration::from_millis(2500),
+            state.replica_timed_out(9008),
+        );
+        assert!(watch.await.is_err());
+        hub.send(HubMsg::Deregister(9008)).unwrap();
+        await_connected(&state, 0).await;
+        // Let go of: it ends, and not as silent.
+        let watch = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.replica_timed_out(9008),
+        );
+        assert_eq!(watch.await, Ok(false));
     }
 
     /// A queue's memory stops being counted out as soon as its receiver is

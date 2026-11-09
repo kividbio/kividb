@@ -2553,12 +2553,15 @@ where
         _ = &mut forward_task => {
             drop(resp_tx);
         }
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
             forward_task.abort();
             write_task.abort();
         }

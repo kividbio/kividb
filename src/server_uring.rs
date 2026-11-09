@@ -251,18 +251,22 @@ pub async fn handle_replica_connection_uring(
     tokio::select! {
         _ = ack_reader => {}
         _ = &mut forward_task => {}
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
         }
     }
 
     // The forwarder ends with the connection. Left running when the ACK
-    // reader or `repl-timeout` ended it, it kept the socket open and the
-    // replica's queue allocated after the hub had forgotten both.
+    // reader, `repl-timeout` or the hub letting go of the replica ended it,
+    // it kept the socket open and the replica's queue allocated after the
+    // hub had forgotten both.
     forward_task.abort();
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
     log_info!("Replication: uring: replica disconnected");

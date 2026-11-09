@@ -159,10 +159,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in full: it is now freed at once, since the replica resyncs anyway, from
   the backlog or in full. `connected_slaves` also stopped going one lower
   at each such drop (it reached -53): a late `REPLCONF ACK` from the
-  dropped replica brought back its row. And on the io_uring loop, a
-  replica connection ended by `repl-timeout` or by the replica going away
-  left its forwarder running, holding the socket and the replica's queue
-  after the master had forgotten both: it now ends with the connection.
+  dropped replica brought back its row. A dropped replica that read
+  nothing (a stopped process) kept its connection and its queue for good,
+  since the master no longer timed it out: its connection now ends within
+  a second of the drop, and its queue is freed however the connection
+  ends. On the io_uring loop, a connection ended by `repl-timeout` or by
+  the replica going away left its forwarder running, holding the socket
+  and the queue: it now ends with the connection.
   On the issue's test (256 MB limit,
   ~1 M `SET`s a second, a replica attached at 30 s), the master went from
   27 M `OOM` replies and 17-18 M evictions down to no keys, to no `OOM`
