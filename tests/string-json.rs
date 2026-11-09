@@ -1057,7 +1057,7 @@ fn test_json_numincrby_nummultby() {
     assert_eq!(
         c.cmds(&["JSON.NUMMULTBY", "doc", "$.score", "0.5"])
             .as_str(),
-        "[12]"
+        "[12.0]"
     );
     assert_eq!(
         c.cmds(&["JSON.NUMINCRBY", "doc", "$.score", "0.5"])
@@ -1069,6 +1069,50 @@ fn test_json_numincrby_nummultby() {
         c.cmds(&["JSON.NUMINCRBY", "doc", ".score", "1"]).as_str(),
         "13.5"
     );
+}
+
+/// A float stays a float, even when the result is whole (#470). The expected
+/// replies are those of Redis 8.10.3.
+#[test]
+fn json_arithmetic_keeps_a_float_result_a_float() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (start, op, operand, want, kind) in [
+        ("1.0", "JSON.NUMINCRBY", "0", "[1.0]", "number"),
+        ("1.5", "JSON.NUMINCRBY", "1.5", "[3.0]", "number"),
+        ("1e5", "JSON.NUMINCRBY", "0", "[100000.0]", "number"),
+        ("-0.0", "JSON.NUMMULTBY", "1", "[-0.0]", "number"),
+        ("-0", "JSON.NUMINCRBY", "0", "[0.0]", "number"),
+        ("2", "JSON.NUMINCRBY", "1.0", "[3.0]", "number"),
+        ("24", "JSON.NUMMULTBY", "0.5", "[12.0]", "number"),
+        ("2", "JSON.NUMINCRBY", "1", "[3]", "integer"),
+        ("24", "JSON.NUMMULTBY", "2", "[48]", "integer"),
+        (
+            "9007199254740992.0",
+            "JSON.NUMINCRBY",
+            "1",
+            "[9007199254740992.0]",
+            "number",
+        ),
+    ] {
+        assert!(c.cmds(&["JSON.SET", "k", "$", start]).is_ok());
+        assert_eq!(
+            c.cmds(&[op, "k", "$", operand]).as_str(),
+            want,
+            "{start} {op} {operand}"
+        );
+        assert_eq!(
+            c.cmds(&["JSON.GET", "k", "$"]).as_str(),
+            want,
+            "stored value of {start} {op} {operand}"
+        );
+        let RespValue::Array(types) = c.cmds(&["JSON.TYPE", "k", "$"]) else {
+            panic!("JSON.TYPE");
+        };
+        assert_eq!(types[0].as_str(), kind, "{start} {op} {operand}");
+    }
 }
 
 // Manual test scenario:
@@ -2584,7 +2628,7 @@ fn json_numbers_keep_every_double_exactly() {
                 assert!(reply.is_error(), "{command} {a:?} {b:e}: {reply:?}");
                 continue;
             }
-            // A whole result is kept as an integer, and -0 as 0.
+            // A float stays a float, even when it is whole. -0 is compared as 0.
             if result == 0.0 {
                 assert_eq!(numbers(reply.as_str()), [0.0], "{command} {a:?} {b:e}");
                 continue;
@@ -2610,7 +2654,7 @@ fn json_numbers_keep_every_double_exactly() {
                 .is_ok()
         );
         let reply = c3.cmds(&["JSON.NUMINCRBY", "n445:r3", "$", "0"]);
-        // A double, or an integer when the number is a whole one.
+        // A float stays a float, so this is a double, even when it is whole.
         let got = match &reply.as_array()[0] {
             RespValue::Int(n) => *n as f64,
             other => other.as_f64(),

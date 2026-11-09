@@ -145,6 +145,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` keep a float result a float
+  (#470).** A whole result was stored as an integer: `1.5 + 1.5` gave `3`
+  where RedisJSON gives `3.0`, `JSON.TYPE` then said `integer`, and `-0.0`
+  lost its sign. The result is now an integer only when both numbers are,
+  so a client that reads such a result as an integer may need to change.
+  An append-only file written by an earlier version replays to the new
+  form, with the same numeric value. Checked against Redis 8.10.3.
 - **`INFO commandstats` counts `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`,
   `RESET` and `AUTH` (#388).** The connection answered them itself and left
   them out, so `cmdstat_watch`, `cmdstat_hello` and the others were missing,
