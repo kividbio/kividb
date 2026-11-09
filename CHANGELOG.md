@@ -155,6 +155,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     used to stay claimed, without being saved to `nodes.conf` or counted in
     `CLUSTER INFO`. `ADDSLOTSRANGE` with a start above its end now says
     `ERR start slot number N is greater than end slot number M`.
+    A slot they claim is no longer `IMPORTING`, as in Redis.
   - `CLUSTER BUMPEPOCH` gives this node a config epoch above every other
     one, and replies `STILL <n>` when it has the highest already. It used to
     raise only the current epoch, and always said `BUMPED`.

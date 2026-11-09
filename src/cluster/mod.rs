@@ -1321,16 +1321,7 @@ impl ClusterState {
         if !self.enabled {
             return Err("This instance has cluster support disabled".into());
         }
-        if slot as usize >= CLUSTER_SLOTS {
-            return Err(format!("Invalid slot {slot}"));
-        }
-        let mut slots = self.slots.write();
-        if slots[slot as usize].is_some() {
-            return Err(format!("Slot {slot} is already busy"));
-        }
-        slots[slot as usize] = Some(self.myself());
-        self.slot_deletions.came_here([slot]);
-        Ok(())
+        self.claim_slots(&[slot]).map(|_| ())
     }
 
     /// Remove a slot from this node's view of the cluster: CLUSTER DELSLOTS.
@@ -1434,19 +1425,7 @@ impl ClusterState {
         if (end as usize) >= CLUSTER_SLOTS {
             return Err(format!("Invalid slot {end}"));
         }
-        let mut slots = self.slots.write();
-        // Validate the whole range first.
-        for i in start..=end {
-            if slots[i as usize].is_some() {
-                return Err(format!("Slot {i} is already busy"));
-            }
-        }
-        // All clear — claim them.
-        for i in start..=end {
-            slots[i as usize] = Some(self.myself());
-        }
-        self.slot_deletions.came_here(start..=end);
-        Ok((end - start + 1) as usize)
+        self.claim_slots(&(start..=end).collect::<Vec<u16>>())
     }
 
     /// Why `list` cannot all be claimed here, if it cannot: the first slot,
@@ -1485,18 +1464,33 @@ impl ClusterState {
     /// already or named twice, as in Redis. They used to claim slot by
     /// slot, or range by range, and the ones before the first busy slot
     /// stayed claimed (#553).
+    ///
+    /// A slot claimed is no longer being imported: its `SETSLOT IMPORTING`
+    /// state goes, as in Redis's `clusterUpdateSlots`. It stayed, and the
+    /// slot was still shown as importing in `CLUSTER NODES`. (An atomic
+    /// import, `CLUSTER MIGRATION`, is tracked apart, in `slot_migrations`,
+    /// and is not touched.)
     pub fn claim_slots(&self, list: &[u16]) -> Result<usize, String> {
         if !self.enabled {
             return Err("This instance has cluster support disabled".into());
         }
         let me = self.myself();
+        // `slots` before `migrations`, as everywhere (see `ClusterState`).
         let mut slots = self.slots.write();
         if let Some(e) = Self::unclaimable(&slots[..], list) {
             return Err(e);
         }
+        let mut migrations = self.migrations.write();
         for &slot in list {
             slots[slot as usize] = Some(me);
+            if matches!(
+                migrations.get(&slot),
+                Some(MigrationState::Importing { .. })
+            ) {
+                migrations.remove(&slot);
+            }
         }
+        drop(migrations);
         self.slot_deletions.came_here(list.iter().copied());
         Ok(list.len())
     }
@@ -3182,6 +3176,24 @@ mod tests {
         // A peer moves ahead: this node bumps again.
         cs.observe_epoch(12);
         assert_eq!(cs.bump_config_epoch_without_consensus(), (true, 13));
+    }
+
+    /// A slot claimed with ADDSLOTS is no longer importing, as in Redis's
+    /// `clusterUpdateSlots`.
+    #[test]
+    fn claiming_a_slot_ends_its_import() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let other = add_master(&cs, 100..=100);
+        cs.set_importing(5, other).unwrap();
+        cs.set_importing(6, other).unwrap();
+        cs.claim_slots(&[5]).unwrap();
+        assert!(!cs.migrations.read().contains_key(&5));
+        assert!(matches!(
+            cs.migrations.read().get(&6),
+            Some(MigrationState::Importing { .. })
+        ));
+        cs.claim_slot_range(6, 7).unwrap();
+        assert!(cs.migrations.read().is_empty());
     }
 
     /// SET-CONFIG-EPOCH only on a node that knows no other one (#563).

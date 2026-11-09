@@ -771,14 +771,21 @@ fn cmd_flushslots(ctx: &Ctx) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
-    let has_keys = ctx
-        .store
-        .iter()
-        .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()));
-    if has_keys {
-        return resp_error("ERR DB must be empty to perform CLUSTER FLUSHSLOTS.");
+    {
+        // No write lands between the check and the flush: the writes in
+        // the gate are waited for, and the next ones held back, until the
+        // slots are gone. Those find them gone, and are refused. (Not
+        // inside a transaction or a script: nothing runs beside them.)
+        let _cut = (!crate::command_gate::alone_on_this_thread()).then(crate::write_gate::cut);
+        let has_keys = ctx
+            .store
+            .iter()
+            .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()));
+        if has_keys {
+            return resp_error("ERR DB must be empty to perform CLUSTER FLUSHSLOTS.");
+        }
+        state.flush_slots();
     }
-    state.flush_slots();
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
             "ERR FLUSHSLOTS persisted in memory but disk save failed: {e}"
@@ -2323,6 +2330,10 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'cluster|reset' command");
     };
 
+    // As in FLUSHSLOTS: no write lands between the check for keys below
+    // and the reset dropping the slots.
+    let cut = (!crate::command_gate::alone_on_this_thread()).then(crate::write_gate::cut);
+
     // Redis refuses to reset a master that holds keys: the reset drops its
     // slots, and the keys would be left belonging to nothing. (A replica's
     // dataset is flushed by the reset instead.)
@@ -2356,6 +2367,7 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
         ctx.cluster.soft_reset();
         log_info!("Cluster: Soft reset performed");
     }
+    drop(cut);
 
     // Drop our replica relationship if any.
     ctx.repl_state.become_master();

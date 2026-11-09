@@ -866,7 +866,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `CLIENT TRACKING` | `CLIENT TRACKING ON\|OFF [REDIRECT client-id] [BCAST] [PREFIX prefix [...]] [OPTIN] [OPTOUT] [NOLOOP]` | Enable or disable client-side cache invalidation. Invalidations reach a RESP3 connection as push messages; a RESP2 connection has to `REDIRECT` them to a connection subscribed to `__redis__:invalidate`, and without `REDIRECT` is sent nothing, as in Redis. Every key a command reads is tracked, and keys written by scripts, expired, evicted or flushed are invalidated. Default mode: all reads auto-register; writers receive their own invalidations. OPTIN: only reads preceded by `CLIENT CACHING yes` are registered. OPTOUT: all reads register unless preceded by `CLIENT CACHING no`. NOLOOP: suppress invalidations sent back to the client that caused the write. REDIRECT forwards invalidations to another client ID. Zero cost when no tracking clients connected — one atomic load per command on the hot path |
 | `CLIENT TRACKINGINFO` | `CLIENT TRACKINGINFO` | Return tracking state for the current connection: flags (off, on, bcast, optin, optout, noloop), redirect client ID (-1 if none), and prefix list |
 | `CLIENT SETINFO` | `CLIENT SETINFO LIB-NAME name \| LIB-VER ver` | Store the client library name and version on this connection; shown by `CLIENT LIST` and `CLIENT INFO` as `lib-name` and `lib-ver` |
-| `CLIENT UNBLOCK` | `CLIENT UNBLOCK id` | Returns 0; accepted for compatibility, not functional |
+| `CLIENT UNBLOCK` | `CLIENT UNBLOCK id [TIMEOUT \| ERROR]` | End the blocking command (`BLPOP`, `BLMOVE`, `BZPOPMIN`, `XREAD BLOCK`, ...) connection `id` waits in: as on a timeout (`TIMEOUT`, the default) or with `-UNBLOCKED client unblocked via CLIENT UNBLOCK` (`ERROR`). Returns 1 if it was blocked, 0 otherwise |
 | `CLIENT GETREDIR` | `CLIENT GETREDIR` | Return the client ID this connection redirects invalidations to, or -1 if no redirect is set |
 | `CLIENT REPLY` | `CLIENT REPLY ON\|OFF\|SKIP` | `OFF` stops replies on this connection until `ON`; `SKIP` drops the reply to the next command. Messages — Pub/Sub, RESP3 pushes — are still sent |
 
@@ -1037,24 +1037,24 @@ A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 | Command | Syntax | Notes |
 |---|---|---|
 | `CLUSTER INFO` | `CLUSTER INFO` | Cluster state, slot counts, known nodes, current/my epoch, gossip stats. |
-| `CLUSTER MYID` | `CLUSTER MYID` | Returns this node's 40-hex ID. Stable across restarts. |
-| `CLUSTER MYSHARDID` | `CLUSTER MYSHARDID` | Returns the shard ID — own ID for masters, master's ID for replicas. |
+| `CLUSTER MYID` | `CLUSTER MYID` | Returns this node's 40-hex ID. Stable across restarts. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `CLUSTER MYSHARDID` | `CLUSTER MYSHARDID` | Returns the shard ID — own ID for masters, master's ID for replicas. So it changes when a replica takes over; in Redis a shard has an ID of its own that stays the same across failovers. |
 | `CLUSTER NODES` | `CLUSTER NODES` | Full node table as a bulk string. Format matches Redis. |
 | `CLUSTER SLOTS` | `CLUSTER SLOTS` | Slot-to-node mapping. Each entry: `[start, end, [master_ip, port, id], ...replicas]`. |
 | `CLUSTER SHARDS` | `CLUSTER SHARDS` | Per-shard summary including slots and node descriptions. |
 | `CLUSTER KEYSLOT` | `CLUSTER KEYSLOT key` | CRC16/XMODEM mod 16384 with `{tag}` extraction. |
-| `CLUSTER COUNTKEYSINSLOT` | `CLUSTER COUNTKEYSINSLOT slot` | Walks the current DB to count keys hashing to `slot`. |
-| `CLUSTER GETKEYSINSLOT` | `CLUSTER GETKEYSINSLOT slot count` | Returns up to `count` keys in `slot`. |
+| `CLUSTER COUNTKEYSINSLOT` | `CLUSTER COUNTKEYSINSLOT slot` | Walks the current DB to count keys hashing to `slot`. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `CLUSTER GETKEYSINSLOT` | `CLUSTER GETKEYSINSLOT slot count` | Returns up to `count` keys in `slot`; a `count` of 0 returns an empty array, a negative one is `ERR Invalid slot or number of keys`. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
 
 ### Slot ownership
 
 | Command | Syntax | Notes |
 |---|---|---|
-| `CLUSTER ADDSLOTS` | `CLUSTER ADDSLOTS slot [slot ...]` | Claim individual slots. Atomic — rejects duplicates. |
-| `CLUSTER ADDSLOTSRANGE` | `CLUSTER ADDSLOTSRANGE start end [start end ...]` | Claim contiguous ranges. |
+| `CLUSTER ADDSLOTS` | `CLUSTER ADDSLOTS slot [slot ...]` | Claim individual slots. All or nothing, as in Redis: a slot already assigned (`Slot n is already busy`) or named twice (`Slot n specified multiple times`) claims none. A claimed slot's `IMPORTING` state is cleared. |
+| `CLUSTER ADDSLOTSRANGE` | `CLUSTER ADDSLOTSRANGE start end [start end ...]` | Claim contiguous ranges. All the ranges or none, as `ADDSLOTS`; overlapping ranges are `Slot n specified multiple times`. |
 | `CLUSTER DELSLOTS` | `CLUSTER DELSLOTS slot [slot ...]` | Release individual slots. |
 | `CLUSTER DELSLOTSRANGE` | `CLUSTER DELSLOTSRANGE start end [start end ...]` | Release contiguous ranges. |
-| `CLUSTER FLUSHSLOTS` | `CLUSTER FLUSHSLOTS` | Clear all slot ownership for this node. |
+| `CLUSTER FLUSHSLOTS` | `CLUSTER FLUSHSLOTS` | Give up every slot this node owns; other nodes' slots stay as they are. Refused with `ERR DB must be empty to perform CLUSTER FLUSHSLOTS.` while the node holds keys, as in Redis. |
 | `CLUSTER SETSLOT` | `CLUSTER SETSLOT slot <IMPORTING\|MIGRATING\|NODE> node-id` or `CLUSTER SETSLOT slot STABLE` | Mark migration state or finalize ownership transfer. |
 
 ### Discovery and membership
@@ -1065,7 +1065,7 @@ A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 | `CLUSTER FORGET` | `CLUSTER FORGET node-id` | Remove a node from the routing table. Slots owned by the forgotten node become unassigned. The node is refused re-admission for 60 seconds, so gossip from a node that has not been told yet does not bring it back. |
 | `CLUSTER LINKS` | `CLUSTER LINKS` | Report active bus links to peers. |
 | `CLUSTER REPLICAS` / `CLUSTER SLAVES` | `CLUSTER REPLICAS master-id` | The replicas of a master: an array with one `CLUSTER NODES` line per replica (empty for a master without any). Aliases. |
-| `CLUSTER COUNT-FAILURE-REPORTS` | `CLUSTER COUNT-FAILURE-REPORTS node-id` | Number of distinct nodes currently flagging this node as failing. Excludes the local node's own opinion. |
+| `CLUSTER COUNT-FAILURE-REPORTS` | `CLUSTER COUNT-FAILURE-REPORTS node-id` | Number of distinct nodes currently flagging this node as failing. Excludes the local node's own opinion. A node this one does not know is `ERR Unknown node <id>`. |
 
 ### Replication and failover
 
@@ -1166,9 +1166,9 @@ During migration:
 | Command | Syntax | Notes |
 |---|---|---|
 | `MIGRATE` | `MIGRATE host port key\|"" db timeout [COPY] [REPLACE] [AUTH password \| AUTH2 username password] [KEYS key [key ...]]` | Serialise each key, `RESTORE` it on the destination with its TTL, and delete it here once the destination has acknowledged. Every data type that `DUMP` supports. |
-| `ASKING` | `ASKING` | Per-connection single-shot flag. Required before each query against an `IMPORTING` slot. |
-| `READONLY` | `READONLY` | Per-connection flag: read commands for slots this node replicates are served here instead of redirected to the master. |
-| `READWRITE` | `READWRITE` | Clears the `READONLY` flag. |
+| `ASKING` | `ASKING` | Per-connection single-shot flag. Required before each query against an `IMPORTING` slot. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `READONLY` | `READONLY` | Per-connection flag: read commands for slots this node replicates are served here instead of redirected to the master. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `READWRITE` | `READWRITE` | Clears the `READONLY` flag. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
 
 A node that loses a slot to another master without having migrated its keys —
 a bare `SETSLOT … NODE` on the other side, or the losing side of a partition —
@@ -1178,8 +1178,8 @@ deletes the keys it holds for that slot, as Redis does.
 
 | Command | Syntax | Notes |
 |---|---|---|
-| `CLUSTER BUMPEPOCH` | `CLUSTER BUMPEPOCH` | Advance `current_epoch` and return `BUMPED <new>`. |
-| `CLUSTER SET-CONFIG-EPOCH` | `CLUSTER SET-CONFIG-EPOCH epoch` | Set this node's `config_epoch`. Only valid when current value is 0. |
+| `CLUSTER BUMPEPOCH` | `CLUSTER BUMPEPOCH` | Give this node a config epoch above every epoch it knows of and reply `BUMPED <epoch>`, or reply `STILL <epoch>` when its config epoch is already the highest (and not 0), as in Redis. |
+| `CLUSTER SET-CONFIG-EPOCH` | `CLUSTER SET-CONFIG-EPOCH epoch` | Set this node's `config_epoch`, on a fresh node only, as in Redis: refused once the node knows any other node, when its config epoch is already non-zero, and for a negative epoch. |
 | `CLUSTER SAVECONFIG` | `CLUSTER SAVECONFIG` | Force a write of `nodes.conf`. |
 | `CLUSTER RESET` | `CLUSTER RESET [HARD \| SOFT]` | Clear topology: forget the other nodes and the slot assignments. `SOFT` (default) keeps the node ID and epochs, and is refused on a master that holds keys; `HARD` also resets the epochs, flushes the dataset and gives the node a new ID. |
 
