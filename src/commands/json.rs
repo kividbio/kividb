@@ -355,11 +355,8 @@ fn arithmetic(current: &Number, operand: &Number, op: NumOp) -> Option<Number> {
         NumOp::Add => a + b,
         NumOp::Multiply => a * b,
     };
-    // A whole number that an integer can hold exactly is stored as one, so
-    // `1.5 + 1.5` is `3` and not `3.0`.
-    if result.fract() == 0.0 && result.abs() < 9_007_199_254_740_992.0 {
-        return Some((result as i64).into());
-    }
+    // A float stays a float even when the result is whole: `1.5 + 1.5` is
+    // `3.0`, as in RedisJSON. Only two integers give an integer, above.
     Number::from_f64(result)
 }
 

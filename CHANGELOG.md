@@ -145,6 +145,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` keep a float result a float
+  (#470).** A whole result was stored as an integer: `1.5 + 1.5` gave `3`
+  where RedisJSON gives `3.0`, `JSON.TYPE` then said `integer`, and `-0.0`
+  lost its sign. The result is now an integer only when both numbers are,
+  so a client that reads such a result as an integer may need to change.
+  An append-only file written by an earlier version replays to the new
+  form, with the same numeric value. Checked against Redis 8.10.3.
+
 - **A failover of the source during an atomic slot migration no longer
   loses acknowledged writes (#516).** With `CLUSTER FAILOVER` sent to the
   source's replica while `CLUSTER MIGRATION IMPORT` ran, the replica took
