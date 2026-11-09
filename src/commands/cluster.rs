@@ -38,10 +38,7 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
     match sub {
         // Read-only — work in both standalone and cluster modes
         "INFO" => return cmd_info(state),
-        "MYID" => return cmd_myid(state),
         "KEYSLOT" => return cmd_keyslot(&ctx.cmd),
-        "COUNTKEYSINSLOT" => return cmd_countkeysinslot(ctx),
-        "GETKEYSINSLOT" => return cmd_getkeysinslot(ctx),
         "NODES" => return cmd_nodes(state),
         "SLOTS" => return cmd_slots(state),
         "SHARDS" => return cmd_shards(state),
@@ -51,7 +48,7 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "DELSLOTS" => return cmd_delslots(state, &ctx.cmd),
         "ADDSLOTSRANGE" => return cmd_addslotsrange(ctx),
         "DELSLOTSRANGE" => return cmd_delslotsrange(state, &ctx.cmd),
-        "FLUSHSLOTS" => return cmd_flushslots(state),
+        "FLUSHSLOTS" => return cmd_flushslots(ctx),
         "BUMPEPOCH" => return cmd_bumpepoch(state),
         "SET-CONFIG-EPOCH" => return cmd_set_config_epoch(state, &ctx.cmd),
         "SAVECONFIG" => return cmd_saveconfig(state),
@@ -67,6 +64,11 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
     }
 
     match sub {
+        // As in Redis, these refuse on a node with cluster support disabled
+        // (#563): there is no node id, and a slot means nothing.
+        "MYID" => cmd_myid(state),
+        "COUNTKEYSINSLOT" => cmd_countkeysinslot(ctx),
+        "GETKEYSINSLOT" => cmd_getkeysinslot(ctx),
         "MEET" => cmd_meet(ctx),
         "FORGET" => cmd_forget(ctx),
         "COUNT-FAILURE-REPORTS" => cmd_count_failure_reports(ctx),
@@ -203,16 +205,25 @@ fn cmd_getkeysinslot(ctx: &Ctx) -> Vec<u8> {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let count: usize = match std::str::from_utf8(ctx.cmd[3])
+    let count: i64 = match std::str::from_utf8(ctx.cmd[3])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
         None => return resp_error("ERR value is not an integer or out of range"),
     };
+    if count < 0 {
+        return resp_error("ERR Invalid slot or number of keys");
+    }
+    let count = count as usize;
 
     let db = &ctx.store[*ctx.selected_db];
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(count.min(64));
+    // A count of 0 is an empty array, as in Redis: the loop below pushes
+    // a key before it compares (#563).
+    if count == 0 {
+        return resp_array(out);
+    }
     'outer: for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
@@ -592,23 +603,18 @@ fn cmd_addslots(ctx: &mut Ctx) -> Vec<u8> {
             Err(e) => return e,
         }
     }
-    // Reject duplicates inside the same call. Real Redis returns this error.
-    {
-        let mut seen = std::collections::HashSet::with_capacity(slots.len());
-        for &s in &slots {
-            if !seen.insert(s) {
-                return resp_error(&format!("ERR Slot {s} specified multiple times"));
-            }
-        }
+    // Every slot is checked (free, and named once) before any is claimed,
+    // as in Redis: one busy slot claims none of them. The earlier ones used
+    // to stay claimed, unsaved and with `cluster_state` stale (#553).
+    if let Err(e) = state.check_slots_claimable(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTS") {
         return refused;
     }
     let state: &ClusterState = ctx.cluster;
-    for s in &slots {
-        if let Err(e) = state.claim_slot(*s) {
-            return resp_error(&format!("ERR {e}"));
-        }
+    if let Err(e) = state.claim_slots(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
@@ -676,7 +682,9 @@ fn cmd_addslotsrange(ctx: &mut Ctx) -> Vec<u8> {
             Err(e) => return e,
         };
         if start > end {
-            return resp_error(&format!("ERR Invalid range {start}-{end}"));
+            return resp_error(&format!(
+                "ERR start slot number {start} is greater than end slot number {end}"
+            ));
         }
         ranges.push((start, end));
         i += 2;
@@ -686,17 +694,17 @@ fn cmd_addslotsrange(ctx: &mut Ctx) -> Vec<u8> {
         .iter()
         .flat_map(|&(start, end)| start..=end)
         .collect();
+    // All the ranges or none, as in Redis. A busy slot in a later range
+    // used to leave the earlier ranges claimed, unsaved (#553).
+    if let Err(e) = state.check_slots_claimable(&slots) {
+        return resp_error(&format!("ERR {e}"));
+    }
     if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTSRANGE") {
         return refused;
     }
     let state: &ClusterState = ctx.cluster;
-    // Apply each range. claim_slot_range is itself atomic per-range; if a
-    // later range fails, earlier ones stay claimed. That matches Redis's
-    // observable behavior.
-    for (start, end) in ranges {
-        if let Err(e) = state.claim_slot_range(start, end) {
-            return resp_error(&format!("ERR {e}"));
-        }
+    if let Err(e) = state.claim_slots(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
@@ -753,10 +761,22 @@ fn cmd_delslotsrange(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
     resp_simple("OK")
 }
 
-/// CLUSTER FLUSHSLOTS — clear all our slot assignments.
-fn cmd_flushslots(state: &ClusterState) -> Vec<u8> {
+/// CLUSTER FLUSHSLOTS — give up every slot this node owns, as Redis's
+/// `clusterDelNodeSlots(myself)`. Refused while the node holds keys, as in
+/// Redis. It used to unassign every slot in this node's view, the other
+/// masters' too, keys or not, and the node went to `cluster_state:fail`
+/// (#552).
+fn cmd_flushslots(ctx: &Ctx) -> Vec<u8> {
+    let state: &ClusterState = ctx.cluster;
     if let Some(err) = require_cluster_mode(state) {
         return err;
+    }
+    let has_keys = ctx
+        .store
+        .iter()
+        .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()));
+    if has_keys {
+        return resp_error("ERR DB must be empty to perform CLUSTER FLUSHSLOTS.");
     }
     state.flush_slots();
     if let Err(e) = state.save_to_disk() {
@@ -767,27 +787,31 @@ fn cmd_flushslots(state: &ClusterState) -> Vec<u8> {
     resp_simple("OK")
 }
 
-/// CLUSTER BUMPEPOCH — increment current_epoch and return the new value.
-/// Real Redis only bumps if it's actually higher than known epochs in the
-/// cluster; with no gossip yet, ours always succeeds. Returns "BUMPED <n>"
-/// or "STILL <n>" — matching Redis's wire format exactly so cluster scripts
-/// that parse this string keep working.
+/// CLUSTER BUMPEPOCH — give this node a config epoch of its own, above
+/// every other one, unless it has one already: `BUMPED <n>` or `STILL <n>`,
+/// with this node's config epoch, as Redis's
+/// `clusterBumpConfigEpochWithoutConsensus`. It used to raise only the
+/// current epoch, and always said `BUMPED` (#563).
 fn cmd_bumpepoch(state: &ClusterState) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
-    let new = state.bump_epoch();
+    let (bumped, epoch) = state.bump_config_epoch_without_consensus();
+    if !bumped {
+        return resp_simple(&format!("STILL {epoch}"));
+    }
     // Save to disk so the bump survives restart.
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
             "ERR BUMPEPOCH persisted in memory but disk save failed: {e}"
         ));
     }
-    resp_simple(&format!("BUMPED {new}"))
+    resp_simple(&format!("BUMPED {epoch}"))
 }
 
 /// CLUSTER SET-CONFIG-EPOCH <epoch>
-/// Only valid when our current config_epoch is 0 (i.e. fresh node).
+/// Only on a fresh node: one that knows no other node and has no config
+/// epoch yet, as in Redis.
 fn cmd_set_config_epoch(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(state) {
         return err;
@@ -795,14 +819,17 @@ fn cmd_set_config_epoch(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
     if cmd.len() != 3 {
         return resp_error("ERR wrong number of arguments for 'cluster|set-config-epoch' command");
     }
-    let new_epoch: u64 = match std::str::from_utf8(cmd[2])
+    let new_epoch: i64 = match std::str::from_utf8(cmd[2])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
         None => return resp_error("ERR value is not an integer or out of range"),
     };
-    if let Err(e) = state.set_my_config_epoch(new_epoch) {
+    if new_epoch < 0 {
+        return resp_error(&format!("ERR Invalid config epoch specified: {new_epoch}"));
+    }
+    if let Err(e) = state.set_my_config_epoch(new_epoch as u64) {
         return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
@@ -931,9 +958,15 @@ fn cmd_count_failure_reports(ctx: &mut Ctx) -> Vec<u8> {
             "ERR wrong number of arguments for 'cluster|count-failure-reports' command",
         );
     }
-    let id = match crate::cluster::node::parse_node_id(cmd[2]) {
-        Some(id) => id,
-        None => return resp_error("ERR Invalid node id"),
+    // A node this one does not know is an error, as in Redis; it used to
+    // count 0 failure reports for it (#563).
+    let id = crate::cluster::node::parse_node_id(cmd[2])
+        .filter(|id| ctx.cluster.nodes.read().contains_key(id));
+    let Some(id) = id else {
+        return resp_error(&format!(
+            "ERR Unknown node {}",
+            String::from_utf8_lossy(cmd[2])
+        ));
     };
     let count = ctx.cluster.failure_report_count(id);
     resp_integer(count as i64)
@@ -1169,6 +1202,9 @@ fn cmd_failover(ctx: &mut Ctx) -> Vec<u8> {
 // the next command runs, whether it succeeded or not.
 
 fn cmd_asking(ctx: &mut Ctx) -> Vec<u8> {
+    if let Some(err) = require_cluster_mode(ctx.cluster) {
+        return err;
+    }
     ctx.client_registry.update(ctx.client_id, |info| {
         info.asking = true;
     });
@@ -1185,7 +1221,14 @@ fn cmd_asking(ctx: &mut Ctx) -> Vec<u8> {
 // later: "if asking_flag OR (readonly_flag AND slot owned by my master),
 // accept the read."
 
+//
+// All three refuse on a node with cluster support disabled, as in Redis
+// (#563).
+
 fn cmd_readonly(ctx: &mut Ctx) -> Vec<u8> {
+    if let Some(err) = require_cluster_mode(ctx.cluster) {
+        return err;
+    }
     ctx.client_registry.update(ctx.client_id, |info| {
         info.readonly = true;
     });
@@ -1193,6 +1236,9 @@ fn cmd_readonly(ctx: &mut Ctx) -> Vec<u8> {
 }
 
 fn cmd_readwrite(ctx: &mut Ctx) -> Vec<u8> {
+    if let Some(err) = require_cluster_mode(ctx.cluster) {
+        return err;
+    }
     ctx.client_registry.update(ctx.client_id, |info| {
         info.readonly = false;
     });

@@ -1249,6 +1249,31 @@ impl ClusterState {
         self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// CLUSTER BUMPEPOCH, as Redis's `clusterBumpConfigEpochWithoutConsensus`:
+    /// unless this node's config epoch is already the highest there is (and
+    /// not 0), it takes a new epoch, above every one this node has seen, as
+    /// its config epoch. Returns whether it did, and its config epoch.
+    pub fn bump_config_epoch_without_consensus(&self) -> (bool, u64) {
+        let me = self.myself();
+        let mut nodes = self.nodes.write();
+        let highest = nodes
+            .values()
+            .map(|n| n.config_epoch)
+            .max()
+            .unwrap_or(0)
+            .max(self.current_epoch.load(Ordering::SeqCst));
+        let Some(node) = nodes.get_mut(&me) else {
+            return (false, 0);
+        };
+        if node.config_epoch != 0 && node.config_epoch == highest {
+            return (false, node.config_epoch);
+        }
+        self.current_epoch.fetch_max(highest, Ordering::SeqCst);
+        let epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        node.config_epoch = epoch;
+        (true, epoch)
+    }
+
     /// Note an epoch a peer is at.
     pub fn observe_epoch(&self, epoch: u64) {
         self.current_epoch.fetch_max(epoch, Ordering::SeqCst);
@@ -1424,6 +1449,58 @@ impl ClusterState {
         Ok((end - start + 1) as usize)
     }
 
+    /// Why `list` cannot all be claimed here, if it cannot: the first slot,
+    /// in order, that is assigned already or named twice. As Redis's
+    /// `checkSlotAssignmentsOrReply`.
+    fn unclaimable(table: &[Option<NodeId>], list: &[u16]) -> Option<String> {
+        let mut seen = vec![false; CLUSTER_SLOTS];
+        for &slot in list {
+            if slot as usize >= CLUSTER_SLOTS {
+                return Some(format!("Invalid slot {slot}"));
+            }
+            if table[slot as usize].is_some() {
+                return Some(format!("Slot {slot} is already busy"));
+            }
+            if std::mem::replace(&mut seen[slot as usize], true) {
+                return Some(format!("Slot {slot} specified multiple times"));
+            }
+        }
+        None
+    }
+
+    /// Whether every slot of `list` could be claimed here now: see
+    /// [`Self::claim_slots`].
+    pub fn check_slots_claimable(&self, list: &[u16]) -> Result<(), String> {
+        if !self.enabled {
+            return Err("This instance has cluster support disabled".into());
+        }
+        match Self::unclaimable(&self.slots.read()[..], list) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Claim every slot of `list`, or none: CLUSTER ADDSLOTS and
+    /// ADDSLOTSRANGE. Errors, changing nothing, if one of them is assigned
+    /// already or named twice, as in Redis. They used to claim slot by
+    /// slot, or range by range, and the ones before the first busy slot
+    /// stayed claimed (#553).
+    pub fn claim_slots(&self, list: &[u16]) -> Result<usize, String> {
+        if !self.enabled {
+            return Err("This instance has cluster support disabled".into());
+        }
+        let me = self.myself();
+        let mut slots = self.slots.write();
+        if let Some(e) = Self::unclaimable(&slots[..], list) {
+            return Err(e);
+        }
+        for &slot in list {
+            slots[slot as usize] = Some(me);
+        }
+        self.slot_deletions.came_here(list.iter().copied());
+        Ok(list.len())
+    }
+
     /// Release a contiguous range: [`Self::release_slots`], all or nothing.
     pub fn release_slot_range(&self, start: u16, end: u16) -> Result<usize, String> {
         if !self.enabled {
@@ -1435,29 +1512,42 @@ impl ClusterState {
         self.release_slots(&(start..=end).collect::<Vec<u16>>())
     }
 
-    /// Wipe all slot ownership records on this node. Used by FLUSHSLOTS.
-    /// Note: this only affects our local view; other nodes still think we
-    /// own them until gossip propagates the change (Step 5).
-    pub fn flush_slots(&self) {
+    /// Give up every slot this node owns: CLUSTER FLUSHSLOTS, as Redis's
+    /// `clusterDelNodeSlots(myself)`. The other masters' slots stay as they
+    /// are; this used to unassign every slot in this node's view (#552).
+    /// Returns how many it gave up.
+    pub fn flush_slots(&self) -> usize {
         if !self.enabled {
-            return;
+            return 0;
         }
+        let me = self.myself();
         let mut slots = self.slots.write();
+        let mut flushed = 0;
         for s in slots.iter_mut() {
-            *s = None;
+            if *s == Some(me) {
+                *s = None;
+                flushed += 1;
+            }
         }
+        drop(slots);
         // As for DELSLOTS (`release_slots`).
         crate::pause::routes_moved();
+        flushed
     }
 
-    /// Set our own node's config_epoch. Used by SET-CONFIG-EPOCH (only
-    /// allowed when current epoch is 0 — Redis enforces this to prevent
-    /// epoch hijacking after the cluster is alive).
+    /// Set our own node's config_epoch. Used by SET-CONFIG-EPOCH: only on a
+    /// node that knows no other node and has no config epoch yet, as in
+    /// Redis. It used to be allowed on a node in a cluster (#563).
     pub fn set_my_config_epoch(&self, new_epoch: u64) -> Result<(), String> {
         if !self.enabled {
             return Err("This instance has cluster support disabled".into());
         }
         let mut nodes = self.nodes.write();
+        if nodes.len() > 1 {
+            return Err("The user can assign a config epoch only when the \
+                        node does not know any other node."
+                .into());
+        }
         let me = nodes
             .get_mut(&self.myself())
             .ok_or_else(|| "internal error: self not in nodes".to_string())?;
@@ -3046,6 +3136,68 @@ mod tests {
         (cs, a, b)
     }
 
+    /// FLUSHSLOTS gives up this node's own slots only (#552).
+    #[test]
+    fn flush_slots_gives_up_only_this_nodes_slots() {
+        let (cs, a, b) = three_master_cluster();
+        assert_eq!(cs.flush_slots(), 5461);
+        assert!((0..=5460).all(|s| cs.slot_owner(s).is_none()));
+        assert!((5461..=10922).all(|s| cs.slot_owner(s) == Some(a)));
+        assert!((10923..=16383).all(|s| cs.slot_owner(s) == Some(b)));
+    }
+
+    /// ADDSLOTS and ADDSLOTSRANGE claim all their slots or none (#553).
+    #[test]
+    fn claiming_slots_is_all_or_nothing() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.claim_slots(&[200]).unwrap();
+        let list: Vec<u16> = (0..=99).chain(150..=250).collect();
+        assert_eq!(
+            cs.claim_slots(&list).unwrap_err(),
+            "Slot 200 is already busy"
+        );
+        assert_eq!(
+            cs.check_slots_claimable(&list).unwrap_err(),
+            "Slot 200 is already busy"
+        );
+        assert!((0..=99).all(|s| cs.slot_owner(s).is_none()));
+        assert_eq!(
+            cs.claim_slots(&[1, 2, 1]).unwrap_err(),
+            "Slot 1 specified multiple times"
+        );
+        assert!(cs.slot_owner(1).is_none());
+        assert_eq!(cs.claim_slots(&[1, 2]).unwrap(), 2);
+        assert_eq!(cs.slot_owner(2), Some(cs.myself()));
+    }
+
+    /// BUMPEPOCH gives this node a config epoch above every other, or
+    /// says it has the highest already (#563).
+    #[test]
+    fn bump_config_epoch_without_consensus_is_redis_s() {
+        let (cs, a, _) = three_master_cluster();
+        cs.nodes.write().get_mut(&a).unwrap().config_epoch = 7;
+        assert_eq!(cs.bump_config_epoch_without_consensus(), (true, 8));
+        assert_eq!(cs.current_epoch(), 8);
+        assert_eq!(cs.bump_config_epoch_without_consensus(), (false, 8));
+        // A peer moves ahead: this node bumps again.
+        cs.observe_epoch(12);
+        assert_eq!(cs.bump_config_epoch_without_consensus(), (true, 13));
+    }
+
+    /// SET-CONFIG-EPOCH only on a node that knows no other one (#563).
+    #[test]
+    fn set_config_epoch_needs_a_lone_node() {
+        let (cs, _, _) = three_master_cluster();
+        let e = cs.set_my_config_epoch(5).unwrap_err();
+        assert!(e.contains("does not know any other node"), "{e}");
+        let lone = ClusterState::new_enabled(None, 15000);
+        lone.set_my_config_epoch(5).unwrap();
+        assert_eq!(
+            lone.set_my_config_epoch(6).unwrap_err(),
+            "Node config epoch is already non-zero"
+        );
+    }
+
     /// A failover of this master and the handover of an atomic slot
     /// migration away from it exclude each other (#516).
     #[test]
@@ -3120,7 +3272,9 @@ mod tests {
             cs.hold_writes_until_confirmed(HoldReason::MarkedFailed, now_ms() + 60_000);
             assert!(!cs.is_serving());
         });
-        moved("FLUSHSLOTS", &|| cs.flush_slots());
+        moved("FLUSHSLOTS", &|| {
+            cs.flush_slots();
+        });
         cs.claim_slot_range(0, 100).unwrap();
         moved("CLUSTER RESET", &|| cs.soft_reset());
     }
