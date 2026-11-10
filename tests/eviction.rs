@@ -246,6 +246,12 @@ impl Server {
             .append(true)
             .open(dir.join("server.log"))
             .unwrap();
+        // The tokio loop, unless the test names its own.
+        let io_model: &[&str] = if extra.contains(&"--io-model") {
+            &[]
+        } else {
+            &["--io-model", "tokio"]
+        };
         let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(&dir)
             .args([
@@ -253,13 +259,12 @@ impl Server {
                 &port.to_string(),
                 "--bind",
                 "127.0.0.1",
-                "--io-model",
-                "tokio",
                 "--threads",
                 "4",
                 "--configfile",
                 "kividb.conf",
             ])
+            .args(io_model)
             .args(extra)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
