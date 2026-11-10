@@ -2440,6 +2440,33 @@ fn test_restore_of_a_huge_claimed_length_is_bad_data_not_a_crash() {
     );
 }
 
+/// On a node with cluster support disabled, `CLUSTER MYID`,
+/// `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `READONLY`, `READWRITE` and `ASKING`
+/// refuse, as in Redis. They answered (#563).
+#[test]
+fn cluster_commands_refuse_when_cluster_support_is_disabled() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for cmd in [
+        &["CLUSTER", "MYID"][..],
+        &["CLUSTER", "COUNTKEYSINSLOT", "0"],
+        &["CLUSTER", "GETKEYSINSLOT", "0", "1"],
+        &["READONLY"],
+        &["READWRITE"],
+        &["ASKING"],
+    ] {
+        let reply = c.cmds(cmd);
+        assert_eq!(
+            reply,
+            RespValue::Error("ERR This instance has cluster support disabled".into()),
+            "{cmd:?}"
+        );
+    }
+    // KEYSLOT still answers.
+    assert_eq!(c.cmds(&["CLUSTER", "KEYSLOT", "foo"]).as_int(), 12182);
+}
+
 // Without Lua, every script command says which build has it: BullMQ and
 // Sidekiq show this error to their users.
 #[cfg(not(feature = "lua"))]

@@ -3,8 +3,9 @@ use crate::commands::helpers::{
     ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
     ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
     expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis, from_unix_ms,
-    get_expiry, is_expired, lazy_expire_on_read, parse_bytes_as_i128, parse_expire_modifier_flags,
-    parse_utf8, set_expiry, system_time_from_unix_millis_i128, take_key, ttl_remaining_secs_ceil,
+    get_expiry, is_expired, lazy_expire_on_read, ms_to_nearest_secs, parse_bytes_as_i128,
+    parse_expire_modifier_flags, parse_utf8, set_expiry, system_time_from_unix_millis_i128,
+    take_key, ttl_remaining_ms,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
@@ -574,12 +575,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             match expires {
                 None => Some(resp_integer(-1)), // key exists but no TTL
-                Some(at) => match from_unix_ms(at)
-                    .duration_since(crate::script_clock::wall_system_time_now())
-                {
-                    Ok(d) => Some(resp_integer(ttl_remaining_secs_ceil(d))),
-                    Err(_) => Some(resp_integer(-2)),
-                },
+                Some(at) => Some(resp_integer(ms_to_nearest_secs(ttl_remaining_ms(at)))),
             }
         }
 
@@ -741,12 +737,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             match expires {
                 None => Some(resp_integer(-1)),
-                Some(at) => match from_unix_ms(at)
-                    .duration_since(crate::script_clock::wall_system_time_now())
-                {
-                    Ok(d) => Some(resp_integer(d.as_millis() as i64)),
-                    Err(_) => Some(resp_integer(-2)),
-                },
+                Some(at) => Some(resp_integer(ttl_remaining_ms(at))),
             }
         }
 
@@ -1683,7 +1674,8 @@ enum TimeUnit {
 fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
     let d = exp.duration_since(UNIX_EPOCH).unwrap_or_default();
     match unit {
-        TimeUnit::Secs => d.as_secs() as i64,
+        // To the nearest second, as `TTL` (Redis's `(ms + 500) / 1000`).
+        TimeUnit::Secs => ms_to_nearest_secs(d.as_millis() as i64),
         TimeUnit::Millis => d.as_millis() as i64,
     }
 }
