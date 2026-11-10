@@ -325,28 +325,39 @@ fn configure_new(ts: &mut TsInner, options: &TsOptions) {
     }
 }
 
-/// The options of a `TS.INCRBY` or `TS.DECRBY` as 1.2.0 sent it to its
-/// replicas and its AOF: every `TIMESTAMP` taken out and `TIMESTAMP <time>`
-/// added at the end. Read with the rest, the end can be taken by what
-/// comes before it: `LABELS a` left a word that made a label of
-/// `TIMESTAMP` and passed over the time, and `RETENTION`, `ENCODING` with
-/// no value took `TIMESTAMP` as theirs. Then the record failed, or its
-/// sample was put at the time of the replay, and the records after it
-/// failed for a timestamp before it: data lost. 1.2.0 read no option but
-/// `TIMESTAMP`, so the rest is read as far as it can be, and the time is the
-/// one at the end. Only when the command's options, read as they are, have
-/// no `TIMESTAMP`: 1.2.1 sends one with every record.
+/// The word 1.2.1 puts right after the value of every `TS.INCRBY` and
+/// `TS.DECRBY` it sends to its replicas and its AOF, with the time the
+/// command used: `TIMESTAMP` in lower case. It tells such a record from one
+/// 1.2.0 sent, which must be read as 1.2.0 read it. 1.2.0 took every
+/// `TIMESTAMP` out, in any case, and added `TIMESTAMP` (upper case) at the
+/// end; so a record of 1.2.0 never has this word at that place: either
+/// another word is there, or, with nothing else to send, the `TIMESTAMP` it
+/// added, in upper case. Read as an option, it is `TIMESTAMP`, by any
+/// version.
+pub(crate) const INCRBY_MARK: &[u8] = b"timestamp";
+
+/// A `TS.INCRBY` or `TS.DECRBY` (its options, `tokens`) as 1.2.0 sent it to
+/// its replicas and its AOF, read as 1.2.0 read it: its time, the one at
+/// the end, and no other option. 1.2.0 read no option but `TIMESTAMP`,
+/// made a series with the defaults, and did not trim to the retention.
+/// Read as 1.2.1 reads a command, the record's options were applied, and
+/// the series trimmed, where 1.2.0 kept the samples: data lost on replay,
+/// and a replica of 1.2.0 not the same as its master. And the end could be
+/// taken by what came before it (`LABELS a`, or a `RETENTION` with no
+/// value, took `TIMESTAMP`): the sample at the replay's time, or the record
+/// refused. `None` for a record that does not end in `TIMESTAMP <time>`,
+/// which 1.2.0 did not send.
 fn written_by_1_2_0(tokens: &[&[u8]]) -> Option<TsOptions> {
-    let [rest @ .., word, at] = tokens else {
+    let [.., word, at] = tokens else {
         return None;
     };
     if !word.eq_ignore_ascii_case(b"TIMESTAMP") {
         return None;
     }
-    let at = option_number(at)?;
-    let mut options = parse_ts_options(rest, OptionsOf::IncrBy, false).unwrap_or_default();
-    options.timestamp = Some(at);
-    Some(options)
+    Some(TsOptions {
+        timestamp: Some(option_number(at)?),
+        ..Default::default()
+    })
 }
 
 /// Where a `TS.INCRBY` or `TS.DECRBY` (the whole command) has its
@@ -858,14 +869,20 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
     // TIMESTAMP, and the options a series it creates is made with, as in
     // RedisTimeSeries: RETENTION, CHUNK_SIZE, DUPLICATE_POLICY, LABELS. They
     // were passed over, and the series made with the defaults (#555).
-    let options = match parse_ts_options(&cmd[3..], OptionsOf::IncrBy, strict) {
-        Ok(v) if strict || v.timestamp.is_some() => v,
-        parsed => match written_by_1_2_0(&cmd[3..]) {
-            Some(v) if !strict => v,
-            _ => match parsed {
-                Ok(v) => v,
-                Err(e) => return Some(e),
-            },
+    //
+    // From the AOF or a master, a record without 1.2.1's mark is one 1.2.0
+    // sent, and is read as 1.2.0 read it (`written_by_1_2_0`).
+    let of_1_2_0 = if !strict && cmd.get(3).is_none_or(|word| *word != INCRBY_MARK) {
+        written_by_1_2_0(&cmd[3..])
+    } else {
+        None
+    };
+    let trim = of_1_2_0.is_none();
+    let options = match of_1_2_0 {
+        Some(v) => v,
+        None => match parse_ts_options(&cmd[3..], OptionsOf::IncrBy, strict) {
+            Ok(v) => v,
+            Err(e) => return Some(e),
         },
     };
     let timestamp = options.timestamp.unwrap_or_else(TsInner::now_ms);
@@ -893,8 +910,15 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
             .unwrap_or(0.0);
         // `LAST` whatever the series' duplicate policy: at the latest
         // timestamp this replaces the value. Through `add_sample_as`, as
-        // `TS.ADD`, so the retention trims the series (#555).
-        ts.add_sample_as(timestamp, last_val + delta, &DuplicatePolicy::Last)
+        // `TS.ADD`, so the retention trims the series (#555); not for a
+        // record of 1.2.0, which did not trim.
+        if trim {
+            ts.add_sample_as(timestamp, last_val + delta, &DuplicatePolicy::Last)
+        } else {
+            ts.samples.insert(timestamp, last_val + delta);
+            ts.last_ts = Some(timestamp);
+            Ok(timestamp)
+        }
     };
     if created {
         let labels = options.labels.unwrap_or_default();

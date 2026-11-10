@@ -4471,42 +4471,44 @@ mod backlog_tests {
     }
 }
 
-/// Time series commands an AOF written by 1.2.0 holds, with what that
+/// Time series commands in an AOF: those written by 1.2.0, with what that
 /// version accepted and 1.2.1 refuses from a client (#565), a chunk size
-/// out of bounds, `IGNORE`: replayed, rather than the series lost.
+/// out of bounds, `IGNORE`, replayed rather than the series lost, and its
+/// `TS.INCRBY` records read as it read them; and 1.2.1's, replayed as they
+/// ran.
 #[cfg(test)]
 mod ts_option_replay_tests {
     use super::past_deadline_replay_tests::{replayed, replayed_with_index};
     use crate::store::ValueRef;
 
-    /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
-    /// `TS.INCRBY` as the feed writes it, with a word left over from
-    /// `LABELS`: replayed as they ran.
     /// `TS.INCRBY` records as 1.2.0 wrote them, `TIMESTAMP <time>` at the
-    /// end, after a word that takes it when read with the rest: each sample
-    /// at its time, and the records after it applied.
+    /// end, read as 1.2.0 read them: each sample at its time, the options
+    /// passed over, no trim to the retention, and the records after them
+    /// applied. A word before the time that takes it when read with the
+    /// rest changes nothing. A record of 1.2.1, behind its mark, is read
+    /// with its options and trims.
     #[test]
-    fn incrby_records_of_1_2_0_keep_their_time() {
+    fn incrby_records_of_1_2_0_are_read_as_1_2_0_read_them() {
         let store = replayed(&[
             vec!["TS.INCRBY", "a", "1", "LABELS", "x", "TIMESTAMP", "42"],
             vec!["TS.INCRBY", "a", "1", "TIMESTAMP", "50"],
             vec!["TS.INCRBY", "b", "1", "RETENTION", "TIMESTAMP", "42"],
             vec!["TS.INCRBY", "c", "1", "ENCODING", "TIMESTAMP", "42"],
             vec![
-                "TS.INCRBY",
-                "d",
-                "1",
-                "RETENTION",
-                "100",
-                "LABELS",
-                "x",
-                "y",
-                "z",
-                "TIMESTAMP",
+                "TS.INCRBY", "d", "1", "RETENTION", "100", "LABELS", "x", "y", "z", "TIMESTAMP",
                 "42",
             ],
             vec!["TS.INCRBY", "e", "1", "DUPLICATE_POLICY", "TIMESTAMP", "42"],
             vec!["TS.INCRBY", "f", "1", "LABELS", "a", "b", "TIMESTAMP", "42"],
+            // Read cleanly too, these were trimmed and given options.
+            vec!["TS.CREATE", "r", "RETENTION", "10"],
+            vec!["TS.INCRBY", "r", "1", "TIMESTAMP", "1"],
+            vec!["TS.INCRBY", "r", "1", "RETENTION", "10", "TIMESTAMP", "100"],
+            // 1.2.1's.
+            vec![
+                "TS.INCRBY", "m", "1", "timestamp", "5", "RETENTION", "10", "LABELS", "a", "b",
+            ],
+            vec!["TS.INCRBY", "m", "1", "timestamp", "100"],
         ]);
         let series = |key: &str| {
             let shard = crate::store::get_shard(&store[0], key);
@@ -4516,24 +4518,30 @@ mod ts_option_replay_tests {
                 _ => panic!("{key} is not a series"),
             }
         };
-        let a = series("a");
-        assert_eq!(
-            a.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
-            [(42, 1.0), (50, 2.0)]
-        );
-        assert!(a.labels.is_empty());
-        for key in ["b", "c", "e"] {
-            assert_eq!(series(key).samples.get(&42), Some(&1.0), "{key}");
+        let samples = |key: &str| {
+            series(key)
+                .samples
+                .iter()
+                .map(|(t, v)| (*t, *v))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(samples("a"), [(42, 1.0), (50, 2.0)]);
+        for key in ["a", "b", "c", "d", "e", "f"] {
+            let s = series(key);
+            assert!(s.labels.is_empty(), "{key}");
+            assert_eq!(s.retention, 0, "{key}");
+            assert_eq!(s.samples.get(&42), Some(&1.0), "{key}");
         }
-        let d = series("d");
-        assert_eq!(d.samples.get(&42), Some(&1.0));
-        assert_eq!(d.retention, 100);
-        assert_eq!(d.labels.get("x").map(String::as_str), Some("y"));
-        let f = series("f");
-        assert_eq!(f.samples.get(&42), Some(&1.0));
-        assert_eq!(f.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(samples("r"), [(1, 1.0), (100, 2.0)]);
+        let m = series("m");
+        assert_eq!(m.retention, 10);
+        assert_eq!(m.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(samples("m"), [(100, 2.0)]);
     }
 
+    /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
+    /// `TS.INCRBY` as the feed writes it, with a word left over from
+    /// `LABELS`: replayed as they ran.
     #[test]
     fn options_replay_as_they_ran() {
         let (store, index) = replayed_with_index(&[
@@ -4542,7 +4550,7 @@ mod ts_option_replay_tests {
             vec!["TS.CREATE", "d", "DUPLICATE_POLICY", "BLOCK"],
             vec!["TS.ADD", "d", "1", "1"],
             vec!["TS.ADD", "d", "1", "5", "ON_DUPLICATE", "SUM"],
-            vec!["TS.INCRBY", "c", "2", "TIMESTAMP", "9", "LABELS", "x"],
+            vec!["TS.INCRBY", "c", "2", "timestamp", "9", "LABELS", "x"],
         ]);
         let series = |key: &str| {
             let shard = crate::store::get_shard(&store[0], key);

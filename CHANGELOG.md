@@ -176,7 +176,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   accepted, so a log written by 1.2.0 replays whole; it replays under these
   rules, so after the first restart a series can differ from what 1.2.0
   held in memory: `TS.CREATE k FOO RETENTION 10` now has the retention, and
-  trims, and `ON_DUPLICATE SUM` is now applied.
+  trims, and `ON_DUPLICATE SUM` is now applied. A `TS.INCRBY` or
+  `TS.DECRBY` record 1.2.0 wrote, or a 1.2.0 master sends, is read as 1.2.0
+  read it: its time, no other option, no trim. 1.2.1 sends these commands
+  with a lower-case `timestamp` and the time right after the value, which
+  tells its records from 1.2.0's.
 
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
