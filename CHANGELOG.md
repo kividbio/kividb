@@ -157,7 +157,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ordered against the index's scan of the hashes. The same applies to
   indexes loaded from a snapshot or the AOF and rebuilt after a replica's
   full sync. A write of a hash when no index exists costs 8 instructions
-  more (0.2%).
+  more (0.2%). A script that runs beside others (`lua-parallel-scripts`)
+  can no longer create the first index of a server, which it cannot wait
+  for the writes under way to finish: `FT.CREATE` there fails with an
+  error, and works outside the script, or once an index exists.
 
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then

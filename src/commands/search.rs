@@ -434,7 +434,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     // the first (`vector::Indexes::write_to_add`, #570).
     def.name = name.clone();
     {
-        let mut store = ctx.index_store.write_to_add();
+        let mut store = ctx.index_store.write_to_add()?;
         if store.contains_key(&name) {
             return Err("Index already exists".into());
         }

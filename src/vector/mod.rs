@@ -967,23 +967,33 @@ impl Indexes {
     /// index, whose walk finds what it wrote. One that takes an order after
     /// the barrier has passed it finds `none` false, and takes it whole.
     ///
-    /// Not inside a transaction or a script: no other command runs then, and
-    /// every one that runs after asks after it.
-    pub fn write_to_add(&self) -> IndexesWriteGuard<'_> {
+    /// Not with the command gate held alone (a transaction, or a script run
+    /// alone): no other command runs then, and every one that runs after
+    /// asks after it.
+    ///
+    /// Refused ([`FIRST_INDEX_BESIDE_OTHERS`]) in a script that runs beside
+    /// others (`tag_locks`): other commands run meanwhile, and the barrier
+    /// cannot, since the script holds its keys' order. With an index there
+    /// already, nothing has to be waited out, and it is not refused.
+    pub fn write_to_add(&self) -> Result<IndexesWriteGuard<'_>, &'static str> {
         let mut map = self.map.write();
+        let first = map.is_empty() && !crate::command_gate::alone_on_this_thread();
+        if first && (crate::tag_locks::beside_others() || crate::write_order::holds_stripes()) {
+            return Err(FIRST_INDEX_BESIDE_OTHERS);
+        }
         self.any.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        if map.is_empty() && !crate::command_gate::alone_on_this_thread() {
+        if first {
             self.raising.fetch_add(1, Relaxed);
             drop(map);
             crate::write_order::barrier();
             map = self.map.write();
             self.raising.fetch_sub(1, Relaxed);
         }
-        IndexesWriteGuard {
+        Ok(IndexesWriteGuard {
             map,
             any: &self.any.0,
             raising: &self.raising,
-        }
+        })
     }
 
     /// Whether there is no index, nor alias, without taking the lock: what
@@ -993,6 +1003,11 @@ impl Indexes {
         !self.any.0.load(Acquire)
     }
 }
+
+/// [`Indexes::write_to_add`]'s refusal.
+pub const FIRST_INDEX_BESIDE_OTHERS: &str = "ERR the first search index cannot be created \
+     from a script that runs beside other scripts (lua-parallel-scripts): create it outside \
+     the script";
 
 /// [`Indexes::write`]'s hold of the lock.
 pub struct IndexesWriteGuard<'a> {
@@ -1915,8 +1930,11 @@ pub fn register_index_schemas(
     if schemas.is_empty() {
         return;
     }
-    // Possibly the first index: see `Indexes::write_to_add` (#570).
-    let mut idx = index_store.write_to_add();
+    // Possibly the first index: see `Indexes::write_to_add` (#570). Never
+    // from a script, so never refused.
+    let mut idx = index_store
+        .write_to_add()
+        .unwrap_or_else(|_| index_store.write());
     for schema in schemas {
         let mut def = schema.clone().into_def();
         if let Some(field_graphs) = hnsw_graphs.get(&def.name) {
@@ -2678,7 +2696,10 @@ mod indexes_tests {
         let adder = {
             let (store, added) = (Arc::clone(&store), Arc::clone(&added));
             std::thread::spawn(move || {
-                store.write_to_add().insert("idx".into(), schema("idx"));
+                store
+                    .write_to_add()
+                    .unwrap()
+                    .insert("idx".into(), schema("idx"));
                 added.store(true, SeqCst);
             })
         };
@@ -2702,7 +2723,9 @@ mod indexes_tests {
         let writing = crate::write_order::lock_key_shared(0, b"doc:570");
         let more = Arc::clone(&store);
         std::thread::spawn(move || {
-            more.write_to_add().insert("other".into(), schema("other"));
+            more.write_to_add()
+                .unwrap()
+                .insert("other".into(), schema("other"));
         })
         .join()
         .unwrap();
