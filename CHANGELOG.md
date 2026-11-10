@@ -163,6 +163,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deadline. A negative `HEXPIREAT` or `HPEXPIREAT` time was already refused
   (#486).
 
+  The same commands now read their options and their time in Redis's order.
+  A time that is not an integer, or does not fit a 64-bit signed integer,
+  is `ERR value is not an integer or out of range` before any bound is
+  looked at; it was often `ERR invalid expire time` (`SETEX k abc v`,
+  `SET k v EXAT abc`) or `ERR invalid EXAT timestamp` (`MSETEX`). `EXAT 0`
+  and `PXAT 0` of `SET`, `GETEX` and `MSETEX` are refused as an invalid
+  time; the key was set and gone at once. `SET` with `KEEPTTL` and a time,
+  or with two of `EX`, `PX`, `EXAT` and `PXAT`, is `ERR syntax error`; the
+  last one was taken, or `KEEPTTL EX 10` was an invalid time. The same unit
+  given twice is still taken, the last one, as in Redis. `GETEX` reads all
+  its options, where it read only the first and ignored the rest, and on a
+  key that is not there answers nil whatever the time, as Redis does.
+  `MSETEX` takes `NX NX` and `KEEPTTL KEEPTTL`, as Redis does.
+
+  From a master's stream or an AOF being replayed, a time past the latest
+  is taken as the latest, and a Unix time of 0 as one that has passed, as
+  1.2.0 took them: 1.2.0 wrote `SET … PXAT` up to 18446744073709551615 for
+  a large `SETEX`, and refusing it there would lose the key.
+  `EXPIRETIME` of the latest deadline is 9223372036854776, as in Redis,
+  where it was one less.
+
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
   `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a
