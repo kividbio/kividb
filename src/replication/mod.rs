@@ -39,6 +39,9 @@ pub struct ReplState {
     pub repl_offset: AtomicU64,
     /// Number of currently connected replicas.
     pub connected_replicas: AtomicI64,
+    /// How many times this node has become a replica: see
+    /// `commands::blocking::role_changes`.
+    pub role_changes: AtomicU64,
     /// Woken when a replica acknowledges, connects or goes: what a `WAIT`
     /// sleeps on between looks at its replicas.
     pub replicas_changed: tokio::sync::Notify,
@@ -490,6 +493,7 @@ impl ReplState {
             slave_mode: AtomicBool::new(false),
             repl_offset: AtomicU64::new(0),
             connected_replicas: AtomicI64::new(0),
+            role_changes: AtomicU64::new(0),
             replicas_changed: tokio::sync::Notify::new(),
             repl_id: RwLock::new(generate_repl_id()),
             startup_digest: parking_lot::Mutex::new(None),
@@ -4400,6 +4404,14 @@ pub async fn wait_for_replicas(
                 }
                 Ok(crate::commands::blocking::Unblock::Timeout) => {
                     return reply(targets.count(state));
+                }
+                // The sweep of a role change (#591), which may come before
+                // the look at `is_slave` above: either ends the wait, once.
+                Ok(crate::commands::blocking::Unblock::RoleChange) => {
+                    return WaitEnd {
+                        reply: UNBLOCKED_ROLE_CHANGE.to_vec(),
+                        close: true,
+                    };
                 }
                 Err(_) => unblockable = false,
             },

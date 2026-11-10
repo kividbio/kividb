@@ -1766,6 +1766,8 @@ fn do_fsync() {
     if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
+    // A test holds the sync here, as a slow disk would: `WAITAOF` waits.
+    failpoint("fsync");
     // Under `appendfsync always`, a sync that fails stops the server, here
     // as for a reply: logged and passed over, its error would be gone for
     // the next sync, which would answer replies with their writes lost.
