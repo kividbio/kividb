@@ -506,7 +506,8 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let def = &def;
     let resp = ctx.resp;
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
-    let mut num_docs = count_docs(&ctx.store[*ctx.selected_db], def, cluster);
+    // The index's own database, whichever the client has selected.
+    let mut num_docs = count_docs(&ctx.store[def.db_index], def, cluster);
     // In a cluster, the documents of every master.
     if crate::cluster::search::coordinates(ctx) {
         let owned: Vec<Vec<u8>> = ctx.cmd.iter().map(|a| a.to_vec()).collect();

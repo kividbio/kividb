@@ -67,7 +67,7 @@ impl<'a> ReadShards<'a> {
 }
 
 /// The same for writing: what makes a write of several keys one step.
-struct WriteShards<'a> {
+pub(super) struct WriteShards<'a> {
     shards: usize,
     held: Vec<(usize, store::ShardWrite<'a>)>,
 }
@@ -93,7 +93,7 @@ impl<'a> WriteShards<'a> {
     ///
     /// Out of line: `SET` is in the same `handle`, and must not pay for it.
     #[inline(never)]
-    fn lock<'k>(db: &'a store::Db, keys: impl Iterator<Item = &'k [u8]>) -> Self {
+    pub(super) fn lock<'k>(db: &'a store::Db, keys: impl Iterator<Item = &'k [u8]>) -> Self {
         let indexes = shards_of(db, keys);
         let mut held = Vec::with_capacity(indexes.len());
         // The shard last found busy, held from when it was waited for.
@@ -126,7 +126,7 @@ impl<'a> WriteShards<'a> {
     }
 
     /// The table `key` is in. The key must be one this was locked for.
-    fn map(&mut self, key: &[u8]) -> &mut store::ShardMap {
+    pub(super) fn map(&mut self, key: &[u8]) -> &mut store::ShardMap {
         let index = store::shard_index(self.shards, key);
         let at = self
             .held
