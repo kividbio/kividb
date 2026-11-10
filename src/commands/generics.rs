@@ -263,7 +263,7 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
     key.extend_from_slice(elem);
     key.extend_from_slice(suffix);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
-    let now = std::time::Instant::now();
+    let now = crate::types::field_now();
     let mut tried = false;
     loop {
         let map = read_lock!(shard);
@@ -283,7 +283,11 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
                 let name = crate::key_bytes::text_of(field);
                 let inner = h.read();
                 let value = inner.fields.get(&*name)?;
-                if inner.expiries.get(&*name).is_none_or(|at| *at > now) {
+                if inner
+                    .expiries
+                    .get(&*name)
+                    .is_none_or(|at| !crate::types::field_due(*at, now))
+                {
                     return Some(value.to_vec());
                 }
                 match crate::field_expiry::policy(ctx.store) {

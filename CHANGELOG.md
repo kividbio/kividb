@@ -145,6 +145,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A hash field's deadline is kept to the millisecond everywhere, and a
+  replica holds the master's (#594, #489).** A field's deadline was kept as
+  a monotonic clock reading and converted to and from Unix milliseconds by
+  reading both clocks each time, so a round trip could land on the next
+  millisecond: `HPEXPIRETIME` read back 1 ms off what `HPEXPIREAT` set, now
+  and then, after `MIGRATE`, `DUMP` and `RESTORE`, a restart, an AOF replay
+  or a full sync. A relative time to live (`HPEXPIRE`, `HEXPIRE`, `EX` and
+  `PX` of `HSETEX` and `HGETEX`) was sent to replicas and the AOF worked out
+  apart from the master's own deadline, up to 1 ms earlier. A deadline is
+  now kept as Unix milliseconds by the wall clock, as Redis keeps it and as
+  every file, payload and stream carries it: nothing is converted, the
+  master sends the very number it keeps, and each of these reads back
+  exactly. As in Redis and as for a key here, the deadline follows the wall
+  clock (a clock set back or forward moves when fields go), and a field
+  lives through the millisecond its deadline is in. A field with a time to
+  live takes about 10 bytes less (52 where it took 62), and `HSETEX`,
+  `HPEXPIRE`, `HGET` and `HPEXPIRETIME` on such hashes cost no more
+  instructions than before (1 to 5% fewer).
+
 - **A master that becomes a replica ends its blocked clients, as Redis
   does (#591).** On `REPLICAOF`, `CLUSTER REPLICATE`, or a cluster failover
   that demotes it, every client blocked in `BLPOP`, `BRPOP`, `BLMOVE`,
