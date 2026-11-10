@@ -40,6 +40,12 @@ pub async fn handle_replica_connection_uring(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
+    // However this ends, the socket is shut down: dropped, the forwarder's and
+    // the ACK reader's operations still hold it open (and a stuck write its
+    // buffer) until they complete, which for a replica that reads nothing is
+    // never. Shut down, they complete at once.
+    let _shutdown = ShutdownOnDrop(Rc::clone(&stream));
+
     // ── 1. The stream queue. Unbounded: bounded queues fill before forwarding runs.
     let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let replica_id = crate::replication::next_replica_id();
@@ -48,7 +54,10 @@ pub async fn handle_replica_connection_uring(
     // decrements it after each successful flush. Lets the hub evict us if we fall
     // far enough behind instead of queueing an unbounded backlog — see
     // `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the connection ends, also before the
+    // forwarder runs, and says so.
+    let replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // ── 2. A replica that only lost its connection is sent what it missed.
     // Failing that, take the cut: register with the hub and serialise the
@@ -111,10 +120,16 @@ pub async fn handle_replica_connection_uring(
         Some(_) => None,
     };
     if let Some(greeting) = greeting {
-        let (res, _) = stream.write_all(greeting.into_bytes()).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            return Err(e.into());
+        match write_unless_let_go(&stream, greeting.into_bytes(), &repl_state, replica_id).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                return Err(e.into());
+            }
+            None => {
+                let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                return Ok(());
+            }
         }
     }
 
@@ -123,7 +138,7 @@ pub async fn handle_replica_connection_uring(
     // Blocks on `recv()` (event-driven) — no polling, no re-issued ops.
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel::<()>();
     let stream_fwd = Rc::clone(&stream);
-    let forward_task = tokio_uring::spawn(async move {
+    let mut forward_task = tokio_uring::spawn(async move {
         if rdb_enqueued_rx.await.is_err() {
             return;
         }
@@ -135,24 +150,37 @@ pub async fn handle_replica_connection_uring(
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
+                return;
+            }
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        pending_bytes
-                            .fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let _ = stream_fwd.write_all(batch).await;
+                        pending_bytes.taken(batch.len(), held);
+                        if !pending_bytes.abandoned() {
+                            let _ = stream_fwd.write_all(batch).await;
+                        }
                         return;
                     }
                 }
             }
-            pending_bytes.fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            pending_bytes.taken(batch.len(), held);
             if stream_fwd.write_all(batch).await.0.is_err() {
                 break;
             }
@@ -165,17 +193,27 @@ pub async fn handle_replica_connection_uring(
             replica.set_state(crate::replication::ReplicaState::SendBulk);
         }
         let header = format!("${}\r\n", sync.payload.len()).into_bytes();
-        let (res, _) = stream.write_all(header).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            drop(rdb_enqueued_tx);
-            return Err(e.into());
-        }
-        let (res, _) = stream.write_all(sync.payload).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            drop(rdb_enqueued_tx);
-            return Err(e.into());
+        for part in [header, sync.payload] {
+            // A replica that stops reading during its full sync is let go of
+            // once its queue passes its limit: the write is given up then,
+            // rather than waited on for good with its queue held (#542).
+            match write_unless_let_go(&stream, part, &repl_state, replica_id).await {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                    drop(rdb_enqueued_tx);
+                    return Err(e.into());
+                }
+                None => {
+                    log_warn!(
+                        "Replication: uring: replica {endpoint} let go of during its full sync"
+                    );
+                    let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                    drop(rdb_enqueued_tx);
+                    forward_task.abort();
+                    return Ok(());
+                }
+            }
         }
         log_info!("Replication: uring: sent full RDB; streaming queued writes from hub");
     }
@@ -234,19 +272,51 @@ pub async fn handle_replica_connection_uring(
 
     tokio::select! {
         _ = ack_reader => {}
-        _ = forward_task => {}
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        _ = &mut forward_task => {}
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
         }
     }
 
+    // The forwarder ends with the connection. Left running when the ACK
+    // reader, `repl-timeout` or the hub letting go of the replica ended it,
+    // it kept the socket open and the replica's queue allocated after the
+    // hub had forgotten both.
+    forward_task.abort();
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
     log_info!("Replication: uring: replica disconnected");
     Ok(())
+}
+
+/// Shuts a replica's socket down when dropped (see
+/// `handle_replica_connection_uring`).
+struct ShutdownOnDrop(Rc<TcpStream>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Write `buf` to a replica, unless it goes silent or the hub lets go of it
+/// first (`None`; see `ReplState::replica_timed_out`).
+async fn write_unless_let_go(
+    stream: &TcpStream,
+    buf: Vec<u8>,
+    repl_state: &crate::replication::ReplState,
+    replica_id: u64,
+) -> Option<std::io::Result<()>> {
+    tokio::select! {
+        (res, _) = stream.write_all(buf) => Some(res),
+        _ = repl_state.replica_timed_out(replica_id) => None,
+    }
 }
 
 #[inline(always)]
@@ -620,6 +690,14 @@ fn open_subscriptions(
     subs
 }
 
+/// The address a client connected to: `laddr` in `CLIENT LIST`.
+fn local_address(stream: &TcpStream) -> Option<std::net::SocketAddr> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
+    // SAFETY: `stream` owns `fd` and outlives this borrow of it.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    socket2::SockRef::from(&fd).local_addr().ok()?.as_socket()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
     stream: TcpStream,
@@ -658,7 +736,12 @@ pub async fn handle_client(
     let client_id = crate::client_registry::next_client_id();
     let (mut client_info, mut kill_rx) =
         crate::client_registry::ClientInfo::new(client_id, peer_addr.clone());
-    client_info.laddr = format!("{}:{}", config.bind, config.port);
+    // The socket's own address, as Redis shows it (#566): not the bind
+    // setting, which can be 0.0.0.0.
+    client_info.laddr = local_address(&stream).map_or_else(
+        || format!("{}:{}", config.bind, config.port),
+        |a| a.to_string(),
+    );
     let activity = Arc::clone(&client_info.activity);
     let query_buffer = Arc::clone(&client_info.query_buffer);
     // `CLIENT REPLY`.
@@ -1353,22 +1436,8 @@ pub async fn handle_client(
             if authenticated_user.is_none()
                 && !matches!(cmd_name.as_str(), "AUTH" | "QUIT" | "HELLO" | "RESET")
             {
-                // Log unauthenticated access attempt
-                let entry = crate::acl::AclLogEntry {
-                    id: acl_log.next_id(),
-                    reason: "auth".into(),
-                    context: "toplevel".into(),
-                    object: cmd_name.to_lowercase(),
-                    username: "default".into(),
-                    age_seconds: 0.0,
-                    client_info: peer_addr.clone(),
-                    timestamp_created: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    count: 1,
-                };
-                acl_log.push(entry);
+                // As in Redis, nothing goes to the ACL log: no user was
+                // refused anything.
                 out_buf.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
                 parse_offset += consumed;
                 continue;
@@ -1381,14 +1450,41 @@ pub async fn handle_client(
                     .get(username.as_str())
                     .and_then(|user| crate::acl::check_permission(user, &cmd_name, &cmd).err());
                 if let Some(denied) = denied {
-                    acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                    // As in Redis, a command there is no such command as, or
+                    // with the wrong number of arguments, is refused for that
+                    // before the user's rules are looked at.
+                    let refusal = if !commands::server::is_command(&cmd_name) {
+                        commands::handler::unknown_command(&cmd)
+                    } else if let Some(wrong) = commands::arity::check(&cmd_name, &cmd) {
+                        wrong
+                    } else if tx.active && commands::transaction::not_allowed_in_multi(&cmd_name) {
+                        crate::resp::write::resp_error(commands::transaction::NOT_IN_MULTI)
+                    } else {
+                        let _context = tx.active.then(|| crate::acl::log_context("multi"));
+                        acl_log.record(
+                            denied.reason(),
+                            denied.object(),
+                            username,
+                            &crate::acl::log_client_info(&client_registry, client_id, &peer_addr),
+                        );
+                        format!("-{}\r\n", denied.message(username)).into_bytes()
+                    };
                     // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
-                    // for a command refused for any other reason (#159).
-                    if tx.active {
-                        tx.aborted = true;
-                    }
-                    out_buf
-                        .extend_from_slice(format!("-{}\r\n", denied.message(username)).as_bytes());
+                    // for a command refused for any other reason (#159). A refused
+                    // EXEC discards the transaction, as in Redis.
+                    let reply = commands::transaction::reject(
+                        &mut tx,
+                        &cmd,
+                        watch_registry.as_ref(),
+                        &dirty_flag,
+                        commands::transaction::Monitored {
+                            registry: &monitor_registry,
+                            db: selected_db,
+                            peer_addr: &peer_addr,
+                        },
+                        refusal,
+                    );
+                    out_buf.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
                 }
@@ -1433,7 +1529,9 @@ pub async fn handle_client(
             // connection stays a client until it asks again; so is one of a
             // master that lost its dataset (`ReplState::psync_offer`).
             // A replica does not take replicas of its own (#144).
-            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
+            // Inside MULTI they are refused, as in Redis (`queue_refusal`), and
+            // the transaction with them: they do not hand the connection over.
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && !tx.active && repl_state.is_slave() {
                 out_buf.extend_from_slice(&crate::resp::write::resp_error(
                     crate::replication::NOT_A_MASTER,
                 ));
@@ -1441,6 +1539,7 @@ pub async fn handle_client(
                 continue;
             }
             if cmd_name == "PSYNC"
+                && !tx.active
                 && let Some(offer) =
                     repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
             {
@@ -1448,7 +1547,7 @@ pub async fn handle_client(
                 parse_offset += consumed;
                 continue;
             }
-            if cmd_name == "PSYNC" || cmd_name == "SYNC" {
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && !tx.active {
                 parse_offset += consumed;
                 connection_handoff = Some(ConnectionHandoff::Replica {
                     legacy_sync: cmd_name == "SYNC",
@@ -1480,26 +1579,19 @@ pub async fn handle_client(
                 "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" | "RESET"
             ) && let Some(wrong) = commands::arity::check(&cmd_name, &cmd)
             {
-                if cmd_name == "EXEC" {
-                    watch_registry.as_ref().unwatch_all(
-                        &tx.watched_keys
-                            .iter()
-                            .map(|_| Arc::clone(&dirty_flag))
-                            .collect::<Vec<_>>(),
-                    );
-                    tx.reset();
-                    dirty_flag.store(false, std::sync::atomic::Ordering::Release);
-                    let why = String::from_utf8_lossy(&wrong);
-                    out_buf.extend_from_slice(&crate::resp::write::resp_error(&format!(
-                        "EXECABORT Transaction discarded because of: {}",
-                        why.trim_start_matches('-').trim_end()
-                    )));
-                } else {
-                    if tx.active {
-                        tx.aborted = true;
-                    }
-                    out_buf.extend_from_slice(&wrong);
-                }
+                let reply = commands::transaction::reject(
+                    &mut tx,
+                    &cmd,
+                    watch_registry.as_ref(),
+                    &dirty_flag,
+                    commands::transaction::Monitored {
+                        registry: &monitor_registry,
+                        db: selected_db,
+                        peer_addr: &peer_addr,
+                    },
+                    wrong,
+                );
+                out_buf.extend_from_slice(&reply);
                 parse_offset += consumed;
                 continue;
             }
@@ -1601,7 +1693,10 @@ pub async fn handle_client(
                     }
                     tracking_table.unregister_client(client_id);
                     monitoring = None;
+                    // `HIMPORT` fieldsets are the connection's state (#566).
+                    crate::commands::hash_import::forget_client(client_id);
                     client_registry.update(client_id, |info| {
+                        info.no_evict = false;
                         info.resp = 2;
                         info.name = String::new();
                         info.tracking = false;
@@ -1952,14 +2047,11 @@ pub async fn handle_client(
                             let count = queued.len();
                             let mut exec_out = format!("*{count}\r\n").into_bytes();
 
-                            // Hoist outside the loop — name won't change mid-transaction
-                            let client_name_for_slowlog = client_registry
-                                .get(client_id)
-                                .map(|info| info.name.clone())
-                                .unwrap_or_default();
-
                             // A plain FLUSHALL here is not counted as lazily freed.
                             let _queued = crate::lazyfree::running_queued();
+                            // What the queued commands write to the ACL log is
+                            // in context `multi`, as in Redis.
+                            let _context = crate::acl::log_context("multi");
                             for queued_cmd in queued {
                                 let queued_name = queued_cmd
                                     .first()
@@ -2032,6 +2124,8 @@ pub async fn handle_client(
                                                     .as_deref()
                                                     .unwrap_or("default"),
                                                 peer_addr: &peer_addr,
+                                                client_registry: &client_registry,
+                                                client_id,
                                                 repl_state: &repl_state,
                                                 wait_targets: wait_targets.as_deref(),
                                             },
@@ -2144,7 +2238,12 @@ pub async fn handle_client(
                                         &raw_cmd,
                                         elapsed_us,
                                         &peer_addr,
-                                        client_name_for_slowlog.clone(),
+                                        // The name now: a queued CLIENT SETNAME
+                                        // or HELLO may have changed it.
+                                        client_registry
+                                            .get(client_id)
+                                            .map(|info| info.name.clone())
+                                            .unwrap_or_default(),
                                     );
                                 }
 
@@ -2270,67 +2369,37 @@ pub async fn handle_client(
                 }
 
                 "WAIT" if !tx.active => {
-                    if cmd.len() < 3 {
-                        b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec()
-                    } else {
-                        let num_replicas: i64 =
-                            std::str::from_utf8(cmd.get(1).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-
-                        let timeout_ms: u64 =
-                            std::str::from_utf8(cmd.get(2).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-
-                        let connected = repl_state
-                            .connected_replicas
-                            .load(std::sync::atomic::Ordering::Relaxed);
-
-                        if num_replicas == 0 || connected == 0 {
-                            crate::resp::write::resp_integer(connected).to_vec()
-                        } else {
-                            // See the tokio loop in server.rs: per-replica
-                            // targets, taken after a hub barrier.
-                            let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
-                            if hub_tx
-                                .send(crate::replication::HubMsg::Barrier(barrier_tx))
-                                .is_ok()
-                            {
-                                let _ = barrier_rx.await;
-                            }
-                            let targets = repl_state.wait_targets();
-
-                            let deadline = tokio::time::Instant::now()
-                                + tokio::time::Duration::from_millis(if timeout_ms == 0 {
-                                    u64::MAX
-                                } else {
-                                    timeout_ms
-                                });
-
+                    match crate::replication::wait_args(&cmd, repl_state.is_slave()) {
+                        Err(refusal) => refusal,
+                        Ok((wanted, timeout_ms)) => {
+                            // A blocked client while it waits, as in Redis:
+                            // `b` in CLIENT LIST, counted in
+                            // `blocked_clients`, and ended by CLIENT UNBLOCK.
+                            let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+                            let _blocked = (wanted > 0).then(|| {
+                                client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
+                            });
                             let waited = unless_gone(
-                                async {
-                                    loop {
-                                        let acked =
-                                            crate::replication::ReplState::count_reached(&targets);
-                                        if acked >= num_replicas
-                                            || tokio::time::Instant::now() >= deadline
-                                        {
-                                            break crate::resp::write::resp_integer(acked).to_vec();
-                                        }
-                                        // Let the worker park so tokio-uring submits
-                                        // the replica writes and reads needed for ACKs.
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
-                                            .await;
-                                    }
-                                },
+                                crate::replication::wait_for_replicas(
+                                    &repl_state,
+                                    &hub_tx,
+                                    wanted,
+                                    timeout_ms,
+                                    unblock_rx,
+                                ),
                                 &peer_watch,
                             )
                             .await;
                             match waited {
-                                Some(reply) => reply,
+                                Some(end) if end.close => {
+                                    // This master became a replica: told so,
+                                    // and closed, as Redis closes it.
+                                    out_buf.extend_from_slice(&end.reply);
+                                    parse_offset += consumed;
+                                    quit_requested = true;
+                                    break;
+                                }
+                                Some(end) => end.reply,
                                 // The client has gone: there is nobody to answer.
                                 None => {
                                     quit_requested = true;

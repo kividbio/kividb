@@ -58,8 +58,15 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
 
     // Anything past this point requires cluster mode for now.
     // (ADDSLOTS / SETSLOT / MEET come in later steps; until they exist we
-    // return the same error redis-cli expects, instead of "unknown".)
+    // return the same error redis-cli expects, instead of "unknown".) A
+    // subcommand there is no such thing as is unknown either way, as in
+    // Redis.
     if !state.enabled {
+        if crate::commands::arity::of(&format!("CLUSTER|{sub}")).is_none()
+            && !matches!(sub, "MIGRATION" | "SYNCSLOTS")
+        {
+            return unknown_cluster_subcommand(ctx);
+        }
         return resp_error("ERR This instance has cluster support disabled");
     }
 
@@ -86,8 +93,87 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "MIGRATION" => cmd_migration(ctx),
         // Node-to-node half of CLUSTER MIGRATION; not for clients.
         "SYNCSLOTS" => cmd_syncslots(ctx),
-        other => resp_error(&format!("ERR Unknown CLUSTER subcommand '{other}'")),
+        "HELP" if ctx.cmd.len() == 2 => cluster_help(),
+        _ => unknown_cluster_subcommand(ctx),
     }
+}
+
+/// Redis's reply to a `CLUSTER` subcommand there is no such thing as.
+fn unknown_cluster_subcommand(ctx: &Ctx) -> Vec<u8> {
+    resp_error(&format!(
+        "ERR unknown subcommand '{}'. Try CLUSTER HELP.",
+        String::from_utf8_lossy(ctx.cmd[1])
+    ))
+}
+
+/// `CLUSTER HELP`, Redis 8.10's lines (#562).
+fn cluster_help() -> Vec<u8> {
+    const LINES: &[&str] = &[
+        "CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "COUNTKEYSINSLOT <slot>",
+        "    Return the number of keys in <slot>.",
+        "GETKEYSINSLOT <slot> <count>",
+        "    Return key names stored by current node in a slot.",
+        "INFO",
+        "    Return information about the cluster.",
+        "KEYSLOT <key>",
+        "    Return the hash slot for <key>.",
+        "MYID",
+        "    Return the node id.",
+        "MYSHARDID",
+        "    Return the node's shard id.",
+        "NODES",
+        "    Return cluster configuration seen by node. Output format:",
+        "    <id> <ip:port@bus-port[,hostname]> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ...",
+        "REPLICAS <node-id>",
+        "    Return <node-id> replicas.",
+        "SLOTS",
+        "    Return information about slots range mappings. Each range is made of:",
+        "    start, end, master and replicas IP addresses, ports and ids",
+        "SLOT-STATS",
+        "    Return an array of slot usage statistics for slots assigned to the current node.",
+        "SHARDS",
+        "    Return information about slot range mappings and the nodes associated with them.",
+        "ADDSLOTS <slot> [<slot> ...]",
+        "    Assign slots to current node.",
+        "ADDSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...]",
+        "    Assign slots which are between <start-slot> and <end-slot> to current node.",
+        "BUMPEPOCH",
+        "    Advance the cluster config epoch.",
+        "COUNT-FAILURE-REPORTS <node-id>",
+        "    Return number of failure reports for <node-id>.",
+        "DELSLOTS <slot> [<slot> ...]",
+        "    Delete slots information from current node.",
+        "DELSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...]",
+        "    Delete slots information which are between <start-slot> and <end-slot> from current node.",
+        "FAILOVER [FORCE|TAKEOVER]",
+        "    Promote current replica node to being a master.",
+        "FORGET <node-id>",
+        "    Remove a node from the cluster.",
+        "FLUSHSLOTS",
+        "    Delete current node own slots information.",
+        "MEET <ip> <port> [<bus-port>]",
+        "    Connect nodes into a working cluster.",
+        "REPLICATE <node-id>",
+        "    Configure current node as replica to <node-id>.",
+        "RESET [HARD|SOFT]",
+        "    Reset current node (default: soft).",
+        "SET-CONFIG-EPOCH <epoch>",
+        "    Set config epoch of current node.",
+        "SETSLOT <slot> (IMPORTING <node-id>|MIGRATING <node-id>|STABLE|NODE <node-id>)",
+        "    Set slot state.",
+        "SAVECONFIG",
+        "    Force saving cluster configuration on disk.",
+        "LINKS",
+        "    Return information about all network links between this node and its peers.",
+        "    Output format is an array where each array element is a map containing attributes of a link",
+        "MIGRATION IMPORT <start-slot end-slot [start-slot end-slot ...]> |",
+        "          STATUS [ID <task-id> | ALL] | CANCEL [ID <task-id> | ALL]",
+        "    Start, monitor and cancel slot migration.",
+        "HELP",
+        "    Print this help.",
+    ];
+    resp_array(LINES.iter().map(|line| resp_simple(line)).collect())
 }
 
 // ── CLUSTER MYID ─────────────────────────────────────────────────────────────

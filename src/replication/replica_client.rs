@@ -2316,12 +2316,14 @@ where
     // ── 1. The stream queue. The hub starts filling it at the cut below.
     // Must be **unbounded**: the forwarding task doesn't drain until the payload is sent; a bounded
     // queue hits capacity during long dumps and evicts the replica (connected_slaves goes to 0).
-    let (replica_tx, mut replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
+    let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel();
     // Shared with the hub: it increments this on enqueue, we decrement it after each
     // successful flush. Lets the hub evict us if we fall far enough behind instead of
     // queueing an unbounded backlog — see `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the forwarder ends, and says so.
+    let mut replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // The forwarder writes to the socket itself, one batch at a time, as the
     // io_uring loop's does. Handed to the writer task, the replica's queue
@@ -2351,26 +2353,40 @@ where
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes_fwd.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
+                return;
+            }
 
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
 
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
-                        write_batch(batch).await;
+                        pending_bytes_fwd.taken(batch.len(), held);
+                        if !pending_bytes_fwd.abandoned() {
+                            write_batch(batch).await;
+                        }
                         return;
                     }
                 }
             }
 
-            pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+            pending_bytes_fwd.taken(batch.len(), held);
             if !write_batch(batch).await {
                 break;
             }
@@ -2458,17 +2474,37 @@ where
     // counted against `maxmemory`, rather than in the writer's behind the
     // payload, which was; and the payload is let go of once it is written.
     // Nothing is queued for the writer task before these.
-    {
+    //
+    // Raced against the replica going silent or being let go of: one that
+    // stops reading during its full sync is let go of once its queue passes
+    // its limit, and the write is given up then, rather than waited on for
+    // good with its queue and the payload held (#542).
+    let sent = {
         use tokio::io::AsyncWriteExt;
         let mut out = writer.lock().await;
-        for frame in frames {
-            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(frame.len() as u64, Ordering::Relaxed);
-            if out.write_all(&frame).await.is_err() {
-                rollback_hub(&hub_tx, replica_id);
-                drop(rdb_enqueued_tx);
-                return Ok(());
+        let write_frames = async {
+            for frame in frames {
+                crate::stats::TOTAL_NET_OUTPUT_BYTES
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                if out.write_all(&frame).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        };
+        tokio::select! {
+            sent = write_frames => sent,
+            _ = repl_state.replica_timed_out(replica_id) => {
+                log_warn!("Replication: replica {endpoint} let go of during its full sync");
+                false
             }
         }
+    };
+    if !sent {
+        rollback_hub(&hub_tx, replica_id);
+        drop(rdb_enqueued_tx);
+        forward_task.abort();
+        return Ok(());
     }
     drop(payload_not_counted);
 
@@ -2537,16 +2573,22 @@ where
         _ = &mut forward_task => {
             drop(resp_tx);
         }
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
             forward_task.abort();
             write_task.abort();
         }
     }
+    // However the connection ended, its forwarder ends with it: left
+    // running, it held the replica's queue after the hub had forgotten it.
+    forward_task.abort();
     ack_reader_task.abort();
 
     // Hub drops channel list + ACK + connected_slaves (paired with hub RegisterChannel fetch_add).

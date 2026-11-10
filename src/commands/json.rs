@@ -1179,7 +1179,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             let bound = |at: usize| arg(cmd, at).and_then(|s| s.parse::<i64>().ok());
             let (start, stop) = (bound(4).unwrap_or(0), bound(5).unwrap_or(0));
-            read_doc(ctx, key, resp_null_bulk(), |root| {
+            // A key that does not exist is no path, as in RedisJSON.
+            read_doc(ctx, key, resp_error(PATH_MISSING), |root| {
                 let search = |value: &Value| -> Option<i64> {
                     let items = value.as_array()?;
                     let from = clamp_index(start, items.len());

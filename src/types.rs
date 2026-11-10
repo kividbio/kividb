@@ -604,6 +604,23 @@ impl TsInner {
         if self.duplicate_policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
             return Err(BLOCKED_DUPLICATE);
         }
+        let policy = self.duplicate_policy.clone();
+        self.add_sample_as(ts, value, &policy)
+    }
+
+    /// [`Self::add_sample`], with `policy` for a sample already at `ts` in
+    /// place of the series' own: `TS.ADD … ON_DUPLICATE`, and `TS.INCRBY`,
+    /// which replaces the latest value whatever the series' policy.
+    pub fn add_sample_as(
+        &mut self,
+        ts: u64,
+        value: f64,
+        policy: &DuplicatePolicy,
+    ) -> Result<u64, &'static str> {
+        // Refused before anything changes: the trim below is a change too.
+        if *policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
+            return Err(BLOCKED_DUPLICATE);
+        }
         // Enforce retention: trim samples older than (ts - retention)
         if self.retention > 0 && ts >= self.retention {
             let cutoff = ts - self.retention;
@@ -624,7 +641,7 @@ impl TsInner {
         }
 
         if let Some(&existing) = self.samples.get(&ts) {
-            match self.duplicate_policy {
+            match policy {
                 DuplicatePolicy::Block => return Err(BLOCKED_DUPLICATE),
                 DuplicatePolicy::First => { /* keep existing, do nothing */ }
                 DuplicatePolicy::Last => {

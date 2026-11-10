@@ -805,7 +805,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if secs < 0 {
                 return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
-            let Some(at_ms) = field_deadline_ms(secs, true, now_ms() as i64) else {
+            let Some(at_ms) = field_deadline_after(secs, true) else {
                 return Some(invalid_field_expire_time("HEXPIRE"));
             };
             let (flag, fields) = match parse_hfe_tail(
@@ -815,7 +815,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(t) => t,
                 Err(e) => return Some(e),
             };
-            let results = apply_field_expire(ctx, &key, &fields, at_ms as u64, flag, secs == 0);
+            let results = apply_field_expire(ctx, &key, &fields, at_ms, flag, secs == 0);
             // results is already a Vec<Vec<u8>> of resp_integer / resp_error.
             // If a single WRONGTYPE error was returned, surface that directly.
             if results.len() == 1 && results[0].starts_with(b"-") {
@@ -842,7 +842,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if ms < 0 {
                 return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
-            let Some(at_ms) = field_deadline_ms(ms, false, now_ms() as i64) else {
+            let Some(at_ms) = field_deadline_after(ms, false) else {
                 return Some(invalid_field_expire_time("HPEXPIRE"));
             };
             let (flag, fields) = match parse_hfe_tail(
@@ -852,7 +852,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(t) => t,
                 Err(e) => return Some(e),
             };
-            let results = apply_field_expire(ctx, &key, &fields, at_ms as u64, flag, ms == 0);
+            let results = apply_field_expire(ctx, &key, &fields, at_ms, flag, ms == 0);
             if results.len() == 1 && results[0].starts_with(b"-") {
                 return Some(results.into_iter().next().unwrap());
             }
@@ -1982,34 +1982,23 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 };
                 // Past the latest deadline Redis allows: refused, as by Redis.
                 let relative = matches!(tok.as_str(), "EX" | "PX");
-                if n > 0
-                    && field_deadline_ms(
-                        n,
-                        matches!(tok.as_str(), "EX" | "EXAT"),
-                        if relative { now_ms() as i64 } else { 0 },
-                    )
-                    .is_none()
-                {
+                let secs = matches!(tok.as_str(), "EX" | "EXAT");
+                if !relative && n > 0 && field_deadline_ms(n, secs, 0).is_none() {
                     return Some(invalid_field_expire_time("HGETEX"));
                 }
                 if !relative && let Some(refused) = negative_unix_time(ctx, n) {
                     return Some(refused);
                 }
-                let now_ms = now_ms();
                 let act = match tok.as_str() {
                     "EX" | "PX" if n < 0 => {
                         return Some(resp_error("ERR invalid expire time, must be >= 0"));
                     }
                     // 0 is now: the fields go, as in Redis 8.10.
-                    "EX" | "PX" if n == 0 => HgetexAction::SetExpiryPast(now_ms),
-                    "EX" | "PX" => {
-                        let ms = if tok == "EX" {
-                            (n as u64).saturating_mul(1000)
-                        } else {
-                            n as u64
-                        };
-                        HgetexAction::SetExpiry(now_ms.saturating_add(ms))
-                    }
+                    "EX" | "PX" if n == 0 => HgetexAction::SetExpiryPast(now_ms()),
+                    "EX" | "PX" => match field_deadline_after(n, secs) {
+                        Some(at_ms) => HgetexAction::SetExpiry(at_ms),
+                        None => return Some(invalid_field_expire_time("HGETEX")),
+                    },
                     _ => {
                         let at_ms = if tok == "EXAT" {
                             (n.max(0) as u64).saturating_mul(1000)
@@ -2428,11 +2417,11 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Legacy form: the TTL in seconds comes straight after the key.
     let legacy_expiry = match integer(cmd[2]) {
         Some(secs) if secs > 0 => {
-            let Some(at_ms) = field_deadline_ms(secs, true, now_ms() as i64) else {
+            let Some(deadline) = field_deadline_after(secs, true) else {
                 return Some(invalid_field_expire_time("HSETEX"));
             };
             idx = 3;
-            Some(at_ms as u64)
+            Some(deadline)
         }
         Some(_) => return Some(resp_error("ERR invalid expire time, must be > 0")),
         None => None,
@@ -2477,34 +2466,23 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 };
                 // Past the latest deadline Redis allows: refused, as by Redis.
                 let relative = matches!(tok.as_str(), "EX" | "PX");
-                if n > 0
-                    && field_deadline_ms(
-                        n,
-                        matches!(tok.as_str(), "EX" | "EXAT"),
-                        if relative { now_ms() as i64 } else { 0 },
-                    )
-                    .is_none()
-                {
+                let secs = matches!(tok.as_str(), "EX" | "EXAT");
+                if !relative && n > 0 && field_deadline_ms(n, secs, 0).is_none() {
                     return Some(invalid_field_expire_time("HSETEX"));
                 }
                 if !relative && let Some(refused) = negative_unix_time(ctx, n) {
                     return Some(refused);
                 }
-                let now_ms = now_ms();
                 ttl = Some(match tok.as_str() {
                     "EX" | "PX" if n < 0 => {
                         return Some(resp_error("ERR invalid expire time, must be >= 0"));
                     }
                     // 0 is now: the fields are set and go, as in Redis 8.10.
-                    "EX" | "PX" if n == 0 => HsetexTtl::Past(now_ms),
-                    "EX" | "PX" => {
-                        let ms = if tok == "EX" {
-                            (n as u64).saturating_mul(1000)
-                        } else {
-                            n as u64
-                        };
-                        HsetexTtl::Set(now_ms.saturating_add(ms))
-                    }
+                    "EX" | "PX" if n == 0 => HsetexTtl::Past(now_ms()),
+                    "EX" | "PX" => match field_deadline_after(n, secs) {
+                        Some(at_ms) => HsetexTtl::Set(at_ms),
+                        None => return Some(invalid_field_expire_time("HSETEX")),
+                    },
                     // A Unix time, kept as it came (#594).
                     _ => {
                         let at_ms = if tok == "EXAT" {

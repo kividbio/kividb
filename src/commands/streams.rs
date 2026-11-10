@@ -1301,6 +1301,30 @@ fn entries_read_arg(raw: &[u8]) -> Result<u64, Vec<u8>> {
     }
 }
 
+/// Redis's reply to an `XGROUP` subcommand on a key that does not exist.
+const XGROUP_NO_KEY: &str = "ERR The XGROUP subcommand requires the key to exist. \
+     Note that for CREATE you may want to use the MKSTREAM option to create an \
+     empty stream automatically.";
+
+/// A `HELP` reply: the lines given, between Redis's first and last lines.
+fn help_reply(command: &str, lines: &[&str]) -> Vec<u8> {
+    let mut out = vec![resp_simple(&format!(
+        "{command} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"
+    ))];
+    out.extend(lines.iter().map(|line| resp_simple(line)));
+    out.push(resp_simple("HELP"));
+    out.push(resp_simple("    Print this help."));
+    resp_array(out)
+}
+
+/// Redis's reply to a subcommand a command does not have.
+fn unknown_subcommand(command: &str, sub: &[u8]) -> Vec<u8> {
+    resp_error(&format!(
+        "ERR unknown subcommand '{}'. Try {command} HELP.",
+        String::from_utf8_lossy(sub)
+    ))
+}
+
 pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
     let (key, group, id_str, mkstream, entries_read) = {
         let cmd = &ctx.cmd;
@@ -1310,25 +1334,35 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
 
         let key: Vec<u8> = cmd[2].to_vec();
         let group = crate::types::StreamName::from(cmd[3]);
-        let id_str = std::str::from_utf8(cmd[4]).unwrap_or("$").to_string();
+        // An ID that is not UTF-8 is no ID, and is refused as one; it was
+        // taken as `$` (#576).
+        let id_str = std::str::from_utf8(cmd[4]).unwrap_or_default().to_string();
 
-        let mkstream = cmd.iter().any(|b| {
-            std::str::from_utf8(b)
-                .map(|s| s.eq_ignore_ascii_case("MKSTREAM"))
-                .unwrap_or(false)
-        });
-        let entries_read = match cmd[5..]
-            .windows(2)
-            .find(|w| w[0].eq_ignore_ascii_case(b"ENTRIESREAD"))
-        {
-            // Not said: not known. It is worked out, where it can be, when
-            // the group first reads. See `stream_extra::Shape`.
-            None => ConsumerGroup::NO_COUNT,
-            Some(w) => match entries_read_arg(w[1]) {
-                Ok(n) => n,
-                Err(e) => return e,
-            },
-        };
+        // The options come after the ID, and are all options, as Redis
+        // parses them: a key or group called `mkstream` was taken for the
+        // option, and an unknown word was ignored (#576).
+        let mut mkstream = false;
+        // Not said: not known. It is worked out, where it can be, when the
+        // group first reads. See `stream_extra::Shape`.
+        let mut entries_read = ConsumerGroup::NO_COUNT;
+        let mut at = 5;
+        while at < cmd.len() {
+            if cmd[at].eq_ignore_ascii_case(b"MKSTREAM") {
+                mkstream = true;
+                at += 1;
+            } else if cmd[at].eq_ignore_ascii_case(b"ENTRIESREAD") && at + 1 < cmd.len() {
+                match entries_read_arg(cmd[at + 1]) {
+                    Ok(n) => entries_read = n,
+                    Err(e) => return e,
+                }
+                at += 2;
+            } else {
+                return resp_error(&format!(
+                    "ERR unknown subcommand or wrong number of arguments for '{}'. Try XGROUP HELP.",
+                    String::from_utf8_lossy(cmd[1])
+                ));
+            }
+        }
 
         (key, group, id_str, mkstream, entries_read)
         // ← &ctx.cmd borrow ends here
@@ -1339,7 +1373,7 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db_ref, &key);
         let map = read_lock!(shard);
         if !map.contains_key(key.as_slice()) && !mkstream {
-            return resp_error("ERR The XGROUP subcommand requires the key to exist");
+            return resp_error(XGROUP_NO_KEY);
         }
     }
 
@@ -1400,7 +1434,7 @@ pub fn xgroup_destroy(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_integer(0),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             resp_integer(inner.groups.remove(group).is_some() as i64)
@@ -1435,7 +1469,7 @@ pub fn xgroup_setid(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error("ERR no such key"),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             let added = inner.entries_added;
@@ -1491,7 +1525,7 @@ pub fn xgroup_createconsumer(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error("ERR no such key"),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
@@ -1534,7 +1568,7 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error("ERR no such key"),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
@@ -2242,7 +2276,8 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                     .unwrap_or_default();
 
                 // Consumer → pending count
-                let mut per_consumer: AHashMap<&[u8], i64> = AHashMap::new();
+                // By name, as Redis lists them (#564).
+                let mut per_consumer: BTreeMap<&[u8], i64> = BTreeMap::new();
                 for pel in g.pel.values() {
                     *per_consumer.entry(pel.consumer.as_bytes()).or_insert(0) += 1;
                 }
@@ -2729,6 +2764,19 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
 
 pub fn xinfo(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
+    if cmd.len() == 2 && cmd[1].eq_ignore_ascii_case(b"HELP") {
+        return help_reply(
+            "XINFO",
+            &[
+                "CONSUMERS <key> <groupname>",
+                "    Show consumers of <groupname>.",
+                "GROUPS <key>",
+                "    Show the stream consumer groups.",
+                "STREAM <key> [FULL [COUNT <count>]",
+                "    Show information about the stream.",
+            ],
+        );
+    }
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'xinfo' command");
     }
@@ -2739,7 +2787,7 @@ pub fn xinfo(ctx: &mut Ctx) -> Vec<u8> {
         "STREAM" => xinfo_stream(ctx),
         "GROUPS" => xinfo_groups(ctx),
         "CONSUMERS" => xinfo_consumers(ctx),
-        _ => resp_error("ERR unknown subcommand for XINFO"),
+        _ => unknown_subcommand("XINFO", cmd[1]),
     }
 }
 
@@ -3141,7 +3189,26 @@ pub fn xgroup(ctx: &mut Ctx) -> Vec<u8> {
         "SETID" => xgroup_setid(ctx),
         "CREATECONSUMER" => xgroup_createconsumer(ctx),
         "DELCONSUMER" => xgroup_delconsumer(ctx),
-        _ => resp_error("ERR unknown subcommand for XGROUP"),
+        "HELP" if cmd.len() == 2 => help_reply(
+            "XGROUP",
+            &[
+                "CREATE <key> <groupname> <id|$> [option]",
+                "    Create a new consumer group. Options are:",
+                "    * MKSTREAM",
+                "      Create the empty stream if it does not exist.",
+                "    * ENTRIESREAD entries_read",
+                "      Set the group's entries_read counter (internal use).",
+                "CREATECONSUMER <key> <groupname> <consumer>",
+                "    Create a new consumer in the specified group.",
+                "DELCONSUMER <key> <groupname> <consumer>",
+                "    Remove the specified consumer.",
+                "DESTROY <key> <groupname>",
+                "    Remove the specified group.",
+                "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
+                "    Set the current group ID and entries_read counter.",
+            ],
+        ),
+        _ => unknown_subcommand("XGROUP", cmd[1]),
     }
 }
 

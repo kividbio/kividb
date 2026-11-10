@@ -1278,6 +1278,43 @@ const BUSY_WITH_SCRIPT: &str =
     "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
 const BUSY_WITH_FUNCTION: &str =
     "BUSY Redis is busy running a script. You can only call FUNCTION KILL or SHUTDOWN NOSAVE.";
+/// `SCRIPT KILL` or `FUNCTION KILL` with nothing running.
+const NOT_BUSY: &str = "NOTBUSY No scripts in execution right now.";
+
+/// The `BUSY` reply to a command refused while a script runs: it names the
+/// command that stops what is running, `FUNCTION KILL` for a function and
+/// `SCRIPT KILL` for a script, as Redis's does.
+pub(crate) fn busy_reply() -> Vec<u8> {
+    if RUNNING_FUNCTION.lock().is_some() {
+        resp_error(BUSY_WITH_FUNCTION)
+    } else {
+        resp_error(BUSY_WITH_SCRIPT)
+    }
+}
+
+/// Whether `source` compiles, as `SCRIPT LOAD` asks before it keeps a
+/// script: Redis compiles it there and refuses one that does not. Checked
+/// in a VM of its own, so that a script running in the shared one is not
+/// waited for. As `EVAL` runs it: an expression (`1 + 1`) is taken too.
+fn script_compiles(source: &str) -> Result<(), String> {
+    let (body, _) = preprocess_eval_script(source).map_err(|e| format!("ERR {e}"))?;
+    let lua = Lua::new();
+    if lua
+        .load(format!("return {body}"))
+        .set_name("=user_script")
+        .into_function()
+        .is_ok()
+    {
+        return Ok(());
+    }
+    match lua.load(body).set_name("=user_script").into_function() {
+        Ok(_) => Ok(()),
+        Err(LuaError::SyntaxError { message, .. }) => Err(format!(
+            "ERR Error compiling script (new function): {message}"
+        )),
+        Err(e) => Err(format!("ERR Error compiling script (new function): {e}")),
+    }
+}
 
 /// `SCRIPT KILL` (`function == false`) or `FUNCTION KILL`: each stops what
 /// its own kind of call started, and is refused while the other kind runs.
@@ -1293,7 +1330,7 @@ fn kill_running(function: bool) -> Vec<u8> {
         return resp_simple("OK");
     }
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
-        return resp_error("ERR No scripts in execution.");
+        return resp_error(NOT_BUSY);
     }
     match (function, RUNNING_FUNCTION.lock().is_some()) {
         (false, true) => resp_error(BUSY_WITH_FUNCTION),
@@ -1304,7 +1341,7 @@ fn kill_running(function: bool) -> Vec<u8> {
 
 fn dispatch_lua_script_kill() -> Vec<u8> {
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
-        return resp_error("ERR No scripts in execution.");
+        return resp_error(NOT_BUSY);
     }
     if LUA_HOLDER_WROTE.load(Ordering::SeqCst) {
         return resp_error(
@@ -4949,23 +4986,37 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
             );
         }
     }
-    let libraries = std::mem::take(&mut *function_store().write());
-    let names = std::mem::take(&mut *fn_name_to_library().write());
-    let vm = match lua_vms_renew_for_admin(&[Vm::Functions]) {
-        Ok(vm) => vm,
-        Err(LuaVmBusy) => {
-            return resp_error(
-                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-            );
-        }
-    };
+    let asynchronous = ctx.cmd.len() == 3 && ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC");
+    match flush_functions(asynchronous) {
+        Ok(()) => resp_simple("OK"),
+        Err(LuaVmBusy) => resp_error(BUSY_RUNNING_A_SCRIPT),
+    }
+}
+
+/// Drop every library, unless a script holds the VM.
+///
+/// Refused before anything is taken: a refused flush changes nothing. It
+/// used to empty the store first, and its BUSY reply then left the
+/// libraries gone here while the replicas, which are not sent a refused
+/// command, kept them (#559). The libraries are taken out under the same
+/// hold of the VM's lock as the check, so no script runs between the two.
+fn flush_functions(asynchronous: bool) -> Result<(), LuaVmBusy> {
+    // One lock at a time: the store's is let go of before the name map's is
+    // taken. Held together, in this order, they deadlocked against
+    // `rebuild_fn_name_map_from_store`, which took them the other way round
+    // (a `FUNCTION RESTORE` beside the flush).
+    let (vm, (libraries, names)) = lua_vms_renew_for_admin_and(&[Vm::Functions], || {
+        let libraries = std::mem::take(&mut *function_store().write());
+        let names = std::mem::take(&mut *fn_name_to_library().write());
+        (libraries, names)
+    })?;
     // `ASYNC`: the VM and the libraries are freed in the background, and
     // counted as Redis counts them, a function each and one for the VM.
-    if ctx.cmd.len() == 3 && ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC") {
+    if asynchronous {
         let functions: u64 = libraries.values().map(|l| l.functions.len() as u64).sum();
         crate::lazyfree::free_later((vm, libraries, names), functions + 1);
     }
-    resp_simple("OK")
+    Ok(())
 }
 
 /// Take each of `vms` out under one hold of the lock, for the next script
@@ -4979,6 +5030,16 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
 /// (with cjson, cmsgpack, bit and the read-only proxies) is about 50 KB,
 /// where Redis's suite allows a flushed functions VM 40000 bytes.
 fn lua_vms_renew_for_admin(vms: &[Vm]) -> Result<Vec<Lua>, LuaVmBusy> {
+    lua_vms_renew_for_admin_and(vms, || ()).map(|(old, ())| old)
+}
+
+/// [`lua_vms_renew_for_admin`], running `then` too before the lock is let
+/// go, and only if the VMs were renewed. The lock is taken before any of the
+/// function store's: `then` may take those, as a script does.
+fn lua_vms_renew_for_admin_and<R>(
+    vms: &[Vm],
+    then: impl FnOnce() -> R,
+) -> Result<(Vec<Lua>, R), LuaVmBusy> {
     let mut guard = LUA_VM.try_lock().ok_or(LuaVmBusy)?;
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) != 0 {
         return Err(LuaVmBusy);
@@ -4989,7 +5050,9 @@ fn lua_vms_renew_for_admin(vms: &[Vm]) -> Result<Vec<Lua>, LuaVmBusy> {
         vm.generation().fetch_add(1, Ordering::Release);
         old.extend(guard.of(vm).take());
     }
-    Ok(old)
+    let done = then();
+    drop(guard);
+    Ok((old, done))
 }
 
 fn function_stats() -> Vec<u8> {
@@ -5239,10 +5302,12 @@ fn merge_function_libraries(
     }
 }
 
+/// The store's lock is taken before the name map's, as everywhere both are
+/// held.
 fn rebuild_fn_name_map_from_store() {
+    let store = function_store().read();
     let mut m = fn_name_to_library().write();
     m.clear();
-    let store = function_store().read();
     for lib in store.values() {
         for fname in &lib.functions {
             m.insert(fname.clone(), lib.name.clone());
@@ -5459,7 +5524,7 @@ fn redis_function_dispatch(ctx: &mut Ctx) -> Vec<u8> {
             ],
         ),
         _ => resp_error(&format!(
-            "ERR unknown subcommand '{}'",
+            "ERR unknown subcommand '{}'. Try FUNCTION HELP.",
             String::from_utf8_lossy(ctx.cmd[1])
         )),
     }
@@ -5479,6 +5544,9 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 Ok(s) => s,
                 Err(_) => return resp_error("ERR script is not valid UTF-8"),
             };
+            if let Err(e) = script_compiles(source) {
+                return resp_error(&e);
+            }
             let sha = sha1_hex(source);
             // Loaded again, it stays the copy that is already compiled.
             script_store()
@@ -5528,7 +5596,16 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
             ),
         },
         "KILL" => kill_running(false),
-        "DEBUG" => resp_simple("OK"),
+        "DEBUG" => match ctx.cmd.get(2) {
+            Some(mode)
+                if [&b"YES"[..], b"SYNC", b"NO"]
+                    .iter()
+                    .any(|m| mode.eq_ignore_ascii_case(m)) =>
+            {
+                resp_simple("OK")
+            }
+            _ => resp_error("ERR Use SCRIPT DEBUG YES/SYNC/NO"),
+        },
         "HELP" => resp_array(
             [
                 "SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -5554,8 +5631,8 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
             .collect(),
         ),
         _ => resp_error(&format!(
-            "ERR unknown subcommand '{}' for SCRIPT",
-            sub.to_lowercase()
+            "ERR unknown subcommand '{}'. Try SCRIPT HELP.",
+            String::from_utf8_lossy(ctx.cmd[1])
         )),
     }
 }
@@ -5572,5 +5649,67 @@ mod lua_busy_allow_tests {
         assert!(lua_command_allowed_while_busy(&[b"SCRIPT", b"KILL"]));
         assert!(!lua_command_allowed_while_busy(&[b"FUNCTION", b"LIST"]));
         assert!(!lua_command_allowed_while_busy(&[b"PING"]));
+    }
+
+    /// A flush and a rebuild of the name map (what `FUNCTION RESTORE` ends
+    /// with) at the same time never deadlock. The flush held the store's
+    /// lock while it took the name map's, and the rebuild took them the
+    /// other way round.
+    #[test]
+    fn a_flush_beside_a_rebuild_of_the_name_map_does_not_deadlock() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for flusher in [true, false] {
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200_000 {
+                    if flusher {
+                        let _ = flush_functions(false);
+                    } else {
+                        rebuild_fn_name_map_from_store();
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a flush and a rebuild of the name map deadlocked");
+        }
+    }
+
+    /// A `FUNCTION FLUSH` refused because a script holds the VM leaves the
+    /// libraries where they were (#559).
+    #[test]
+    fn a_refused_function_flush_keeps_the_libraries() {
+        let (lib, function) = ("flush_refused_559", "flush_refused_559_f");
+        let held = LUA_VM.lock();
+        function_store().write().insert(
+            lib.to_string(),
+            FunctionLibrary {
+                name: lib.to_string(),
+                engine: "LUA".to_string(),
+                body: String::new(),
+                functions: vec![function.to_string()],
+                registered: Vec::new(),
+            },
+        );
+        fn_name_to_library()
+            .write()
+            .insert(function.to_string(), lib.to_string());
+
+        let refused = flush_functions(false);
+        let kept = function_store().read().contains_key(lib);
+        let named = fn_name_to_library().read().contains_key(function);
+        function_store().write().remove(lib);
+        fn_name_to_library().write().remove(function);
+        drop(held);
+
+        assert!(refused.is_err());
+        assert!(kept, "the library was taken out by a refused flush");
+        assert!(
+            named,
+            "the function's name was taken out by a refused flush"
+        );
     }
 }
