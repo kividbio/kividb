@@ -164,7 +164,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Tcl
-        run: sudo apt-get install -y tcl tcllib
+        timeout-minutes: 10
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y tcl tcllib
 
       # The release KiviDB reports itself as (`redis_version` in INFO): an
       # older suite fails it for what that release added, such as the
