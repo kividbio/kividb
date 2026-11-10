@@ -27,6 +27,20 @@ def _decode(v):
     return v.decode() if isinstance(v, bytes) else v
 
 
+def _spellcheck_words(raw):
+    """The suggested words of each misspelled term of a raw FT.SPELLCHECK
+    reply, in either of RediSearch's shapes: RESP2
+    ``[["TERM", term, [[score, word], ...]], ...]`` or RESP3
+    ``{"results": {term: [{word: score}, ...]}}``."""
+    if isinstance(raw, dict):
+        results = {_decode(k): v for k, v in raw.items()}["results"]
+        return {
+            _decode(term): [_decode(w) for s in suggestions for w in s]
+            for term, suggestions in results.items()
+        }
+    return {_decode(e[1]): [_decode(s[1]) for s in e[2]] for e in raw}
+
+
 def _ft_search_knn(client, index, query_vec, k, field="embedding", extra_params=None):
     """
     Issue FT.SEARCH KNN and return (total: int, results: list[tuple[str, dict[str,str]]]).
@@ -1084,10 +1098,7 @@ class TestFtSpellcheckIncremental:
             raw = rb.execute_command(
                 "FT.SPELLCHECK", idx, "helo", "DISTANCE", "1"
             )
-            entry = raw[0]
-            suggestions = entry[2]
-            words = [_decode(s[1]) for s in suggestions]
-            assert "hello" in words
+            assert "hello" in _spellcheck_words(raw)["helo"]
 
             # Brand-new word added — should be queryable right away
             rb.hset(b"sp:2", mapping={b"body": b"zephyr"})
@@ -1096,10 +1107,7 @@ class TestFtSpellcheckIncremental:
             raw2 = rb.execute_command(
                 "FT.SPELLCHECK", idx, "zephir", "DISTANCE", "1"
             )
-            entry2 = raw2[0]
-            suggestions2 = entry2[2]
-            words2 = [_decode(s[1]) for s in suggestions2]
-            assert "zephyr" in words2
+            assert "zephyr" in _spellcheck_words(raw2)["zephir"]
         finally:
             try:
                 rb.execute_command("FT.DROPINDEX", idx)
@@ -1127,11 +1135,52 @@ class TestFtSpellcheckIncremental:
             raw = rb.execute_command(
                 "FT.SPELLCHECK", idx, "delt", "DISTANCE", "1"
             )
-            entry = raw[0]
-            suggestions = entry[2]
-            words = [_decode(s[1]) for s in suggestions]
-            assert "delta" in words, \
+            assert "delta" in _spellcheck_words(raw)["delt"], \
                 "vocab should aggregate across all TEXT fields"
+        finally:
+            try:
+                rb.execute_command("FT.DROPINDEX", idx)
+            except Exception:
+                pass
+
+    def test_redis_py_parses_spellcheck_in_both_protocols(self, rb):
+        """redis-py's own parser (``ft().spellcheck``) reads the reply the
+        same way over RESP2 and RESP3, as it does RediSearch's: scores are
+        the share of documents holding the word, and a word no document
+        holds any more is not offered."""
+        idx = "sp_rpy_idx"
+        rb.execute_command(
+            "FT.CREATE", idx,
+            "ON", "HASH", "PREFIX", "1", "sprp:",
+            "SCHEMA", "body", "TEXT",
+        )
+        try:
+            for i, body in enumerate([b"hello world", b"hello there", b"held", b"other", b"help"]):
+                rb.hset(f"sprp:{i}".encode(), mapping={b"body": body})
+            rb.delete(b"sprp:4")  # "help": in no document any more
+            time.sleep(0.02)
+
+            got = rb.ft(idx).spellcheck("helo")
+            if b"results" in got or "results" in got:
+                # redis-py's default (legacy) responses hand RESP3's map
+                # back as it came, as they do from RediSearch.
+                results = got.get(b"results", got.get("results"))
+                got = {
+                    _decode(term): [
+                        (repr(score), _decode(word))
+                        for s in suggestions
+                        for word, score in s.items()
+                    ]
+                    for term, suggestions in results.items()
+                }
+            else:
+                got = {
+                    _decode(term): [
+                        (_decode(s["score"]), _decode(s["suggestion"])) for s in suggestions
+                    ]
+                    for term, suggestions in got.items()
+                }
+            assert got == {"helo": [("0.5", "hello"), ("0.25", "held")]}, got
         finally:
             try:
                 rb.execute_command("FT.DROPINDEX", idx)

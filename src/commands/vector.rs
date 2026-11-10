@@ -1400,40 +1400,14 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
 
-    // ── Read the per-index vocabulary ─────────────────────────────────────
-    //
-    // The vocab is maintained incrementally by maybe_index and backfill_index.
-    // We clone the Arc to drop the IndexStore lock before doing the lookup
-    // loop — keeps the fast path uncontended.
-    let text_arc = {
-        let store = ctx.index_store.read();
-        let def = match store.get(&index_name) {
-            Some(d) => d,
-            None => {
-                return Some(resp_error(&crate::commands::search::no_such_index(
-                    &index_name,
-                )));
-            }
-        };
-        Arc::clone(&def.text)
+    // The index first, as RediSearch looks it up before the rest.
+    let Some(def) = ctx.index_store.read().get(&index_name).cloned() else {
+        return Some(resp_error(&crate::commands::search::no_such_index(
+            &index_name,
+        )));
     };
 
-    // Take a read lock on the vocab itself. We need to convert it into a
-    // BTreeSet<String> we can mutate (for INCLUDE/EXCLUDE dicts), so clone
-    // the contents. For a typical 100k-word vocab this is a few MB — cheap
-    // compared to the avoided shard walk.
-    //
-    // The vocab is then a local owned BTreeSet; we drop the read lock before
-    // any further work so concurrent HSETs can keep updating the index.
-    let mut vocab: BTreeSet<String> = text_arc.read().words().map(str::to_string).collect();
-
-    // AFTER the vocab-building loop over shards,
-    // this block is used to merge in any INCLUDE dicts and remove EXCLUDE dicts.
-    // First, re-parse TERMS INCLUDE/EXCLUDE from the command:
-
-    // Parse TERMS INCLUDE|EXCLUDE dict clauses
-    // These appear after DISTANCE in the command args.
-    // We re-scan cmd here since we already consumed i above.
+    // The TERMS INCLUDE|EXCLUDE clauses.
     let mut include_dicts: Vec<String> = Vec::new();
     let mut exclude_dicts: Vec<String> = Vec::new();
     let mut j = 3usize;
@@ -1477,80 +1451,114 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
 
-    // Merge INCLUDE dicts into vocabulary. The words of the EXCLUDE dicts
-    // are spelled right: a query word among them gets no entry, as in
-    // RediSearch. (They used to be taken out of the vocabulary, which made
-    // a word of both the index and the dictionary misspelled.)
+    // The dictionaries, each of which must exist, the INCLUDE ones first,
+    // as RediSearch checks them (before anything else is read). A query word
+    // in an EXCLUDE dictionary is spelled right and gets no entry. The words
+    // of an INCLUDE dictionary are offered as suggestions too, but a query
+    // word that is only in one is still misspelled.
+    let mut included: BTreeSet<String> = BTreeSet::new();
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     {
         let dict_store = ctx.dict_store.read();
-        for dict_name in &include_dicts {
-            if let Some(dict) = dict_store.get(dict_name) {
-                vocab.extend(dict.iter().cloned());
-            }
-        }
-        for dict_name in &exclude_dicts {
-            if let Some(dict) = dict_store.get(dict_name) {
-                excluded.extend(dict.iter().cloned());
+        for (names, into) in [
+            (&include_dicts, &mut included),
+            (&exclude_dicts, &mut excluded),
+        ] {
+            for dict_name in names {
+                match dict_store.get(dict_name) {
+                    Some(dict) => into.extend(dict.iter().cloned()),
+                    None => {
+                        return Some(resp_error(&format!("Dict does not exist: {dict_name}")));
+                    }
+                }
             }
         }
     }
 
-    // For each token in the query, check if it's in the vocabulary.
-    // If not, find all vocab words within max_distance edits.
-    //
-    // Redis response format per term:
-    //   ["TERM", term, [[score, suggestion], [score, suggestion], ...]]
-    // Score = 1.0 - (edit_distance / max(len_a, len_b)) — higher is better.
+    // The words some document holds, each with how many do, read in one
+    // pass and cloned, so that the lock is let go of before the edit
+    // distances are measured. A word no document holds any more is neither
+    // spelled right nor offered, as in RediSearch once its GC has run.
+    let vocab: std::collections::BTreeMap<String, usize> = {
+        let text = def.text.read();
+        text.live_words()
+            .map(|(id, word)| (word.to_string(), text.df(id)))
+            .collect()
+    };
 
+    // What RediSearch divides a word's document count by: every document of
+    // the index (`docs.size - 1`), as `FT.INFO`'s `num_docs` counts them.
+    let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
+    let total_docs =
+        crate::commands::search::count_docs(&ctx.store[def.db_index], &def, cluster).max(1) as f64;
+
+    // RediSearch's reply per misspelled word, RESP2:
+    //   ["TERM", word, [[score, suggestion], ...]]
+    // and RESP3: {"results": {word: [{suggestion: score}, ...], ...}}.
+    // A suggestion's score is the share of the index's documents that hold
+    // it (`spell_check.c`), best first, written as Redis writes a double; a
+    // word only in an INCLUDE dictionary scores 0.
+    let resp3 = ctx.resp == 3;
+    let score = |docs: usize| -> Vec<u8> {
+        let digits = crate::commands::helpers::format_score(docs as f64 / total_docs);
+        if resp3 {
+            format!(",{digits}\r\n").into_bytes()
+        } else {
+            resp_bulk_str(&digits)
+        }
+    };
     let mut out: Vec<Vec<u8>> = Vec::new();
 
     // The query's words as the index has them, so that `world_x` and
     // `users\.u_1` are the words the vocabulary holds.
     for token_clean in crate::vector::tokenize_for_vocab(&query) {
-        if token_clean.is_empty() || vocab.contains(&token_clean) || excluded.contains(&token_clean)
+        if token_clean.is_empty()
+            || vocab.contains_key(&token_clean)
+            || excluded.contains(&token_clean)
         {
             continue; // correctly spelled — skip
         }
 
-        // Find candidates within edit distance
-        let mut candidates: Vec<(f64, &str)> = vocab
+        let near = |word: &str| levenshtein(&token_clean, word) <= max_distance;
+        let mut candidates: Vec<(usize, &str)> = vocab
             .iter()
-            .filter_map(|word| {
-                let dist = levenshtein(&token_clean, word);
-                if dist <= max_distance && dist > 0 {
-                    // Normalize score: 1.0 = identical, lower = more edits needed
-                    let max_len = token_clean.len().max(word.len()) as f64;
-                    let score = 1.0 - (dist as f64 / max_len);
-                    Some((score, word.as_str()))
+            .filter(|(word, _)| near(word))
+            .map(|(word, &docs)| (docs, word.as_str()))
+            .collect();
+        for word in &included {
+            if !vocab.contains_key(word) && near(word) {
+                candidates.push((0, word.as_str()));
+            }
+        }
+        // Best first; words of one score in order, to be the same each time.
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+
+        let suggestions: Vec<Vec<u8>> = candidates
+            .iter()
+            .map(|&(docs, word)| {
+                if resp3 {
+                    resp_map(vec![resp_bulk_str(word), score(docs)])
                 } else {
-                    None
+                    resp_array(vec![score(docs), resp_bulk_str(word)])
                 }
             })
             .collect();
 
-        // Sort by score descending (best suggestions first)
-        candidates.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-
-        // Build the suggestion sub-array: [[score, word], ...]
-        let suggestions: Vec<Vec<u8>> = candidates
-            .iter()
-            .map(|(score, word)| {
-                resp_array(vec![
-                    resp_bulk_str(&format!("{:.4}", score)),
-                    resp_bulk_str(word),
-                ])
-            })
-            .collect();
-
-        // Each term result: ["TERM", token, [suggestions]]
-        out.push(resp_array(vec![
-            resp_bulk_str("TERM"),
-            resp_bulk_str(&token_clean),
-            resp_array(suggestions),
-        ]));
+        if resp3 {
+            out.push(resp_bulk_str(&token_clean));
+            out.push(resp_array(suggestions));
+        } else {
+            out.push(resp_array(vec![
+                resp_bulk_str("TERM"),
+                resp_bulk_str(&token_clean),
+                resp_array(suggestions),
+            ]));
+        }
     }
 
+    if resp3 {
+        return Some(resp_map(vec![resp_bulk_str("results"), resp_map(out)]));
+    }
     Some(resp_array(out))
 }
 
