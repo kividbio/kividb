@@ -32,16 +32,14 @@ impl Login<'_> {
     /// `auth`, the user named, and the command as the client sent it
     /// (`command`, `AUTH` or `HELLO`) as the object.
     ///
-    /// Users and passwords are text here: a name or a password that is not
-    /// UTF-8 is no user's. (They were read as `default`, and as an empty
-    /// password.)
+    /// The password is any bytes, as in Redis: a `nopass` user takes any,
+    /// and one set by its hash (`#<sha256>`) is checked against the bytes
+    /// sent. User names are text here: one that is not UTF-8 is no user's.
+    /// (It was read as `default`, and such a password as an empty one.)
     fn log_in(&mut self, command: &[u8], username: &[u8], password: &[u8]) -> bool {
-        let user = match (std::str::from_utf8(username), std::str::from_utf8(password)) {
-            (Ok(username), Ok(password)) => {
-                crate::acl::authenticate(self.acl_store, username, password)
-            }
-            _ => None,
-        };
+        let user = std::str::from_utf8(username)
+            .ok()
+            .and_then(|username| crate::acl::authenticate(self.acl_store, username, password));
         match user {
             Some(user) => {
                 self.become_user(&user);
@@ -52,7 +50,11 @@ impl Login<'_> {
                     "auth",
                     &String::from_utf8_lossy(command),
                     &String::from_utf8_lossy(username),
-                    self.peer_addr,
+                    &crate::acl::log_client_info(
+                        self.client_registry,
+                        self.client_id,
+                        self.peer_addr,
+                    ),
                 );
                 false
             }

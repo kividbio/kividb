@@ -355,6 +355,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 _ => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            "acllog-max-len" => match value.parse::<usize>() {
+                Ok(v) => {
+                    ctx.acl_log.set_max_len(v);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR value is not an integer or out of range")),
+            },
             "maxmemory" => match memory_size(value) {
                 Some(v) => {
                     crate::RUNTIME_MAXMEMORY.store(v, std::sync::atomic::Ordering::Relaxed);
@@ -1846,6 +1853,7 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             },
         ),
         ("slowlog-max-len", ctx.slowlog.len_cap().to_string()),
+        ("acllog-max-len", ctx.acl_log.max_len().to_string()),
         ("appendonly", yes_no(crate::aof::AOF_ENABLED.load(Relaxed))),
         (
             "loglevel",

@@ -89,6 +89,8 @@ pub struct InExec<'a> {
     pub acl_log: &'a crate::acl::SharedAclLog,
     pub user: &'a str,
     pub peer_addr: &'a str,
+    pub client_registry: &'a crate::client_registry::ClientRegistry,
+    pub client_id: u64,
     pub repl_state: &'a crate::replication::ReplState,
     /// For a queued `WAIT`: the replicas, and what each had been sent, as
     /// `EXEC` began (see `queues_wait`). None when nothing queued waits.
@@ -136,8 +138,12 @@ pub fn connection_reply_in_exec(name: &str, cmd: &[&[u8]], env: &InExec) -> Opti
             .get(env.user)
             .and_then(|user| crate::acl::check_permission(user, name, cmd).err());
         if let Some(denied) = denied {
-            env.acl_log
-                .record(denied.reason(), denied.object(), env.user, env.peer_addr);
+            env.acl_log.record(
+                denied.reason(),
+                denied.object(),
+                env.user,
+                &crate::acl::log_client_info(env.client_registry, env.client_id, env.peer_addr),
+            );
             return Some(crate::resp::write::resp_error(&denied.message(env.user)));
         }
     }

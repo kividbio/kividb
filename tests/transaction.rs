@@ -1455,8 +1455,10 @@ fn test_hello_edge_cases_as_redis() {
     });
 }
 
-/// AUTH as Redis: no more than a user and a password, and a user or a
-/// password that is not UTF-8 is nobody's, not `default`'s.
+/// AUTH as Redis: no more than a user and a password; a password is any
+/// bytes, so a `nopass` user takes one that is not UTF-8, and a user set
+/// by the hash of such bytes is logged in with them; a user name that is
+/// not UTF-8 is nobody's, not `default`'s.
 #[test]
 fn test_auth_arguments_as_redis() {
     on_each_io_model(|port| {
@@ -1478,6 +1480,27 @@ fn test_auth_arguments_as_redis() {
         assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
         assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "default");
         assert!(c.cmds(&["AUTH", "au", "pw"]).is_ok());
+
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "np", "on", "nopass", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(c.cmd(&[&b"AUTH"[..], &b"np"[..], &b"\xff"[..]]).is_ok());
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "np");
+
+        let raw_password = b"\xff\x00pw";
+        let hash = format!("#{}", kividb::acl::sha256_hex(raw_password));
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "hb", "on", &hash, "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(
+            c.cmd(&[&b"AUTH"[..], &b"hb"[..], &raw_password[..]])
+                .is_ok()
+        );
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "hb");
     });
 }
 
@@ -1559,5 +1582,114 @@ fn test_bgrewriteaof_and_failover_are_queued() {
         let replies = exec.as_array();
         assert_eq!(replies.len(), 3);
         assert_eq!(replies[2].as_str(), "PONG");
+    });
+}
+
+/// A queued command refused by rules changed since it was queued is
+/// logged in context `multi`, as Redis's EXEC re-check logs it.
+#[test]
+fn test_the_exec_recheck_is_logged_in_context_multi() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "rc", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "rc", "pw"]).is_ok());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["GET", "rc:k"]).as_str(), "QUEUED");
+        assert!(admin.cmds(&["ACL", "SETUSER", "rc", "-get"]).is_ok());
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert!(replies[0].error_msg().starts_with("NOPERM"), "{replies:?}");
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(field(&log[0], "context"), "multi");
+        assert_eq!(field(&log[0], "object"), "get");
+    });
+}
+
+/// ACL LOG as Redis writes it: ten fields, in its order, `entry-id` from
+/// 0, the client as CLIENT INFO describes it, `age-seconds` a double.
+#[test]
+fn test_acl_log_reply_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "lf", "on", ">pw", "~*", "+@all", "-get"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "lf", "pw"]).is_ok());
+        assert!(c.cmds(&["CLIENT", "SETNAME", "logged"]).is_ok());
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1);
+        let names: Vec<&str> = log[0].iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "count",
+                "reason",
+                "context",
+                "object",
+                "username",
+                "age-seconds",
+                "client-info",
+                "entry-id",
+                "timestamp-created",
+                "timestamp-last-updated"
+            ]
+        );
+        assert_eq!(field(&log[0], "entry-id"), "Int(0)");
+        let client = field(&log[0], "client-info");
+        assert!(
+            client.starts_with("id=")
+                && client.contains(" addr=")
+                && client.contains(" name=logged "),
+            "{client}"
+        );
+        assert!(field(&log[0], "age-seconds").parse::<f64>().is_ok());
+    });
+}
+
+/// `acllog-max-len`: the ACL log keeps that many entries, and none at 0.
+#[test]
+fn test_acllog_max_len() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        let got = admin.cmds(&["CONFIG", "GET", "acllog-max-len"]);
+        assert_eq!(got.as_array()[1].as_str(), "128");
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "ml", "on", ">pw", "~*", "+@all", "-get", "-set", "-del"
+                ])
+                .is_ok()
+        );
+        assert!(
+            admin
+                .cmds(&["CONFIG", "SET", "acllog-max-len", "2"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "ml", "pw"]).is_ok());
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        assert!(c.cmds(&["SET", "k", "v"]).error_msg().starts_with("NOPERM"));
+        assert!(c.cmds(&["DEL", "k"]).error_msg().starts_with("NOPERM"));
+        let log = acl_log(&mut admin);
+        let objects: Vec<&str> = log.iter().map(|e| field(e, "object")).collect();
+        assert_eq!(objects, ["del", "set"]);
+        assert!(
+            admin
+                .cmds(&["CONFIG", "SET", "acllog-max-len", "0"])
+                .is_ok()
+        );
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        assert!(acl_log(&mut admin).is_empty());
     });
 }

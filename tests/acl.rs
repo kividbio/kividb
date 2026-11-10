@@ -881,10 +881,10 @@ fn test_acl_log_records_a_failed_auth_and_not_a_noauth() {
     let entries = log.as_array();
     assert_eq!(entries.len(), 1, "{log:?}");
     let entry = entries[0].as_array();
-    assert_eq!(entry[9].as_str(), "auth");
-    assert_eq!(entry[11].as_str(), "toplevel");
-    assert_eq!(entry[13].as_str(), "AUTH");
-    assert_eq!(entry[15].as_str(), "default");
+    assert_eq!(entry[3].as_str(), "auth");
+    assert_eq!(entry[5].as_str(), "toplevel");
+    assert_eq!(entry[7].as_str(), "AUTH");
+    assert_eq!(entry[9].as_str(), "default");
 }
 
 #[test]
@@ -1997,7 +1997,7 @@ fn test_channel_patterns_are_enforced() {
     assert!(
         log.as_array().iter().any(|entry| {
             let entry = entry.as_array();
-            entry[9].as_str() == "channel" && entry[13].as_str() == "secret"
+            entry[3].as_str() == "channel" && entry[7].as_str() == "secret"
         }),
         "a refused channel is logged: {log:?}"
     );

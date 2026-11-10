@@ -201,7 +201,9 @@ impl AclUser {
     }
 
     /// Whether `password` authenticates this user.
-    pub fn accepts(&self, password: &str) -> bool {
+    /// Whether `password`, as the client sent it (any bytes, as in Redis),
+    /// logs in as this user.
+    pub fn accepts(&self, password: impl AsRef<[u8]>) -> bool {
         self.enabled && (self.nopass || self.passwords.contains(&sha256_hex(password)))
     }
 
@@ -279,9 +281,9 @@ fn describe_permissions(keys: &[KeyPattern], channels: &[String], commands: &str
 
 // ── SHA-256 helper ─────────────────────────────────────────────────────────────
 
-pub fn sha256_hex(input: &str) -> String {
+pub fn sha256_hex(input: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(input.as_bytes());
+    let hash = Sha256::digest(input.as_ref());
     hash.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
@@ -314,7 +316,12 @@ pub const AUTH_WITHOUT_PASSWORD: &str = "-ERR AUTH <password> called without any
     configured for the default user. Are you sure your configuration is correct?\r\n";
 
 /// The user `username` authenticates as with `password`, if it does.
-pub fn authenticate(store: &AclStore, username: &str, password: &str) -> Option<AclUser> {
+pub fn authenticate(
+    store: &AclStore,
+    username: &str,
+    password: impl AsRef<[u8]>,
+) -> Option<AclUser> {
+    let password = password.as_ref();
     let user = store
         .read()
         .get(username)
@@ -348,15 +355,17 @@ pub struct AclLogEntry {
 pub struct AclLog {
     entries: RwLock<std::collections::VecDeque<AclLogEntry>>,
     next_id: std::sync::atomic::AtomicU64,
-    max_len: usize,
+    /// `acllog-max-len`: 0 keeps nothing.
+    max_len: std::sync::atomic::AtomicUsize,
 }
 
 impl AclLog {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(std::collections::VecDeque::new()),
-            next_id: std::sync::atomic::AtomicU64::new(1),
-            max_len: 128,
+            // As Redis's: the first entry is 0.
+            next_id: std::sync::atomic::AtomicU64::new(0),
+            max_len: std::sync::atomic::AtomicUsize::new(128),
         }
     }
 
@@ -367,7 +376,12 @@ impl AclLog {
     /// `entry` is added, with an id of its own.
     pub fn push(&self, mut entry: AclLogEntry) {
         const GROUPING_MS: u64 = 60_000;
+        let max_len = self.max_len();
         let mut log = self.entries.write();
+        if max_len == 0 {
+            log.clear();
+            return;
+        }
         let newest = log.len();
         let matched = (0..newest).rev().take(10).find(|&i| {
             let e = &log[i];
@@ -388,10 +402,10 @@ impl AclLog {
             return;
         }
         entry.id = self.next_id();
-        if log.len() >= self.max_len {
+        log.push_back(entry);
+        while log.len() > max_len {
             log.pop_front();
         }
-        log.push_back(entry);
     }
 
     /// Record a refusal: a command, key or channel the user's rules refuse,
@@ -433,6 +447,17 @@ impl AclLog {
             .collect()
     }
 
+    /// `acllog-max-len`.
+    pub fn max_len(&self) -> usize {
+        self.max_len.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `CONFIG SET acllog-max-len`: taken at the next entry, as in Redis.
+    pub fn set_max_len(&self, max_len: usize) {
+        self.max_len
+            .store(max_len, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn reset(&self) {
         self.entries.write().clear();
     }
@@ -459,16 +484,33 @@ thread_local! {
 /// `context` (`multi` inside a transaction, `lua` inside a script), as
 /// Redis's entries are. Set around code that does not await.
 pub fn log_context(context: &'static str) -> LogContext {
-    LogContext(LOG_CONTEXT.with(|current| current.replace(context)))
+    LogContext(
+        LOG_CONTEXT.with(|current| current.replace(context)),
+        std::marker::PhantomData,
+    )
 }
 
-/// See [`log_context`]: the context before, put back on drop.
-pub struct LogContext(&'static str);
+/// See [`log_context`]: the context before, put back on drop. Not `Send`,
+/// so that a task cannot hold it across an await on the tokio loop.
+pub struct LogContext(&'static str, std::marker::PhantomData<*const ()>);
 
 impl Drop for LogContext {
     fn drop(&mut self) {
         LOG_CONTEXT.with(|current| current.set(self.0));
     }
+}
+
+/// The client in an ACL log entry, as `CLIENT INFO` describes it (Redis
+/// logs `catClientInfoString`); its address if it is not registered.
+pub fn log_client_info(
+    registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    address: &str,
+) -> String {
+    registry.get(client_id).map_or_else(
+        || address.to_string(),
+        |info| info.to_list_line().trim_end().to_string(),
+    )
 }
 
 pub fn new_acl_log() -> SharedAclLog {
@@ -1314,6 +1356,82 @@ pub fn clear_restriction_counters(key_restricted: &mut bool, cmd_restricted: &mu
 
 #[cfg(test)]
 mod tests {
+    /// An entry as `AclLog::push` is given one, at `ms`.
+    fn event(object: &str, client: &str, ms: u64) -> super::AclLogEntry {
+        super::AclLogEntry {
+            id: 0,
+            reason: "command".into(),
+            context: "toplevel".into(),
+            object: object.into(),
+            username: "u".into(),
+            age_seconds: 0.0,
+            client_info: client.into(),
+            timestamp_created: ms,
+            timestamp_last_updated: ms,
+            count: 1,
+        }
+    }
+
+    /// As Redis's `addACLLogEntry`: an event like one of the ten newest
+    /// entries, within 60 s of its last update, is counted in it.
+    #[test]
+    fn the_acl_log_merges_as_redis() {
+        let log = super::AclLog::new();
+        log.push(event("a", "c1", 1_000));
+        log.push(event("b", "c1", 2_000));
+        // Like the older one: counted in it, which becomes the newest, keeps
+        // its id and creation, and takes the new client and time.
+        log.push(event("a", "c2", 3_000));
+        let entries = log.get(usize::MAX);
+        assert_eq!(entries.len(), 2);
+        let a = &entries[0];
+        assert_eq!((a.object.as_str(), a.count, a.id), ("a", 2, 0));
+        assert_eq!(a.timestamp_created, 1_000);
+        assert_eq!(a.timestamp_last_updated, 3_000);
+        assert_eq!(a.client_info, "c2");
+        assert_eq!((entries[1].object.as_str(), entries[1].id), ("b", 1));
+
+        // More than 60 s after its last update: a new entry.
+        log.push(event("a", "c3", 3_000 + 60_001));
+        let entries = log.get(usize::MAX);
+        assert_eq!(entries.len(), 3);
+        assert_eq!((entries[0].count, entries[0].id), (1, 2));
+        // Exactly 60 s: the same one.
+        log.push(event("a", "c4", 3_000 + 60_001 + 60_000));
+        assert_eq!(log.get(1)[0].count, 2);
+
+        // Only the ten newest are looked at.
+        let log = super::AclLog::new();
+        log.push(event("old", "c", 0));
+        for i in 0..10 {
+            log.push(event(&format!("o{i}"), "c", 0));
+        }
+        log.push(event("old", "c", 0));
+        let entries = log.get(usize::MAX);
+        assert_eq!(entries.len(), 12);
+        assert!(entries.iter().all(|e| e.count == 1));
+        // Nine back, it is found.
+        log.push(event("o2", "c", 0));
+        let entries = log.get(usize::MAX);
+        assert_eq!(entries.len(), 12);
+        assert_eq!((entries[0].object.as_str(), entries[0].count), ("o2", 2));
+    }
+
+    /// `acllog-max-len`: the oldest go; 0 keeps nothing.
+    #[test]
+    fn the_acl_log_keeps_acllog_max_len_entries() {
+        let log = super::AclLog::new();
+        log.set_max_len(2);
+        for object in ["a", "b", "c"] {
+            log.push(event(object, "c", 0));
+        }
+        let objects: Vec<String> = log.get(usize::MAX).into_iter().map(|e| e.object).collect();
+        assert_eq!(objects, ["c", "b"]);
+        log.set_max_len(0);
+        log.push(event("d", "c", 0));
+        assert!(log.get(usize::MAX).is_empty());
+    }
+
     use super::*;
 
     fn user(rules: &[&str]) -> AclUser {

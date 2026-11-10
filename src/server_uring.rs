@@ -1378,7 +1378,12 @@ pub async fn handle_client(
                         crate::resp::write::resp_error(commands::transaction::NOT_IN_MULTI)
                     } else {
                         let _context = tx.active.then(|| crate::acl::log_context("multi"));
-                        acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                        acl_log.record(
+                            denied.reason(),
+                            denied.object(),
+                            username,
+                            &crate::acl::log_client_info(&client_registry, client_id, &peer_addr),
+                        );
                         format!("-{}\r\n", denied.message(username)).into_bytes()
                     };
                     // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
@@ -2033,6 +2038,8 @@ pub async fn handle_client(
                                                     .as_deref()
                                                     .unwrap_or("default"),
                                                 peer_addr: &peer_addr,
+                                                client_registry: &client_registry,
+                                                client_id,
                                                 repl_state: &repl_state,
                                                 wait_targets: wait_targets.as_deref(),
                                             },

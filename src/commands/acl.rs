@@ -154,10 +154,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(n) => n,
                     None => return Some(resp_error("ERR value is not an integer or out of range")),
                 };
-                Some(format_acl_log(ctx.acl_log.get(count)))
+                Some(format_acl_log(ctx.acl_log.get(count), ctx.resp))
             } else {
                 // ACL LOG with no args — return all (up to max_len)
-                Some(format_acl_log(ctx.acl_log.get(usize::MAX)))
+                Some(format_acl_log(ctx.acl_log.get(usize::MAX), ctx.resp))
             }
         }
 
@@ -406,19 +406,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
 // ── Format ACL LOG entries as RESP ────────────────────────────────────────────
 
-fn format_acl_log(entries: Vec<AclLogEntry>) -> Vec<u8> {
+/// As Redis's `ACL LOG`: a map of ten fields an entry, in its order.
+fn format_acl_log(entries: Vec<AclLogEntry>, resp: u8) -> Vec<u8> {
     let items: Vec<Vec<u8>> = entries
         .into_iter()
         .map(|e| {
-            resp_array(vec![
-                resp_bulk_str("id"),
-                resp_integer(e.id as i64),
-                resp_bulk_str("timestamp-created"),
-                resp_integer(e.timestamp_created as i64),
-                resp_bulk_str("timestamp-last-updated"),
-                resp_integer(e.timestamp_last_updated as i64),
-                resp_bulk_str("client-info"),
-                resp_bulk_str(&e.client_info),
+            let fields = vec![
+                resp_bulk_str("count"),
+                resp_integer(e.count as i64),
                 resp_bulk_str("reason"),
                 resp_bulk_str(&e.reason),
                 resp_bulk_str("context"),
@@ -428,10 +423,21 @@ fn format_acl_log(entries: Vec<AclLogEntry>) -> Vec<u8> {
                 resp_bulk_str("username"),
                 resp_bulk_str(&e.username),
                 resp_bulk_str("age-seconds"),
-                resp_bulk_str(&format!("{:.3}", e.age_seconds)),
-                resp_bulk_str("count"),
-                resp_integer(e.count as i64),
-            ])
+                resp_double_for(resp, e.age_seconds),
+                resp_bulk_str("client-info"),
+                resp_bulk_str(&e.client_info),
+                resp_bulk_str("entry-id"),
+                resp_integer(e.id as i64),
+                resp_bulk_str("timestamp-created"),
+                resp_integer(e.timestamp_created as i64),
+                resp_bulk_str("timestamp-last-updated"),
+                resp_integer(e.timestamp_last_updated as i64),
+            ];
+            if resp >= 3 {
+                resp_map(fields)
+            } else {
+                resp_array(fields)
+            }
         })
         .collect();
     resp_array(items)

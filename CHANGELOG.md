@@ -237,8 +237,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   log. An `EXEC` refused before it runs is shown to `MONITOR`.
   `BGREWRITEAOF` and `FAILOVER` are queued inside `MULTI`, as in Redis,
   where they were refused. `AUTH` with more than a user and a password is a
-  syntax error. A user name or password that is not UTF-8 matches no user.
-  Before, they were read as `default` and as an empty password.
+  syntax error. A password is now any bytes, as in Redis: a `nopass` user
+  takes one that is not UTF-8, and a user set by the hash of such bytes
+  (`#<sha256>`) logs in with them. Before, such a password was read as an
+  empty one. A user name that is not UTF-8 matches no user. Before, it was
+  read as `default`.
 
 - **The ACL log keeps what Redis's keeps.** A failed `AUTH` or `HELLO ...
   AUTH` is logged with the command as the object (`AUTH`, `HELLO`), not
@@ -247,7 +250,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `toplevel`. A command refused for want of `AUTH` is no longer logged. An
   event like one of the ten newest entries (same reason, context, object
   and user, within 60 seconds) is counted in that entry, and moves its
-  `timestamp-last-updated`, instead of adding another.
+  `timestamp-last-updated`, instead of adding another. `ACL LOG` answers
+  as Redis does: the fields in Redis's order, `entry-id` (not `id`)
+  counting from 0, `client-info` as `CLIENT INFO` describes the client,
+  `age-seconds` as a double, and a map under RESP3. `acllog-max-len` is
+  now a setting (default 128, 0 keeps nothing) in the configuration file,
+  `CONFIG SET` and `CONFIG GET`, where it was accepted and ignored. A
+  client that reads `ACL LOG` entries by position, or by the name `id`,
+  needs to change.
 
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and

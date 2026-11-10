@@ -741,7 +741,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
                 denied.reason(),
                 denied.object(),
                 ctx.authenticated_user,
-                ctx.peer_addr,
+                &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
             );
             let reply = resp_error(&denied.message(ctx.authenticated_user));
             return reply;
@@ -1191,7 +1191,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
                 denied.reason(),
                 denied.object(),
                 ctx.authenticated_user,
-                ctx.peer_addr,
+                &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
             );
             return resp_error(&denied.message(ctx.authenticated_user));
         }
