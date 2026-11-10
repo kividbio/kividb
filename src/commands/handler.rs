@@ -1474,7 +1474,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         None
     };
 
-    let _write_order = if crate::command_gate::alone_on_this_thread() {
+    // Whether a hash command took its key's order shared, having found no
+    // search index: see `ask_again_for_an_index`.
+    let mut hash_beside_others = false;
+    let mut _write_order = if crate::command_gate::alone_on_this_thread() {
         // No other command is running: there is nothing to be ordered
         // against, and the writes made from inside this one take nothing.
         Some(crate::write_order::held_exclusively())
@@ -1486,6 +1489,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // orders (see `write_order::lock_key_shared`). Not while anything
         // reads the write stream: the stream carries the writes to a key in
         // the order they take this lock whole.
+        // `HSET`, `HMSET`, `HSETNX`, `HINCRBY`, `HINCRBYFLOAT`: the only
+        // ones of them that start with an H.
+        hash_beside_others = name.as_bytes()[0] == b'H';
         Some(crate::write_order::lock_key_shared(
             *ctx.selected_db,
             ctx.cmd[1],
@@ -1518,6 +1524,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         None
     };
+    if hash_beside_others && !ctx.index_store.none() {
+        ask_again_for_an_index(ctx, &mut _write_order);
+    }
 
     // HOTKEYS: one relaxed load when no session is running.
     let hotkeys_started = hotkeys::active().then(std::time::Instant::now);
@@ -2048,7 +2057,8 @@ fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
 ///
 /// The hash commands only while no search index is defined: they bring the
 /// indexes up to date after the shard is let go of, and two of them beside
-/// each other could leave an index with the earlier one's fields.
+/// each other could leave an index with the earlier one's fields. Asked
+/// again once the order is held ([`ask_again_for_an_index`], #570).
 ///
 /// Never a command that removes what it finds (`SREM`, `HDEL`, `LPOP`, ...)
 /// or writes back what it read under an earlier hold of the shard
@@ -2066,6 +2076,28 @@ fn atomic_under_its_shard(ctx: &Ctx, name: &str) -> bool {
         "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => ctx.index_store.none(),
         _ => false,
     }
+}
+
+/// A hash command that [`atomic_under_its_shard`] let take its key's order
+/// shared, and that finds a search index now that it holds it: it takes the
+/// order whole instead, before it has touched the store.
+///
+/// It was let because there was no index when it asked, before it held the
+/// order; one may have been added since. The first index is added only once
+/// every write that holds an order is done, and after `none` has become
+/// false (`vector::Indexes::write_to_add`): a write that holds the order
+/// shared and still finds no index is over before that index exists, and
+/// one that finds an index is ordered against its walk, as every other write
+/// of a document is (#570).
+#[cold]
+#[inline(never)]
+fn ask_again_for_an_index(ctx: &Ctx, order: &mut Option<crate::write_order::OrderGuard>) {
+    // Let go of first: the stripe is the one taken next.
+    *order = None;
+    *order = Some(crate::write_order::lock_keys(
+        *ctx.selected_db,
+        std::iter::once(ctx.cmd[1]),
+    ));
 }
 
 /// Commands that can take the last element out of a list, set, sorted set,
