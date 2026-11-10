@@ -2982,3 +2982,114 @@ fn a_snapshot_keeps_json_numbers_exactly() {
         .collect();
     assert_exact("snapshot", &doubles, &got);
 }
+
+// ── JSON.MSET is all or nothing (#551) ──────────────────────────────────────
+//
+// A triple that fails fails the whole command, and the triples before it
+// are not written: an error reply is not sent to replicas or the AOF, so a
+// write kept on the master would be on the master alone.
+
+fn json_doc(c: &mut Conn, key: &str) -> Option<serde_json::Value> {
+    match c.cmds(&["JSON.GET", key]) {
+        RespValue::Nil => None,
+        v => Some(serde_json::from_str(v.as_str()).unwrap()),
+    }
+}
+
+#[test]
+fn test_json_mset_that_fails_writes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["JSON.SET", "a", "$", r#"{"keep":1}"#]).is_ok());
+    assert!(c.cmds(&["SET", "s", "plain"]).is_ok());
+
+    // A new key needs the root path: the issue's case.
+    let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "c", "$.x", "1"]);
+    assert!(
+        r.error_str()
+            .contains("new objects must be created at the root"),
+        "{r:?}"
+    );
+    // WRONGTYPE on a later key.
+    let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "s", "$", "1"]);
+    assert!(r.error_str().starts_with("WRONGTYPE"), "{r:?}");
+    // A legacy path whose parent is not there.
+    let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "a", ".no.such", "1"]);
+    assert!(r.error_str().contains("path does not exist"), "{r:?}");
+    // A new key created by an earlier triple, then a path its value does
+    // not have: the creation is not kept either.
+    let r = c.cmds(&["JSON.MSET", "b", "$", "{}", "b", ".x.y", "1"]);
+    assert!(r.error_str().contains("path does not exist"), "{r:?}");
+    // An earlier triple of the same key takes away what a later one needs.
+    assert!(c.cmds(&["JSON.SET", "d", "$", r#"{"x":{}}"#]).is_ok());
+    let r = c.cmds(&["JSON.MSET", "d", "$", "{}", "d", ".x.y", "1"]);
+    assert!(r.error_str().contains("path does not exist"), "{r:?}");
+
+    assert_eq!(json_doc(&mut c, "a"), Some(serde_json::json!({"keep": 1})));
+    assert_eq!(json_doc(&mut c, "d"), Some(serde_json::json!({"x": {}})));
+    assert_eq!(c.cmds(&["EXISTS", "b", "c"]).as_int(), 0);
+    assert_eq!(c.cmds(&["GET", "s"]).as_str(), "plain");
+}
+
+#[test]
+fn test_json_mset_triples_see_the_ones_before() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // A key made by an earlier triple, then written below the root.
+    assert!(
+        c.cmds(&[
+            "JSON.MSET",
+            "n",
+            "$",
+            "{}",
+            "n",
+            "$.x",
+            "1",
+            "n",
+            ".y",
+            "[1]",
+            "m",
+            "$",
+            "2"
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        json_doc(&mut c, "n"),
+        Some(serde_json::json!({"x": 1, "y": [1]}))
+    );
+    assert_eq!(json_doc(&mut c, "m"), Some(serde_json::json!(2)));
+
+    // An existing key, named twice, and another named once.
+    assert!(c.cmds(&["JSON.SET", "e", "$", r#"{"a":{"b":1}}"#]).is_ok());
+    assert!(
+        c.cmds(&[
+            "JSON.MSET",
+            "e",
+            "$.a.b",
+            "2",
+            "m",
+            "$",
+            "3",
+            "e",
+            "$.a.c",
+            "4"
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        json_doc(&mut c, "e"),
+        Some(serde_json::json!({"a": {"b": 2, "c": 4}}))
+    );
+    assert_eq!(json_doc(&mut c, "m"), Some(serde_json::json!(3)));
+
+    // A TTL on a key that MSET writes stays.
+    assert_eq!(c.cmds(&["EXPIRE", "e", "1000"]).as_int(), 1);
+    assert!(c.cmds(&["JSON.MSET", "e", "$", "1", "e", "$", "5"]).is_ok());
+    assert_eq!(json_doc(&mut c, "e"), Some(serde_json::json!(5)));
+    assert!(c.cmds(&["TTL", "e"]).as_int() > 0);
+}
