@@ -162,7 +162,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lives through the millisecond its deadline is in. A field with a time to
   live takes about 10 bytes less (52 where it took 62), and `HSETEX`,
   `HPEXPIRE`, `HGET` and `HPEXPIRETIME` on such hashes cost no more
-  instructions than before (1 to 10% fewer).
+  instructions than before (1 to 5% fewer).
 
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
