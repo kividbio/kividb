@@ -2474,17 +2474,37 @@ where
     // counted against `maxmemory`, rather than in the writer's behind the
     // payload, which was; and the payload is let go of once it is written.
     // Nothing is queued for the writer task before these.
-    {
+    //
+    // Raced against the replica going silent or being let go of: one that
+    // stops reading during its full sync is let go of once its queue passes
+    // its limit, and the write is given up then, rather than waited on for
+    // good with its queue and the payload held (#542).
+    let sent = {
         use tokio::io::AsyncWriteExt;
         let mut out = writer.lock().await;
-        for frame in frames {
-            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(frame.len() as u64, Ordering::Relaxed);
-            if out.write_all(&frame).await.is_err() {
-                rollback_hub(&hub_tx, replica_id);
-                drop(rdb_enqueued_tx);
-                return Ok(());
+        let write_frames = async {
+            for frame in frames {
+                crate::stats::TOTAL_NET_OUTPUT_BYTES
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                if out.write_all(&frame).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        };
+        tokio::select! {
+            sent = write_frames => sent,
+            _ = repl_state.replica_timed_out(replica_id) => {
+                log_warn!("Replication: replica {endpoint} let go of during its full sync");
+                false
             }
         }
+    };
+    if !sent {
+        rollback_hub(&hub_tx, replica_id);
+        drop(rdb_enqueued_tx);
+        forward_task.abort();
+        return Ok(());
     }
     drop(payload_not_counted);
 

@@ -161,9 +161,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   at each such drop (it reached -53): a late `REPLCONF ACK` from the
   dropped replica brought back its row. A dropped replica that read
   nothing (a stopped process) kept its connection and its queue for good,
-  since the master no longer timed it out: its connection now ends within
-  a second of the drop, and its queue is freed however the connection
-  ends. On the io_uring loop, a connection ended by `repl-timeout` or by
+  since the master no longer timed it out, also when it stopped during its
+  full sync with the payload half written: its connection now ends within
+  a second of the drop, and its queue and the payload are freed however
+  the connection ends. On the io_uring loop, a connection ended by `repl-timeout` or by
   the replica going away left its forwarder running, holding the socket
   and the queue: it now ends with the connection.
   On the issue's test (256 MB limit,

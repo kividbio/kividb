@@ -2459,7 +2459,9 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                 .max()
                 .unwrap_or(0);
             crate::memory_use::set_replica_queued(queued as usize);
-            state.replica_queued_memory.store(queued, Ordering::Relaxed);
+            if state.replica_queued_memory.load(Ordering::Relaxed) != queued {
+                state.replica_queued_memory.store(queued, Ordering::Relaxed);
+            }
             let msg = tokio::select! {
                 msg = hub_rx.recv() => match msg {
                     Some(m) => m,
@@ -4670,26 +4672,35 @@ mod replication_invariants_tests {
         assert_eq!(pending.memory(), 0);
     }
 
-    /// A replica's connection ends once the hub has let go of it, not only
-    /// once it is silent for `repl-timeout`: one let go of for its queue
-    /// limit while it read nothing kept its connection, and its queue, for
-    /// good (#542).
+    /// The watch on a replica's connection ends once the hub has let go of
+    /// it for its queue limit, not only once it is silent for
+    /// `repl-timeout`: one let go of while it read nothing kept its
+    /// connection, and its queue, for good (#542).
     #[tokio::test]
-    async fn the_connection_of_a_replica_let_go_of_ends() {
+    async fn the_watch_on_a_replica_ends_once_it_is_let_go_of_for_its_queue_limit() {
         let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
         let hub = start_hub(Arc::clone(&state));
         let pending = Arc::new(ReplicaQueue::default());
-        state.register_replica(9008, "127.0.0.1".into(), 9008, 0);
         let _rx = register_syncing(&hub, 9008, &pending);
         await_connected(&state, 1).await;
-        // Registered and not silent: the watch goes on.
+        // Registered, in its full sync and reading nothing: the watch goes on.
         let watch = tokio::time::timeout(
             std::time::Duration::from_millis(2500),
             state.replica_timed_out(9008),
         );
         assert!(watch.await.is_err());
-        hub.send(HubMsg::Deregister(9008)).unwrap();
+        // Its queue passes the full sync's limit.
+        for _ in 0..21 {
+            propagate(&hub, vec![0u8; 50]);
+        }
         await_connected(&state, 0).await;
+        assert!(pending.abandoned());
         // Let go of: it ends, and not as silent.
         let watch = tokio::time::timeout(
             std::time::Duration::from_secs(5),
