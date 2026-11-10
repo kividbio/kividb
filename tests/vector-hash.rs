@@ -1168,18 +1168,18 @@ fn test_ft_spellcheck_uses_incremental_vocab() {
         "newly added word should be found in vocabulary"
     );
 
-    // Document deletion should NOT remove tokens from vocabulary
-    // (this is intentional — see comments in vector/mod.rs).
+    // A word no document holds any more is not offered, as in RediSearch
+    // once its GC has run (#583).
     c.cmds(&["DEL", "doc:1"]);
     let r3 = c.cmds(&["FT.SPELLCHECK", "idx", "helo", "DISTANCE", "1"]);
     let arr3 = r3.as_array();
-    assert!(!arr3.is_empty(), "vocab should retain tokens after delete");
+    assert!(!arr3.is_empty(), "helo is still misspelled");
     let suggestions3 = arr3[0].as_array()[2].as_array();
     assert!(
-        suggestions3
+        !suggestions3
             .iter()
             .any(|s| s.as_array()[1].as_str() == "hello"),
-        "hello should still be in vocab after doc:1 delete (append-only vocab)"
+        "hello is in no document after doc:1 is deleted: {r3:?}"
     );
 }
 

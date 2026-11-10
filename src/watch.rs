@@ -14,9 +14,6 @@ pub trait WatchNotifier: Send + Sync {
     /// Whether any key is being watched at all. Lets a caller skip working
     /// out which keys a write touched when nobody could care.
     fn has_watchers(&self) -> bool;
-    /// Invalidate every watch in `db` (`None` = every database): the whole
-    /// keyspace changed under them (`SWAPDB`).
-    fn notify_db(&self, db: Option<usize>);
     /// Invalidate the watches in `db` (`None` = every database) on keys for
     /// which `exists` says yes: those are the keys a flush removes.
     fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &[u8]) -> bool);
@@ -120,19 +117,6 @@ impl WatchNotifier for WatchRegistryInner {
         self.watch_count.load(Ordering::Relaxed) != 0
     }
 
-    fn notify_db(&self, db: Option<usize>) {
-        if !self.has_watchers() {
-            return;
-        }
-        for ((watched_db, _), flags) in self.inner.read().iter() {
-            if db.is_none_or(|db| db == *watched_db) {
-                for f in flags {
-                    f.store(true, Ordering::Release);
-                }
-            }
-        }
-    }
-
     fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &[u8]) -> bool) {
         if !self.has_watchers() {
             return;
@@ -220,11 +204,6 @@ impl WatchNotifier for ForStore<'_> {
     fn has_watchers(&self) -> bool {
         WATCHES.load(Ordering::Relaxed) > 0
     }
-    fn notify_db(&self, db: Option<usize>) {
-        if let Some(registry) = self.registry() {
-            registry.notify_db(db);
-        }
-    }
     fn notify_existing(&self, db: Option<usize>, exists: &dyn Fn(usize, &[u8]) -> bool) {
         if let Some(registry) = self.registry() {
             registry.notify_existing(db, exists);
@@ -243,7 +222,6 @@ impl WatchNotifier for NoopWatchRegistry {
     fn has_watchers(&self) -> bool {
         false
     }
-    fn notify_db(&self, _db: Option<usize>) {}
     fn notify_existing(&self, _db: Option<usize>, _exists: &dyn Fn(usize, &[u8]) -> bool) {}
 }
 
@@ -252,7 +230,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_flush_invalidates_every_watch_in_that_database() {
+    fn a_flush_invalidates_the_watches_on_present_keys_of_that_database() {
         let reg = WatchRegistryInner::new();
         assert!(!reg.has_watchers());
         let (a, b) = (
@@ -263,10 +241,12 @@ mod tests {
         reg.watch(1, b"k", Arc::clone(&b));
         assert!(reg.has_watchers());
 
-        reg.notify_db(Some(1));
+        reg.notify_existing(Some(1), &|_, _| true);
         assert!(!a.load(Ordering::Acquire));
         assert!(b.load(Ordering::Acquire));
-        reg.notify_db(None);
+        reg.notify_existing(None, &|db, _| db == 1);
+        assert!(!a.load(Ordering::Acquire));
+        reg.notify_existing(None, &|_, _| true);
         assert!(a.load(Ordering::Acquire));
     }
 }

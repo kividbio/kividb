@@ -207,6 +207,9 @@ pub fn commands_for_propagation(
         // AOF replay) has: send the hash it produced instead.
         "HIMPORT" => crate::commands::hash_import::propagation(ctx.client_id, cmd),
         "BLMOVE" => blocking_move_feed(cmd, resp, "LMOVE", 5),
+        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" | "BLMPOP" | "BZMPOP" => {
+            blocking_pop_feed(name, cmd, resp)
+        }
         "BRPOPLPUSH" => blocking_move_feed(cmd, resp, "RPOPLPUSH", 3),
         _ => {
             if cmd.is_empty() {
@@ -293,6 +296,76 @@ fn blocking_move_feed(
     vec![parts]
 }
 
+/// `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BLMPOP` and `BZMPOP` propagate
+/// as the pop they made, as in Redis: `LPOP key`, `ZPOPMIN key`, and for the
+/// `M` forms `LPOP key count` / `ZPOPMIN key count` with the number taken,
+/// all for the key the reply names. A replica, or the AOF replayed, then
+/// takes the same elements from the same key: the blocking form, run there,
+/// looks at its keys in order and could take from another one than the
+/// master did (the master leaves a key to a client that has waited longer).
+/// Nothing is sent when nothing was popped.
+fn blocking_pop_feed(name: &str, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    let verbatim = || vec![cmd.iter().map(|b| b.to_vec()).collect::<Vec<Vec<u8>>>()];
+    let Some((elements, header)) = array_header(resp) else {
+        // A null reply, or none (a client that has parked): nothing popped.
+        if resp.is_empty() || resp.starts_with(b"*-1") || resp.starts_with(b"_") {
+            return Vec::new();
+        }
+        return verbatim();
+    };
+    if elements < 2 {
+        return Vec::new();
+    }
+    let Some((used, Some(key))) = parse_bulk(&resp[header..]) else {
+        return verbatim();
+    };
+    let plain: &[u8] = match name {
+        "BLPOP" => b"LPOP",
+        "BRPOP" => b"RPOP",
+        "BZPOPMIN" => b"ZPOPMIN",
+        "BZPOPMAX" => b"ZPOPMAX",
+        // BLMPOP / BZMPOP timeout numkeys key [key ...] LEFT|RIGHT|MIN|MAX ...
+        _ => {
+            let numkeys = cmd
+                .get(2)
+                .and_then(|n| std::str::from_utf8(n).ok())
+                .and_then(|n| n.parse::<usize>().ok());
+            let side = numkeys
+                .and_then(|n| 3usize.checked_add(n))
+                .and_then(|i| cmd.get(i));
+            let plain: &[u8] = match side.map(|s| s.to_ascii_uppercase()).as_deref() {
+                Some(b"LEFT") => b"LPOP",
+                Some(b"RIGHT") => b"RPOP",
+                Some(b"MIN") => b"ZPOPMIN",
+                Some(b"MAX") => b"ZPOPMAX",
+                _ => return verbatim(),
+            };
+            let Some((count, _)) = array_header(&resp[header + used..]) else {
+                return verbatim();
+            };
+            if count == 0 {
+                return Vec::new();
+            }
+            return vec![vec![plain.to_vec(), key, count.to_string().into_bytes()]];
+        }
+    };
+    vec![vec![plain.to_vec(), key]]
+}
+
+/// The element count of the array whose header starts `resp`, and the
+/// header's length; `None` for anything else, a null array among them.
+fn array_header(resp: &[u8]) -> Option<(usize, usize)> {
+    if resp.first()? != &b'*' {
+        return None;
+    }
+    let line_end = resp.windows(2).position(|w| w == b"\r\n")?;
+    let count = std::str::from_utf8(resp.get(1..line_end)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    Some((count, line_end + 2))
+}
+
 /// `TS.ADD key * value`: the `*` is the master's clock at the moment it ran.
 /// A replica (or the AOF, replayed later) would stamp the sample with its own,
 /// so the timestamp the master assigned is sent in its place.
@@ -309,25 +382,32 @@ fn ts_add_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
 
 /// `TS.MADD` with `*` timestamps: each replaced by the one it was given, read
 /// from the matching element of the reply.
+///
+/// A sample that was refused is left out, as RedisTimeSeries leaves it out:
+/// it changed nothing. Sent with its `*`, a replica stamped it with its own
+/// clock and could add a sample the master had refused.
 fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
-    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
-    if !cmd.iter().skip(2).step_by(3).any(|ts| *ts == b"*") {
-        return vec![parts];
+    if resp.first() != Some(&b'*') || cmd.is_empty() {
+        return vec![cmd.iter().map(|b| b.to_vec()).collect()];
     }
     // The reply is an array with one element per sample: `:timestamp`, or an
     // error for a sample that was refused.
     let mut lines = resp.split(|b| *b == b'\n');
     lines.next(); // the array header
-    for (sample, line) in lines.enumerate() {
-        let ts_index = 2 + sample * 3;
-        if ts_index >= parts.len() {
-            break;
+    let mut parts: Vec<Vec<u8>> = vec![cmd[0].to_vec()];
+    for (sample, line) in cmd[1..].chunks(3).zip(lines) {
+        match line.first() {
+            Some(b'-') => continue,
+            Some(b':') if sample.len() == 3 => {
+                parts.push(sample[0].to_vec());
+                parts.push(line[1..].trim_ascii().to_vec());
+                parts.push(sample[2].to_vec());
+            }
+            _ => parts.extend(sample.iter().map(|b| b.to_vec())),
         }
-        if cmd[ts_index] == b"*"
-            && let Some(assigned) = line.strip_prefix(b":")
-        {
-            parts[ts_index] = assigned.trim_ascii().to_vec();
-        }
+    }
+    if parts.len() == 1 {
+        return Vec::new();
     }
     vec![parts]
 }
@@ -338,19 +418,21 @@ fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     let Some(ts) = parse_resp_integer(resp) else {
         return verbatim();
     };
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() + 2);
-    let mut i = 0;
-    while i < cmd.len() {
-        if i >= 3 && cmd[i].eq_ignore_ascii_case(b"TIMESTAMP") {
-            // Dropped here, re-added below with the concrete value.
-            i += 2;
-            continue;
-        }
-        parts.push(cmd[i].to_vec());
-        i += 1;
+    // Each `TIMESTAMP` option the command read is given the time it used, in
+    // its place, so every other word is where it was and reads as it did; a
+    // word `TIMESTAMP` that is a label's value is left alone. And the time
+    // goes right after the value, before any option, behind 1.2.1's mark
+    // (`ts::INCRBY_MARK`), which tells the record from one 1.2.0 sent. Added
+    // at the end, as 1.2.0 did, it made a label of a word left over from
+    // `LABELS` (#555).
+    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
+    let ts = ts.to_string().into_bytes();
+    for at in crate::commands::ts::incrby_timestamp_options(cmd) {
+        parts[at + 1] = ts.clone();
     }
-    parts.push(b"TIMESTAMP".to_vec());
-    parts.push(ts.to_string().into_bytes());
+    let at = parts.len().min(3);
+    parts.insert(at, ts);
+    parts.insert(at, crate::commands::ts::INCRBY_MARK.to_vec());
     vec![parts]
 }
 
@@ -368,7 +450,10 @@ fn spop_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
             }
             Vec::new()
         }
-        Some(b'*') => {
+        // `~`: the set a RESP3 client is answered with, from a script too
+        // after `redis.setresp(3)`. It was not looked at, and the members
+        // popped stayed on the replicas and in the AOF.
+        Some(b'*' | b'~') => {
             if let Some((_n, members)) = parse_array(resp) {
                 if members.is_empty() {
                     return Vec::new();
@@ -569,11 +654,16 @@ fn incrbyfloat_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     if cmd.len() != 3 {
         return Vec::new();
     }
-    let Some((_n, val_opt)) = parse_bulk(resp) else {
-        return Vec::new();
-    };
-    let Some(val) = val_opt else {
-        return Vec::new();
+    // A bulk string; or, if a RESP3 reply is ever a double (`,`), that.
+    let val = match parse_bulk(resp) {
+        Some((_, Some(val))) => val,
+        _ => match resp
+            .strip_prefix(b",")
+            .and_then(|rest| rest.strip_suffix(b"\r\n"))
+        {
+            Some(val) => val.to_vec(),
+            None => return Vec::new(),
+        },
     };
     vec![vec![
         b"SET".to_vec(),
@@ -602,8 +692,9 @@ fn parse_bulk(resp: &[u8]) -> Option<(usize, Option<Vec<u8>>)> {
     Some((body_end, Some(resp[header_end..header_end + n].to_vec())))
 }
 
+/// An array of bulk strings, or a RESP3 set of them (`~`).
 fn parse_array(resp: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
-    if resp.first()? != &b'*' {
+    if !matches!(resp.first()?, b'*' | b'~') {
         return None;
     }
     let line_end = resp.windows(2).position(|w| w == b"\r\n")?;
@@ -787,7 +878,7 @@ mod tests {
         let c = cmd(&["TS.INCRBY", "k", "2"]);
         assert_eq!(
             ts_incrby_feed(&refs(&c), b":42\r\n"),
-            vec![cmd(&["TS.INCRBY", "k", "2", "TIMESTAMP", "42"])]
+            vec![cmd(&["TS.INCRBY", "k", "2", "timestamp", "42"])]
         );
         let c = cmd(&["TS.DECRBY", "k", "2", "TIMESTAMP", "*", "RETENTION", "9"]);
         assert_eq!(
@@ -796,12 +887,123 @@ mod tests {
                 "TS.DECRBY",
                 "k",
                 "2",
-                "RETENTION",
-                "9",
+                "timestamp",
+                "42",
                 "TIMESTAMP",
-                "42"
+                "42",
+                "RETENTION",
+                "9"
             ])]
         );
+    }
+
+    /// A sample `TS.MADD` refused is left out of what is sent; `*` is the
+    /// time the master gave.
+    #[test]
+    fn ts_madd_feed_leaves_out_refused_samples() {
+        let c = cmd(&["TS.MADD", "a", "*", "1", "b", "*", "2", "c", "5", "3"]);
+        let resp = b"*3\r\n-TSDB: Duplicate sample in BLOCK policy\r\n:101\r\n:5\r\n";
+        assert_eq!(
+            ts_madd_feed(&refs(&c), resp),
+            vec![cmd(&["TS.MADD", "b", "101", "2", "c", "5", "3"])]
+        );
+        let c = cmd(&["TS.MADD", "a", "*", "1"]);
+        assert!(ts_madd_feed(&refs(&c), b"*1\r\n-TSDB: the key does not exist\r\n").is_empty());
+    }
+
+    /// Each `TIMESTAMP` option the command read is given the time, where it
+    /// is, and the time goes right after the value behind 1.2.1's mark. Not
+    /// after a `LABELS` list, where a word left over from the list, which
+    /// the command passed over, became a label with it on a replica. A
+    /// label's value `TIMESTAMP` is not an option (#555).
+    #[test]
+    fn ts_incrby_feed_gives_the_time_without_moving_a_word() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a"],
+                &["TS.INCRBY", "k", "2", "timestamp", "42", "LABELS", "a"],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "c"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "c",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "UNCOMPRESSED"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "UNCOMPRESSED",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "TIMESTAMP", "*"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "TIMESTAMP",
+                    "*",
+                ],
+            ),
+            (
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "5",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "*",
+                    "c",
+                ],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "42",
+                    "c",
+                ],
+            ),
+        ];
+        for (given, sent) in cases {
+            let c = cmd(given);
+            assert_eq!(
+                ts_incrby_feed(&refs(&c), b":42\r\n"),
+                vec![cmd(sent)],
+                "{given:?}"
+            );
+        }
     }
 
     #[test]
@@ -833,6 +1035,63 @@ mod tests {
         assert_eq!(
             blocking_move_feed(&refs(&c), &bulk("a"), "RPOPLPUSH", 3),
             vec![cmd(&["RPOPLPUSH", "s", "d"])]
+        );
+    }
+
+    #[test]
+    fn blocking_pops_propagate_as_the_pop_they_made() {
+        let c = cmd(&["BLPOP", "a", "b", "0"]);
+        let popped = b"*2\r\n$1\r\nb\r\n$1\r\nx\r\n";
+        assert_eq!(
+            blocking_pop_feed("BLPOP", &refs(&c), popped),
+            vec![cmd(&["LPOP", "b"])]
+        );
+        assert!(blocking_pop_feed("BLPOP", &refs(&c), b"*-1\r\n").is_empty());
+        assert!(blocking_pop_feed("BLPOP", &refs(&c), b"_\r\n").is_empty());
+        assert!(blocking_pop_feed("BLPOP", &refs(&c), b"").is_empty());
+
+        let c = cmd(&["BRPOP", "a", "0"]);
+        assert_eq!(
+            blocking_pop_feed("BRPOP", &refs(&c), b"*2\r\n$1\r\na\r\n$1\r\nx\r\n"),
+            vec![cmd(&["RPOP", "a"])]
+        );
+
+        let c = cmd(&["BZPOPMAX", "z1", "z2", "1.5"]);
+        let popped = b"*3\r\n$2\r\nz2\r\n$1\r\nm\r\n$1\r\n3\r\n";
+        assert_eq!(
+            blocking_pop_feed("BZPOPMAX", &refs(&c), popped),
+            vec![cmd(&["ZPOPMAX", "z2"])]
+        );
+
+        let c = cmd(&["BLMPOP", "0", "2", "a", "b", "right", "COUNT", "5"]);
+        let popped = b"*2\r\n$1\r\nb\r\n*2\r\n$1\r\nx\r\n$1\r\ny\r\n";
+        assert_eq!(
+            blocking_pop_feed("BLMPOP", &refs(&c), popped),
+            vec![cmd(&["RPOP", "b", "2"])]
+        );
+
+        let c = cmd(&["BZMPOP", "0", "1", "z", "MIN", "COUNT", "3"]);
+        let popped = b"*2\r\n$1\r\nz\r\n*1\r\n*2\r\n$1\r\nm\r\n$1\r\n1\r\n";
+        assert_eq!(
+            blocking_pop_feed("BZMPOP", &refs(&c), popped),
+            vec![cmd(&["ZPOPMIN", "z", "1"])]
+        );
+        assert!(blocking_pop_feed("BZMPOP", &refs(&c), b"*-1\r\n").is_empty());
+    }
+
+    #[test]
+    fn spop_of_a_resp3_client_is_rewritten_too() {
+        let owned = cmd(&["SPOP", "s", "2"]);
+        let resp = b"~2\r\n$3\r\nm01\r\n$3\r\nm07\r\n";
+        assert_eq!(
+            spop_feed(&refs(&owned), resp),
+            vec![cmd(&["SREM", "s", "m01", "m07"])]
+        );
+        assert!(spop_feed(&refs(&owned), b"~0\r\n").is_empty());
+        assert!(spop_feed(&refs(&cmd(&["SPOP", "s"])), b"_\r\n").is_empty());
+        assert_eq!(
+            incrbyfloat_feed(&refs(&cmd(&["INCRBYFLOAT", "f", "1.5"])), b",2.5\r\n"),
+            vec![cmd(&["SET", "f", "2.5", "KEEPTTL"])]
         );
     }
 

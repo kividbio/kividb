@@ -173,6 +173,69 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replies, keeping 113-139k keys. Once caught up, the replica had the same
   data. 1.2.0 has the same bug.
 
+- **`TS.INCRBY` and `TS.DECRBY` make a series with the options given
+  (#555).** `RETENTION`, `CHUNK_SIZE`, `DUPLICATE_POLICY` and `LABELS` were
+  passed over, and a series either command created had the defaults and no
+  labels. They now apply when the command creates the series, as in
+  RedisTimeSeries, and the sample is added as `TS.ADD` adds one, so the
+  series is trimmed to its retention; it never was.
+- **The time series options take RedisTimeSeries's spellings, and a word
+  that is not one no longer drops the options after it (#565).**
+  `TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.INCRBY` and `TS.DECRBY` took
+  `CHUNK SIZE` but not `CHUNK_SIZE`, and a word they did not know ended the
+  options with no error: `CHUNK_SIZE` and everything after it, `LABELS`
+  too, was dropped. `CHUNK_SIZE` is read now, and a word that is no option
+  is passed over and the options after it read, as RedisTimeSeries passes
+  it over. A chunk size must be a multiple of 8 from 48 to 1048576, an
+  `ENCODING` must be `COMPRESSED` or `UNCOMPRESSED`, and `IGNORE`, which
+  KiviDB does not support, is refused. `CHUNK SIZE`, `ON DUPLICATE` and
+  `DUPLICATE POLICY` are still accepted. `TS.ADD … ON_DUPLICATE policy`
+  applies to that one sample, as in RedisTimeSeries, while KiviDB's older
+  `ON DUPLICATE policy` still makes `policy` the series' own for good, as
+  it did in 1.2.0. `TS.ALTER` sets what it is given: `RETENTION 0`,
+  `CHUNK_SIZE 4096` and `LABELS` with no pairs were ignored. A `LABELS`
+  list still ends at the next option's name, as in 1.2.0, where
+  RedisTimeSeries takes every word after `LABELS` as a label: its
+  `LABELS a b RETENTION 5` has a label `RETENTION=5` as well; `ON`,
+  `CHUNK` and `DUPLICATE` end the list only when the word after them makes
+  the option. A `TS.ADD` its duplicate policy refuses no longer changes the
+  series' retention or policy, or trims it, on the master alone. A command
+  replayed from an AOF, or sent by a master, is not refused for what 1.2.0
+  accepted, so a log written by 1.2.0 replays whole; it replays under these
+  rules, so after the first restart a series can differ from what 1.2.0
+  held in memory: `TS.CREATE k FOO RETENTION 10` now has the retention, and
+  trims, and `ON_DUPLICATE SUM` is now applied. A `TS.INCRBY` or
+  `TS.DECRBY` record 1.2.0 wrote, or a 1.2.0 master sends, is read as 1.2.0
+  read it: its time, no other option, no trim. 1.2.1 sends these commands
+  with a lower-case `timestamp` and the time right after the value, which
+  tells its records from 1.2.0's.
+
+- **Blocking commands in a script take what is there (#558).** Called from
+  a script or a function, `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`,
+  `BLMPOP`, `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` answered nil without
+  running, whatever the key held. They now run as their non-blocking form,
+  as in Redis and as they already did inside `MULTI`: the element if there
+  is one, their empty reply if not. A blocking pop now reaches replicas and
+  the AOF as the pop it made (`BLPOP` as `LPOP` of the key it took from,
+  `BZMPOP` as `ZPOPMIN key count`), as Redis sends it. A pop that takes
+  nothing (a `BLPOP` that times out, an `LPOP` of a missing key), from a
+  client or a script, is no longer sent, no longer counted as a change for
+  `save`, and no longer fails a `WATCH` on its key, as in Redis.
+- **`SWAPDB` fails only the watches on the swapped keys (#556).** It made
+  every `EXEC` after a `WATCH` fail, in every database. As in Redis, it now
+  fails a watch only on a key of the two databases it swaps that is in
+  either of them, a key whose time is up counting as absent, and `SWAPDB`
+  of a database with itself fails none.
+- **A refused `FUNCTION FLUSH` keeps the libraries (#559).** It emptied the
+  function store before it checked whether a script held the functions'
+  VM. When one did, the reply was `BUSY` but the libraries were gone, on
+  the master only. It now checks first, and a refused flush changes
+  nothing.
+- **`SPOP` with a count from a RESP3 client reaches replicas and the AOF.**
+  Its reply is a set there, which was not read, so nothing was sent: the
+  replicas, and a restart from the AOF, kept the members the master had
+  popped. So too from a script after `redis.setresp(3)`. It is now sent as
+  an `SREM` of the members popped, as from a RESP2 client.
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
   `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a
@@ -239,6 +302,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `MULTI` the wrong number also fails the transaction, and an `EXEC` with
   the wrong number discards it. Both I/O models.
 
+- **More of MULTI as Redis does it.** `PSYNC` and `SYNC` inside `MULTI`
+  handed the connection over as a replica. They are now refused with `ERR
+  Command not allowed inside a transaction`, and the transaction with them.
+  An `EXEC` the user's ACL rules refuse left the transaction open. It now
+  discards it and its watches and answers `EXECABORT Transaction discarded
+  because of: NOPERM ...`. A command with the wrong number of arguments, or
+  one that does not exist, is refused for that before the ACL rules are
+  checked, so the error says what is wrong. `HELLO 3 AUTH user wrong-password`
+  answered `WRONGPASS` but switched the connection to RESP3 anyway. The
+  protocol now changes only once the rest of `HELLO` is accepted. A command
+  run by `EXEC` is written to the slow log under the client name it ran
+  with. Before, the log used the name from before the transaction, even when
+  a queued `CLIENT SETNAME` or `HELLO SETNAME` had changed it. Both I/O
+  models.
+
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
   `HINCRBYFLOAT` took the search indexes' lock twice to find out whether
@@ -289,6 +367,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     answered `Cursor not found`.
   - `FT.CONFIG HELP` describes each setting, in RediSearch's words; every
     description was empty.
+
+- **More JSON and search replies as RedisJSON and RediSearch give them
+  (#583).**
+  - `JSON.ARRINDEX` of a key that does not exist answers `ERR Path does
+    not exist`, by a legacy path or a JSONPath; it was nil.
+  - `FT.SPELLCHECK` scores a suggestion by the share of the index's
+    documents that hold it, as RediSearch does, written as Redis writes a
+    double (`9.765625e-4` for one document of 1024); it scored the edit
+    distance, with four decimals. A word that no document holds any more
+    is no longer offered, nor counted as spelled right. In RESP3 the reply
+    is RediSearch's map (`results`: each misspelled word to its
+    suggestions, each a map of the word to its score as a double); it was
+    the RESP2 arrays. A word of a `TERMS INCLUDE` dictionary
+    is offered as a suggestion (scoring 0 when no document holds it), but
+    a query word that is only in such a dictionary is still reported; it
+    counted as spelled right. A dictionary named in `TERMS INCLUDE` or
+    `EXCLUDE` that does not exist is the error `Dict does not exist:
+    <name>`; it was passed over.
+  - `FT.CONFIG HELP`'s descriptions are RediSearch's byte for byte,
+    including three whose words its source runs together.
 
 - **JSON keyspace events are announced as RedisJSON announces them
   (#575).** A JSON write that changed nothing announced its event anyway:

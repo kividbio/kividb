@@ -1058,6 +1058,31 @@ fn indexes_and_lengths_past_i64_max() {
     c.cmds(&["DEL", k]);
 }
 
+/// `ARSCAN ... LIMIT` takes the first elements of the span, either way
+/// round, and stops there (#583: it copied the whole span first).
+#[test]
+fn arscan_limit_takes_the_first_of_the_span() {
+    let mut c = conn();
+    let k = "t:arscanlimit";
+    c.cmds(&["DEL", k]);
+    for i in 0..1000u32 {
+        c.cmds(&["ARSET", k, &(i * 3).to_string(), &format!("v{i}")]);
+    }
+    assert_eq!(
+        c.cmds(&["ARSCAN", k, "0", "2997", "LIMIT", "2"]).flat(),
+        ["0", "v0", "3", "v1"]
+    );
+    assert_eq!(
+        c.cmds(&["ARSCAN", k, "2997", "0", "LIMIT", "2"]).flat(),
+        ["2997", "v999", "2994", "v998"]
+    );
+    assert_eq!(
+        c.cmds(&["ARSCAN", k, "4", "10", "LIMIT", "5"]).flat(),
+        ["6", "v2", "9", "v3"]
+    );
+    c.cmds(&["DEL", k]);
+}
+
 /// `ARLASTITEMS` after `ARSEEK 0` gives the array's tail, and an insert past
 /// the last index is `insert index overflow`, as in Redis.
 #[test]

@@ -100,116 +100,278 @@ impl LabelFilter {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-type TsOptions = (u64, usize, Option<DuplicatePolicy>, Vec<(String, String)>);
-/// Parse optional common TS options from a token slice.
-/// Returns (retention, chunk_size, duplicate_policy, labels, idx_consumed).
-fn parse_ts_options(tokens: &[&[u8]]) -> Result<TsOptions, Vec<u8>> {
-    let mut retention = 0u64;
-    let mut chunk_size = 4096usize;
-    let mut dup_policy: Option<DuplicatePolicy> = None;
-    let mut labels: Vec<(String, String)> = Vec::new();
+/// The command whose options are read: a few are one command's own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptionsOf {
+    Create,
+    Alter,
+    Add,
+    IncrBy,
+}
+
+/// The options of `TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.INCRBY` and
+/// `TS.DECRBY`, each `None` when not given. `TS.ALTER` changes only what was
+/// given: `RETENTION 0`, `CHUNK_SIZE 4096` and a `LABELS` with no pairs too
+/// (#565), where a value equal to the default used to count as not given.
+#[derive(Default)]
+struct TsOptions {
+    retention: Option<u64>,
+    chunk_size: Option<usize>,
+    /// `DUPLICATE_POLICY` (and KiviDB's `ON DUPLICATE`): the series' policy.
+    duplicate_policy: Option<DuplicatePolicy>,
+    /// `ON_DUPLICATE` (`TS.ADD`): the policy for this one sample, as in
+    /// RedisTimeSeries. The series keeps its own.
+    on_duplicate: Option<DuplicatePolicy>,
+    labels: Option<Vec<(String, String)>>,
+    /// `TIMESTAMP` (`TS.INCRBY`, `TS.DECRBY`): the time the last one gives
+    /// (`*`, the clock).
+    timestamp: Option<u64>,
+    /// Where each `TIMESTAMP` option is among the options.
+    timestamp_at: Vec<usize>,
+}
+
+/// RedisTimeSeries's error for a `CHUNK_SIZE` out of its bounds.
+const CHUNK_SIZE_RANGE: &str =
+    "TSDB: CHUNK_SIZE value must be a multiple of 8 in the range [48 .. 1048576]";
+
+/// The word after an option's name: its value.
+fn option_value<'t>(tokens: &[&'t [u8]], at: usize) -> Result<&'t [u8], Vec<u8>> {
+    tokens
+        .get(at)
+        .copied()
+        .ok_or_else(|| resp_error("ERR syntax error"))
+}
+
+fn option_number(value: &[u8]) -> Option<u64> {
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+/// A chunk size: as RedisTimeSeries, a multiple of 8 from 48 to 1048576.
+/// Not checked when `strict` is off: 1.2.0 took any.
+fn option_chunk_size(value: &[u8], strict: bool) -> Result<usize, Vec<u8>> {
+    let size = std::str::from_utf8(value)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or_else(|| resp_error("TSDB: Couldn't parse CHUNK_SIZE"))?;
+    if strict && (!(48..=1_048_576).contains(&size) || !size.is_multiple_of(8)) {
+        return Err(resp_error(CHUNK_SIZE_RANGE));
+    }
+    Ok(size)
+}
+
+fn option_policy(value: &[u8]) -> Result<DuplicatePolicy, Vec<u8>> {
+    DuplicatePolicy::parse(std::str::from_utf8(value).unwrap_or(""))
+        .ok_or_else(|| resp_error("ERR invalid DUPLICATE POLICY"))
+}
+
+/// Whether `tokens[at]` starts an option, which ends a `LABELS` list: its
+/// name, or the first of `CHUNK SIZE`, `ON DUPLICATE` and `DUPLICATE
+/// POLICY` followed by the second (1.2.0 ended the list at the first word
+/// alone).
+///
+/// Not RedisTimeSeries's way: it takes every word after `LABELS` as label
+/// pairs and finds options anywhere, so its `LABELS a b RETENTION 5` has the
+/// labels `a=b` and `RETENTION=5`, and a retention of 5. Here the list ends
+/// at `RETENTION`, as in 1.2.0, which a log 1.2.0 wrote replays by.
+fn ends_labels(tokens: &[&[u8]], at: usize, of: OptionsOf) -> bool {
+    const NAMES: [&[u8]; 6] = [
+        b"RETENTION",
+        b"CHUNK_SIZE",
+        b"ENCODING",
+        b"DUPLICATE_POLICY",
+        b"ON_DUPLICATE",
+        b"IGNORE",
+    ];
+    let word = tokens[at];
+    NAMES.iter().any(|name| word.eq_ignore_ascii_case(name))
+        || (word.eq_ignore_ascii_case(b"CHUNK") && second_word(tokens, at, b"SIZE"))
+        || (word.eq_ignore_ascii_case(b"ON") && second_word(tokens, at, b"DUPLICATE"))
+        || (word.eq_ignore_ascii_case(b"DUPLICATE") && second_word(tokens, at, b"POLICY"))
+        || (of == OptionsOf::IncrBy && word.eq_ignore_ascii_case(b"TIMESTAMP"))
+}
+
+/// Whether the checks 1.2.0 did not make apply: `CHUNK_SIZE`'s bounds, an
+/// `ENCODING` value, `IGNORE`. Not to a command from a master, or replayed
+/// from the AOF: one an older version accepted is applied, rather than
+/// refused and the series it made lost.
+fn strict_options(ctx: &Ctx) -> bool {
+    !(ctx.apply_replication || crate::expiry::replaying())
+}
+
+/// Whether the word after `tokens[at]` is `second`: `CHUNK SIZE`, `ON
+/// DUPLICATE`, `DUPLICATE POLICY`. Not followed by it, the first word is
+/// one RedisTimeSeries does not know, and passed over.
+fn second_word(tokens: &[&[u8]], at: usize, second: &[u8]) -> bool {
+    tokens
+        .get(at + 1)
+        .is_some_and(|word| word.eq_ignore_ascii_case(second))
+}
+
+/// Parse the options of a TS command.
+///
+/// The spellings are RedisTimeSeries's: `RETENTION`, `CHUNK_SIZE`,
+/// `ENCODING`, `UNCOMPRESSED`, `COMPRESSED`, `DUPLICATE_POLICY`,
+/// `ON_DUPLICATE` (`TS.ADD`), `TIMESTAMP` (`TS.INCRBY`, `TS.DECRBY`) and
+/// `LABELS`; and KiviDB's own of 1.2.0, `CHUNK SIZE`, `ON DUPLICATE` and
+/// `DUPLICATE POLICY`. A word that is none of these is passed over and the
+/// parse goes on, as RedisTimeSeries, which looks for each option by name,
+/// passes it over. It used to end the parse, with no error, dropping the
+/// options after it: `CHUNK_SIZE`, unknown then, dropped `LABELS` (#565).
+/// `IGNORE` is not supported, and says so. Where a `LABELS` list ends is
+/// not as in RedisTimeSeries: see [`ends_labels`].
+fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsOptions, Vec<u8>> {
+    let mut options = TsOptions::default();
     let mut i = 0;
-
     while i < tokens.len() {
-        let opt = match std::str::from_utf8(tokens[i]) {
-            Ok(s) => s.to_ascii_uppercase(),
-            Err(_) => return Err(resp_error("ERR invalid option")),
-        };
-
-        match opt.as_str() {
-            "RETENTION" => {
-                i += 1;
-                if i >= tokens.len() {
-                    return Err(resp_error("ERR syntax error"));
-                }
-                retention = std::str::from_utf8(tokens[i])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| resp_error("ERR invalid RETENTION value"))?;
-            }
-            "CHUNK" => {
-                // CHUNK SIZE <n>
-                i += 1;
-                if i >= tokens.len() {
-                    return Err(resp_error("ERR syntax error"));
-                }
-                // next token should be "SIZE"
-                i += 1;
-                if i >= tokens.len() {
-                    return Err(resp_error("ERR syntax error"));
-                }
-                chunk_size = std::str::from_utf8(tokens[i])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| resp_error("ERR invalid CHUNK SIZE value"))?;
-            }
-            "ENCODING" => {
-                // ENCODING COMPRESSED | UNCOMPRESSED — we accept but ignore (we always use BTreeMap)
-                i += 1;
-            }
-            "DUPLICATE_POLICY" | "ON" => {
-                // ON DUPLICATE <policy>  OR  DUPLICATE_POLICY <policy>
-                if opt == "ON" {
-                    i += 1; // skip "DUPLICATE"
-                }
-                i += 1;
-                if i >= tokens.len() {
-                    return Err(resp_error("ERR syntax error"));
-                }
-                let pol_str = std::str::from_utf8(tokens[i]).unwrap_or("");
-                dup_policy = Some(
-                    DuplicatePolicy::parse(pol_str)
-                        .ok_or_else(|| resp_error("ERR invalid DUPLICATE POLICY"))?,
+        let word = tokens[i].to_ascii_uppercase();
+        match word.as_slice() {
+            b"RETENTION" => {
+                let value = option_value(tokens, i + 1)?;
+                options.retention = Some(
+                    option_number(value)
+                        .ok_or_else(|| resp_error("ERR invalid RETENTION value"))?,
                 );
+                i += 2;
             }
-            "DUPLICATE" => {
-                // DUPLICATE POLICY <policy>
-                i += 1; // skip "POLICY"
-                i += 1;
-                if i >= tokens.len() {
-                    return Err(resp_error("ERR syntax error"));
+            b"CHUNK_SIZE" => {
+                options.chunk_size = Some(option_chunk_size(option_value(tokens, i + 1)?, strict)?);
+                i += 2;
+            }
+            // `CHUNK SIZE n`, `ON DUPLICATE policy` and `DUPLICATE POLICY
+            // policy`: KiviDB's spellings, kept. 1.2.0 took any second word.
+            b"CHUNK" if second_word(tokens, i, b"SIZE") => {
+                options.chunk_size = Some(option_chunk_size(option_value(tokens, i + 2)?, strict)?);
+                i += 3;
+            }
+            b"ON" | b"DUPLICATE"
+                if second_word(
+                    tokens,
+                    i,
+                    if word == b"ON" {
+                        &b"DUPLICATE"[..]
+                    } else {
+                        &b"POLICY"[..]
+                    },
+                ) =>
+            {
+                options.duplicate_policy = Some(option_policy(option_value(tokens, i + 2)?)?);
+                i += 3;
+            }
+            b"DUPLICATE_POLICY" => {
+                options.duplicate_policy = Some(option_policy(option_value(tokens, i + 1)?)?);
+                i += 2;
+            }
+            b"ON_DUPLICATE" if of == OptionsOf::Add => {
+                options.on_duplicate = Some(option_policy(option_value(tokens, i + 1)?)?);
+                i += 2;
+            }
+            // Accepted: KiviDB stores every series one way.
+            b"ENCODING" => {
+                let value = option_value(tokens, i + 1)?;
+                if strict
+                    && !value.eq_ignore_ascii_case(b"COMPRESSED")
+                    && !value.eq_ignore_ascii_case(b"UNCOMPRESSED")
+                {
+                    return Err(resp_error("TSDB: unknown ENCODING parameter"));
                 }
-                let pol_str = std::str::from_utf8(tokens[i]).unwrap_or("");
-                dup_policy = Some(
-                    DuplicatePolicy::parse(pol_str)
-                        .ok_or_else(|| resp_error("ERR invalid DUPLICATE POLICY"))?,
-                );
+                i += 2;
             }
-            "LABELS" => {
+            b"UNCOMPRESSED" | b"COMPRESSED" => i += 1,
+            b"TIMESTAMP" if of == OptionsOf::IncrBy => {
+                let value = option_value(tokens, i + 1)?;
+                let at = if value == b"*" {
+                    TsInner::now_ms()
+                } else {
+                    option_number(value).ok_or_else(|| resp_error("ERR invalid TIMESTAMP"))?
+                };
+                options.timestamp = Some(at);
+                options.timestamp_at.push(i);
+                i += 2;
+            }
+            b"LABELS" => {
                 i += 1;
-                // Consume pairs until we hit another known keyword or end
-                while i + 1 < tokens.len() {
-                    let next_opt = std::str::from_utf8(tokens[i])
-                        .unwrap_or("")
-                        .to_ascii_uppercase();
-                    if matches!(
-                        next_opt.as_str(),
-                        "RETENTION"
-                            | "CHUNK"
-                            | "ENCODING"
-                            | "DUPLICATE_POLICY"
-                            | "ON"
-                            | "DUPLICATE"
-                    ) {
-                        break;
-                    }
-                    let lk = std::str::from_utf8(tokens[i]).unwrap_or("").to_string();
-                    let lv = std::str::from_utf8(tokens[i + 1]).unwrap_or("").to_string();
-                    labels.push((lk, lv));
+                let mut labels = Vec::new();
+                // Pairs, up to the next option.
+                while i + 1 < tokens.len() && !ends_labels(tokens, i, of) {
+                    let text = |t: &[u8]| std::str::from_utf8(t).unwrap_or("").to_string();
+                    labels.push((text(tokens[i]), text(tokens[i + 1])));
                     i += 2;
                 }
-                continue; // don't i += 1 at bottom
+                options.labels = Some(labels);
             }
-            "UNCOMPRESSED" => { /* accepted, ignored */ }
-            _ => {
-                // Unknown token — stop consuming (caller handles remaining tokens)
-                break;
+            b"IGNORE" if strict => {
+                return Err(resp_error("TSDB: IGNORE is not supported"));
             }
+            // Passed over, as RedisTimeSeries does.
+            _ => i += 1,
         }
-        i += 1;
     }
+    Ok(options)
+}
 
-    Ok((retention, chunk_size, dup_policy, labels))
+/// A series made by a command: the options given, the defaults otherwise.
+fn configure_new(ts: &mut TsInner, options: &TsOptions) {
+    if let Some(retention) = options.retention {
+        ts.retention = retention;
+    }
+    if let Some(chunk_size) = options.chunk_size {
+        ts.chunk_size = chunk_size;
+    }
+    if let Some(policy) = &options.duplicate_policy {
+        ts.duplicate_policy = policy.clone();
+    }
+    for (lk, lv) in options.labels.iter().flatten() {
+        ts.labels.insert(lk.clone(), lv.clone());
+    }
+}
+
+/// The word 1.2.1 puts right after the value of every `TS.INCRBY` and
+/// `TS.DECRBY` it sends to its replicas and its AOF, with the time the
+/// command used: `TIMESTAMP` in lower case. It tells such a record from one
+/// 1.2.0 sent, which must be read as 1.2.0 read it. 1.2.0 took every
+/// `TIMESTAMP` out, in any case, and added `TIMESTAMP` (upper case) at the
+/// end; so a record of 1.2.0 never has this word at that place: either
+/// another word is there, or, with nothing else to send, the `TIMESTAMP` it
+/// added, in upper case. Read as an option, it is `TIMESTAMP`, by any
+/// version.
+pub(crate) const INCRBY_MARK: &[u8] = b"timestamp";
+
+/// A `TS.INCRBY` or `TS.DECRBY` (its options, `tokens`) as 1.2.0 sent it to
+/// its replicas and its AOF, read as 1.2.0 read it: its time, the one at
+/// the end, and no other option. 1.2.0 read no option but `TIMESTAMP`,
+/// made a series with the defaults, and did not trim to the retention.
+/// Read as 1.2.1 reads a command, the record's options were applied, and
+/// the series trimmed, where 1.2.0 kept the samples: data lost on replay,
+/// and a replica of 1.2.0 not the same as its master. And the end could be
+/// taken by what came before it (`LABELS a`, or a `RETENTION` with no
+/// value, took `TIMESTAMP`): the sample at the replay's time, or the record
+/// refused. `None` for a record that does not end in `TIMESTAMP <time>`,
+/// which 1.2.0 did not send.
+fn written_by_1_2_0(tokens: &[&[u8]]) -> Option<TsOptions> {
+    let [.., word, at] = tokens else {
+        return None;
+    };
+    if !word.eq_ignore_ascii_case(b"TIMESTAMP") {
+        return None;
+    }
+    Some(TsOptions {
+        timestamp: Some(option_number(at)?),
+        ..Default::default()
+    })
+}
+
+/// Where a `TS.INCRBY` or `TS.DECRBY` (the whole command) has its
+/// `TIMESTAMP` options, as the command reads them: for the replication
+/// feed, which gives each the timestamp the command used. A `TIMESTAMP`
+/// that is a label's value is not one.
+pub(crate) fn incrby_timestamp_options(cmd: &[&[u8]]) -> Vec<usize> {
+    match cmd
+        .get(3..)
+        .map(|tokens| parse_ts_options(tokens, OptionsOf::IncrBy, false))
+    {
+        Some(Ok(options)) => options.timestamp_at.iter().map(|at| 3 + at).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Update the label index for a key. Clears old labels for this key and
@@ -427,6 +589,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 // ── TS.CREATE ─────────────────────────────────────────────────────────────────
 
 fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 2 {
         return Some(resp_error(
@@ -435,7 +598,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let key: Vec<u8> = cmd[1].to_vec();
 
-    let (retention, chunk_size, dup_policy, labels) = match parse_ts_options(&cmd[2..]) {
+    let options = match parse_ts_options(&cmd[2..], OptionsOf::Create, strict) {
         Ok(v) => v,
         Err(e) => return Some(e),
     };
@@ -449,16 +612,13 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     let mut ts = TsInner::new();
-    ts.retention = retention;
-    ts.chunk_size = chunk_size;
-    ts.duplicate_policy = dup_policy.unwrap_or_else(DuplicatePolicy::server_default);
-    for (lk, lv) in &labels {
-        ts.labels.insert(lk.clone(), lv.clone());
-    }
+    ts.duplicate_policy = DuplicatePolicy::server_default();
+    configure_new(&mut ts, &options);
 
     map.insert(&*key, KiviDBValue::TimeSeries(Arc::new(RwLock::new(ts))));
     drop(map);
 
+    let labels = options.labels.unwrap_or_default();
     update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);
     Some(resp_simple("OK"))
 }
@@ -466,6 +626,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // ── TS.ALTER ──────────────────────────────────────────────────────────────────
 
 fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 2 {
         return Some(resp_error(
@@ -474,7 +635,7 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let key: Vec<u8> = cmd[1].to_vec();
 
-    let (retention, chunk_size, dup_policy, new_labels) = match parse_ts_options(&cmd[2..]) {
+    let options = match parse_ts_options(&cmd[2..], OptionsOf::Alter, strict) {
         Ok(v) => v,
         Err(e) => return Some(e),
     };
@@ -486,20 +647,21 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key.as_slice()) {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
-            let old_labels = ts.labels.clone();
 
-            if retention > 0 {
+            // What was given, whatever the value: `RETENTION 0` takes the
+            // retention away, `LABELS` alone the labels (#565).
+            if let Some(retention) = options.retention {
                 ts.retention = retention;
             }
-            if chunk_size != 4096 {
+            if let Some(chunk_size) = options.chunk_size {
                 ts.chunk_size = chunk_size;
             }
-            if let Some(dp) = dup_policy {
+            if let Some(dp) = options.duplicate_policy {
                 ts.duplicate_policy = dp;
             }
 
-            if !new_labels.is_empty() {
-                ts.labels.clear();
+            if let Some(new_labels) = options.labels {
+                let old_labels = std::mem::take(&mut ts.labels);
                 for (lk, lv) in &new_labels {
                     ts.labels.insert(lk.clone(), lv.clone());
                 }
@@ -524,6 +686,7 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // we can't do read-check then write-upgrade because that's a TOCTOU race.
 
 fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 4 {
         return Some(resp_error(
@@ -556,7 +719,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
         None => return Some(resp_error("ERR invalid value")),
     };
 
-    let (retention, chunk_size, dup_policy, labels) = match parse_ts_options(&cmd[4..]) {
+    let options = match parse_ts_options(&cmd[4..], OptionsOf::Add, strict) {
         Ok(v) => v,
         Err(e) => return Some(e),
     };
@@ -568,28 +731,36 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     let result = {
         let mut ts = series.write();
-        // A sample the policy refuses fails the command before the options
-        // are applied: a failed command must change nothing, as it is not
-        // sent to replicas or the AOF.
-        let policy = dup_policy.as_ref().unwrap_or(&ts.duplicate_policy);
-        if matches!(policy, DuplicatePolicy::Block) && ts.samples.contains_key(&timestamp) {
+        // The policy the sample is added under: `ON_DUPLICATE`'s, or the
+        // series' as the options leave it. A sample it refuses fails the
+        // command before anything changes: a failed command is not sent to
+        // replicas or the AOF, so the options must not stay applied.
+        let policy = options
+            .on_duplicate
+            .clone()
+            .or_else(|| options.duplicate_policy.clone())
+            .unwrap_or_else(|| ts.duplicate_policy.clone());
+        if policy == DuplicatePolicy::Block && ts.samples.contains_key(&timestamp) {
             return Some(resp_error(crate::types::BLOCKED_DUPLICATE));
         }
         if created {
-            ts.retention = retention;
-            ts.chunk_size = chunk_size;
-            for (lk, lv) in &labels {
-                ts.labels.insert(lk.clone(), lv.clone());
+            configure_new(&mut ts, &options);
+        } else {
+            // As 1.2.0 did, which a log it wrote replays by: a retention, and
+            // a duplicate policy (`DUPLICATE_POLICY`, `ON DUPLICATE`), given
+            // to an existing series are its own from now on. RedisTimeSeries
+            // passes them over there.
+            if let Some(retention) = options.retention.filter(|&r| r > 0) {
+                ts.retention = retention;
             }
-        } else if retention > 0 {
-            ts.retention = retention;
+            if let Some(dp) = &options.duplicate_policy {
+                ts.duplicate_policy = dp.clone();
+            }
         }
-        if let Some(dp) = dup_policy {
-            ts.duplicate_policy = dp;
-        }
-        ts.add_sample(timestamp, value)
+        ts.add_sample_as(timestamp, value, &policy)
     };
     if created {
+        let labels = options.labels.unwrap_or_default();
         update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);
     }
 
@@ -679,6 +850,7 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // at the given (or current) timestamp.
 
 fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
+    let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 3 {
         return Some(resp_error("ERR wrong number of arguments"));
@@ -694,39 +866,36 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
         None => return Some(resp_error("ERR invalid value")),
     };
 
-    // Parse optional TIMESTAMP, RETENTION, CHUNK SIZE, LABELS from cmd[3..]
-    let mut explicit_ts: Option<u64> = None;
-    let mut i = 3;
-    while i < cmd.len() {
-        let opt = std::str::from_utf8(cmd[i])
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        if opt == "TIMESTAMP" {
-            i += 1;
-            if i >= cmd.len() {
-                return Some(resp_error("ERR syntax error"));
-            }
-            let ts_str = std::str::from_utf8(cmd[i]).unwrap_or("bad");
-            explicit_ts = Some(if ts_str == "*" {
-                TsInner::now_ms()
-            } else {
-                match ts_str.parse() {
-                    Ok(n) => n,
-                    Err(_) => return Some(resp_error("ERR invalid TIMESTAMP")),
-                }
-            });
-        }
-        i += 1;
-    }
+    // TIMESTAMP, and the options a series it creates is made with, as in
+    // RedisTimeSeries: RETENTION, CHUNK_SIZE, DUPLICATE_POLICY, LABELS. They
+    // were passed over, and the series made with the defaults (#555).
+    //
+    // From the AOF or a master, a record without 1.2.1's mark is one 1.2.0
+    // sent, and is read as 1.2.0 read it (`written_by_1_2_0`).
+    let of_1_2_0 = if !strict && cmd.get(3).is_none_or(|word| *word != INCRBY_MARK) {
+        written_by_1_2_0(&cmd[3..])
+    } else {
+        None
+    };
+    let trim = of_1_2_0.is_none();
+    let options = match of_1_2_0 {
+        Some(v) => v,
+        None => match parse_ts_options(&cmd[3..], OptionsOf::IncrBy, strict) {
+            Ok(v) => v,
+            Err(e) => return Some(e),
+        },
+    };
+    let timestamp = options.timestamp.unwrap_or_else(TsInner::now_ms);
 
-    let timestamp = explicit_ts.unwrap_or_else(TsInner::now_ms);
-
-    let (series, _) = match series_for_append(ctx, &key) {
+    let (series, created) = match series_for_append(ctx, &key) {
         Ok(found) => found,
         Err(e) => return Some(e),
     };
     let added = {
         let mut ts = series.write();
+        if created {
+            configure_new(&mut ts, &options);
+        }
         // A counter only moves forward: the new sample goes at or after the
         // latest one, building on its value (or on 0 for an empty series).
         if ts.last_ts.is_some_and(|last| timestamp < last) {
@@ -739,14 +908,29 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
             .and_then(|lt| ts.samples.get(&lt))
             .copied()
             .unwrap_or(0.0);
-        // Not `add_sample`: at the latest timestamp this replaces the value
-        // whatever the series' duplicate policy says.
-        ts.samples.insert(timestamp, last_val + delta);
-        ts.last_ts = Some(timestamp);
-        timestamp
+        // `LAST` whatever the series' duplicate policy: at the latest
+        // timestamp this replaces the value. Through `add_sample_as`, as
+        // `TS.ADD`, so the retention trims the series (#555); not for a
+        // record of 1.2.0, which did not trim.
+        if trim {
+            ts.add_sample_as(timestamp, last_val + delta, &DuplicatePolicy::Last)
+        } else {
+            ts.samples.insert(timestamp, last_val + delta);
+            ts.last_ts = Some(timestamp);
+            Ok(timestamp)
+        }
     };
-    after_append(ctx, &key, &series, added);
-    Some(resp_integer(added as i64))
+    if created {
+        let labels = options.labels.unwrap_or_default();
+        update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);
+    }
+    match added {
+        Ok(stored_ts) => {
+            after_append(ctx, &key, &series, stored_ts);
+            Some(resp_integer(stored_ts as i64))
+        }
+        Err(e) => Some(resp_error(e)),
+    }
 }
 
 // ── TS.DEL ────────────────────────────────────────────────────────────────────
