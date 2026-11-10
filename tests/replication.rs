@@ -1623,12 +1623,31 @@ fn test_blocking_pops_are_sent_as_the_pop_they_made() {
     assert!(master.cmds(&["SET", "end", "1"]).is_ok());
 
     let mut seen = stream_until(&mut tap, |command| command.starts_with("SET end"));
-    // The two pops of `k1` and `k2` are made by two clients at once: either
-    // may be sent first.
-    if let Some(at) = seen.iter().position(|command| command == "LPOP k2")
-        && seen.get(at + 1).map(String::as_str) == Some("LPOP k1")
-    {
-        seen.swap(at, at + 1);
+    // The pushes to `k1` and `k2` and the two pops are made by two clients at
+    // once. `first`, woken by the push to `k1`, may pop it before the push to
+    // `k2` is applied, or after; and either pop may be sent first. What must
+    // hold is that the two pushes are in the order they were sent, and each
+    // pop comes after the push it took from. Those four are then put in one
+    // order, to compare the rest.
+    let racing = ["RPUSH k1 a", "RPUSH k2 b", "LPOP k1", "LPOP k2"];
+    let from = seen
+        .iter()
+        .position(|command| command == "LPOP lw")
+        .map(|at| at + 1)
+        .filter(|from| from + racing.len() <= seen.len())
+        .unwrap_or_else(|| panic!("no pushes and pops of k1 and k2: {seen:?}"));
+    let window = &seen[from..from + racing.len()];
+    let at = |command: &str| {
+        window
+            .iter()
+            .position(|sent| sent == command)
+            .unwrap_or_else(|| panic!("{command} not sent with the others: {seen:?}"))
+    };
+    assert!(at("RPUSH k1 a") < at("RPUSH k2 b"), "{seen:?}");
+    assert!(at("RPUSH k1 a") < at("LPOP k1"), "{seen:?}");
+    assert!(at("RPUSH k2 b") < at("LPOP k2"), "{seen:?}");
+    for (sent, command) in seen[from..from + racing.len()].iter_mut().zip(racing) {
+        *sent = command.to_string();
     }
     let mut expected = vec![
         "SELECT 0",
@@ -1659,11 +1678,16 @@ fn test_blocking_pops_are_sent_as_the_pop_they_made() {
     expected.push("SET end 1");
     assert_eq!(seen, expected);
 
-    // The replica holds what the master does.
+    // The replica holds what the master does, whatever order the stream
+    // had: every list and set popped empty, and the one key written last.
     assert_eq!(master.cmds(&["WAIT", "1", "5000"]).as_int(), 1);
     for key in ["l1", "l2", "l3", "lw", "k1", "k2", "z"] {
+        assert_eq!(master.cmds(&["EXISTS", key]).as_int(), 0, "{key}");
         assert_eq!(replica.cmds(&["EXISTS", key]).as_int(), 0, "{key}");
     }
+    assert_eq!(master.cmds(&["DBSIZE"]).as_int(), 1);
+    assert_eq!(replica.cmds(&["DBSIZE"]).as_int(), 1);
+    assert_eq!(replica.cmds(&["GET", "end"]).as_str(), "1");
 }
 
 /// Send `args` and read the one reply, whatever its RESP3 type. Returns the
