@@ -145,6 +145,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A relative TTL reaches replicas and the AOF as the master's own
+  deadline (#602).** `SET` with `EX` or `PX`, `SETEX`, `PSETEX`, `MSETEX`
+  and `RESTORE` with a relative TTL are sent on with an absolute deadline
+  (`PXAT`, or `ABSTTL`). That deadline was worked out again from the clock
+  after the command ran, so a replica and an AOF replay could give the key
+  a `PEXPIRETIME` 1 ms later than the master's when the clock ticked in
+  between. Inside a Lua script, whose commands keep time by the clock as the
+  script began, it was later by however long the script had run. The
+  deadline sent is now the one stored on the master's key, as `EXPIRE`,
+  `PEXPIRE` and `GETEX` already sent theirs.
+
 - **A search index created while clients write the hashes it covers
   indexes each hash as it now is (#570).** With no index defined, two
   writes to the same hash (`HSET`, `HMSET`, `HSETNX`, `HINCRBY`,

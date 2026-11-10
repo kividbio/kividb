@@ -161,10 +161,16 @@ pub fn commands_for_propagation(
         // runs the command later — a replica a moment behind, or an AOF
         // replayed after a restart, where every TTL would start over. These
         // are sent with the moment of expiry instead.
-        "SET" => set_feed(cmd),
-        "SETEX" | "PSETEX" => setex_feed(name, cmd),
+        "SET" => set_feed(ctx, cmd),
+        "SETEX" | "PSETEX" => setex_feed(ctx, name, cmd),
         "GETEX" => getex_feed(ctx, cmd, resp),
-        "MSETEX" => vec![absolute_ttl_options(cmd, msetex_options_start(cmd), &[])],
+        "MSETEX" => vec![absolute_ttl_options(
+            ctx,
+            cmd,
+            msetex_options_start(cmd),
+            &[],
+            cmd.get(2).copied(),
+        )],
         // Sent as what they did, recorded by the commands themselves: the
         // fields whose deadline changed (`HPEXPIREAT … FIELDS`, with no
         // condition left to weigh), whose time to live went (`HPERSIST`), or
@@ -174,7 +180,7 @@ pub fn commands_for_propagation(
         }
         // A SET of the result, or DEL/UNLINK; see `cmd_increx`.
         "INCREX" => effects_take(),
-        "RESTORE" => restore_feed(cmd),
+        "RESTORE" => restore_feed(ctx, cmd),
         "INCRBYFLOAT" => incrbyfloat_feed(cmd, resp),
         "XADD" => xadd_feed(cmd, resp),
         // A `~` trim is sent as what it removed; see `exact_trim_args`.
@@ -505,8 +511,15 @@ fn expiry_ms(ctx: &Ctx<'_>, key: &[u8]) -> Option<u64> {
 /// which a replica or a replayed AOF refused.
 ///
 /// `with_argument` names the options that take an argument, so that argument
-/// is not read as an option.
-fn absolute_ttl_options(cmd: &[&[u8]], start: usize, with_argument: &[&str]) -> Vec<Vec<u8>> {
+/// is not read as an option. A relative time (`EX`, `PX`) is sent as the
+/// deadline `key` was given here ([`stored_deadline`]).
+fn absolute_ttl_options(
+    ctx: &Ctx<'_>,
+    cmd: &[&[u8]],
+    start: usize,
+    with_argument: &[&str],
+    key: Option<&[u8]>,
+) -> Vec<Vec<u8>> {
     let mut times = Vec::new();
     let mut i = start;
     while i < cmd.len() {
@@ -529,9 +542,9 @@ fn absolute_ttl_options(cmd: &[&[u8]], start: usize, with_argument: &[&str]) -> 
         return owned(cmd);
     };
     let at = if cmd[last].eq_ignore_ascii_case(b"EX") {
-        now_ms().saturating_add(n.saturating_mul(1000))
+        stored_deadline(ctx, key, n.saturating_mul(1000))
     } else if cmd[last].eq_ignore_ascii_case(b"PX") {
-        now_ms().saturating_add(n)
+        stored_deadline(ctx, key, n)
     } else if cmd[last].eq_ignore_ascii_case(b"EXAT") {
         n.saturating_mul(1000)
     } else {
@@ -548,17 +561,33 @@ fn absolute_ttl_options(cmd: &[&[u8]], start: usize, with_argument: &[&str]) -> 
     out
 }
 
+/// The deadline a command with a relative time to live of `ms` gave `key`,
+/// read back from the key, as `expire_feed` and `getex_feed` send theirs:
+/// worked out again here from the clock, it was later than the master's by
+/// however long had gone by since, a millisecond now and then, and inside a
+/// script, whose commands keep time by the script's frozen clock, by how
+/// long the script had run (#602). From the clock only when the key has no
+/// deadline (a write that did not happen: a condition that did not hold,
+/// which the reader of the stream weighs again and refuses too).
+fn stored_deadline(ctx: &Ctx<'_>, key: Option<&[u8]>, ms: i64) -> i64 {
+    key.and_then(|key| expiry_ms(ctx, key))
+        .and_then(|at| i64::try_from(at).ok())
+        .unwrap_or_else(|| now_ms().saturating_add(ms))
+}
+
 /// `SET key value [...] EX|PX|EXAT|PXAT time` → the same with `PXAT`.
-fn set_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
+fn set_feed(ctx: &Ctx<'_>, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     vec![absolute_ttl_options(
+        ctx,
         cmd,
         3,
         &["IFEQ", "IFNE", "IFDEQ", "IFDNE"],
+        cmd.get(1).copied(),
     )]
 }
 
 /// `SETEX key seconds value` / `PSETEX key ms value` → `SET key value PXAT at`.
-fn setex_feed(name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
+fn setex_feed(ctx: &Ctx<'_>, name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     let ttl = match cmd.get(2).and_then(|arg| integer_arg(arg)) {
         Some(ttl) if cmd.len() == 4 => ttl,
         _ => return vec![owned(cmd)],
@@ -573,7 +602,9 @@ fn setex_feed(name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
         cmd[1].to_vec(),
         cmd[3].to_vec(),
         b"PXAT".to_vec(),
-        now_ms().saturating_add(ms).to_string().into_bytes(),
+        stored_deadline(ctx, Some(cmd[1]), ms)
+            .to_string()
+            .into_bytes(),
     ]]
 }
 
@@ -624,8 +655,11 @@ fn msetex_options_start(cmd: &[&[u8]]) -> usize {
 
 /// `INCREX` can refuse to move (a bound), can round (BYFLOAT), and can set a
 /// TTL only when there is none (ENX): what is sent is where it left the key.
-/// `RESTORE key ttl payload …` with a relative TTL → the same with `ABSTTL`.
-fn restore_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
+/// `RESTORE key ttl payload …` with a relative TTL → the same with `ABSTTL`
+/// and the deadline the key was given here, read back from the key as
+/// `expire_feed` does: worked out again from the clock, it was up to 1 ms
+/// off what the master keeps, on every replica and in the AOF (#602).
+fn restore_feed(ctx: &Ctx<'_>, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     let mut out = owned(cmd);
     let absolute = cmd
         .iter()
@@ -635,7 +669,9 @@ fn restore_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
         && let Some(ttl) = cmd.get(2).and_then(|arg| integer_arg(arg))
         && ttl > 0
     {
-        out[2] = now_ms().saturating_add(ttl).to_string().into_bytes();
+        out[2] = stored_deadline(ctx, cmd.get(1).copied(), ttl)
+            .to_string()
+            .into_bytes();
         out.push(b"ABSTTL".to_vec());
     }
     vec![out]
