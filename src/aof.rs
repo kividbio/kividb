@@ -4562,6 +4562,87 @@ mod ts_option_replay_tests {
     /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
     /// `TS.INCRBY` as the feed writes it, with a word left over from
     /// `LABELS`: replayed as they ran.
+    /// A time above `i64::MAX`, which 1.2.0 took: in its log as given
+    /// (`TS.ADD`, `TS.MADD`), or, from `TS.INCRBY`, as the negative number
+    /// it replied. Replayed, each sample at the time 1.2.0 kept (#592).
+    #[test]
+    fn times_above_i64_max_of_1_2_0_replay() {
+        let max = u64::MAX.to_string();
+        let below = (u64::MAX - 1).to_string();
+        let store = replayed(&[
+            vec!["TS.ADD", "h", below.as_str(), "1"],
+            vec!["TS.MADD", "h", max.as_str(), "2"],
+            vec!["TS.INCRBY", "i", "1", "TIMESTAMP", "-1"],
+        ]);
+        let samples = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner
+                    .read()
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (*t, *v))
+                    .collect::<Vec<_>>(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert_eq!(samples("h"), [(u64::MAX - 1, 1.0), (u64::MAX, 2.0)]);
+        assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
+    }
+
+    /// A compaction's destination past its time (its `DEL` not yet in the
+    /// log), deleted, made again and given its source again; and a source
+    /// renamed. Replayed, the links are as the master had them (#593).
+    #[test]
+    fn compaction_links_replay_as_they_ran() {
+        let store = replayed(&[
+            vec!["TS.CREATE", "s"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "1", "1"],
+            vec!["PEXPIREAT", "d", "1"],
+            vec!["TS.ADD", "s", "15", "1"],
+            vec!["DEL", "d"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "25", "1"],
+            vec!["RENAME", "s", "s2"],
+            vec!["TS.ADD", "s2", "35", "1"],
+            // A destination renamed onto another of its source's.
+            vec!["TS.CREATE", "w"],
+            vec!["TS.CREATE", "a"],
+            vec!["TS.CREATE", "b"],
+            vec!["TS.CREATERULE", "w", "a", "AGGREGATION", "sum", "10"],
+            vec!["TS.CREATERULE", "w", "b", "AGGREGATION", "sum", "10"],
+            vec!["RENAME", "a", "b"],
+            vec!["TS.ADD", "w", "1", "1"],
+            vec!["TS.ADD", "w", "15", "1"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let s = series("s2");
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].dest_key, "d");
+        let d = series("d");
+        assert_eq!(d.source.as_deref(), Some("s2"));
+        assert_eq!(
+            d.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
+            [(10, 1.0), (20, 1.0)]
+        );
+        let w = series("w");
+        assert_eq!(w.rules.len(), 1);
+        assert_eq!(w.rules[0].dest_key, "b");
+        assert_eq!(series("b").source.as_deref(), Some("w"));
+        assert_eq!(series("b").samples.get(&0), Some(&1.0));
+    }
+
     #[test]
     fn options_replay_as_they_ran() {
         let (store, index) = replayed_with_index(&[

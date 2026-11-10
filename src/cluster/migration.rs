@@ -34,6 +34,7 @@
 use super::{ClusterState, MigrationState, NodeId, key_hash_slot};
 use crate::replication::{HubTx, ReplPayload, ReplState};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -1107,6 +1108,49 @@ fn restore_command(
     Ok(restore)
 }
 
+/// The time series compaction rules among `keys`, as the `TS.CREATERULE`s
+/// that make them again, to be sent after the keys' `RESTORE`s, which carry
+/// no links (`snapshot::dump_payload`). A rule's two series are in one slot
+/// and move together. Only a rule whose destination moves and names its
+/// source back; any other is dead (#593).
+fn compaction_rules(keys: &[Captured]) -> Vec<Vec<Vec<u8>>> {
+    use crate::types::KiviDBValue;
+    let sources: HashMap<&[u8], Option<String>> = keys
+        .iter()
+        .filter_map(|c| match &c.value {
+            KiviDBValue::TimeSeries(series) => {
+                Some((c.key.as_bytes(), series.read().source.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for c in keys {
+        let KiviDBValue::TimeSeries(series) = &c.value else {
+            continue;
+        };
+        let name = crate::key_bytes::text_of(c.key.as_bytes());
+        for rule in &series.read().rules {
+            let dest = crate::key_bytes::bytes_of(&rule.dest_key);
+            if sources
+                .get(&*dest)
+                .is_some_and(|source| source.as_deref() == Some(&*name))
+            {
+                out.push(vec![
+                    b"TS.CREATERULE".to_vec(),
+                    c.key.as_bytes().to_vec(),
+                    dest.into_owned(),
+                    b"AGGREGATION".to_vec(),
+                    rule.aggregation.name().as_bytes().to_vec(),
+                    rule.bucket_duration.to_string().into_bytes(),
+                    rule.align_timestamp.to_string().into_bytes(),
+                ]);
+            }
+        }
+    }
+    out
+}
+
 /// Every key in `ranges`, as what recreates it. Call with the write gate
 /// closed: it does no more than must be done while writes wait. The values
 /// are serialised afterwards (see [`Captured::into_restore`]); they used to
@@ -1380,7 +1424,15 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         t.write_pause_ms = capture_ms;
     });
     let captured = captured
-        .and_then(|keys| keys.into_iter().map(Captured::into_restore).collect())
+        .and_then(|keys| {
+            let rules = compaction_rules(&keys);
+            let mut commands = keys
+                .into_iter()
+                .map(Captured::into_restore)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            commands.extend(rules);
+            Ok(commands)
+        })
         .map_err(|e| format!("could not serialise the slots' keys: {e}"))?;
     let captured: Vec<Vec<Vec<u8>>> = captured;
 
