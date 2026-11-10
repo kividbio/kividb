@@ -365,6 +365,21 @@ fn not_allowed_from_script(name: &str, sub: Option<&[u8]>) -> bool {
     }
 }
 
+/// The `BUSY` reply to a command refused while a script runs: it names
+/// `FUNCTION KILL` while a function runs, as Redis's does (#562).
+fn busy_reply() -> Vec<u8> {
+    #[cfg(feature = "lua")]
+    {
+        crate::commands::lua::busy_reply()
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        resp_error(
+            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+        )
+    }
+}
+
 /// The rest of [`execute_command_from_script`], with the command in `ctx.cmd`.
 /// Why a script on a cluster node may not run `ctx.cmd`, or `None` when it
 /// may: as in Redis, its keys must be ones this node serves, and, unless the
@@ -739,11 +754,12 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
             .get(ctx.authenticated_user)
             .and_then(|user| crate::acl::check_permission(user, name2, ctx.cmd.as_slice()).err());
         if let Some(denied) = denied {
+            let _lua = crate::acl::log_context("lua");
             ctx.acl_log.record(
                 denied.reason(),
                 denied.object(),
                 ctx.authenticated_user,
-                ctx.peer_addr,
+                &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
             );
             let reply = resp_error(&denied.message(ctx.authenticated_user));
             return reply;
@@ -1131,9 +1147,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     #[cfg(feature = "lua")]
     if crate::commands::lua::lua_server_busy_for_command(ctx.cmd.as_slice()) {
-        return resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        );
+        return busy_reply();
     }
 
     // Masters skip `is_write_command` entirely here — hot path for standalone read benchmarks.
@@ -1196,11 +1210,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             .get(ctx.authenticated_user)
             .and_then(|user| crate::acl::check_permission(user, name, ctx.cmd.as_slice()).err());
         if let Some(denied) = denied {
+            // As in Redis, a command there is no such command as is refused
+            // for that, before the user's rules (and the ACL log). The
+            // wrong number of arguments was refused above.
+            if !crate::commands::server::is_command(name) {
+                return unknown_command(&ctx.cmd);
+            }
             ctx.acl_log.record(
                 denied.reason(),
                 denied.object(),
                 ctx.authenticated_user,
-                ctx.peer_addr,
+                &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
             );
             return resp_error(&denied.message(ctx.authenticated_user));
         }
@@ -1340,9 +1360,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
     };
     let Some((_command_gate, _alone)) = gates else {
-        return resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        );
+        return busy_reply();
     };
 
     // A write under a script or an `EXEC` that already holds the gate is part
