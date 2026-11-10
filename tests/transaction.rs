@@ -752,7 +752,17 @@ fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
         &["XGROUP", "CREATE", "xs:2", "g", "0"],
     ]);
     for command in [
-        &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "xs:1", "xs:2", ">", ">"][..],
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "STREAMS",
+            "xs:1",
+            "xs:2",
+            ">",
+            ">",
+        ][..],
         &["XACK", "xs:1", "g", "1-1"],
         &["XCLAIM", "xs:2", "g", "c2", "0", "1-1"],
         &["XAUTOCLAIM", "xs:2", "g", "c3", "0", "0"],
@@ -765,7 +775,10 @@ fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
         );
     }
     assert_eq!(
-        failed(&[("0", "xs:1"), ("0", "xs:2")], &["XADD", "xs:1", "*", "f", "v"]),
+        failed(
+            &[("0", "xs:1"), ("0", "xs:2")],
+            &["XADD", "xs:1", "*", "f", "v"]
+        ),
         ["0/xs:1"]
     );
 

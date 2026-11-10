@@ -1926,7 +1926,8 @@ fn for_each_changed_key(
     let Some(first) = keys.first() else {
         return false;
     };
-    if changed_nothing(name, &ctx.cmd, result) || leaves_the_stream_signalled_as_is(name, &ctx.cmd) {
+    if changed_nothing(name, &ctx.cmd, result) || leaves_the_stream_signalled_as_is(name, &ctx.cmd)
+    {
         return true;
     }
     let db = *ctx.selected_db;
@@ -1961,8 +1962,12 @@ fn for_each_changed_key(
 fn leaves_the_stream_signalled_as_is(name: &str, cmd: &[&[u8]]) -> bool {
     match name {
         "XREADGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "XSETID" => true,
-        "XGROUP" => !(cmd.get(1).is_some_and(|sub| sub.eq_ignore_ascii_case(b"CREATE"))
-            && cmd.iter().any(|arg| arg.eq_ignore_ascii_case(b"MKSTREAM"))),
+        "XGROUP" => {
+            !(cmd
+                .get(1)
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"CREATE"))
+                && cmd.iter().any(|arg| arg.eq_ignore_ascii_case(b"MKSTREAM")))
+        }
         _ => false,
     }
 }
