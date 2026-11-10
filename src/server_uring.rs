@@ -40,6 +40,12 @@ pub async fn handle_replica_connection_uring(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
+    // However this ends, the socket is shut down: dropped, the forwarder's and
+    // the ACK reader's operations still hold it open (and a stuck write its
+    // buffer) until they complete, which for a replica that reads nothing is
+    // never. Shut down, they complete at once.
+    let _shutdown = ShutdownOnDrop(Rc::clone(&stream));
+
     // ── 1. The stream queue. Unbounded: bounded queues fill before forwarding runs.
     let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let replica_id = crate::replication::next_replica_id();
@@ -48,7 +54,10 @@ pub async fn handle_replica_connection_uring(
     // decrements it after each successful flush. Lets the hub evict us if we fall
     // far enough behind instead of queueing an unbounded backlog — see
     // `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the connection ends, also before the
+    // forwarder runs, and says so.
+    let replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // ── 2. A replica that only lost its connection is sent what it missed.
     // Failing that, take the cut: register with the hub and serialise the
@@ -111,10 +120,16 @@ pub async fn handle_replica_connection_uring(
         Some(_) => None,
     };
     if let Some(greeting) = greeting {
-        let (res, _) = stream.write_all(greeting.into_bytes()).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            return Err(e.into());
+        match write_unless_let_go(&stream, greeting.into_bytes(), &repl_state, replica_id).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                return Err(e.into());
+            }
+            None => {
+                let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                return Ok(());
+            }
         }
     }
 
@@ -123,7 +138,7 @@ pub async fn handle_replica_connection_uring(
     // Blocks on `recv()` (event-driven) — no polling, no re-issued ops.
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel::<()>();
     let stream_fwd = Rc::clone(&stream);
-    let forward_task = tokio_uring::spawn(async move {
+    let mut forward_task = tokio_uring::spawn(async move {
         if rdb_enqueued_rx.await.is_err() {
             return;
         }
@@ -135,24 +150,37 @@ pub async fn handle_replica_connection_uring(
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
+                return;
+            }
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        pending_bytes
-                            .fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let _ = stream_fwd.write_all(batch).await;
+                        pending_bytes.taken(batch.len(), held);
+                        if !pending_bytes.abandoned() {
+                            let _ = stream_fwd.write_all(batch).await;
+                        }
                         return;
                     }
                 }
             }
-            pending_bytes.fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            pending_bytes.taken(batch.len(), held);
             if stream_fwd.write_all(batch).await.0.is_err() {
                 break;
             }
@@ -165,17 +193,27 @@ pub async fn handle_replica_connection_uring(
             replica.set_state(crate::replication::ReplicaState::SendBulk);
         }
         let header = format!("${}\r\n", sync.payload.len()).into_bytes();
-        let (res, _) = stream.write_all(header).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            drop(rdb_enqueued_tx);
-            return Err(e.into());
-        }
-        let (res, _) = stream.write_all(sync.payload).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            drop(rdb_enqueued_tx);
-            return Err(e.into());
+        for part in [header, sync.payload] {
+            // A replica that stops reading during its full sync is let go of
+            // once its queue passes its limit: the write is given up then,
+            // rather than waited on for good with its queue held (#542).
+            match write_unless_let_go(&stream, part, &repl_state, replica_id).await {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                    drop(rdb_enqueued_tx);
+                    return Err(e.into());
+                }
+                None => {
+                    log_warn!(
+                        "Replication: uring: replica {endpoint} let go of during its full sync"
+                    );
+                    let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                    drop(rdb_enqueued_tx);
+                    forward_task.abort();
+                    return Ok(());
+                }
+            }
         }
         log_info!("Replication: uring: sent full RDB; streaming queued writes from hub");
     }
@@ -234,19 +272,51 @@ pub async fn handle_replica_connection_uring(
 
     tokio::select! {
         _ = ack_reader => {}
-        _ = forward_task => {}
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        _ = &mut forward_task => {}
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
         }
     }
 
+    // The forwarder ends with the connection. Left running when the ACK
+    // reader, `repl-timeout` or the hub letting go of the replica ended it,
+    // it kept the socket open and the replica's queue allocated after the
+    // hub had forgotten both.
+    forward_task.abort();
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
     log_info!("Replication: uring: replica disconnected");
     Ok(())
+}
+
+/// Shuts a replica's socket down when dropped (see
+/// `handle_replica_connection_uring`).
+struct ShutdownOnDrop(Rc<TcpStream>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Write `buf` to a replica, unless it goes silent or the hub lets go of it
+/// first (`None`; see `ReplState::replica_timed_out`).
+async fn write_unless_let_go(
+    stream: &TcpStream,
+    buf: Vec<u8>,
+    repl_state: &crate::replication::ReplState,
+    replica_id: u64,
+) -> Option<std::io::Result<()>> {
+    tokio::select! {
+        (res, _) = stream.write_all(buf) => Some(res),
+        _ = repl_state.replica_timed_out(replica_id) => None,
+    }
 }
 
 #[inline(always)]

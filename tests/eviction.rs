@@ -246,6 +246,12 @@ impl Server {
             .append(true)
             .open(dir.join("server.log"))
             .unwrap();
+        // The tokio loop, unless the test names its own.
+        let io_model: &[&str] = if extra.contains(&"--io-model") {
+            &[]
+        } else {
+            &["--io-model", "tokio"]
+        };
         let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(&dir)
             .args([
@@ -253,13 +259,12 @@ impl Server {
                 &port.to_string(),
                 "--bind",
                 "127.0.0.1",
-                "--io-model",
-                "tokio",
                 "--threads",
                 "4",
                 "--configfile",
                 "kividb.conf",
             ])
+            .args(io_model)
             .args(extra)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
@@ -1405,6 +1410,135 @@ fn writes_during_a_full_sync_evict_nothing_that_fits() {
     m.snapshot_let_go(limit);
     assert_eq!(r.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64);
     assert_eq!(r.cmd(&["GET", "s0"]).s(), big_value('b'));
+}
+
+/// Everything written while a replica is behind is queued for it, and none
+/// of it is counted: not the stream's bytes, and not what each write takes
+/// in the queue besides (its allocation, its slot). Only the bytes were
+/// taken off. A replica gigabytes behind under heavy writes left hundreds of
+/// megabytes counted, and its master evicted nearly every key for them and
+/// then refused writes (#542). Here the replica is held in its full sync,
+/// reading nothing of the stream, while small writes are queued for it: what
+/// they take besides their bytes is several times the room the master has.
+#[test]
+fn writes_queued_for_a_replica_that_is_behind_evict_nothing() {
+    let master = Server::start_holding_snapshots(&[
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
+    let replica = Server::start(&[]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    let limit = m.fill_to_the_limit();
+    assert!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()])
+            .ok()
+    );
+    let held = master.snapshot_held(1);
+
+    // Payloads of about 30 bytes, each taking about 40 more in the queue:
+    // some 16 MB besides the bytes, against 4 MB of room.
+    const WRITES: usize = 400_000;
+    const BATCH: usize = 2_000;
+    let incr = b"*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n";
+    for batch in 0..WRITES / BATCH {
+        m.writer.write_all(&incr.repeat(BATCH)).unwrap();
+        for i in 0..BATCH {
+            let reply = m.read();
+            let n = (batch * BATCH + i + 1) as i64;
+            assert_eq!(reply, V::Int(n), "write {n} was refused");
+        }
+    }
+    assert_eq!(
+        m.evicted(),
+        0,
+        "keys were evicted for what is queued for the replica"
+    );
+
+    // Once the replica has it all, nothing is left uncounted, and it has
+    // what the master has.
+    std::fs::remove_file(held).unwrap();
+    r.wait_for("replication", "master_link_status", "up");
+    assert_eq!(m.cmd(&["WAIT", "1", "30000"]).i(), 1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while m.not_counted() != 0 {
+        assert!(Instant::now() < deadline, "memory is still not counted");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let used = m.used_memory();
+    assert!(
+        used <= limit,
+        "{used} bytes used, over the limit of {limit}"
+    );
+    assert_eq!(m.evicted(), 0);
+    assert_eq!(m.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64 + 1);
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64 + 1);
+    assert_eq!(r.cmd(&["GET", "counter"]).s(), WRITES.to_string());
+    assert_eq!(r.cmd(&["GET", "s0"]).s(), big_value('a'));
+}
+
+/// A replica that stops reading while its full sync's payload is written (a
+/// stopped process, whose kernel still answers) is let go of once its queue
+/// passes the sync's limit: the payload's write is given up then, and
+/// nothing is left counted out of `maxmemory`. The write used to be waited on
+/// for good, with the replica's queue and the payload held (#542). On both
+/// I/O models where there are two.
+#[test]
+fn a_replica_that_stops_reading_during_its_full_sync_is_let_go_of() {
+    let models: &[&str] = if cfg!(target_os = "linux") {
+        &["tokio", "uring"]
+    } else {
+        &["tokio"]
+    };
+    for &model in models {
+        let master = Server::start(&["--io-model", model, "--repl-backlog-size", "1048576"]);
+        let mut m = master.conn();
+        if model == "uring" {
+            assert_eq!(m.info("server", "multiplexing_api"), "io_uring");
+        }
+        // 48 MB of values: a payload no pair of socket buffers holds.
+        let value = big_value('a');
+        for i in 0..6000 {
+            assert!(m.cmd(&["SET", &format!("s{i}"), &value]).ok());
+        }
+        for (name, bytes) in [
+            ("repl-replica-max-backlog-bytes", "1048576"),
+            ("repl-replica-sync-max-backlog-bytes", "4194304"),
+        ] {
+            assert!(m.cmd(&["CONFIG", "SET", name, bytes]).ok());
+        }
+
+        // A replica that asks for a full sync, and reads nothing.
+        let mut replica = TcpStream::connect(("127.0.0.1", master.port)).unwrap();
+        replica
+            .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+            .unwrap();
+        m.wait_for("replication", "connected_slaves", "1");
+
+        // 8 MB written meanwhile, queued for it: past the sync's limit.
+        for i in 0..1000 {
+            assert!(m.cmd(&["SET", &format!("w{i}"), &value]).ok());
+        }
+
+        // Let go of: its connection is closed, and nothing it held is left
+        // counted out.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let held = m.not_counted();
+            let replicas = m.info("replication", "connected_slaves");
+            if held == 0 && replicas == "0" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{model}: {held} bytes still not counted, {replicas} replica(s) connected"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(m.cmd(&["DBSIZE"]).i(), 7000);
+        drop(replica);
+    }
 }
 
 #[test]
