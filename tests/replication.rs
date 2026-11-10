@@ -1680,7 +1680,10 @@ fn read_resp3(r: &mut impl BufRead) -> String {
     let mut line = String::new();
     r.read_line(&mut line).unwrap();
     let head = line.trim_end().to_string();
-    let n = head.get(1..).and_then(|n| n.parse::<i64>().ok()).unwrap_or(0);
+    let n = head
+        .get(1..)
+        .and_then(|n| n.parse::<i64>().ok())
+        .unwrap_or(0);
     match head.as_bytes().first() {
         Some(b'$' | b'=' | b'!') if n >= 0 => {
             let mut body = vec![0u8; n as usize + 2];
@@ -1718,7 +1721,10 @@ fn test_a_resp3_client_s_writes_are_sent_as_their_effects() {
     resp3_call(&mut c, &["SADD", "s", "a", "b", "c", "d", "e"]);
     assert_eq!(resp3_call(&mut c, &["SPOP", "s", "2"]), "~2");
     assert_eq!(resp3_call(&mut c, &["SPOP", "s"]), "$1");
-    assert_eq!(resp3_call(&mut c, &["SPOP", "none", "2"]).as_bytes()[0], b'~');
+    assert_eq!(
+        resp3_call(&mut c, &["SPOP", "none", "2"]).as_bytes()[0],
+        b'~'
+    );
     resp3_call(&mut c, &["RPUSH", "l", "a", "b"]);
     resp3_call(&mut c, &["BLPOP", "l", "0"]);
     resp3_call(&mut c, &["BLMOVE", "l", "l2", "LEFT", "RIGHT", "0"]);
@@ -1747,7 +1753,10 @@ fn test_a_resp3_client_s_writes_are_sent_as_their_effects() {
     for sent in &seen {
         let name = sent.split(' ').next().unwrap_or("");
         assert!(
-            !matches!(name, "SPOP" | "BLPOP" | "BLMOVE" | "BZPOPMIN" | "BZMPOP" | "INCRBYFLOAT"),
+            !matches!(
+                name,
+                "SPOP" | "BLPOP" | "BLMOVE" | "BZPOPMIN" | "BZMPOP" | "INCRBYFLOAT"
+            ),
             "{sent} was sent as it was: {seen:?}"
         );
     }

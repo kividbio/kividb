@@ -166,6 +166,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   VM. When one did, the reply was `BUSY` but the libraries were gone, on
   the master only. It now checks first, and a refused flush changes
   nothing.
+- **`SPOP` with a count from a RESP3 client reaches replicas and the AOF.**
+  Its reply is a set there, which was not read, so nothing was sent: the
+  replicas, and a restart from the AOF, kept the members the master had
+  popped. So too from a script after `redis.setresp(3)`. It is now sent as
+  an `SREM` of the members popped, as from a RESP2 client.
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
   `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a

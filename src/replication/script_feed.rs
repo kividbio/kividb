@@ -648,7 +648,10 @@ fn incrbyfloat_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     // A bulk string; or, if a RESP3 reply is ever a double (`,`), that.
     let val = match parse_bulk(resp) {
         Some((_, Some(val))) => val,
-        _ => match resp.strip_prefix(b",").and_then(|rest| rest.strip_suffix(b"\r\n")) {
+        _ => match resp
+            .strip_prefix(b",")
+            .and_then(|rest| rest.strip_suffix(b"\r\n"))
+        {
             Some(val) => val.to_vec(),
             None => return Vec::new(),
         },

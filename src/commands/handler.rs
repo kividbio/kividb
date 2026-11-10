@@ -1759,29 +1759,28 @@ fn popped_nothing(name: &str, result: &[u8]) -> bool {
     matches!(
         result,
         b"$-1\r\n" | b"*-1\r\n" | b"_\r\n" | b"*0\r\n" | b"~0\r\n"
+    ) && matches!(
+        name,
+        "LPOP"
+            | "RPOP"
+            | "LMPOP"
+            | "LMOVE"
+            | "RPOPLPUSH"
+            | "LMOVEM"
+            | "ZPOPMIN"
+            | "ZPOPMAX"
+            | "ZMPOP"
+            | "SPOP"
+            | "BLPOP"
+            | "BRPOP"
+            | "BLMPOP"
+            | "BLMOVE"
+            | "BRPOPLPUSH"
+            | "BLMOVEM"
+            | "BZPOPMIN"
+            | "BZPOPMAX"
+            | "BZMPOP"
     )
-        && matches!(
-            name,
-            "LPOP"
-                | "RPOP"
-                | "LMPOP"
-                | "LMOVE"
-                | "RPOPLPUSH"
-                | "LMOVEM"
-                | "ZPOPMIN"
-                | "ZPOPMAX"
-                | "ZMPOP"
-                | "SPOP"
-                | "BLPOP"
-                | "BRPOP"
-                | "BLMPOP"
-                | "BLMOVE"
-                | "BRPOPLPUSH"
-                | "BLMOVEM"
-                | "BZPOPMIN"
-                | "BZPOPMAX"
-                | "BZMPOP"
-        )
 }
 
 /// After a `SWAPDB` (`ctx.cmd`): the watches on keys of the two swapped
