@@ -162,6 +162,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the writes under way to finish: `FT.CREATE` there fails with an
   error, and works outside the script, or once an index exists.
 
+- **A hash field's deadline is kept to the millisecond everywhere, and a
+  replica holds the master's (#594, #489).** A field's deadline was kept as
+  a monotonic clock reading and converted to and from Unix milliseconds by
+  reading both clocks each time, so a round trip could land on the next
+  millisecond: `HPEXPIRETIME` read back 1 ms off what `HPEXPIREAT` set, now
+  and then, after `MIGRATE`, `DUMP` and `RESTORE`, a restart, an AOF replay
+  or a full sync. A relative time to live (`HPEXPIRE`, `HEXPIRE`, `EX` and
+  `PX` of `HSETEX` and `HGETEX`) was sent to replicas and the AOF worked out
+  apart from the master's own deadline, up to 1 ms earlier. A deadline is
+  now kept as Unix milliseconds by the wall clock, as Redis keeps it and as
+  every file, payload and stream carries it: nothing is converted, the
+  master sends the very number it keeps, and each of these reads back
+  exactly. As in Redis and as for a key here, the deadline follows the wall
+  clock (a clock set back or forward moves when fields go), and a field
+  lives through the millisecond its deadline is in. A field with a time to
+  live takes about 10 bytes less (52 where it took 62), and `HSETEX`,
+  `HPEXPIRE`, `HGET` and `HPEXPIRETIME` on such hashes cost no more
+  instructions than before (1 to 5% fewer).
+
 - **A master that becomes a replica ends its blocked clients, as Redis
   does (#591).** On `REPLICAOF`, `CLUSTER REPLICATE`, or a cluster failover
   that demotes it, every client blocked in `BLPOP`, `BRPOP`, `BLMOVE`,
@@ -447,6 +466,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with. Before, the log used the name from before the transaction, even when
   a queued `CLIENT SETNAME` or `HELLO SETNAME` had changed it. Both I/O
   models.
+
+- **A write fails only the watches on the keys it changed (#584).** A write
+  failed the `WATCH` on every key it named, and told client-side caching
+  of every one. As in Redis, it now does so for the keys it changed: of
+  `BLPOP a b` (and the other pops from several keys) only the key it took
+  from; of `SUNIONSTORE`, `ZUNIONSTORE`, `COPY`, `BITOP`, `PFMERGE`,
+  `SORT … STORE`, `GEOSEARCHSTORE` and the like, the destination and not
+  the sources; of `DEL`, the keys that were there. `MOVE`, and `COPY … DB`,
+  now fail a watch on the key in the other database, which they did not.
+  A write that changed nothing (`SET … NX` on a key that is there, a `COPY`
+  that copied nothing) no longer tells caching clients either. As in Redis,
+  `XREADGROUP`, `XACK`, `XCLAIM`, `XAUTOCLAIM`, `XSETID` and `XGROUP` (but
+  a `CREATE … MKSTREAM`) no longer fail a watch on the stream or tell
+  caching clients: they change its consumer groups, which Redis does not
+  signal (#588).
 
 - **`HELLO` and refused commands, as in Redis.** `HELLO` now takes its
   `AUTH` and `SETNAME` options in any order. It checks the name before it

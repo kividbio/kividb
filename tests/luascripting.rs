@@ -341,6 +341,29 @@ fn blocking_commands_in_a_script_take_what_is_there() {
     assert_eq!(c.cmds(&["LLEN", "l"]).as_int(), 1);
 }
 
+/// A key a script's call left as it was (a `DEL` of a key that is not
+/// there) and a later call changed (a `SET` of it) has changed: a `WATCH` on
+/// it fails (#584). What the first call said held for the next.
+#[test]
+fn a_script_that_deletes_a_missing_key_then_sets_it_fails_a_watch() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut watcher = Conn::connect(port);
+    assert_eq!(watcher.cmds(&["WATCH", "made"]).as_str(), "OK");
+    let reply = c.cmds(&[
+        "EVAL",
+        "redis.call('DEL', KEYS[1]) return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        "made",
+    ]);
+    assert!(!reply.is_error(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(watcher.cmds(&["EXEC"]).is_nil());
+}
+
 // ── Nil bulk → Lua false ──────────────────────────────────────────────────────
 
 /// When a Redis command returns nil (key not found), Lua must see false, not nil.

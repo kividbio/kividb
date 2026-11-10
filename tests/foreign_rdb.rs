@@ -104,15 +104,9 @@ fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
     assert_eq!(fields, ["a", "b", "gone"]);
     assert_eq!(&h.fields["a"][..], b"1");
     assert_eq!(h.expiries.len(), 2, "b has no TTL");
-    assert!(
-        h.expiries["gone"] <= std::time::Instant::now(),
-        "gone is due"
-    );
-    let left = h.expiries["a"].saturating_duration_since(std::time::Instant::now());
-    assert!(
-        (3_590..=3_600).contains(&left.as_secs()),
-        "a's TTL is {left:?}"
-    );
+    assert!(h.expiries["gone"] < now_ms(), "gone is due");
+    let left = h.expiries["a"].saturating_sub(now_ms()) / 1_000;
+    assert!((3_590..=3_600).contains(&left), "a's TTL is {left} s");
 }
 
 // Valkey writes a hash all of whose fields have TTLs as type 22 too. When
@@ -133,8 +127,8 @@ fn a_valkey_9_hash_whose_fields_have_all_run_out_is_kept_with_them_due() {
     let KiviDBValue::HashEx(h) = &dbs[0]["gone"] else {
         panic!("gone is not a hash with field TTLs");
     };
-    assert!(h.read().has_due(std::time::Instant::now()));
-    assert!(h.read().live_fields(std::time::Instant::now()).is_empty());
+    assert!(h.read().has_due(now_ms()));
+    assert!(h.read().live_fields(now_ms()).is_empty());
 }
 
 // What Valkey 9.0 and 9.1 do not write is refused, by what it is: a newer
@@ -269,21 +263,16 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
         }
         assert!(functions.is_some(), "Valkey {label}: the library was lost");
 
-        // Field TTLs, each to the millisecond: `left` is what is left of
-        // one now, which must match FAR from the wall clock.
+        // Field TTLs, each to the millisecond: kept as the file has them.
         let ttls = |key: &str| -> Vec<(String, u64)> {
             let KiviDBValue::HashEx(h) = &db[key] else {
                 panic!("Valkey {label} {key}: not a hash with field TTLs");
             };
             let h = h.read();
-            let (wall, mono) = (now_ms(), std::time::Instant::now());
             let mut ttls: Vec<(String, u64)> = h
                 .expiries
                 .iter()
-                .map(|(field, at)| {
-                    let left = at.saturating_duration_since(mono).as_millis() as u64;
-                    (field.clone(), wall + left)
-                })
+                .map(|(field, at)| (field.clone(), *at))
                 .collect();
             ttls.sort();
             ttls
@@ -297,8 +286,8 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
             let names: Vec<&str> = got.iter().map(|(f, _)| f.as_str()).collect();
             assert_eq!(names, with_ttl, "Valkey {label} {key}");
             for (field, at) in &got {
-                assert!(
-                    at.abs_diff(FAR) <= 2,
+                assert_eq!(
+                    *at, FAR,
                     "Valkey {label} {key} {field}: expires at {at}, not {FAR}"
                 );
             }

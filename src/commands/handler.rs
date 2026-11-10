@@ -795,7 +795,13 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // caller has read.
     {
         let is_write = replication::is_write_command_bytes(cmd0);
-        track(ctx, name2, is_write && !result.starts_with(b"-"), is_write);
+        track(
+            ctx,
+            name2,
+            &result,
+            is_write && !result.starts_with(b"-"),
+            is_write,
+        );
     }
 
     // A pop that took nothing changed nothing: not sent, not counted, and
@@ -824,11 +830,12 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
             crate::stats::record_rdb_change();
         }
         // A write made from a script dirties a WATCH like any other write,
-        // and one that changed nothing does not, as from a client.
-        if !changed_nothing(name2, ctx.cmd.as_slice(), &result) {
-            notify_watchers(ctx, name2);
-        }
+        // on the keys it changed.
+        notify_watchers(ctx, name2, &result);
     }
+    // What this command said it left unchanged is for this command only:
+    // the next one a script calls may change the same key.
+    crate::watch::clear_unchanged();
 
     rewrite_wrong_arity_error_for_script(result)
 }
@@ -1757,7 +1764,8 @@ fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
                 .any(|a| a.eq_ignore_ascii_case(b"NX") || a.eq_ignore_ascii_case(b"XX"))
         }
         "SETNX" | "MSETNX" | "HSETNX" | "RENAMENX" | "PERSIST" | "EXPIRE" | "PEXPIRE"
-        | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" => zero,
+        | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" | "DEL"
+        | "UNLINK" | "COPY" | "MOVE" => zero,
         _ => popped_nothing(name, result),
     }
 }
@@ -1844,38 +1852,180 @@ fn touch_swapped_watches(ctx: &Ctx) {
     }
 }
 
-/// Mark every `WATCH` on a key this write touched as dirty.
+/// Mark every `WATCH` on a key this write (`result`, its reply) changed as
+/// dirty: the keys [`for_each_changed_key`] gives.
 ///
 /// It used to notify `cmd[1]` and nothing else. So `MSET a 1 b 2` left a
 /// client watching `b` free to `EXEC`, as did `RENAME a b`, `LMOVE a b …`,
 /// `SUNIONSTORE …` for their other keys — and for a command whose first
 /// argument is not a key (`XGROUP CREATE s …`, `LMPOP 1 k …`) it notified a
-/// "key" named `CREATE` or `1`. A flush did not notify anyone.
-fn notify_watchers(ctx: &Ctx, name: &str) {
+/// "key" named `CREATE` or `1`. A flush did not notify anyone. Then it
+/// notified every key the command named, changed or not (#584).
+fn notify_watchers(ctx: &Ctx, name: &str, result: &[u8]) {
     if !ctx.watch_registry.has_watchers() {
         return;
     }
+    notify_watchers_of_changed_keys(ctx, name, result);
+}
+
+#[cold]
+fn notify_watchers_of_changed_keys(ctx: &Ctx, name: &str, result: &[u8]) {
     let db = *ctx.selected_db;
     match name {
         // The flush has said which watched keys it removed, before it
         // removed them (`touch_watched_keys`).
         "FLUSHDB" | "FLUSHALL" => return,
         "SWAPDB" => return touch_swapped_watches(ctx),
+        // The key, in this database and in the one it went to, as Redis
+        // signals both.
+        "MOVE" => {
+            if result == b":1\r\n" {
+                ctx.watch_registry.notify(db, ctx.cmd[1]);
+                if let Some(to) = ctx.cmd.get(2).and_then(|to| parse_db(to)) {
+                    ctx.watch_registry.notify(to, ctx.cmd[1]);
+                }
+            }
+            return;
+        }
+        // `COPY … DB n`: the destination is in database `n`.
+        "COPY" => {
+            if let Some(to) = copy_db(&ctx.cmd) {
+                if result == b":1\r\n" {
+                    ctx.watch_registry.notify(to, ctx.cmd[2]);
+                }
+                return;
+            }
+        }
         _ => {}
     }
-    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
-    if keys.is_empty() {
+    let known = for_each_changed_key(ctx, name, result, |key| ctx.watch_registry.notify(db, key));
+    if !known && !changed_nothing(name, &ctx.cmd, result) {
         // Not in the key table: keep the old first-argument guess.
         if let Some(key) = ctx.cmd.get(1) {
             ctx.watch_registry.notify(db, key);
         }
-        return;
     }
-    for pos in keys.iter() {
-        let key = ctx.cmd[pos];
+}
+
+fn parse_db(arg: &[u8]) -> Option<usize> {
+    std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// The database of `COPY source destination DB n`, if it names one.
+fn copy_db(cmd: &[&[u8]]) -> Option<usize> {
+    let at = cmd
+        .iter()
+        .skip(3)
+        .position(|arg| arg.eq_ignore_ascii_case(b"DB"))?;
+    parse_db(cmd.get(3 + at + 1)?)
+}
+
+/// Run `changed` on each key of the current database that a successful
+/// write (`result`, its reply) changed: the keys Redis signals as modified
+/// (`signalModifiedKey`), and so those whose `WATCH` fails and whose
+/// tracking clients are told. Not every key a command names:
+///
+/// * a write that changed nothing changes no key ([`changed_nothing`]);
+/// * a key the command said it left as it was ([`crate::watch::unchanged`]:
+///   a `DEL` of a key that is not there, `SMOVE` to a set that has the
+///   member already);
+/// * of a pop from the first of several keys that has something (`BLPOP`,
+///   `BZPOPMIN`, `LMPOP`, ...), only the key it took from, which its reply
+///   names;
+/// * a key the command only reads: the sources of `SUNIONSTORE`, `COPY`,
+///   `BITOP`, `PFMERGE`, `SORT … STORE`, `GEOSEARCHSTORE`, ..., those whose
+///   key spec is `RO`;
+/// * a stream whose consumer groups alone a command changes (`XREADGROUP`,
+///   `XACK`, `XCLAIM`, `XAUTOCLAIM`, `XSETID`, `XGROUP` but a `CREATE …
+///   MKSTREAM`): Redis does not signal it (#588).
+///
+/// Returns false, having done nothing, for a command the key table knows no
+/// keys of. Only called while someone watches a key or tracks keys: the
+/// common write pays nothing for it.
+#[cold]
+fn for_each_changed_key(
+    ctx: &Ctx,
+    name: &str,
+    result: &[u8],
+    mut changed: impl FnMut(&[u8]),
+) -> bool {
+    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
+    let Some(first) = keys.first() else {
+        return false;
+    };
+    if changed_nothing(name, &ctx.cmd, result) || leaves_the_stream_signalled_as_is(name, &ctx.cmd)
+    {
+        return true;
+    }
+    let db = *ctx.selected_db;
+    let mut tell = |key: &[u8]| {
         if !crate::watch::is_unchanged(db, key) {
-            ctx.watch_registry.notify(db, key);
+            changed(key);
         }
+    };
+    if keys.iter().nth(1).is_none() {
+        tell(ctx.cmd[first]);
+        return true;
+    }
+    if let Some(popped) = popped_from(name, result)
+        && let Some(pos) = keys.iter().find(|&pos| ctx.cmd[pos] == popped)
+    {
+        tell(ctx.cmd[pos]);
+        return true;
+    }
+    let read_only = read_only_key_positions(&ctx.cmd);
+    for pos in keys.iter() {
+        if !read_only.contains(&pos) {
+            tell(ctx.cmd[pos]);
+        }
+    }
+    true
+}
+
+/// Whether `cmd` is a stream command that Redis does not signal the key of:
+/// it changes a consumer group, or the stream's last ID, and calls no
+/// `signalModifiedKey` (Redis 8.2's `t_stream.c`). `XGROUP CREATE …
+/// MKSTREAM` may make the stream, and is taken as changing it.
+fn leaves_the_stream_signalled_as_is(name: &str, cmd: &[&[u8]]) -> bool {
+    match name {
+        "XREADGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "XSETID" => true,
+        "XGROUP" => {
+            !(cmd
+                .get(1)
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"CREATE"))
+                && cmd.iter().any(|arg| arg.eq_ignore_ascii_case(b"MKSTREAM")))
+        }
+        _ => false,
+    }
+}
+
+/// The key a pop from the first of several keys that has something took
+/// from: the first element of its reply (`*2 $key ...`). `None` for any
+/// other command, or a reply that is not that.
+fn popped_from<'a>(name: &str, result: &'a [u8]) -> Option<&'a [u8]> {
+    if !matches!(
+        name,
+        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" | "LMPOP" | "ZMPOP" | "BLMPOP" | "BZMPOP"
+    ) {
+        return None;
+    }
+    let rest = result.strip_prefix(b"*")?;
+    let rest = &rest[rest.iter().position(|&b| b == b'\n')? + 1..];
+    let rest = rest.strip_prefix(b"$")?;
+    let digits = rest.iter().position(|&b| b == b'\r')?;
+    let len: usize = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+    rest.get(digits + 2..digits + 2 + len)
+}
+
+/// The positions of the keys of `cmd` that its key specs say it only reads.
+fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
+    match crate::commands::key_specs::keys_of(cmd) {
+        Some(Ok(keys)) => keys
+            .into_iter()
+            .filter(|(_, flags)| flags.starts_with("RO"))
+            .map(|(pos, _)| pos)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2273,9 +2423,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
             }
         }
 
-        if !changed_nothing(name, &ctx.cmd, result) {
-            notify_watchers(ctx, name);
-        }
+        notify_watchers(ctx, name, result);
 
         // An XREADGROUP that only re-read pending entries, or found nothing
         // new, changed nothing Redis counts (#27); nor did a pop that took
@@ -2309,7 +2457,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         replication::propagate_in_order(ctx.repl_state, ctx.hub_tx, payload);
     }
 
-    track(ctx, name, is_mutating_ok_write, writes_operation);
+    track(ctx, name, result, is_mutating_ok_write, writes_operation);
 }
 
 /// Client-side caching: what a command that has just run means for the
@@ -2319,15 +2467,15 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
 ///
 /// One atomic load when no client has tracking on.
 #[inline(always)]
-fn track(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
+fn track(ctx: &Ctx, name: &str, result: &[u8], wrote: bool, is_write: bool) {
     if crate::tracking::TRACKING_CLIENT_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
-    track_for_clients(ctx, name, wrote, is_write);
+    track_for_clients(ctx, name, result, wrote, is_write);
 }
 
 #[cold]
-fn track_for_clients(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
+fn track_for_clients(ctx: &Ctx, name: &str, result: &[u8], wrote: bool, is_write: bool) {
     // A script is tracked by what it calls, one command at a time. `CLIENT`
     // subcommands are not reads of data, and must not use up the one-shot
     // `CLIENT CACHING`.
@@ -2346,9 +2494,11 @@ fn track_for_clients(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
             );
             return;
         }
-        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-            invalidate_tracked_key(ctx, ctx.cmd[pos], true);
-        }
+        // The keys it changed, as for `WATCH`: Redis tells both from
+        // `signalModifiedKey` (#584).
+        for_each_changed_key(ctx, name, result, |key| {
+            invalidate_tracked_key(ctx, key, true)
+        });
         return;
     }
     if is_write {
