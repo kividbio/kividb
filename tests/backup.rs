@@ -1569,7 +1569,8 @@ fn hotkeys_session() {
     // process and sees every command it runs.
     let server = Server::start(&[]);
     let mut c = server.conn();
-    assert!(c.cmd(&["HOTKEYS", "STOP"]).is_err(), "nothing to stop");
+    // Nothing to stop: nil, as in Redis 8.10.
+    assert_eq!(c.cmd(&["HOTKEYS", "STOP"]), V::Nil);
     assert!(c.cmd(&["HOTKEYS", "START"]).is_err(), "METRICS is required");
     assert!(
         c.cmd(&["HOTKEYS", "START", "METRICS", "1", "CPU", "SLOTS", "1", "5"])
