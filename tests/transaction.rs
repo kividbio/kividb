@@ -743,6 +743,32 @@ fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
         ["0/sm:s"]
     );
 
+    // Consumer-group commands do not fail a watch on the stream, as in
+    // Redis (#588); XADD does.
+    set_up(&[
+        &["XADD", "xs:1", "1-1", "f", "v"],
+        &["XADD", "xs:2", "1-1", "f", "v"],
+        &["XGROUP", "CREATE", "xs:1", "g", "0"],
+        &["XGROUP", "CREATE", "xs:2", "g", "0"],
+    ]);
+    for command in [
+        &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "xs:1", "xs:2", ">", ">"][..],
+        &["XACK", "xs:1", "g", "1-1"],
+        &["XCLAIM", "xs:2", "g", "c2", "0", "1-1"],
+        &["XAUTOCLAIM", "xs:2", "g", "c3", "0", "0"],
+        &["XGROUP", "CREATECONSUMER", "xs:1", "g", "c4"],
+        &["XSETID", "xs:1", "5-0"],
+    ] {
+        assert!(
+            failed(&[("0", "xs:1"), ("0", "xs:2")], command).is_empty(),
+            "{command:?}"
+        );
+    }
+    assert_eq!(
+        failed(&[("0", "xs:1"), ("0", "xs:2")], &["XADD", "xs:1", "*", "f", "v"]),
+        ["0/xs:1"]
+    );
+
     // Writes that change every key they name still fail every watch.
     set_up(&[&["RPUSH", "lmv:a", "x"], &["SET", "rn:a", "v"]]);
     for (command, a, b) in [

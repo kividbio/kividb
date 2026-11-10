@@ -1907,7 +1907,10 @@ fn copy_db(cmd: &[&[u8]]) -> Option<usize> {
 ///   names;
 /// * a key the command only reads: the sources of `SUNIONSTORE`, `COPY`,
 ///   `BITOP`, `PFMERGE`, `SORT … STORE`, `GEOSEARCHSTORE`, ..., those whose
-///   key spec is `RO`.
+///   key spec is `RO`;
+/// * a stream whose consumer groups alone a command changes (`XREADGROUP`,
+///   `XACK`, `XCLAIM`, `XAUTOCLAIM`, `XSETID`, `XGROUP` but a `CREATE …
+///   MKSTREAM`): Redis does not signal it (#588).
 ///
 /// Returns false, having done nothing, for a command the key table knows no
 /// keys of. Only called while someone watches a key or tracks keys: the
@@ -1923,7 +1926,7 @@ fn for_each_changed_key(
     let Some(first) = keys.first() else {
         return false;
     };
-    if changed_nothing(name, &ctx.cmd, result) {
+    if changed_nothing(name, &ctx.cmd, result) || leaves_the_stream_signalled_as_is(name, &ctx.cmd) {
         return true;
     }
     let db = *ctx.selected_db;
@@ -1949,6 +1952,19 @@ fn for_each_changed_key(
         }
     }
     true
+}
+
+/// Whether `cmd` is a stream command that Redis does not signal the key of:
+/// it changes a consumer group, or the stream's last ID, and calls no
+/// `signalModifiedKey` (Redis 8.2's `t_stream.c`). `XGROUP CREATE …
+/// MKSTREAM` may make the stream, and is taken as changing it.
+fn leaves_the_stream_signalled_as_is(name: &str, cmd: &[&[u8]]) -> bool {
+    match name {
+        "XREADGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "XSETID" => true,
+        "XGROUP" => !(cmd.get(1).is_some_and(|sub| sub.eq_ignore_ascii_case(b"CREATE"))
+            && cmd.iter().any(|arg| arg.eq_ignore_ascii_case(b"MKSTREAM"))),
+        _ => false,
+    }
 }
 
 /// The key a pop from the first of several keys that has something took

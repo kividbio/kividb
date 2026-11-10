@@ -261,7 +261,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the sources; of `DEL`, the keys that were there. `MOVE`, and `COPY … DB`,
   now fail a watch on the key in the other database, which they did not.
   A write that changed nothing (`SET … NX` on a key that is there, a `COPY`
-  that copied nothing) no longer tells caching clients either.
+  that copied nothing) no longer tells caching clients either. As in Redis,
+  `XREADGROUP`, `XACK`, `XCLAIM`, `XAUTOCLAIM`, `XSETID` and `XGROUP` (but
+  a `CREATE … MKSTREAM`) no longer fail a watch on the stream or tell
+  caching clients: they change its consumer groups, which Redis does not
+  signal (#588).
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
   `HINCRBYFLOAT` took the search indexes' lock twice to find out whether
