@@ -1217,9 +1217,12 @@ fn an_enable_overtaken_by_a_disable_does_not_answer_ok() {
         let mut c = server.conn();
         assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
         assert!(c.cmd(&["SET", "k", "1"]).ok());
-        // Connections are spread over the server's threads, and the enable
-        // holds its own while it waits at the step: the disable is sent on
-        // several, and one on another thread is answered.
+        // The enable holds its thread while it waits at the step. An io_uring
+        // server spreads connections over its threads, and the disable is
+        // sent on several: one on another thread is answered. A tokio server
+        // runs the enable off the runtime, and answers any of them; it used
+        // to keep the enable on a worker, and about one run in a hundred
+        // nothing else polled the sockets until the enable was done.
         let others: Vec<Conn> = (0..8).map(|_| server.conn()).collect();
         send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
         assert!(server.reached("aof-enabling.1", LONG), "{io}");
