@@ -2870,7 +2870,15 @@ fn test_a_replica_of_1_2_0_reads_its_ts_incrby_as_1_2_0_did() {
             &["TS.INCRBY", "r", "1", "TIMESTAMP", "1"],
             &["TS.INCRBY", "r", "1", "TIMESTAMP", "100"],
             &[
-                "TS.INCRBY", "c", "1", "RETENTION", "10", "LABELS", "a", "TIMESTAMP", "5",
+                "TS.INCRBY",
+                "c",
+                "1",
+                "RETENTION",
+                "10",
+                "LABELS",
+                "a",
+                "TIMESTAMP",
+                "5",
             ],
             &["TS.INCRBY", "c", "1", "LABELS", "x", "TIMESTAMP", "50"],
             &["SET", "done", "1"],
@@ -2885,7 +2893,12 @@ fn test_a_replica_of_1_2_0_reads_its_ts_incrby_as_1_2_0_did() {
         c.cmds(&["TS.RANGE", key, "-", "+"])
             .as_array()
             .iter()
-            .map(|s| (s.as_array()[0].as_int(), s.as_array()[1].as_str().to_string()))
+            .map(|s| {
+                (
+                    s.as_array()[0].as_int(),
+                    s.as_array()[1].as_str().to_string(),
+                )
+            })
             .collect()
     };
     let num = |n: &str| n.to_string();

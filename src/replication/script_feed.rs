@@ -802,7 +802,15 @@ mod tests {
         assert_eq!(
             ts_incrby_feed(&refs(&c), b":42\r\n"),
             vec![cmd(&[
-                "TS.DECRBY", "k", "2", "timestamp", "42", "TIMESTAMP", "42", "RETENTION", "9"
+                "TS.DECRBY",
+                "k",
+                "2",
+                "timestamp",
+                "42",
+                "TIMESTAMP",
+                "42",
+                "RETENTION",
+                "9"
             ])]
         );
     }
@@ -835,21 +843,74 @@ mod tests {
             ),
             (
                 &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "c"],
-                &["TS.INCRBY", "k", "2", "timestamp", "42", "LABELS", "a", "b", "c"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "c",
+                ],
             ),
             (
                 &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "UNCOMPRESSED"],
-                &["TS.INCRBY", "k", "2", "timestamp", "42", "LABELS", "a", "b", "UNCOMPRESSED"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "UNCOMPRESSED",
+                ],
             ),
             (
                 &["TS.INCRBY", "k", "2", "LABELS", "a", "TIMESTAMP", "*"],
-                &["TS.INCRBY", "k", "2", "timestamp", "42", "LABELS", "a", "TIMESTAMP", "*"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "TIMESTAMP",
+                    "*",
+                ],
             ),
             (
-                &["TS.INCRBY", "k", "2", "TIMESTAMP", "5", "LABELS", "a", "b", "TIMESTAMP", "*", "c"],
                 &[
-                    "TS.INCRBY", "k", "2", "timestamp", "42", "TIMESTAMP", "42", "LABELS", "a", "b",
-                    "TIMESTAMP", "42", "c",
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "5",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "*",
+                    "c",
+                ],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "42",
+                    "c",
                 ],
             ),
         ];
