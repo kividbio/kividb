@@ -17,8 +17,8 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{ERR_VALUE_NOT_INTEGER, glob_match, parse_utf8};
 use crate::resp::write::{
-    resp_array, resp_bulk, resp_bulk_str, resp_error, resp_integer, resp_map, resp_null_bulk,
-    resp_null_for,
+    resp_array, resp_bignum_resp3, resp_bulk, resp_bulk_str, resp_error, resp_integer, resp_map,
+    resp_null_bulk, resp_null_for,
 };
 use crate::store;
 use crate::store::ValueRef;
@@ -27,7 +27,7 @@ use crate::{read_lock, write_lock};
 use std::sync::Arc;
 
 const ERR_WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
-const ERR_INDEX_RANGE: &str = "ERR index is out of range";
+const ERR_INDEX_RANGE: &str = "ERR array index overflow";
 const ERR_CURSOR_EXHAUSTED: &str = "ERR insert index overflow";
 
 /// Upper bound on how many slots `ARGETRANGE` will materialise in one reply.
@@ -156,6 +156,23 @@ fn wrong_args(cmd: &str) -> Vec<u8> {
 #[inline]
 fn nil_element(ctx: &Ctx) -> Vec<u8> {
     resp_null_for(crate::commands::handler::effective_resp_for_reply(ctx))
+}
+
+/// An index or a length, as Redis's `addReplyUnsignedLongLong` sends it: an
+/// integer up to `i64::MAX`, past it a big number in RESP3 and its digits as
+/// a bulk string in RESP2. `resp` is `effective_resp_for_reply`'s.
+fn resp_unsigned(resp: u8, n: u64) -> Vec<u8> {
+    match i64::try_from(n) {
+        Ok(n) => resp_integer(n),
+        Err(_) if resp >= 3 => resp_bignum_resp3(&n.to_string()),
+        Err(_) => resp_bulk_str(&n.to_string()),
+    }
+}
+
+/// The protocol a reply of `ctx` is written in (see [`nil_element`]).
+#[inline]
+fn reply_resp(ctx: &Ctx) -> u8 {
+    crate::commands::handler::effective_resp_for_reply(ctx)
 }
 
 /// Run `f` against the array at `key`, read-only.
@@ -515,8 +532,9 @@ fn cmd_arlen(ctx: &mut Ctx) -> Vec<u8> {
         return wrong_args("ARLEN");
     }
     let key: Vec<u8> = ctx.cmd[1].to_vec();
+    let resp = reply_resp(ctx);
     match with_array_read(ctx, &key, 0u64, |inner| inner.len()) {
-        Ok(n) => resp_integer(n as i64),
+        Ok(n) => resp_unsigned(resp, n),
         Err(e) => e,
     }
 }
@@ -562,7 +580,7 @@ fn cmd_arinsert(ctx: &mut Ctx) -> Vec<u8> {
         }
         Ok(last)
     }) {
-        Ok(Ok(last)) => resp_integer(last as i64),
+        Ok(Ok(last)) => resp_unsigned(reply_resp(ctx), last),
         Ok(Err(e)) | Err(e) => e,
     }
 }
@@ -659,7 +677,7 @@ fn cmd_arnext(ctx: &mut Ctx) -> Vec<u8> {
             Some(inner.next_insert)
         }
     }) {
-        Ok(Some(n)) => resp_integer(n as i64),
+        Ok(Some(n)) => resp_unsigned(reply_resp(ctx), n),
         Ok(None) => resp_null_bulk(),
         Err(e) => e,
     }
@@ -720,13 +738,14 @@ fn cmd_arscan(ctx: &mut Ctx) -> Vec<u8> {
     // LIMIT caps *existing* elements returned — empty slots are skipped
     // entirely, unlike ARGETRANGE — so it maps straight onto `take`.
     let cap = limit.unwrap_or(u64::MAX) as usize;
+    let resp = reply_resp(ctx);
     match with_array_read(ctx, &key, Vec::new(), |inner| {
         let mut out: Vec<Vec<u8>> = Vec::new();
         for (idx, val) in existing_in_span(inner, lo, hi, reverse)
             .into_iter()
             .take(cap)
         {
-            out.push(resp_array(vec![resp_integer(idx as i64), resp_bulk(&val)]));
+            out.push(resp_array(vec![resp_unsigned(resp, idx), resp_bulk(&val)]));
         }
         out
     }) {
@@ -934,6 +953,7 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
 
     // Resolve `-`/`+` against the array's own bounds and run the scan in a
     // single read of the key.
+    let resp = reply_resp(ctx);
     let result = with_array_read(ctx, &key, Ok(Vec::new()), |inner| {
         let first = inner
             .entries
@@ -969,9 +989,9 @@ fn cmd_argrep(ctx: &mut Ctx) -> Vec<u8> {
                 continue;
             }
             out.push(if with_values {
-                resp_array(vec![resp_integer(idx as i64), resp_bulk(&val)])
+                resp_array(vec![resp_unsigned(resp, idx), resp_bulk(&val)])
             } else {
-                resp_integer(idx as i64)
+                resp_unsigned(resp, idx)
             });
             taken += 1;
         }
@@ -1246,14 +1266,23 @@ fn cmd_arinfo(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     let resp3 = ctx.resp == 3;
+    let resp = reply_resp(ctx);
     match with_array_read(ctx, &key, None, |inner| {
         let stats = slice_stats(inner);
         let mut kv: Vec<(&'static str, Vec<u8>)> = vec![
             ("count", resp_integer(inner.count() as i64)),
-            ("len", resp_integer(inner.len() as i64)),
+            ("len", resp_unsigned(resp, inner.len())),
+            // 0 once the cursor is exhausted, as in Redis.
             (
                 "next-insert-index",
-                resp_integer(inner.next_insert.min(ARRAY_MAX_INDEX) as i64),
+                resp_unsigned(
+                    resp,
+                    if inner.cursor_exhausted() {
+                        0
+                    } else {
+                        inner.next_insert
+                    },
+                ),
             ),
             ("slices", resp_integer(stats.slices as i64)),
             ("directory-size", resp_integer(stats.slices as i64)),
@@ -1311,5 +1340,24 @@ fn cmd_arinfo(ctx: &mut Ctx) -> Vec<u8> {
             }
         }
         Err(e) => e,
+    }
+}
+
+#[cfg(test)]
+mod unsigned_tests {
+    use super::resp_unsigned;
+
+    #[test]
+    fn past_i64_max_is_a_big_number_or_its_digits() {
+        assert_eq!(resp_unsigned(2, 5), b":5\r\n");
+        assert_eq!(
+            resp_unsigned(3, i64::MAX as u64),
+            b":9223372036854775807\r\n"
+        );
+        assert_eq!(resp_unsigned(3, 1 << 63), b"(9223372036854775808\r\n");
+        assert_eq!(
+            resp_unsigned(2, u64::MAX),
+            b"$20\r\n18446744073709551615\r\n"
+        );
     }
 }

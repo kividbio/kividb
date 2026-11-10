@@ -312,5 +312,48 @@ fn overwritten_type_changed_and_array_events() {
         "del marker2",
         "no delete for a source left with y"
     );
+
+    // `d`: every JSON write, by RedisJSON's names, and only once it changed
+    // something (#575).
+    c.ok(&["CONFIG", "SET", "notify-keyspace-events", "Ed"]);
+    let doc = r#"{"a":1,"s":"x","l":[1],"b":true,"o":{},"m":0}"#;
+    c.ok(&["JSON.SET", "j2", "$", doc]);
+    assert_eq!(event(&mut sub), "json.set j2");
+    assert_eq!(c.cmd(&["JSON.SET", "j2", "$", "{}", "NX"]), V::Nil);
+    c.ok(&["JSON.SET", "j2", "$.a", "2", "XX"]);
+    assert_eq!(event(&mut sub), "json.set j2");
+    c.cmd(&["JSON.NUMINCRBY", "j2", "$.s", "1"]); // not a number: nothing
+    c.cmd(&["JSON.NUMINCRBY", "j2", "$.a", "1"]);
+    assert_eq!(event(&mut sub), "json.numincrby j2");
+    c.cmd(&["JSON.NUMMULTBY", "j2", "$.a", "2"]);
+    assert_eq!(event(&mut sub), "json.nummultby j2");
+    c.cmd(&["JSON.STRAPPEND", "j2", "$.a", "\"y\""]); // not a string
+    c.cmd(&["JSON.STRAPPEND", "j2", "$.s", "\"y\""]);
+    assert_eq!(event(&mut sub), "json.strappend j2");
+    c.cmd(&["JSON.TOGGLE", "j2", "$.a"]); // not a boolean
+    c.cmd(&["JSON.TOGGLE", "j2", "$.b"]);
+    assert_eq!(event(&mut sub), "json.toggle j2");
+    c.cmd(&["JSON.ARRAPPEND", "j2", "$.nope", "2"]); // no match
+    c.cmd(&["JSON.ARRAPPEND", "j2", "$.l", "2"]);
+    assert_eq!(event(&mut sub), "json.arrappend j2");
+    c.cmd(&["JSON.ARRINSERT", "j2", "$.l", "0", "0"]);
+    assert_eq!(event(&mut sub), "json.arrinsert j2");
+    c.cmd(&["JSON.ARRTRIM", "j2", "$.l", "0", "1"]);
+    assert_eq!(event(&mut sub), "json.arrtrim j2");
+    c.cmd(&["JSON.ARRPOP", "j2", "$.l"]);
+    assert_eq!(event(&mut sub), "json.arrpop j2");
+    c.ok(&["JSON.MERGE", "j2", "$", r#"{"n":1}"#]);
+    assert_eq!(event(&mut sub), "json.merge j2");
+    c.ok(&["JSON.MSET", "j2", "$.a", "5", "j3", "$", "1"]);
+    assert_eq!(event(&mut sub), "json.mset j2");
+    assert_eq!(event(&mut sub), "json.mset j3");
+    assert_eq!(c.cmd(&["JSON.CLEAR", "j2", "$.o"]), V::Int(0));
+    assert_eq!(c.cmd(&["JSON.CLEAR", "j2", "$.a"]), V::Int(1));
+    assert_eq!(event(&mut sub), "json.clear j2");
+    assert_eq!(c.cmd(&["JSON.DEL", "j2", "$.nope"]), V::Int(0));
+    assert_eq!(c.cmd(&["JSON.DEL", "j2", "$.m"]), V::Int(1));
+    assert_eq!(event(&mut sub), "json.del j2");
+    assert_eq!(c.cmd(&["JSON.FORGET", "j3"]), V::Int(1));
+    assert_eq!(event(&mut sub), "json.del j3");
     c.ok(&["CONFIG", "SET", "notify-keyspace-events", ""]);
 }
