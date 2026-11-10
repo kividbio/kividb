@@ -184,6 +184,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `EXPIRETIME` of the latest deadline is 9223372036854776, as in Redis,
   where it was one less.
 
+  What replicas and the AOF get is the time that took effect. `SET` and
+  `MSETEX` are sent with only that one, as `PXAT`: with two, only the first
+  was made a `PXAT` and both were sent, so `SET k v EX 10 EX 20` went out as
+  `SET k v PXAT <t> EX 20`, and a restart started the 20 seconds over.
+  `GETEX` is sent as the deadline it left (`PEXPIREAT`), `PERSIST`, or
+  `DEL`. `GETEX` with an `EXAT` or `PXAT` that has already passed deletes
+  the key at once and says `del`, as Redis does, and `GETEX k PERSIST` on a
+  key with no time to live no longer says `persist`.
+
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
   `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a

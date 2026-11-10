@@ -249,12 +249,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
                     // One unit, and not with KEEPTTL, as Redis parses them;
                     // the same one again replaces it. `EX 10 PX 10` was the
-                    // last one, and `KEEPTTL EX 10` an invalid time.
+                    // last one, and `KEEPTTL EX 10` an invalid time. From a
+                    // stream, mixed units are still the last one: 1.2.0 took
+                    // them, and logged `SET k v EX 10 EX 20` as `SET k v PXAT
+                    // <t> EX 20`.
                     "EX" | "PX" | "EXAT" | "PXAT" => {
                         let arg = TimeArg::of_option(cmd[i]);
                         if keepttl
                             || i + 1 >= cmd.len()
-                            || expire.is_some_and(|(unit, _)| Some(unit) != arg)
+                            || (expire.is_some_and(|(unit, _)| Some(unit) != arg)
+                                && !applying_stream(ctx))
                         {
                             return Some(resp_error("ERR syntax error"));
                         }
@@ -1309,16 +1313,30 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 _ => None,
             };
-            // Apply it, and say so as Redis does.
-            if val.is_some() && (deadline.is_some() || persist) {
+            // Apply it, and say so as Redis does: a time that has already
+            // come deletes the key now (`del`), where it was kept to expire
+            // later, and `persist` only when there was a time to take away.
+            // From a stream the time is set as it is (`expiry::held`).
+            if val.is_some() {
+                let db = *ctx.selected_db;
                 match deadline {
-                    Some(at) => set_expiry(ctx.store, *ctx.selected_db, key, at),
-                    None => {
-                        clear_expiry(ctx.store, *ctx.selected_db, key);
+                    Some(at)
+                        if at <= crate::script_clock::wall_system_time_now()
+                            && !applying_stream(ctx) =>
+                    {
+                        delete_key(ctx.store, db, key);
+                        crate::vector::maybe_unindex(ctx.index_store, db, key);
+                        notify(ctx.pubsub, db, KS_GENERIC, "del", key);
                     }
+                    Some(at) => {
+                        set_expiry(ctx.store, db, key, at);
+                        notify(ctx.pubsub, db, KS_GENERIC, "expire", key);
+                    }
+                    None if persist && clear_expiry(ctx.store, db, key) => {
+                        notify(ctx.pubsub, db, KS_GENERIC, "persist", key);
+                    }
+                    None => {}
                 }
-                let event = if persist { "persist" } else { "expire" };
-                notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, event, key);
             }
             match val {
                 Some(v) => Some(resp_bulk(&v)),
@@ -1711,7 +1729,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 } else if let Some(arg) = arg
                     && !keepttl
                     && i + 1 < cmd.len()
-                    && expire.is_none_or(|(unit, _)| unit == arg)
+                    && (expire.is_none_or(|(unit, _)| unit == arg) || applying_stream(ctx))
                 {
                     expire = Some((arg, cmd[i + 1]));
                     i += 1;

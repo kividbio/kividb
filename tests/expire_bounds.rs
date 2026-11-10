@@ -129,6 +129,8 @@ struct Server {
     port: u16,
     dir: PathBuf,
     child: Child,
+    model: Option<String>,
+    extra: Vec<String>,
 }
 
 impl Server {
@@ -141,7 +143,19 @@ impl Server {
     fn start_in(dir: PathBuf, model: Option<&str>, extra: &[&str]) -> Self {
         let port = free_port();
         let child = kividb(&dir, port, model, extra);
-        let server = Server { port, dir, child };
+        let server = Server {
+            port,
+            dir,
+            child,
+            model: model.map(str::to_string),
+            extra: extra.iter().map(|s| s.to_string()).collect(),
+        };
+        server.wait_up();
+        server
+    }
+
+    fn wait_up(&self) {
+        let port = self.port;
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let up = TcpStream::connect(("127.0.0.1", port)).and_then(|mut s| {
@@ -152,11 +166,20 @@ impl Server {
                 Ok(&reply == b"+PONG\r\n")
             });
             if up.unwrap_or(false) {
-                return server;
+                return;
             }
             assert!(Instant::now() < deadline, "the server did not come up");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Killed, and started again on the same port and directory.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let extra: Vec<&str> = self.extra.iter().map(String::as_str).collect();
+        self.child = kividb(&self.dir, self.port, self.model.as_deref(), &extra);
+        self.wait_up();
     }
 
     fn conn(&self) -> Conn {
@@ -489,6 +512,7 @@ fn an_aof_written_by_1_2_0_with_far_deadlines_keeps_its_keys() {
     let u64_max = u64::MAX.to_string();
     let ms_past = (i64::MAX as u64 + 1).to_string();
     let secs_past = (i64::MAX / 1000 + 1).to_string();
+    let soon = (unix_ms_now() + 3_600_000).to_string();
     let records: Vec<Vec<&str>> = vec![
         vec!["SELECT", "0"],
         vec!["SET", "a", "1", "PXAT", &u64_max],
@@ -501,6 +525,11 @@ fn an_aof_written_by_1_2_0_with_far_deadlines_keeps_its_keys() {
         vec!["SET", "e", "6"],
         vec!["SET", "f", "7", "EXAT", "0"],
         vec!["MSETEX", "1", "g", "8", "PXAT", &u64_max],
+        // Two time options, as 1.2.0 logged `SET k v EX 10 EX 20` (the
+        // first made `PXAT`): the last one is taken, as 1.2.0 took it.
+        vec!["SET", "h", "9", "PXAT", &soon, "EX", "2000"],
+        vec!["SET", "i", "10", "PXAT", &soon, "PX", "2000000"],
+        vec!["SET", "j", "11", "EXAT", "4102444800", "PXAT", &soon],
     ];
     let mut aof = Vec::new();
     for record in &records {
@@ -520,7 +549,150 @@ fn an_aof_written_by_1_2_0_with_far_deadlines_keeps_its_keys() {
         );
         assert_eq!(c.cmd(&["PEXPIRETIME", key]), V::Int(i64::MAX), "{key}");
     }
+    for key in ["h", "i"] {
+        let left = ttl(&mut c, key);
+        assert!((1990..=2000).contains(&left), "TTL {key} {left}");
+    }
+    assert_eq!(c.cmd(&["GET", "j"]), V::Str(b"11".to_vec()));
+    assert_eq!(c.cmd(&["PEXPIRETIME", "j"]), V::Int(soon.parse().unwrap()));
     assert_eq!(c.cmd(&["GET", "e"]), V::Str(b"6".to_vec()));
     assert_eq!(c.cmd(&["PTTL", "e"]), V::Int(-1));
     assert_eq!(c.cmd(&["GET", "f"]), V::Nil);
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn ttl(c: &mut Conn, key: &str) -> i64 {
+    match c.cmd(&["TTL", key]) {
+        V::Int(n) => n,
+        other => panic!("TTL {key}: {other:?}"),
+    }
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The time option that took effect is what reaches the AOF and a replica:
+/// the last of two (`EX 10 EX 2000`), for `SET`, `MSETEX` and `GETEX`; and a
+/// time that has come, given to `GETEX`, deletes the key everywhere. The
+/// first was sent, or the command went out with both and was refused there:
+/// the key was lost on the replica and after a restart.
+#[test]
+fn a_repeated_time_option_reaches_the_aof_and_a_replica_as_it_took_effect() {
+    let mut master = Server::start_in(tempfile::tempdir().unwrap().keep(), None, &["--aof"]);
+    let master_port = master.port.to_string();
+    let replica = Server::start_in(
+        tempfile::tempdir().unwrap().keep(),
+        None,
+        &["--replicaof", "127.0.0.1", &master_port],
+    );
+    let mut r = replica.conn();
+    wait_until("the replica's link", || {
+        matches!(r.cmd(&["INFO", "replication"]), V::Str(info)
+            if String::from_utf8_lossy(&info).contains("master_link_status:up"))
+    });
+
+    let mut m = master.conn();
+    let ok = V::Str(b"OK".to_vec());
+    assert_eq!(m.cmd(&["SET", "a", "v", "EX", "10", "EX", "2000"]), ok);
+    assert_eq!(
+        m.cmd(&["MSETEX", "1", "b", "v", "EX", "10", "EX", "2000"]),
+        V::Int(1)
+    );
+    assert_eq!(m.cmd(&["SET", "c", "v"]), ok);
+    assert_eq!(
+        m.cmd(&["GETEX", "c", "EX", "40", "EX", "3000"]),
+        V::Str(b"v".to_vec())
+    );
+    assert_eq!(m.cmd(&["SET", "d", "v", "EX", "100"]), ok);
+    assert_eq!(m.cmd(&["GETEX", "d", "PXAT", "1"]), V::Str(b"v".to_vec()));
+    assert_eq!(m.cmd(&["EXISTS", "d"]), V::Int(0));
+    assert_eq!(m.cmd(&["SET", "e", "v", "EX", "100"]), ok);
+    assert_eq!(m.cmd(&["GETEX", "e", "PERSIST"]), V::Str(b"v".to_vec()));
+    assert_eq!(m.cmd(&["SET", "marker", "1"]), ok);
+    wait_until("the replica to catch up", || {
+        r.cmd(&["GET", "marker"]) == V::Str(b"1".to_vec())
+    });
+
+    let check = |c: &mut Conn, who: &str| {
+        for (key, want) in [("a", 2000), ("b", 2000), ("c", 3000)] {
+            let left = ttl(c, key);
+            assert!(
+                (want - 10..=want).contains(&left),
+                "{who}: TTL {key} {left}"
+            );
+        }
+        assert_eq!(c.cmd(&["EXISTS", "d"]), V::Int(0), "{who}: d");
+        assert_eq!(c.cmd(&["TTL", "e"]), V::Int(-1), "{who}: e");
+    };
+    check(&mut m, "master");
+    check(&mut r, "replica");
+    drop(r);
+    drop(replica);
+    master.restart();
+    let mut m = master.conn();
+    check(&mut m, "master after a restart");
+}
+
+/// `GETEX` says what it did, as Redis: `del` for a time that has come, and
+/// nothing for `PERSIST` on a key with no time to live.
+#[test]
+fn getex_notifies_what_it_did() {
+    let server = Server::start(None);
+    let mut c = server.conn();
+    let ok = V::Str(b"OK".to_vec());
+    assert_eq!(
+        c.cmd(&["CONFIG", "SET", "notify-keyspace-events", "KEA"]),
+        ok
+    );
+    assert_eq!(c.cmd(&["SET", "nottl", "1"]), ok);
+    assert_eq!(c.cmd(&["SET", "past", "1"]), ok);
+    let mut sub = server.conn();
+    assert!(matches!(
+        sub.cmd(&["PSUBSCRIBE", "__keyevent@0__:*"]),
+        V::Arr(_)
+    ));
+    assert_eq!(c.cmd(&["GETEX", "nottl", "PERSIST"]), V::Str(b"1".to_vec()));
+    assert_eq!(
+        c.cmd(&["GETEX", "past", "PXAT", "1"]),
+        V::Str(b"1".to_vec())
+    );
+    assert_eq!(c.cmd(&["EXISTS", "past"]), V::Int(0));
+    assert_eq!(c.cmd(&["SET", "marker", "1"]), ok);
+    let mut events = Vec::new();
+    loop {
+        let Some(V::Arr(message)) = sub.read() else {
+            panic!("no message")
+        };
+        let text = |v: &V| match v {
+            V::Str(s) => String::from_utf8_lossy(s).into_owned(),
+            other => panic!("{other:?}"),
+        };
+        let event = text(&message[2])
+            .trim_start_matches("__keyevent@0__:")
+            .to_string();
+        let key = text(&message[3]);
+        let done = key == "marker";
+        events.push((event, key));
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        events,
+        vec![
+            ("del".to_string(), "past".to_string()),
+            ("set".to_string(), "marker".to_string())
+        ]
+    );
 }

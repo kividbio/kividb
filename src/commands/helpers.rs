@@ -1645,6 +1645,8 @@ mod active_expiry_tests {
     /// and so is one given a new value without a time.
     #[test]
     fn a_key_given_a_new_time_is_kept() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
@@ -1694,6 +1696,8 @@ mod active_expiry_tests {
     /// whatever it removed, and keeps what is live.
     #[test]
     fn a_full_round_is_not_behind() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
@@ -1712,6 +1716,8 @@ mod active_expiry_tests {
     /// every due key of the shard, then run out of time after one batch).
     #[test]
     fn a_pass_takes_one_batch_and_stops() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
@@ -1747,6 +1753,8 @@ mod active_expiry_tests {
     /// Two parts between them go through every shard, each only its own.
     #[test]
     fn parts_share_the_shards() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);

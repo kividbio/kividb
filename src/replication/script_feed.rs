@@ -163,13 +163,8 @@ pub fn commands_for_propagation(
         // are sent with the moment of expiry instead.
         "SET" => set_feed(cmd),
         "SETEX" | "PSETEX" => setex_feed(name, cmd),
-        "GETEX" => getex_feed(cmd, resp),
-        "MSETEX" => vec![absolute_ttl_options(
-            cmd,
-            msetex_options_start(cmd),
-            &[],
-            None,
-        )],
+        "GETEX" => getex_feed(ctx, cmd, resp),
+        "MSETEX" => vec![absolute_ttl_options(cmd, msetex_options_start(cmd), &[])],
         // Sent as what they did, recorded by the commands themselves: the
         // fields whose deadline changed (`HPEXPIREAT … FIELDS`, with no
         // condition left to weigh), whose time to live went (`HPERSIST`), or
@@ -404,52 +399,62 @@ fn expiry_ms(ctx: &Ctx<'_>, key: &[u8]) -> Option<u64> {
     read_lock!(shard).expires(key)
 }
 
-/// `cmd` with a relative `EX seconds` / `PX milliseconds` option, looked for
-/// from `start`, replaced by `PXAT <unix-ms>`.
+/// `cmd` with its time option, looked for from `start`, sent as
+/// `PXAT <unix-ms>`, as Redis sends `SET`: the last one given, which is the
+/// one that took effect, and none of the others. Only the first was
+/// rewritten, so `SET k v EX 10 EX 20` went out as `SET k v PXAT <t> EX 20`,
+/// which a replica or a replayed AOF refused.
 ///
 /// `with_argument` names the options that take an argument, so that argument
-/// is not read as an option; the scan stops at `stop`, if given.
-fn absolute_ttl_options(
-    cmd: &[&[u8]],
-    start: usize,
-    with_argument: &[&str],
-    stop: Option<&str>,
-) -> Vec<Vec<u8>> {
-    let mut out = owned(cmd);
+/// is not read as an option.
+fn absolute_ttl_options(cmd: &[&[u8]], start: usize, with_argument: &[&str]) -> Vec<Vec<u8>> {
+    let mut times = Vec::new();
     let mut i = start;
     while i < cmd.len() {
         let token = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
-        if stop == Some(token.as_str()) {
-            break;
+        if matches!(token.as_str(), "EX" | "PX" | "EXAT" | "PXAT") {
+            times.push(i);
+            i += 2;
+            continue;
         }
-        if token == "EX" || token == "PX" {
-            if let Some(ttl) = cmd.get(i + 1).and_then(|arg| integer_arg(arg)) {
-                let ms = if token == "EX" {
-                    ttl.saturating_mul(1000)
-                } else {
-                    ttl
-                };
-                out[i] = b"PXAT".to_vec();
-                out[i + 1] = now_ms().saturating_add(ms).to_string().into_bytes();
-            }
-            break;
-        }
-        i += if with_argument.contains(&token.as_str()) || token == "EXAT" || token == "PXAT" {
+        i += if with_argument.contains(&token.as_str()) {
             2
         } else {
             1
         };
     }
+    let Some(&last) = times.last() else {
+        return owned(cmd);
+    };
+    let Some(n) = cmd.get(last + 1).and_then(|arg| integer_arg(arg)) else {
+        return owned(cmd);
+    };
+    let at = if cmd[last].eq_ignore_ascii_case(b"EX") {
+        now_ms().saturating_add(n.saturating_mul(1000))
+    } else if cmd[last].eq_ignore_ascii_case(b"PX") {
+        now_ms().saturating_add(n)
+    } else if cmd[last].eq_ignore_ascii_case(b"EXAT") {
+        n.saturating_mul(1000)
+    } else {
+        n
+    };
+    let mut out: Vec<Vec<u8>> = cmd
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| !times.iter().any(|&t| *j == t || *j == t + 1))
+        .map(|(_, arg)| arg.to_vec())
+        .collect();
+    out.push(b"PXAT".to_vec());
+    out.push(at.to_string().into_bytes());
     out
 }
 
-/// `SET key value [...] EX|PX ttl` → the same with `PXAT`.
+/// `SET key value [...] EX|PX|EXAT|PXAT time` → the same with `PXAT`.
 fn set_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     vec![absolute_ttl_options(
         cmd,
         3,
         &["IFEQ", "IFNE", "IFDEQ", "IFDNE"],
-        None,
     )]
 }
 
@@ -473,31 +478,38 @@ fn setex_feed(name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     ]]
 }
 
-/// `GETEX` reads; what it changes is the key's TTL, and that is what is sent.
-fn getex_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
+/// `GETEX` reads; what it changes is the key's TTL, and that is what is sent:
+/// `PERSIST`, or the deadline the key was left with, whichever option gave
+/// it, or `DEL` for a time that had already come. Only the first option was
+/// read, so `GETEX k EX 40 EX 50` went out as 40.
+fn getex_feed(ctx: &Ctx<'_>, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     // Nothing there, or no option: nothing changed.
     if cmd.len() < 3 || resp.starts_with(b"$-1") || resp.starts_with(b"_") {
         return Vec::new();
     }
-    let option = String::from_utf8_lossy(cmd[2]).to_ascii_uppercase();
-    if option == "PERSIST" {
-        return vec![vec![b"PERSIST".to_vec(), cmd[1].to_vec()]];
+    let key = cmd[1];
+    if cmd[2..]
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case(b"PERSIST"))
+    {
+        return vec![vec![b"PERSIST".to_vec(), key.to_vec()]];
     }
-    let Some(n) = cmd.get(3).and_then(|arg| integer_arg(arg)) else {
-        return vec![owned(cmd)];
-    };
-    let at = match option.as_str() {
-        "EX" => now_ms().saturating_add(n.saturating_mul(1000)),
-        "PX" => now_ms().saturating_add(n),
-        "EXAT" => n.saturating_mul(1000),
-        "PXAT" => n,
-        _ => return vec![owned(cmd)],
-    };
-    vec![vec![
-        b"PEXPIREAT".to_vec(),
-        cmd[1].to_vec(),
-        at.to_string().into_bytes(),
-    ]]
+    match expiry_ms(ctx, key) {
+        Some(at) => vec![vec![
+            b"PEXPIREAT".to_vec(),
+            key.to_vec(),
+            at.to_string().into_bytes(),
+        ]],
+        None => {
+            let shard = crate::store::get_shard(&ctx.store[*ctx.selected_db], key);
+            if read_lock!(shard).contains_key(key) {
+                // Not what GETEX with a time leaves; sent as it came.
+                vec![owned(cmd)]
+            } else {
+                vec![vec![b"DEL".to_vec(), key.to_vec()]]
+            }
+        }
+    }
 }
 
 /// Where the options of `MSETEX numkeys key value [key value ...] [options]`
