@@ -926,7 +926,15 @@ mod tests {
         let c = cmd(&["TS.INCRBY", "a", "1", "TIMESTAMP", &max]);
         assert_eq!(
             ts_incrby_feed(&refs(&c), b":-1\r\n"),
-            vec![cmd(&["TS.INCRBY", "a", "1", "timestamp", &max, "TIMESTAMP", &max])]
+            vec![cmd(&[
+                "TS.INCRBY",
+                "a",
+                "1",
+                "timestamp",
+                &max,
+                "TIMESTAMP",
+                &max
+            ])]
         );
     }
 

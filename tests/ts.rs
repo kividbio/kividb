@@ -1348,13 +1348,14 @@ fn test_ts_compaction_writes_closed_buckets_and_latest_adds_the_open_one() {
         .is_error()
     );
 
-    // Kept by the snapshot format.
+    // Not carried by DUMP, as in RedisTimeSeries: a payload has no links to
+    // other keys (#593). The snapshot keeps it (see tests/backup.rs).
     let dump = c.cmd(&[b"DUMP", b"ob:dst"]);
     let RespValue::Bulk(payload) = dump else {
         panic!("{dump:?}")
     };
     assert!(c.cmd(&[b"RESTORE", b"ob:copy", b"0", &payload]).is_ok());
-    assert_eq!(source_key(&mut c, "ob:copy").as_deref(), Some("ob:src"));
+    assert_eq!(source_key(&mut c, "ob:copy"), None);
 
     assert!(c.cmds(&["TS.DELETERULE", "ob:src", "ob:dst"]).is_ok());
     assert_eq!(source_key(&mut c, "ob:dst"), None);
@@ -1931,7 +1932,9 @@ fn test_ts_time_above_i64_max_is_refused() {
     assert!(c.cmds(&["TS.ADD", "big", &over, "1"]).is_error());
     assert!(c.cmds(&["TS.ADD", "big", "-1", "1"]).is_error());
     assert_eq!(c.cmds(&["TS.ADD", "big", &max, "1"]).as_int(), i64::MAX);
-    let replies = c.cmds(&["TS.MADD", "big", "1", "1", "big", &over, "2", "big", "2", "3"]);
+    let replies = c.cmds(&[
+        "TS.MADD", "big", "1", "1", "big", &over, "2", "big", "2", "3",
+    ]);
     let replies = replies.as_array();
     assert_eq!(replies[0].as_int(), 1);
     assert!(replies[1].is_error(), "{replies:?}");
@@ -1969,8 +1972,15 @@ fn test_ts_dump_restore() {
     ]);
     c.cmds(&["TS.CREATE", "dr:avg"]);
     assert!(
-        c.cmds(&["TS.CREATERULE", "dr:src", "dr:avg", "AGGREGATION", "avg", "10"])
-            .is_ok()
+        c.cmds(&[
+            "TS.CREATERULE",
+            "dr:src",
+            "dr:avg",
+            "AGGREGATION",
+            "avg",
+            "10"
+        ])
+        .is_ok()
     );
     for (at, value) in [("1", "1"), ("5", "3"), ("12", "4"), ("25", "5")] {
         c.cmds(&["TS.ADD", "dr:src", at, value]);
@@ -2011,7 +2021,10 @@ fn test_ts_dump_restore() {
     assert_eq!(found, ["dr:copy", "dr:src"]);
     // The source's own rule still feeds its compaction.
     let info = c.cmds(&["TS.INFO", "dr:avg"]);
-    assert!(info.as_array().contains(&RespValue::Bulk(b"dr:src".to_vec())));
+    assert!(
+        info.as_array()
+            .contains(&RespValue::Bulk(b"dr:src".to_vec()))
+    );
 
     // RESTORE REPLACE over a series with other labels: found by the new ones.
     c.cmds(&["TS.CREATE", "dr:old", "LABELS", "room", "attic"]);

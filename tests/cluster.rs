@@ -2315,15 +2315,24 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
     );
     assert!(s.cmd(&["TS.CREATE", &k("tsavg")]).is_ok());
     assert!(
-        s.cmd(&["TS.CREATERULE", &k("tsr"), &k("tsavg"), "AGGREGATION", "avg", "10"])
-            .is_ok()
+        s.cmd(&[
+            "TS.CREATERULE",
+            &k("tsr"),
+            &k("tsavg"),
+            "AGGREGATION",
+            "avg",
+            "10"
+        ])
+        .is_ok()
     );
     for (at, value) in [("1", "1"), ("5", "3"), ("12", "4")] {
         s.cmd(&["TS.ADD", &k("tsr"), at, value]);
     }
     let range_before = s.cmd(&["TS.RANGE", &k("tsr"), "-", "+"]);
     let avg_before = s.cmd(&["TS.RANGE", &k("tsavg"), "-", "+"]);
-    let names = ["str", "list", "hash", "set", "zset", "stream", "ts", "tsr", "tsavg"];
+    let names = [
+        "str", "list", "hash", "set", "zset", "stream", "ts", "tsr", "tsavg",
+    ];
 
     // Giving the slot away while its keys are still here is refused.
     let reply = s.cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id]);
@@ -2460,8 +2469,15 @@ fn atomic_slot_migration_moves_time_series_with_their_rules() {
     );
     assert!(s.cmd(&["TS.CREATE", &k("avg")]).is_ok());
     assert!(
-        s.cmd(&["TS.CREATERULE", &k("raw"), &k("avg"), "AGGREGATION", "avg", "10"])
-            .is_ok()
+        s.cmd(&[
+            "TS.CREATERULE",
+            &k("raw"),
+            &k("avg"),
+            "AGGREGATION",
+            "avg",
+            "10"
+        ])
+        .is_ok()
     );
     for (at, value) in [("1", "1"), ("5", "3"), ("12", "4")] {
         s.cmd(&["TS.ADD", &k("raw"), at, value]);
