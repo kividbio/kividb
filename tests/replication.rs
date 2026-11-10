@@ -2903,7 +2903,7 @@ fn replica_fed_a_dd(version: Option<&str>) -> bool {
     let replica_port = spawn_server(replica_of(master));
     let mut replica = Conn::connect(replica_port);
     wait_until("the stream is applied", Duration::from_secs(10), || {
-        replica.cmds(&["EXISTS", "done"]).as_int() == 1
+        matches!(replica.cmds(&["EXISTS", "done"]), RespValue::Int(1))
     });
 
     assert_eq!(replica.cmds(&["EXISTS", "n:1"]).as_int(), 0);
@@ -3033,7 +3033,7 @@ fn a_replica_holds_json_numbers_exactly() {
             .is_ok()
     );
     wait_until("the replica has jr:stream", Duration::from_secs(10), || {
-        replica.cmds(&["EXISTS", "jr:stream"]).as_int() == 1
+        matches!(replica.cmds(&["EXISTS", "jr:stream"]), RespValue::Int(1))
     });
     assert!(exact(&mut replica, "jr:sync", synced), "from the full sync");
     assert!(
@@ -3169,7 +3169,7 @@ fn test_a_replica_of_1_2_0_reads_its_ts_incrby_as_1_2_0_did() {
     let node = spawn_server(replica_of(master));
     let mut c = Conn::connect(node);
     wait_until("the stream to be applied", Duration::from_secs(10), || {
-        c.cmds(&["EXISTS", "done"]).as_int() == 1
+        matches!(c.cmds(&["EXISTS", "done"]), RespValue::Int(1))
     });
     let samples = |c: &mut Conn, key: &str| -> Vec<(i64, String)> {
         c.cmds(&["TS.RANGE", key, "-", "+"])
