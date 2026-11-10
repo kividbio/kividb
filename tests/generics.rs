@@ -2319,8 +2319,7 @@ fn test_default_tracking_is_told_only_of_the_keys_a_write_changed() {
         }
         String::from_utf8_lossy(&all).into_owned()
     };
-    let named =
-        |frames: &str, key: &str| frames.contains(&format!("${}\r\n{key}\r\n", key.len()));
+    let named = |frames: &str, key: &str| frames.contains(&format!("${}\r\n{key}\r\n", key.len()));
     // The tracker reads `keys`, `c` runs `command`: the keys `told` hears of.
     let mut told_of = |keys: &[&str], command: &[&str]| -> Vec<String> {
         for key in keys {
@@ -2328,7 +2327,10 @@ fn test_default_tracking_is_told_only_of_the_keys_a_write_changed() {
         }
         drain(&mut told);
         let reply = c.cmds(command);
-        assert!(!matches!(reply, RespValue::Error(_)), "{command:?}: {reply:?}");
+        assert!(
+            !matches!(reply, RespValue::Error(_)),
+            "{command:?}: {reply:?}"
+        );
         let frames = drain(&mut told);
         keys.iter()
             .filter(|key| named(&frames, key))
