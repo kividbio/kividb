@@ -90,6 +90,7 @@ impl Conn {
                 RespValue::Map(pairs)
             }
             Some(b'_') => RespValue::Nil,
+            Some(b',') => RespValue::SimpleStr(line[1..].to_string()),
             _ => panic!("unexpected RESP line: {:?}", line),
         }
     }
@@ -1691,5 +1692,103 @@ fn test_acllog_max_len() {
         );
         assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
         assert!(acl_log(&mut admin).is_empty());
+    });
+}
+
+/// ACL LOG's count, as Redis's: ten entries without one, none for a
+/// negative one, and nothing after it.
+#[test]
+fn test_acl_log_count_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "none", "on", ">pw", "~*", "-@all"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "none", "pw"]).is_ok());
+        let refused: [&[&str]; 12] = [
+            &["GET", "k"],
+            &["SET", "k", "v"],
+            &["DEL", "k"],
+            &["INCR", "k"],
+            &["DECR", "k"],
+            &["APPEND", "k", "v"],
+            &["STRLEN", "k"],
+            &["LPUSH", "k", "v"],
+            &["RPUSH", "k", "v"],
+            &["SADD", "k", "v"],
+            &["HSET", "k", "f", "v"],
+            &["ZADD", "k", "1", "m"],
+        ];
+        for cmd in refused {
+            assert!(c.cmds(cmd).error_msg().starts_with("NOPERM"), "{cmd:?}");
+        }
+        assert_eq!(admin.cmds(&["ACL", "LOG"]).as_array().len(), 10);
+        assert_eq!(admin.cmds(&["ACL", "LOG", "20"]).as_array().len(), 12);
+        assert_eq!(admin.cmds(&["ACL", "LOG", "-1"]).as_array().len(), 0);
+        assert_eq!(
+            admin.cmds(&["ACL", "LOG", "+1"]).error_msg(),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            admin.cmds(&["ACL", "log", "1", "2"]).error_msg(),
+            "ERR unknown subcommand or wrong number of arguments for 'log'. Try ACL HELP."
+        );
+
+        // Under RESP3, each entry is a map.
+        assert!(matches!(admin.cmds(&["HELLO", "3"]), RespValue::Map(_)));
+        let log = admin.cmds(&["ACL", "LOG", "1"]);
+        let RespValue::Map(entry) = &log.as_array()[0] else {
+            panic!("not a map: {log:?}");
+        };
+        assert_eq!(entry.len(), 10);
+        assert_eq!(entry[0].0.as_str(), "count");
+        assert_eq!(entry[5].0.as_str(), "age-seconds");
+        assert!(entry[5].1.as_str().parse::<f64>().is_ok(), "{entry:?}");
+    });
+}
+
+/// A negative `acllog-max-len` is refused, and changes nothing.
+#[test]
+fn test_a_negative_acllog_max_len_is_refused() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(
+            c.cmds(&["CONFIG", "SET", "acllog-max-len", "-1"])
+                .is_error()
+        );
+        let got = c.cmds(&["CONFIG", "GET", "acllog-max-len"]);
+        assert_eq!(got.as_array()[1].as_str(), "128");
+    });
+}
+
+/// ACL SETUSER takes a password that is not UTF-8, as Redis does, to add
+/// (`>`) and to remove (`<`).
+#[test]
+fn test_setuser_takes_a_binary_password() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        let set = |admin: &mut Conn, rule: &[u8]| {
+            admin.cmd(&[
+                &b"ACL"[..],
+                &b"SETUSER"[..],
+                &b"bu"[..],
+                &b"on"[..],
+                rule,
+                &b"~*"[..],
+                &b"+@all"[..],
+            ])
+        };
+        assert!(set(&mut admin, b">\xff\x01").is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmd(&[&b"AUTH"[..], &b"bu"[..], &b"\xff\x01"[..]]).is_ok());
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "bu");
+        assert!(set(&mut admin, b"<\xff\x01").is_ok());
+        let r = c.cmd(&[&b"AUTH"[..], &b"bu"[..], &b"\xff\x01"[..]]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        // Anything else that is not UTF-8 is still no rule.
+        assert_eq!(set(&mut admin, b"~\xff").error_msg(), "ERR invalid rule");
     });
 }

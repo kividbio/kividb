@@ -214,3 +214,19 @@ fn a_scripts_refusal_is_logged_in_context_lua() {
         );
     }
 }
+
+/// CONFIG REWRITE writes `acllog-max-len` as it was set.
+#[test]
+fn config_rewrite_writes_acllog_max_len() {
+    for io in io_models() {
+        let server = Server::start(io, "loglevel notice\n");
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["CONFIG", "SET", "acllog-max-len", "7"]), "+OK\r\n");
+        assert_eq!(c.cmd(&["CONFIG", "REWRITE"]), "+OK\r\n", "{io}");
+        let written = std::fs::read_to_string(server.dir.join("kividb.conf")).unwrap();
+        assert!(
+            written.lines().any(|line| line == "acllog-max-len 7"),
+            "{io}: {written}"
+        );
+    }
+}

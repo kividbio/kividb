@@ -140,25 +140,27 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         // ── ACL LOG ───────────────────────────────────────────────────────────
         // ACL LOG [count | RESET]
         "LOG" => {
-            if cmd.len() >= 3 {
-                let arg = String::from_utf8_lossy(cmd[2]).to_ascii_uppercase();
-                if arg == "RESET" {
+            // As Redis: `LOG`, `LOG <count>` or `LOG RESET`, and nothing more.
+            if cmd.len() > 3 {
+                let sub = &cmd[1][..cmd[1].len().min(128)];
+                return Some(resp_error(&format!(
+                    "ERR unknown subcommand or wrong number of arguments for '{}'. Try ACL HELP.",
+                    String::from_utf8_lossy(sub).replace(['\r', '\n'], " ")
+                )));
+            }
+            // Ten entries unless a count is given; a negative count is none.
+            let mut count: i64 = 10;
+            if let Some(arg) = cmd.get(2) {
+                if arg.eq_ignore_ascii_case(b"RESET") {
                     ctx.acl_log.reset();
                     return Some(resp_simple("OK"));
                 }
-                // ACL LOG <count>
-                let count: usize = match std::str::from_utf8(cmd[2])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                {
-                    Some(n) => n,
+                count = match crate::commands::login::strict_integer(arg) {
+                    Some(n) => n.max(0),
                     None => return Some(resp_error("ERR value is not an integer or out of range")),
                 };
-                Some(format_acl_log(ctx.acl_log.get(count), ctx.resp))
-            } else {
-                // ACL LOG with no args — return all (up to max_len)
-                Some(format_acl_log(ctx.acl_log.get(usize::MAX), ctx.resp))
             }
+            Some(format_acl_log(ctx.acl_log.get(count as usize), ctx.resp))
         }
 
         // ── ACL SETUSER ───────────────────────────────────────────────────────
@@ -188,14 +190,24 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR Usernames can't contain spaces or null characters",
                 ));
             }
-            let mut args: Vec<&str> = Vec::with_capacity(cmd.len().saturating_sub(3));
+            let mut args: Vec<String> = Vec::with_capacity(cmd.len().saturating_sub(3));
             for rule_bytes in cmd.iter().skip(3) {
                 match std::str::from_utf8(rule_bytes) {
-                    Ok(s) => args.push(s),
-                    Err(_) => return Some(resp_error("ERR invalid rule")),
+                    Ok(s) => args.push(s.to_string()),
+                    // A password is any bytes, as in Redis: one that is not
+                    // UTF-8 is added, or removed, by its hash.
+                    Err(_) => match rule_bytes.split_first() {
+                        Some((b'>', password)) => {
+                            args.push(format!("#{}", crate::acl::sha256_hex(password)))
+                        }
+                        Some((b'<', password)) => {
+                            args.push(format!("!{}", crate::acl::sha256_hex(password)))
+                        }
+                        _ => return Some(resp_error("ERR invalid rule")),
+                    },
                 }
             }
-            let rules = match crate::acl::merge_selector_args(args.into_iter()) {
+            let rules = match crate::acl::merge_selector_args(args.iter().map(String::as_str)) {
                 Ok(rules) => rules,
                 Err(e) => return Some(resp_error(&format!("ERR {e}"))),
             };

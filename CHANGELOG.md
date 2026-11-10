@@ -241,7 +241,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   takes one that is not UTF-8, and a user set by the hash of such bytes
   (`#<sha256>`) logs in with them. Before, such a password was read as an
   empty one. A user name that is not UTF-8 matches no user. Before, it was
-  read as `default`.
+  read as `default`. `ACL SETUSER` takes such a password too (`>` and
+  `<`), where it answered `ERR invalid rule`.
 
 - **The ACL log keeps what Redis's keeps.** A failed `AUTH` or `HELLO ...
   AUTH` is logged with the command as the object (`AUTH`, `HELLO`), not
@@ -257,7 +258,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now a setting (default 128, 0 keeps nothing) in the configuration file,
   `CONFIG SET` and `CONFIG GET`, where it was accepted and ignored. A
   client that reads `ACL LOG` entries by position, or by the name `id`,
-  needs to change.
+  needs to change. `ACL LOG` without a count gives the ten newest entries,
+  as Redis does, where it gave them all. A negative count gives none, and
+  more arguments are refused.
 
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and

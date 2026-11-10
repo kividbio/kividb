@@ -222,7 +222,7 @@ impl Login<'_> {
 
 /// An integer as Redis's `string2ll` reads one: digits, a `-` before them
 /// at most, no `+`, no leading zero (but `0` itself), no space.
-fn strict_integer(raw: &[u8]) -> Option<i64> {
+pub(crate) fn strict_integer(raw: &[u8]) -> Option<i64> {
     let digits = raw.strip_prefix(b"-").unwrap_or(raw);
     let well_formed = match digits {
         [] => false,
