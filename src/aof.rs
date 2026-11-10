@@ -4607,6 +4607,15 @@ mod ts_option_replay_tests {
             vec!["TS.ADD", "s", "25", "1"],
             vec!["RENAME", "s", "s2"],
             vec!["TS.ADD", "s2", "35", "1"],
+            // A destination renamed onto another of its source's.
+            vec!["TS.CREATE", "w"],
+            vec!["TS.CREATE", "a"],
+            vec!["TS.CREATE", "b"],
+            vec!["TS.CREATERULE", "w", "a", "AGGREGATION", "sum", "10"],
+            vec!["TS.CREATERULE", "w", "b", "AGGREGATION", "sum", "10"],
+            vec!["RENAME", "a", "b"],
+            vec!["TS.ADD", "w", "1", "1"],
+            vec!["TS.ADD", "w", "15", "1"],
         ]);
         let series = |key: &str| {
             let shard = crate::store::get_shard(&store[0], key);
@@ -4625,6 +4634,11 @@ mod ts_option_replay_tests {
             d.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
             [(10, 1.0), (20, 1.0)]
         );
+        let w = series("w");
+        assert_eq!(w.rules.len(), 1);
+        assert_eq!(w.rules[0].dest_key, "b");
+        assert_eq!(series("b").source.as_deref(), Some("w"));
+        assert_eq!(series("b").samples.get(&0), Some(&1.0));
     }
 
     #[test]

@@ -580,9 +580,17 @@ pub(crate) fn renamed(ctx: &Ctx, from: &[u8], to: &[u8]) {
     };
     if let Some(source) = source
         && let Some(source) = series_named(ctx, &source)
-        && let Some(rule) = source.write().rules.iter_mut().find(|r| r.dest_key == from)
     {
-        rule.dest_key = to.clone();
+        let mut source = source.write();
+        if source.rules.iter().any(|r| r.dest_key == from) {
+            // A rule it had to the series the rename replaced goes: two
+            // rules to one destination fed it twice (RedisTimeSeries
+            // deletes the replaced series, and its links, first).
+            source.rules.retain(|r| r.dest_key != to);
+            if let Some(rule) = source.rules.iter_mut().find(|r| r.dest_key == from) {
+                rule.dest_key = to.clone();
+            }
+        }
     }
     for dest in dests {
         if let Some(dest) = series_named(ctx, &dest) {
@@ -1519,7 +1527,8 @@ fn ts_deleterule(ctx: &mut Ctx) -> Option<Vec<u8>> {
             } else {
                 drop(ts);
                 drop(map);
-                if let Ok(Some(dest)) = ts_query::series_at(ctx, dest_key.as_slice()) {
+                // Past its time or not, as on a replica (`series_named`).
+                if let Some(dest) = series_named(ctx, &dest_name) {
                     let mut dest = dest.write();
                     if dest.source.as_deref()
                         == Some(&*crate::key_bytes::text_of(src_key.as_slice()))

@@ -2225,6 +2225,32 @@ fn test_ts_rename_and_copy_keep_compactions_right() {
     assert_eq!(range_len(&mut c, "rn:d3"), 3);
     assert!(c.cmds(&["TS.DELETERULE", "rn:s3", "rn:d3"]).is_ok());
 
+    // A destination renamed onto another of its source's destinations: the
+    // source has one rule to it, not two.
+    for key in ["rn:w", "rn:a", "rn:b"] {
+        c.cmds(&["TS.CREATE", key]);
+    }
+    for dest in ["rn:a", "rn:b"] {
+        assert!(
+            c.cmds(&["TS.CREATERULE", "rn:w", dest, "AGGREGATION", "sum", "10"])
+                .is_ok()
+        );
+    }
+    assert!(c.cmds(&["RENAME", "rn:a", "rn:b"]).is_ok());
+    let info = c.cmds(&["TS.INFO", "rn:w"]);
+    let arr = info.as_array();
+    let at = arr
+        .iter()
+        .position(|v| matches!(v, RespValue::Bulk(b) if b == b"rules"))
+        .unwrap();
+    assert_eq!(arr[at + 1].as_array().len(), 1, "{info:?}");
+    assert_eq!(ts_source(&mut c, "rn:b").as_deref(), Some("rn:w"));
+    c.cmds(&["TS.ADD", "rn:w", "1", "2"]);
+    c.cmds(&["TS.ADD", "rn:w", "15", "2"]);
+    let b = c.cmds(&["TS.RANGE", "rn:b", "-", "+"]);
+    assert_eq!(b.as_array().len(), 1, "{b:?}");
+    assert_eq!(b.as_array()[0].as_array()[1].as_f64(), 2.0);
+
     // COPY: no links, found by its labels.
     c.cmds(&["TS.CREATE", "cp:s"]);
     c.cmds(&["TS.CREATE", "cp:d", "LABELS", "kind", "copied"]);

@@ -2315,9 +2315,19 @@ fn time_series_links_reach_a_replica() {
     };
 
     assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).ok());
-    for key in ["rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s", "rl:z:d"] {
+    for key in [
+        "rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s", "rl:z:d", "rl:w:s", "rl:w:a", "rl:w:b",
+    ] {
         m.cmd(&["TS.CREATE", key]);
     }
+    // A destination renamed onto another of its source's: one rule left.
+    for dest in ["rl:w:a", "rl:w:b"] {
+        assert!(rule(&mut m, "rl:w:s", dest).ok());
+    }
+    assert!(m.cmd(&["RENAME", "rl:w:a", "rl:w:b"]).ok());
+    m.cmd(&["TS.ADD", "rl:w:s", "1", "1"]);
+    m.cmd(&["TS.ADD", "rl:w:s", "15", "1"]);
+    assert_eq!(m.cmd(&["TS.INFO", "rl:w:s"]).field("rules").arr().len(), 1);
     for tag in ["x", "y", "z"] {
         let (s, d) = (format!("rl:{tag}:s"), format!("rl:{tag}:d"));
         assert!(rule(&mut m, &s, &d).ok());
@@ -2343,7 +2353,9 @@ fn time_series_links_reach_a_replica() {
     assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).ok());
     assert_eq!(m.cmd(&["WAIT", "1", "5000"]).i(), 1);
 
-    for key in ["rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s2", "rl:z:d2"] {
+    for key in [
+        "rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s2", "rl:z:d2", "rl:w:s", "rl:w:b",
+    ] {
         let (on_master, on_replica) = (m.cmd(&["TS.INFO", key]), r.cmd(&["TS.INFO", key]));
         for field in ["sourceKey", "rules", "totalSamples"] {
             assert_eq!(
