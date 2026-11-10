@@ -5575,6 +5575,55 @@ mod field_deadline_tests {
         assert_eq!(read_back(&loaded.dbs[0][&b"h"[..]], want.len()), want);
     }
 
+    /// Bytes as 1.2.0 writes them: a KDB image and a `DUMP` payload of `h`,
+    /// fields `a` `b` `c`, `a` due at 4102444800123 and `b` at
+    /// 4102444800999 (`HPEXPIREAT`), `c` with none. Saved by a server of the
+    /// format before deadlines were kept as Unix milliseconds; they load to
+    /// the very deadlines, and are written back byte for byte (#594).
+    #[test]
+    fn deadlines_written_by_1_2_0_load_exactly() {
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        // The whole file: its header, `h`, the end of the database and an
+        // empty key-expiry section (the zeros).
+        let image: Vec<u8> = unhex(
+            "4b495649444230311000000001000000680a03000000010000006101000000310100\
+             0000620100000032010000006301000000330200000001000000617bd8c32cbb03\
+             00000100000062e7dbc32cbb03",
+        )
+        .into_iter()
+        .chain(std::iter::repeat_n(0u8, 66))
+        .collect();
+        let payload = unhex(
+            "0a030000000100000061010000003101000000620100000032010000006301000000\
+             330200000001000000617bd8c32cbb0300000100000062e7dbc32cbb0300000a00\
+             a003f06b3b4b048d",
+        );
+        let want = |value: &KiviDBValue| {
+            let KiviDBValue::HashEx(hash) = value else {
+                panic!("not a hash with field TTLs");
+            };
+            let hash = hash.read();
+            assert_eq!(hash.fields.len(), 3);
+            assert_eq!(hash.expiries.get("a"), Some(&4_102_444_800_123));
+            assert_eq!(hash.expiries.get("b"), Some(&4_102_444_800_999));
+            assert_eq!(hash.expiries.get("c"), None);
+        };
+        let loaded = load_snapshot_from(&image[..]).unwrap();
+        want(&loaded.dbs[0][&b"h"[..]]);
+        let restored = restore_payload(&payload).expect("the payload restores");
+        want(&restored);
+        // Written back as 1.2.0 wrote it, but for the order of the two
+        // deadlines, which a hash map does not keep.
+        let again = dump_payload(&restored).unwrap();
+        assert_eq!(again.len(), payload.len());
+        want(&restore_payload(&again).unwrap());
+    }
+
     /// Type 24, a hash table: the soonest deadline, then for each field its
     /// deadline less the soonest one, plus 1, its name and its value.
     #[test]
