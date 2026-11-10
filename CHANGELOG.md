@@ -145,6 +145,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An idle server with many keys that have a long TTL no longer spends
+  CPU on them (#618).** Every active-expiry cycle, ten times a second,
+  looked at every key with a TTL in every shard, due or not. Each expiry
+  thread spent its whole 25 ms budget on that, so with 5 million keys set
+  with `EX 3600` and no traffic the server used about 40% of a core on
+  8 vCPUs (57% on 12), and more the more such keys it held. The keys with a
+  TTL are now kept in two lists per shard: those that may come due within
+  the next 20 seconds, and those that cannot. A cycle looks only at the
+  first. About every 20 seconds a sweep, a few thousand keys per lock of
+  the shard, moves keys between the two as their time comes closer. A key
+  given a TTL that ends sooner goes straight to the first list, so it is
+  expired as promptly as before. Idle CPU with 5 million such keys is now
+  0.5-0.75% of a core (0.3-0.35% at 1 million), and 1.2-1.35% with their
+  TTLs spread over an hour, so that keys expire all the time (40% before).
+  `SET ... EX` under load is
+  about 16% faster: the passes no longer hold shard locks that writes wait
+  for. 1 million keys set with a 10-second TTL still all expire within
+  0.2 s of the last deadline.
+
 - **A relative TTL reaches replicas and the AOF as the master's own
   deadline (#602).** `SET` with `EX` or `PX`, `SETEX`, `PSETEX`, `MSETEX`
   and `RESTORE` with a relative TTL are sent on with an absolute deadline
