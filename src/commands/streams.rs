@@ -1343,6 +1343,21 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
 
+    // Before MKSTREAM makes the stream: an ID that is no ID fails the
+    // command, and a failed command must leave no key behind. One that did
+    // was not sent to replicas or the AOF (an error is not), so only this
+    // node had it.
+    let given_id = if id_str == "$" {
+        None
+    } else {
+        match parse_range_id_lo(&id_str) {
+            Some(id) => Some(id),
+            None => {
+                return resp_error("ERR Invalid stream ID specified as stream command argument");
+            }
+        }
+    };
+
     let stream = match get_or_create_stream(ctx, &key) {
         Ok(s) => s,
         Err(e) => return e,
@@ -1353,16 +1368,7 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("BUSYGROUP Consumer Group name already exists");
     }
 
-    let last_id = if id_str == "$" {
-        inner.last_id.clone()
-    } else {
-        match parse_range_id_lo(&id_str) {
-            Some(id) => id,
-            None => {
-                return resp_error("ERR Invalid stream ID specified as stream command argument");
-            }
-        }
-    };
+    let last_id = given_id.unwrap_or_else(|| inner.last_id.clone());
 
     let entries_read = capped_entries_read(entries_read, inner.entries_added);
     inner.groups.insert(
