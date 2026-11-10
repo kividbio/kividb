@@ -883,45 +883,6 @@ fn test_function_flush() {
     assert!(result.is_error(), "FCALL after FUNCTION FLUSH should error");
 }
 
-/// `FUNCTION RESTORE` and `FUNCTION FLUSH` from two clients at once never
-/// deadlock. The flush held the function store's lock while it took the
-/// name map's, and a restore took them the other way round: the two waited
-/// for each other for good, and the server with them.
-#[test]
-fn function_restore_and_flush_at_once_do_not_deadlock() {
-    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
-    let port = free_port();
-    start_server(port);
-    let mut c = Conn::connect(port);
-    let loaded = c.cmds(&[
-        "FUNCTION",
-        "LOAD",
-        "#!lua name=race\nredis.register_function('race_f', function() return 1 end)",
-    ]);
-    assert!(!loaded.is_error(), "{loaded:?}");
-    let RespValue::Bulk(dump) = c.cmds(&["FUNCTION", "DUMP"]) else {
-        panic!("FUNCTION DUMP is not a bulk string");
-    };
-    let done = |reply: RespValue| match reply {
-        RespValue::SimpleStr(_) => {}
-        RespValue::Error(e) if e.starts_with("BUSY") => {}
-        other => panic!("{other:?}"),
-    };
-    let restorer = thread::spawn(move || {
-        let mut r = Conn::connect(port);
-        for _ in 0..2000 {
-            let args: [&[u8]; 4] = [b"FUNCTION", b"RESTORE", &dump, b"FLUSH"];
-            done(r.cmd(&args));
-        }
-    });
-    let mut f = Conn::connect(port);
-    for _ in 0..2000 {
-        done(f.cmds(&["FUNCTION", "FLUSH"]));
-    }
-    restorer.join().unwrap();
-    assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
-}
-
 #[test]
 fn test_function_keys_and_argv() {
     let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();

@@ -5602,6 +5602,33 @@ mod lua_busy_allow_tests {
         assert!(!lua_command_allowed_while_busy(&[b"PING"]));
     }
 
+    /// A flush and a rebuild of the name map (what `FUNCTION RESTORE` ends
+    /// with) at the same time never deadlock. The flush held the store's
+    /// lock while it took the name map's, and the rebuild took them the
+    /// other way round.
+    #[test]
+    fn a_flush_beside_a_rebuild_of_the_name_map_does_not_deadlock() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for flusher in [true, false] {
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200_000 {
+                    if flusher {
+                        let _ = flush_functions(false);
+                    } else {
+                        rebuild_fn_name_map_from_store();
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a flush and a rebuild of the name map deadlocked");
+        }
+    }
+
     /// A `FUNCTION FLUSH` refused because a script holds the VM leaves the
     /// libraries where they were (#559).
     #[test]
