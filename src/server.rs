@@ -1254,14 +1254,28 @@ where
                     .get(username.as_str())
                     .and_then(|user| crate::acl::check_permission(user, &cmd_name, &cmd).err());
                 if let Some(denied) = denied {
-                    acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                    // As in Redis, a command there is no such command as, or
+                    // with the wrong number of arguments, is refused for that
+                    // before the user's rules are looked at.
+                    let refusal = if !commands::server::is_command(&cmd_name) {
+                        commands::handler::unknown_command(&cmd)
+                    } else if let Some(wrong) = commands::arity::check(&cmd_name, &cmd) {
+                        wrong
+                    } else {
+                        acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                        format!("-{}\r\n", denied.message(username)).into_bytes()
+                    };
                     // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
-                    // for a command refused for any other reason (#159).
-                    if tx.active {
-                        tx.aborted = true;
-                    }
-                    combined
-                        .extend_from_slice(format!("-{}\r\n", denied.message(username)).as_bytes());
+                    // for a command refused for any other reason (#159). A refused
+                    // EXEC discards the transaction, as in Redis.
+                    let reply = commands::transaction::reject(
+                        &mut tx,
+                        cmd_name == "EXEC",
+                        watch_registry.as_ref(),
+                        &dirty_flag,
+                        refusal,
+                    );
+                    combined.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
                 }
@@ -1306,7 +1320,9 @@ where
             // connection stays a client until it asks again; so is one of a
             // master that lost its dataset (`ReplState::psync_offer`).
             // A replica does not take replicas of its own (#144).
-            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
+            // Inside MULTI they are refused, as in Redis (`queue_refusal`), and
+            // the transaction with them: they do not hand the connection over.
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && !tx.active && repl_state.is_slave() {
                 combined.extend_from_slice(&crate::resp::write::resp_error(
                     crate::replication::NOT_A_MASTER,
                 ));
@@ -1314,6 +1330,7 @@ where
                 continue;
             }
             if cmd_name == "PSYNC"
+                && !tx.active
                 && let Some(offer) =
                     repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
             {
@@ -1321,7 +1338,7 @@ where
                 parse_offset += consumed;
                 continue;
             }
-            if cmd_name == "PSYNC" || cmd_name == "SYNC" {
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && !tx.active {
                 parse_offset += consumed;
                 connection_handoff = Some(ConnectionHandoff::Replica {
                     legacy_sync: cmd_name == "SYNC",
@@ -1353,26 +1370,14 @@ where
                 "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" | "RESET"
             ) && let Some(wrong) = commands::arity::check(&cmd_name, &cmd)
             {
-                if cmd_name == "EXEC" {
-                    watch_registry.as_ref().unwatch_all(
-                        &tx.watched_keys
-                            .iter()
-                            .map(|_| Arc::clone(&dirty_flag))
-                            .collect::<Vec<_>>(),
-                    );
-                    tx.reset();
-                    dirty_flag.store(false, std::sync::atomic::Ordering::Release);
-                    let why = String::from_utf8_lossy(&wrong);
-                    combined.extend_from_slice(&crate::resp::write::resp_error(&format!(
-                        "EXECABORT Transaction discarded because of: {}",
-                        why.trim_start_matches('-').trim_end()
-                    )));
-                } else {
-                    if tx.active {
-                        tx.aborted = true;
-                    }
-                    combined.extend_from_slice(&wrong);
-                }
+                let reply = commands::transaction::reject(
+                    &mut tx,
+                    cmd_name == "EXEC",
+                    watch_registry.as_ref(),
+                    &dirty_flag,
+                    wrong,
+                );
+                combined.extend_from_slice(&reply);
                 parse_offset += consumed;
                 continue;
             }
@@ -1824,12 +1829,6 @@ where
                             let count = queued.len();
                             let mut exec_out = format!("*{count}\r\n").into_bytes();
 
-                            // Hoist outside the loop — name won't change mid-transaction
-                            let client_name_for_slowlog = client_registry
-                                .get(client_id)
-                                .map(|info| info.name.clone())
-                                .unwrap_or_default();
-
                             // A plain FLUSHALL here is not counted as lazily freed.
                             let _queued = crate::lazyfree::running_queued();
                             for queued_cmd in queued {
@@ -2018,7 +2017,12 @@ where
                                         &raw_cmd,
                                         elapsed_us,
                                         &peer_addr,
-                                        client_name_for_slowlog.clone(),
+                                        // The name now: a queued CLIENT SETNAME
+                                        // or HELLO may have changed it.
+                                        client_registry
+                                            .get(client_id)
+                                            .map(|info| info.name.clone())
+                                            .unwrap_or_default(),
                                     );
                                 }
 

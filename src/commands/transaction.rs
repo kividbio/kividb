@@ -259,6 +259,41 @@ impl TxState {
     }
 }
 
+/// A command refused before it ran — no such command, the wrong number of
+/// arguments, not allowed inside MULTI, not allowed to the user — as Redis's
+/// `rejectCommand` refuses it. Inside MULTI the transaction is failed, and
+/// `EXEC` will refuse it. A refused `EXEC` itself discards the transaction,
+/// watches and all, and says why: `-EXECABORT Transaction discarded because
+/// of: <the refusal>`. `refusal` is the error reply; what is returned is the
+/// reply to send.
+pub fn reject(
+    tx: &mut TxState,
+    is_exec: bool,
+    watches: &dyn crate::watch::WatchNotifier,
+    dirty_flag: &Arc<std::sync::atomic::AtomicBool>,
+    refusal: Vec<u8>,
+) -> Vec<u8> {
+    if !is_exec {
+        if tx.active {
+            tx.aborted = true;
+        }
+        return refusal;
+    }
+    watches.unwatch_all(
+        &tx.watched_keys
+            .iter()
+            .map(|_| Arc::clone(dirty_flag))
+            .collect::<Vec<_>>(),
+    );
+    tx.reset();
+    dirty_flag.store(false, Ordering::Release);
+    let why = String::from_utf8_lossy(&refusal);
+    crate::resp::write::resp_error(&format!(
+        "EXECABORT Transaction discarded because of: {}",
+        why.trim_start_matches('-').trim_end()
+    ))
+}
+
 impl Default for TxState {
     fn default() -> Self {
         Self::new()
