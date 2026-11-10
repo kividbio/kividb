@@ -409,15 +409,21 @@ links below always resolve to the newest release; replace `latest/download` with
 # Linux x86_64
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-x86_64.tar.gz
 tar xzf kividb-linux-x86_64.tar.gz
-./kividb
+./kividb/kividb
 
 # Linux aarch64 (an ARMv8.1 CPU or newer: Graviton2 and later, Ampere; not a Raspberry Pi 4)
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-aarch64.tar.gz
+tar xzf kividb-linux-aarch64.tar.gz
+./kividb/kividb
 
-# macOS, Apple silicon / Intel
+# macOS, Apple silicon (use kividb-darwin-x86_64.tar.gz on Intel)
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-darwin-aarch64.tar.gz
-curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-darwin-x86_64.tar.gz
+tar xzf kividb-darwin-aarch64.tar.gz
+./kividb/kividb
 ```
+
+Each tarball unpacks to a `kividb/` directory holding the `kividb` binary, `LICENSE` and
+`NOTICE`.
 
 Each variant other than the default has its name in the file: `kividb-lua-linux-x86_64.tar.gz`,
 `kividb-tls-…`, `kividb-full-…`. The default variant is also packaged for Linux as

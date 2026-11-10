@@ -809,6 +809,63 @@ pub fn turn_away(mut socket: tokio::net::TcpStream) {
     });
 }
 
+/// A replica's link to its master, listed among its clients as Redis lists
+/// it: `flags=M`, `TYPE master`, by the master's address. `CLIENT KILL` ends
+/// the link, and the replica connects again and continues from where it
+/// stands (#595). Taken off the list when dropped.
+pub struct MasterLink {
+    registry: ClientRegistry,
+    id: u64,
+    activity: Arc<Activity>,
+    kill_rx: KillRx,
+    /// Until it is known to have been taken off the list other than by a
+    /// kill: its `kill_rx` is then done with.
+    listed: bool,
+}
+
+impl MasterLink {
+    pub fn register(registry: &ClientRegistry, addr: String, laddr: String) -> Self {
+        let id = next_client_id();
+        let (mut info, killed) = ClientInfo::new(id, addr);
+        info.laddr = laddr;
+        info.flags = "M".to_string();
+        // Redis's master client has no ACL user.
+        info.user = "(superuser)".to_string();
+        let activity = Arc::clone(&info.activity);
+        registry.register(info);
+        Self {
+            registry: Arc::clone(registry),
+            id,
+            activity,
+            kill_rx: killed,
+            listed: true,
+        }
+    }
+
+    /// Resolves when the link is killed (`CLIENT KILL`), and never
+    /// otherwise. Cancel-safe: it may be raced and dropped again and again.
+    pub async fn killed(&mut self) {
+        if self.listed {
+            if (&mut self.kill_rx).await.is_ok() {
+                return;
+            }
+            self.listed = false;
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// The master has sent something: the link is not idle.
+    pub fn touch(&self) {
+        self.activity.touch();
+    }
+}
+
+impl Drop for MasterLink {
+    fn drop(&mut self) {
+        self.registry.unregister(self.id);
+    }
+}
+
 /// A connection's place under `maxclients`, given back when dropped.
 pub struct Slot(ClientRegistry);
 
@@ -904,6 +961,16 @@ impl ClientRegistryInner {
         self.clients.read().is_empty()
     }
 
+    /// `connected_clients`: the clients less the replicas' links, as Redis
+    /// counts them.
+    pub fn connected_clients(&self) -> usize {
+        self.clients
+            .read()
+            .values()
+            .filter(|info| !info.flags.contains('S'))
+            .count()
+    }
+
     /// The client has begun to wait in a blocking command (`Some`), or has
     /// stopped (`None`).
     pub fn set_blocked(
@@ -958,6 +1025,24 @@ impl ClientRegistryInner {
     /// `clients_in_timeout_table` (#158): clients blocked with a timeout.
     pub fn in_timeout_table() -> u64 {
         IN_TIMEOUT_TABLE.load(Ordering::Relaxed)
+    }
+
+    /// This node has become a replica: every client waiting in a blocking
+    /// command is answered `-UNBLOCKED … (master -> replica?)` and its
+    /// connection closed, as Redis's `disconnectAllBlockedClients` does
+    /// (#591). A client paused by `CLIENT PAUSE` is not blocked, and is let
+    /// be, as in Redis. Returns how many were ended.
+    pub fn end_blocked_for_role_change(&self) -> usize {
+        let senders: Vec<_> = self
+            .clients
+            .write()
+            .values_mut()
+            .filter_map(|info| info.unblock_tx.take())
+            .collect();
+        senders
+            .into_iter()
+            .filter_map(|tx| tx.send(crate::commands::blocking::Unblock::RoleChange).ok())
+            .count()
     }
 
     /// What the clients' query buffers hold, the replicas' apart:
