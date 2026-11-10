@@ -1974,7 +1974,10 @@ mod tests {
         // A pass looks at those alone, and finds exactly the due ones.
         let (due, looked) = map.due(now + 6_000, usize::MAX);
         assert_eq!((due.len(), looked), (100, 100));
-        assert!(due.iter().all(|k| map.expires(k.as_bytes()) == Some(now + 5_000)));
+        assert!(
+            due.iter()
+                .all(|k| map.expires(k.as_bytes()) == Some(now + 5_000))
+        );
         assert_eq!(map.due(now + 4_000, usize::MAX), (vec![], 100));
         // A key given a time now goes where the new horizon says.
         map.insert_expiring("late", s("v"), Some(now + HORIZON_MS + 1));
