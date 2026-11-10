@@ -731,6 +731,8 @@ impl Config {
             while let Some(next) = raw.peek(&cursor) {
                 // Redis accepts a first value starting with --, except for bare --save.
                 if next.is_escape()
+                    || next.to_value_os() == "-h"
+                    || next.to_value_os() == "-V"
                     || (next.is_long() && (!values.is_empty() || name.eq_ignore_ascii_case("save")))
                 {
                     break;
@@ -2319,12 +2321,23 @@ mod cli_tests {
     fn help_version_and_end_of_options_keep_clap_behavior() {
         for (flag, kind) in [
             ("--help", clap::error::ErrorKind::DisplayHelp),
+            ("-h", clap::error::ErrorKind::DisplayHelp),
             ("--version", clap::error::ErrorKind::DisplayVersion),
+            ("-V", clap::error::ErrorKind::DisplayVersion),
         ] {
             let args = ["kividb", "--appendonly", "no", flag];
             let error = Config::parse_cli_from(args).unwrap_err();
             assert_eq!(error.kind(), kind);
         }
+        for (flag, kind) in [
+            ("-h", clap::error::ErrorKind::DisplayHelp),
+            ("-V", clap::error::ErrorKind::DisplayVersion),
+        ] {
+            let error = Config::parse_cli_from(["kividb", "--primaryauth", flag]).unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+        let (config, _) = load(&["kividb", "--primaryauth=-h"], "").unwrap();
+        assert_eq!(config.masterauth, "-h");
         assert!(load(&["kividb", "--", "--appendonly", "yes"], "").is_err());
     }
 }
