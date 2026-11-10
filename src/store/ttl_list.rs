@@ -21,6 +21,13 @@
 //!
 //! The order within each list means nothing: a key that leaves, or loses
 //! its time to live, has the last one of its list moved into its place.
+//!
+//! The lists also keep the sum of when their entries' times end
+//! ([`TtlList::deadline_sum`]), kept as entries come, go and are given new
+//! times: what `INFO keyspace` makes `avg_ttl` of, in one step a shard.
+//! It went over every entry, holding each shard while it did: 45-70 ms at
+//! 5 million keys with a time to live, and writes to a shard waited
+//! that long (#622).
 
 use super::entry::{Entry, prefetch_expiry};
 
@@ -68,6 +75,13 @@ pub(super) struct TtlList {
     checked: usize,
     /// While a sweep is under way, how much of `near` it has looked at.
     near_checked: usize,
+    /// The sum of when the times of all the entries, near and far, end.
+    /// Every entry comes in by `push` (or `replaced`), goes out by `take`
+    /// (or `replaced`, or `clear`), and has its time changed by `retimed`
+    /// (or `replaced`): those keep it. A sweep moves entries between the
+    /// lists and leaves it as it is. 128 bits: 2^32 entries of times up
+    /// to 2^64 do not overflow it.
+    deadlines: u128,
 }
 
 impl TtlList {
@@ -80,7 +94,15 @@ impl TtlList {
             sweeping: false,
             checked: 0,
             near_checked: 0,
+            deadlines: 0,
         }
+    }
+
+    /// The sum of when the times of all the entries end (milliseconds
+    /// since the Unix epoch): over [`TtlList::len`], their mean.
+    #[inline]
+    pub(super) fn deadline_sum(&self) -> u128 {
+        self.deadlines
     }
 
     /// How many entries there are.
@@ -146,6 +168,7 @@ impl TtlList {
         self.far.clear();
         self.checked = 0;
         self.near_checked = 0;
+        self.deadlines = 0;
     }
 
     /// Give back the room of each list that is `sparse`, down to its
@@ -180,7 +203,9 @@ impl TtlList {
     /// `entry`, which has a time to live, put in the list its time says.
     #[inline]
     pub(super) fn push(&mut self, entry: Entry) {
-        if deadline(entry) < self.next {
+        let at = deadline(entry);
+        self.deadlines += u128::from(at);
+        if at < self.next {
             self.push_near(entry);
         } else {
             self.push_far(entry);
@@ -220,6 +245,7 @@ impl TtlList {
     /// `entry` taken out.
     #[inline]
     pub(super) fn take(&mut self, entry: Entry) {
+        self.deadlines -= u128::from(deadline(entry));
         let pos = entry.pos();
         if pos & FAR == 0 {
             debug_assert!(self.near[pos] == entry);
@@ -230,12 +256,22 @@ impl TtlList {
         }
     }
 
-    /// `entry`, in the list, has a new time to live: to the near list if
-    /// it is in the far one and its time now ends before the horizon.
+    /// `entry`, in the list, has a new time to live, in place of the one
+    /// that ended at `was`: to the near list if it is in the far one and
+    /// its time now ends before the horizon.
     #[inline]
-    pub(super) fn retimed(&mut self, entry: Entry) {
-        if entry.pos() & FAR != 0 && deadline(entry) < self.next {
-            self.take(entry);
+    pub(super) fn retimed(&mut self, entry: Entry, was: u64) {
+        self.deadlines = self.deadlines - u128::from(was) + u128::from(deadline(entry));
+        self.relist(entry);
+    }
+
+    /// `entry`, in the list, to the near list if it is in the far one and
+    /// its time ends before the horizon. Neither comes nor goes.
+    #[inline]
+    fn relist(&mut self, entry: Entry) {
+        let pos = entry.pos();
+        if pos & FAR != 0 && deadline(entry) < self.next {
+            self.take_far(pos & !FAR);
             self.push_near(entry);
         }
     }
@@ -250,7 +286,7 @@ impl TtlList {
                 let pos = old.pos();
                 new.set_pos(pos);
                 *self.at_mut(pos) = new;
-                self.retimed(new);
+                self.retimed(new, deadline(old));
             }
             (true, false) => self.take(old),
             (false, true) => self.push(new),
@@ -369,6 +405,8 @@ impl TtlList {
     /// next one in the part a sweep has looked at.
     #[cfg(test)]
     pub(super) fn check(&self) {
+        let sum: u128 = self.iter().map(|e| u128::from(deadline(*e))).sum();
+        assert_eq!(self.deadlines, sum, "sum of the times");
         for (i, e) in self.near.iter().enumerate() {
             assert_eq!(e.pos(), i);
         }

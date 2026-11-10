@@ -145,6 +145,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`INFO` no longer stalls writes on a server with many keys that have a
+  TTL (#622).** To report `avg_ttl` in the keyspace section, `INFO` and
+  `INFO keyspace` went over every key with a TTL, holding each shard's
+  lock while it did. With 5 million such keys each call took about 55 ms,
+  and while an exporter or the operator's agent polled `INFO`, writes
+  waited for it: with `INFO` every 100 ms, a `SET` benchmark lost a fifth
+  of its throughput and its slowest `SET` took 62 ms instead of under
+  1 ms. Each shard now keeps the sum of its keys' expiry times as they
+  are set, changed and removed, and `avg_ttl` is worked out from those
+  sums. `INFO` now takes about 0.1 ms, and polling it no longer changes
+  `SET` throughput or latency. `SET ... EX` costs no more than before.
+  The value is the same as before, except for keys that are already past
+  their time but that active expiry has not removed yet: they now pull
+  the average down until it removes them, where before they were left
+  out. `INFO all` and `INFO everything`, which some exporters ask for,
+  include `INFO keysizes`, which counts every key. It was already counted
+  at most once every 10 seconds; that count now runs on a thread of its
+  own, and `INFO all` returns the last one without waiting for it (only
+  the first `INFO all` waits). The count also holds a shard for 1,024 hash
+  buckets at a time instead of for all of its keys. `INFO keysizes` asked
+  for by name still counts at once. `tracking_total_items` in the clients
+  section is now a running count instead of a pass over the client-side
+  caching table.
 - **An idle server with many keys that have a long TTL no longer spends
   CPU on them (#618).** Every active-expiry cycle, ten times a second,
   looked at every key with a TTL in every shard, due or not. Each expiry

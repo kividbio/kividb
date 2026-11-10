@@ -5,28 +5,24 @@ use crate::resp::write::*;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Average remaining TTL in milliseconds for keys with a future expiry (Redis `avg_ttl`).
-fn avg_ttl_ms(db: &crate::store::Db) -> i64 {
-    let now = crate::commands::helpers::unix_ms(std::time::SystemTime::now());
-    let mut sum_ms: u128 = 0;
-    let mut n = 0usize;
-    for shard in db.iter() {
-        if shard.holds_no_ttl() {
-            continue;
-        }
-        let map = read_lock!(shard);
-        for (_, at) in map.expiring() {
-            if at >= now {
-                sum_ms += u128::from(at - now);
-                n += 1;
-            }
-        }
+/// Redis's `avg_ttl`: how long the `expires` keys with a time to live have
+/// left on average, in milliseconds, at `now` (milliseconds since the Unix
+/// epoch), given the sum of when their times end (`ttl_deadline_sum`, kept
+/// by each shard as times come, change and go).
+///
+/// It went over every key with a time to live, holding each shard while it
+/// did: at 5 million such keys `INFO` took 45-70 ms, and writes to each
+/// shard waited for it (#622). Now it is a sum and a count a shard. The
+/// mean of the times, less `now`, is the mean of what is left, rounded down
+/// as before. Keys past their time that expiry has not taken out yet (a
+/// cycle or so) count as having less than nothing left, and the whole is
+/// at least 0; the pass left them out.
+fn avg_ttl_ms(expires: usize, deadlines: u128, now: u64) -> i64 {
+    if expires == 0 {
+        return 0;
     }
-    if n == 0 {
-        0
-    } else {
-        (sum_ms / n as u128) as i64
-    }
+    let mean = deadlines / expires as u128;
+    mean.saturating_sub(u128::from(now)).min(i64::MAX as u128) as i64
 }
 
 /// Replication, cluster and slowlog settings as `CONFIG GET` reports them.
@@ -1671,29 +1667,72 @@ fn config_set_tls_replication(_ctx: &Ctx, on: bool) -> Vec<u8> {
     }
 }
 
+/// The last `INFO keysizes` of each server (by its store's address): when
+/// it was counted, what it said, and whether a count is under way.
+struct KeysizesCount {
+    at: std::time::Instant,
+    text: String,
+    counting: bool,
+}
+
+static KEYSIZES_LAST: std::sync::LazyLock<
+    parking_lot::Mutex<ahash::AHashMap<usize, KeysizesCount>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// `INFO keysizes` of every database of `store`: a pass over every key.
+fn keysizes_text(store: &crate::store::Store) -> String {
+    store
+        .iter()
+        .enumerate()
+        .map(|(i, db)| keysizes(i, db))
+        .collect()
+}
+
 /// `INFO keysizes`: a pass over every key. Asked for by name it is counted
 /// now; as part of `INFO all` or `everything`, which exporters scrape every
 /// few seconds, a count up to [`KEYSIZES_REUSED_FOR`] old is given again,
 /// so that they cost one pass per that time and not one each (#158).
+///
+/// Nor does `INFO all` wait for that pass, but for the first (#622): an
+/// older count starts a new one on a thread of its own, and is given
+/// meanwhile. The pass took 100-200 ms at 5 million keys, on the thread
+/// that serves the connection, and every connection that thread serves
+/// waited for it.
 fn keysizes_section(ctx: &Ctx, fresh: bool) -> String {
-    static LAST: std::sync::LazyLock<
-        parking_lot::Mutex<ahash::AHashMap<usize, (std::time::Instant, String)>>,
-    > = std::sync::LazyLock::new(Default::default);
     let server = Arc::as_ptr(ctx.store) as *const () as usize;
-    if !fresh
-        && let Some((at, text)) = LAST.lock().get(&server)
-        && at.elapsed() < KEYSIZES_REUSED_FOR
-    {
-        return text.clone();
+    if !fresh {
+        let mut last = KEYSIZES_LAST.lock();
+        if let Some(count) = last.get_mut(&server) {
+            if count.at.elapsed() >= KEYSIZES_REUSED_FOR && !count.counting {
+                let store = Arc::clone(ctx.store);
+                let counter = std::thread::Builder::new()
+                    .name("keysizes".to_string())
+                    .spawn(move || {
+                        let text = keysizes_text(&store);
+                        KEYSIZES_LAST.lock().insert(
+                            server,
+                            KeysizesCount {
+                                at: std::time::Instant::now(),
+                                text,
+                                counting: false,
+                            },
+                        );
+                    });
+                // No thread: the count is tried again on the next ask.
+                count.counting = counter.is_ok();
+            }
+            return count.text.clone();
+        }
     }
-    let text: String = ctx
-        .store
-        .iter()
-        .enumerate()
-        .map(|(i, db)| keysizes(i, db))
-        .collect();
-    LAST.lock()
-        .insert(server, (std::time::Instant::now(), text.clone()));
+    let text = keysizes_text(ctx.store);
+    KEYSIZES_LAST.lock().insert(
+        server,
+        KeysizesCount {
+            at: std::time::Instant::now(),
+            text: text.clone(),
+            counting: false,
+        },
+    );
     text
 }
 
@@ -3426,6 +3465,72 @@ fn in_module(module: &str, name: &str) -> bool {
     }
 }
 
+/// `INFO keysizes` counts: by type, then by bin. Bin 0 is the empty, bin n
+/// holds 2^(n-1) to 2^n - 1.
+type KeysizeBins = [[u64; 65]; 5];
+
+/// How many buckets of a shard `INFO keysizes` goes over in one hold of it.
+const KEYSIZES_BUCKETS: usize = 1024;
+
+/// `value` counted in its type's bin.
+fn keysize_count(bins: &mut KeysizeBins, value: crate::store::ValueRef<'_>) {
+    let (kind, len) = match value {
+        crate::store::ValueRef::String(b) => (0, b.len()),
+        crate::store::ValueRef::List(l) => (1, l.read().len()),
+        crate::store::ValueRef::Set(s) => (2, s.read().len()),
+        crate::store::ValueRef::SortedSet(z) => (3, z.read().len()),
+        crate::store::ValueRef::Hash(h) => (4, h.read().len()),
+        crate::store::ValueRef::HashEx(h) => (4, h.read().len()),
+        _ => return,
+    };
+    let bin = (usize::BITS - len.leading_zeros()) as usize;
+    bins[kind][bin] += 1;
+}
+
+/// One shard's `INFO keysizes` counts, gone over [`KEYSIZES_BUCKETS`]
+/// buckets at a time and let go of in between. It was held for the whole
+/// of its keys, and writes to it waited: tens of milliseconds a shard at
+/// millions of keys, every time an exporter scraped `INFO all` (#622).
+///
+/// Keys stay in their buckets until the table is resized, so a key there
+/// all along is counted once; one written or deleted meanwhile is counted
+/// or not, as in a `SCAN`. A table resized meanwhile has had its keys
+/// moved: the shard is counted again, and after a few tries in one hold,
+/// as before.
+fn keysizes_of_shard(shard: &crate::store::Shard) -> KeysizeBins {
+    let mut tries = 0;
+    'shard: loop {
+        let mut bins: KeysizeBins = [[0u64; 65]; 5];
+        let mut at = 0;
+        let mut size = None;
+        loop {
+            let map = read_lock!(shard);
+            let buckets = map.buckets();
+            if *size.get_or_insert(buckets) != buckets {
+                tries += 1;
+                if tries < 3 {
+                    continue 'shard;
+                }
+                let mut bins: KeysizeBins = [[0u64; 65]; 5];
+                for value in map.values() {
+                    keysize_count(&mut bins, value);
+                }
+                return bins;
+            }
+            let end = buckets.min(at + KEYSIZES_BUCKETS);
+            for index in at..end {
+                if let Some((_, value)) = map.bucket(index) {
+                    keysize_count(&mut bins, value);
+                }
+            }
+            at = end;
+            if at >= buckets {
+                return bins;
+            }
+        }
+    }
+}
+
 /// `INFO keysizes` for database `db`: for strings, lists, sets, sorted sets
 /// and hashes, how many keys have a length (bytes, or items) in each
 /// power-of-two bin, as Redis 8.10 writes it:
@@ -3439,21 +3544,12 @@ fn keysizes(db: usize, shards: &crate::store::Db) -> String {
         "distrib_zsets_items",
         "distrib_hashes_items",
     ];
-    // Bin 0 is the empty, bin n holds 2^(n-1) to 2^n - 1.
-    let mut bins = [[0u64; 65]; 5];
+    let mut bins: KeysizeBins = [[0u64; 65]; 5];
     for shard in shards.iter() {
-        for value in read_lock!(shard).values() {
-            let (kind, len) = match value {
-                crate::store::ValueRef::String(b) => (0, b.len()),
-                crate::store::ValueRef::List(l) => (1, l.read().len()),
-                crate::store::ValueRef::Set(s) => (2, s.read().len()),
-                crate::store::ValueRef::SortedSet(z) => (3, z.read().len()),
-                crate::store::ValueRef::Hash(h) => (4, h.read().len()),
-                crate::store::ValueRef::HashEx(h) => (4, h.read().len()),
-                _ => continue,
-            };
-            let bin = (usize::BITS - len.leading_zeros()) as usize;
-            bins[kind][bin] += 1;
+        for (all, one) in bins.iter_mut().zip(keysizes_of_shard(shard).iter()) {
+            for (a, b) in all.iter_mut().zip(one.iter()) {
+                *a += *b;
+            }
         }
     }
     let mut out = String::new();
@@ -4046,13 +4142,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("keyspace") {
                 out.push_str("# Keyspace\r\n");
+                let now = crate::commands::helpers::unix_ms(std::time::SystemTime::now());
                 for (i, db) in ctx.store.iter().enumerate() {
-                    let (keys, expires) = db.iter().fold((0usize, 0usize), |(k, e), shard| {
-                        let map = read_lock!(shard);
-                        (k + map.len(), e + map.ttl_len())
-                    });
+                    // Three numbers a shard, each kept as keys change.
+                    let (keys, expires, deadlines) =
+                        db.iter().fold((0usize, 0usize, 0u128), |(k, e, d), shard| {
+                            let map = read_lock!(shard);
+                            (k + map.len(), e + map.ttl_len(), d + map.ttl_deadline_sum())
+                        });
                     if keys > 0 || expires > 0 {
-                        let avg_ttl = if expires > 0 { avg_ttl_ms(db) } else { 0 };
+                        let avg_ttl = avg_ttl_ms(expires, deadlines, now);
                         out.push_str(&format!(
                             "db{}:keys={},expires={},avg_ttl={}\r\n",
                             i, keys, expires, avg_ttl
