@@ -1324,6 +1324,142 @@ fn spawn_kividb(args: &[&str]) -> Spawned {
     )
 }
 
+#[test]
+fn cli_redis_directives_start_and_config_get() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("kividb.conf");
+    std::fs::write(
+        &file,
+        "appendonly yes\ntimeout 42\ntcp-keepalive 60\nio-threads 8\ndatabases 4\n",
+    )
+    .unwrap();
+    let port = free_port();
+    let _server = Spawned(
+        std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(dir.path())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--configfile",
+                file.to_str().unwrap(),
+            ])
+            .args([
+                "--protected-mode",
+                "no",
+                "--threads",
+                "1",
+                "--io-model",
+                "tokio",
+            ])
+            .args([
+                "--appendonly",
+                "no",
+                "--save",
+                "",
+                "--appendfsync",
+                "everysec",
+            ])
+            .args([
+                "--dbfilename",
+                "dump.rdb",
+                "--timeout",
+                "0",
+                "--tcp-keepalive",
+                "300",
+            ])
+            .args(["--io-threads", "4", "--update-check", "no"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start kividb with Redis directives"),
+    );
+    let mut conn = Conn::connect(port);
+    for (key, expected) in [
+        ("appendonly", "no"),
+        ("save", ""),
+        ("appendfsync", "everysec"),
+        ("timeout", "0"),
+        ("tcp-keepalive", "300"),
+        ("databases", "4"),
+    ] {
+        let reply = conn.cmds(&["CONFIG", "GET", key]);
+        let values = reply.as_array();
+        assert_eq!(values.len(), 2, "{key}: {reply:?}");
+        assert_eq!(values[1].as_str(), expected, "{key}");
+    }
+    // Like the config file, dump.rdb is accepted without changing the fixed
+    // snapshot filename or adding a CONFIG GET entry.
+    assert!(
+        conn.cmds(&["CONFIG", "GET", "dbfilename"])
+            .as_array()
+            .is_empty()
+    );
+    assert!(!dir.path().join("appendonly.aof").exists());
+}
+
+#[test]
+fn cli_native_precedence_is_logged_in_both_argument_orders() {
+    for flags in [
+        ["--appendonly", "no", "--aof"],
+        ["--aof", "--appendonly", "no"],
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("startup.log");
+        let port = free_port();
+        let _server = Spawned(
+            std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+                .current_dir(dir.path())
+                .args(["--port", &port.to_string(), "--configfile", ""])
+                .args([
+                    "--threads",
+                    "1",
+                    "--io-model",
+                    "tokio",
+                    "--update-check",
+                    "no",
+                ])
+                .args(flags)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let mut conn = Conn::connect(port);
+        assert_eq!(config_get(&mut conn, "appendonly"), "yes");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("Ignoring '--appendonly': native flag '--aof' takes precedence regardless of argument order"),
+            "{logged}"
+        );
+    }
+}
+
+#[test]
+fn cli_unknown_or_invalid_directives_fail_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    for (args, expected) in [
+        (
+            vec!["--not-a-real-directive", "42"],
+            "unknown directive 'not-a-real-directive'",
+        ),
+        (
+            vec!["--appendonly", "maybe"],
+            "argument must be 'yes' or 'no'",
+        ),
+        (vec!["--appendonly"], "needs a value"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(dir.path())
+            .args(["--configfile", "", "--port", "0", "--update-check", "no"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{args:?}: {error}");
+    }
+}
+
 /// `INFO replication`'s value of `field`, once the server is a replica.
 fn replica_info(c: &mut Conn, field: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -71,9 +71,9 @@ logged as they happen. See [PERSISTENCE.md](../PERSISTENCE.md).
 - **Not tested:** Redis Sentinel (`REDIS_USE_SENTINEL`), Redis Cluster (`REDIS_USE_CLUSTERS`), TLS
   (`REDIS_USE_SSL`), and the opt-in KnowledgeFS services. The agent backend and the collaboration
   websocket server start and connect, but no agent app or live collaboration session is run.
-- **Cluster mode:** Dify's own cluster-mode test starts its server with `--appendonly no`, which KiviDB's
-  command line refuses ([#390](https://github.com/kividbio/kividb/issues/390)), and then sets
-  `cluster-announce-ip` with `CONFIG SET`, which KiviDB allows only at start-up
+- **Cluster mode:** Dify's own cluster-mode test passes Redis-style directives such as
+  `--appendonly no`, now accepted on KiviDB's command line. It also sets `cluster-announce-ip`
+  with `CONFIG SET`, which KiviDB allows only at start-up
   ([#391](https://github.com/kividbio/kividb/issues/391)).
 - **Models:** the harness points Dify's OpenAI-API-compatible plugin at a local stub for the chat and
   embedding models. It proves the wiring, not a model's results.

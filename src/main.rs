@@ -282,17 +282,21 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Parsed by hand rather than with `Config::parse()`, to keep the matches:
-    // the config file must not override an option given on the command line,
-    // and only the matches know which those are.
-    let matches = <Config as clap::CommandFactory>::command().get_matches();
+    // Keep the matches so the config file cannot override native CLI flags.
+    // Extra Redis directives are applied after the file through the same handler.
+    let (matches, passthrough_directives) =
+        Config::parse_cli_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
     let mut cfg =
         <Config as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let from_cli =
         |option: &str| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine);
     cfg.bind_explicit =
         matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
-    match cfg.apply_config_file(&from_cli) {
+    let loaded = cfg.apply_config_file(&from_cli).and_then(|mut warnings| {
+        warnings.extend(cfg.apply_cli_directives(&passthrough_directives, &from_cli)?);
+        Ok(warnings)
+    });
+    match loaded {
         Ok(warnings) => {
             for w in warnings {
                 log_warn!("{w}");
