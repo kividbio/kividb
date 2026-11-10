@@ -149,7 +149,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does (#591).** On `REPLICAOF`, `CLUSTER REPLICATE`, or a cluster failover
   that demotes it, every client blocked in `BLPOP`, `BRPOP`, `BLMOVE`,
   `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `XREAD ...
-  BLOCK`, `XREADGROUP ... BLOCK` or `WAITAOF` is answered `-UNBLOCKED force
+  BLOCK`, `XREADGROUP ... BLOCK`, `WAIT` or `WAITAOF` is answered `-UNBLOCKED force
   unblock from blocking operation, instance state changed (master ->
   replica?)` and its connection is closed, as Redis 8 does. They stayed
   blocked, and were woken only by what the new master wrote. A client
@@ -164,7 +164,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replica` and `CLIENT KILL TYPE replica` (or `slave`) find it. On a
   replica, the link to its master is listed with `flags=M`, so `CLIENT
   KILL TYPE master` ends it, and the replica connects again and continues
-  where it stands.
+  where it stands. `connected_clients` no longer counts the replicas'
+  links, as in Redis.
 
 - **A replica that falls behind no longer makes its master evict its keys
   and refuse writes (#542).** Under an `allkeys-*` policy, a replica that

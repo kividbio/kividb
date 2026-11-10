@@ -2224,10 +2224,13 @@ fn blocked_clients_are_ended_when_a_master_becomes_a_replica() {
 
 /// `CLIENT KILL` (by `ID`, `ADDR` or `TYPE`) ends a replica's link on
 /// either I/O model, and the replica comes back by partial resync with the
-/// master's data, nothing lost or repeated. The link is listed with `S`,
-/// and the replica's link to its master with `M` (#595). On the tokio loop
-/// the kill used to be answered 1 and do nothing; and neither loop listed
-/// the links as Redis does, so `TYPE replica` and `TYPE master` found none.
+/// master's data, nothing lost or repeated, also with writes going on as it
+/// is killed (the stream cut in the middle of a write). The link is listed
+/// with `S`, and the replica's link to its master with `M` and no ACL user
+/// (#595). On the tokio loop the kill used to be answered 1 and do nothing;
+/// and neither loop listed the links as Redis does, so `TYPE replica` and
+/// `TYPE master` found none. `connected_clients` counts the master link on
+/// the replica, and not the replica's link on the master, as in Redis.
 #[test]
 fn client_kill_ends_replication_links_and_the_replica_continues() {
     for io in io_models() {
@@ -2244,6 +2247,33 @@ fn client_kill_ends_replication_links_and_the_replica_continues() {
         wait_link_up(&mut r);
         assert_same_dataset(&mut m, &mut r);
         assert_eq!(m.stat("sync_full"), 1, "{io}");
+
+        let line = client_line(&mut r, "master");
+        assert_eq!(field(&line, "flags"), "M", "{io}: {line}");
+        assert_eq!(field(&line, "user"), "(superuser)", "{io}: {line}");
+        wait_until("the master to count only its one client", || {
+            m.info("clients", "connected_clients") == "1"
+        });
+        wait_until("the replica to count its client and its master", || {
+            r.info("clients", "connected_clients") == "2"
+        });
+
+        // Writes in flight through every kill below.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, port) = (Arc::clone(&stop), master.port);
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut n = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    assert!(c.cmd(&["INCR", "inflight"]).i() > 0);
+                    let item = n.to_string();
+                    assert!(c.cmd(&["RPUSH", "inflight-list", &item]).i() > 0);
+                    n += 1;
+                }
+                n
+            })
+        };
 
         let mut resyncs = 0;
         for (round, how) in ["ID", "ADDR", "TYPE replica", "TYPE slave"]
@@ -2265,7 +2295,6 @@ fn client_kill_ends_replication_links_and_the_replica_continues() {
                 }
             };
             assert_eq!(killed, V::Int(1), "{io}: CLIENT KILL {how}");
-            // Written while the link is down or coming back.
             write_batch(&mut m, round + 1, 40);
             resyncs += 1;
             wait_until("the replica to resume by partial resync", || {
@@ -2281,8 +2310,6 @@ fn client_kill_ends_replication_links_and_the_replica_continues() {
         }
 
         // The replica's side: its link to the master, killed there.
-        let line = client_line(&mut r, "master");
-        assert_eq!(field(&line, "flags"), "M", "{io}: {line}");
         assert_eq!(
             r.cmd(&["CLIENT", "KILL", "TYPE", "master"]),
             V::Int(1),
@@ -2294,9 +2321,167 @@ fn client_kill_ends_replication_links_and_the_replica_continues() {
             m.stat("sync_partial_ok") == resyncs
         });
         wait_link_up(&mut r);
-        assert_same_dataset(&mut m, &mut r);
 
+        stop.store(true, Ordering::SeqCst);
+        let written = writer.join().unwrap();
+        assert!(written > 0, "{io}");
+        assert_same_dataset(&mut m, &mut r);
+        for probe in [
+            &["GET", "inflight"][..],
+            &["LLEN", "inflight-list"],
+            &["LRANGE", "inflight-list", "0", "-1"],
+        ] {
+            assert_eq!(m.cmd(probe), r.cmd(probe), "{io}: {probe:?}");
+        }
+        assert_eq!(m.cmd(&["GET", "inflight"]), V::Str(written.to_string()));
         assert_eq!(m.stat("sync_full"), 1, "{io}: no dataset was sent again");
         assert_eq!(m.stat("sync_partial_err"), 0, "{io}");
+    }
+}
+
+/// A command that parks just as the node becomes a replica — after the
+/// sweep has looked for blocked clients, before it is listed as one — is
+/// ended as the sweep would have ended it: by the count of role changes for
+/// `XREAD BLOCK`, which a replica may run, and also by the role itself for
+/// `BLPOP`, which it refuses (#591). The test build holds every park, on
+/// `KIVIDB_TEST_PARK_DELAY_MS`, for the change to land in between.
+#[test]
+fn a_command_that_parks_as_the_role_changes_is_ended() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start_with_env(
+            &["--io-model", io],
+            &[("KIVIDB_TEST_PARK_DELAY_MS", "1500")],
+        );
+        let mut admin = node.conn();
+        assert_eq!(admin.cmd(&["XADD", "s", "1-1", "f", "v"]).s(), "1-1");
+        let mut clients = Vec::new();
+        for args in [
+            &["XREAD", "BLOCK", "0", "STREAMS", "s", "$"][..],
+            &["BLPOP", "l", "0"],
+        ] {
+            let mut conn = node.conn();
+            send(&mut conn, args);
+            clients.push((args, conn));
+        }
+        // Parked, and held before they are listed as blocked.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(admin.info("clients", "blocked_clients"), "0", "{io}");
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        for (args, mut conn) in clients {
+            assert_eq!(conn.read(), V::Err(ROLE_CHANGED.into()), "{args:?} on {io}");
+            assert!(closed(&mut conn), "{args:?} on {io}: still connected");
+        }
+    }
+}
+
+/// `WAITAOF` waiting for its write to be synced is ended by a role change,
+/// as every blocked client is (#591). A failpoint holds the sync, as a slow
+/// disk would.
+#[test]
+fn waitaof_is_ended_when_a_master_becomes_a_replica() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start_with_env(
+            &["--io-model", io, "--aof"],
+            &[("KIVIDB_TEST_FAILPOINTS", "fsync")],
+        );
+        let mut admin = node.conn();
+        assert!(admin.cmd(&["SET", "k", "v"]).ok());
+        let mut waiting = node.conn();
+        send(&mut waiting, &["WAITAOF", "1", "0", "0"]);
+        let held = node.dir.join("failpoint.fsync.1");
+        wait_until("the sync to be held", || held.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        assert_eq!(waiting.read(), V::Err(ROLE_CHANGED.into()), "{io}");
+        assert!(closed(&mut waiting), "{io}: still connected");
+        // Let every held sync go.
+        for entry in std::fs::read_dir(&node.dir).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("failpoint.")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// A client held by `CLIENT PAUSE` is not blocked, and a role change leaves
+/// it be, as Redis leaves it: once the pause ends its command runs, on the
+/// replica the node now is, and it stays connected.
+#[test]
+fn a_client_held_by_a_pause_is_left_alone_on_a_role_change() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start(&["--io-model", io]);
+        let mut admin = node.conn();
+        assert!(admin.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+        let mut held = node.conn();
+        send(&mut held, &["SET", "k", "v"]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        assert!(admin.cmd(&["CLIENT", "UNPAUSE"]).ok());
+        match held.read() {
+            V::Err(e) => assert!(e.starts_with("READONLY"), "{io}: {e}"),
+            other => panic!("{io}: {other:?}"),
+        }
+        assert_eq!(held.cmd(&["PING"]).s(), "PONG", "{io}");
+    }
+}
+
+/// A node made a replica and then a master again while its blocked client's
+/// command was still to leave the line takes nothing for that client: the
+/// client is told of the role change, and every element stays. Writes were
+/// paused throughout, which held the command until the node was a master
+/// again; it used to look once more as if its time had run out, and take
+/// an element whose reply was never sent.
+#[test]
+fn a_role_change_and_back_loses_no_element() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let mut o = other.conn();
+        assert_eq!(o.cmd(&["RPUSH", "k", "a", "b"]).i(), 2);
+        let node = Server::start(&["--io-model", io]);
+        let mut admin = node.conn();
+        let mut blocked = node.conn();
+        send(&mut blocked, &["BLPOP", "k", "0"]);
+        wait_until("the client to block", || {
+            admin.info("clients", "blocked_clients") == "1"
+        });
+        assert!(admin.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        wait_link_up(&mut admin);
+        wait_until("the new master's list", || {
+            admin.cmd(&["LLEN", "k"]) == V::Int(2)
+        });
+        assert!(admin.cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+        assert!(admin.cmd(&["CLIENT", "UNPAUSE"]).ok());
+        assert_eq!(blocked.read(), V::Err(ROLE_CHANGED.into()), "{io}");
+        assert!(closed(&mut blocked), "{io}: still connected");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            admin.cmd(&["LRANGE", "k", "0", "-1"]),
+            V::Arr(vec![V::Str("a".into()), V::Str("b".into())]),
+            "{io}"
+        );
     }
 }
