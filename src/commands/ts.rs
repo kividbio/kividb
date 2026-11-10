@@ -706,7 +706,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
             .or_else(|| options.duplicate_policy.clone())
             .unwrap_or_else(|| ts.duplicate_policy.clone());
         if policy == DuplicatePolicy::Block && ts.samples.contains_key(&timestamp) {
-            return Some(resp_error("TSDB: Duplicate sample in BLOCK policy"));
+            return Some(resp_error(crate::types::BLOCKED_DUPLICATE));
         }
         if created {
             configure_new(&mut ts, &options);

@@ -178,6 +178,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   held in memory: `TS.CREATE k FOO RETENTION 10` now has the retention, and
   trims, and `ON_DUPLICATE SUM` is now applied.
 
+- **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
+  `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
+  `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a
+  half up (`(ms + 500) / 1000`), and `EXPIRETIME` rounds the time of day to
+  the nearest second too, where it cut it. A hash field's time rounds as
+  Redis rounds it, which differs from a key's: `HTTL` up to the next second,
+  as before, and now `HEXPIRETIME` up too, where it cut it (`HPEXPIREAT h
+  4102444800001` reads back as 4102444801). Checked against Redis 8.4's
+  `ttlGenericCommand` and `httlGenericCommand`.
+
+- **A write that fails changes nothing, so replicas and the AOF stay in
+  step (#551).** Only a write whose reply is not an error is sent to
+  replicas and the append-only file. Three commands changed data and then
+  failed, so the change stayed on the master alone. A replica, and a
+  restart that replayed the AOF, never had it. `JSON.MSET` kept the
+  triples before one that failed, for example on a new key with a path
+  other than the root, or a key of another type. It now checks every
+  triple, against what the triples before it leave, with every key it
+  names locked, and writes only if all of them pass. As in RedisJSON, a
+  key named twice sees what its earlier triple wrote. `XGROUP CREATE ...
+  MKSTREAM` with an invalid ID kept the empty stream it had made. It now
+  checks the ID first. `TS.ADD` of a sample that the BLOCK policy refuses
+  kept the `RETENTION` and `DUPLICATE_POLICY` given with it, and the
+  samples that retention trimmed. It now refuses the sample before
+  changing anything.
+
+- **Cluster admin commands answer as Redis does (#552, #553, #563).**
+  - `CLUSTER FLUSHSLOTS` gives up only this node's own slots, and refuses
+    with `ERR DB must be empty to perform CLUSTER FLUSHSLOTS.` while the node
+    holds keys. It used to unassign every slot in the node's view, the other
+    masters' too, and the node went to `cluster_state:fail`.
+  - `CLUSTER ADDSLOTS` and `ADDSLOTSRANGE` check every slot first and
+    claim none if one is busy or named twice. The slots before the busy one
+    used to stay claimed, without being saved to `nodes.conf` or counted in
+    `CLUSTER INFO`. `ADDSLOTSRANGE` with a start above its end now says
+    `ERR start slot number N is greater than end slot number M`.
+    A slot they claim is no longer `IMPORTING`, as in Redis.
+  - `CLUSTER BUMPEPOCH` gives this node a config epoch above every other
+    one, and replies `STILL <n>` when it has the highest already. It used to
+    raise only the current epoch, and always said `BUMPED`.
+  - `CLUSTER SET-CONFIG-EPOCH` is refused on a node that knows other nodes,
+    and a negative epoch with `ERR Invalid config epoch specified`.
+  - `CLUSTER COUNT-FAILURE-REPORTS` of a node this one does not know is
+    `ERR Unknown node <id>`, not 0.
+  - `CLUSTER GETKEYSINSLOT` with a count of 0 returns an empty array, not
+    one key; a negative count is `ERR Invalid slot or number of keys`.
+  - With `cluster-enabled no`, `CLUSTER MYID`, `COUNTKEYSINSLOT`,
+    `GETKEYSINSLOT`, `READONLY`, `READWRITE` and `ASKING` reply
+    `ERR This instance has cluster support disabled`.
+
 - **`UNWATCH` inside `MULTI` is queued, and no longer lets `EXEC` run
   after a watched key changed (#550).** It ran at once and dropped the
   watches, so `WATCH k`, `MULTI`, ..., `UNWATCH`, then `EXEC` ran even
@@ -206,6 +256,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   take the lock only when an index exists. On the same machines `HSET`
   runs at about 4.9M ops/s, faster than in 1.2.0. Writes to indexed
   hashes behave as before.
+
+- **Array indexes go up to 2^64 - 2 with every command, and are never
+  reported negative (#554).** `ARSET` refused an index past `i64::MAX`
+  while `ARMSET` took any up to 2^64 - 2, and `ARLEN` (and `ARINFO`'s
+  `len`) of such an array came back negative, as did `ARSCAN`'s,
+  `ARGREP`'s, `ARINSERT`'s and `ARNEXT`'s indexes past `i64::MAX`. As in
+  Redis 8.10, `ARSET` now takes the same indexes as `ARMSET`, a run that
+  would go past the last one fails with `ERR array index overflow` (it was
+  `ERR index is out of range`), and an index or length past `i64::MAX` is
+  sent as a big number in RESP3 and as its digits in a bulk string in
+  RESP2. `ARINFO`'s `next-insert-index` is 0 once the insert cursor is
+  used up, as in Redis.
+
+- **JSON and search replies that differed from RedisJSON and RediSearch
+  (#567).**
+  - A JSON read through a legacy path (`.a`, not `$.a`) that matches
+    nothing, or matches a value of the wrong type, answers as RedisJSON
+    8.10 does; it was nil. `JSON.STRLEN`, `JSON.ARRLEN`, `JSON.ARRINDEX`,
+    `JSON.RESP` and `JSON.DEBUG MEMORY` answer `ERR Path does not exist`
+    for a path that matches nothing; `JSON.TYPE`, `JSON.OBJLEN` and
+    `JSON.OBJKEYS` still answer nil. A value of the wrong type is
+    `WRONGTYPE wrong type of path value - expected string` (`STRLEN`;
+    `object` for `OBJLEN`, `array` for `ARRINDEX`, which said
+    `ERR path is not an array`), or `ERR Path does not exist or not an
+    array` (`ARRLEN`) and `... or not an object` (`OBJKEYS`). A JSONPath
+    is unchanged.
+  - `JSON.DEBUG MEMORY` reports the bytes the value takes in memory; it
+    reported the length of its JSON text. Of a key that does not exist it
+    answers 0 (legacy path) or an empty array (JSONPath); it was nil.
+  - `FT.SPELLCHECK ... TERMS EXCLUDE dict`: a query word in the
+    dictionary is spelled right and gets no entry, as in RediSearch. The
+    dictionary's words were taken out of the index's words instead, so a
+    word of both was reported misspelled.
+  - `FT.CURSOR READ` and `DEL` find a cursor by an alias of its index, and
+    by the index when the aggregation was run through an alias. They
+    answered `Cursor not found`.
+  - `FT.CONFIG HELP` describes each setting, in RediSearch's words; every
+    description was empty.
+
+- **JSON keyspace events are announced as RedisJSON announces them
+  (#575).** A JSON write that changed nothing announced its event anyway:
+  `JSON.SET` whose `NX` or `XX` was not met, and a JSONPath that matched
+  no value of the type the command works on (`JSON.TOGGLE`,
+  `JSON.STRAPPEND`, `JSON.NUMINCRBY` and the array commands). It now
+  announces nothing, as in RedisJSON. `JSON.FORGET` announces `json.del`,
+  as RedisJSON's does; it was `json.forget`.
 
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
