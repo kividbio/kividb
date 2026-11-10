@@ -939,7 +939,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // deleted on its replicas, and in its AOF, by the DEL or UNLINK
             // it sends, whatever its key (#437). A key that is not text was
             // skipped.
-            for &key in cmd.iter().skip(1) {
+            for (at, &key) in cmd.iter().enumerate().skip(1) {
                 // Redis: expireIfNeeded deletes volatile keys first; that removal does not add
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.store, *ctx.selected_db, key) {
@@ -969,9 +969,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
                     removed += 1;
-                } else if ctx.watch_registry.has_watchers() {
-                    // There was nothing to delete: a client watching the key
-                    // has seen no change.
+                } else if (ctx.watch_registry.has_watchers()
+                    || crate::tracking::TRACKING_CLIENT_COUNT
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        != 0)
+                    && !cmd[1..at].contains(&key)
+                {
+                    // There was nothing to delete: a client watching the key,
+                    // or caching it, has seen no change. Unless the key was
+                    // named before in this command, and deleted then: `DEL a
+                    // a` changes `a`.
                     crate::watch::unchanged(*ctx.selected_db, key);
                 }
             }

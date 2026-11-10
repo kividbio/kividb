@@ -559,6 +559,267 @@ fn test_swapdb_dirties_only_the_watches_on_the_swapped_keys() {
     assert_eq!(exec(&mut itself).as_array().len(), 1);
 }
 
+/// A write fails the watches on the keys it changed and on no other key it
+/// names, as Redis signals them (#584): of a pop from the first of several
+/// keys that has something, the key it took from; of `SUNIONSTORE`, `COPY`,
+/// `BITOP`, `PFMERGE`, `SORT … STORE` and the like, the destination and not
+/// the sources; of a `DEL`, the keys that were there; of `SMOVE`, the
+/// destination only if the member was not in it. `MOVE` and `COPY … DB`
+/// change the key in the other database too. Every key named used to fail.
+#[test]
+fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
+    let port = free_port();
+    start_server(port);
+    let mut setup = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    // Which of `watched` (database, key) fail once `command` has run.
+    let mut failed = |watched: &[(&str, &str)], command: &[&str]| -> Vec<String> {
+        let mut watchers: Vec<(String, Conn)> = watched
+            .iter()
+            .map(|(db, key)| {
+                let mut w = Conn::connect(port);
+                assert!(w.cmds(&["SELECT", db]).is_ok());
+                assert!(w.cmds(&["WATCH", key]).is_ok());
+                (format!("{db}/{key}"), w)
+            })
+            .collect();
+        let reply = c.cmds(command);
+        assert!(!reply.is_error(), "{command:?}: {reply:?}");
+        watchers
+            .iter_mut()
+            .filter_map(|(name, w)| {
+                assert!(w.cmds(&["MULTI"]).is_ok());
+                w.cmds(&["PING"]);
+                w.cmds(&["EXEC"]).is_nil().then(|| name.clone())
+            })
+            .collect()
+    };
+    let mut set_up = |commands: &[&[&str]]| {
+        for command in commands {
+            let reply = setup.cmds(command);
+            assert!(!reply.is_error(), "{command:?}: {reply:?}");
+        }
+    };
+
+    // Pops from the first of several keys that has something.
+    set_up(&[&["RPUSH", "p:b", "x"], &["RPUSH", "r:b", "x", "y"]]);
+    set_up(&[
+        &["ZADD", "z:b", "1", "m"],
+        &["ZADD", "zx:b", "1", "m", "2", "n"],
+    ]);
+    set_up(&[&["RPUSH", "lm:b", "x"], &["ZADD", "zm:b", "1", "m"]]);
+    set_up(&[&["RPUSH", "blm:b", "x"], &["ZADD", "bzm:b", "1", "m"]]);
+    for (command, a, b) in [
+        (&["BLPOP", "p:a", "p:b", "0"][..], "p:a", "p:b"),
+        (&["BRPOP", "r:a", "r:b", "0"], "r:a", "r:b"),
+        (&["BZPOPMIN", "z:a", "z:b", "0"], "z:a", "z:b"),
+        (&["BZPOPMAX", "zx:a", "zx:b", "0"], "zx:a", "zx:b"),
+        (&["LMPOP", "2", "lm:a", "lm:b", "LEFT"], "lm:a", "lm:b"),
+        (&["ZMPOP", "2", "zm:a", "zm:b", "MIN"], "zm:a", "zm:b"),
+        (
+            &["BLMPOP", "0", "2", "blm:a", "blm:b", "LEFT"],
+            "blm:a",
+            "blm:b",
+        ),
+        (
+            &["BZMPOP", "0", "2", "bzm:a", "bzm:b", "MIN"],
+            "bzm:a",
+            "bzm:b",
+        ),
+    ] {
+        assert_eq!(
+            failed(&[("0", a), ("0", b)], command),
+            [format!("0/{b}")],
+            "{command:?}"
+        );
+    }
+
+    // Commands that read some keys and write another.
+    set_up(&[&["SADD", "s:1", "a"], &["SADD", "s:2", "b"]]);
+    assert_eq!(
+        failed(
+            &[("0", "s:1"), ("0", "s:2"), ("0", "s:d")],
+            &["SUNIONSTORE", "s:d", "s:1", "s:2"]
+        ),
+        ["0/s:d"]
+    );
+    set_up(&[&["ZADD", "zs:1", "1", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "zs:1"), ("0", "zs:d")],
+            &["ZUNIONSTORE", "zs:d", "1", "zs:1"]
+        ),
+        ["0/zs:d"]
+    );
+    set_up(&[&["ZADD", "zr:s", "1", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "zr:s"), ("0", "zr:d")],
+            &["ZRANGESTORE", "zr:d", "zr:s", "0", "-1"]
+        ),
+        ["0/zr:d"]
+    );
+    set_up(&[&["SET", "bo:1", "a"], &["SET", "bo:2", "b"]]);
+    assert_eq!(
+        failed(
+            &[("0", "bo:1"), ("0", "bo:2"), ("0", "bo:d")],
+            &["BITOP", "AND", "bo:d", "bo:1", "bo:2"]
+        ),
+        ["0/bo:d"]
+    );
+    set_up(&[&["PFADD", "hl:1", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "hl:1"), ("0", "hl:d")],
+            &["PFMERGE", "hl:d", "hl:1"]
+        ),
+        ["0/hl:d"]
+    );
+    set_up(&[&["RPUSH", "so:s", "3", "1", "2"]]);
+    assert_eq!(
+        failed(
+            &[("0", "so:s"), ("0", "so:d")],
+            &["SORT", "so:s", "STORE", "so:d"]
+        ),
+        ["0/so:d"]
+    );
+    set_up(&[&["GEOADD", "g:s", "13.36", "38.11", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "g:s"), ("0", "g:d")],
+            &[
+                "GEOSEARCHSTORE",
+                "g:d",
+                "g:s",
+                "FROMLONLAT",
+                "13.36",
+                "38.11",
+                "BYRADIUS",
+                "10",
+                "km"
+            ]
+        ),
+        ["0/g:d"]
+    );
+    set_up(&[&["SET", "cp:s", "v"]]);
+    assert_eq!(
+        failed(&[("0", "cp:s"), ("0", "cp:d")], &["COPY", "cp:s", "cp:d"]),
+        ["0/cp:d"]
+    );
+    assert_eq!(
+        failed(
+            &[("0", "cp:s"), ("0", "cp:e"), ("3", "cp:e")],
+            &["COPY", "cp:s", "cp:e", "DB", "3"]
+        ),
+        ["3/cp:e"]
+    );
+    // Not copied: the destination is there.
+    assert!(failed(&[("0", "cp:s"), ("0", "cp:d")], &["COPY", "cp:s", "cp:d"]).is_empty());
+
+    // DEL: the keys that were there.
+    set_up(&[&["SET", "de:x", "v"]]);
+    assert_eq!(
+        failed(
+            &[("0", "de:x"), ("0", "de:missing")],
+            &["DEL", "de:x", "de:missing"]
+        ),
+        ["0/de:x"]
+    );
+    // A key named twice, deleted the first time: it changed.
+    set_up(&[&["SET", "de:twice", "v"], &["SET", "un:twice", "v"]]);
+    assert_eq!(
+        failed(&[("0", "de:twice")], &["DEL", "de:twice", "de:twice"]),
+        ["0/de:twice"]
+    );
+    assert_eq!(
+        failed(&[("0", "un:twice")], &["UNLINK", "un:twice", "un:twice"]),
+        ["0/un:twice"]
+    );
+    // XGROUP CREATE … MKSTREAM of a stream that is not there makes it.
+    assert_eq!(
+        failed(
+            &[("0", "xs:new")],
+            &["XGROUP", "CREATE", "xs:new", "g", "$", "MKSTREAM"]
+        ),
+        ["0/xs:new"]
+    );
+    // MOVE: the key here and in the other database.
+    set_up(&[&["SET", "mv:k", "v"]]);
+    assert_eq!(
+        failed(
+            &[("0", "mv:k"), ("4", "mv:k"), ("4", "mv:other")],
+            &["MOVE", "mv:k", "4"]
+        ),
+        ["0/mv:k", "4/mv:k"]
+    );
+    // SMOVE of a member the destination has: the source only.
+    set_up(&[&["SADD", "sm:s", "a"], &["SADD", "sm:d", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "sm:s"), ("0", "sm:d")],
+            &["SMOVE", "sm:s", "sm:d", "a"]
+        ),
+        ["0/sm:s"]
+    );
+
+    // Consumer-group commands do not fail a watch on the stream, as in
+    // Redis (#588); XADD does.
+    set_up(&[
+        &["XADD", "xs:1", "1-1", "f", "v"],
+        &["XADD", "xs:2", "1-1", "f", "v"],
+        &["XGROUP", "CREATE", "xs:1", "g", "0"],
+        &["XGROUP", "CREATE", "xs:2", "g", "0"],
+    ]);
+    for command in [
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "STREAMS",
+            "xs:1",
+            "xs:2",
+            ">",
+            ">",
+        ][..],
+        &["XACK", "xs:1", "g", "1-1"],
+        &["XCLAIM", "xs:2", "g", "c2", "0", "1-1"],
+        &["XAUTOCLAIM", "xs:2", "g", "c3", "0", "0"],
+        &["XGROUP", "CREATECONSUMER", "xs:1", "g", "c4"],
+        &["XSETID", "xs:1", "5-0"],
+    ] {
+        assert!(
+            failed(&[("0", "xs:1"), ("0", "xs:2")], command).is_empty(),
+            "{command:?}"
+        );
+    }
+    assert_eq!(
+        failed(
+            &[("0", "xs:1"), ("0", "xs:2")],
+            &["XADD", "xs:1", "*", "f", "v"]
+        ),
+        ["0/xs:1"]
+    );
+
+    // Writes that change every key they name still fail every watch.
+    set_up(&[&["RPUSH", "lmv:a", "x"], &["SET", "rn:a", "v"]]);
+    for (command, a, b) in [
+        (&["MSET", "ms:a", "1", "ms:b", "2"][..], "ms:a", "ms:b"),
+        (&["RENAME", "rn:a", "rn:b"], "rn:a", "rn:b"),
+        (
+            &["LMOVE", "lmv:a", "lmv:b", "LEFT", "RIGHT"],
+            "lmv:a",
+            "lmv:b",
+        ),
+    ] {
+        assert_eq!(
+            failed(&[("0", a), ("0", b)], command),
+            [format!("0/{a}"), format!("0/{b}")],
+            "{command:?}"
+        );
+    }
+}
+
 /// For `SWAPDB`, a key whose time is up is not there, as for a flush: a
 /// watch on one that had expired, swapped for none, holds, as does a watch
 /// on a key that is in neither database but for an expired one. A key that
