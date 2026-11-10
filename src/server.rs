@@ -196,12 +196,27 @@ where
         subs.flushed();
     }
 
+    let refused_on_replica = wait.refused_on_replica();
+    let park_epoch = wait.role_epoch();
     let block_state = wait.take_state();
+    #[cfg(debug_assertions)]
+    if let Some(delay) = crate::commands::blocking::test_park_delay() {
+        tokio::time::sleep(delay).await;
+    }
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     waiter
         .client_registry
         .set_blocked(waiter.client_id, Some(unblock_tx), wait.has_timeout());
-    let delivery = {
+    let delivery = if crate::commands::blocking::ended_by_role_change(
+        park_epoch,
+        refused_on_replica,
+        waiter.repl_state,
+    ) {
+        // This node became a replica before the client was listed as
+        // blocked, so the sweep that ends blocked clients passed it by.
+        waiter.interrupted.role_changed = true;
+        None
+    } else {
         let waiting = wait.wait();
         tokio::pin!(waiting);
         let mut temp = [0u8; 4096];
@@ -255,6 +270,8 @@ where
                     Ok(how) => {
                         waiter.interrupted.unblocked_with_error =
                             how == crate::commands::blocking::Unblock::Error;
+                        waiter.interrupted.role_changed =
+                            how == crate::commands::blocking::Unblock::RoleChange;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -265,11 +282,25 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, None, false);
+    // Woken, or unblocked otherwise, at the moment this node became a
+    // replica: ended as the sweep ends it.
+    if !waiter.interrupted.gone
+        && crate::commands::blocking::ended_by_role_change(
+            park_epoch,
+            refused_on_replica,
+            waiter.repl_state,
+        )
+    {
+        waiter.interrupted.unblocked_with_error = false;
+        waiter.interrupted.role_changed = true;
+    }
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
-    // leaves the line it was standing in — or, its client gone, only to
-    // leave that line, taking nothing.
-    if waiter.interrupted.gone {
+    // leaves the line it was standing in — or, its client gone or the role
+    // changed, only to leave that line, taking nothing: a look made as if
+    // its time had run out could take an element, on a node that is a
+    // master again by then, and the reply that carried it is not sent.
+    if waiter.interrupted.gone || waiter.interrupted.role_changed {
         slot.set_gone(block_state);
     } else {
         slot.set_pending(delivery, block_state);
@@ -367,6 +398,9 @@ struct Waiter<'a, R> {
     activity: &'a crate::client_registry::Activity,
     /// The socket underneath, if there is one to ask (see `socket_says_gone`).
     socket_fd: Option<i32>,
+    /// Whether this node is a replica now: a wait a replica refuses ends
+    /// on a demotion (#591).
+    repl_state: &'a crate::replication::ReplState,
 }
 
 /// A connection's buffer that has grown past this is given back once it is
@@ -941,7 +975,7 @@ where
             // Boxed, and so polled out of line, as `until_gone` is.
             let _ran = if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
                 != 0
-                && !(blocking_slot.resuming() && interrupted.gone)
+                && !(blocking_slot.resuming() && (interrupted.gone || interrupted.role_changed))
             {
                 let gated: std::pin::Pin<
                     Box<
@@ -1111,6 +1145,7 @@ where
                                 interrupted: &mut interrupted,
                                 activity: &activity,
                                 socket_fd,
+                                repl_state: &repl_state,
                             },
                         )
                         .await
@@ -1128,6 +1163,12 @@ where
                     }
                     if interrupted.gone {
                         // It has left the line; there is nobody to reply to.
+                        quit_requested = true;
+                        break;
+                    }
+                    if std::mem::take(&mut interrupted.role_changed) {
+                        // This node became a replica: told so, and closed.
+                        combined.extend_from_slice(crate::commands::blocking::ROLE_CHANGED);
                         quit_requested = true;
                         break;
                     }
@@ -1191,6 +1232,7 @@ where
                             interrupted: &mut interrupted,
                             activity: &activity,
                             socket_fd,
+                            repl_state: &repl_state,
                         },
                     )
                     .await
@@ -1207,6 +1249,12 @@ where
                 }
                 if interrupted.gone {
                     // It has left the line; there is nobody to reply to.
+                    quit_requested = true;
+                    break;
+                }
+                if std::mem::take(&mut interrupted.role_changed) {
+                    // This node became a replica: told so, and closed.
+                    combined.extend_from_slice(crate::commands::blocking::ROLE_CHANGED);
                     quit_requested = true;
                     break;
                 }
@@ -2144,11 +2192,19 @@ where
                             } else {
                                 timeout_ms
                             });
+                        let role_epoch = crate::commands::blocking::role_changes(&repl_state);
 
                         let waited = tokio::select! {
                             biased;
                             reply = async {
                                 loop {
+                                    // Ended, as every blocked client is, when
+                                    // this node becomes a replica (#591).
+                                    if crate::commands::blocking::role_changes(&repl_state)
+                                        != role_epoch
+                                    {
+                                        break crate::commands::blocking::ROLE_CHANGED.to_vec();
+                                    }
                                     let fsynced = crate::aof::AOF_FSYNCED
                                         .load(std::sync::atomic::Ordering::Relaxed);
                                     // As Redis: 1 once the write is on disk here,
@@ -2166,6 +2222,11 @@ where
                             () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
                         };
                         match waited {
+                            Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
+                                combined.extend_from_slice(&reply);
+                                quit_requested = true;
+                                break;
+                            }
                             Some(reply) => reply,
                             // The client has gone: there is nobody to answer.
                             None => {
@@ -2527,7 +2588,12 @@ where
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
-                client_registry.update(client_id, |info| info.push_tx = None);
+                // A replica's link from here: `flags=S`, `TYPE replica`, as
+                // Redis lists it (#595).
+                client_registry.update(client_id, |info| {
+                    info.push_tx = None;
+                    info.flags = "S".to_string();
+                });
 
                 crate::replication::replica_client::handle_replica_connection(
                     reader,
@@ -2552,6 +2618,7 @@ where
                     buffer,
                     listening_port,
                     psync,
+                    kill_rx,
                 )
                 .await?;
                 return Ok(());

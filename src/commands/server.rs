@@ -4534,7 +4534,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if want("clients") {
-                let count = ctx.client_registry.len();
+                let count = ctx.client_registry.connected_clients();
                 let blocked = crate::stats::BLOCKED_CLIENTS.load(Ordering::Relaxed);
                 let tracking = crate::tracking::tracking_client_count();
                 out.push_str("# Clients\r\n");
