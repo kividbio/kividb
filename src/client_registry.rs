@@ -961,6 +961,16 @@ impl ClientRegistryInner {
         self.clients.read().is_empty()
     }
 
+    /// `connected_clients`: the clients less the replicas' links, as Redis
+    /// counts them.
+    pub fn connected_clients(&self) -> usize {
+        self.clients
+            .read()
+            .values()
+            .filter(|info| !info.flags.contains('S'))
+            .count()
+    }
+
     /// The client has begun to wait in a blocking command (`Some`), or has
     /// stopped (`None`).
     pub fn set_blocked(

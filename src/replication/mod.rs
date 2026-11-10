@@ -4393,6 +4393,14 @@ pub async fn wait_for_replicas(
                 Ok(crate::commands::blocking::Unblock::Timeout) => {
                     return reply(targets.count(state));
                 }
+                // The sweep of a role change (#591), which may come before
+                // the look at `is_slave` above: either ends the wait, once.
+                Ok(crate::commands::blocking::Unblock::RoleChange) => {
+                    return WaitEnd {
+                        reply: UNBLOCKED_ROLE_CHANGE.to_vec(),
+                        close: true,
+                    };
+                }
                 Err(_) => unblockable = false,
             },
         }

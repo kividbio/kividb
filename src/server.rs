@@ -196,12 +196,22 @@ where
         subs.flushed();
     }
 
+    let refused_on_replica = wait.refused_on_replica();
+    let park_epoch = wait.role_epoch();
     let block_state = wait.take_state();
+    #[cfg(debug_assertions)]
+    if let Some(delay) = crate::commands::blocking::test_park_delay() {
+        tokio::time::sleep(delay).await;
+    }
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     waiter
         .client_registry
         .set_blocked(waiter.client_id, Some(unblock_tx), wait.has_timeout());
-    let delivery = if wait.role_changed_since_park() {
+    let delivery = if crate::commands::blocking::ended_by_role_change(
+        park_epoch,
+        refused_on_replica,
+        waiter.repl_state,
+    ) {
         // This node became a replica before the client was listed as
         // blocked, so the sweep that ends blocked clients passed it by.
         waiter.interrupted.role_changed = true;
@@ -272,11 +282,25 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, None, false);
+    // Woken, or unblocked otherwise, at the moment this node became a
+    // replica: ended as the sweep ends it.
+    if !waiter.interrupted.gone
+        && crate::commands::blocking::ended_by_role_change(
+            park_epoch,
+            refused_on_replica,
+            waiter.repl_state,
+        )
+    {
+        waiter.interrupted.unblocked_with_error = false;
+        waiter.interrupted.role_changed = true;
+    }
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
-    // leaves the line it was standing in — or, its client gone, only to
-    // leave that line, taking nothing.
-    if waiter.interrupted.gone {
+    // leaves the line it was standing in — or, its client gone or the role
+    // changed, only to leave that line, taking nothing: a look made as if
+    // its time had run out could take an element, on a node that is a
+    // master again by then, and the reply that carried it is not sent.
+    if waiter.interrupted.gone || waiter.interrupted.role_changed {
         slot.set_gone(block_state);
     } else {
         slot.set_pending(delivery, block_state);
@@ -374,6 +398,9 @@ struct Waiter<'a, R> {
     activity: &'a crate::client_registry::Activity,
     /// The socket underneath, if there is one to ask (see `socket_says_gone`).
     socket_fd: Option<i32>,
+    /// Whether this node is a replica now: a wait a replica refuses ends
+    /// on a demotion (#591).
+    repl_state: &'a crate::replication::ReplState,
 }
 
 /// A connection's buffer that has grown past this is given back once it is
@@ -948,7 +975,7 @@ where
             // Boxed, and so polled out of line, as `until_gone` is.
             let _ran = if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
                 != 0
-                && !(blocking_slot.resuming() && interrupted.gone)
+                && !(blocking_slot.resuming() && (interrupted.gone || interrupted.role_changed))
             {
                 let gated: std::pin::Pin<
                     Box<
@@ -1118,6 +1145,7 @@ where
                                 interrupted: &mut interrupted,
                                 activity: &activity,
                                 socket_fd,
+                                repl_state: &repl_state,
                             },
                         )
                         .await
@@ -1204,6 +1232,7 @@ where
                             interrupted: &mut interrupted,
                             activity: &activity,
                             socket_fd,
+                            repl_state: &repl_state,
                         },
                     )
                     .await

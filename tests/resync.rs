@@ -2183,6 +2183,9 @@ fn blocked_clients_are_ended_when_a_master_becomes_a_replica() {
             ],
             // With a timeout too: ended all the same.
             &["BLPOP", "l6", "100"],
+            // `WAIT` is ended by the sweep and by its own look at the role:
+            // once, with one reply (`closed` fails on a second).
+            &["WAIT", "1", "0"],
         ];
         let mut clients = Vec::new();
         for args in blocking {

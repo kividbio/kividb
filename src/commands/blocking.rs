@@ -148,8 +148,9 @@ pub enum Unblock {
 pub const UNBLOCKED: &[u8] = b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n";
 
 /// The reply to a client whose wait is ended because this node became a
-/// replica. Its connection is closed once this is written (#591).
-pub const ROLE_CHANGED: &[u8] = b"-UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)\r\n";
+/// replica. Its connection is closed once this is written (#591). The
+/// same reply `WAIT` gives then.
+pub const ROLE_CHANGED: &[u8] = crate::replication::UNBLOCKED_ROLE_CHANGE;
 
 /// How many times this node has become a replica, or been pointed at
 /// another master. Read when a command parks, and again once its client is
@@ -169,6 +170,36 @@ pub fn note_role_change() {
 #[inline]
 pub fn role_changes() -> u64 {
     ROLE_CHANGES.load(Ordering::Relaxed)
+}
+
+/// Whether a parked wait ends because this node became a replica: the
+/// role changed since the command parked (`park_epoch`), or the command is
+/// one a replica refuses and this node is a replica now (it was let through
+/// by the look at the role just before a demotion). Asked once the client
+/// is listed as blocked, and again when the wait ends, however it ended: a
+/// wake-up at the moment of the change must not hand the client what it
+/// waited for and leave it connected.
+pub fn ended_by_role_change(
+    park_epoch: u64,
+    refused_on_replica: bool,
+    repl_state: &crate::replication::ReplState,
+) -> bool {
+    role_changes() != park_epoch || (refused_on_replica && repl_state.is_slave())
+}
+
+/// Test builds only: `KIVIDB_TEST_PARK_DELAY_MS` holds every parked command
+/// this long before its client is listed as blocked, so that a test can
+/// change the role in between.
+#[cfg(debug_assertions)]
+pub fn test_park_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_PARK_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
 }
 
 /// How a wait ended, when it was not by what was waited for or by its
@@ -683,6 +714,22 @@ impl BlockingWait {
     /// orders it after the sweep's count.
     pub fn role_changed_since_park(&self) -> bool {
         self.role_epoch != role_changes()
+    }
+
+    /// [`role_changes`] when the command parked.
+    pub fn role_epoch(&self) -> u64 {
+        self.role_epoch
+    }
+
+    /// Whether the command is one a replica refuses (`READONLY`): the
+    /// blocking list and sorted-set commands and `XREADGROUP`, which write.
+    /// `XREAD BLOCK` and `TS.READ BLOCK` may wait on a replica. Asked before
+    /// [`take_state`](Self::take_state).
+    pub fn refused_on_replica(&self) -> bool {
+        matches!(
+            self.state,
+            Some(BlockState::Queued { .. } | BlockState::GroupRead { .. })
+        )
     }
 
     /// Whether parking this from a resume dispatch is intended rather than a
