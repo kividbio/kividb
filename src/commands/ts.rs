@@ -146,6 +146,22 @@ fn option_number(value: &[u8]) -> Option<u64> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
 
+/// A sample's time, as a command gives it (`*` is the caller's to read).
+///
+/// From a client, `0` to `i64::MAX`, as RedisTimeSeries, which reads it as
+/// a `long long`: a time above that was taken, and then replied, sent to
+/// replicas and logged as a negative number, which they refused: the
+/// sample lost there (#592). From the AOF or a master, any `u64`, which an
+/// older version took and kept.
+fn sample_time(word: &[u8], strict: bool) -> Option<u64> {
+    let text = std::str::from_utf8(word).ok()?;
+    if strict {
+        text.parse::<i64>().ok().and_then(|t| u64::try_from(t).ok())
+    } else {
+        text.parse().ok()
+    }
+}
+
 /// A chunk size: as RedisTimeSeries, a multiple of 8 from 48 to 1048576.
 /// Not checked when `strict` is off: 1.2.0 took any.
 fn option_chunk_size(value: &[u8], strict: bool) -> Result<usize, Vec<u8>> {
@@ -282,7 +298,7 @@ fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsO
                 let at = if value == b"*" {
                     TsInner::now_ms()
                 } else {
-                    option_number(value).ok_or_else(|| resp_error("ERR invalid TIMESTAMP"))?
+                    sample_time(value, strict).ok_or_else(|| resp_error("ERR invalid TIMESTAMP"))?
                 };
                 options.timestamp = Some(at);
                 options.timestamp_at.push(i);
@@ -354,8 +370,15 @@ fn written_by_1_2_0(tokens: &[&[u8]]) -> Option<TsOptions> {
     if !word.eq_ignore_ascii_case(b"TIMESTAMP") {
         return None;
     }
+    // 1.2.0 sent the time it replied, as an `i64`: one above `i64::MAX` as
+    // a negative number. It is the same 64 bits as the time it kept (#592).
+    let at = std::str::from_utf8(at).ok()?;
+    let at = at
+        .parse::<u64>()
+        .ok()
+        .or_else(|| at.parse::<i64>().ok().map(|t| t as u64))?;
     Some(TsOptions {
-        timestamp: Some(option_number(at)?),
+        timestamp: Some(at),
         ..Default::default()
     })
 }
@@ -696,18 +719,13 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let key: Vec<u8> = cmd[1].to_vec();
 
-    let ts_str = match std::str::from_utf8(cmd[2]) {
-        Ok(s) => s,
-        Err(_) => return Some(resp_error("ERR invalid timestamp")),
-    };
-
     // "*" means current time in milliseconds
-    let timestamp: u64 = if ts_str == "*" {
+    let timestamp: u64 = if cmd[2] == b"*" {
         TsInner::now_ms()
     } else {
-        match ts_str.parse() {
-            Ok(n) => n,
-            Err(_) => return Some(resp_error("ERR invalid timestamp")),
+        match sample_time(cmd[2], strict) {
+            Some(n) => n,
+            None => return Some(resp_error("ERR invalid timestamp")),
         }
     };
 
@@ -781,6 +799,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // under one lock. We process sequentially — each triplet is one write lock.
 
 fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 4 || !(cmd.len() - 1).is_multiple_of(3) {
         return Some(resp_error(
@@ -792,13 +811,12 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut results: Vec<Vec<u8>> = Vec::with_capacity((cmd.len() - 1) / 3);
     for triple in cmd[1..].as_chunks::<3>().0 {
         let key: &[u8] = triple[0];
-        let ts_str = std::str::from_utf8(triple[1]).unwrap_or("bad");
-        let timestamp: u64 = if ts_str == "*" {
+        let timestamp: u64 = if triple[1] == b"*" {
             TsInner::now_ms()
         } else {
-            match ts_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
+            match sample_time(triple[1], strict) {
+                Some(n) => n,
+                None => {
                     results.push(resp_error("ERR invalid timestamp"));
                     continue;
                 }

@@ -1098,7 +1098,8 @@ fn restore_command(
         b"RESTORE".to_vec(),
         key.to_vec(),
         expires_at.to_string().into_bytes(),
-        crate::snapshot::dump_payload(value)?,
+        // With a time series' compaction rules: both ends move.
+        crate::snapshot::dump_payload_with_links(value)?,
         b"REPLACE".to_vec(),
     ];
     if expires_at != 0 {

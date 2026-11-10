@@ -4850,6 +4850,32 @@ const DUMP_IMAGE_KEY: &str = "v";
 /// so every type can be dumped, restored and migrated. `RESTORE` tells the two
 /// forms apart by the image's magic.
 pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
+    // A time series goes without its links to other series, its compaction
+    // rules and the series it is a compaction of, as RedisTimeSeries leaves
+    // them out of a `DUMP`: they name keys, which the payload may be
+    // restored beside, under another name or on another server. Restored
+    // with them, a series fed a compaction that had a source of its own
+    // (#593). Its samples, settings and labels go.
+    if let KiviDBValue::TimeSeries(series) = value {
+        let series = series.read();
+        if !series.rules.is_empty() || series.source.is_some() {
+            let mut alone = series.clone();
+            alone.rules.clear();
+            alone.source = None;
+            drop(series);
+            return dump_payload_with_links(&KiviDBValue::TimeSeries(Arc::new(
+                parking_lot::RwLock::new(alone),
+            )));
+        }
+    }
+    dump_payload_with_links(value)
+}
+
+/// [`dump_payload`], a time series with its compaction rules and source:
+/// for an atomic slot migration, which moves every key of the slot, both
+/// ends of a rule among them (a rule's keys are in one slot), and keeps
+/// their names.
+pub fn dump_payload_with_links(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     if serialize_value(value, &mut out).is_err() {
         out.clear();

@@ -1916,3 +1916,112 @@ fn test_ts_labels_end_at_a_two_word_option_only() {
     assert_eq!(info_field(&mut c, "opt:m", "chunkSize"), "128");
     assert_eq!(info_field(&mut c, "opt:m", "duplicatePolicy"), "max");
 }
+
+/// A sample's time from a client is `0` to `i64::MAX`, as in
+/// RedisTimeSeries. One above was taken, then replied, sent to replicas and
+/// logged as a negative number, which they refused (#592).
+#[test]
+fn test_ts_time_above_i64_max_is_refused() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let max = i64::MAX.to_string();
+    let over = (i64::MAX as u64 + 1).to_string();
+    assert!(c.cmds(&["TS.ADD", "big", &over, "1"]).is_error());
+    assert!(c.cmds(&["TS.ADD", "big", "-1", "1"]).is_error());
+    assert_eq!(c.cmds(&["TS.ADD", "big", &max, "1"]).as_int(), i64::MAX);
+    let replies = c.cmds(&["TS.MADD", "big", "1", "1", "big", &over, "2", "big", "2", "3"]);
+    let replies = replies.as_array();
+    assert_eq!(replies[0].as_int(), 1);
+    assert!(replies[1].is_error(), "{replies:?}");
+    assert_eq!(replies[2].as_int(), 2);
+    assert!(
+        c.cmds(&["TS.INCRBY", "big2", "1", "TIMESTAMP", &over])
+            .is_error()
+    );
+    assert_eq!(c.cmds(&["EXISTS", "big2"]).as_int(), 0);
+    assert_eq!(c.cmds(&["TS.RANGE", "big", "-", "+"]).as_array().len(), 3);
+}
+
+/// `DUMP` and `RESTORE` carry a series: its samples, retention, chunk size,
+/// duplicate policy and labels, and the label index finds the restored key.
+/// Not its compaction rules, nor the series it is a compaction of: as in
+/// RedisTimeSeries, a payload is without links to other keys (#593).
+#[test]
+fn test_ts_dump_restore() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "TS.CREATE",
+        "dr:src",
+        "RETENTION",
+        "100000",
+        "CHUNK_SIZE",
+        "128",
+        "DUPLICATE_POLICY",
+        "MAX",
+        "LABELS",
+        "room",
+        "kitchen",
+    ]);
+    c.cmds(&["TS.CREATE", "dr:avg"]);
+    assert!(
+        c.cmds(&["TS.CREATERULE", "dr:src", "dr:avg", "AGGREGATION", "avg", "10"])
+            .is_ok()
+    );
+    for (at, value) in [("1", "1"), ("5", "3"), ("12", "4"), ("25", "5")] {
+        c.cmds(&["TS.ADD", "dr:src", at, value]);
+    }
+
+    for (from, to) in [("dr:src", "dr:copy"), ("dr:avg", "dr:avg2")] {
+        let RespValue::Bulk(payload) = c.cmds(&["DUMP", from]) else {
+            panic!("DUMP {from}");
+        };
+        let reply = c.cmd(&[b"RESTORE", to.as_bytes(), b"0", &payload]);
+        assert!(reply.is_ok(), "RESTORE {to}: {reply:?}");
+        assert_eq!(
+            c.cmds(&["TS.RANGE", to, "-", "+"]),
+            c.cmds(&["TS.RANGE", from, "-", "+"]),
+            "{to}"
+        );
+        for field in ["retentionTime", "chunkSize", "duplicatePolicy", "labels"] {
+            assert_eq!(
+                info_field(&mut c, to, field),
+                info_field(&mut c, from, field),
+                "{to} {field}"
+            );
+        }
+        let info = c.cmds(&["TS.INFO", to]);
+        let arr = info.as_array();
+        let at = |name: &str| {
+            arr.iter()
+                .position(|v| matches!(v, RespValue::Bulk(b) if b == name.as_bytes()))
+                .unwrap()
+                + 1
+        };
+        assert_eq!(arr[at("rules")], RespValue::Array(vec![]), "{to}");
+        assert_eq!(arr[at("sourceKey")], RespValue::Nil, "{to}");
+    }
+    assert_eq!(info_field(&mut c, "dr:copy", "retentionTime"), "100000");
+    let mut found = query_index(&mut c, "room=kitchen");
+    found.sort();
+    assert_eq!(found, ["dr:copy", "dr:src"]);
+    // The source's own rule still feeds its compaction.
+    let info = c.cmds(&["TS.INFO", "dr:avg"]);
+    assert!(info.as_array().contains(&RespValue::Bulk(b"dr:src".to_vec())));
+
+    // RESTORE REPLACE over a series with other labels: found by the new ones.
+    c.cmds(&["TS.CREATE", "dr:old", "LABELS", "room", "attic"]);
+    let RespValue::Bulk(payload) = c.cmds(&["DUMP", "dr:src"]) else {
+        panic!("DUMP");
+    };
+    assert!(
+        c.cmd(&[b"RESTORE", b"dr:old", b"0", &payload, b"REPLACE"])
+            .is_ok()
+    );
+    assert!(query_index(&mut c, "room=attic").is_empty());
+    assert!(query_index(&mut c, "room=kitchen").contains(&"dr:old".to_string()));
+}

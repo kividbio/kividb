@@ -4560,6 +4560,35 @@ mod ts_option_replay_tests {
     /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
     /// `TS.INCRBY` as the feed writes it, with a word left over from
     /// `LABELS`: replayed as they ran.
+    /// A time above `i64::MAX`, which 1.2.0 took: in its log as given
+    /// (`TS.ADD`, `TS.MADD`), or, from `TS.INCRBY`, as the negative number
+    /// it replied. Replayed, each sample at the time 1.2.0 kept (#592).
+    #[test]
+    fn times_above_i64_max_of_1_2_0_replay() {
+        let max = u64::MAX.to_string();
+        let below = (u64::MAX - 1).to_string();
+        let store = replayed(&[
+            vec!["TS.ADD", "h", below.as_str(), "1"],
+            vec!["TS.MADD", "h", max.as_str(), "2"],
+            vec!["TS.INCRBY", "i", "1", "TIMESTAMP", "-1"],
+        ]);
+        let samples = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner
+                    .read()
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (*t, *v))
+                    .collect::<Vec<_>>(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert_eq!(samples("h"), [(u64::MAX - 1, 1.0), (u64::MAX, 2.0)]);
+        assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
+    }
+
     #[test]
     fn options_replay_as_they_ran() {
         let (store, index) = replayed_with_index(&[

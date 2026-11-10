@@ -375,9 +375,17 @@ fn ts_add_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
         && cmd[2] == b"*"
         && let Some(ts) = parse_resp_integer(resp)
     {
-        parts[2] = ts.to_string().into_bytes();
+        parts[2] = sample_time(ts);
     }
     vec![parts]
+}
+
+/// A sample's time as a TS command replied it, an `i64`, as the `u64` the
+/// series holds. A time above `i64::MAX`, which a replica or a replayed AOF
+/// takes from a record an older version wrote, is replied as a negative
+/// number, which no TS command takes (#592).
+fn sample_time(replied: i64) -> Vec<u8> {
+    (replied as u64).to_string().into_bytes()
 }
 
 /// `TS.MADD` with `*` timestamps: each replaced by the one it was given, read
@@ -399,8 +407,14 @@ fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
         match line.first() {
             Some(b'-') => continue,
             Some(b':') if sample.len() == 3 => {
+                let replied = line[1..].trim_ascii();
                 parts.push(sample[0].to_vec());
-                parts.push(line[1..].trim_ascii().to_vec());
+                parts.push(
+                    std::str::from_utf8(replied)
+                        .ok()
+                        .and_then(|t| t.parse::<i64>().ok())
+                        .map_or_else(|| replied.to_vec(), sample_time),
+                );
                 parts.push(sample[2].to_vec());
             }
             _ => parts.extend(sample.iter().map(|b| b.to_vec())),
@@ -426,7 +440,7 @@ fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     // at the end, as 1.2.0 did, it made a label of a word left over from
     // `LABELS` (#555).
     let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
-    let ts = ts.to_string().into_bytes();
+    let ts = sample_time(ts);
     for at in crate::commands::ts::incrby_timestamp_options(cmd) {
         parts[at + 1] = ts.clone();
     }
@@ -899,6 +913,23 @@ mod tests {
 
     /// A sample `TS.MADD` refused is left out of what is sent; `*` is the
     /// time the master gave.
+    /// A time above `i64::MAX`, replied as a negative number, is sent as
+    /// the `u64` the series holds (#592).
+    #[test]
+    fn ts_feeds_send_times_above_i64_max_unsigned() {
+        let max = u64::MAX.to_string();
+        let c = cmd(&["TS.MADD", "a", &max, "1"]);
+        assert_eq!(
+            ts_madd_feed(&refs(&c), b"*1\r\n:-1\r\n"),
+            vec![cmd(&["TS.MADD", "a", &max, "1"])]
+        );
+        let c = cmd(&["TS.INCRBY", "a", "1", "TIMESTAMP", &max]);
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":-1\r\n"),
+            vec![cmd(&["TS.INCRBY", "a", "1", "timestamp", &max, "TIMESTAMP", &max])]
+        );
+    }
+
     #[test]
     fn ts_madd_feed_leaves_out_refused_samples() {
         let c = cmd(&["TS.MADD", "a", "*", "1", "b", "*", "2", "c", "5", "3"]);
