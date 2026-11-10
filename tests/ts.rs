@@ -2098,7 +2098,11 @@ fn test_ts_links_left_behind_are_dead() {
             .is_ok()
     );
     c.cmds(&["TS.ADD", "la:s", "15", "1"]);
-    assert!(c.cmds(&["TS.RANGE", "la:d", "-", "+"]).as_array().is_empty());
+    assert!(
+        c.cmds(&["TS.RANGE", "la:d", "-", "+"])
+            .as_array()
+            .is_empty()
+    );
     let info = c.cmds(&["TS.INFO", "la:s"]);
     assert!(
         !info.as_array().contains(&RespValue::Bulk(b"la:d".to_vec())),

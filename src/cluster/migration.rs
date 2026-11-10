@@ -34,11 +34,11 @@
 use super::{ClusterState, MigrationState, NodeId, key_hash_slot};
 use crate::replication::{HubTx, ReplPayload, ReplState};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Inclusive slot ranges.
@@ -1118,7 +1118,9 @@ fn compaction_rules(keys: &[Captured]) -> Vec<Vec<Vec<u8>>> {
     let sources: HashMap<&[u8], Option<String>> = keys
         .iter()
         .filter_map(|c| match &c.value {
-            KiviDBValue::TimeSeries(series) => Some((c.key.as_bytes(), series.read().source.clone())),
+            KiviDBValue::TimeSeries(series) => {
+                Some((c.key.as_bytes(), series.read().source.clone()))
+            }
             _ => None,
         })
         .collect();
@@ -1130,7 +1132,10 @@ fn compaction_rules(keys: &[Captured]) -> Vec<Vec<Vec<u8>>> {
         let name = crate::key_bytes::text_of(c.key.as_bytes());
         for rule in &series.read().rules {
             let dest = crate::key_bytes::bytes_of(&rule.dest_key);
-            if sources.get(&*dest).is_some_and(|source| source.as_deref() == Some(&*name)) {
+            if sources
+                .get(&*dest)
+                .is_some_and(|source| source.as_deref() == Some(&*name))
+            {
                 out.push(vec![
                     b"TS.CREATERULE".to_vec(),
                     c.key.as_bytes().to_vec(),

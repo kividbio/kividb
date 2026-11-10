@@ -626,7 +626,10 @@ fn after_append(ctx: &Ctx, key: &[u8], series: &Series, ts: u64) {
         ctx.wait_table.notify_signal(&dest_key);
     }
     if !dead.is_empty() {
-        series.write().rules.retain(|rule| !dead.contains(&rule.dest_key));
+        series
+            .write()
+            .rules
+            .retain(|rule| !dead.contains(&rule.dest_key));
     }
     ctx.wait_table.notify_signal(key);
 }
