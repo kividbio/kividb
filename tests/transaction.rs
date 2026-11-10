@@ -724,6 +724,24 @@ fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
         ),
         ["0/de:x"]
     );
+    // A key named twice, deleted the first time: it changed.
+    set_up(&[&["SET", "de:twice", "v"], &["SET", "un:twice", "v"]]);
+    assert_eq!(
+        failed(&[("0", "de:twice")], &["DEL", "de:twice", "de:twice"]),
+        ["0/de:twice"]
+    );
+    assert_eq!(
+        failed(&[("0", "un:twice")], &["UNLINK", "un:twice", "un:twice"]),
+        ["0/un:twice"]
+    );
+    // XGROUP CREATE … MKSTREAM of a stream that is not there makes it.
+    assert_eq!(
+        failed(
+            &[("0", "xs:new")],
+            &["XGROUP", "CREATE", "xs:new", "g", "$", "MKSTREAM"]
+        ),
+        ["0/xs:new"]
+    );
     // MOVE: the key here and in the other database.
     set_up(&[&["SET", "mv:k", "v"]]);
     assert_eq!(

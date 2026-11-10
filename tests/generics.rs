@@ -2281,10 +2281,89 @@ fn test_tracking_is_told_only_of_the_keys_a_write_changed() {
     assert!(named(&frames, "t584:x"), "{frames:?}");
     assert!(!named(&frames, "t584:missing"), "{frames:?}");
 
+    // A key named twice and deleted the first time has changed.
+    c.cmds(&["SET", "t584:twice", "v"]);
+    drain(&mut told);
+    assert_eq!(c.cmds(&["DEL", "t584:twice", "t584:twice"]).as_int(), 1);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:twice"), "{frames:?}");
+    c.cmds(&["SET", "t584:twice", "v"]);
+    drain(&mut told);
+    assert_eq!(c.cmds(&["UNLINK", "t584:twice", "t584:twice"]).as_int(), 1);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:twice"), "{frames:?}");
+
     assert!(c.cmds(&["SET", "t584:n", "w", "NX"]).is_nil());
     c.cmds(&["LPOP", "t584:missing"]);
     let frames = drain(&mut told);
     assert!(frames.is_empty(), "{frames:?}");
+}
+
+/// The same in the default mode, where a client is told of the keys it has
+/// read: of the keys a write names, only those it changed (#584).
+#[test]
+fn test_default_tracking_is_told_only_of_the_keys_a_write_changed() {
+    let port = free_port();
+    start_server(port);
+    let mut tracker = Conn::connect(port);
+    let mut told = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    let told_id = told.cmds(&["CLIENT", "ID"]).as_int().to_string();
+    told.cmds(&["SUBSCRIBE", "__redis__:invalidate"]);
+    let tracking = tracker.cmds(&["CLIENT", "TRACKING", "ON", "REDIRECT", &told_id]);
+    assert!(tracking.is_ok(), "{tracking:?}");
+    let drain = |told: &mut Conn| {
+        let mut all = Vec::new();
+        while let Some(more) = try_read_with_timeout(told, Duration::from_millis(200)) {
+            all.extend(more);
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    };
+    let named =
+        |frames: &str, key: &str| frames.contains(&format!("${}\r\n{key}\r\n", key.len()));
+    // The tracker reads `keys`, `c` runs `command`: the keys `told` hears of.
+    let mut told_of = |keys: &[&str], command: &[&str]| -> Vec<String> {
+        for key in keys {
+            tracker.cmds(&["EXISTS", key]);
+        }
+        drain(&mut told);
+        let reply = c.cmds(command);
+        assert!(!matches!(reply, RespValue::Error(_)), "{command:?}: {reply:?}");
+        let frames = drain(&mut told);
+        keys.iter()
+            .filter(|key| named(&frames, key))
+            .map(|key| key.to_string())
+            .collect()
+    };
+
+    let mut setup = Conn::connect(port);
+    setup.cmds(&["RPUSH", "dt:b", "x"]);
+    setup.cmds(&["SADD", "dt:s1", "a"]);
+    setup.cmds(&["SET", "dt:x", "v"]);
+    setup.cmds(&["SET", "dt:twice", "v"]);
+    setup.cmds(&["SET", "dt:unlinked", "v"]);
+    setup.cmds(&["SET", "dt:n", "v"]);
+    assert_eq!(
+        told_of(&["dt:a", "dt:b"], &["BLPOP", "dt:a", "dt:b", "0"]),
+        ["dt:b"]
+    );
+    assert_eq!(
+        told_of(&["dt:s1", "dt:d"], &["SUNIONSTORE", "dt:d", "dt:s1"]),
+        ["dt:d"]
+    );
+    assert_eq!(
+        told_of(&["dt:x", "dt:missing"], &["DEL", "dt:x", "dt:missing"]),
+        ["dt:x"]
+    );
+    assert_eq!(
+        told_of(&["dt:twice"], &["DEL", "dt:twice", "dt:twice"]),
+        ["dt:twice"]
+    );
+    assert_eq!(
+        told_of(&["dt:unlinked"], &["UNLINK", "dt:unlinked", "dt:unlinked"]),
+        ["dt:unlinked"]
+    );
+    assert!(told_of(&["dt:n"], &["SET", "dt:n", "w", "NX"]).is_empty());
 }
 
 // RESP3 target: must get a 2-element push frame with no literal "push" element.
