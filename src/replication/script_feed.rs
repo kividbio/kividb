@@ -309,25 +309,32 @@ fn ts_add_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
 
 /// `TS.MADD` with `*` timestamps: each replaced by the one it was given, read
 /// from the matching element of the reply.
+///
+/// A sample that was refused is left out, as RedisTimeSeries leaves it out:
+/// it changed nothing. Sent with its `*`, a replica stamped it with its own
+/// clock and could add a sample the master had refused.
 fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
-    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
-    if !cmd.iter().skip(2).step_by(3).any(|ts| *ts == b"*") {
-        return vec![parts];
+    if resp.first() != Some(&b'*') || cmd.is_empty() {
+        return vec![cmd.iter().map(|b| b.to_vec()).collect()];
     }
     // The reply is an array with one element per sample: `:timestamp`, or an
     // error for a sample that was refused.
     let mut lines = resp.split(|b| *b == b'\n');
     lines.next(); // the array header
-    for (sample, line) in lines.enumerate() {
-        let ts_index = 2 + sample * 3;
-        if ts_index >= parts.len() {
-            break;
+    let mut parts: Vec<Vec<u8>> = vec![cmd[0].to_vec()];
+    for (sample, line) in cmd[1..].chunks(3).zip(lines) {
+        match line.first() {
+            Some(b'-') => continue,
+            Some(b':') if sample.len() == 3 => {
+                parts.push(sample[0].to_vec());
+                parts.push(line[1..].trim_ascii().to_vec());
+                parts.push(sample[2].to_vec());
+            }
+            _ => parts.extend(sample.iter().map(|b| b.to_vec())),
         }
-        if cmd[ts_index] == b"*"
-            && let Some(assigned) = line.strip_prefix(b":")
-        {
-            parts[ts_index] = assigned.trim_ascii().to_vec();
-        }
+    }
+    if parts.len() == 1 {
+        return Vec::new();
     }
     vec![parts]
 }
@@ -813,6 +820,20 @@ mod tests {
     /// list, where a word left over from the list, which the command passed
     /// over, became a label with it on a replica. A label's value
     /// `TIMESTAMP` is not an option (#555).
+    /// A sample `TS.MADD` refused is left out of what is sent; `*` is the
+    /// time the master gave.
+    #[test]
+    fn ts_madd_feed_leaves_out_refused_samples() {
+        let c = cmd(&["TS.MADD", "a", "*", "1", "b", "*", "2", "c", "5", "3"]);
+        let resp = b"*3\r\n-TSDB: Duplicate sample in BLOCK policy\r\n:101\r\n:5\r\n";
+        assert_eq!(
+            ts_madd_feed(&refs(&c), resp),
+            vec![cmd(&["TS.MADD", "b", "101", "2", "c", "5", "3"])]
+        );
+        let c = cmd(&["TS.MADD", "a", "*", "1"]);
+        assert!(ts_madd_feed(&refs(&c), b"*1\r\n-TSDB: the key does not exist\r\n").is_empty());
+    }
+
     #[test]
     fn ts_incrby_feed_gives_the_time_without_moving_a_word() {
         let cases: &[(&[&str], &[&str])] = &[

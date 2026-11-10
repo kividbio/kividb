@@ -325,6 +325,30 @@ fn configure_new(ts: &mut TsInner, options: &TsOptions) {
     }
 }
 
+/// The options of a `TS.INCRBY` or `TS.DECRBY` as 1.2.0 sent it to its
+/// replicas and its AOF: every `TIMESTAMP` taken out and `TIMESTAMP <time>`
+/// added at the end. Read with the rest, the end can be taken by what
+/// comes before it: `LABELS a` left a word that made a label of
+/// `TIMESTAMP` and passed over the time, and `RETENTION`, `ENCODING` with
+/// no value took `TIMESTAMP` as theirs. Then the record failed, or its
+/// sample was put at the time of the replay, and the records after it
+/// failed for a timestamp before it: data lost. 1.2.0 read no option but
+/// `TIMESTAMP`, so the rest is read as far as it can be, and the time is the
+/// one at the end. Only when the command's options, read as they are, have
+/// no `TIMESTAMP`: 1.2.1 sends one with every record.
+fn written_by_1_2_0(tokens: &[&[u8]]) -> Option<TsOptions> {
+    let [rest @ .., word, at] = tokens else {
+        return None;
+    };
+    if !word.eq_ignore_ascii_case(b"TIMESTAMP") {
+        return None;
+    }
+    let at = option_number(at)?;
+    let mut options = parse_ts_options(rest, OptionsOf::IncrBy, false).unwrap_or_default();
+    options.timestamp = Some(at);
+    Some(options)
+}
+
 /// Where a `TS.INCRBY` or `TS.DECRBY` (the whole command) has its
 /// `TIMESTAMP` options, as the command reads them: for the replication
 /// feed, which gives each the timestamp the command used. A `TIMESTAMP`
@@ -835,8 +859,14 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
     // RedisTimeSeries: RETENTION, CHUNK_SIZE, DUPLICATE_POLICY, LABELS. They
     // were passed over, and the series made with the defaults (#555).
     let options = match parse_ts_options(&cmd[3..], OptionsOf::IncrBy, strict) {
-        Ok(v) => v,
-        Err(e) => return Some(e),
+        Ok(v) if strict || v.timestamp.is_some() => v,
+        parsed => match written_by_1_2_0(&cmd[3..]) {
+            Some(v) if !strict => v,
+            _ => match parsed {
+                Ok(v) => v,
+                Err(e) => return Some(e),
+            },
+        },
     };
     let timestamp = options.timestamp.unwrap_or_else(TsInner::now_ms);
 

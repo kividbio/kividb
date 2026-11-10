@@ -4482,6 +4482,58 @@ mod ts_option_replay_tests {
     /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
     /// `TS.INCRBY` as the feed writes it, with a word left over from
     /// `LABELS`: replayed as they ran.
+    /// `TS.INCRBY` records as 1.2.0 wrote them, `TIMESTAMP <time>` at the
+    /// end, after a word that takes it when read with the rest: each sample
+    /// at its time, and the records after it applied.
+    #[test]
+    fn incrby_records_of_1_2_0_keep_their_time() {
+        let store = replayed(&[
+            vec!["TS.INCRBY", "a", "1", "LABELS", "x", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "a", "1", "TIMESTAMP", "50"],
+            vec!["TS.INCRBY", "b", "1", "RETENTION", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "c", "1", "ENCODING", "TIMESTAMP", "42"],
+            vec![
+                "TS.INCRBY",
+                "d",
+                "1",
+                "RETENTION",
+                "100",
+                "LABELS",
+                "x",
+                "y",
+                "z",
+                "TIMESTAMP",
+                "42",
+            ],
+            vec!["TS.INCRBY", "e", "1", "DUPLICATE_POLICY", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "f", "1", "LABELS", "a", "b", "TIMESTAMP", "42"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let a = series("a");
+        assert_eq!(
+            a.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
+            [(42, 1.0), (50, 2.0)]
+        );
+        assert!(a.labels.is_empty());
+        for key in ["b", "c", "e"] {
+            assert_eq!(series(key).samples.get(&42), Some(&1.0), "{key}");
+        }
+        let d = series("d");
+        assert_eq!(d.samples.get(&42), Some(&1.0));
+        assert_eq!(d.retention, 100);
+        assert_eq!(d.labels.get("x").map(String::as_str), Some("y"));
+        let f = series("f");
+        assert_eq!(f.samples.get(&42), Some(&1.0));
+        assert_eq!(f.labels.get("a").map(String::as_str), Some("b"));
+    }
+
     #[test]
     fn options_replay_as_they_ran() {
         let (store, index) = replayed_with_index(&[

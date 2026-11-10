@@ -2206,6 +2206,22 @@ fn time_series_options_reach_a_replica() {
         cmd.extend_from_slice(labels);
         assert!(m.cmd(&cmd).i() > 0, "{cmd:?}");
     }
+    // `TS.MADD` with a sample BLOCK refuses in the middle, on a series whose
+    // retention would trim at its time: refused alone, nothing trimmed, and
+    // the others added, on both.
+    m.cmd(&["TS.CREATE", "rp:ts:m", "DUPLICATE_POLICY", "BLOCK"]);
+    m.cmd(&["TS.ADD", "rp:ts:m", "1", "1"]);
+    m.cmd(&["TS.ADD", "rp:ts:m", "100", "1"]);
+    m.cmd(&["TS.ALTER", "rp:ts:m", "RETENTION", "10"]);
+    m.cmd(&["TS.CREATE", "rp:ts:x"]);
+    let replies = m.cmd(&[
+        "TS.MADD", "rp:ts:x", "1", "1", "rp:ts:m", "100", "5", "rp:ts:x", "2", "2",
+    ]);
+    let replies = replies.arr();
+    assert_eq!(replies[0].i(), 1);
+    assert!(replies[1].is_err(), "{replies:?}");
+    assert_eq!(replies[2].i(), 2);
+    assert_eq!(m.cmd(&["TS.RANGE", "rp:ts:m", "-", "+"]).arr().len(), 2);
     // `ON_DUPLICATE`: for the sample; the series keeps `BLOCK`.
     m.cmd(&["TS.CREATE", "rp:ts:d", "DUPLICATE_POLICY", "BLOCK"]);
     m.cmd(&["TS.ADD", "rp:ts:d", "1", "1"]);
@@ -2218,6 +2234,7 @@ fn time_series_options_reach_a_replica() {
 
     for key in [
         "rp:ts:c", "rp:ts:r", "rp:ts:a", "rp:ts:o1", "rp:ts:o2", "rp:ts:o3", "rp:ts:o4", "rp:ts:d",
+        "rp:ts:m", "rp:ts:x",
     ] {
         let (on_master, on_replica) = (m.cmd(&["TS.INFO", key]), r.cmd(&["TS.INFO", key]));
         for field in [
