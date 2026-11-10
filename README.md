@@ -233,6 +233,17 @@ the run's dashboard is a
 Results depend on the environment. Treat published figures as one controlled capture, not
 a guarantee, and measure on your own hardware and workload.
 
+### Independent reviews
+
+Written by others, not by the KiviDB project:
+
+- [Redis vs Valkey vs Dragonfly vs KiviDB](https://warefeats.com/posts/2026-11-05-kv-stores-redis-vs-valkey-vs-dragonfly-vs-kividb/)
+  (warefeats, 5 November 2026): KiviDB 1.2.0 measured on AWS Graviton3 against Redis 8.10,
+  Valkey 9.1 and Dragonfly 2.1: throughput, pipelining, latency and memory per key.
+- [KiviDB Review: Rust Redis Alternative With Vector Search](https://andrew.ooo/posts/kividb-review-rust-redis-alternative-vector-search/)
+  (andrew.ooo, 10 November 2026): a review of KiviDB's design, published benchmarks,
+  durability record and where it fits.
+
 ## Vector search (Redis Stack–style `FT.*`)
 
 KiviDB implements **Redis Stack–compatible** search and vector commands, so existing clients
