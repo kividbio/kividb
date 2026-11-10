@@ -250,7 +250,9 @@ redis-cli -p 6380 FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA \
 
 2. **Store vectors** as raw **FLOAT32** little-endian bytes in a hash field (**`DIM × 4` bytes**), the same convention as Redis Stack and `redis-py` / `numpy` blobs. Use your client's binary-safe `HSET` (the integration tests under `tests/e2e/` have examples).
 
-3. **Query with KNN** (Dialect 2), passing the query vector as a named binary parameter:
+3. **Query with KNN** (Dialect 2), passing the query vector as a named binary parameter
+   (`<blob>` stands for the query vector's raw bytes, which a shell cannot type: send this
+   from a client library, as in step 2):
 
 ```bash
 redis-cli -p 6380 FT.SEARCH idx '*=>[KNN 10 @vec $q]' PARAMS 2 q <blob> DIALECT 2
@@ -337,7 +339,7 @@ install the binary, a systemd unit, a `kividb` system user, and a default
 starts the unit, and an upgrade restarts it:
 
 ```bash
-sudo apt install ./kividb_amd64.deb     # or: sudo rpm -i kividb.x86_64.rpm
+sudo apt install ./kividb_amd64.deb     # or: sudo dnf install ./kividb.x86_64.rpm
 redis-cli -p 6380 PING
 ```
 
@@ -380,14 +382,20 @@ docker run -p 6380:6380 ghcr.io/kividbio/kividb \
 
 ```bash
 docker run -p 6380:6380 \
-  -v $(pwd)/data:/home/kividb \
+  -v kividb-data:/home/kividb \
   ghcr.io/kividbio/kividb --aof --requirepass "change-me"
 ```
 
-With `--aof`, every write is appended to `appendonly.aof` and the file is replayed on
-startup, so a crash loses at most about the last second of writes (the fsync interval)
-rather than everything since the last snapshot. When an AOF is present it is the source of
-truth and the snapshot is not loaded; see [docs/PERSISTENCE.md](docs/PERSISTENCE.md) for why.
+To keep the data in a host directory instead, create it owned by UID 1000 first
+(`mkdir -p data && sudo chown 1000:1000 data`, then `-v "$(pwd)/data:/home/kividb"`): a
+directory Docker creates for a bind mount belongs to root, and the server stops with
+`Permission denied` when it opens `appendonly.aof`.
+
+With `--aof`, every write is appended to `appendonly.aof`, so a crash loses at most about the
+last second of writes (the fsync interval) rather than everything since the last snapshot.
+On startup the snapshot (`dump.kdb`) is loaded first, and the AOF, which holds the writes
+made since that snapshot, is replayed on top of it; see
+[docs/PERSISTENCE.md](docs/PERSISTENCE.md).
 
 The image is distroless: it has no shell and no `redis-cli`. Connect from another container
 instead, for example `docker run --rm -it --network container:<name> redis redis-cli -p 6380`.
@@ -434,7 +442,7 @@ of every file in a release.
 
 ```bash
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb_amd64.deb && sudo dpkg -i kividb_amd64.deb
-curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb.x86_64.rpm && sudo rpm -i kividb.x86_64.rpm
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb.x86_64.rpm && sudo dnf install ./kividb.x86_64.rpm
 ```
 
 From 1.2.0 on, every file in a release and every image carries signed build provenance: a
@@ -475,8 +483,8 @@ list.
 | `--aclfile <path>` | none | ACL file to load users from |
 | `--replicaof <HOST> <PORT>` | none | Replicate from a primary |
 | `--replica-announced-port <port>` | server port (the TLS port with `--tls-replication yes` or `--port 0`) | Port announced to the primary via `REPLCONF listening-port` |
-| `--replica-priority <n>` | `100` | Sentinel promotes the replica of lowest priority first, and never one of `0` |
-| `--replica-announced <yes\|no>` | `yes` | Whether Sentinel lists this replica |
+| `--replica-priority <n>` | `100` | Sentinel promotes the replica of lowest priority first, and never one of `0`. New in 1.2.1: 1.2.0 has no such flag, and ignores the setting in the file |
+| `--replica-announced <yes\|no>` | `yes` | Whether Sentinel lists this replica. New in 1.2.1, as above |
 | `--slowlog-log-slower-than <us>` | off | Slowlog threshold in microseconds (`0` logs every command) |
 | `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
 | `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
@@ -532,7 +540,8 @@ be loaded or listened on is refused, and nothing changes. `tls-cluster` needs a 
 does `tls-port` on a node with `tls-cluster yes`.
 
 **Clients must use TLS on the TLS port.** A plain connection to it (for example `redis-cli -p 6381`
-without `--tls`) fails the handshake, and the server logs `[TLS] handshake failed`. For
+without `--tls`) fails the handshake; at `--loglevel verbose` the server logs
+`TLS: handshake failed from <address>`. For
 memtier_benchmark, add `--tls` (and `--tls-skip-verify` for a self-signed certificate).
 
 ### Logs and errors
