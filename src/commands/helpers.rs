@@ -300,6 +300,11 @@ macro_rules! write_lock {
 /// Most keys one batch deletes from a shard between releases of its locks.
 const ACTIVE_EXPIRE_BATCH: usize = 1024;
 
+/// Most keys a sweep of a shard's keys with a time to live looks at under
+/// one lock of the shard (`ShardMap::sweep_ttl`): some tens of
+/// microseconds.
+const TTL_SWEEP_STEPS: usize = 2048;
+
 /// How long one cycle may run: a quarter of the time between cycles, as in
 /// Redis. Reads expire keys lazily whatever this does.
 const ACTIVE_EXPIRE_BUDGET: Duration = Duration::from_millis(25);
@@ -424,6 +429,13 @@ pub fn active_expire_cycle(
         let (db, shard) = (cursor.db, cursor.shard);
         if !db_values[shard].holds_no_ttl() {
             let now = now_ms();
+            // About every 20 s, the keys that may come due before the next
+            // horizon are set apart from those that cannot, so that a pass
+            // looks only at those (#618): before, every cycle went over every
+            // key with a time to live, due or not.
+            if read_lock!(db_values[shard]).ttl_sweep_due(now) {
+                while !write_lock!(db_values[shard]).sweep_ttl(now, TTL_SWEEP_STEPS) {}
+            }
             // A batch at a time: a pass stops at the batch's last key, so it
             // copies no more keys than it deletes. Collecting every due key
             // of the shard first copied all of them, again each cycle, when

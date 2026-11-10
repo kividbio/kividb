@@ -9,6 +9,7 @@ use std::thread::available_parallelism;
 mod access;
 mod entry;
 mod shard_map;
+mod ttl_list;
 pub use access::AccessScope;
 #[allow(unused_imports)] // Not every item is named outside the store yet.
 pub use shard_map::{
