@@ -4898,8 +4898,38 @@ fn a_fields_time_is_told_in_full_when_asked_at_once() {
             .as_array()[0]
             .as_int();
         assert_eq!(told.to_string(), at, "HPEXPIRETIME");
+        // Rounded up, as Redis does: (expire + 999) / 1000.
         let told = c.cmds(&["HEXPIRETIME", "h", "FIELDS", "1", "c"]).as_array()[0].as_int();
-        assert_eq!(told, 4102444800, "HEXPIRETIME");
+        assert_eq!(told, 4102444801, "HEXPIRETIME");
+    }
+}
+
+/// A field's time is rounded as Redis's `httlGenericCommand` rounds it:
+/// `HTTL` and `HEXPIRETIME` up to the next second, `HPTTL` and
+/// `HPEXPIRETIME` in whole milliseconds. Not to the nearest second, as a
+/// key's `TTL` and `EXPIRETIME` are (#557).
+#[test]
+fn a_fields_time_is_rounded_up_as_in_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["HSET", "h", "a", "x", "b", "y", "c", "z"]);
+    c.cmds(&["HPEXPIRE", "h", "1400", "FIELDS", "1", "a"]);
+    let told = c.cmds(&["HTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
+    assert_eq!(told, 2, "HTTL of 1400 ms");
+    let told = c.cmds(&["HPTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
+    assert!((1000..=1400).contains(&told), "HPTTL {told}");
+    // A whole second reads back as itself; a millisecond past it, as the
+    // next.
+    for (at, secs) in [("4102444800000", 4102444800), ("4102444800001", 4102444801)] {
+        c.cmds(&["HPEXPIREAT", "h", at, "FIELDS", "1", "b"]);
+        let told = c.cmds(&["HEXPIRETIME", "h", "FIELDS", "1", "b"]).as_array()[0].as_int();
+        assert_eq!(told, secs, "HEXPIRETIME of {at}");
+        let told = c
+            .cmds(&["HPEXPIRETIME", "h", "FIELDS", "1", "b"])
+            .as_array()[0]
+            .as_int();
+        assert_eq!(told.to_string(), at, "HPEXPIRETIME of {at}");
     }
 }
 

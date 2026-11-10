@@ -145,6 +145,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
+  `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
+  `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a
+  half up (`(ms + 500) / 1000`), and `EXPIRETIME` rounds the time of day to
+  the nearest second too, where it cut it. A hash field's time rounds as
+  Redis rounds it, which differs from a key's: `HTTL` up to the next second,
+  as before, and now `HEXPIRETIME` up too, where it cut it (`HPEXPIREAT h
+  4102444800001` reads back as 4102444801). Checked against Redis 8.4's
+  `ttlGenericCommand` and `httlGenericCommand`.
+
 - **A write that fails changes nothing, so replicas and the AOF stay in
   step (#551).** Only a write whose reply is not an error is sent to
   replicas and the append-only file. Three commands changed data and then
