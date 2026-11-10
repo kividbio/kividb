@@ -317,6 +317,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a queued `CLIENT SETNAME` or `HELLO SETNAME` had changed it. Both I/O
   models.
 
+- **`HELLO` and refused commands, as in Redis.** `HELLO` now takes its
+  `AUTH` and `SETNAME` options in any order. It checks the name before it
+  tries the password, writes a failed `AUTH` to the ACL log, and refuses
+  every protocol version but 2 and 3 with `NOPROTO`. It used to take 0 and
+  1 as 2. `HELLO 3 AUTH password`, without a user name, is now
+  a syntax error, as in Redis. A command that does not exist is refused as
+  unknown before the ACL rules are checked, and so is one inside `MULTI` that
+  cannot be part of a transaction (`PSYNC`, `SYNC`). Neither goes to the ACL
+  log. An `EXEC` refused before it runs is shown to `MONITOR`.
+  `BGREWRITEAOF` and `FAILOVER` are queued inside `MULTI`, as in Redis,
+  where they were refused. `AUTH` with more than a user and a password is a
+  syntax error. A password is now any bytes, as in Redis: a `nopass` user
+  takes one that is not UTF-8, and a user set by the hash of such bytes
+  (`#<sha256>`) logs in with them. Before, such a password was read as an
+  empty one. A user name that is not UTF-8 matches no user. Before, it was
+  read as `default`. `ACL SETUSER` takes such a password too (`>` and
+  `<`), where it answered `ERR invalid rule`.
+
+- **The ACL log keeps what Redis's keeps.** A failed `AUTH` or `HELLO ...
+  AUTH` is logged with the command as the object (`AUTH`, `HELLO`), not
+  the user name. A refusal inside `MULTI` or `EXEC` has the context
+  `multi`, and one inside a script has `lua`, where every entry said
+  `toplevel`. A command refused for want of `AUTH` is no longer logged. An
+  event like one of the ten newest entries (same reason, context, object
+  and user, within 60 seconds) is counted in that entry, and moves its
+  `timestamp-last-updated`, instead of adding another. `ACL LOG` answers
+  as Redis does: the fields in Redis's order, `entry-id` (not `id`)
+  counting from 0, `client-info` as `CLIENT INFO` describes the client,
+  `age-seconds` as a double, and a map under RESP3. `acllog-max-len` is
+  now a setting (default 128, 0 keeps nothing) in the configuration file,
+  `CONFIG SET` and `CONFIG GET`, where it was accepted and ignored. A
+  client that reads `ACL LOG` entries by position, or by the name `id`,
+  needs to change. `ACL LOG` without a count gives the ten newest entries,
+  as Redis does, where it gave them all. A negative count gives none, and
+  more arguments are refused.
+
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
   `HINCRBYFLOAT` took the search indexes' lock twice to find out whether
