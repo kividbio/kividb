@@ -2286,56 +2286,24 @@ pub async fn handle_client(
                 }
 
                 "WAIT" if !tx.active => {
-                    let wait_args = crate::replication::wait_args(&cmd);
-                    if let Err(refusal) = &wait_args {
-                        refusal.clone()
-                    } else {
-                        let (num_replicas, timeout_ms) = wait_args.unwrap_or_default();
-
-                        let connected = repl_state
-                            .connected_replicas
-                            .load(std::sync::atomic::Ordering::Relaxed);
-
-                        // Without replicas, as in Redis, the wait lasts its
-                        // timeout and the answer is 0 (#566): nothing is
-                        // acknowledged.
-                        if num_replicas <= 0 {
-                            crate::resp::write::resp_integer(connected).to_vec()
-                        } else {
-                            // See the tokio loop in server.rs: per-replica
-                            // targets, taken after a hub barrier.
-                            let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
-                            if hub_tx
-                                .send(crate::replication::HubMsg::Barrier(barrier_tx))
-                                .is_ok()
-                            {
-                                let _ = barrier_rx.await;
-                            }
-                            let targets = repl_state.wait_targets();
-
-                            let deadline = tokio::time::Instant::now()
-                                + tokio::time::Duration::from_millis(if timeout_ms == 0 {
-                                    u64::MAX
-                                } else {
-                                    timeout_ms
-                                });
-
+                    match crate::replication::wait_args(&cmd, repl_state.is_slave()) {
+                        Err(refusal) => refusal,
+                        Ok((wanted, timeout_ms)) => {
+                            // A blocked client while it waits, as in Redis:
+                            // `b` in CLIENT LIST, counted in
+                            // `blocked_clients`, and ended by CLIENT UNBLOCK.
+                            let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+                            let _blocked = (wanted > 0).then(|| {
+                                client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
+                            });
                             let waited = unless_gone(
-                                async {
-                                    loop {
-                                        let acked =
-                                            crate::replication::ReplState::count_reached(&targets);
-                                        if acked >= num_replicas
-                                            || tokio::time::Instant::now() >= deadline
-                                        {
-                                            break crate::resp::write::resp_integer(acked).to_vec();
-                                        }
-                                        // Let the worker park so tokio-uring submits
-                                        // the replica writes and reads needed for ACKs.
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
-                                            .await;
-                                    }
-                                },
+                                crate::replication::wait_for_replicas(
+                                    &repl_state,
+                                    &hub_tx,
+                                    wanted,
+                                    timeout_ms,
+                                    unblock_rx,
+                                ),
                                 &peer_watch,
                             )
                             .await;

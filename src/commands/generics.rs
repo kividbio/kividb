@@ -1072,13 +1072,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // An expired key that stays (on a replica, while writes are
             // paused, or while loading) could be picked again and again:
             // after 100 of those, as in Redis, the answer is one of them.
+            //
+            // Whether expired keys stay is asked again at every pick, as
+            // Redis does: a pause that begins while this looks must not
+            // leave it looking for ever.
             let db = *ctx.selected_db;
             let shards = ctx.store[db].len();
-            let expired_keys_stay = crate::pause::expiry_deferred()
-                || crate::expiry::held()
-                || crate::expiry::of(ctx.store)
-                    .as_ref()
-                    .is_some_and(crate::expiry::Target::on_replica);
+            let expired_keys_stay = || {
+                crate::pause::expiry_deferred()
+                    || crate::expiry::held()
+                    || crate::expiry::of(ctx.store)
+                        .as_ref()
+                        .is_some_and(crate::expiry::Target::on_replica)
+            };
             let mut kept_expired = 0;
             loop {
                 let start = rand::random::<usize>() % shards.max(1);
@@ -1090,7 +1096,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 match picked {
                     None => break Some(resp_null_bulk()),
                     Some(key) if lazy_expire_on_read(ctx.store, db, &key) => {
-                        if expired_keys_stay {
+                        if expired_keys_stay() {
                             kept_expired += 1;
                             if kept_expired == 100 {
                                 break Some(resp_bulk(&key));

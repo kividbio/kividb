@@ -501,6 +501,8 @@ pub struct ClientInfo {
     pub activity: Arc<Activity>,
     pub query_buffer: Arc<QueryBufferMetrics>,
     pub no_evict: bool,
+    /// Waiting in a blocking command: `b` in `CLIENT LIST`.
+    pub blocked: bool,
     /// True iff the client has issued ASKING for the next command.
     /// Single-shot: cleared after the next command runs (whatever the result).
     pub asking: bool,
@@ -570,6 +572,7 @@ impl ClientInfo {
             activity: Arc::new(activity),
             query_buffer: Arc::default(),
             no_evict: false,
+            blocked: false,
             asking: false,
             readonly: false,
             tracking: false,
@@ -621,6 +624,9 @@ impl ClientInfo {
         }
         if self.subscriptions.iter().any(|n| *n > 0) {
             flags.push('P');
+        }
+        if self.blocked {
+            flags.push('b');
         }
         if self.tracking {
             flags.push('t');
@@ -909,6 +915,7 @@ impl ClientRegistryInner {
         let blocked = unblock.is_some();
         if let Some(info) = self.clients.write().get_mut(&id) {
             info.unblock_tx = unblock;
+            info.blocked = blocked;
             let counted = blocked && with_timeout;
             if counted != info.blocked_with_timeout {
                 if counted {
@@ -922,6 +929,20 @@ impl ClientRegistryInner {
         if blocked {
             crate::pause::went_on(id);
         }
+    }
+
+    /// Client `id` waits in a command that is no key's (`WAIT`): blocked,
+    /// counted in `blocked_clients`, and ended by `CLIENT UNBLOCK` through
+    /// `unblock`, until what this returns is dropped.
+    pub fn blocked_in(
+        &self,
+        id: u64,
+        unblock: oneshot::Sender<crate::commands::blocking::Unblock>,
+        with_timeout: bool,
+    ) -> BlockedIn<'_> {
+        self.set_blocked(id, Some(unblock), with_timeout);
+        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        BlockedIn { registry: self, id }
     }
 
     /// `CLIENT UNBLOCK`: end the client's wait, if it is waiting.
@@ -1012,6 +1033,7 @@ impl ClientRegistryInner {
                 activity: Arc::clone(&c.activity),
                 query_buffer: Arc::clone(&c.query_buffer),
                 no_evict: c.no_evict,
+                blocked: c.blocked,
                 asking: c.asking,
                 readonly: c.readonly,
                 tracking: c.tracking,
@@ -1051,6 +1073,7 @@ impl ClientRegistryInner {
             activity: Arc::clone(&c.activity),
             query_buffer: Arc::clone(&c.query_buffer),
             no_evict: c.no_evict,
+            blocked: c.blocked,
             asking: c.asking,
             readonly: c.readonly,
             kill_tx: None,
@@ -1188,6 +1211,20 @@ pub fn new_client_registry() -> ClientRegistry {
 impl Default for ClientRegistryInner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See [`ClientRegistry::blocked_in`]: the client stops being blocked when
+/// this is dropped.
+pub struct BlockedIn<'a> {
+    registry: &'a ClientRegistryInner,
+    id: u64,
+}
+
+impl Drop for BlockedIn<'_> {
+    fn drop(&mut self) {
+        self.registry.set_blocked(self.id, None, false);
+        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

@@ -147,17 +147,22 @@ pub fn connection_reply_in_exec(name: &str, cmd: &[&[u8]], env: &InExec) -> Opti
         "MONITOR" => {
             crate::resp::write::resp_error("ERR MONITOR isn't allowed for DENY BLOCKING client")
         }
-        "WAIT" => {
-            let connected = env.repl_state.connected_replicas.load(Ordering::Relaxed);
-            if number(1) == 0 || connected == 0 {
-                crate::resp::write::resp_integer(connected)
-            } else {
-                crate::resp::write::resp_integer(
-                    env.wait_targets
-                        .map_or(0, crate::replication::ReplState::count_reached),
-                )
+        // Its arguments checked as outside a transaction (#561), and refused
+        // on a replica.
+        "WAIT" => match crate::replication::wait_args(cmd, env.repl_state.is_slave()) {
+            Err(refusal) => refusal,
+            Ok((wanted, _)) => {
+                let connected = env.repl_state.connected_replicas.load(Ordering::Relaxed);
+                if wanted <= 0 || connected == 0 {
+                    crate::resp::write::resp_integer(connected)
+                } else {
+                    crate::resp::write::resp_integer(
+                        env.wait_targets
+                            .map_or(0, crate::replication::ReplState::count_reached),
+                    )
+                }
             }
-        }
+        },
         _ => {
             if !crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
                 if number(1) != 0 {

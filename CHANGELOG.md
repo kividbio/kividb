@@ -275,9 +275,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `FLUSHALL` and `FLUSHDB` refuse anything but `ASYNC` or `SYNC` with
     `ERR syntax error`; an unknown word used to flush synchronously.
   - `WAIT` refuses a count or timeout that is not an integer, and a
-    negative timeout (which used to wait for ever). Without replicas,
-    `WAIT n timeout` with `n` above 0 now waits out its timeout and answers
-    0, as Redis does; it answered at once.
+    negative timeout (which used to wait for ever), inside `MULTI` too. On
+    a replica it is refused, as in Redis; it waited for ever. Without
+    replicas, `WAIT n timeout` with `n` above 0 now waits out its timeout
+    and answers 0, as Redis does; it answered at once. A replica that
+    connects while a `WAIT` waits is counted once it has caught up. A
+    client waiting in `WAIT` shows as blocked (`b` in `CLIENT LIST`,
+    `blocked_clients`), and `CLIENT UNBLOCK` ends its wait. `CLIENT LIST`
+    shows `b` for every blocked client.
   - `LOLWUT VERSION` takes an integer, as do the options of versions 5 and
     6.
   - `VSETATTR` answers 1, or 0 when there is no such key or element (it
@@ -314,9 +319,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     it gave up after 64 and answered nil.
   - `HOTKEYS STOP` answers nil when nothing is collecting, including after
     `DURATION` has run out; it answered `OK` or an error.
-  - `GEORADIUS` and `GEORADIUSBYMEMBER` are refused on a read-only replica
-    with `READONLY`, with or without `STORE`, as Redis refuses them: use
-    `GEORADIUS_RO` and `GEORADIUSBYMEMBER_RO` there.
+  - **`GEORADIUS` and `GEORADIUSBYMEMBER` are now refused on a read-only
+    replica** with `READONLY`, with or without `STORE`, as Redis refuses
+    them; they used to run there when they did not store. An application
+    that reads from replicas with them must switch to `GEORADIUS_RO` and
+    `GEORADIUSBYMEMBER_RO` (or `GEOSEARCH`).
   - `ACL WHOAMI`, `ACL CAT`, `ACL GENPASS` and `ACL HELP` are no longer in
     `@admin` or `@dangerous`, so a user without `@admin` can run them.
   - Smaller texts: `BACKUP LIST x` names `backup|list`, and `MODULE LOAD`

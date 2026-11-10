@@ -39,6 +39,9 @@ pub struct ReplState {
     pub repl_offset: AtomicU64,
     /// Number of currently connected replicas.
     pub connected_replicas: AtomicI64,
+    /// Woken when a replica acknowledges, connects or goes: what a `WAIT`
+    /// sleeps on between looks at its replicas.
+    pub replicas_changed: tokio::sync::Notify,
     /// The dataset's fingerprint when this node started as a master, at
     /// offset 0 of its stream: see [`Self::fingerprint_at_start`].
     pub startup_digest: parking_lot::Mutex<Option<u64>>,
@@ -486,6 +489,7 @@ impl ReplState {
             slave_mode: AtomicBool::new(false),
             repl_offset: AtomicU64::new(0),
             connected_replicas: AtomicI64::new(0),
+            replicas_changed: tokio::sync::Notify::new(),
             repl_id: RwLock::new(generate_repl_id()),
             startup_digest: parking_lot::Mutex::new(None),
             replica_acks: parking_lot::Mutex::new(std::collections::HashMap::new()), // NEW
@@ -951,6 +955,7 @@ impl ReplState {
             .lock()
             .push((replica_id, peer_ip, peer_port));
         self.connected_replicas.fetch_add(1, Ordering::Relaxed);
+        self.replicas_changed.notify_waiters();
         progress
     }
 
@@ -2379,6 +2384,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // loaded: this is what "online" means.
                         p.set_state(ReplicaState::Online);
                     }
+                    state.replicas_changed.notify_waiters();
                 }
 
                 HubMsg::Continue {
@@ -2878,6 +2884,7 @@ fn forget_replica(state: &ReplState, replica_id: u64) {
         // Pairs with fetch_add on successful RegisterChannel in the hub task.
         state.connected_replicas.fetch_sub(1, Ordering::Relaxed);
     }
+    state.replicas_changed.notify_waiters();
 }
 
 /// Shutdown: end the write stream here. A master restarted from its final
@@ -4029,13 +4036,25 @@ fn is_write_command_reference(name: &str) -> bool {
     )
 }
 
+/// Redis's reply to `WAIT` on a replica.
+pub const WAIT_ON_REPLICA: &[u8] = b"-ERR WAIT cannot be used with replica instances. Please also \
+    note that since Redis 4.0 if a replica is configured to be writable (which is not the \
+    default) writes to replicas are just local and are not propagated.\r\n";
+
 /// `WAIT numreplicas timeout`'s arguments, or the error Redis gives for
 /// them (#561): both integers, the timeout in milliseconds and not negative
 /// (0 waits for ever). Each used to read as 0 when it was not a number, and
 /// a negative timeout as 0, which waited for ever.
-pub fn wait_args(cmd: &[&[u8]]) -> Result<(i64, u64), Vec<u8>> {
+///
+/// On a replica, `WAIT` is refused before its arguments are looked at, as
+/// Redis refuses it: there is nothing it could wait for (it used to wait for
+/// ever).
+pub fn wait_args(cmd: &[&[u8]], on_replica: bool) -> Result<(i64, u64), Vec<u8>> {
     if cmd.len() != 3 {
         return Err(b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec());
+    }
+    if on_replica {
+        return Err(WAIT_ON_REPLICA.to_vec());
     }
     let int = |arg: &[u8]| std::str::from_utf8(arg).ok()?.parse::<i64>().ok();
     let replicas =
@@ -4046,6 +4065,86 @@ pub fn wait_args(cmd: &[&[u8]]) -> Result<(i64, u64), Vec<u8>> {
         return Err(b"-ERR timeout is negative\r\n".to_vec());
     }
     Ok((replicas, timeout as u64))
+}
+
+/// `WAIT` once its arguments are taken: the number of replicas that have
+/// acknowledged everything written before it, once `wanted` have, or at
+/// `timeout_ms` (0: no timeout), or when `CLIENT UNBLOCK` ends it (with that
+/// number, or `-UNBLOCKED` if asked for an error), as Redis answers. Each
+/// connection loop runs this beside its own watch on the client going.
+///
+/// What a replica has to acknowledge is settled per replica: everything it
+/// had been sent as of now, made exact by a hub barrier. A replica that
+/// connects while this waits counts too, as in Redis, where its full sync
+/// covers what was written: once it is online and has acknowledged what it
+/// had been sent when this first saw it.
+///
+/// Between looks it sleeps until a replica acknowledges, connects or goes,
+/// or the time is up: nothing is polled.
+pub async fn wait_for_replicas(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    wanted: i64,
+    timeout_ms: u64,
+    mut unblocked: tokio::sync::oneshot::Receiver<crate::commands::blocking::Unblock>,
+) -> Vec<u8> {
+    let reply = |n: i64| crate::resp::write::resp_integer(n).to_vec();
+    if wanted <= 0 {
+        return reply(state.connected_replicas.load(Ordering::Relaxed));
+    }
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    if hub_tx.send(HubMsg::Barrier(barrier_tx)).is_ok() {
+        let _ = barrier_rx.await;
+    }
+    // Replica id -> (its progress, what it has to have acknowledged, whether
+    // it came after the WAIT did).
+    let mut targets: std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64, bool)> = state
+        .replica_progress
+        .lock()
+        .iter()
+        .map(|(id, p)| (*id, (Arc::clone(p), p.sent.load(Ordering::Relaxed), false)))
+        .collect();
+    let deadline = (timeout_ms > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+    let mut unblockable = true;
+    loop {
+        // Before looking, so that a change made while looking still wakes it.
+        let changed = state.replicas_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+
+        for (id, p) in state.replica_progress.lock().iter() {
+            targets
+                .entry(*id)
+                .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed), true));
+        }
+        let acked = targets
+            .values()
+            .filter(|(p, target, late)| {
+                (!late || p.state() == ReplicaState::Online) && p.delivered() >= *target
+            })
+            .count() as i64;
+        if acked >= wanted {
+            return reply(acked);
+        }
+        let time_up = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = &mut changed => {}
+            () = time_up => return reply(acked),
+            how = &mut unblocked, if unblockable => match how {
+                Ok(crate::commands::blocking::Unblock::Error) => {
+                    return crate::commands::blocking::UNBLOCKED.to_vec();
+                }
+                Ok(crate::commands::blocking::Unblock::Timeout) => return reply(acked),
+                Err(_) => unblockable = false,
+            },
+        }
+    }
 }
 
 /// True if this command may not run on a read-only replica (READONLY reply).

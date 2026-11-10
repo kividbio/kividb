@@ -298,6 +298,142 @@ fn wait_checks_its_arguments_and_waits_without_replicas() {
     });
 }
 
+/// Inside `MULTI`, `WAIT`'s arguments are checked when `EXEC` runs it, as
+/// Redis checks them, and nothing waits.
+#[test]
+fn wait_in_a_transaction_checks_its_arguments() {
+    on_each_loop(&[], |server, io| {
+        let mut c = server.conn();
+        assert!(c.cmd(&["MULTI"]).ok(), "{io}");
+        for args in [
+            &["WAIT", "x", "0"][..],
+            &["WAIT", "1", "-1"],
+            &["WAIT", "1", "0"],
+        ] {
+            assert_eq!(c.cmd(args), V::Simple("QUEUED".into()), "{io}");
+        }
+        let started = Instant::now();
+        let replies = c.cmd(&["EXEC"]);
+        assert_eq!(
+            replies,
+            V::Arr(vec![
+                V::Err("ERR value is not an integer or out of range".into()),
+                V::Err("ERR timeout is negative".into()),
+                V::Int(0),
+            ]),
+            "{io}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "{io}");
+    });
+}
+
+/// Wait until the replica on `replica` has synced with its master.
+fn wait_for_link(replica: &Server) {
+    let mut r = replica.conn();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while info_field(&mut r, "replication", "master_link_status") != "up" {
+        assert!(Instant::now() < deadline, "the replica did not sync");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `WAIT` on a replica is refused with Redis's words, in and out of a
+/// transaction; it waited for ever.
+#[test]
+fn wait_on_a_replica_is_refused() {
+    let master = Server::start("tokio", &[]);
+    let port = master.port.to_string();
+    for io in io_models() {
+        let replica = Server::start(io, &["--replicaof", "127.0.0.1", &port]);
+        wait_for_link(&replica);
+        let mut r = replica.conn();
+        let refused = "ERR WAIT cannot be used with replica instances. Please also note that \
+                       since Redis 4.0 if a replica is configured to be writable (which is not \
+                       the default) writes to replicas are just local and are not propagated.";
+        assert_eq!(r.cmd(&["WAIT", "1", "0"]).err(), refused, "{io}");
+        assert!(r.cmd(&["MULTI"]).ok(), "{io}");
+        r.cmd(&["WAIT", "0", "0"]);
+        assert_eq!(
+            r.cmd(&["EXEC"]),
+            V::Arr(vec![V::Err(refused.into())]),
+            "{io}"
+        );
+    }
+}
+
+/// A replica that connects while a `WAIT` waits is counted once it has
+/// caught up, as in Redis: the wait used to look only at the replicas there
+/// when it began.
+#[test]
+fn wait_counts_a_replica_that_connects_while_it_waits() {
+    for io in io_models() {
+        let master = Server::start(io, &[]);
+        let mut c = master.conn();
+        c.cmd(&["SET", "k", "v"]);
+        let port = master.port;
+        let waiting = std::thread::spawn(move || {
+            let mut w = Conn::connect(port);
+            let started = Instant::now();
+            let n = w.cmd(&["WAIT", "1", "15000"]).i();
+            (n, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let port_text = port.to_string();
+        let replica = Server::start("tokio", &["--replicaof", "127.0.0.1", &port_text]);
+        let (n, took) = waiting.join().unwrap();
+        assert_eq!(n, 1, "{io}");
+        assert!(took < Duration::from_secs(14), "{io}: WAIT took {took:?}");
+        let mut r = replica.conn();
+        assert_eq!(r.cmd(&["GET", "k"]), V::Bulk("v".into()), "{io}");
+    }
+}
+
+/// A client in `WAIT` is a blocked client: `b` in `CLIENT LIST`, counted
+/// in `blocked_clients`, and `CLIENT UNBLOCK` ends its wait with the count
+/// (`TIMEOUT`) or `-UNBLOCKED` (`ERROR`), as in Redis.
+#[test]
+fn client_unblock_ends_a_wait() {
+    on_each_loop(&[], |server, io| {
+        let mut c = server.conn();
+        for (how, expected) in [
+            ("TIMEOUT", V::Int(0)),
+            (
+                "ERROR",
+                V::Err("UNBLOCKED client unblocked via CLIENT UNBLOCK".into()),
+            ),
+        ] {
+            let mut w = server.conn();
+            let id = w.cmd(&["CLIENT", "ID"]).i();
+            let waiting = std::thread::spawn(move || w.cmd(&["WAIT", "1", "0"]));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let list = c.cmd(&["CLIENT", "LIST", "ID", &id.to_string()]);
+                if list.s().contains("flags=b") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{io}: never blocked: {list:?}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                info_field(&mut c, "clients", "blocked_clients"),
+                "1",
+                "{io}"
+            );
+            assert_eq!(
+                c.cmd(&["CLIENT", "UNBLOCK", &id.to_string(), how]).i(),
+                1,
+                "{io}"
+            );
+            assert_eq!(waiting.join().unwrap(), expected, "{io} {how}");
+            assert_eq!(
+                info_field(&mut c, "clients", "blocked_clients"),
+                "0",
+                "{io}"
+            );
+        }
+    });
+}
+
 /// `LOLWUT VERSION` takes an integer, and so do the options of versions 5
 /// and 6.
 #[test]
