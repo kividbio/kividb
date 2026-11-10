@@ -69,7 +69,7 @@ pub struct BlockingWait {
     /// Carried across the park and handed back on resume. See [`BlockState`].
     state: Option<BlockState>,
     /// [`role_changes`] when the command parked: see
-    /// [`BlockingWait::role_changed_since_park`].
+    /// [`ended_by_role_change`].
     role_epoch: u64,
 }
 
@@ -152,24 +152,24 @@ pub const UNBLOCKED: &[u8] = b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\
 /// same reply `WAIT` gives then.
 pub const ROLE_CHANGED: &[u8] = crate::replication::UNBLOCKED_ROLE_CHANGE;
 
+/// This node has become a replica (or been pointed at another master):
+/// its count of role changes (`ReplState::role_changes`) goes up. Called
+/// with the role already changed, before the blocked clients are swept.
+///
+/// The count is the node's own, not the process's: several servers run in
+/// one test process, and a role change of one must end nothing on another.
+pub fn note_role_change(repl_state: &crate::replication::ReplState) {
+    repl_state.role_changes.fetch_add(1, Ordering::SeqCst);
+}
+
 /// How many times this node has become a replica, or been pointed at
 /// another master. Read when a command parks, and again once its client is
 /// listed as blocked: a role change between the two, which the sweep that
 /// ends the blocked clients (`ClientRegistry::end_blocked_for_role_change`)
 /// cannot have seen, ends the wait as the sweep would have.
-static ROLE_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// This node has become a replica (or been pointed at another master).
-/// Called with the role already changed, before the blocked clients are
-/// swept.
-pub fn note_role_change() {
-    ROLE_CHANGES.fetch_add(1, Ordering::SeqCst);
-}
-
-/// See [`ROLE_CHANGES`].
 #[inline]
-pub fn role_changes() -> u64 {
-    ROLE_CHANGES.load(Ordering::Relaxed)
+pub fn role_changes(repl_state: &crate::replication::ReplState) -> u64 {
+    repl_state.role_changes.load(Ordering::Relaxed)
 }
 
 /// Whether a parked wait ends because this node became a replica: the
@@ -184,7 +184,7 @@ pub fn ended_by_role_change(
     refused_on_replica: bool,
     repl_state: &crate::replication::ReplState,
 ) -> bool {
-    role_changes() != park_epoch || (refused_on_replica && repl_state.is_slave())
+    role_changes(repl_state) != park_epoch || (refused_on_replica && repl_state.is_slave())
 }
 
 /// Test builds only: `KIVIDB_TEST_PARK_DELAY_MS` holds every parked command
@@ -418,7 +418,7 @@ pub fn park_with_state(
                 rxs,
                 timeout,
                 state,
-                role_epoch: role_changes(),
+                role_epoch: role_changes(ctx.repl_state),
             });
             ParkOutcome::Parked
         }
@@ -705,15 +705,6 @@ impl BlockingWait {
     /// Whether it ends by itself at a time: `clients_in_timeout_table`.
     pub fn has_timeout(&self) -> bool {
         self.timeout.is_some()
-    }
-
-    /// Whether this node has become a replica since the command parked.
-    /// Asked once its client is listed as blocked, which is when the sweep
-    /// of a role change would find it: before that, the sweep has passed it
-    /// by. One relaxed load; the registry's lock, taken to list the client,
-    /// orders it after the sweep's count.
-    pub fn role_changed_since_park(&self) -> bool {
-        self.role_epoch != role_changes()
     }
 
     /// [`role_changes`] when the command parked.

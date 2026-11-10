@@ -2371,14 +2371,16 @@ pub async fn handle_client(
                             } else {
                                 timeout_ms
                             });
-                        let role_epoch = crate::commands::blocking::role_changes();
+                        let role_epoch = crate::commands::blocking::role_changes(&repl_state);
 
                         let waited = unless_gone(
                             async {
                                 loop {
                                     // Ended, as every blocked client is, when
                                     // this node becomes a replica (#591).
-                                    if crate::commands::blocking::role_changes() != role_epoch {
+                                    if crate::commands::blocking::role_changes(&repl_state)
+                                        != role_epoch
+                                    {
                                         break crate::commands::blocking::ROLE_CHANGED.to_vec();
                                     }
                                     let fsynced = crate::aof::AOF_FSYNCED

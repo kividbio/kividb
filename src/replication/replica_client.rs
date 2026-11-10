@@ -152,7 +152,7 @@ impl ReplicaStarter {
         // only a master is written (#591). Counted first: a command that
         // parks from here on, before it is listed as blocked, sees the
         // count change and ends as the sweep would have ended it.
-        crate::commands::blocking::note_role_change();
+        crate::commands::blocking::note_role_change(&self.repl_state);
         let ended = self.client_registry.end_blocked_for_role_change();
         if ended > 0 {
             log_info!("Replication: ended {ended} blocked client(s): this node is now a replica");
