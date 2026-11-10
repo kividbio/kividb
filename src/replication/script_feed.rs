@@ -441,7 +441,10 @@ fn spop_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
             }
             Vec::new()
         }
-        Some(b'*') => {
+        // `~`: the set a RESP3 client is answered with, from a script too
+        // after `redis.setresp(3)`. It was not looked at, and the members
+        // popped stayed on the replicas and in the AOF.
+        Some(b'*' | b'~') => {
             if let Some((_n, members)) = parse_array(resp) {
                 if members.is_empty() {
                     return Vec::new();
@@ -642,11 +645,13 @@ fn incrbyfloat_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     if cmd.len() != 3 {
         return Vec::new();
     }
-    let Some((_n, val_opt)) = parse_bulk(resp) else {
-        return Vec::new();
-    };
-    let Some(val) = val_opt else {
-        return Vec::new();
+    // A bulk string; or, if a RESP3 reply is ever a double (`,`), that.
+    let val = match parse_bulk(resp) {
+        Some((_, Some(val))) => val,
+        _ => match resp.strip_prefix(b",").and_then(|rest| rest.strip_suffix(b"\r\n")) {
+            Some(val) => val.to_vec(),
+            None => return Vec::new(),
+        },
     };
     vec![vec![
         b"SET".to_vec(),
@@ -675,8 +680,9 @@ fn parse_bulk(resp: &[u8]) -> Option<(usize, Option<Vec<u8>>)> {
     Some((body_end, Some(resp[header_end..header_end + n].to_vec())))
 }
 
+/// An array of bulk strings, or a RESP3 set of them (`~`).
 fn parse_array(resp: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
-    if resp.first()? != &b'*' {
+    if !matches!(resp.first()?, b'*' | b'~') {
         return None;
     }
     let line_end = resp.windows(2).position(|w| w == b"\r\n")?;
@@ -948,6 +954,22 @@ mod tests {
             vec![cmd(&["ZPOPMIN", "z", "1"])]
         );
         assert!(blocking_pop_feed("BZMPOP", &refs(&c), b"*-1\r\n").is_empty());
+    }
+
+    #[test]
+    fn spop_of_a_resp3_client_is_rewritten_too() {
+        let owned = cmd(&["SPOP", "s", "2"]);
+        let resp = b"~2\r\n$3\r\nm01\r\n$3\r\nm07\r\n";
+        assert_eq!(
+            spop_feed(&refs(&owned), resp),
+            vec![cmd(&["SREM", "s", "m01", "m07"])]
+        );
+        assert!(spop_feed(&refs(&owned), b"~0\r\n").is_empty());
+        assert!(spop_feed(&refs(&cmd(&["SPOP", "s"])), b"_\r\n").is_empty());
+        assert_eq!(
+            incrbyfloat_feed(&refs(&cmd(&["INCRBYFLOAT", "f", "1.5"])), b",2.5\r\n"),
+            vec![cmd(&["SET", "f", "2.5", "KEEPTTL"])]
+        );
     }
 
     #[test]

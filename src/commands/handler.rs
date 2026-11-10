@@ -1756,7 +1756,10 @@ fn moved_nothing(name: &str, result: &[u8]) -> bool {
 /// keys holds. The reply is looked at first: it is rarely one of these.
 #[inline]
 fn popped_nothing(name: &str, result: &[u8]) -> bool {
-    matches!(result, b"$-1\r\n" | b"*-1\r\n" | b"_\r\n" | b"*0\r\n")
+    matches!(
+        result,
+        b"$-1\r\n" | b"*-1\r\n" | b"_\r\n" | b"*0\r\n" | b"~0\r\n"
+    )
         && matches!(
             name,
             "LPOP"

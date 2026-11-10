@@ -4964,11 +4964,14 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
 /// command, kept them (#559). The libraries are taken out under the same
 /// hold of the VM's lock as the check, so no script runs between the two.
 fn flush_functions(asynchronous: bool) -> Result<(), LuaVmBusy> {
+    // One lock at a time: the store's is let go of before the name map's is
+    // taken. Held together, in this order, they deadlocked against
+    // `rebuild_fn_name_map_from_store`, which took them the other way round
+    // (a `FUNCTION RESTORE` beside the flush).
     let (vm, (libraries, names)) = lua_vms_renew_for_admin_and(&[Vm::Functions], || {
-        (
-            std::mem::take(&mut *function_store().write()),
-            std::mem::take(&mut *fn_name_to_library().write()),
-        )
+        let libraries = std::mem::take(&mut *function_store().write());
+        let names = std::mem::take(&mut *fn_name_to_library().write());
+        (libraries, names)
     })?;
     // `ASYNC`: the VM and the libraries are freed in the background, and
     // counted as Redis counts them, a function each and one for the VM.
@@ -5262,10 +5265,12 @@ fn merge_function_libraries(
     }
 }
 
+/// The store's lock is taken before the name map's, as everywhere both are
+/// held.
 fn rebuild_fn_name_map_from_store() {
+    let store = function_store().read();
     let mut m = fn_name_to_library().write();
     m.clear();
-    let store = function_store().read();
     for lib in store.values() {
         for fname in &lib.functions {
             m.insert(fname.clone(), lib.name.clone());

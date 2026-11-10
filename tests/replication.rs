@@ -1665,6 +1665,121 @@ fn test_blocking_pops_are_sent_as_the_pop_they_made() {
     }
 }
 
+/// Send `args` and read the one reply, whatever its RESP3 type. Returns the
+/// reply's first line.
+fn resp3_call(c: &mut Conn, args: &[&str]) -> String {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+    }
+    c.stream.write_all(&out).unwrap();
+    read_resp3(&mut c.reader)
+}
+
+fn read_resp3(r: &mut impl BufRead) -> String {
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    let head = line.trim_end().to_string();
+    let n = head.get(1..).and_then(|n| n.parse::<i64>().ok()).unwrap_or(0);
+    match head.as_bytes().first() {
+        Some(b'$' | b'=' | b'!') if n >= 0 => {
+            let mut body = vec![0u8; n as usize + 2];
+            r.read_exact(&mut body).unwrap();
+        }
+        Some(b'*' | b'~' | b'>') if n > 0 => {
+            for _ in 0..n {
+                read_resp3(r);
+            }
+        }
+        Some(b'%' | b'|') if n > 0 => {
+            for _ in 0..2 * n {
+                read_resp3(r);
+            }
+        }
+        _ => {}
+    }
+    head
+}
+
+/// A RESP3 client's writes reach replicas and the AOF as their effects, as
+/// a RESP2 client's do. `SPOP` with a count answers it with a set (`~`),
+/// which was not read: nothing was sent, and the replicas kept the members
+/// the master had popped. So from a script after `redis.setresp(3)`.
+#[test]
+fn test_a_resp3_client_s_writes_are_sent_as_their_effects() {
+    let master_port = spawn_server(Config::default());
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    let mut tap = attach_stream_reader(master_port);
+    let mut c = Conn::connect(master_port);
+    assert!(resp3_call(&mut c, &["HELLO", "3"]).starts_with('%'));
+
+    resp3_call(&mut c, &["SADD", "s", "a", "b", "c", "d", "e"]);
+    assert_eq!(resp3_call(&mut c, &["SPOP", "s", "2"]), "~2");
+    assert_eq!(resp3_call(&mut c, &["SPOP", "s"]), "$1");
+    assert_eq!(resp3_call(&mut c, &["SPOP", "none", "2"]).as_bytes()[0], b'~');
+    resp3_call(&mut c, &["RPUSH", "l", "a", "b"]);
+    resp3_call(&mut c, &["BLPOP", "l", "0"]);
+    resp3_call(&mut c, &["BLMOVE", "l", "l2", "LEFT", "RIGHT", "0"]);
+    resp3_call(&mut c, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    resp3_call(&mut c, &["BZPOPMIN", "z", "0"]);
+    resp3_call(&mut c, &["BZMPOP", "0", "1", "z", "MAX", "COUNT", "5"]);
+    resp3_call(&mut c, &["SET", "f", "1"]);
+    resp3_call(&mut c, &["INCRBYFLOAT", "f", "1.5"]);
+    #[cfg(feature = "lua")]
+    {
+        resp3_call(&mut c, &["SADD", "s2", "x", "y", "z"]);
+        let reply = resp3_call(
+            &mut c,
+            &[
+                "EVAL",
+                "redis.setresp(3) return redis.call('SPOP', KEYS[1], 2)",
+                "1",
+                "s2",
+            ],
+        );
+        assert!(!reply.starts_with('-'), "{reply}");
+    }
+    assert!(resp3_call(&mut c, &["SET", "end", "1"]).starts_with('+'));
+
+    let seen = stream_until(&mut tap, |command| command.starts_with("SET end"));
+    for sent in &seen {
+        let name = sent.split(' ').next().unwrap_or("");
+        assert!(
+            !matches!(name, "SPOP" | "BLPOP" | "BLMOVE" | "BZPOPMIN" | "BZMPOP" | "INCRBYFLOAT"),
+            "{sent} was sent as it was: {seen:?}"
+        );
+    }
+    let has = |prefix: &str| seen.iter().filter(|sent| sent.starts_with(prefix)).count();
+    assert_eq!(has("SREM s "), 2, "{seen:?}");
+    assert_eq!(has("LPOP l"), 1, "{seen:?}");
+    assert_eq!(has("LMOVE l l2 LEFT RIGHT"), 1, "{seen:?}");
+    assert_eq!(has("ZPOPMIN z"), 1, "{seen:?}");
+    assert_eq!(has("ZPOPMAX z 2"), 1, "{seen:?}");
+    assert_eq!(has("SET f 2.5 KEEPTTL"), 1, "{seen:?}");
+    if cfg!(feature = "lua") {
+        assert_eq!(has("SREM s2 "), 1, "{seen:?}");
+    }
+
+    // The replica holds what the master does.
+    let mut master = Conn::connect(master_port);
+    assert_eq!(master.cmds(&["WAIT", "1", "5000"]).as_int(), 1);
+    for key in ["s", "s2"] {
+        let members = |c: &mut Conn| {
+            let mut m: Vec<String> = c
+                .cmds(&["SMEMBERS", key])
+                .as_array()
+                .iter()
+                .map(|v| v.as_str().to_string())
+                .collect();
+            m.sort();
+            m
+        };
+        assert_eq!(members(&mut replica), members(&mut master), "{key}");
+    }
+}
+
 /// A replica attached while the master is taking non-idempotent writes must
 /// end up identical to it. The full-sync payload and the stream used to
 /// overlap — a write landing during the dump was in both — so `INCR` counters
