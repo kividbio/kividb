@@ -1600,6 +1600,22 @@ fn json_debug_memory_is_the_values_memory() {
     assert!(mem(&mut c, ".") > members);
 }
 
+/// `JSON.ARRINDEX` of a key that does not exist is `ERR Path does not exist`,
+/// by a legacy path and a JSONPath alike, as in RedisJSON (#583). It was nil.
+#[test]
+fn json_arrindex_of_a_missing_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for path in [".a", "$.a"] {
+        assert_eq!(
+            c.cmds(&["JSON.ARRINDEX", "nosuch", path, "1"]).error_str(),
+            "ERR Path does not exist",
+            "{path}"
+        );
+    }
+}
+
 /// A legacy path that matches nothing, or matches a value of the wrong type,
 /// answers as RedisJSON 8.10 does: an error for most reads, where it used
 /// to be nil (#567).
