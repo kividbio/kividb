@@ -162,6 +162,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the writes under way to finish: `FT.CREATE` there fails with an
   error, and works outside the script, or once an index exists.
 
+- **Blocking commands in a script take what is there (#558).** Called from
+  a script or a function, `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`,
+  `BLMPOP`, `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` answered nil without
+  running, whatever the key held. They now run as their non-blocking form,
+  as in Redis and as they already did inside `MULTI`: the element if there
+  is one, their empty reply if not. A blocking pop now reaches replicas and
+  the AOF as the pop it made (`BLPOP` as `LPOP` of the key it took from,
+  `BZMPOP` as `ZPOPMIN key count`), as Redis sends it. A pop that takes
+  nothing (a `BLPOP` that times out, an `LPOP` of a missing key), from a
+  client or a script, is no longer sent, no longer counted as a change for
+  `save`, and no longer fails a `WATCH` on its key, as in Redis.
+- **`SWAPDB` fails only the watches on the swapped keys (#556).** It made
+  every `EXEC` after a `WATCH` fail, in every database. As in Redis, it now
+  fails a watch only on a key of the two databases it swaps that is in
+  either of them, a key whose time is up counting as absent, and `SWAPDB`
+  of a database with itself fails none.
+- **A refused `FUNCTION FLUSH` keeps the libraries (#559).** It emptied the
+  function store before it checked whether a script held the functions'
+  VM. When one did, the reply was `BUSY` but the libraries were gone, on
+  the master only. It now checks first, and a refused flush changes
+  nothing.
+- **`SPOP` with a count from a RESP3 client reaches replicas and the AOF.**
+  Its reply is a set there, which was not read, so nothing was sent: the
+  replicas, and a restart from the AOF, kept the members the master had
+  popped. So too from a script after `redis.setresp(3)`. It is now sent as
+  an `SREM` of the members popped, as from a RESP2 client.
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
   `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a
@@ -227,6 +253,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   check their number of arguments (`UNWATCH x` answered `OK`). Inside
   `MULTI` the wrong number also fails the transaction, and an `EXEC` with
   the wrong number discards it. Both I/O models.
+
+- **More of MULTI as Redis does it.** `PSYNC` and `SYNC` inside `MULTI`
+  handed the connection over as a replica. They are now refused with `ERR
+  Command not allowed inside a transaction`, and the transaction with them.
+  An `EXEC` the user's ACL rules refuse left the transaction open. It now
+  discards it and its watches and answers `EXECABORT Transaction discarded
+  because of: NOPERM ...`. A command with the wrong number of arguments, or
+  one that does not exist, is refused for that before the ACL rules are
+  checked, so the error says what is wrong. `HELLO 3 AUTH user wrong-password`
+  answered `WRONGPASS` but switched the connection to RESP3 anyway. The
+  protocol now changes only once the rest of `HELLO` is accepted. A command
+  run by `EXEC` is written to the slow log under the client name it ran
+  with. Before, the log used the name from before the transaction, even when
+  a queued `CLIENT SETNAME` or `HELLO SETNAME` had changed it. Both I/O
+  models.
 
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and

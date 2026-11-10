@@ -81,6 +81,15 @@ impl Conn {
                 let items = (0..count).map(|_| self.read_value()).collect();
                 RespValue::Array(items)
             }
+            // RESP3, for a connection that a HELLO 3 has switched.
+            Some(b'%') => {
+                let count: usize = line[1..].parse().unwrap();
+                let pairs = (0..count)
+                    .map(|_| (self.read_value(), self.read_value()))
+                    .collect();
+                RespValue::Map(pairs)
+            }
+            Some(b'_') => RespValue::Nil,
             _ => panic!("unexpected RESP line: {:?}", line),
         }
     }
@@ -93,6 +102,7 @@ enum RespValue {
     Int(i64),
     Bulk(Vec<u8>),
     Array(Vec<RespValue>),
+    Map(Vec<(RespValue, RespValue)>),
     Nil,
 }
 
@@ -183,6 +193,21 @@ fn start_server(port: u16) {
 }
 
 fn start_server_on(port: u16, io_model: kividb::config::IoModel) {
+    start_server_with(port, io_model, None, None);
+}
+
+/// A server on `port`, a replica of the server on `replica_of` if that is
+/// given, working in `dir` if that is.
+fn start_server_with(
+    port: u16,
+    io_model: kividb::config::IoModel,
+    replica_of: Option<u16>,
+    dir: Option<&std::path::Path>,
+) {
+    let replicaof = replica_of.map(|master| vec!["127.0.0.1".to_string(), master.to_string()]);
+    let dir = dir
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
     thread::spawn(move || {
         let config = kividb::config::Config {
             port,
@@ -193,7 +218,8 @@ fn start_server_on(port: u16, io_model: kividb::config::IoModel) {
             maxmemory: 0,
             loglevel: "error".to_string(),
             io_model,
-            replicaof: None,
+            replicaof,
+            dir,
             replica_announced_port: 0,
             requirepass: String::new(),
             aclfile: "".to_string(),
@@ -488,6 +514,183 @@ fn test_a_write_that_changes_nothing_does_not_fail_a_watch() {
     assert!(c.cmds(&["MULTI"]).is_ok());
     c.cmds(&["SET", "w", "5"]);
     assert!(c.cmds(&["EXEC"]).is_nil());
+}
+
+/// `SWAPDB` dirties the watches on the keys of the two databases it swaps
+/// that are in either of them, and no other: not a watch in another
+/// database, nor one on a key in neither. A database swapped with itself
+/// changes nothing (#556). Every watch in every database used to fail.
+#[test]
+fn test_swapdb_dirties_only_the_watches_on_the_swapped_keys() {
+    let port = free_port();
+    start_server(port);
+    let mut other = Conn::connect(port);
+    let watch = |db: &str, key: &str| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["SELECT", db]).is_ok());
+        assert!(c.cmds(&["WATCH", key]).is_ok());
+        c
+    };
+    let exec = |c: &mut Conn| {
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        c.cmds(&["EXEC"])
+    };
+    for (db, key) in [("5", "k"), ("0", "in0"), ("1", "in1")] {
+        assert!(other.cmds(&["SELECT", db]).is_ok());
+        assert!(other.cmds(&["SET", key, "v"]).is_ok());
+    }
+
+    let mut elsewhere = watch("5", "k");
+    let mut in_neither = watch("1", "absent");
+    let mut arrives = watch("1", "in0");
+    let mut leaves = watch("1", "in1");
+    let mut goes = watch("0", "in0");
+    assert!(other.cmds(&["SWAPDB", "0", "1"]).is_ok());
+    assert_eq!(exec(&mut elsewhere).as_array().len(), 1);
+    assert_eq!(exec(&mut in_neither).as_array().len(), 1);
+    assert!(exec(&mut arrives).is_nil());
+    assert!(exec(&mut leaves).is_nil());
+    assert!(exec(&mut goes).is_nil());
+
+    let mut itself = watch("1", "in0");
+    assert!(other.cmds(&["SWAPDB", "1", "1"]).is_ok());
+    assert_eq!(exec(&mut itself).as_array().len(), 1);
+}
+
+/// For `SWAPDB`, a key whose time is up is not there, as for a flush: a
+/// watch on one that had expired, swapped for none, holds, as does a watch
+/// on a key that is in neither database but for an expired one. A key that
+/// was there and is swapped for an expired one is gone: its watch fails
+/// (#556). Active expiry is off, so that the keys stay where they are.
+#[test]
+fn test_swapdb_takes_an_expired_key_as_absent() {
+    let port = free_port();
+    start_server(port);
+    let mut other = Conn::connect(port);
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).is_ok());
+    let watch = |db: &str, key: &str| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["SELECT", db]).is_ok());
+        assert!(c.cmds(&["WATCH", key]).is_ok());
+        c
+    };
+    let exec = |c: &mut Conn| {
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        c.cmds(&["EXEC"])
+    };
+    assert!(other.cmds(&["SELECT", "2"]).is_ok());
+    assert!(other.cmds(&["SET", "gone", "v", "PX", "1"]).is_ok());
+    assert!(other.cmds(&["SET", "live", "v", "PX", "1"]).is_ok());
+    assert!(other.cmds(&["SELECT", "3"]).is_ok());
+    assert!(other.cmds(&["SET", "live", "v"]).is_ok());
+    thread::sleep(Duration::from_millis(20));
+
+    let mut expired_here = watch("2", "gone");
+    let mut expired_there = watch("3", "gone");
+    let mut replaced = watch("3", "live");
+    assert!(other.cmds(&["SWAPDB", "2", "3"]).is_ok());
+    let held = (
+        exec(&mut expired_here),
+        exec(&mut expired_there),
+        exec(&mut replaced),
+    );
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).is_ok());
+    assert_eq!(held.0.as_array().len(), 1);
+    assert_eq!(held.1.as_array().len(), 1);
+    assert!(held.2.is_nil(), "{:?}", held.2);
+}
+
+/// A pop that takes nothing changes nothing, and a watch on its key holds,
+/// as in Redis: a `BLPOP` that times out, an `LPOP` of a missing key, and a
+/// `BLPOP` in a transaction that finds nothing (#558).
+#[test]
+fn test_a_pop_that_takes_nothing_does_not_fail_a_watch() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    assert!(c.cmds(&["WATCH", "empty"]).is_ok());
+    assert!(other.cmds(&["BLPOP", "empty", "0.01"]).is_nil());
+    assert!(other.cmds(&["LPOP", "empty"]).is_nil());
+    assert!(
+        other
+            .cmds(&["BLMOVE", "empty", "d", "LEFT", "LEFT", "0.01"])
+            .is_nil()
+    );
+    assert!(other.cmds(&["MULTI"]).is_ok());
+    other.cmds(&["BLPOP", "empty", "0"]);
+    other.cmds(&["BZPOPMIN", "empty", "0"]);
+    assert_eq!(other.cmds(&["EXEC"]).as_array().len(), 2);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert_eq!(c.cmds(&["EXEC"]).as_array().len(), 1);
+
+    // One that takes something fails it.
+    assert_eq!(other.cmds(&["RPUSH", "full", "a", "b"]).as_int(), 2);
+    assert!(c.cmds(&["WATCH", "full"]).is_ok());
+    assert_eq!(other.cmds(&["BLPOP", "full", "0"]).as_array().len(), 2);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert!(c.cmds(&["EXEC"]).is_nil());
+}
+
+/// A blocking command in a transaction never waits: it runs as its
+/// non-blocking form and takes what is there, as in Redis, and answers its
+/// empty reply when nothing is (#558).
+#[test]
+fn test_blocking_commands_in_a_transaction_take_what_is_there() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmds(&["RPUSH", "l", "a", "b", "c", "d"]).as_int(), 4);
+    assert_eq!(
+        c.cmds(&["ZADD", "z", "1", "m1", "2", "m2", "3", "m3"])
+            .as_int(),
+        3
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    for command in [
+        &["BLPOP", "l", "0"][..],
+        &["BRPOP", "l", "0"],
+        &["BLMOVE", "l", "dst", "LEFT", "RIGHT", "0"],
+        &["BLMPOP", "0", "1", "l", "LEFT"],
+        &["BRPOPLPUSH", "dst", "l", "0"],
+        &["BZPOPMIN", "z", "0"],
+        &["BZPOPMAX", "z", "0"],
+        &["BZMPOP", "0", "1", "z", "MIN"],
+        &["BLPOP", "empty", "0"],
+        &["BRPOPLPUSH", "empty", "dst", "0"],
+    ] {
+        assert_eq!(c.cmds(command).as_str(), "QUEUED");
+    }
+    let replies = c.cmds(&["EXEC"]);
+    let replies = replies.as_array();
+    let strings = |reply: &RespValue| {
+        reply
+            .as_array()
+            .iter()
+            .map(|part| part.as_str().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(strings(&replies[0]), ["l", "a"]);
+    assert_eq!(strings(&replies[1]), ["l", "d"]);
+    assert_eq!(replies[2].as_str(), "b");
+    assert_eq!(replies[3].as_array()[0].as_str(), "l");
+    assert_eq!(strings(&replies[3].as_array()[1]), ["c"]);
+    assert_eq!(replies[4].as_str(), "b");
+    assert_eq!(strings(&replies[5]), ["z", "m1", "1"]);
+    assert_eq!(strings(&replies[6]), ["z", "m3", "3"]);
+    assert_eq!(replies[7].as_array()[0].as_str(), "z");
+    assert_eq!(
+        strings(&replies[7].as_array()[1].as_array()[0]),
+        ["m2", "2"]
+    );
+    assert!(replies[8].is_nil(), "{:?}", replies[8]);
+    assert!(replies[9].is_nil(), "{:?}", replies[9]);
+    assert_eq!(c.cmds(&["LRANGE", "l", "0", "-1"]).as_array().len(), 1);
+    assert_eq!(c.cmds(&["EXISTS", "z", "dst"]).as_int(), 0);
 }
 
 /// A DEL of keys on several shards is one step: a reader never finds some
@@ -914,5 +1117,232 @@ fn test_transaction_commands_check_their_arguments() {
         );
         assert!(c.cmds(&["EXEC"]).error_msg().contains("EXEC without MULTI"));
         assert!(c.cmds(&["GET", "arity:k"]).is_nil());
+    });
+}
+
+/// A queued WAIT, with a replica connected, counts the replicas that have
+/// what was written before EXEC, and does not wait: neither `WAIT 1 0` nor
+/// `WAIT 5 0`, which outside a transaction would wait for ever.
+#[test]
+fn test_wait_inside_multi_with_a_replica_answers_without_waiting() {
+    for io_model in io_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let (master_dir, replica_dir) = (dir.path().join("m"), dir.path().join("r"));
+        std::fs::create_dir_all(&master_dir).unwrap();
+        std::fs::create_dir_all(&replica_dir).unwrap();
+        let master = free_port();
+        start_server_with(master, io_model, None, Some(&master_dir));
+        let replica = free_port();
+        start_server_with(
+            replica,
+            kividb::config::IoModel::Tokio,
+            Some(master),
+            Some(&replica_dir),
+        );
+        let mut m = Conn::connect(master);
+        let _r = Conn::connect(replica);
+
+        assert!(m.cmds(&["SET", "wr:before", "1"]).is_ok());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while m.cmds(&["WAIT", "1", "200"]).as_int() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replica never caught up"
+            );
+        }
+
+        let mut counted = false;
+        for _ in 0..20 {
+            assert!(m.cmds(&["MULTI"]).is_ok());
+            assert_eq!(m.cmds(&["SET", "wr:k", "v"]).as_str(), "QUEUED");
+            assert_eq!(m.cmds(&["WAIT", "1", "0"]).as_str(), "QUEUED");
+            assert_eq!(m.cmds(&["WAIT", "5", "0"]).as_str(), "QUEUED");
+            let started = std::time::Instant::now();
+            let exec = m.cmds(&["EXEC"]);
+            assert!(started.elapsed() < Duration::from_secs(2), "EXEC waited");
+            let replies = exec.as_array();
+            assert_eq!(replies.len(), 3);
+            assert!(replies[0].is_ok());
+            let (one, five) = (replies[1].as_int(), replies[2].as_int());
+            assert!(
+                (0..=1).contains(&one) && (0..=1).contains(&five),
+                "{replies:?}"
+            );
+            if one == 1 && five == 1 {
+                counted = true;
+                break;
+            }
+            // Something reached the replica's stream since: let it catch up.
+            m.cmds(&["WAIT", "1", "1000"]);
+        }
+        assert!(counted, "a caught-up replica was never counted");
+    }
+}
+
+/// The commands after a queued AUTH run under the rules of the user it
+/// made the connection; and a command queued after an AUTH that has not run
+/// yet is checked against the user the connection is now, as in Redis.
+#[test]
+fn test_acl_rules_follow_a_queued_auth() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        for user in [
+            &[
+                "ACL", "SETUSER", "noget", "on", ">pw", "~*", "+@all", "-get",
+            ][..],
+            &["ACL", "SETUSER", "full", "on", ">pw", "~*", "+@all"],
+        ] {
+            assert!(admin.cmds(user).is_ok());
+        }
+        assert!(admin.cmds(&["SET", "acl:k", "v"]).is_ok());
+        let mut c = Conn::connect(port);
+
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["AUTH", "noget", "pw"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["GET", "acl:k"]).as_str(), "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0].is_ok());
+        assert!(
+            replies[1].error_msg().starts_with("NOPERM"),
+            "{:?}",
+            replies[1]
+        );
+
+        // Now `noget`: a GET queued after an AUTH to `full` is refused when
+        // it is queued, and the transaction with it; the AUTH never runs.
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["AUTH", "full", "pw"]).as_str(), "QUEUED");
+        assert!(c.cmds(&["GET", "acl:k"]).error_msg().starts_with("NOPERM"));
+        assert!(c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"));
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "noget");
+    });
+}
+
+/// HELLO 3 run by EXEC answers with a map, and the replies after it in the
+/// same EXEC are RESP3.
+#[test]
+fn test_hello_3_inside_multi_switches_the_rest_of_the_exec() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert_eq!(c.cmds(&["HSET", "h3:h", "f", "v"]).as_int(), 1);
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["HELLO", "3"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["HGETALL", "h3:h"]).as_str(), "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 2);
+        let RespValue::Map(hello) = &replies[0] else {
+            panic!("HELLO 3 did not answer with a map: {:?}", replies[0]);
+        };
+        assert!(
+            hello
+                .iter()
+                .any(|(k, v)| k.as_str() == "proto" && *v == RespValue::Int(3)),
+            "{hello:?}"
+        );
+        assert_eq!(
+            replies[1],
+            RespValue::Map(vec![(
+                RespValue::Bulk(b"f".to_vec()),
+                RespValue::Bulk(b"v".to_vec())
+            )])
+        );
+    });
+}
+
+/// A HELLO whose AUTH fails leaves the protocol as it was, as in Redis.
+#[test]
+fn test_hello_with_a_failed_auth_keeps_the_protocol() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(
+            c.cmds(&["ACL", "SETUSER", "hu", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        let r = c.cmds(&["HELLO", "3", "AUTH", "hu", "wrong"]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" resp=2 "), "{}", info.as_str());
+        assert_eq!(c.cmds(&["HSET", "hp:h", "f", "v"]).as_int(), 1);
+        assert!(matches!(c.cmds(&["HGETALL", "hp:h"]), RespValue::Array(_)));
+    });
+}
+
+/// PSYNC and SYNC inside MULTI are refused, and the transaction with them,
+/// as in Redis (they are `no-multi`): they used to hand the connection over
+/// as a replica.
+#[test]
+fn test_psync_and_sync_inside_multi_are_refused() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        for sync in [&["PSYNC", "?", "-1"][..], &["SYNC"]] {
+            assert!(c.cmds(&["MULTI"]).is_ok());
+            assert_eq!(
+                c.cmds(sync).error_msg(),
+                "ERR Command not allowed inside a transaction"
+            );
+            assert!(c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"));
+            assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+        }
+    });
+}
+
+/// An EXEC refused by the user's rules discards the transaction, as Redis
+/// does: it used to be failed and left open.
+#[test]
+fn test_an_exec_refused_by_acl_discards_the_transaction() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "noexec", "on", ">pw", "~*", "+@all", "-exec"
+                ])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "noexec", "pw"]).is_ok());
+        assert!(c.cmds(&["WATCH", "ae:k"]).is_ok());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["SET", "ae:k", "v"]).as_str(), "QUEUED");
+        let r = c.cmds(&["EXEC"]);
+        assert!(
+            r.error_msg()
+                .starts_with("EXECABORT Transaction discarded because of: NOPERM"),
+            "{r:?}"
+        );
+        // Not in a transaction any more.
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert!(c.cmds(&["DISCARD"]).is_ok());
+        assert!(c.cmds(&["GET", "ae:k"]).is_nil());
+    });
+}
+
+/// A command with the wrong number of arguments, or no such command, is
+/// refused for that before the user's rules are looked at, as in Redis.
+#[test]
+fn test_arity_and_existence_come_before_acl() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "nowait", "on", ">pw", "~*", "+@all", "-wait"
+                ])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "nowait", "pw"]).is_ok());
+        assert_eq!(
+            c.cmds(&["WAIT"]).error_msg(),
+            "ERR wrong number of arguments for 'wait' command"
+        );
+        assert!(
+            c.cmds(&["WAIT", "0", "0"])
+                .error_msg()
+                .starts_with("NOPERM")
+        );
     });
 }
