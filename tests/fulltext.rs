@@ -1271,6 +1271,18 @@ fn test_spellcheck_scores_and_include_as_redisearch() {
     assert_eq!(r.as_array()[0].as_array()[1].as_str(), "helot", "{r:?}");
     assert_eq!(suggestions(&r), pairs(&[("0", "helot")]), "{r:?}");
 
+    // A word no document holds any more is neither offered nor spelled
+    // right, and the share is of the documents left.
+    c.cmds(&["DEL", "sc:3"]);
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "helo"]);
+    assert_eq!(
+        suggestions(&r),
+        pairs(&[("0.6666666666666666", "hello")]),
+        "{r:?}"
+    );
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "held"]);
+    assert_eq!(r.as_array()[0].as_array()[1].as_str(), "held", "{r:?}");
+
     for mode in ["INCLUDE", "EXCLUDE"] {
         let r = c.cmds(&["FT.SPELLCHECK", "idx", "helo", "TERMS", mode, "nosuch"]);
         assert!(

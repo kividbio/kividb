@@ -1400,45 +1400,14 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
 
-    // ── Read the per-index vocabulary ─────────────────────────────────────
-    //
-    // The vocab is maintained incrementally by maybe_index and backfill_index.
-    // We clone the Arc to drop the IndexStore lock before doing the lookup
-    // loop — keeps the fast path uncontended.
-    let (text_arc, total_docs) = {
-        let store = ctx.index_store.read();
-        let def = match store.get(&index_name) {
-            Some(d) => d,
-            None => {
-                return Some(resp_error(&crate::commands::search::no_such_index(
-                    &index_name,
-                )));
-            }
-        };
-        // The documents of the index, which RediSearch divides a word's
-        // document count by.
-        let total_docs = if def.keeps_postings() {
-            def.postings.read().len()
-        } else {
-            def.text.read().doc_count()
-        };
-        (Arc::clone(&def.text), total_docs)
+    // The index first, as RediSearch looks it up before the rest.
+    let Some(def) = ctx.index_store.read().get(&index_name).cloned() else {
+        return Some(resp_error(&crate::commands::search::no_such_index(
+            &index_name,
+        )));
     };
 
-    // The index's words, each with how many documents hold it, cloned so
-    // that the lock is let go of before the edit distances are measured.
-    let vocab: std::collections::BTreeMap<String, usize> = {
-        let text = text_arc.read();
-        text.words()
-            .map(|word| (word.to_string(), text.df_of(word)))
-            .collect()
-    };
-
-    // The TERMS INCLUDE|EXCLUDE clauses, re-read from the command:
-
-    // Parse TERMS INCLUDE|EXCLUDE dict clauses
-    // These appear after DISTANCE in the command args.
-    // We re-scan cmd here since we already consumed i above.
+    // The TERMS INCLUDE|EXCLUDE clauses.
     let mut include_dicts: Vec<String> = Vec::new();
     let mut exclude_dicts: Vec<String> = Vec::new();
     let mut j = 3usize;
@@ -1483,10 +1452,10 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     // The dictionaries, each of which must exist, the INCLUDE ones first,
-    // as RediSearch checks them. A query word in an EXCLUDE dictionary is
-    // spelled right and gets no entry. The words of an INCLUDE dictionary
-    // are offered as suggestions too, but a query word that is only in one
-    // is still misspelled.
+    // as RediSearch checks them (before anything else is read). A query word
+    // in an EXCLUDE dictionary is spelled right and gets no entry. The words
+    // of an INCLUDE dictionary are offered as suggestions too, but a query
+    // word that is only in one is still misspelled.
     let mut included: BTreeSet<String> = BTreeSet::new();
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     {
@@ -1506,12 +1475,38 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
 
-    // RediSearch's reply per misspelled word:
+    // The words some document holds, each with how many do, read in one
+    // pass and cloned, so that the lock is let go of before the edit
+    // distances are measured. A word no document holds any more is neither
+    // spelled right nor offered, as in RediSearch once its GC has run.
+    let vocab: std::collections::BTreeMap<String, usize> = {
+        let text = def.text.read();
+        text.live_words()
+            .map(|(id, word)| (word.to_string(), text.df(id)))
+            .collect()
+    };
+
+    // What RediSearch divides a word's document count by: every document of
+    // the index (`docs.size - 1`), as `FT.INFO`'s `num_docs` counts them.
+    let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
+    let total_docs =
+        crate::commands::search::count_docs(&ctx.store[def.db_index], &def, cluster).max(1) as f64;
+
+    // RediSearch's reply per misspelled word, RESP2:
     //   ["TERM", word, [[score, suggestion], ...]]
+    // and RESP3: {"results": {word: [{suggestion: score}, ...], ...}}.
     // A suggestion's score is the share of the index's documents that hold
-    // it (`spell_check.c`), best first; a word only in an INCLUDE
-    // dictionary scores 0.
-    let total_docs = total_docs.max(1) as f64;
+    // it (`spell_check.c`), best first, written as Redis writes a double; a
+    // word only in an INCLUDE dictionary scores 0.
+    let resp3 = ctx.resp == 3;
+    let score = |docs: usize| -> Vec<u8> {
+        let digits = crate::commands::helpers::format_score(docs as f64 / total_docs);
+        if resp3 {
+            format!(",{digits}\r\n").into_bytes()
+        } else {
+            resp_bulk_str(&digits)
+        }
+    };
     let mut out: Vec<Vec<u8>> = Vec::new();
 
     // The query's words as the index has them, so that `world_x` and
@@ -1541,20 +1536,29 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let suggestions: Vec<Vec<u8>> = candidates
             .iter()
             .map(|&(docs, word)| {
-                resp_array(vec![
-                    crate::resp::write::resp_double_bulk(docs as f64 / total_docs),
-                    resp_bulk_str(word),
-                ])
+                if resp3 {
+                    resp_map(vec![resp_bulk_str(word), score(docs)])
+                } else {
+                    resp_array(vec![score(docs), resp_bulk_str(word)])
+                }
             })
             .collect();
 
-        out.push(resp_array(vec![
-            resp_bulk_str("TERM"),
-            resp_bulk_str(&token_clean),
-            resp_array(suggestions),
-        ]));
+        if resp3 {
+            out.push(resp_bulk_str(&token_clean));
+            out.push(resp_array(suggestions));
+        } else {
+            out.push(resp_array(vec![
+                resp_bulk_str("TERM"),
+                resp_bulk_str(&token_clean),
+                resp_array(suggestions),
+            ]));
+        }
     }
 
+    if resp3 {
+        return Some(resp_map(vec![resp_bulk_str("results"), resp_map(out)]));
+    }
     Some(resp_array(out))
 }
 

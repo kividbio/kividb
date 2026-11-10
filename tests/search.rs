@@ -2791,6 +2791,64 @@ fn the_query_engine_settings_are_described() {
     }
 }
 
+/// `FT.SPELLCHECK` writes a small score as RediSearch does, in scientific
+/// notation (1 document of 1024 is `9.765625e-4`), divides by every
+/// document of the index, including those with no word near the query,
+/// and answers RESP3 with RediSearch's maps and doubles (#583).
+#[test]
+fn spellcheck_scores_as_redisearch_writes_them() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sp7",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sp7:",
+            "SCHEMA",
+            "body",
+            "TEXT",
+        ])
+        .ok()
+    );
+    c.cmd(&["HSET", "sp7:0", "body", "zebra"]);
+    for i in 1..1024 {
+        c.cmd(&["HSET", &format!("sp7:{i}"), "body", "plain"]);
+    }
+    // A document with no TEXT value counts too.
+    c.cmd(&["HSET", "sp7:none", "other", "x"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let reply = c.cmd(&["FT.SPELLCHECK", "sp7", "zebrb"]);
+    let term = reply.arr()[0].arr();
+    assert_eq!(term[0].s(), "TERM");
+    assert_eq!(term[1].s(), "zebrb");
+    let suggestion = term[2].arr()[0].arr();
+    assert_eq!(suggestion[0].s(), "9.75609756097561e-4", "{reply:?}");
+    assert_eq!(suggestion[1].s(), "zebra");
+
+    c.cmd(&["DEL", "sp7:none"]);
+    let reply = c.cmd(&["FT.SPELLCHECK", "sp7", "zebrb"]);
+    let suggestion = reply.arr()[0].arr()[2].arr()[0].arr().to_vec();
+    assert_eq!(suggestion[0].s(), "9.765625e-4", "{reply:?}");
+
+    let mut c3 = conn();
+    assert!(matches!(c3.cmd(&["HELLO", "3"]), V::Map(_)));
+    let reply = c3.cmd(&["FT.SPELLCHECK", "sp7", "zebrb plain"]);
+    let V::Map(results) = reply.get("results") else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(results.len(), 1, "{reply:?}");
+    assert_eq!(results[0].0.s(), "zebrb");
+    let V::Map(entry) = &results[0].1.arr()[0] else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(entry[0].0.s(), "zebra");
+    assert_eq!(entry[0].1, V::Double(1.0 / 1024.0));
+}
+
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.
 #[test]
 fn explain_and_profile_describe_the_query() {

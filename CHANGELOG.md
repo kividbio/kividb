@@ -267,8 +267,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `JSON.ARRINDEX` of a key that does not exist answers `ERR Path does
     not exist`, by a legacy path or a JSONPath; it was nil.
   - `FT.SPELLCHECK` scores a suggestion by the share of the index's
-    documents that hold it, as RediSearch does; it scored the edit
-    distance, with four decimals. A word of a `TERMS INCLUDE` dictionary
+    documents that hold it, as RediSearch does, written as Redis writes a
+    double (`9.765625e-4` for one document of 1024); it scored the edit
+    distance, with four decimals. A word that no document holds any more
+    is no longer offered, nor counted as spelled right. In RESP3 the reply
+    is RediSearch's map (`results`: each misspelled word to its
+    suggestions, each a map of the word to its score as a double); it was
+    the RESP2 arrays. A word of a `TERMS INCLUDE` dictionary
     is offered as a suggestion (scoring 0 when no document holds it), but
     a query word that is only in such a dictionary is still reported; it
     counted as spelled right. A dictionary named in `TERMS INCLUDE` or
