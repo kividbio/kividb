@@ -14,6 +14,9 @@ Each folder holds its README, harness and raw results. The README gives the hard
 | [datatypes](datatypes/README.md) | lists, hashes, sets, sorted sets and counters at 100 B and 2 KB, pipeline 1 and 16 (42 rows), plus 24 new rows on hashes whose fields carry TTLs | 2 alternating rounds (6 runs) per build; 4 more for `HSET` p16 |
 | [memory](memory/README.md) | bytes per key as the dataset grows to 50M keys (100 B and 1 KB), the warefeats cell, hashes with field TTLs, idle memory | 2-3 per build |
 | [profiling](profiling/README.md) | instructions per command with callgrind, fat LTO: the 18 `WORKLOADS=full` workloads plus 5 hash workloads | 4 runs per build |
+| [final](final/README.md) | the final commit `74071531` against 1.2.0: `GET`/`SET`, a mixed workload, `TS.ADD`, vector KNN, and the hash and field-TTL rows | 4 alternating rounds (2 for the hash rows) |
+
+**On the final commit (`74071531`, [final](final/README.md)):** no row is more than 3% slower than 1.2.0. `HSET` at pipeline 16 is now 7.8% faster (#544 fixed by #569), and writes of hash fields with a TTL are 5-44% faster.
 
 ## Builds
 
