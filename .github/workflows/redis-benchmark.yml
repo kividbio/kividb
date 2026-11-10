@@ -85,6 +85,7 @@ jobs:
       # compared with anywhere else (it reports itself as 8.10). Pinned: do not
       # float on whatever the repo's latest is on a given day.
       - name: Install redis-benchmark and redis-server (Redis 8.10.2)
+        timeout-minutes: 10
         env:
           REDIS_VERSION: "8.10.2"
         run: |

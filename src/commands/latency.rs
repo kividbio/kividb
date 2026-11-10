@@ -206,7 +206,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             .collect(),
         )),
 
-        _ => Some(resp_error("ERR unknown subcommand for LATENCY")),
+        _ => Some(resp_error(&format!(
+            "ERR unknown subcommand '{}'. Try LATENCY HELP.",
+            String::from_utf8_lossy(ctx.cmd[1])
+        ))),
     }
 }
 

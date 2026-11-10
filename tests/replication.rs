@@ -391,8 +391,9 @@ fn test_wait_no_replicas() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    // WAIT 1 0 — wait for 1 replica, 0ms timeout
-    let r = c.cmds(&["WAIT", "1", "0"]);
+    // WAIT 1 100: no replica acknowledges; after the timeout, as in Redis,
+    // the answer is 0. (`WAIT 1 0` waits for ever.)
+    let r = c.cmds(&["WAIT", "1", "100"]);
     assert_eq!(r.as_int(), 0);
 }
 
@@ -3131,6 +3132,71 @@ fn test_a_replica_of_keydb_in_active_replication_stops_at_rreplay() {
     assert_eq!(c.cmds(&["GET", "before"]).as_str(), "1");
     assert_eq!(c.cmds(&["EXISTS", "k"]).as_int(), 0);
     assert_eq!(c.cmds(&["EXISTS", "after"]).as_int(), 0);
+}
+
+/// A 1.2.0 master sends `TS.INCRBY` with `TIMESTAMP <time>` at the end, and
+/// read no other option. A 1.2.1 replica reads it so: the sample at that
+/// time, the options passed over, no trim to the retention. It is the
+/// master's dataset; read as 1.2.1 reads a command, the replica trimmed
+/// samples the master kept, made a label of `TIMESTAMP`, and put a sample
+/// at its own time (#555).
+#[test]
+fn test_a_replica_of_1_2_0_reads_its_ts_incrby_as_1_2_0_did() {
+    let mut payload = b"REDIS0009".to_vec();
+    payload.push(0xFF);
+    payload.extend_from_slice(&[0; 8]);
+    let master = keydb_master(
+        payload,
+        &[
+            &["TS.CREATE", "r", "RETENTION", "10"],
+            &["TS.INCRBY", "r", "1", "TIMESTAMP", "1"],
+            &["TS.INCRBY", "r", "1", "TIMESTAMP", "100"],
+            &[
+                "TS.INCRBY",
+                "c",
+                "1",
+                "RETENTION",
+                "10",
+                "LABELS",
+                "a",
+                "TIMESTAMP",
+                "5",
+            ],
+            &["TS.INCRBY", "c", "1", "LABELS", "x", "TIMESTAMP", "50"],
+            &["SET", "done", "1"],
+        ],
+    );
+    let node = spawn_server(replica_of(master));
+    let mut c = Conn::connect(node);
+    wait_until("the stream to be applied", Duration::from_secs(10), || {
+        c.cmds(&["EXISTS", "done"]).as_int() == 1
+    });
+    let samples = |c: &mut Conn, key: &str| -> Vec<(i64, String)> {
+        c.cmds(&["TS.RANGE", key, "-", "+"])
+            .as_array()
+            .iter()
+            .map(|s| {
+                (
+                    s.as_array()[0].as_int(),
+                    s.as_array()[1].as_str().to_string(),
+                )
+            })
+            .collect()
+    };
+    let num = |n: &str| n.to_string();
+    assert_eq!(samples(&mut c, "r"), [(1, num("1")), (100, num("2"))]);
+    assert_eq!(samples(&mut c, "c"), [(5, num("1")), (50, num("2"))]);
+    let info = c.cmds(&["TS.INFO", "c"]);
+    let info = info.as_array();
+    let field = |name: &str| {
+        let at = info
+            .iter()
+            .position(|v| matches!(v, RespValue::Bulk(b) if b == name.as_bytes()))
+            .unwrap_or_else(|| panic!("no {name}"));
+        &info[at + 1]
+    };
+    assert_eq!(field("retentionTime").as_str(), "0");
+    assert_eq!(field("labels"), &RespValue::Array(vec![]));
 }
 
 /// A Redis full sync that does not read is a broken link, retried as

@@ -162,6 +162,71 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the writes under way to finish: `FT.CREATE` there fails with an
   error, and works outside the script, or once an index exists.
 
+- **A replica that falls behind no longer makes its master evict its keys
+  and refuse writes (#542).** Under an `allkeys-*` policy, a replica that
+  full-synced or lagged under heavy writes made its master evict nearly
+  every key and answer writes with `OOM`; the replica deleted the same
+  keys. What is queued for a replica is not counted against `maxmemory`, as
+  in Redis, but only the stream's bytes were taken off: each queued write
+  also takes its allocation's header and padding and a slot in the queue,
+  6-7% more for writes of 100-1000 bytes, which with a replica gigabytes
+  behind came to over 100 MB. All of it is now left out. And a replica
+  dropped for passing `repl-replica-max-backlog-bytes` had the rest of its
+  queue sent to it before it was freed, at the replica's pace and counted
+  in full: it is now freed at once, since the replica resyncs anyway, from
+  the backlog or in full. `connected_slaves` also stopped going one lower
+  at each such drop (it reached -53): a late `REPLCONF ACK` from the
+  dropped replica brought back its row. A dropped replica that read
+  nothing (a stopped process) kept its connection and its queue for good,
+  since the master no longer timed it out, also when it stopped during its
+  full sync with the payload half written: its connection now ends within
+  a second of the drop, and its queue and the payload are freed however
+  the connection ends. On the io_uring loop, a connection ended by `repl-timeout` or by
+  the replica going away left its forwarder running, holding the socket
+  and the queue: it now ends with the connection.
+  On the issue's test (256 MB limit,
+  ~1 M `SET`s a second, a replica attached at 30 s), the master went from
+  27 M `OOM` replies and 17-18 M evictions down to no keys, to no `OOM`
+  replies, keeping 113-139k keys. Once caught up, the replica had the same
+  data. 1.2.0 has the same bug.
+
+- **`TS.INCRBY` and `TS.DECRBY` make a series with the options given
+  (#555).** `RETENTION`, `CHUNK_SIZE`, `DUPLICATE_POLICY` and `LABELS` were
+  passed over, and a series either command created had the defaults and no
+  labels. They now apply when the command creates the series, as in
+  RedisTimeSeries, and the sample is added as `TS.ADD` adds one, so the
+  series is trimmed to its retention; it never was.
+- **The time series options take RedisTimeSeries's spellings, and a word
+  that is not one no longer drops the options after it (#565).**
+  `TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.INCRBY` and `TS.DECRBY` took
+  `CHUNK SIZE` but not `CHUNK_SIZE`, and a word they did not know ended the
+  options with no error: `CHUNK_SIZE` and everything after it, `LABELS`
+  too, was dropped. `CHUNK_SIZE` is read now, and a word that is no option
+  is passed over and the options after it read, as RedisTimeSeries passes
+  it over. A chunk size must be a multiple of 8 from 48 to 1048576, an
+  `ENCODING` must be `COMPRESSED` or `UNCOMPRESSED`, and `IGNORE`, which
+  KiviDB does not support, is refused. `CHUNK SIZE`, `ON DUPLICATE` and
+  `DUPLICATE POLICY` are still accepted. `TS.ADD … ON_DUPLICATE policy`
+  applies to that one sample, as in RedisTimeSeries, while KiviDB's older
+  `ON DUPLICATE policy` still makes `policy` the series' own for good, as
+  it did in 1.2.0. `TS.ALTER` sets what it is given: `RETENTION 0`,
+  `CHUNK_SIZE 4096` and `LABELS` with no pairs were ignored. A `LABELS`
+  list still ends at the next option's name, as in 1.2.0, where
+  RedisTimeSeries takes every word after `LABELS` as a label: its
+  `LABELS a b RETENTION 5` has a label `RETENTION=5` as well; `ON`,
+  `CHUNK` and `DUPLICATE` end the list only when the word after them makes
+  the option. A `TS.ADD` its duplicate policy refuses no longer changes the
+  series' retention or policy, or trims it, on the master alone. A command
+  replayed from an AOF, or sent by a master, is not refused for what 1.2.0
+  accepted, so a log written by 1.2.0 replays whole; it replays under these
+  rules, so after the first restart a series can differ from what 1.2.0
+  held in memory: `TS.CREATE k FOO RETENTION 10` now has the retention, and
+  trims, and `ON_DUPLICATE SUM` is now applied. A `TS.INCRBY` or
+  `TS.DECRBY` record 1.2.0 wrote, or a 1.2.0 master sends, is read as 1.2.0
+  read it: its time, no other option, no trim. 1.2.1 sends these commands
+  with a lower-case `timestamp` and the time right after the value, which
+  tells its records from 1.2.0's.
+
 - **Blocking commands in a script take what is there (#558).** Called from
   a script or a function, `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`,
   `BLMPOP`, `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` answered nil without
@@ -320,6 +385,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `FT.CONFIG HELP` describes each setting, in RediSearch's words; every
     description was empty.
 
+- **More JSON and search replies as RedisJSON and RediSearch give them
+  (#583).**
+  - `JSON.ARRINDEX` of a key that does not exist answers `ERR Path does
+    not exist`, by a legacy path or a JSONPath; it was nil.
+  - `FT.SPELLCHECK` scores a suggestion by the share of the index's
+    documents that hold it, as RediSearch does, written as Redis writes a
+    double (`9.765625e-4` for one document of 1024); it scored the edit
+    distance, with four decimals. A word that no document holds any more
+    is no longer offered, nor counted as spelled right. In RESP3 the reply
+    is RediSearch's map (`results`: each misspelled word to its
+    suggestions, each a map of the word to its score as a double); it was
+    the RESP2 arrays. A word of a `TERMS INCLUDE` dictionary
+    is offered as a suggestion (scoring 0 when no document holds it), but
+    a query word that is only in such a dictionary is still reported; it
+    counted as spelled right. A dictionary named in `TERMS INCLUDE` or
+    `EXCLUDE` that does not exist is the error `Dict does not exist:
+    <name>`; it was passed over.
+  - `FT.CONFIG HELP`'s descriptions are RediSearch's byte for byte,
+    including three whose words its source runs together.
+
 - **JSON keyspace events are announced as RedisJSON announces them
   (#575).** A JSON write that changed nothing announced its event anyway:
   `JSON.SET` whose `NX` or `XX` was not met, and a JSONPath that matched
@@ -327,6 +412,71 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `JSON.STRAPPEND`, `JSON.NUMINCRBY` and the array commands). It now
   announces nothing, as in RedisJSON. `JSON.FORGET` announces `json.del`,
   as RedisJSON's does; it was `json.forget`.
+
+- **Small differences from Redis 8.10 in arguments, replies and errors
+  (#561, #562, #564, #566, #576).** Checked against Redis 8.10.3.
+  - `FLUSHALL` and `FLUSHDB` refuse anything but `ASYNC` or `SYNC` with
+    `ERR syntax error`; an unknown word used to flush synchronously.
+  - `WAIT` refuses a count or timeout that is not an integer, and a
+    negative timeout (which used to wait for ever), inside `MULTI` too. On
+    a replica it is refused, as in Redis; it waited for ever. Without
+    replicas, `WAIT n timeout` with `n` above 0 now waits out its timeout
+    and answers 0, as Redis does; it answered at once. A replica that
+    connects while a `WAIT` waits is counted once it has caught up. Only
+    replicas that are online and still connected are counted, a replica that
+    reconnected is counted once, and one back by partial resync only once it
+    has acknowledged the backlog it was sent. `WAIT 0` (and `WAIT` inside
+    `MULTI`) answers the number of replicas that have what was written, not
+    the number connected. A master that becomes a replica ends a waiting
+    `WAIT` with Redis's `-UNBLOCKED` error and closes the connection. A
+    client waiting in `WAIT` shows as blocked (`b` in `CLIENT LIST`,
+    `blocked_clients`), and `CLIENT UNBLOCK` ends its wait. `CLIENT LIST`
+    shows `b` for every blocked client.
+  - `LOLWUT VERSION` takes an integer, as do the options of versions 5 and
+    6.
+  - `VSETATTR` answers 1, or 0 when there is no such key or element (it
+    answered `OK`, or an error). `VRANDMEMBER` refuses a count that is not
+    an integer and extra arguments; `VEMB` refuses any option but `RAW`.
+  - `COMMAND INFO` gives RedisJSON's arity for the JSON commands (it gave
+    -2 for most).
+  - `XGROUP HELP`, `XINFO HELP` and `CLUSTER HELP` exist. An unknown
+    subcommand of `XGROUP`, `XINFO`, `PUBSUB`, `SLOWLOG`, `MODULE`,
+    `CLUSTER`, `FUNCTION`, `SCRIPT` and `LATENCY` gets Redis's
+    `ERR unknown subcommand '<name>'. Try <COMMAND> HELP.`. `SLOWLOG HELP`
+    lines are simple strings.
+  - An `XGROUP` subcommand on a key that does not exist gets Redis's error;
+    `XGROUP DESTROY` answered 0. `XGROUP CREATE` takes `MKSTREAM` and
+    `ENTRIESREAD` only after the ID, so a key or group called `mkstream` no
+    longer creates the stream, and refuses an ID that is not valid.
+  - `SCRIPT KILL` and `FUNCTION KILL` with nothing running answer
+    `NOTBUSY No scripts in execution right now.`; a command refused while a
+    function runs names `FUNCTION KILL`.
+  - `SCRIPT LOAD` compiles the script and refuses one that does not compile
+    or has an unknown shebang flag, as Redis does; the error used to come
+    at `EVALSHA`. `SCRIPT DEBUG` takes `YES`, `SYNC` or `NO` only.
+  - `SSUBSCRIBE` and `SUNSUBSCRIBE` count shard channels only, and the
+    other (un)subscribes count channels and patterns only; all three were
+    added together.
+  - The `XPENDING` summary lists consumers by name.
+  - `CLIENT LIST` and `CLIENT INFO` show `e` for `CLIENT NO-EVICT on`, and
+    `laddr` is the address the client connected to, not the bind address.
+    `RESET` turns NO-EVICT off and forgets the connection's `HIMPORT`
+    fieldsets.
+  - `CONFIG RESETSTAT` no longer zeroes `rdb_changes_since_last_save`.
+  - `LATENCY HISTORY` keeps 160 samples, one a second (the highest).
+  - `RANDOMKEY` keeps looking past expired keys while there are live ones;
+    it gave up after 64 and answered nil.
+  - `HOTKEYS STOP` answers nil when nothing is collecting, including after
+    `DURATION` has run out; it answered `OK` or an error.
+  - **`GEORADIUS` and `GEORADIUSBYMEMBER` are now refused on a read-only
+    replica** with `READONLY`, with or without `STORE`, as Redis refuses
+    them; they used to run there when they did not store. An application
+    that reads from replicas with them must switch to `GEORADIUS_RO` and
+    `GEORADIUSBYMEMBER_RO` (or `GEOSEARCH`).
+  - `ACL WHOAMI`, `ACL CAT`, `ACL GENPASS` and `ACL HELP` are no longer in
+    `@admin` or `@dangerous`, so a user without `@admin` can run them.
+  - Smaller texts: `BACKUP LIST x` names `backup|list`, and `MODULE LOAD`
+    no longer points to a file that does not exist.
 
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,

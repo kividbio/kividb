@@ -1216,6 +1216,82 @@ fn test_spellcheck_terms_exclude_counts_words_as_correct() {
     );
 }
 
+/// As RediSearch: a suggestion's score is the share of the index's
+/// documents that hold it, best first; the words of a `TERMS INCLUDE`
+/// dictionary are suggestions too (scoring 0 if no document holds them),
+/// but a query word only in one is still misspelled; and a dictionary that
+/// does not exist is an error (#583). Scores were a measure of the edit
+/// distance, an INCLUDE word counted as spelled right, and a missing
+/// dictionary was passed over.
+#[test]
+fn test_spellcheck_scores_and_include_as_redisearch() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "sc:", "p");
+    c.cmds(&["HSET", "sc:1", "p", "hello world"]);
+    c.cmds(&["HSET", "sc:2", "p", "hello there"]);
+    c.cmds(&["HSET", "sc:3", "p", "held"]);
+    c.cmds(&["HSET", "sc:4", "p", "other"]);
+    thread::sleep(Duration::from_millis(50));
+    c.cmds(&["FT.DICTADD", "inc", "helot", "hello", "zzz"]);
+
+    let suggestions = |r: &RespValue| -> Vec<(String, String)> {
+        r.as_array()[0].as_array()[2]
+            .as_array()
+            .iter()
+            .map(|s| {
+                let pair = s.as_array();
+                (pair[0].as_str().to_string(), pair[1].as_str().to_string())
+            })
+            .collect()
+    };
+    let pairs = |want: &[(&str, &str)]| -> Vec<(String, String)> {
+        want.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    };
+
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "helo"]);
+    assert_eq!(
+        suggestions(&r),
+        pairs(&[("0.5", "hello"), ("0.25", "held")]),
+        "{r:?}"
+    );
+
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "helo", "TERMS", "INCLUDE", "inc"]);
+    assert_eq!(
+        suggestions(&r),
+        pairs(&[("0.5", "hello"), ("0.25", "held"), ("0", "helot")]),
+        "{r:?}"
+    );
+
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "helot", "TERMS", "INCLUDE", "inc"]);
+    assert_eq!(r.as_array()[0].as_array()[1].as_str(), "helot", "{r:?}");
+    assert_eq!(suggestions(&r), pairs(&[("0", "helot")]), "{r:?}");
+
+    // A word no document holds any more is neither offered nor spelled
+    // right, and the share is of the documents left.
+    c.cmds(&["DEL", "sc:3"]);
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "helo"]);
+    assert_eq!(
+        suggestions(&r),
+        pairs(&[("0.6666666666666666", "hello")]),
+        "{r:?}"
+    );
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", "held"]);
+    assert_eq!(r.as_array()[0].as_array()[1].as_str(), "held", "{r:?}");
+
+    for mode in ["INCLUDE", "EXCLUDE"] {
+        let r = c.cmds(&["FT.SPELLCHECK", "idx", "helo", "TERMS", mode, "nosuch"]);
+        assert!(
+            matches!(&r, RespValue::Error(e) if e == "Dict does not exist: nosuch"),
+            "{mode}: {r:?}"
+        );
+    }
+}
+
 /// A query term matches every term of its synonym groups (`FT.SYNUPDATE`),
 /// in documents indexed before the group was made as well as after, as in
 /// RediSearch. The groups were kept, and searching changed nothing (#130).

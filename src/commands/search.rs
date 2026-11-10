@@ -465,7 +465,11 @@ fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<V
 }
 
 /// Documents the index covers: hashes, or JSON documents, under its prefixes.
-fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
+pub(crate) fn count_docs(
+    db: &Db,
+    def: &IndexDef,
+    cluster: Option<&crate::cluster::ClusterState>,
+) -> usize {
     // Read before any shard is locked: not the slot table with one held
     // (see `ClusterState`).
     let served = cluster.map(crate::cluster::search::served_slots);

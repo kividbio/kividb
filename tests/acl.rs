@@ -1488,7 +1488,7 @@ fn test_dangerous_category_denies_what_it_names() {
         "DEBUG",
         "SHUTDOWN",
         "REPLICAOF",
-        "ACL",
+        "ACL|LIST",
         "ACL|SETUSER",
         "CLUSTER|RESET",
         "CLUSTER|FORGET",
@@ -1516,6 +1516,9 @@ fn test_dangerous_category_denies_what_it_names() {
         "PING",
         "LMOVEM",
         "HIMPORT|PREPARE",
+        // Not administrative in Redis (#566).
+        "ACL|WHOAMI",
+        "ACL|CAT",
     ] {
         assert!(allowed(&user, kept), "{kept} should be allowed");
     }
