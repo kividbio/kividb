@@ -736,6 +736,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
             .get(ctx.authenticated_user)
             .and_then(|user| crate::acl::check_permission(user, name2, ctx.cmd.as_slice()).err());
         if let Some(denied) = denied {
+            let _lua = crate::acl::log_context("lua");
             ctx.acl_log.record(
                 denied.reason(),
                 denied.object(),

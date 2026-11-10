@@ -334,14 +334,15 @@ pub fn authenticate(store: &AclStore, username: &str, password: &str) -> Option<
 #[derive(Clone, Debug)]
 pub struct AclLogEntry {
     pub id: u64,
-    pub reason: String,         // "auth" or "command" or "key" or "channel"
-    pub context: String,        // "toplevel" or "multi" or "lua"
-    pub object: String,         // the offending command/key/channel name
-    pub username: String,       // which user triggered it
-    pub age_seconds: f64,       // seconds since the event (computed at query time)
-    pub client_info: String,    // addr:port
-    pub timestamp_created: u64, // Unix ms when created
-    pub count: u64,             // how many times this event was seen
+    pub reason: String,              // "auth" or "command" or "key" or "channel"
+    pub context: String,             // "toplevel" or "multi" or "lua"
+    pub object: String,              // the offending command/key/channel name
+    pub username: String,            // which user triggered it
+    pub age_seconds: f64,            // seconds since the event (computed at query time)
+    pub client_info: String,         // addr:port
+    pub timestamp_created: u64,      // Unix ms when created
+    pub timestamp_last_updated: u64, // Unix ms of the last event merged into it
+    pub count: u64,                  // how many times this event was seen
 }
 
 pub struct AclLog {
@@ -359,28 +360,58 @@ impl AclLog {
         }
     }
 
-    pub fn push(&self, entry: AclLogEntry) {
+    /// Add `entry`, as Redis's `addACLLogEntry` does: if one of the ten
+    /// newest entries has the same reason, context, object and user and was
+    /// last updated within 60 seconds, that entry is counted once more,
+    /// takes this one's client and time, and becomes the newest; otherwise
+    /// `entry` is added, with an id of its own.
+    pub fn push(&self, mut entry: AclLogEntry) {
+        const GROUPING_MS: u64 = 60_000;
         let mut log = self.entries.write();
+        let newest = log.len();
+        let matched = (0..newest).rev().take(10).find(|&i| {
+            let e = &log[i];
+            e.reason == entry.reason
+                && e.context == entry.context
+                && e.timestamp_last_updated
+                    .abs_diff(entry.timestamp_last_updated)
+                    <= GROUPING_MS
+                && e.object == entry.object
+                && e.username == entry.username
+        });
+        if let Some(i) = matched {
+            let mut e = log.remove(i).expect("an index found in the log");
+            e.count += 1;
+            e.client_info = entry.client_info;
+            e.timestamp_last_updated = entry.timestamp_last_updated;
+            log.push_back(e);
+            return;
+        }
+        entry.id = self.next_id();
         if log.len() >= self.max_len {
             log.pop_front();
         }
         log.push_back(entry);
     }
 
-    /// Record a refused command, key or channel.
+    /// Record a refusal: a command, key or channel the user's rules refuse,
+    /// or a failed AUTH. The context is the one the connection is in (see
+    /// [`log_context`]): `toplevel`, `multi` or `lua`.
     pub fn record(&self, reason: &str, object: &str, username: &str, client_info: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         self.push(AclLogEntry {
-            id: self.next_id(),
+            id: 0,
             reason: reason.into(),
-            context: "toplevel".into(),
+            context: LOG_CONTEXT.with(|context| context.get()).into(),
             object: object.into(),
             username: username.into(),
             age_seconds: 0.0,
             client_info: client_info.into(),
-            timestamp_created: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            timestamp_created: now,
+            timestamp_last_updated: now,
             count: 1,
         });
     }
@@ -396,7 +427,7 @@ impl AclLog {
             .take(count)
             .map(|e| {
                 let mut e = e.clone();
-                e.age_seconds = (now_ms.saturating_sub(e.timestamp_created)) as f64 / 1000.0;
+                e.age_seconds = (now_ms.saturating_sub(e.timestamp_last_updated)) as f64 / 1000.0;
                 e
             })
             .collect()
@@ -419,6 +450,26 @@ impl Default for AclLog {
 }
 
 pub type SharedAclLog = Arc<AclLog>;
+
+thread_local! {
+    static LOG_CONTEXT: std::cell::Cell<&'static str> = const { std::cell::Cell::new("toplevel") };
+}
+
+/// Until it is dropped, what this thread writes to the ACL log is in
+/// `context` (`multi` inside a transaction, `lua` inside a script), as
+/// Redis's entries are. Set around code that does not await.
+pub fn log_context(context: &'static str) -> LogContext {
+    LogContext(LOG_CONTEXT.with(|current| current.replace(context)))
+}
+
+/// See [`log_context`]: the context before, put back on drop.
+pub struct LogContext(&'static str);
+
+impl Drop for LogContext {
+    fn drop(&mut self) {
+        LOG_CONTEXT.with(|current| current.set(self.0));
+    }
+}
 
 pub fn new_acl_log() -> SharedAclLog {
     Arc::new(AclLog::new())

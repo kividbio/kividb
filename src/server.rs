@@ -1226,22 +1226,8 @@ where
             if authenticated_user.is_none()
                 && !matches!(cmd_name.as_str(), "AUTH" | "QUIT" | "HELLO" | "RESET")
             {
-                // Log unauthenticated access attempt
-                let entry = crate::acl::AclLogEntry {
-                    id: acl_log.next_id(),
-                    reason: "auth".into(),
-                    context: "toplevel".into(),
-                    object: cmd_name.to_lowercase(),
-                    username: "default".into(),
-                    age_seconds: 0.0,
-                    client_info: peer_addr.clone(),
-                    timestamp_created: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    count: 1,
-                };
-                acl_log.push(entry);
+                // As in Redis, nothing goes to the ACL log: no user was
+                // refused anything.
                 combined.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
                 parse_offset += consumed;
                 continue;
@@ -1264,6 +1250,7 @@ where
                     } else if tx.active && commands::transaction::not_allowed_in_multi(&cmd_name) {
                         crate::resp::write::resp_error(commands::transaction::NOT_IN_MULTI)
                     } else {
+                        let _context = tx.active.then(|| crate::acl::log_context("multi"));
                         acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
                         format!("-{}\r\n", denied.message(username)).into_bytes()
                     };
@@ -1843,6 +1830,9 @@ where
 
                             // A plain FLUSHALL here is not counted as lazily freed.
                             let _queued = crate::lazyfree::running_queued();
+                            // What the queued commands write to the ACL log is
+                            // in context `multi`, as in Redis.
+                            let _context = crate::acl::log_context("multi");
                             for queued_cmd in queued {
                                 let queued_name = queued_cmd
                                     .first()
@@ -1887,7 +1877,6 @@ where
                                             user: &mut authenticated_user,
                                             key_restricted: &mut key_restricted,
                                             cmd_restricted: &mut cmd_restricted,
-                                            in_exec: true,
                                         }
                                         .auth(&args)
                                     } else if queued_name == "HELLO" {
@@ -1900,7 +1889,6 @@ where
                                             user: &mut authenticated_user,
                                             key_restricted: &mut key_restricted,
                                             cmd_restricted: &mut cmd_restricted,
-                                            in_exec: true,
                                         }
                                         .hello(
                                             &args,
@@ -2067,7 +2055,6 @@ where
                     user: &mut authenticated_user,
                     key_restricted: &mut key_restricted,
                     cmd_restricted: &mut cmd_restricted,
-                    in_exec: false,
                 }
                 .auth(&cmd),
 
@@ -2081,7 +2068,6 @@ where
                         user: &mut authenticated_user,
                         key_restricted: &mut key_restricted,
                         cmd_restricted: &mut cmd_restricted,
-                        in_exec: false,
                     }
                     .hello(&cmd, &mut resp_version, &repl_state);
                     // Counted here: the commands below are not.

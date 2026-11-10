@@ -22,31 +22,41 @@ pub struct Login<'a> {
     /// See `acl::track_restriction_counters`.
     pub key_restricted: &'a mut bool,
     pub cmd_restricted: &'a mut bool,
-    /// Run by `EXEC`, from a transaction's queue: the ACL log says
-    /// `multi` for a failed AUTH, as Redis's does.
-    pub in_exec: bool,
 }
 
 const WRONGPASS: &[u8] = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n";
 
 impl Login<'_> {
-    /// A failed AUTH, in the ACL log, as Redis's `ACLAuthenticateUser`
-    /// writes it.
-    fn log_failed_auth(&self, username: &str) {
-        self.acl_log.push(crate::acl::AclLogEntry {
-            id: self.acl_log.next_id(),
-            reason: "auth".into(),
-            context: if self.in_exec { "multi" } else { "toplevel" }.into(),
-            object: username.to_string(),
-            username: username.to_string(),
-            age_seconds: 0.0,
-            client_info: self.peer_addr.to_string(),
-            timestamp_created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            count: 1,
-        });
+    /// Logs the connection in as `username` with `password`, or writes the
+    /// failure to the ACL log as Redis's `ACLAuthenticateUser` does: reason
+    /// `auth`, the user named, and the command as the client sent it
+    /// (`command`, `AUTH` or `HELLO`) as the object.
+    ///
+    /// Users and passwords are text here: a name or a password that is not
+    /// UTF-8 is no user's. (They were read as `default`, and as an empty
+    /// password.)
+    fn log_in(&mut self, command: &[u8], username: &[u8], password: &[u8]) -> bool {
+        let user = match (std::str::from_utf8(username), std::str::from_utf8(password)) {
+            (Ok(username), Ok(password)) => {
+                crate::acl::authenticate(self.acl_store, username, password)
+            }
+            _ => None,
+        };
+        match user {
+            Some(user) => {
+                self.become_user(&user);
+                true
+            }
+            None => {
+                self.acl_log.record(
+                    "auth",
+                    &String::from_utf8_lossy(command),
+                    &String::from_utf8_lossy(username),
+                    self.peer_addr,
+                );
+                false
+            }
+        }
     }
 
     /// The connection is now `user`.
@@ -73,32 +83,23 @@ impl Login<'_> {
             // is not in use. It was answered OK (#135).
             return crate::acl::AUTH_WITHOUT_PASSWORD.as_bytes().to_vec();
         }
-        let (provided_username, provided_password) = if cmd.len() >= 3 {
-            // AUTH username password
-            (
-                std::str::from_utf8(cmd[1]).unwrap_or("").to_string(),
-                std::str::from_utf8(cmd[2]).unwrap_or("").to_string(),
-            )
+        // Only the two forms, as in Redis.
+        if cmd.len() > 3 {
+            return b"-ERR syntax error\r\n".to_vec();
+        }
+        // `AUTH password` is the legacy form: the user is `default`.
+        let (username, password): (&[u8], &[u8]) = if cmd.len() == 3 {
+            (cmd[1], cmd[2])
         } else {
-            // AUTH password — legacy form, authenticate as "default"
-            (
-                "default".to_string(),
-                std::str::from_utf8(cmd[1]).unwrap_or("").to_string(),
-            )
+            (b"default", cmd[1])
         };
-
-        match crate::acl::authenticate(self.acl_store, &provided_username, &provided_password) {
-            Some(user) => {
-                self.become_user(&user);
-                // Simple string, not a bulk string: real Redis replies `+OK`
-                // here, and clients that text-match a leading `+OK` on
-                // control connections read `$2\r\nOK\r\n` as a failed AUTH.
-                resp_simple("OK")
-            }
-            None => {
-                self.log_failed_auth(&provided_username);
-                WRONGPASS.to_vec()
-            }
+        if self.log_in(cmd[0], username, password) {
+            // Simple string, not a bulk string: real Redis replies `+OK`
+            // here, and clients that text-match a leading `+OK` on
+            // control connections read `$2\r\nOK\r\n` as a failed AUTH.
+            resp_simple("OK")
+        } else {
+            WRONGPASS.to_vec()
         }
     }
 
@@ -117,10 +118,7 @@ impl Login<'_> {
         let mut next = 1usize;
         if let Some(ver) = cmd.get(1) {
             next = 2;
-            let Some(ver) = std::str::from_utf8(ver)
-                .ok()
-                .and_then(|ver| ver.parse::<i64>().ok())
-            else {
+            let Some(ver) = strict_integer(ver) else {
                 return b"-ERR Protocol version is not an integer or out of range\r\n".to_vec();
             };
             if !(2..=3).contains(&ver) {
@@ -157,18 +155,10 @@ impl Login<'_> {
             }
         }
 
-        if let Some((username, password)) = credentials {
-            let username = std::str::from_utf8(username).unwrap_or("default");
-            let password = std::str::from_utf8(password).unwrap_or("");
-            // The user named, and no other. (This used to accept `default`
-            // as a name for *any* user whose password matched.)
-            match crate::acl::authenticate(self.acl_store, username, password) {
-                Some(user) => self.become_user(&user),
-                None => {
-                    self.log_failed_auth(username);
-                    return WRONGPASS.to_vec();
-                }
-            }
+        if let Some((username, password)) = credentials
+            && !self.log_in(cmd[0], username, password)
+        {
+            return WRONGPASS.to_vec();
         }
 
         // HELLO is let through the auth gate so that it can carry AUTH;
@@ -226,4 +216,19 @@ impl Login<'_> {
             resp_array(kv)
         }
     }
+}
+
+/// An integer as Redis's `string2ll` reads one: digits, a `-` before them
+/// at most, no `+`, no leading zero (but `0` itself), no space.
+fn strict_integer(raw: &[u8]) -> Option<i64> {
+    let digits = raw.strip_prefix(b"-").unwrap_or(raw);
+    let well_formed = match digits {
+        [] => false,
+        [b'0'] => raw.len() == 1,
+        [first, rest @ ..] => (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit),
+    };
+    if !well_formed {
+        return None;
+    }
+    std::str::from_utf8(raw).ok()?.parse().ok()
 }

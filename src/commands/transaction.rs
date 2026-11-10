@@ -75,13 +75,11 @@ const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 /// The refusal of a command that may not be part of a transaction.
 pub const NOT_IN_MULTI: &str = "ERR Command not allowed inside a transaction";
 
-/// Whether `name` (in capitals) may not be part of a transaction (Redis's
-/// `no-multi`): it ends the process, or takes the connection over.
+/// Whether `name` (in capitals) may not be part of a transaction: the
+/// commands Redis flags `no-multi`. They end the process, write a
+/// snapshot in the foreground, or take the connection over.
 pub fn not_allowed_in_multi(name: &str) -> bool {
-    matches!(
-        name,
-        "SAVE" | "SHUTDOWN" | "BGREWRITEAOF" | "FAILOVER" | "SYNC" | "PSYNC"
-    )
+    matches!(name, "SAVE" | "SHUTDOWN" | "SYNC" | "PSYNC")
 }
 
 /// What a transaction's queued command is run with, when the connection loop

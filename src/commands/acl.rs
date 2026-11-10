@@ -416,7 +416,7 @@ fn format_acl_log(entries: Vec<AclLogEntry>) -> Vec<u8> {
                 resp_bulk_str("timestamp-created"),
                 resp_integer(e.timestamp_created as i64),
                 resp_bulk_str("timestamp-last-updated"),
-                resp_integer(e.timestamp_created as i64),
+                resp_integer(e.timestamp_last_updated as i64),
                 resp_bulk_str("client-info"),
                 resp_bulk_str(&e.client_info),
                 resp_bulk_str("reason"),

@@ -1368,11 +1368,196 @@ fn test_hello_options_as_redis() {
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(field(&log[0], "reason").contains("auth"), "{log:?}");
         assert!(field(&log[0], "username").contains("hu2"), "{log:?}");
+        assert_eq!(field(&log[0], "object"), "HELLO", "{log:?}");
+        assert_eq!(field(&log[0], "context"), "toplevel", "{log:?}");
 
         // SETNAME before AUTH.
         let hello = c.cmds(&["HELLO", "2", "SETNAME", "n1", "AUTH", "hu2", "pw"]);
         assert_eq!(hello.as_array()[0].as_str(), "server");
         assert_eq!(c.cmds(&["CLIENT", "GETNAME"]).as_str(), "n1");
         assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "hu2");
+    });
+}
+
+/// A failed AUTH or HELLO AUTH run by EXEC is logged in context `multi`,
+/// with the command as the client sent it as the object.
+#[test]
+fn test_a_failed_auth_inside_exec_is_logged_in_context_multi() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "mu", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["auth", "mu", "wrong"]).as_str(), "QUEUED");
+        assert_eq!(
+            c.cmds(&["Hello", "2", "AUTH", "mu", "bad"]).as_str(),
+            "QUEUED"
+        );
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert!(replies[0].error_msg().starts_with("WRONGPASS"));
+        assert!(replies[1].error_msg().starts_with("WRONGPASS"));
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 2, "{log:?}");
+        // Newest first.
+        assert_eq!(field(&log[0], "object"), "Hello");
+        assert_eq!(field(&log[1], "object"), "auth");
+        for entry in &log {
+            assert_eq!(field(entry, "reason"), "auth");
+            assert_eq!(field(entry, "context"), "multi");
+            assert_eq!(field(entry, "username"), "mu");
+        }
+    });
+}
+
+/// More of HELLO, as Redis's `helloCommand`.
+#[test]
+fn test_hello_edge_cases_as_redis() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        // No version: the protocol stays as it is.
+        let hello = c.cmds(&["HELLO"]);
+        let fields = hello.as_array();
+        let proto = fields.iter().position(|f| f.as_str() == "proto").unwrap();
+        assert_eq!(fields[proto + 1], RespValue::Int(2));
+        // An option without its value.
+        assert_eq!(
+            c.cmds(&["HELLO", "3", "SETNAME"]).error_msg(),
+            "ERR Syntax error in HELLO option 'SETNAME'"
+        );
+        // The version is checked before the options.
+        assert!(
+            c.cmds(&["HELLO", "4", "BOGUS"])
+                .error_msg()
+                .starts_with("NOPROTO")
+        );
+        // An integer as Redis reads one.
+        for ver in ["+3", "03", " 3", "3 "] {
+            assert_eq!(
+                c.cmds(&["HELLO", ver]).error_msg(),
+                "ERR Protocol version is not an integer or out of range",
+                "{ver:?}"
+            );
+        }
+        // Options given twice: the last one counts.
+        assert!(matches!(
+            c.cmds(&["HELLO", "2", "SETNAME", "first", "SETNAME", "second"]),
+            RespValue::Array(_)
+        ));
+        assert_eq!(c.cmds(&["CLIENT", "GETNAME"]).as_str(), "second");
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" resp=2 "), "{}", info.as_str());
+    });
+}
+
+/// AUTH as Redis: no more than a user and a password, and a user or a
+/// password that is not UTF-8 is nobody's, not `default`'s.
+#[test]
+fn test_auth_arguments_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "au", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert_eq!(
+            c.cmds(&["AUTH", "au", "pw", "extra"]).error_msg(),
+            "ERR syntax error"
+        );
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "default");
+        let r = c.cmd(&[&b"AUTH"[..], &b"\xff\xfe"[..], &b"pw"[..]]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        let r = c.cmd(&[&b"AUTH"[..], &b"au"[..], &b"\xff"[..]]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "default");
+        assert!(c.cmds(&["AUTH", "au", "pw"]).is_ok());
+    });
+}
+
+/// The ACL log merges an event into an entry like it, as Redis does: same
+/// reason, context, object and user, within 60 s. A refusal inside MULTI is
+/// in context `multi`, and so a separate entry.
+#[test]
+fn test_the_acl_log_merges_entries_like_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "lu", "on", ">pw", "~*", "+@all", "-get"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "lu", "pw"]).is_ok());
+        for _ in 0..3 {
+            assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        }
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(field(&log[0], "count"), "Int(3)");
+        assert_eq!(field(&log[0], "context"), "toplevel");
+        assert_eq!(field(&log[0], "object"), "get");
+        let created: u64 = field(&log[0], "timestamp-created")
+            .trim_start_matches("Int(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
+        let updated: u64 = field(&log[0], "timestamp-last-updated")
+            .trim_start_matches("Int(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
+        assert!(updated >= created);
+
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        assert!(c.cmds(&["DISCARD"]).is_ok());
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(field(&log[0], "context"), "multi");
+        assert_eq!(field(&log[0], "count"), "Int(1)");
+    });
+}
+
+/// A command refused for want of AUTH is not in the ACL log, as in Redis:
+/// no user was refused anything.
+#[test]
+fn test_noauth_writes_no_acl_log_entry() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "default", "resetpass", ">pw"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOAUTH"));
+        assert!(c.cmds(&["SET", "k", "v"]).error_msg().starts_with("NOAUTH"));
+        assert!(acl_log(&mut admin).is_empty());
+    });
+}
+
+/// BGREWRITEAOF and FAILOVER are not `no-multi` in Redis: they are queued,
+/// and run by EXEC.
+#[test]
+fn test_bgrewriteaof_and_failover_are_queued() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["BGREWRITEAOF"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["FAILOVER"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[2].as_str(), "PONG");
     });
 }

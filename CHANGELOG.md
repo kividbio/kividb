@@ -235,6 +235,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unknown before the ACL rules are checked, and so is one inside `MULTI` that
   cannot be part of a transaction (`PSYNC`, `SYNC`). Neither goes to the ACL
   log. An `EXEC` refused before it runs is shown to `MONITOR`.
+  `BGREWRITEAOF` and `FAILOVER` are queued inside `MULTI`, as in Redis,
+  where they were refused. `AUTH` with more than a user and a password is a
+  syntax error. A user name or password that is not UTF-8 matches no user.
+  Before, they were read as `default` and as an empty password.
+
+- **The ACL log keeps what Redis's keeps.** A failed `AUTH` or `HELLO ...
+  AUTH` is logged with the command as the object (`AUTH`, `HELLO`), not
+  the user name. A refusal inside `MULTI` or `EXEC` has the context
+  `multi`, and one inside a script has `lua`, where every entry said
+  `toplevel`. A command refused for want of `AUTH` is no longer logged. An
+  event like one of the ten newest entries (same reason, context, object
+  and user, within 60 seconds) is counted in that entry, and moves its
+  `timestamp-last-updated`, instead of adding another.
 
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
