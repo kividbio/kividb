@@ -1825,10 +1825,20 @@ mod tests {
         // Far past the clock, so that no write takes a key for expired.
         let mut now = crate::commands::helpers::now_ms() + 1_000_000_000;
         let mut map = ShardMap::new();
-        for step in 0..60_000 {
+        // What the table says, not the list under test: every key with a
+        // time to live and when it ends.
+        let timed = |map: &ShardMap| -> Vec<(Vec<u8>, u64)> {
+            let mut timed: Vec<(Vec<u8>, u64)> = map
+                .entries()
+                .filter_map(|e| e.expires().map(|at| (e.key().to_vec(), at)))
+                .collect();
+            timed.sort();
+            timed
+        };
+        for step in 0..80_000 {
             let key = format!("k{}", rand(300));
             let at = now + rand(60_000);
-            match rand(12) {
+            match rand(16) {
                 0 => {
                     map.set_str_expiring(&key, "v", Some(at));
                 }
@@ -1857,12 +1867,41 @@ mod tests {
                     map.sweep_ttl(now, 1 + rand(40) as usize);
                 }
                 10 => now += rand(4_000),
+                // The clock stepped back, now and then by much more than a
+                // horizon.
+                11 => {
+                    let most = if rand(20) == 0 { 600_000 } else { 4_000 };
+                    now -= rand(most);
+                }
+                12 => {
+                    // A key taken out and put back, as `MOVE` does.
+                    if let Some(taken) = map.remove(&key) {
+                        assert!(map.put_back(taken).is_ok_and(|old| old.is_none()));
+                    }
+                }
+                13 => {
+                    // A new time given to an entry someone else holds: a
+                    // new entry takes its place.
+                    let held = map.get_ref(&key);
+                    map.set_expires(&key, at);
+                    drop(held);
+                }
+                14 => {
+                    // The sweep under way finished, then one from now if
+                    // that is due: none is due after it, wherever the clock
+                    // has gone meanwhile.
+                    while !map.sweep_ttl(now, 64) {}
+                    if map.ttl_sweep_due(now) {
+                        while !map.sweep_ttl(now, 64) {}
+                    }
+                    assert!(!map.ttl_sweep_due(now), "step {step}");
+                }
                 _ => {
                     // A key past its time, taken out as expiry takes one.
-                    let past = map
-                        .expiring()
+                    let past = timed(&map)
+                        .into_iter()
                         .find(|&(_, at)| at < now)
-                        .map(|(k, _)| k.to_vec());
+                        .map(|(k, _)| k);
                     if let Some(k) = past {
                         assert!(map.remove_if_due(&k, now).is_some());
                     }
@@ -1871,10 +1910,11 @@ mod tests {
             map.ttl.check();
             if step % 50 == 0 {
                 let probe = now + rand(30_000);
-                let mut want: Vec<Vec<u8>> = map
-                    .expiring()
-                    .filter(|&(_, at)| at < probe)
-                    .map(|(k, _)| k.to_vec())
+                let table = timed(&map);
+                let want: Vec<Vec<u8>> = table
+                    .iter()
+                    .filter(|&&(_, at)| at < probe)
+                    .map(|(k, _)| k.clone())
                     .collect();
                 let mut got: Vec<Vec<u8>> = map
                     .due(probe, usize::MAX)
@@ -1882,10 +1922,14 @@ mod tests {
                     .iter()
                     .map(|k| k.as_bytes().to_vec())
                     .collect();
-                want.sort();
                 got.sort();
                 assert_eq!(got, want, "step {step}");
-                assert_eq!(map.ttl.len(), map.expiring().count());
+                // The list holds every key with a time to live, and nothing
+                // else.
+                let mut listed: Vec<(Vec<u8>, u64)> =
+                    map.expiring().map(|(k, at)| (k.to_vec(), at)).collect();
+                listed.sort();
+                assert_eq!(listed, table, "step {step}");
             }
         }
         // The near part is no bigger than what can come due before the
@@ -1893,10 +1937,114 @@ mod tests {
         while !map.sweep_ttl(now, 7) {}
         while !map.sweep_ttl(now, 7) {}
         map.ttl.check();
-        let soon = map
-            .expiring()
-            .filter(|&(_, at)| at < now + super::super::ttl_list::HORIZON_MS)
+        let soon = timed(&map)
+            .iter()
+            .filter(|&&(_, at)| at < now + super::super::ttl_list::HORIZON_MS)
             .count();
         assert_eq!(map.ttl.near_len(), soon);
+    }
+
+    /// A clock stepped forward, a sweep, then the clock stepped back: the
+    /// next sweep brings the horizon back, and the keys that cannot be due
+    /// soon go back to the far list, rather than every pass looking at them
+    /// until the clock has caught up.
+    #[test]
+    fn a_clock_stepped_back_does_not_leave_every_key_near() {
+        use super::super::ttl_list::HORIZON_MS;
+        let mut map = ShardMap::new();
+        let now = crate::commands::helpers::now_ms() + 1_000_000_000;
+        for i in 0..1000 {
+            let at = if i % 10 == 0 {
+                now + 5_000
+            } else {
+                now + 3_600_000
+            };
+            map.insert_expiring(format!("k{i}"), s("v"), Some(at));
+        }
+        // An hour ahead: every key ends before that horizon.
+        let ahead = now + 3_600_000;
+        while !map.sweep_ttl(ahead, 64) {}
+        assert_eq!(map.ttl.near_len(), 1000);
+        // Back: a sweep is due at once, though the horizon is an hour off.
+        assert!(map.ttl_sweep_due(now));
+        while !map.sweep_ttl(now, 64) {}
+        map.ttl.check();
+        assert!(!map.ttl_sweep_due(now));
+        assert_eq!(map.ttl.near_len(), 100);
+        // A pass looks at those alone, and finds exactly the due ones.
+        let (due, looked) = map.due(now + 6_000, usize::MAX);
+        assert_eq!((due.len(), looked), (100, 100));
+        assert!(
+            due.iter()
+                .all(|k| map.expires(k.as_bytes()) == Some(now + 5_000))
+        );
+        assert_eq!(map.due(now + 4_000, usize::MAX), (vec![], 100));
+        // A key given a time now goes where the new horizon says.
+        map.insert_expiring("late", s("v"), Some(now + HORIZON_MS + 1));
+        map.insert_expiring("soon", s("v"), Some(now + 1));
+        map.ttl.check();
+        assert_eq!(map.ttl.near_len(), 101);
+        // Past the horizon, a pass looks at everything again.
+        let past = now + HORIZON_MS + 2;
+        assert_eq!(map.due(past, usize::MAX).0.len(), 102);
+    }
+
+    /// Compaction moving an entry while a sweep is under way: its place in
+    /// the list goes with it, and the sweep carries on.
+    #[test]
+    fn an_entry_moved_by_compaction_mid_sweep_keeps_its_place() {
+        use crate::value_slab;
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        let long = |i: usize| format!("{i:0>3000}");
+        let now = crate::commands::helpers::now_ms() + 1_000_000_000;
+        let late = now + 3_600_000;
+        // Made on a thread that ends, so that its slabs are nobody's.
+        let mut map = std::thread::spawn(move || {
+            let mut map = ShardMap::new();
+            for i in 0..64 {
+                map.insert_str_expiring(long(i), b"v", Some(late));
+            }
+            map
+        })
+        .join()
+        .unwrap();
+        // One long key left: its slab holds nothing else.
+        for i in 1..64 {
+            map.remove(&long(i));
+        }
+        for i in 0..200 {
+            let at = if i % 2 == 0 { now + 5_000 } else { late };
+            map.insert_expiring(format!("k{i}"), s("v"), Some(at));
+        }
+        // Part of the way: the long key, first in the far list, is in the
+        // part looked at.
+        assert!(!map.sweep_ttl(now, 50));
+        map.ttl.check();
+        let index = (0..map.buckets())
+            .find(|&i| {
+                map.table
+                    .get_bucket(i)
+                    .is_some_and(|s| s.entry().has_key(long(0).as_bytes()))
+            })
+            .unwrap();
+        let old = map.table.get_bucket(index).unwrap().entry();
+        let evacuating = value_slab::evacuate_only(old.base()).expect("a slab nobody owns");
+        assert_eq!(evacuating.live(), 1, "the key's slab is shared");
+        let regions = value_slab::regions_snapshot();
+        match map.relocate_at(index, &regions) {
+            Relocated::Moved(left) => drop(left),
+            _ => panic!("not moved"),
+        }
+        drop(evacuating);
+        let new = map.table.get_bucket(index).unwrap().entry();
+        assert!(new != old && map.ttl.at(new.pos()) == new);
+        map.ttl.check();
+        while !map.sweep_ttl(now, 50) {}
+        map.ttl.check();
+        assert_eq!(map.ttl.len(), 201);
+        assert_eq!(map.ttl.near_len(), 100);
+        assert_eq!(map.due(now + 6_000, usize::MAX).0.len(), 100);
+        assert_eq!(map.expires(&long(0)), Some(late));
+        assert_eq!(map.due(late + 1, usize::MAX).0.len(), 201);
     }
 }
