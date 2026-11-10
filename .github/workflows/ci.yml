@@ -119,7 +119,8 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: pip install -r tests/e2e/requirements.txt
+        timeout-minutes: 10
+        run: pip install --timeout 30 --retries 5 -r tests/e2e/requirements.txt
 
       - name: Start KiviDB
         run: |
