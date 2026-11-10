@@ -1853,6 +1853,45 @@ fn test_expiretime_already_expired() {
     assert!(c.cmds(&["GET", "k"]).is_nil());
 }
 
+/// `TTL` rounds what is left to the nearest second, as Redis's
+/// `(ms + 500) / 1000`: 1400 ms is 1, where it was rounded up to 2, and
+/// 1900 ms is 2. `PTTL` is the whole milliseconds, as given (#557).
+#[test]
+fn ttl_rounds_to_the_nearest_second_as_in_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (px, secs) in [("1400", 1), ("1900", 2), ("100", 0), ("10000", 10)] {
+        c.cmds(&["SET", "k", "v", "PX", px]);
+        assert_eq!(c.cmds(&["TTL", "k"]).as_int(), secs, "TTL of PX {px}");
+    }
+    c.cmds(&["SET", "k", "v", "PX", "1499"]);
+    let pttl = c.cmds(&["PTTL", "k"]).as_int();
+    assert!((1000..=1499).contains(&pttl), "PTTL {pttl}");
+}
+
+/// `EXPIRETIME` rounds the time of day to the nearest second, as `TTL`
+/// does and as Redis does; `PEXPIRETIME` is the millisecond given (#557).
+#[test]
+fn expiretime_rounds_to_the_nearest_second_as_in_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "v"]);
+    for (at, secs) in [
+        ("4102444800000", 4102444800),
+        ("4102444800499", 4102444800),
+        ("4102444800500", 4102444801),
+        ("4102444800999", 4102444801),
+    ] {
+        assert_eq!(c.cmds(&["PEXPIREAT", "k", at]).as_int(), 1);
+        assert_eq!(c.cmds(&["EXPIRETIME", "k"]).as_int(), secs, "of {at}");
+        assert_eq!(c.cmds(&["PEXPIRETIME", "k"]).as_int().to_string(), at);
+    }
+}
+
 // Wrong arity — both commands take exactly one argument
 #[test]
 fn test_expiretime_arity() {

@@ -4073,8 +4073,14 @@ fn a_write_routed_before_a_manual_failover_is_sent_on_not_run_on_the_old_master(
 /// A write routed here before `remove` took its slot from this node, and
 /// held up before the write gate until then, is refused: no node is
 /// serving the slot, in this one's view. It used to run, here (#337). Once
-/// `restore` gives the slot back, the key is as it was.
-fn a_write_routed_before_its_slot_was_removed(remove: &[&str], restore: &[&str]) {
+/// `restore` gives the slot back, the key is as it was. With
+/// `key_there_before` false the node holds no key when `remove` runs
+/// (FLUSHSLOTS refuses otherwise, #552), and the write is the key's first.
+fn a_write_routed_before_its_slot_was_removed(
+    remove: &[&str],
+    restore: &[&str],
+    key_there_before: bool,
+) {
     let key = key_in(0..=16383, "removed");
     let slot = slot_of(&key).to_string();
     let env = [
@@ -4094,10 +4100,19 @@ fn a_write_routed_before_its_slot_was_removed(remove: &[&str], restore: &[&str])
             })
             .collect()
     };
-    assert!(run_past_the_stall(node, 1, &["SET", &key, "5"]).is_ok());
+    let mut hit = 1;
+    if key_there_before {
+        assert!(run_past_the_stall(node, hit, &["SET", &key, "5"]).is_ok());
+        hit += 1;
+    }
 
-    let incr = commands_in_background(node.port, &[&["INCR", &key]]);
-    let held = routed_and_held(node, 2);
+    let write: &[&str] = if key_there_before {
+        &["INCR", &key]
+    } else {
+        &["SET", &key, "6"]
+    };
+    let incr = commands_in_background(node.port, &[write]);
+    let held = routed_and_held(node, hit);
     let remove = with_slot(remove);
     let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
     let r = node.conn().cmd(&refs);
@@ -4115,7 +4130,12 @@ fn a_write_routed_before_its_slot_was_removed(remove: &[&str], restore: &[&str])
     let r = node.conn().cmd(&refs);
     assert!(r.is_ok(), "{refs:?}: {r:?}");
     wait_cluster_ok(&[node], 1);
-    assert_eq!(run_past_the_stall(node, 3, &["GET", &key]).text(), "5");
+    let got = run_past_the_stall(node, hit + 1, &["GET", &key]);
+    if key_there_before {
+        assert_eq!(got.text(), "5");
+    } else {
+        assert_eq!(got, Resp::Nil);
+    }
 }
 
 #[test]
@@ -4123,6 +4143,7 @@ fn a_write_routed_before_delslots_took_its_slot_is_refused() {
     a_write_routed_before_its_slot_was_removed(
         &["CLUSTER", "DELSLOTS", "{slot}"],
         &["CLUSTER", "ADDSLOTS", "{slot}"],
+        true,
     );
 }
 
@@ -4131,7 +4152,147 @@ fn a_write_routed_before_flushslots_is_refused() {
     a_write_routed_before_its_slot_was_removed(
         &["CLUSTER", "FLUSHSLOTS"],
         &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+        false,
     );
+}
+
+/// CLUSTER FLUSHSLOTS gives up only this node's own slots, and refuses
+/// while the node holds keys, as in Redis. It used to unassign every slot
+/// in this node's view, the other masters' too, keys or not, and the node
+/// went to `cluster_state:fail` (#552).
+#[test]
+fn flushslots_gives_up_only_this_nodes_slots_and_needs_an_empty_db() {
+    let (nodes, ranges) = form_cluster(2);
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let key = key_in(ranges[1].0..=ranges[1].1, "kept");
+    assert!(b.conn().cmd(&["SET", &key, "v"]).is_ok());
+
+    // `b` holds a key: refused, and nothing changes.
+    let r = b.conn().cmd(&["CLUSTER", "FLUSHSLOTS"]);
+    assert_eq!(
+        r.err(),
+        Some("ERR DB must be empty to perform CLUSTER FLUSHSLOTS."),
+        "{r:?}"
+    );
+    assert_eq!(b.cluster_info("cluster_slots_assigned"), "16384");
+    assert_eq!(b.conn().cmd(&["GET", &key]).text(), "v");
+
+    // `a` holds none: its own slots go, `b`'s stay mapped.
+    assert!(a.conn().cmd(&["CLUSTER", "FLUSHSLOTS"]).is_ok());
+    assert_eq!(
+        a.cluster_info("cluster_slots_assigned"),
+        (ranges[1].1 - ranges[1].0 + 1).to_string()
+    );
+    let slots = a.conn().cmd(&["CLUSTER", "SLOTS"]);
+    assert_eq!(slots.array().len(), 1, "{slots:?}");
+    assert_eq!(slots.array()[0].array()[0].int(), ranges[1].0 as i64);
+    assert_eq!(slots.array()[0].array()[1].int(), ranges[1].1 as i64);
+    // `b` serves its slots as before.
+    assert_eq!(b.cluster_info("cluster_state"), "ok");
+    assert_eq!(b.conn().cmd(&["GET", &key]).text(), "v");
+}
+
+/// CLUSTER ADDSLOTS and ADDSLOTSRANGE check every slot before they claim
+/// any, as in Redis: one busy slot claims none. The slots before it used
+/// to stay claimed in memory, not saved to nodes.conf, with `cluster_state`
+/// and the slot counts stale (#553).
+#[test]
+fn addslots_that_fail_claim_nothing() {
+    let mut node = Node::start(&[]);
+    let mut c = node.conn();
+    assert!(c.cmd(&["CLUSTER", "ADDSLOTS", "200"]).is_ok());
+    let busy = Some("ERR Slot 200 is already busy");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "99", "150", "250"]);
+    assert_eq!(r.err(), busy, "{r:?}");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTS", "1", "2", "200"]);
+    assert_eq!(r.err(), busy, "{r:?}");
+    let twice = Some("ERR Slot 5 specified multiple times");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTS", "5", "6", "5"]);
+    assert_eq!(r.err(), twice, "{r:?}");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "9", "5", "20"]);
+    assert_eq!(r.err(), twice, "{r:?}");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "10", "5"]);
+    assert_eq!(
+        r.err(),
+        Some("ERR start slot number 10 is greater than end slot number 5"),
+        "{r:?}"
+    );
+    assert_eq!(node.cluster_info("cluster_slots_assigned"), "1");
+    // And after a restart, from nodes.conf, the same.
+    node.restart();
+    assert_eq!(node.cluster_info("cluster_slots_assigned"), "1");
+    let mut c = node.conn();
+    assert!(
+        c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "199", "201", "16383"])
+            .is_ok()
+    );
+    wait_cluster_ok(&[&node], 1);
+}
+
+/// SET-CONFIG-EPOCH, BUMPEPOCH, COUNT-FAILURE-REPORTS and GETKEYSINSLOT
+/// answer as in Redis (#563).
+#[test]
+fn cluster_admin_commands_answer_as_redis_does() {
+    // SET-CONFIG-EPOCH only on a fresh node, and BUMPEPOCH's `STILL`.
+    let lone = Node::start(&[]);
+    let mut c = lone.conn();
+    let r = c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "-1"]);
+    assert_eq!(r.err(), Some("ERR Invalid config epoch specified: -1"));
+    assert!(c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "3"]).is_ok());
+    let r = c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "4"]);
+    assert_eq!(r.err(), Some("ERR Node config epoch is already non-zero"));
+    assert_eq!(c.cmd(&["CLUSTER", "BUMPEPOCH"]).text(), "STILL 3");
+    assert_eq!(lone.cluster_info("cluster_my_epoch"), "3");
+
+    // BUMPEPOCH gives a fresh node a config epoch, once.
+    let fresh = Node::start(&[]);
+    let mut f = fresh.conn();
+    let bumped = f.cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    let epoch = bumped
+        .strip_prefix("BUMPED ")
+        .unwrap_or_else(|| panic!("{bumped}"))
+        .to_string();
+    assert_ne!(epoch, "0");
+    assert_eq!(fresh.cluster_info("cluster_my_epoch"), epoch);
+    assert_eq!(
+        f.cmd(&["CLUSTER", "BUMPEPOCH"]).text(),
+        format!("STILL {epoch}")
+    );
+
+    // In a cluster.
+    let (nodes, ranges) = form_cluster(2);
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut c = a.conn();
+    let r = c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "9"]);
+    assert_eq!(
+        r.err(),
+        Some(
+            "ERR The user can assign a config epoch only when the node does not know any other node."
+        )
+    );
+    assert_eq!(
+        c.cmd(&["CLUSTER", "COUNT-FAILURE-REPORTS", &b.id()]).int(),
+        0
+    );
+    let unknown = "0123456789012345678901234567890123456789";
+    let r = c.cmd(&["CLUSTER", "COUNT-FAILURE-REPORTS", unknown]);
+    let expected = format!("ERR Unknown node {unknown}");
+    assert_eq!(r.err(), Some(expected.as_str()));
+    let r = c.cmd(&["CLUSTER", "COUNT-FAILURE-REPORTS", "nonsense"]);
+    assert_eq!(r.err(), Some("ERR Unknown node nonsense"));
+
+    // GETKEYSINSLOT with a count of 0 is an empty array.
+    let key = key_in(ranges[0].0..=ranges[0].1, "gk");
+    let slot = slot_of(&key).to_string();
+    assert!(c.cmd(&["SET", &key, "v"]).is_ok());
+    let none = c.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "0"]);
+    assert_eq!(none, Resp::Array(vec![]));
+    assert_eq!(
+        c.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "1"]),
+        Resp::Array(vec![Resp::Bulk(key.clone().into_bytes())])
+    );
+    let r = c.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "-1"]);
+    assert_eq!(r.err(), Some("ERR Invalid slot or number of keys"));
 }
 
 /// The destination gets to the `TAKEOVER` only after the source has
