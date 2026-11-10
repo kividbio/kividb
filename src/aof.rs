@@ -3762,9 +3762,13 @@ pub(crate) fn failpoint(name: &'static str) {
         return;
     }
     log_warn!("Test failpoint {path} reached — waiting for it to be removed");
-    while std::path::Path::new(&path).exists() {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // Off the runtime: a tokio worker held here for as long as a test likes
+    // must not take the polling of every other client with it.
+    crate::cluster::migration::off_the_runtime(|| {
+        while std::path::Path::new(&path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
 }
 
 /// Whether `KIVIDB_TEST_FAILPOINTS` names `name`. Read once.
