@@ -2098,3 +2098,202 @@ fn a_field_deadline_during_a_full_sync_leaves_the_replica_as_the_master() {
         assert_eq!(r.cmd(&["HLEN", &key]).i(), 1, "{key}");
     }
 }
+
+// ── Role changes and CLIENT KILL of replication links (#591, #595) ───────────
+
+/// The I/O models a test is run on: io_uring is Linux's.
+fn io_models() -> &'static [&'static str] {
+    if cfg!(target_os = "linux") {
+        &["tokio", "uring"]
+    } else {
+        &["tokio"]
+    }
+}
+
+/// Send a command without reading its reply.
+fn send(conn: &mut Conn, args: &[&str]) {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    conn.writer.write_all(&buf).unwrap();
+}
+
+/// Whether the server has closed the connection: nothing more to read.
+fn closed(conn: &mut Conn) -> bool {
+    let mut rest = String::new();
+    match conn.reader.read_line(&mut rest) {
+        Ok(0) => true,
+        Ok(_) => panic!("read {rest:?} where the connection should have closed"),
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionReset,
+    }
+}
+
+/// The one line of `CLIENT LIST TYPE <kind>`, and a field of it.
+fn client_line(conn: &mut Conn, kind: &str) -> String {
+    let list = conn.cmd(&["CLIENT", "LIST", "TYPE", kind]);
+    let lines: Vec<&str> = list.s().lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "CLIENT LIST TYPE {kind}: {lines:?}");
+    lines[0].to_string()
+}
+
+fn field<'a>(line: &'a str, name: &str) -> &'a str {
+    line.split(' ')
+        .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("no {name} in {line}"))
+}
+
+const ROLE_CHANGED: &str =
+    "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)";
+
+/// A master that becomes a replica ends every client blocked in a command
+/// with Redis's `-UNBLOCKED` error, and closes its connection, as Redis's
+/// `disconnectAllBlockedClients` does (#591). They used to stay blocked,
+/// woken only by what the new master wrote.
+#[test]
+fn blocked_clients_are_ended_when_a_master_becomes_a_replica() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start(&["--io-model", io]);
+        let mut admin = node.conn();
+        assert_eq!(admin.cmd(&["XADD", "s", "1-1", "f", "v"]).s(), "1-1");
+        assert!(admin.cmd(&["XGROUP", "CREATE", "s", "g", "$"]).ok());
+        let blocking: &[&[&str]] = &[
+            &["BLPOP", "l1", "0"],
+            &["BRPOP", "l2", "0"],
+            &["BLMOVE", "l3", "dst", "LEFT", "RIGHT", "0"],
+            &["BRPOPLPUSH", "l4", "dst", "0"],
+            &["BLMPOP", "0", "1", "l5", "LEFT"],
+            &["BZPOPMIN", "z1", "0"],
+            &["BZPOPMAX", "z2", "0"],
+            &["BZMPOP", "0", "1", "z3", "MIN"],
+            &["XREAD", "BLOCK", "0", "STREAMS", "s", "$"],
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "BLOCK",
+                "0",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            // With a timeout too: ended all the same.
+            &["BLPOP", "l6", "100"],
+        ];
+        let mut clients = Vec::new();
+        for args in blocking {
+            let mut conn = node.conn();
+            send(&mut conn, args);
+            clients.push((args, conn));
+        }
+        let n = blocking.len().to_string();
+        wait_until("every client to block", || {
+            admin.info("clients", "blocked_clients") == n
+        });
+        // One that is not blocked is not touched.
+        let mut idle = node.conn();
+        assert_eq!(idle.cmd(&["PING"]).s(), "PONG");
+
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        for (args, mut conn) in clients {
+            assert_eq!(conn.read(), V::Err(ROLE_CHANGED.into()), "{args:?} on {io}");
+            assert!(closed(&mut conn), "{args:?} on {io}: still connected");
+        }
+        assert_eq!(idle.cmd(&["PING"]).s(), "PONG");
+        assert_eq!(admin.info("clients", "blocked_clients"), "0", "{io}");
+        // As a replica, it follows its new master.
+        let mut o = other.conn();
+        assert!(o.cmd(&["SET", "after", "1"]).ok());
+        wait_link_up(&mut admin);
+        wait_until("the new master's write", || {
+            admin.cmd(&["GET", "after"]) == V::Str("1".into())
+        });
+    }
+}
+
+/// `CLIENT KILL` (by `ID`, `ADDR` or `TYPE`) ends a replica's link on
+/// either I/O model, and the replica comes back by partial resync with the
+/// master's data, nothing lost or repeated. The link is listed with `S`,
+/// and the replica's link to its master with `M` (#595). On the tokio loop
+/// the kill used to be answered 1 and do nothing; and neither loop listed
+/// the links as Redis does, so `TYPE replica` and `TYPE master` found none.
+#[test]
+fn client_kill_ends_replication_links_and_the_replica_continues() {
+    for io in io_models() {
+        let master = Server::start(&["--io-model", io]);
+        let replica = Server::start(&[
+            "--io-model",
+            io,
+            "--replicaof",
+            "127.0.0.1",
+            &master.port.to_string(),
+        ]);
+        let (mut m, mut r) = (master.conn(), replica.conn());
+        write_batch(&mut m, 0, 50);
+        wait_link_up(&mut r);
+        assert_same_dataset(&mut m, &mut r);
+        assert_eq!(m.stat("sync_full"), 1, "{io}");
+
+        let mut resyncs = 0;
+        for (round, how) in ["ID", "ADDR", "TYPE replica", "TYPE slave"]
+            .into_iter()
+            .enumerate()
+        {
+            let line = client_line(&mut m, "replica");
+            assert_eq!(field(&line, "flags"), "S", "{io}: {line}");
+            let (id, addr) = (
+                field(&line, "id").to_string(),
+                field(&line, "addr").to_string(),
+            );
+            let killed = match how {
+                "ID" => m.cmd(&["CLIENT", "KILL", "ID", &id]),
+                "ADDR" => m.cmd(&["CLIENT", "KILL", "ADDR", &addr]),
+                _ => {
+                    let kind = how.split(' ').nth(1).unwrap();
+                    m.cmd(&["CLIENT", "KILL", "TYPE", kind])
+                }
+            };
+            assert_eq!(killed, V::Int(1), "{io}: CLIENT KILL {how}");
+            // Written while the link is down or coming back.
+            write_batch(&mut m, round + 1, 40);
+            resyncs += 1;
+            wait_until("the replica to resume by partial resync", || {
+                m.stat("sync_partial_ok") == resyncs
+            });
+            wait_link_up(&mut r);
+            assert_same_dataset(&mut m, &mut r);
+            assert_eq!(
+                m.info("replication", "connected_slaves"),
+                "1",
+                "{io}: CLIENT KILL {how}"
+            );
+        }
+
+        // The replica's side: its link to the master, killed there.
+        let line = client_line(&mut r, "master");
+        assert_eq!(field(&line, "flags"), "M", "{io}: {line}");
+        assert_eq!(
+            r.cmd(&["CLIENT", "KILL", "TYPE", "master"]),
+            V::Int(1),
+            "{io}"
+        );
+        write_batch(&mut m, 9, 40);
+        resyncs += 1;
+        wait_until("the replica to resume by partial resync", || {
+            m.stat("sync_partial_ok") == resyncs
+        });
+        wait_link_up(&mut r);
+        assert_same_dataset(&mut m, &mut r);
+
+        assert_eq!(m.stat("sync_full"), 1, "{io}: no dataset was sent again");
+        assert_eq!(m.stat("sync_partial_err"), 0, "{io}");
+    }
+}

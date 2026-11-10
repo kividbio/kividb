@@ -398,7 +398,12 @@ async fn park_blocking_uring(
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = watch.fd;
-    let delivery = {
+    let delivery = if wait.role_changed_since_park() {
+        // This node became a replica before the client was listed as
+        // blocked, so the sweep that ends blocked clients passed it by.
+        interrupted.role_changed = true;
+        None
+    } else {
         let waiting = wait.wait();
         tokio::pin!(waiting);
         // Whether the client is still there. A read cannot be raced against
@@ -430,6 +435,8 @@ async fn park_blocking_uring(
                     Ok(how) => {
                         interrupted.unblocked_with_error =
                             how == crate::commands::blocking::Unblock::Error;
+                        interrupted.role_changed =
+                            how == crate::commands::blocking::Unblock::RoleChange;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -1328,6 +1335,12 @@ pub async fn handle_client(
                         quit_requested = true;
                         break;
                     }
+                    if std::mem::take(&mut interrupted.role_changed) {
+                        // This node became a replica: told so, and closed.
+                        out_buf.extend_from_slice(crate::commands::blocking::ROLE_CHANGED);
+                        quit_requested = true;
+                        break;
+                    }
                     out_buf.extend_from_slice(&response);
                     parse_offset += consumed;
                     continue;
@@ -1398,6 +1411,12 @@ pub async fn handle_client(
                 }
                 if interrupted.gone {
                     // It has left the line; there is nobody to reply to.
+                    quit_requested = true;
+                    break;
+                }
+                if std::mem::take(&mut interrupted.role_changed) {
+                    // This node became a replica: told so, and closed.
+                    out_buf.extend_from_slice(crate::commands::blocking::ROLE_CHANGED);
                     quit_requested = true;
                     break;
                 }
@@ -2326,10 +2345,16 @@ pub async fn handle_client(
                             } else {
                                 timeout_ms
                             });
+                        let role_epoch = crate::commands::blocking::role_changes();
 
                         let waited = unless_gone(
                             async {
                                 loop {
+                                    // Ended, as every blocked client is, when
+                                    // this node becomes a replica (#591).
+                                    if crate::commands::blocking::role_changes() != role_epoch {
+                                        break crate::commands::blocking::ROLE_CHANGED.to_vec();
+                                    }
                                     let fsynced = crate::aof::AOF_FSYNCED
                                         .load(std::sync::atomic::Ordering::Relaxed);
                                     if fsynced >= target || tokio::time::Instant::now() >= deadline
@@ -2349,6 +2374,11 @@ pub async fn handle_client(
                         )
                         .await;
                         match waited {
+                            Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
+                                out_buf.extend_from_slice(&reply);
+                                quit_requested = true;
+                                break;
+                            }
                             Some(reply) => reply,
                             // The client has gone: there is nobody to answer.
                             None => {
@@ -2734,6 +2764,10 @@ pub async fn handle_client(
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                // A replica's link from here: `flags=S`, `TYPE replica`, as
+                // Redis lists it (#595). `CLIENT KILL` shuts its socket, as
+                // any client's, which ends the link.
+                client_registry.update(client_id, |info| info.flags = "S".to_string());
                 // Out of the reactor while the descriptor is surely open.
                 drop(peer_watch);
                 handle_replica_connection_uring(

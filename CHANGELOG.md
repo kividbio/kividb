@@ -145,6 +145,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A master that becomes a replica ends its blocked clients, as Redis
+  does (#591).** On `REPLICAOF`, `CLUSTER REPLICATE`, or a cluster failover
+  that demotes it, every client blocked in `BLPOP`, `BRPOP`, `BLMOVE`,
+  `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `XREAD ...
+  BLOCK`, `XREADGROUP ... BLOCK` or `WAITAOF` is answered `-UNBLOCKED force
+  unblock from blocking operation, instance state changed (master ->
+  replica?)` and its connection is closed, as Redis 8 does. They stayed
+  blocked, and were woken only by what the new master wrote. A client
+  paused by `CLIENT PAUSE` is not blocked and is left alone, as in Redis.
+
+- **`CLIENT KILL` ends a replication link on the tokio I/O model, and the
+  links are listed as Redis lists them (#595).** On `--io-model tokio`,
+  `CLIENT KILL` of a replica's link answered 1 and the replica stayed
+  connected. It now drops the link, as io_uring already did, and the
+  replica reconnects and continues by partial resync. A replica's link
+  shows `flags=S` in `CLIENT LIST` (it showed `N`), so `CLIENT LIST TYPE
+  replica` and `CLIENT KILL TYPE replica` (or `slave`) find it. On a
+  replica, the link to its master is listed with `flags=M`, so `CLIENT
+  KILL TYPE master` ends it, and the replica connects again and continues
+  where it stands.
+
 - **A replica that falls behind no longer makes its master evict its keys
   and refuse writes (#542).** Under an `allkeys-*` policy, a replica that
   full-synced or lagged under heavy writes made its master evict nearly

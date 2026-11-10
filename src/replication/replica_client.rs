@@ -148,6 +148,15 @@ impl ReplicaStarter {
         self.repl_state.set_master_addr(&host, port);
         self.repl_state.become_slave();
         self.repl_state.set_link_state(LinkState::Connect);
+        // As Redis ends them: a client blocked on a master waits for what
+        // only a master is written (#591). Counted first: a command that
+        // parks from here on, before it is listed as blocked, sees the
+        // count change and ends as the sweep would have ended it.
+        crate::commands::blocking::note_role_change();
+        let ended = self.client_registry.end_blocked_for_role_change();
+        if ended > 0 {
+            log_info!("Replication: ended {ended} blocked client(s): this node is now a replica");
+        }
 
         let starter = self.clone();
         let spawned = std::thread::Builder::new()
@@ -173,6 +182,8 @@ enum SessionEnd {
     MasterClosed,
     /// A newer `REPLICAOF` or a promotion took over; this task must stop.
     Superseded,
+    /// `CLIENT KILL` ended the link to the master; it is made again.
+    Killed,
 }
 
 #[derive(Debug)]
@@ -287,6 +298,14 @@ pub async fn start_replica(
             }
             Ok(SessionEnd::MasterClosed) => {
                 log_warn!("Replication: Master closed the connection — reconnecting");
+                failures = 0;
+                unfollowable = 0;
+                RECONNECT_DELAY
+            }
+            Ok(SessionEnd::Killed) => {
+                log_warn!(
+                    "Replication: The link to the master was killed (CLIENT KILL) — reconnecting"
+                );
                 failures = 0;
                 unfollowable = 0;
                 RECONNECT_DELAY
@@ -482,6 +501,16 @@ async fn run_replication_session(
     .await?;
     stream.set_nodelay(true)?;
     tune_replication_socket(&stream, timeout);
+    // How the link is listed among this node's clients, once it streams.
+    let link_addrs = (
+        stream
+            .peer_addr()
+            .map_or_else(|_| addr.clone(), |a| a.to_string()),
+        stream
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
+    );
 
     // Over TLS with `tls-replication` (or `tls-cluster`): see `node_tls`.
     type Reader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
@@ -1269,7 +1298,13 @@ async fn run_replication_session(
     send_ack(&mut writer, applied, timeout).await?;
     let mut last_ack = Instant::now();
 
-    // The link is up from here: synced, and about to stream.
+    // The link is up from here: synced, and about to stream. Listed among
+    // the clients as the master (`flags=M`), as Redis lists it.
+    let mut master_link = crate::client_registry::MasterLink::register(
+        &starter.client_registry,
+        link_addrs.0,
+        link_addrs.1,
+    );
     upstream.mark_synced();
     repl_state.note_master_io();
     log_info!("Replication: Synced with {addr}. Entering command stream.");
@@ -1322,6 +1357,12 @@ async fn run_replication_session(
             let read_n = tokio::select! {
                 res = inner.read(&mut temp) => Some(res?),
                 _ = tokio::time::sleep(EPOCH_CHECK_INTERVAL) => None,
+                // `CLIENT KILL` of the master link: dropped where it stands,
+                // between commands, and continued from there.
+                () = master_link.killed() => {
+                    log_info!("Replication: Link to {addr} killed by CLIENT KILL");
+                    return Ok(SessionEnd::Killed);
+                }
             };
             match read_n {
                 Some(0) => {
@@ -1332,6 +1373,7 @@ async fn run_replication_session(
                     offset += n as u64;
                     last_io = Instant::now();
                     repl_state.note_master_io();
+                    master_link.touch();
                     pending_input = true;
                     drained = n < temp.len();
                 }
@@ -2302,6 +2344,8 @@ pub async fn handle_replica_connection<R, W>(
     listening_port: Option<u16>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
+    // The connection's `CLIENT KILL` signal: it ends the link (#595).
+    mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -2572,6 +2616,14 @@ where
         _ = &mut write_task => {}
         _ = &mut forward_task => {
             drop(resp_tx);
+        }
+        // `CLIENT KILL`: the link ends here, as on the io_uring loop, where
+        // the kill shuts the socket. The replica connects again and is
+        // continued from the backlog.
+        Ok(()) = &mut kill_rx => {
+            log_info!("Replication: Link to replica {endpoint} killed by CLIENT KILL");
+            forward_task.abort();
+            write_task.abort();
         }
         // A replica that has gone silent, or that the hub has let go of:
         // see `ReplState::replica_timed_out`.
