@@ -391,8 +391,9 @@ fn test_wait_no_replicas() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    // WAIT 1 0 — wait for 1 replica, 0ms timeout
-    let r = c.cmds(&["WAIT", "1", "0"]);
+    // WAIT 1 100: no replica acknowledges; after the timeout, as in Redis,
+    // the answer is 0. (`WAIT 1 0` waits for ever.)
+    let r = c.cmds(&["WAIT", "1", "100"]);
     assert_eq!(r.as_int(), 0);
 }
 

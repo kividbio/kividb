@@ -368,6 +368,71 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   announces nothing, as in RedisJSON. `JSON.FORGET` announces `json.del`,
   as RedisJSON's does; it was `json.forget`.
 
+- **Small differences from Redis 8.10 in arguments, replies and errors
+  (#561, #562, #564, #566, #576).** Checked against Redis 8.10.3.
+  - `FLUSHALL` and `FLUSHDB` refuse anything but `ASYNC` or `SYNC` with
+    `ERR syntax error`; an unknown word used to flush synchronously.
+  - `WAIT` refuses a count or timeout that is not an integer, and a
+    negative timeout (which used to wait for ever), inside `MULTI` too. On
+    a replica it is refused, as in Redis; it waited for ever. Without
+    replicas, `WAIT n timeout` with `n` above 0 now waits out its timeout
+    and answers 0, as Redis does; it answered at once. A replica that
+    connects while a `WAIT` waits is counted once it has caught up. Only
+    replicas that are online and still connected are counted, a replica that
+    reconnected is counted once, and one back by partial resync only once it
+    has acknowledged the backlog it was sent. `WAIT 0` (and `WAIT` inside
+    `MULTI`) answers the number of replicas that have what was written, not
+    the number connected. A master that becomes a replica ends a waiting
+    `WAIT` with Redis's `-UNBLOCKED` error and closes the connection. A
+    client waiting in `WAIT` shows as blocked (`b` in `CLIENT LIST`,
+    `blocked_clients`), and `CLIENT UNBLOCK` ends its wait. `CLIENT LIST`
+    shows `b` for every blocked client.
+  - `LOLWUT VERSION` takes an integer, as do the options of versions 5 and
+    6.
+  - `VSETATTR` answers 1, or 0 when there is no such key or element (it
+    answered `OK`, or an error). `VRANDMEMBER` refuses a count that is not
+    an integer and extra arguments; `VEMB` refuses any option but `RAW`.
+  - `COMMAND INFO` gives RedisJSON's arity for the JSON commands (it gave
+    -2 for most).
+  - `XGROUP HELP`, `XINFO HELP` and `CLUSTER HELP` exist. An unknown
+    subcommand of `XGROUP`, `XINFO`, `PUBSUB`, `SLOWLOG`, `MODULE`,
+    `CLUSTER`, `FUNCTION`, `SCRIPT` and `LATENCY` gets Redis's
+    `ERR unknown subcommand '<name>'. Try <COMMAND> HELP.`. `SLOWLOG HELP`
+    lines are simple strings.
+  - An `XGROUP` subcommand on a key that does not exist gets Redis's error;
+    `XGROUP DESTROY` answered 0. `XGROUP CREATE` takes `MKSTREAM` and
+    `ENTRIESREAD` only after the ID, so a key or group called `mkstream` no
+    longer creates the stream, and refuses an ID that is not valid.
+  - `SCRIPT KILL` and `FUNCTION KILL` with nothing running answer
+    `NOTBUSY No scripts in execution right now.`; a command refused while a
+    function runs names `FUNCTION KILL`.
+  - `SCRIPT LOAD` compiles the script and refuses one that does not compile
+    or has an unknown shebang flag, as Redis does; the error used to come
+    at `EVALSHA`. `SCRIPT DEBUG` takes `YES`, `SYNC` or `NO` only.
+  - `SSUBSCRIBE` and `SUNSUBSCRIBE` count shard channels only, and the
+    other (un)subscribes count channels and patterns only; all three were
+    added together.
+  - The `XPENDING` summary lists consumers by name.
+  - `CLIENT LIST` and `CLIENT INFO` show `e` for `CLIENT NO-EVICT on`, and
+    `laddr` is the address the client connected to, not the bind address.
+    `RESET` turns NO-EVICT off and forgets the connection's `HIMPORT`
+    fieldsets.
+  - `CONFIG RESETSTAT` no longer zeroes `rdb_changes_since_last_save`.
+  - `LATENCY HISTORY` keeps 160 samples, one a second (the highest).
+  - `RANDOMKEY` keeps looking past expired keys while there are live ones;
+    it gave up after 64 and answered nil.
+  - `HOTKEYS STOP` answers nil when nothing is collecting, including after
+    `DURATION` has run out; it answered `OK` or an error.
+  - **`GEORADIUS` and `GEORADIUSBYMEMBER` are now refused on a read-only
+    replica** with `READONLY`, with or without `STORE`, as Redis refuses
+    them; they used to run there when they did not store. An application
+    that reads from replicas with them must switch to `GEORADIUS_RO` and
+    `GEORADIUSBYMEMBER_RO` (or `GEOSEARCH`).
+  - `ACL WHOAMI`, `ACL CAT`, `ACL GENPASS` and `ACL HELP` are no longer in
+    `@admin` or `@dangerous`, so a user without `@admin` can run them.
+  - Smaller texts: `BACKUP LIST x` names `backup|list`, and `MODULE LOAD`
+    no longer points to a file that does not exist.
+
 - **`JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse an integer overflow
   (#536).** Two integers whose result did not fit an `i64` gave a float,
   losing precision. They now fail with `ERR numeric overflow` and the

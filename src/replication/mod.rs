@@ -39,6 +39,9 @@ pub struct ReplState {
     pub repl_offset: AtomicU64,
     /// Number of currently connected replicas.
     pub connected_replicas: AtomicI64,
+    /// Woken when a replica acknowledges, connects or goes: what a `WAIT`
+    /// sleeps on between looks at its replicas.
+    pub replicas_changed: tokio::sync::Notify,
     /// The dataset's fingerprint when this node started as a master, at
     /// offset 0 of its stream: see [`Self::fingerprint_at_start`].
     pub startup_digest: parking_lot::Mutex<Option<u64>>,
@@ -486,6 +489,7 @@ impl ReplState {
             slave_mode: AtomicBool::new(false),
             repl_offset: AtomicU64::new(0),
             connected_replicas: AtomicI64::new(0),
+            replicas_changed: tokio::sync::Notify::new(),
             repl_id: RwLock::new(generate_repl_id()),
             startup_digest: parking_lot::Mutex::new(None),
             replica_acks: parking_lot::Mutex::new(std::collections::HashMap::new()), // NEW
@@ -935,6 +939,30 @@ impl ReplState {
         peer_port: u16,
         base: u64,
     ) -> Arc<ReplicaProgress> {
+        self.register_replica_at(
+            replica_id,
+            peer_ip,
+            peer_port,
+            base,
+            0,
+            ReplicaState::WaitBgsave,
+        )
+    }
+
+    /// [`Self::register_replica`], for a replica that has already been sent
+    /// `sent` bytes and is in `replica_state`: a partial resync, sent its
+    /// backlog and online at once. Both are set before anything can see the
+    /// replica, so that a `WAIT` never takes it for one that has been sent
+    /// nothing.
+    pub fn register_replica_at(
+        &self,
+        replica_id: u64,
+        peer_ip: String,
+        peer_port: u16,
+        base: u64,
+        sent: u64,
+        replica_state: ReplicaState,
+    ) -> Arc<ReplicaProgress> {
         let mut acks = self.replica_acks.lock();
         if acks.contains_key(&replica_id)
             && let Some(existing) = self.replica_progress.lock().get(&replica_id)
@@ -943,7 +971,10 @@ impl ReplState {
         }
         self.repl_stream_last_db.store(u64::MAX, Ordering::Relaxed);
         acks.insert(replica_id, base);
-        let progress = Arc::new(ReplicaProgress::new(base));
+        let progress = ReplicaProgress::new(base);
+        progress.sent.store(sent, Ordering::Relaxed);
+        progress.set_state(replica_state);
+        let progress = Arc::new(progress);
         self.replica_progress
             .lock()
             .insert(replica_id, Arc::clone(&progress));
@@ -951,6 +982,7 @@ impl ReplState {
             .lock()
             .push((replica_id, peer_ip, peer_port));
         self.connected_replicas.fetch_add(1, Ordering::Relaxed);
+        self.replicas_changed.notify_waiters();
         progress
     }
 
@@ -965,12 +997,13 @@ impl ReplState {
             .collect()
     }
 
-    /// How many of `targets` have acknowledged everything they had been sent
-    /// when the snapshot was taken.
+    /// How many of `targets` are online and have acknowledged everything they
+    /// had been sent when the snapshot was taken. As in Redis, a replica that
+    /// is not online yet is not counted.
     pub fn count_reached(targets: &[(Arc<ReplicaProgress>, u64)]) -> i64 {
         targets
             .iter()
-            .filter(|(p, target)| p.delivered() >= *target)
+            .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
             .count() as i64
     }
 
@@ -1170,6 +1203,9 @@ impl ReplState {
         }
         self.slave_mode.store(true, Ordering::Release);
         *self.role.write() = "slave".into();
+        // A `WAIT` waiting on this master's replicas ends now (see
+        // `wait_for_replicas`).
+        self.replicas_changed.notify_waiters();
         // Its own replicas would get nothing from here on: a replica does
         // not pass its master's stream on.
         if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
@@ -2379,6 +2415,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // loaded: this is what "online" means.
                         p.set_state(ReplicaState::Online);
                     }
+                    state.replicas_changed.notify_waiters();
                 }
 
                 HubMsg::Continue {
@@ -2400,15 +2437,20 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         let _ = reply.send(Err(registration));
                     }
                     Some(missed) => {
-                        let progress = state.register_replica(
+                        let missed_len = missed.len() as u64;
+                        // Online, and sent the backlog, from the moment it is
+                        // seen: a `WAIT` must not count it before it has
+                        // acknowledged the backlog, which may hold the very
+                        // writes the `WAIT` is for.
+                        let progress = state.register_replica_at(
                             registration.replica_id,
                             registration.peer_ip.clone(),
                             registration.peer_port,
                             offset,
+                            missed_len,
+                            ReplicaState::Online,
                         );
-                        progress.set_state(ReplicaState::Online);
                         let _ = progress.queue.set(Arc::clone(&registration.pending_bytes));
-                        let missed_len = missed.len() as u64;
                         let delivered = missed.is_empty() || {
                             registration
                                 .pending_bytes
@@ -2419,7 +2461,6 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             forget_replica(&state, registration.replica_id);
                             continue;
                         }
-                        progress.sent.fetch_add(missed_len, Ordering::Relaxed);
                         state.sync_partial_ok.fetch_add(1, Ordering::Relaxed);
                         log_info!(
                             "Replication: Partial resync for {}: continuing from offset {offset} \
@@ -2878,6 +2919,7 @@ fn forget_replica(state: &ReplState, replica_id: u64) {
         // Pairs with fetch_add on successful RegisterChannel in the hub task.
         state.connected_replicas.fetch_sub(1, Ordering::Relaxed);
     }
+    state.replicas_changed.notify_waiters();
 }
 
 /// Shutdown: end the write stream here. A master restarted from its final
@@ -4029,6 +4071,153 @@ fn is_write_command_reference(name: &str) -> bool {
     )
 }
 
+/// Redis's reply to `WAIT` on a replica.
+pub const WAIT_ON_REPLICA: &[u8] = b"-ERR WAIT cannot be used with replica instances. Please also \
+    note that since Redis 4.0 if a replica is configured to be writable (which is not the \
+    default) writes to replicas are just local and are not propagated.\r\n";
+
+/// `WAIT numreplicas timeout`'s arguments, or the error Redis gives for
+/// them (#561): both integers, the timeout in milliseconds and not negative
+/// (0 waits for ever). Each used to read as 0 when it was not a number, and
+/// a negative timeout as 0, which waited for ever.
+///
+/// On a replica, `WAIT` is refused before its arguments are looked at, as
+/// Redis refuses it: there is nothing it could wait for (it used to wait for
+/// ever).
+pub fn wait_args(cmd: &[&[u8]], on_replica: bool) -> Result<(i64, u64), Vec<u8>> {
+    if cmd.len() != 3 {
+        return Err(b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec());
+    }
+    if on_replica {
+        return Err(WAIT_ON_REPLICA.to_vec());
+    }
+    let int = |arg: &[u8]| std::str::from_utf8(arg).ok()?.parse::<i64>().ok();
+    let replicas =
+        int(cmd[1]).ok_or_else(|| b"-ERR value is not an integer or out of range\r\n".to_vec())?;
+    let timeout = int(cmd[2])
+        .ok_or_else(|| b"-ERR timeout is not an integer or out of range\r\n".to_vec())?;
+    if timeout < 0 {
+        return Err(b"-ERR timeout is negative\r\n".to_vec());
+    }
+    Ok((replicas, timeout as u64))
+}
+
+/// Redis's reply to a client blocked in `WAIT` when this master becomes a
+/// replica; the connection is then closed, as Redis closes it
+/// (`disconnectAllBlockedClients`).
+pub const UNBLOCKED_ROLE_CHANGE: &[u8] =
+    b"-UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)\r\n";
+
+/// How a `WAIT` ended: its reply, and whether the connection is to be closed
+/// once it is written.
+pub struct WaitEnd {
+    pub reply: Vec<u8>,
+    pub close: bool,
+}
+
+/// What each replica has to have acknowledged for a `WAIT`, by replica id.
+///
+/// A replica counts only while it is connected (its id still registered: one
+/// that reconnects comes back under a new id, and is not counted twice) and
+/// online, and once it has acknowledged everything it had been sent when the
+/// `WAIT` first saw it: for one there when the `WAIT` began, everything
+/// written before the `WAIT`; for one that connected since, its full sync or
+/// its partial resync's backlog (registered with `sent` already counting
+/// it) covers those writes, and the rest is what was sent after.
+#[derive(Default)]
+pub struct WaitTargets(std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64)>);
+
+impl WaitTargets {
+    /// Bring the targets up to date with the replicas connected now, and
+    /// count those that have reached theirs.
+    pub fn count(&mut self, state: &ReplState) -> i64 {
+        let live = state.replica_progress.lock();
+        self.0.retain(|id, _| live.contains_key(id));
+        for (id, p) in live.iter() {
+            self.0
+                .entry(*id)
+                .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed)));
+        }
+        self.0
+            .values()
+            .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
+            .count() as i64
+    }
+}
+
+/// `WAIT` once its arguments are taken: the number of replicas that have
+/// acknowledged everything written before it (see [`WaitTargets`]), once
+/// `wanted` have, or at `timeout_ms` (0: no timeout), or when `CLIENT
+/// UNBLOCK` ends it (with that number, counted then, or `-UNBLOCKED` if asked
+/// for an error), as Redis answers. `wanted` of 0 or less answers at once,
+/// with the number there is. Each connection loop runs this beside its own
+/// watch on the client going.
+///
+/// The targets are made exact by a hub barrier: every write handed to the
+/// hub before it has been fanned out. Between looks it sleeps until a
+/// replica acknowledges, connects or goes, or this master becomes a replica
+/// (which ends the wait as Redis ends it), or the time is up: nothing is
+/// polled.
+pub async fn wait_for_replicas(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    wanted: i64,
+    timeout_ms: u64,
+    mut unblocked: tokio::sync::oneshot::Receiver<crate::commands::blocking::Unblock>,
+) -> WaitEnd {
+    let reply = |n: i64| WaitEnd {
+        reply: crate::resp::write::resp_integer(n).to_vec(),
+        close: false,
+    };
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    if hub_tx.send(HubMsg::Barrier(barrier_tx)).is_ok() {
+        let _ = barrier_rx.await;
+    }
+    let mut targets = WaitTargets::default();
+    let deadline = (timeout_ms > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+    let mut unblockable = true;
+    loop {
+        // Before looking, so that a change made while looking still wakes it.
+        let changed = state.replicas_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+
+        if state.is_slave() {
+            return WaitEnd {
+                reply: UNBLOCKED_ROLE_CHANGE.to_vec(),
+                close: true,
+            };
+        }
+        let acked = targets.count(state);
+        if acked >= wanted {
+            return reply(acked);
+        }
+        let time_up = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = &mut changed => {}
+            () = time_up => return reply(targets.count(state)),
+            how = &mut unblocked, if unblockable => match how {
+                Ok(crate::commands::blocking::Unblock::Error) => {
+                    return WaitEnd {
+                        reply: crate::commands::blocking::UNBLOCKED.to_vec(),
+                        close: false,
+                    };
+                }
+                Ok(crate::commands::blocking::Unblock::Timeout) => {
+                    return reply(targets.count(state));
+                }
+                Err(_) => unblockable = false,
+            },
+        }
+    }
+}
+
 /// True if this command may not run on a read-only replica (READONLY reply).
 #[inline]
 pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
@@ -4048,7 +4237,9 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // before it runs. Every script was, the ones that only read too
         // (#145).
         "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        // Write commands in Redis, refused on a replica whether or not they
+        // store: `GEORADIUS_RO` and `GEORADIUSBYMEMBER_RO` are the reads.
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => true,
         // Only TODENSE and RESET rewrite the value; GETREG, DECODE and
         // ENCODING are diagnostics, deliberately read-only here.
         "PFDEBUG" => pfdebug_mutates(cmd),
@@ -4645,7 +4836,8 @@ mod replication_invariants_tests {
         }
     }
 
-    /// GEORADIUS is a read until it is asked to store its result.
+    /// GEORADIUS replicates only when it stores its result, but is refused on
+    /// a replica either way, as in Redis.
     #[test]
     fn georadius_is_a_write_only_with_store() {
         let read: Vec<&[u8]> = vec![b"GEORADIUS", b"k", b"0", b"0", b"1", b"km"];
@@ -4660,7 +4852,7 @@ mod replication_invariants_tests {
             b"d",
         ];
         assert!(!super::command_mutates_for_replication("GEORADIUS", &read));
-        assert!(!super::is_denied_on_readonly_replica("GEORADIUS", &read));
+        assert!(super::is_denied_on_readonly_replica("GEORADIUS", &read));
         assert!(super::command_mutates_for_replication("GEORADIUS", &store));
         assert!(super::is_denied_on_readonly_replica("GEORADIUS", &store));
         assert!(super::command_mutates_for_replication(
@@ -4762,6 +4954,12 @@ mod replication_invariants_tests {
         })
         .unwrap();
         await_connected(&state, 1).await;
+        // Online, as its first acknowledgement would make it: only an online
+        // replica is counted.
+        state
+            .replica(9005)
+            .unwrap()
+            .set_state(crate::replication::ReplicaState::Online);
 
         // Nothing sent yet: the replica is already at its target.
         let targets = state.wait_targets();

@@ -615,9 +615,18 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         return None;
     }
     if ctx.cmd.len() != 2 {
-        return Some(resp_error(
-            "ERR wrong number of arguments for 'backup' command",
-        ));
+        // `backup|list`, as Redis names a subcommand; `backup` when there
+        // is none.
+        let name = match ctx.cmd.get(1) {
+            Some(sub) => format!(
+                "backup|{}",
+                String::from_utf8_lossy(sub).to_ascii_lowercase()
+            ),
+            None => "backup".to_string(),
+        };
+        return Some(resp_error(&format!(
+            "ERR wrong number of arguments for '{name}' command"
+        )));
     }
     let sub = String::from_utf8_lossy(ctx.cmd[1]).to_ascii_uppercase();
     Some(match sub.as_str() {
