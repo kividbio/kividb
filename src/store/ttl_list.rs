@@ -290,11 +290,16 @@ impl TtlList {
         (due, looked)
     }
 
-    /// Whether the shard should be swept at `now`: one is under way, or
-    /// the horizon is close.
+    /// Whether the shard should be swept at `now`: one is under way, the
+    /// horizon is close, or it is further ahead than a sweep now would put
+    /// it. That is a clock stepped back after a sweep: until it caught up,
+    /// every key given a time to live would go to the near list, and every
+    /// pass would look at it.
     #[inline]
     pub(super) fn sweep_due(&self, now: u64) -> bool {
-        self.sweeping || now.saturating_add(LEAD_MS) >= self.horizon
+        self.sweeping
+            || now.saturating_add(LEAD_MS) >= self.horizon
+            || self.horizon > now.saturating_add(HORIZON_MS + LEAD_MS)
     }
 
     /// Sweep, looking at `steps` entries at most: start one, moving the
@@ -305,7 +310,12 @@ impl TtlList {
     pub(super) fn sweep(&mut self, now: u64, steps: usize) -> bool {
         if !self.sweeping {
             self.sweeping = true;
-            self.next = now.saturating_add(HORIZON_MS).max(self.horizon);
+            let next = now.saturating_add(HORIZON_MS);
+            // A horizon further ahead (the clock stepped back) is brought
+            // back to this one: the far list's entries end at the old one or
+            // later, so at this one or later too.
+            self.horizon = self.horizon.min(next);
+            self.next = next;
             self.checked = 0;
             self.near_checked = 0;
         }
