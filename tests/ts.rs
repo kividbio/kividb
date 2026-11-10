@@ -2085,8 +2085,9 @@ fn test_ts_links_left_behind_are_dead() {
         }
     };
 
-    // The destination replaced: its old source no longer feeds it, and
-    // another source can.
+    // The destination replaced, and given another source before the old
+    // one closes a bucket: the old one does not feed it, and its rule is
+    // dead (hidden, and DELETERULE refuses it).
     for key in ["la:s", "la:d", "la:s2"] {
         c.cmds(&["TS.CREATE", key]);
     }
@@ -2097,6 +2098,8 @@ fn test_ts_links_left_behind_are_dead() {
         c.cmd(&[b"RESTORE", b"la:d", b"0", &payload, b"REPLACE"])
             .is_ok()
     );
+    assert!(rule(&mut c, "la:s2", "la:d").is_ok());
+    assert_eq!(ts_source(&mut c, "la:d").as_deref(), Some("la:s2"));
     c.cmds(&["TS.ADD", "la:s", "15", "1"]);
     assert!(
         c.cmds(&["TS.RANGE", "la:d", "-", "+"])
@@ -2108,8 +2111,8 @@ fn test_ts_links_left_behind_are_dead() {
         !info.as_array().contains(&RespValue::Bulk(b"la:d".to_vec())),
         "{info:?}"
     );
-    assert!(rule(&mut c, "la:s2", "la:d").is_ok());
-    assert_eq!(ts_source(&mut c, "la:d").as_deref(), Some("la:s2"));
+    assert!(c.cmds(&["TS.DELETERULE", "la:s", "la:d"]).is_error());
+    assert!(rule(&mut c, "la:s", "la:d").is_error());
     c.cmds(&["TS.ADD", "la:s2", "1", "4"]);
     c.cmds(&["TS.ADD", "la:s2", "15", "4"]);
     c.cmds(&["TS.ADD", "la:s", "25", "1"]);
@@ -2117,6 +2120,23 @@ fn test_ts_links_left_behind_are_dead() {
     let d = d.as_array();
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].as_array()[1].as_f64(), 4.0);
+
+    // A rule made again over a dead one: the destination was replaced, and
+    // its old source takes it back.
+    for key in ["ld:s", "ld:d"] {
+        c.cmds(&["TS.CREATE", key]);
+    }
+    assert!(rule(&mut c, "ld:s", "ld:d").is_ok());
+    let payload = dump(&mut c, "ld:d");
+    assert!(
+        c.cmd(&[b"RESTORE", b"ld:d", b"0", &payload, b"REPLACE"])
+            .is_ok()
+    );
+    assert!(rule(&mut c, "ld:s", "ld:d").is_ok());
+    assert_eq!(ts_source(&mut c, "ld:d").as_deref(), Some("ld:s"));
+    c.cmds(&["TS.ADD", "ld:s", "1", "2"]);
+    c.cmds(&["TS.ADD", "ld:s", "15", "2"]);
+    assert_eq!(c.cmds(&["TS.RANGE", "ld:d", "-", "+"]).as_array().len(), 1);
 
     // The source replaced: the destination has none, and takes another.
     for key in ["lb:s", "lb:d", "lb:x"] {
@@ -2162,3 +2182,116 @@ fn test_ts_time_above_i64_max_is_refused_in_multi() {
     assert!(results[2].is_error(), "{results:?}");
     assert_eq!(c.cmds(&["TS.RANGE", "mt", "-", "+"]).as_array().len(), 1);
 }
+
+/// `RENAME` and `RENAMENX` of a series take its links along, as in
+/// RedisTimeSeries: a source renamed still feeds its compaction, and a
+/// compaction renamed is still fed; both are found by their labels under
+/// the new name. `COPY` makes a series without links (#593).
+#[test]
+fn test_ts_rename_and_copy_keep_compactions_right() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let range_len = |c: &mut Conn, key: &str| c.cmds(&["TS.RANGE", key, "-", "+"]).as_array().len();
+
+    c.cmds(&["TS.CREATE", "rn:s", "LABELS", "kind", "raw"]);
+    c.cmds(&["TS.CREATE", "rn:d", "LABELS", "kind", "sum"]);
+    assert!(
+        c.cmds(&["TS.CREATERULE", "rn:s", "rn:d", "AGGREGATION", "sum", "10"])
+            .is_ok()
+    );
+    c.cmds(&["TS.ADD", "rn:s", "1", "1"]);
+
+    // The source renamed.
+    assert!(c.cmds(&["RENAME", "rn:s", "rn:s2"]).is_ok());
+    assert_eq!(ts_source(&mut c, "rn:d").as_deref(), Some("rn:s2"));
+    assert_eq!(query_index(&mut c, "kind=raw"), ["rn:s2"]);
+    c.cmds(&["TS.ADD", "rn:s2", "15", "1"]);
+    assert_eq!(range_len(&mut c, "rn:d"), 1);
+
+    // The destination renamed.
+    assert!(c.cmds(&["RENAME", "rn:d", "rn:d2"]).is_ok());
+    assert_eq!(ts_source(&mut c, "rn:d2").as_deref(), Some("rn:s2"));
+    assert_eq!(query_index(&mut c, "kind=sum"), ["rn:d2"]);
+    c.cmds(&["TS.ADD", "rn:s2", "25", "1"]);
+    assert_eq!(range_len(&mut c, "rn:d2"), 2);
+    assert!(c.cmds(&["TS.DELETERULE", "rn:s2", "rn:d"]).is_error());
+
+    // RENAMENX, both ways.
+    assert_eq!(c.cmds(&["RENAMENX", "rn:s2", "rn:s3"]).as_int(), 1);
+    assert_eq!(c.cmds(&["RENAMENX", "rn:d2", "rn:d3"]).as_int(), 1);
+    assert_eq!(ts_source(&mut c, "rn:d3").as_deref(), Some("rn:s3"));
+    c.cmds(&["TS.ADD", "rn:s3", "35", "1"]);
+    assert_eq!(range_len(&mut c, "rn:d3"), 3);
+    assert!(c.cmds(&["TS.DELETERULE", "rn:s3", "rn:d3"]).is_ok());
+
+    // COPY: no links, found by its labels.
+    c.cmds(&["TS.CREATE", "cp:s"]);
+    c.cmds(&["TS.CREATE", "cp:d", "LABELS", "kind", "copied"]);
+    assert!(
+        c.cmds(&["TS.CREATERULE", "cp:s", "cp:d", "AGGREGATION", "sum", "10"])
+            .is_ok()
+    );
+    assert_eq!(c.cmds(&["COPY", "cp:s", "cp:s2"]).as_int(), 1);
+    assert_eq!(c.cmds(&["COPY", "cp:d", "cp:d2"]).as_int(), 1);
+    assert_eq!(ts_source(&mut c, "cp:d2"), None);
+    let mut found = query_index(&mut c, "kind=copied");
+    found.sort();
+    assert_eq!(found, ["cp:d", "cp:d2"]);
+    c.cmds(&["TS.ADD", "cp:s2", "1", "1"]);
+    c.cmds(&["TS.ADD", "cp:s2", "15", "1"]);
+    assert_eq!(range_len(&mut c, "cp:d"), 0);
+    // COPY … REPLACE over the source: the copy at its name has no rule, and
+    // the destination's source is dead.
+    assert_eq!(c.cmds(&["COPY", "cp:s2", "cp:s", "REPLACE"]).as_int(), 1);
+    assert_eq!(ts_source(&mut c, "cp:d"), None);
+    c.cmds(&["TS.ADD", "cp:s", "25", "1"]);
+    assert_eq!(range_len(&mut c, "cp:d"), 0);
+}
+
+/// A payload made by 1.2.0, which carried a series' compaction rules and
+/// source, is restored without them (#593). `LINKED_PAYLOAD`: a series
+/// with one sample (1, 2.5), the label `k=v`, a rule to `lp:d` and the
+/// source `lp:s`, as 1.2.0's `DUMP` wrote it.
+#[test]
+fn test_ts_restore_of_a_payload_with_links_leaves_them_out() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for key in ["lp:s", "lp:d"] {
+        c.cmds(&["TS.CREATE", key]);
+    }
+    let payload = hex(LINKED_PAYLOAD);
+    assert!(c.cmd(&[b"RESTORE", b"lp:x", b"0", &payload]).is_ok());
+    let info = c.cmds(&["TS.INFO", "lp:x"]);
+    let arr = info.as_array();
+    let at = |name: &str| {
+        arr.iter()
+            .position(|v| matches!(v, RespValue::Bulk(b) if b == name.as_bytes()))
+            .unwrap()
+            + 1
+    };
+    assert_eq!(arr[at("rules")], RespValue::Array(vec![]));
+    assert_eq!(arr[at("sourceKey")], RespValue::Nil);
+    assert_eq!(query_index(&mut c, "k=v"), ["lp:x"]);
+    // Nothing of it is alive: lp:d takes a source, and lp:x feeds nothing.
+    assert!(
+        c.cmds(&["TS.CREATERULE", "lp:s", "lp:d", "AGGREGATION", "sum", "10"])
+            .is_ok()
+    );
+    c.cmds(&["TS.ADD", "lp:x", "15", "1"]);
+    assert!(
+        c.cmds(&["TS.RANGE", "lp:d", "-", "+"])
+            .as_array()
+            .is_empty()
+    );
+}
+
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+const LINKED_PAYLOAD: &str = "4b495649444230310100000001000000760f01000000010000000000000000000000000004400000000000000000001000000000000001000000010000006b0100000076040000004c41535401000000040000006c703a640300000073756d0a000000000000000000000000000000040000006c703a73000000000a0036e9b62d4fa3a05d";

@@ -782,10 +782,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Write to dst, the time to live going with the value: the one
             // dst had, if any, goes.
+            let series = matches!(value, KiviDBValue::TimeSeries(_));
             {
                 let shard = store::get_shard(db_ref, &dst);
                 let mut map = write_lock!(shard);
                 map.insert_expiring(&*dst, value, expiry);
+            }
+            if series {
+                crate::commands::ts::renamed(ctx, &src, &dst);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -828,9 +832,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db_ref, &src);
                 write_lock!(shard).remove(src.as_slice());
             }
+            let series = matches!(src_value, KiviDBValue::TimeSeries(_));
             {
                 let shard = store::get_shard(db_ref, &dst);
                 write_lock!(shard).insert_expiring(&*dst, src_value, expiry);
+            }
+            if series {
+                crate::commands::ts::renamed(ctx, &src, &dst);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -901,6 +909,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
+            if let KiviDBValue::TimeSeries(series) = &value {
+                crate::commands::ts::copied(ctx, &dst_key, series);
+            }
             // Write to destination, with the source's time to live (the
             // key replaced may have had one: the copy has the source's, or
             // none).

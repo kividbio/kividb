@@ -4589,6 +4589,44 @@ mod ts_option_replay_tests {
         assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
     }
 
+    /// A compaction's destination past its time (its `DEL` not yet in the
+    /// log), deleted, made again and given its source again; and a source
+    /// renamed. Replayed, the links are as the master had them (#593).
+    #[test]
+    fn compaction_links_replay_as_they_ran() {
+        let store = replayed(&[
+            vec!["TS.CREATE", "s"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "1", "1"],
+            vec!["PEXPIREAT", "d", "1"],
+            vec!["TS.ADD", "s", "15", "1"],
+            vec!["DEL", "d"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "25", "1"],
+            vec!["RENAME", "s", "s2"],
+            vec!["TS.ADD", "s2", "35", "1"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let s = series("s2");
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].dest_key, "d");
+        let d = series("d");
+        assert_eq!(d.source.as_deref(), Some("s2"));
+        assert_eq!(
+            d.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
+            [(10, 1.0), (20, 1.0)]
+        );
+    }
+
     #[test]
     fn options_replay_as_they_ran() {
         let (store, index) = replayed_with_index(&[

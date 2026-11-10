@@ -5514,6 +5514,76 @@ mod dump_payload_tests {
         }
     }
 
+    /// A series with a rule to `lp:d` and the source `lp:s`: links.
+    fn linked_series() -> KiviDBValue {
+        let mut ts = TsInner::new();
+        ts.samples.insert(1, 2.5);
+        ts.last_ts = Some(1);
+        ts.labels.insert("k".into(), "v".into());
+        ts.rules.push(crate::types::CompactionRule {
+            dest_key: "lp:d".into(),
+            aggregation: crate::types::TsAggregation::Sum,
+            bucket_duration: 10,
+            align_timestamp: 0,
+        });
+        ts.source = Some("lp:s".into());
+        KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
+    }
+
+    /// The series' KDB image as a snapshot writes it.
+    fn image(value: &KiviDBValue) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, 1).unwrap();
+        write_kdb_entry(&mut out, DUMP_IMAGE_KEY, value.view()).unwrap();
+        write_kdb_db_end(&mut out).unwrap();
+        out
+    }
+
+    /// `DUMP` leaves a series' links out (#593); a snapshot written after
+    /// it on the same thread keeps them.
+    #[test]
+    fn a_dump_leaves_links_out_and_a_snapshot_after_it_keeps_them() {
+        let series = linked_series();
+        let payload = dump_payload(&series).unwrap();
+        match restore_payload(&payload).unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let ts = arc.read();
+                assert!(ts.rules.is_empty() && ts.source.is_none());
+                assert_eq!(ts.samples.get(&1), Some(&2.5));
+                assert_eq!(ts.labels.get("k").map(String::as_str), Some("v"));
+            }
+            _ => panic!("expected a time series"),
+        }
+        let loaded = load_snapshot_from(&image(&series)[..]).unwrap();
+        match loaded.dbs[0].values().next().unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let ts = arc.read();
+                assert_eq!(ts.rules.len(), 1);
+                assert_eq!(ts.source.as_deref(), Some("lp:s"));
+            }
+            _ => panic!("expected a time series"),
+        }
+    }
+
+    /// A payload as 1.2.0's `DUMP` wrote a series with links: the image,
+    /// the version, the checksum. tests/ts.rs restores it.
+    #[test]
+    fn a_payload_with_links_as_1_2_0_wrote_it() {
+        let mut payload = image(&linked_series());
+        let crc = crc64_digest(&payload);
+        payload.extend_from_slice(&DUMP_VERSION);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        println!("LINKED_PAYLOAD={hex}");
+        match restore_payload(&payload).unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                assert_eq!(arc.read().rules.len(), 1);
+                assert_eq!(arc.read().source.as_deref(), Some("lp:s"));
+            }
+            _ => panic!("expected a time series"),
+        }
+    }
+
     #[test]
     fn a_corrupted_payload_is_rejected() {
         let mut payload =

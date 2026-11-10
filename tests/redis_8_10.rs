@@ -2292,6 +2292,79 @@ fn time_series_options_reach_a_replica() {
     );
 }
 
+/// A compaction's destination past its time and not yet reaped, then made
+/// again and given its source again; one deleted and made again; a source
+/// and a destination renamed: the replica's links and compactions are the
+/// master's (#593). Active expiry is off meanwhile, so the destination is
+/// still there, past its time, when its source closes a bucket.
+#[test]
+fn time_series_links_reach_a_replica() {
+    let master_port = free_port();
+    start(master_port, None);
+    let replica_port = free_port();
+    start(replica_port, Some(master_port));
+    let mut m = Conn::connect(master_port);
+    let mut r = Conn::connect(replica_port);
+    wait_until("the replica to sync", || {
+        r.cmd(&["INFO", "replication"])
+            .s()
+            .contains("master_link_status:up")
+    });
+    let rule = |c: &mut Conn, s: &str, d: &str| {
+        c.cmd(&["TS.CREATERULE", s, d, "AGGREGATION", "sum", "10"])
+    };
+
+    assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).ok());
+    for key in ["rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s", "rl:z:d"] {
+        m.cmd(&["TS.CREATE", key]);
+    }
+    for tag in ["x", "y", "z"] {
+        let (s, d) = (format!("rl:{tag}:s"), format!("rl:{tag}:d"));
+        assert!(rule(&mut m, &s, &d).ok());
+        m.cmd(&["TS.ADD", &s, "1", "1"]);
+    }
+    // Expired, not reaped.
+    assert_eq!(m.cmd(&["PEXPIRE", "rl:x:d", "1"]).i(), 1);
+    thread::sleep(Duration::from_millis(50));
+    m.cmd(&["TS.ADD", "rl:x:s", "15", "1"]);
+    assert!(m.cmd(&["TS.CREATE", "rl:x:d"]).ok());
+    assert!(rule(&mut m, "rl:x:s", "rl:x:d").ok());
+    m.cmd(&["TS.ADD", "rl:x:s", "25", "1"]);
+    // Deleted.
+    assert_eq!(m.cmd(&["DEL", "rl:y:d"]).i(), 1);
+    m.cmd(&["TS.ADD", "rl:y:s", "15", "1"]);
+    assert!(m.cmd(&["TS.CREATE", "rl:y:d"]).ok());
+    assert!(rule(&mut m, "rl:y:s", "rl:y:d").ok());
+    m.cmd(&["TS.ADD", "rl:y:s", "25", "1"]);
+    // Renamed.
+    assert!(m.cmd(&["RENAME", "rl:z:s", "rl:z:s2"]).ok());
+    assert_eq!(m.cmd(&["RENAMENX", "rl:z:d", "rl:z:d2"]).i(), 1);
+    m.cmd(&["TS.ADD", "rl:z:s2", "15", "1"]);
+    assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).ok());
+    assert_eq!(m.cmd(&["WAIT", "1", "5000"]).i(), 1);
+
+    for key in ["rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s2", "rl:z:d2"] {
+        let (on_master, on_replica) = (m.cmd(&["TS.INFO", key]), r.cmd(&["TS.INFO", key]));
+        for field in ["sourceKey", "rules", "totalSamples"] {
+            assert_eq!(
+                on_replica.field(field),
+                on_master.field(field),
+                "{key} {field}"
+            );
+        }
+        assert_eq!(
+            r.cmd(&["TS.RANGE", key, "-", "+"]),
+            m.cmd(&["TS.RANGE", key, "-", "+"]),
+            "{key}"
+        );
+    }
+    for key in ["rl:x:d", "rl:y:d"] {
+        let range = m.cmd(&["TS.RANGE", key, "-", "+"]);
+        assert_eq!(range.arr().len(), 1, "{key}: {range:?}");
+    }
+    assert_eq!(m.cmd(&["TS.RANGE", "rl:z:d2", "-", "+"]).arr().len(), 1);
+}
+
 /// Writes that give a TTL as "this long from now", in every spelling, and the
 /// keys (and hash fields) they leave with one.
 const RELATIVE_TTL_WRITES: &[&[&str]] = &[
