@@ -371,13 +371,20 @@ fn wait_counts_a_replica_that_connects_while_it_waits() {
         let mut c = master.conn();
         c.cmd(&["SET", "k", "v"]);
         let port = master.port;
+        let mut w = Conn::connect(port);
+        let id = w.cmd(&["CLIENT", "ID"]).i();
         let waiting = std::thread::spawn(move || {
-            let mut w = Conn::connect(port);
             let started = Instant::now();
             let n = w.cmd(&["WAIT", "1", "15000"]).i();
             (n, started.elapsed())
         });
-        std::thread::sleep(Duration::from_millis(300));
+        // The WAIT is waiting before the replica exists.
+        wait_until_blocked(&mut c, id);
+        assert_eq!(
+            info_field(&mut c, "replication", "connected_slaves"),
+            "0",
+            "{io}"
+        );
         let port_text = port.to_string();
         let replica = Server::start("tokio", &["--replicaof", "127.0.0.1", &port_text]);
         let (n, took) = waiting.join().unwrap();
@@ -386,6 +393,139 @@ fn wait_counts_a_replica_that_connects_while_it_waits() {
         let mut r = replica.conn();
         assert_eq!(r.cmd(&["GET", "k"]), V::Bulk("v".into()), "{io}");
     }
+}
+
+/// Until client `id` shows as blocked in `CLIENT LIST`.
+fn wait_until_blocked(c: &mut Conn, id: i64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = c.cmd(&["CLIENT", "LIST", "ID", &id.to_string()]);
+        if list.s().contains(" flags=b ") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never blocked: {list:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A replica that comes back by partial resync while a `WAIT` waits is
+/// counted only once it has acknowledged the backlog it was sent, which
+/// holds the write the `WAIT` is for: whenever `WAIT 2` answers 2, both
+/// replicas have it.
+///
+/// The master runs on io_uring: on the tokio loop `CLIENT KILL` does not
+/// drop a replica's link yet (#595), and there is then no partial resync to
+/// test. `WAIT` itself is the same code on both loops.
+#[cfg(target_os = "linux")]
+#[test]
+fn wait_counts_a_replica_back_by_partial_resync_only_once_it_has_the_write() {
+    for io in ["uring"] {
+        let master = Server::start(io, &[]);
+        let port = master.port.to_string();
+        let r1 = Server::start("tokio", &["--replicaof", "127.0.0.1", &port]);
+        let r2 = Server::start("tokio", &["--replicaof", "127.0.0.1", &port]);
+        wait_for_link(&r1);
+        wait_for_link(&r2);
+        let mut m = master.conn();
+        let partial_before: i64 = info_field(&mut m, "stats", "sync_partial_ok")
+            .parse()
+            .unwrap();
+        // The replicas' links: the connections that ran PSYNC.
+        let list = m.cmd(&["CLIENT", "LIST"]);
+        let links: Vec<String> = list
+            .s()
+            .lines()
+            .filter(|line| line.contains(" cmd=psync ") || line.contains(" cmd=replconf "))
+            .filter_map(|line| line.split_whitespace().next())
+            .filter_map(|f| f.strip_prefix("id="))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(links.len(), 2, "{io}: {list:?}");
+        for (round, id) in links.iter().enumerate() {
+            let key = format!("k{round}");
+            // Cut one replica's link: it comes back by partial resync, with
+            // the write below in its backlog.
+            assert_eq!(m.cmd(&["CLIENT", "KILL", "ID", id]).i(), 1, "{io}");
+            // Gone from the master's side before the write, so that the
+            // write reaches it only through its backlog.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while info_field(&mut m, "replication", "connected_slaves") != "1" {
+                assert!(Instant::now() < deadline, "{io}: the link did not drop");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(m.cmd(&["SET", &key, "v"]).ok(), "{io}");
+            assert_eq!(m.cmd(&["WAIT", "2", "15000"]).i(), 2, "{io} round {round}");
+            for r in [&r1, &r2] {
+                assert_eq!(
+                    r.conn().cmd(&["GET", &key]),
+                    V::Bulk("v".into()),
+                    "{io} round {round}: WAIT counted a replica without the write"
+                );
+            }
+        }
+        let partial_after: i64 = info_field(&mut m, "stats", "sync_partial_ok")
+            .parse()
+            .unwrap();
+        assert!(
+            partial_after > partial_before,
+            "{io}: no partial resync happened"
+        );
+    }
+}
+
+/// A master that becomes a replica while a client waits in `WAIT` tells it
+/// so and closes its connection, as Redis does; the WAIT hung.
+#[test]
+fn wait_ends_when_the_master_becomes_a_replica() {
+    for io in io_models() {
+        let other = Server::start("tokio", &[]);
+        let master = Server::start(io, &[]);
+        let mut c = master.conn();
+        let mut w = master.conn();
+        let id = w.cmd(&["CLIENT", "ID"]).i();
+        let waiting = std::thread::spawn(move || {
+            let reply = w.cmd(&["WAIT", "1", "0"]);
+            // Then closed: nothing more comes.
+            let mut rest = [0u8; 1];
+            let closed = matches!(std::io::Read::read(&mut w.reader, &mut rest), Ok(0));
+            (reply, closed)
+        });
+        wait_until_blocked(&mut c, id);
+        assert!(
+            c.cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok(),
+            "{io}"
+        );
+        let (reply, closed) = waiting.join().unwrap();
+        assert_eq!(
+            reply,
+            V::Err(
+                "UNBLOCKED force unblock from blocking operation, instance state changed \
+                 (master -> replica?)"
+                    .into()
+            ),
+            "{io}"
+        );
+        assert!(closed, "{io}: the connection was left open");
+    }
+}
+
+/// Every blocked client shows `b` in `CLIENT LIST`, a `BLPOP` too.
+#[test]
+fn a_client_in_blpop_shows_as_blocked() {
+    on_each_loop(&[], |server, io| {
+        let mut c = server.conn();
+        let mut w = server.conn();
+        let id = w.cmd(&["CLIENT", "ID"]).i();
+        let waiting = std::thread::spawn(move || w.cmd(&["BLPOP", "nothing", "0"]));
+        wait_until_blocked(&mut c, id);
+        c.cmd(&["RPUSH", "nothing", "x"]);
+        assert_eq!(
+            waiting.join().unwrap(),
+            V::Arr(vec![V::Bulk("nothing".into()), V::Bulk("x".into())]),
+            "{io}"
+        );
+    });
 }
 
 /// A client in `WAIT` is a blocked client: `b` in `CLIENT LIST`, counted

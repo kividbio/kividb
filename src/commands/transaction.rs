@@ -151,17 +151,12 @@ pub fn connection_reply_in_exec(name: &str, cmd: &[&[u8]], env: &InExec) -> Opti
         // on a replica.
         "WAIT" => match crate::replication::wait_args(cmd, env.repl_state.is_slave()) {
             Err(refusal) => refusal,
-            Ok((wanted, _)) => {
-                let connected = env.repl_state.connected_replicas.load(Ordering::Relaxed);
-                if wanted <= 0 || connected == 0 {
-                    crate::resp::write::resp_integer(connected)
-                } else {
-                    crate::resp::write::resp_integer(
-                        env.wait_targets
-                            .map_or(0, crate::replication::ReplState::count_reached),
-                    )
-                }
-            }
+            // Whatever the number asked for: the replicas that have what
+            // was written before this `EXEC`, now, as Redis answers.
+            Ok(_) => crate::resp::write::resp_integer(
+                env.wait_targets
+                    .map_or(0, crate::replication::ReplState::count_reached),
+            ),
         },
         _ => {
             if !crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {

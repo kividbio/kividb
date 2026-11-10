@@ -2186,7 +2186,15 @@ where
                                 () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
                             };
                             match waited {
-                                Some(reply) => reply,
+                                Some(end) if end.close => {
+                                    // This master became a replica: told so,
+                                    // and closed, as Redis closes it.
+                                    combined.extend_from_slice(&end.reply);
+                                    parse_offset += consumed;
+                                    quit_requested = true;
+                                    break;
+                                }
+                                Some(end) => end.reply,
                                 // The client has gone: there is nobody to answer.
                                 None => {
                                     quit_requested = true;

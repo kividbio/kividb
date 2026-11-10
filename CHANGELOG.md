@@ -279,7 +279,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     a replica it is refused, as in Redis; it waited for ever. Without
     replicas, `WAIT n timeout` with `n` above 0 now waits out its timeout
     and answers 0, as Redis does; it answered at once. A replica that
-    connects while a `WAIT` waits is counted once it has caught up. A
+    connects while a `WAIT` waits is counted once it has caught up. Only
+    replicas that are online and still connected are counted, a replica that
+    reconnected is counted once, and one back by partial resync only once it
+    has acknowledged the backlog it was sent. `WAIT 0` (and `WAIT` inside
+    `MULTI`) answers the number of replicas that have what was written, not
+    the number connected. A master that becomes a replica ends a waiting
+    `WAIT` with Redis's `-UNBLOCKED` error and closes the connection. A
     client waiting in `WAIT` shows as blocked (`b` in `CLIENT LIST`,
     `blocked_clients`), and `CLIENT UNBLOCK` ends its wait. `CLIENT LIST`
     shows `b` for every blocked client.
