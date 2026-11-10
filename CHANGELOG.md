@@ -145,6 +145,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CLIENT PAUSE ... WRITE` no longer replies while a write is still on
+  its way (#629).** A switchover (the kividb-operator's, and any that works
+  the same way) pauses writes on the master, reads `master_repl_offset`,
+  waits for the replica to reach it and promotes the replica. A write that
+  had passed the pause check just before the pause was set, and was held up
+  before it was applied (a thread descheduled on a CPU-limited pod, say),
+  was applied and acknowledged after `CLIENT PAUSE` had replied OK and the
+  offset had been read, and the promoted replica did not have it. Now
+  `CLIENT PAUSE` (`WRITE` or `ALL`) waits for the writes already being
+  applied to finish, which takes microseconds, and a write that reaches
+  the store after the pause was set goes back and is held until the pause
+  ends, as a write that arrives during the pause is. When OK is sent, every
+  acknowledged write is in the offset. A write held up for longer, behind a
+  script or a transaction, does not delay the reply; and the wait for the
+  writes being applied ends when the pause ends, or after 5 seconds, with a
+  warning in the log. Writes are still held, not refused, and a
+  transaction or a script that pauses clients does not wait for itself.
+
 - **An idle server with many keys that have a long TTL no longer spends
   CPU on them (#618).** Every active-expiry cycle, ten times a second,
   looked at every key with a TTL in every shard, due or not. Each expiry

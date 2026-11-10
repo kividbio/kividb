@@ -1840,6 +1840,171 @@ fn send_only(c: &mut Conn, args: &[&str]) {
     c.writer.write_all(&buf).unwrap();
 }
 
+/// Whether a reply comes to `c` within `wait`. Nothing is read.
+fn replied_within(c: &mut Conn, wait: Duration) -> bool {
+    c.reader
+        .get_ref()
+        .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+        .unwrap();
+    let replied = c.reader.fill_buf().is_ok_and(|buffered| !buffered.is_empty());
+    c.reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    replied
+}
+
+fn master_offset(c: &mut Conn) -> u64 {
+    c.info("replication", "master_repl_offset").parse().unwrap()
+}
+
+/// A master started with `env` (its test hooks), and a replica that
+/// follows it, its link up.
+fn master_and_replica(env: &[(&str, &str)]) -> (Server, Server) {
+    let master = Server::start_with_env(&[], env);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    wait_link_up(&mut replica.conn());
+    (master, replica)
+}
+
+/// A write held up on its way to the write gate while another client
+/// pauses writes (#629). It passed the pause check before the pause was
+/// set, and the test hook holds it there (`KIVIDB_TEST_PRE_GATE_DELAY_MS`,
+/// arguments beginning with `stalled:`). `CLIENT PAUSE` answers at once —
+/// it does not wait for a write that has not reached the gate — and once
+/// the write gets there it is held with the others: not applied, not
+/// answered, and not in `master_repl_offset`, until the pause ends. It used
+/// to be applied and answered during the pause, after `CLIENT PAUSE` had
+/// replied and the offset had been read: a switchover that promoted a
+/// replica at that offset lost it.
+///
+/// `before` is sent first, its replies read; then `write`, whose reply is
+/// read once the pause has ended; `key` is what it sets to "1".
+fn a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+    before: &[&[&str]],
+    write: &[&str],
+    key: &str,
+) {
+    let (master, replica) = master_and_replica(&[("KIVIDB_TEST_PRE_GATE_DELAY_MS", "1500")]);
+    let mut a = master.conn();
+    assert!(a.cmd(&["SET", "first", "0"]).ok());
+    let mut b = master.conn();
+    for args in before {
+        let reply = b.cmd(args);
+        assert!(!matches!(reply, V::Err(_)), "{args:?}: {reply:?}");
+    }
+    let sent = Instant::now();
+    send_only(&mut b, write);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let pausing = Instant::now();
+    assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+    assert!(
+        pausing.elapsed() < Duration::from_millis(1000),
+        "CLIENT PAUSE waited for a write that had not reached the gate ({:?})",
+        pausing.elapsed()
+    );
+    let offset = master_offset(&mut a);
+    assert_eq!(master_offset(&mut a), offset);
+    // Past the end of the hold-up: the write has reached the gate.
+    std::thread::sleep(Duration::from_millis(1500).saturating_sub(sent.elapsed()));
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !replied_within(&mut b, Duration::ZERO),
+        "{write:?} was answered while writes were paused\n{}",
+        master.log()
+    );
+    assert_eq!(a.cmd(&["GET", key]), V::Nil, "{write:?} was applied");
+    assert_eq!(
+        master_offset(&mut a),
+        offset,
+        "something was written after CLIENT PAUSE had replied"
+    );
+
+    assert!(a.cmd(&["CLIENT", "UNPAUSE"]).ok());
+    let reply = b.read();
+    assert!(!matches!(reply, V::Err(_)), "{write:?}: {reply:?}");
+    assert_eq!(a.cmd(&["GET", key]).s(), "1");
+    let offset = master_offset(&mut a);
+    let mut r = replica.conn();
+    wait_until("the replica to catch up", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    assert_eq!(r.cmd(&["GET", key]).s(), "1");
+}
+
+#[test]
+fn a_write_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
+    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(&[], &["SET", "stalled:k", "1"], "stalled:k");
+}
+
+#[test]
+fn a_transaction_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
+    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+        &[&["MULTI"], &["SET", "stalled:t", "1"]],
+        &["EXEC"],
+        "stalled:t",
+    );
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
+    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+        &[],
+        &[
+            "EVAL",
+            "return redis.call('SET', KEYS[1], '1')",
+            "1",
+            "stalled:s",
+        ],
+        "stalled:s",
+    );
+}
+
+/// A write in the write gate when another client pauses writes (#629):
+/// `CLIENT PAUSE` answers once it is done, and the offset read after that
+/// covers it. The test hook holds the write in the gate, between being
+/// encoded and being queued (`KIVIDB_TEST_BARE_WRITE_DELAY_MS`). The pause
+/// used to be answered at once; the write was then queued and answered after
+/// the offset had been read, and a replica promoted at that offset did not
+/// have it.
+#[test]
+fn client_pause_answers_once_the_writes_in_the_gate_are_done() {
+    let (master, replica) = master_and_replica(&[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
+    let mut a = master.conn();
+    assert!(a.cmd(&["SET", "first", "0"]).ok());
+    let mut b = master.conn();
+    let sent = Instant::now();
+    send_only(&mut b, &["SET", "delayed:k", "1"]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+    assert!(
+        sent.elapsed() >= Duration::from_millis(1400),
+        "CLIENT PAUSE did not wait for the write in the gate ({:?})",
+        sent.elapsed()
+    );
+    let offset = master_offset(&mut a);
+    assert!(b.read().ok());
+    assert_eq!(
+        master_offset(&mut a),
+        offset,
+        "the write was queued after CLIENT PAUSE had replied"
+    );
+    let mut r = replica.conn();
+    wait_until("the replica to reach the offset", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    assert_eq!(r.cmd(&["GET", "delayed:k"]).s(), "1", "{}", master.log());
+    assert!(a.cmd(&["CLIENT", "UNPAUSE"]).ok());
+}
+
 /// The keys of database `db`, sorted.
 fn keys_of_db(c: &mut Conn, db: &str) -> Vec<String> {
     assert!(c.cmd(&["SELECT", db]).ok());

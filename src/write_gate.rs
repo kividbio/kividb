@@ -114,6 +114,33 @@ pub fn cut() -> Option<CutGuard> {
     Some(CutGuard(GATE.iter().map(|slot| slot.0.write()).collect()))
 }
 
+/// Wait for every write in the gate now to be done with it, without closing
+/// the gate as [`cut`] does: each slot is taken for an instant, one after
+/// another, and let go of at once. A write that comes to a slot meanwhile
+/// waits for that instant at most, or for a millisecond while a write that
+/// was there before it is still at work. One that enters a slot after it
+/// was taken here sees everything done before this was called: for
+/// `CLIENT PAUSE` (`pause::pause_clients`), that clients are paused.
+///
+/// Gives up at `deadline`, or once `go_on` says so; whether every write was
+/// waited out. The slot of a thread inside a write itself — a transaction
+/// or a script pausing clients — is passed over: what is in it is its own.
+pub fn wait_out_writes(deadline: std::time::Instant, go_on: impl Fn() -> bool) -> bool {
+    const STEP: std::time::Duration = std::time::Duration::from_millis(1);
+    let mine = held_by_this_thread().then(|| MY_SLOT.with(|s| *s));
+    for (at, slot) in GATE.iter().enumerate() {
+        if mine == Some(at) {
+            continue;
+        }
+        while slot.0.try_write_for(STEP).is_none() {
+            if std::time::Instant::now() >= deadline || !go_on() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +207,51 @@ mod tests {
         drop(outer);
         assert!(!held_by_this_thread());
         assert!(cut().is_some());
+    }
+
+    /// A wait for the writes in the gate waits for the one there, gives up
+    /// when told to or at its deadline, and does not wait for its own.
+    #[test]
+    fn the_writes_in_the_gate_are_waited_out_without_closing_it() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            std::thread::spawn(move || {
+                let _gate = enter();
+                entered.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let far = || std::time::Instant::now() + Duration::from_secs(30);
+        assert!(!wait_out_writes(far(), || false), "it did not give up");
+        let soon = std::time::Instant::now() + Duration::from_millis(20);
+        assert!(!wait_out_writes(soon, || true), "it waited past its deadline");
+        let started = std::time::Instant::now();
+        let releaser = {
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                release.store(true, Ordering::SeqCst);
+            })
+        };
+        assert!(wait_out_writes(far(), || true));
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "the write in the gate was not waited for"
+        );
+        writer.join().unwrap();
+        releaser.join().unwrap();
+        let _outer = enter();
+        assert!(
+            wait_out_writes(far(), || true),
+            "a wait from inside a write waited for itself"
+        );
     }
 
     /// Writers must not be blocked by each other, only by a cut.

@@ -177,6 +177,12 @@ where
     S: AsyncWrite + Unpin + Send,
     R: tokio::io::AsyncRead + Unpin,
 {
+    // No wait: a write that got past a `CLIENT PAUSE` before it was set
+    // (`blocking::hold_for_pause`). Read again, and held by the pause check.
+    if wait.held_by_pause() {
+        slot.held_by_pause();
+        return Ok(());
+    }
     if slot.in_resume() && !wait.may_repark() {
         // A resumed handler parked again — it forgot its resume check. Reply
         // as if the wait timed out rather than looping forever.
@@ -1077,6 +1083,12 @@ where
                         resp_version,
                     )
                     .await;
+                    // A script that got past a `CLIENT PAUSE` before it was
+                    // set, and did not run (`pause::HELD_IN_GATE`): read
+                    // again, and held by the pause check.
+                    if crate::pause::is_held(&response) {
+                        continue;
+                    }
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
                         let client_name = client_registry
                             .get(client_id)
@@ -1666,11 +1678,27 @@ where
                         } else {
                             None
                         };
+                        // The test hook that holds a write up before its gates
+                        // (`pause::test_stall_before_the_gate`).
+                        #[cfg(debug_assertions)]
+                        for queued in &tx.queue {
+                            let queued: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
+                            crate::pause::test_stall_before_the_gate(&queued);
+                        }
                         let _alone = crate::command_gate::enter_alone();
                         // And as one write: a snapshot, a backup or a full sync cuts
                         // before it or after it, never between two of its commands
                         // (#148). The writes it runs are inside this one.
                         let _whole = crate::write_gate::enter();
+                        // A `CLIENT PAUSE` set since it passed the pause
+                        // check: out of the gates, read again, and held by
+                        // that check, the transaction as it was (#629). See
+                        // `pause::pause_clients`.
+                        if crate::pause::writes_must_check(routed.at())
+                            && crate::pause::exec_held_in_gate(&tx.queue)
+                        {
+                            continue;
+                        }
                         // And to replicas and the AOF as one: its writes in the
                         // stream between a `MULTI` and an `EXEC`, its records
                         // written together (#172). Dropped first, while the
@@ -2464,6 +2492,11 @@ where
                     result
                 }
             };
+            // A write that got past a `CLIENT PAUSE` before it was set, and
+            // went no further (`pause::HELD_IN_GATE`): read again, and held.
+            if crate::pause::is_held(&response) {
+                continue;
+            }
             // The other commands answered here, and not by `execute_command`,
             // are counted as well (`HELLO` counts itself, as it replies in
             // several places).

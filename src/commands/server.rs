@@ -5419,7 +5419,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(mode) if cmd.len() == 4 && mode.eq_ignore_ascii_case(b"ALL") => false,
                         Some(_) => return Some(resp_error("ERR syntax error")),
                     };
-                    crate::pause::set_pause(ms, write_only);
+                    // Once the writes on their way have been applied or
+                    // will be held: see `pause_clients` (#629).
+                    crate::pause::pause_clients(ms, write_only);
                     Some(resp_simple("OK"))
                 }
 

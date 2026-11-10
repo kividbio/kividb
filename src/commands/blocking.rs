@@ -71,6 +71,9 @@ pub struct BlockingWait {
     /// [`role_changes`] when the command parked: see
     /// [`ended_by_role_change`].
     role_epoch: u64,
+    /// Not a wait: a write that got past a `CLIENT PAUSE` before it was set
+    /// is to be read again and held by the pause ([`hold_for_pause`]).
+    held_by_pause: bool,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -341,6 +344,19 @@ impl BlockingSlot {
         self.pending.is_some()
     }
 
+    /// The dispatch just completed was sent back to be held by a pause
+    /// ([`hold_for_pause`]): the command is dispatched again once the pause
+    /// lets it, as it was dispatched this time. A resume is a resume again,
+    /// with what its wait produced: the handler had not yet taken it.
+    pub fn held_by_pause(&mut self) {
+        if self.in_resume {
+            if let Some(delivery) = self.ctl.resume.take() {
+                self.pending = Some((delivery, self.ctl.state.take(), self.ctl.gone));
+            }
+            self.in_resume = false;
+        }
+    }
+
     /// Clear the resume flag after the guard has fired.
     pub fn clear_resume(&mut self) {
         self.in_resume = false;
@@ -419,6 +435,7 @@ pub fn park_with_state(
                 timeout,
                 state,
                 role_epoch: role_changes(ctx.repl_state),
+                held_by_pause: false,
             });
             ParkOutcome::Parked
         }
@@ -426,6 +443,30 @@ pub fn park_with_state(
             drop(rxs);
             ParkOutcome::CannotWait
         }
+    }
+}
+
+/// The reply of a write that has found, inside the write gate, that a
+/// `CLIENT PAUSE` was set after it passed the pause check
+/// (`pause::held_in_gate`): it does not run now. A connection that can
+/// park a command is asked to read it again, its pause check holding it
+/// until the pause ends: parked, with nothing to wait for
+/// ([`BlockingWait::held_by_pause`]); what is returned is not sent. Any
+/// other caller is answered `pause::HELD_IN_GATE`, which the connection
+/// takes the same way: a script, a command on the slow path.
+pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
+    match ctx.blocking.as_mut() {
+        Some(slot) if slot.awaitable => {
+            slot.parked = Some(BlockingWait {
+                rxs: Vec::new(),
+                timeout: None,
+                state: None,
+                role_epoch: 0,
+                held_by_pause: true,
+            });
+            Vec::new()
+        }
+        _ => crate::pause::HELD_IN_GATE.to_vec(),
     }
 }
 
@@ -712,6 +753,13 @@ impl BlockingWait {
         self.role_epoch
     }
 
+    /// Whether this is no wait, but a write sent back to be held by a
+    /// pause ([`hold_for_pause`]): the connection reads the command again,
+    /// as it is, and its pause check holds it.
+    pub fn held_by_pause(&self) -> bool {
+        self.held_by_pause
+    }
+
     /// Whether the command is one a replica refuses (`READONLY`): the
     /// blocking list and sorted-set commands and `XREADGROUP`, which write.
     /// `XREAD BLOCK` and `TS.READ BLOCK` may wait on a replica. Asked before
@@ -817,6 +865,7 @@ mod tests {
                 timeout,
                 state: None,
                 role_epoch: 0,
+                held_by_pause: false,
             }
             .wait(),
         )
