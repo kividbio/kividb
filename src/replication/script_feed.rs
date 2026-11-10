@@ -377,25 +377,32 @@ fn ts_add_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
 
 /// `TS.MADD` with `*` timestamps: each replaced by the one it was given, read
 /// from the matching element of the reply.
+///
+/// A sample that was refused is left out, as RedisTimeSeries leaves it out:
+/// it changed nothing. Sent with its `*`, a replica stamped it with its own
+/// clock and could add a sample the master had refused.
 fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
-    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
-    if !cmd.iter().skip(2).step_by(3).any(|ts| *ts == b"*") {
-        return vec![parts];
+    if resp.first() != Some(&b'*') || cmd.is_empty() {
+        return vec![cmd.iter().map(|b| b.to_vec()).collect()];
     }
     // The reply is an array with one element per sample: `:timestamp`, or an
     // error for a sample that was refused.
     let mut lines = resp.split(|b| *b == b'\n');
     lines.next(); // the array header
-    for (sample, line) in lines.enumerate() {
-        let ts_index = 2 + sample * 3;
-        if ts_index >= parts.len() {
-            break;
+    let mut parts: Vec<Vec<u8>> = vec![cmd[0].to_vec()];
+    for (sample, line) in cmd[1..].chunks(3).zip(lines) {
+        match line.first() {
+            Some(b'-') => continue,
+            Some(b':') if sample.len() == 3 => {
+                parts.push(sample[0].to_vec());
+                parts.push(line[1..].trim_ascii().to_vec());
+                parts.push(sample[2].to_vec());
+            }
+            _ => parts.extend(sample.iter().map(|b| b.to_vec())),
         }
-        if cmd[ts_index] == b"*"
-            && let Some(assigned) = line.strip_prefix(b":")
-        {
-            parts[ts_index] = assigned.trim_ascii().to_vec();
-        }
+    }
+    if parts.len() == 1 {
+        return Vec::new();
     }
     vec![parts]
 }
@@ -406,19 +413,21 @@ fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     let Some(ts) = parse_resp_integer(resp) else {
         return verbatim();
     };
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() + 2);
-    let mut i = 0;
-    while i < cmd.len() {
-        if i >= 3 && cmd[i].eq_ignore_ascii_case(b"TIMESTAMP") {
-            // Dropped here, re-added below with the concrete value.
-            i += 2;
-            continue;
-        }
-        parts.push(cmd[i].to_vec());
-        i += 1;
+    // Each `TIMESTAMP` option the command read is given the time it used, in
+    // its place, so every other word is where it was and reads as it did; a
+    // word `TIMESTAMP` that is a label's value is left alone. And the time
+    // goes right after the value, before any option, behind 1.2.1's mark
+    // (`ts::INCRBY_MARK`), which tells the record from one 1.2.0 sent. Added
+    // at the end, as 1.2.0 did, it made a label of a word left over from
+    // `LABELS` (#555).
+    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
+    let ts = ts.to_string().into_bytes();
+    for at in crate::commands::ts::incrby_timestamp_options(cmd) {
+        parts[at + 1] = ts.clone();
     }
-    parts.push(b"TIMESTAMP".to_vec());
-    parts.push(ts.to_string().into_bytes());
+    let at = parts.len().min(3);
+    parts.insert(at, ts);
+    parts.insert(at, crate::commands::ts::INCRBY_MARK.to_vec());
     vec![parts]
 }
 
@@ -881,7 +890,7 @@ mod tests {
         let c = cmd(&["TS.INCRBY", "k", "2"]);
         assert_eq!(
             ts_incrby_feed(&refs(&c), b":42\r\n"),
-            vec![cmd(&["TS.INCRBY", "k", "2", "TIMESTAMP", "42"])]
+            vec![cmd(&["TS.INCRBY", "k", "2", "timestamp", "42"])]
         );
         let c = cmd(&["TS.DECRBY", "k", "2", "TIMESTAMP", "*", "RETENTION", "9"]);
         assert_eq!(
@@ -890,12 +899,123 @@ mod tests {
                 "TS.DECRBY",
                 "k",
                 "2",
-                "RETENTION",
-                "9",
+                "timestamp",
+                "42",
                 "TIMESTAMP",
-                "42"
+                "42",
+                "RETENTION",
+                "9"
             ])]
         );
+    }
+
+    /// A sample `TS.MADD` refused is left out of what is sent; `*` is the
+    /// time the master gave.
+    #[test]
+    fn ts_madd_feed_leaves_out_refused_samples() {
+        let c = cmd(&["TS.MADD", "a", "*", "1", "b", "*", "2", "c", "5", "3"]);
+        let resp = b"*3\r\n-TSDB: Duplicate sample in BLOCK policy\r\n:101\r\n:5\r\n";
+        assert_eq!(
+            ts_madd_feed(&refs(&c), resp),
+            vec![cmd(&["TS.MADD", "b", "101", "2", "c", "5", "3"])]
+        );
+        let c = cmd(&["TS.MADD", "a", "*", "1"]);
+        assert!(ts_madd_feed(&refs(&c), b"*1\r\n-TSDB: the key does not exist\r\n").is_empty());
+    }
+
+    /// Each `TIMESTAMP` option the command read is given the time, where it
+    /// is, and the time goes right after the value behind 1.2.1's mark. Not
+    /// after a `LABELS` list, where a word left over from the list, which
+    /// the command passed over, became a label with it on a replica. A
+    /// label's value `TIMESTAMP` is not an option (#555).
+    #[test]
+    fn ts_incrby_feed_gives_the_time_without_moving_a_word() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a"],
+                &["TS.INCRBY", "k", "2", "timestamp", "42", "LABELS", "a"],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "c"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "c",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "UNCOMPRESSED"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "UNCOMPRESSED",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "TIMESTAMP", "*"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "TIMESTAMP",
+                    "*",
+                ],
+            ),
+            (
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "5",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "*",
+                    "c",
+                ],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "42",
+                    "c",
+                ],
+            ),
+        ];
+        for (given, sent) in cases {
+            let c = cmd(given);
+            assert_eq!(
+                ts_incrby_feed(&refs(&c), b":42\r\n"),
+                vec![cmd(sent)],
+                "{given:?}"
+            );
+        }
     }
 
     #[test]
