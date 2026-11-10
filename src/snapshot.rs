@@ -690,14 +690,18 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::TimeSeries(arc) => {
             let inner = arc.read();
+            // Its links to other series, but in a `DUMP` (`dump_payload`).
+            let links = !WITHOUT_LINKS.get();
+            let rules: &[crate::types::CompactionRule] = if links { &inner.rules } else { &[] };
+            let source = if links { inner.source.as_ref() } else { None };
             // The duplicate policy and the compaction rules were not saved at
             // all: after a restart (or on a replica, after a full sync) every
             // series was back on the default policy and no longer fed its
             // compactions — silently.
-            let extended = !inner.rules.is_empty()
+            let extended = !rules.is_empty()
                 || inner.duplicate_policy != crate::types::DuplicatePolicy::Last
-                || inner.source.is_some();
-            w.write_all(&[if inner.source.is_some() {
+                || source.is_some();
+            w.write_all(&[if source.is_some() {
                 TAG_TIMESERIES_V3
             } else if extended {
                 TAG_TIMESERIES_V2
@@ -722,15 +726,15 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             }
             if extended {
                 write_bytes(w, inner.duplicate_policy.as_str().as_bytes())?;
-                w.write_all(&(inner.rules.len() as u32).to_le_bytes())?;
-                for rule in inner.rules.iter() {
+                w.write_all(&(rules.len() as u32).to_le_bytes())?;
+                for rule in rules.iter() {
                     write_bytes(w, &crate::key_bytes::bytes_of(&rule.dest_key))?;
                     write_bytes(w, rule.aggregation.name().as_bytes())?;
                     w.write_all(&rule.bucket_duration.to_le_bytes())?;
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
             }
-            if let Some(source) = &inner.source {
+            if let Some(source) = source {
                 write_bytes(w, &crate::key_bytes::bytes_of(source))?;
             }
         }
@@ -4838,6 +4842,27 @@ fn write_kdb_index_schemas_only(
 /// everything before it.
 const DUMP_VERSION: [u8; 2] = [0x0a, 0x00];
 
+thread_local! {
+    /// Set while [`dump_payload`] writes: a time series is written without
+    /// its compaction rules and source.
+    static WITHOUT_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`WITHOUT_LINKS`], while this lives.
+struct WithoutLinks(bool);
+
+impl WithoutLinks {
+    fn begin() -> Self {
+        WithoutLinks(WITHOUT_LINKS.replace(true))
+    }
+}
+
+impl Drop for WithoutLinks {
+    fn drop(&mut self) {
+        WITHOUT_LINKS.set(self.0);
+    }
+}
+
 /// The key a value is filed under inside a one-entry KDB image. Any non-empty
 /// name will do — an empty one is the format's end-of-database marker.
 const DUMP_IMAGE_KEY: &str = "v";
@@ -4855,27 +4880,9 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     // them out of a `DUMP`: they name keys, which the payload may be
     // restored beside, under another name or on another server. Restored
     // with them, a series fed a compaction that had a source of its own
-    // (#593). Its samples, settings and labels go.
-    if let KiviDBValue::TimeSeries(series) = value {
-        let series = series.read();
-        if !series.rules.is_empty() || series.source.is_some() {
-            let mut alone = series.clone();
-            alone.rules.clear();
-            alone.source = None;
-            drop(series);
-            return dump_payload_with_links(&KiviDBValue::TimeSeries(Arc::new(
-                parking_lot::RwLock::new(alone),
-            )));
-        }
-    }
-    dump_payload_with_links(value)
-}
-
-/// [`dump_payload`], a time series with its compaction rules and source:
-/// for an atomic slot migration, which moves every key of the slot, both
-/// ends of a rule among them (a rule's keys are in one slot), and keeps
-/// their names.
-pub fn dump_payload_with_links(value: &KiviDBValue) -> io::Result<Vec<u8>> {
+    // (#593). Its samples, settings and labels go. An atomic slot migration
+    // sends the rules among the keys it moves as `TS.CREATERULE`s.
+    let _without = WithoutLinks::begin();
     let mut out = Vec::new();
     if serialize_value(value, &mut out).is_err() {
         out.clear();

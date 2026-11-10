@@ -1244,6 +1244,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(resp_error(e.message())),
             };
 
+            // A series restored has no links to other series, as in
+            // RedisTimeSeries (`RestoreKey`): a payload of 1.2.0, or
+            // `MIGRATE` from a node of 1.2.0, carries its compaction rules
+            // and source, by key name (#593). An atomic slot migration sends
+            // the rules among the keys it moves as `TS.CREATERULE`s.
+            if let KiviDBValue::TimeSeries(series) = &value {
+                let mut series = series.write();
+                series.rules.clear();
+                series.source = None;
+            }
+
             // A restored series has to be findable by its labels, the same as
             // one made with TS.CREATE.
             let ts_labels: Vec<(String, String)> = match &value {

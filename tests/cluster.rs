@@ -2427,6 +2427,10 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
     assert_eq!(task_field(&info, "duplicatePolicy").text(), "min");
     assert_eq!(task_field(&info, "rules"), Resp::Array(vec![]));
     assert_eq!(
+        task_field(&d.cmd(&["TS.INFO", &k("tsavg")]), "sourceKey"),
+        Resp::Nil
+    );
+    assert_eq!(
         d.cmd(&["TS.QUERYINDEX", "room=cellar"]).array(),
         [Resp::Bulk(k("tsr").into_bytes())]
     );

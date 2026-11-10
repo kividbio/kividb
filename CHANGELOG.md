@@ -189,8 +189,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   source that did not feed it. As in RedisTimeSeries, the payload now holds
   the samples, retention, chunk size, duplicate policy and labels, and no
   links to other keys; a restored series is found by its labels at once.
-  An atomic slot migration (`CLUSTER MIGRATION`), which moves both ends of
-  a rule together, keeps the rules.
+  `RESTORE` leaves them out of a payload that has them (one 1.2.0 made, or
+  `MIGRATE` from a 1.2.0 node). An atomic slot migration (`CLUSTER
+  MIGRATION`), which moves both ends of a rule together, keeps the rules.
+  And, as in RedisTimeSeries, a link left behind by `DEL`, `RESTORE …
+  REPLACE` or `MIGRATE` of one of its series is dead: the source no longer
+  feeds a destination that names another source, `TS.INFO` no longer shows
+  it, and the destination can be given a new source with `TS.CREATERULE`.
 - **`TS.INCRBY` and `TS.DECRBY` make a series with the options given
   (#555).** `RETENTION`, `CHUNK_SIZE`, `DUPLICATE_POLICY` and `LABELS` were
   passed over, and a series either command created had the defaults and no

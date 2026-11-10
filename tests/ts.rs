@@ -2019,6 +2019,18 @@ fn test_ts_dump_restore() {
     let mut found = query_index(&mut c, "room=kitchen");
     found.sort();
     assert_eq!(found, ["dr:copy", "dr:src"]);
+    // The copy does not feed the original's compaction (#593); the
+    // original does: its sample at 40 closes the bucket [20, 30).
+    let avg_before = c.cmds(&["TS.RANGE", "dr:avg", "-", "+"]);
+    assert_eq!(avg_before.as_array().len(), 2, "{avg_before:?}");
+    c.cmds(&["TS.ADD", "dr:copy", "40", "100"]);
+    assert_eq!(c.cmds(&["TS.RANGE", "dr:avg", "-", "+"]), avg_before);
+    c.cmds(&["TS.ADD", "dr:src", "40", "6"]);
+    let avg = c.cmds(&["TS.RANGE", "dr:avg", "-", "+"]);
+    let avg = avg.as_array();
+    assert_eq!(avg.len(), 3, "{avg:?}");
+    assert_eq!(avg[2].as_array()[0].as_int(), 20);
+    assert_eq!(avg[2].as_array()[1].as_f64(), 5.0);
     // The source's own rule still feeds its compaction.
     let info = c.cmds(&["TS.INFO", "dr:avg"]);
     assert!(
@@ -2037,4 +2049,112 @@ fn test_ts_dump_restore() {
     );
     assert!(query_index(&mut c, "room=attic").is_empty());
     assert!(query_index(&mut c, "room=kitchen").contains(&"dr:old".to_string()));
+}
+
+/// `TS.INFO … sourceKey`, as a name.
+fn ts_source(c: &mut Conn, key: &str) -> Option<String> {
+    let info = c.cmds(&["TS.INFO", key]);
+    let arr = info.as_array();
+    let at = arr
+        .iter()
+        .position(|v| matches!(v, RespValue::Bulk(b) if b == b"sourceKey"))
+        .unwrap();
+    match &arr[at + 1] {
+        RespValue::Bulk(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    }
+}
+
+/// A compaction link left behind by `RESTORE … REPLACE` or `DEL` of one of
+/// its series is dead, as RedisTimeSeries checks it where it is used: a
+/// source does not feed a destination that names another (or none), and a
+/// destination whose source is gone, or has no rule to it, takes another
+/// (#593).
+#[test]
+fn test_ts_links_left_behind_are_dead() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let rule = |c: &mut Conn, s: &str, d: &str| {
+        c.cmds(&["TS.CREATERULE", s, d, "AGGREGATION", "sum", "10"])
+    };
+    let dump = |c: &mut Conn, key: &str| -> Vec<u8> {
+        match c.cmds(&["DUMP", key]) {
+            RespValue::Bulk(payload) => payload,
+            other => panic!("DUMP {key}: {other:?}"),
+        }
+    };
+
+    // The destination replaced: its old source no longer feeds it, and
+    // another source can.
+    for key in ["la:s", "la:d", "la:s2"] {
+        c.cmds(&["TS.CREATE", key]);
+    }
+    assert!(rule(&mut c, "la:s", "la:d").is_ok());
+    c.cmds(&["TS.ADD", "la:s", "1", "1"]);
+    let payload = dump(&mut c, "la:d");
+    assert!(
+        c.cmd(&[b"RESTORE", b"la:d", b"0", &payload, b"REPLACE"])
+            .is_ok()
+    );
+    c.cmds(&["TS.ADD", "la:s", "15", "1"]);
+    assert!(c.cmds(&["TS.RANGE", "la:d", "-", "+"]).as_array().is_empty());
+    let info = c.cmds(&["TS.INFO", "la:s"]);
+    assert!(
+        !info.as_array().contains(&RespValue::Bulk(b"la:d".to_vec())),
+        "{info:?}"
+    );
+    assert!(rule(&mut c, "la:s2", "la:d").is_ok());
+    assert_eq!(ts_source(&mut c, "la:d").as_deref(), Some("la:s2"));
+    c.cmds(&["TS.ADD", "la:s2", "1", "4"]);
+    c.cmds(&["TS.ADD", "la:s2", "15", "4"]);
+    c.cmds(&["TS.ADD", "la:s", "25", "1"]);
+    let d = c.cmds(&["TS.RANGE", "la:d", "-", "+"]);
+    let d = d.as_array();
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].as_array()[1].as_f64(), 4.0);
+
+    // The source replaced: the destination has none, and takes another.
+    for key in ["lb:s", "lb:d", "lb:x"] {
+        c.cmds(&["TS.CREATE", key]);
+    }
+    assert!(rule(&mut c, "lb:s", "lb:d").is_ok());
+    let payload = dump(&mut c, "lb:s");
+    assert!(
+        c.cmd(&[b"RESTORE", b"lb:s", b"0", &payload, b"REPLACE"])
+            .is_ok()
+    );
+    assert_eq!(ts_source(&mut c, "lb:d"), None);
+    assert!(c.cmds(&["TS.DELETERULE", "lb:s", "lb:d"]).is_error());
+    assert!(rule(&mut c, "lb:x", "lb:d").is_ok());
+    assert_eq!(ts_source(&mut c, "lb:d").as_deref(), Some("lb:x"));
+
+    // The source deleted.
+    for key in ["lc:s", "lc:d", "lc:x"] {
+        c.cmds(&["TS.CREATE", key]);
+    }
+    assert!(rule(&mut c, "lc:s", "lc:d").is_ok());
+    assert_eq!(c.cmds(&["DEL", "lc:s"]).as_int(), 1);
+    assert_eq!(ts_source(&mut c, "lc:d"), None);
+    assert!(rule(&mut c, "lc:x", "lc:d").is_ok());
+}
+
+/// Inside `MULTI`, a time above `i64::MAX` is refused too (#592).
+#[test]
+fn test_ts_time_above_i64_max_is_refused_in_multi() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let over = (i64::MAX as u64 + 1).to_string();
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["TS.ADD", "mt", "1", "1"]);
+    c.cmds(&["TS.ADD", "mt", &over, "2"]);
+    c.cmds(&["TS.INCRBY", "mt", "1", "TIMESTAMP", &over]);
+    let results = c.cmds(&["EXEC"]);
+    let results = results.as_array();
+    assert_eq!(results[0].as_int(), 1);
+    assert!(results[1].is_error(), "{results:?}");
+    assert!(results[2].is_error(), "{results:?}");
+    assert_eq!(c.cmds(&["TS.RANGE", "mt", "-", "+"]).as_array().len(), 1);
 }

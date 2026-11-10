@@ -2213,3 +2213,31 @@ fn test_script_help_lists_subcommands() {
         "ERR wrong number of arguments for 'script|help' command"
     );
 }
+
+/// From a script, a time series sample's time above `i64::MAX` is refused,
+/// as from a client (#592).
+#[test]
+fn a_ts_time_above_i64_max_is_refused_in_a_script() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let over = (i64::MAX as u64 + 1).to_string();
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.pcall('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        &over,
+    ]);
+    assert!(matches!(reply, RespValue::Error(_)), "{reply:?}");
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.call('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        "5",
+    ]);
+    assert!(matches!(reply, RespValue::Int(5)), "{reply:?}");
+}

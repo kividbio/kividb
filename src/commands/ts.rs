@@ -507,6 +507,42 @@ fn series_for_append(ctx: &Ctx, key: &[u8]) -> Result<(Series, bool), Vec<u8>> {
     }
 }
 
+/// Whether the series `source` has a compaction rule to `dest` (both names).
+fn feeds(ctx: &Ctx, source: &str, dest: &str) -> bool {
+    ts_query::series_at(ctx, &crate::key_bytes::bytes_of(source))
+        .ok()
+        .flatten()
+        .is_some_and(|series| series.read().rules.iter().any(|r| r.dest_key == dest))
+}
+
+/// Whether the series `dest` names `source` as the series it is a
+/// compaction of (both names).
+fn fed_by(ctx: &Ctx, dest: &str, source: &str) -> bool {
+    ts_query::series_at(ctx, &crate::key_bytes::bytes_of(dest))
+        .ok()
+        .flatten()
+        .is_some_and(|series| series.read().source.as_deref() == Some(source))
+}
+
+/// A series' links that hold, as RedisTimeSeries checks them where they are
+/// used: its source, if that series has the rule back, and the destinations
+/// of its rules that name it back. A link is left behind by a `DEL`, a
+/// `RESTORE … REPLACE` or a `MIGRATE` of the other series (#593).
+fn live_links(ctx: &Ctx, key: &[u8], series: &Series) -> (Option<String>, Vec<String>) {
+    let name = crate::key_bytes::text_of(key).into_owned();
+    let (source, dests): (Option<String>, Vec<String>) = {
+        let series = series.read();
+        let dests = series.rules.iter().map(|r| r.dest_key.clone()).collect();
+        (series.source.clone(), dests)
+    };
+    let source = source.filter(|source| feeds(ctx, source, &name));
+    let dests = dests
+        .into_iter()
+        .filter(|dest| fed_by(ctx, dest, &name))
+        .collect();
+    (source, dests)
+}
+
 /// What follows every sample written to `series`: its compactions are brought
 /// up to date, and anyone blocked in `TS.READ` on it is woken.
 ///
@@ -557,17 +593,29 @@ fn after_append(ctx: &Ctx, key: &[u8], series: &Series, ts: u64) {
             })
             .collect()
     };
-    for (dest_key, bucket, value) in updates {
+    // A rule whose destination is gone, or names another source (it was
+    // replaced, by `RESTORE … REPLACE` among others), is dead: dropped, as
+    // RedisTimeSeries drops it on an append, and the same on a replica and
+    // in a replay, which run this append on the same series (#593).
+    let name = crate::key_bytes::text_of(key);
+    let mut dead: Vec<String> = Vec::new();
+    for (rule_dest, bucket, value) in updates {
         // A rule names its destination (`key_bytes::text_of`).
-        let dest_key = crate::key_bytes::bytes_of(&dest_key);
+        let dest_key = crate::key_bytes::bytes_of(&rule_dest);
         let dest = {
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], &*dest_key);
             match read_lock!(shard).get(&*dest_key) {
                 Some(ValueRef::TimeSeries(inner)) => Arc::clone(inner),
-                // The destination was deleted or replaced; the rule is dead.
-                _ => continue,
+                _ => {
+                    dead.push(rule_dest);
+                    continue;
+                }
             }
         };
+        if dest.read().source.as_deref() != Some(&*name) {
+            dead.push(rule_dest);
+            continue;
+        }
         {
             let mut dest = dest.write();
             dest.samples.insert(bucket, value);
@@ -576,6 +624,9 @@ fn after_append(ctx: &Ctx, key: &[u8], series: &Series, ts: u64) {
             }
         }
         ctx.wait_table.notify_signal(&dest_key);
+    }
+    if !dead.is_empty() {
+        series.write().rules.retain(|rule| !dead.contains(&rule.dest_key));
     }
     ctx.wait_table.notify_signal(key);
 }
@@ -1168,6 +1219,12 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let key: &[u8] = cmd[1];
 
+    // Its links that hold, read before the series is, with no lock held.
+    let (live_source, live_dests) = match ts_query::series_at(ctx, key) {
+        Ok(Some(series)) => live_links(ctx, key, &series),
+        _ => (None, Vec::new()),
+    };
+
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
@@ -1208,7 +1265,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
             out.push(resp_array(label_pairs));
 
             out.push(resp_bulk_str("sourceKey"));
-            out.push(match &ts.source {
+            out.push(match &live_source {
                 Some(source) => resp_bulk(&crate::key_bytes::bytes_of(source)),
                 // RESP3's null to a RESP3 client: `$-1` there breaks it.
                 None => crate::resp::write::resp_null_for(resp),
@@ -1219,6 +1276,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let rules_resp: Vec<Vec<u8>> = ts
                 .rules
                 .iter()
+                .filter(|r| live_dests.contains(&r.dest_key))
                 .map(|r| {
                     resp_array(vec![
                         resp_bulk(&crate::key_bytes::bytes_of(&r.dest_key)),
@@ -1307,8 +1365,16 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Ok(None) => return Some(resp_error("TSDB: the key does not exist")),
         Err(e) => return Some(e),
     };
-    // As RedisTimeSeries: a compaction has one source.
-    if dest.read().source.is_some() {
+    // As RedisTimeSeries: a compaction has one source, one that still has
+    // the rule to it.
+    let source = dest.read().source.clone();
+    if source.is_some_and(|source| {
+        feeds(
+            ctx,
+            &source,
+            &crate::key_bytes::text_of(dest_key.as_slice()),
+        )
+    }) {
         return Some(resp_error(
             "TSDB: the destination key already has a src rule",
         ));
