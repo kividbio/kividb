@@ -155,6 +155,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   4102444800001` reads back as 4102444801). Checked against Redis 8.4's
   `ttlGenericCommand` and `httlGenericCommand`.
 
+- **A write that fails changes nothing, so replicas and the AOF stay in
+  step (#551).** Only a write whose reply is not an error is sent to
+  replicas and the append-only file. Three commands changed data and then
+  failed, so the change stayed on the master alone. A replica, and a
+  restart that replayed the AOF, never had it. `JSON.MSET` kept the
+  triples before one that failed, for example on a new key with a path
+  other than the root, or a key of another type. It now checks every
+  triple, against what the triples before it leave, with every key it
+  names locked, and writes only if all of them pass. As in RedisJSON, a
+  key named twice sees what its earlier triple wrote. `XGROUP CREATE ...
+  MKSTREAM` with an invalid ID kept the empty stream it had made. It now
+  checks the ID first. `TS.ADD` of a sample that the BLOCK policy refuses
+  kept the `RETENTION` and `DUPLICATE_POLICY` given with it, and the
+  samples that retention trimmed. It now refuses the sample before
+  changing anything.
+
 - **Cluster admin commands answer as Redis does (#552, #553, #563).**
   - `CLUSTER FLUSHSLOTS` gives up only this node's own slots, and refuses
     with `ERR DB must be empty to perform CLUSTER FLUSHSLOTS.` while the node
