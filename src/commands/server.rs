@@ -3617,7 +3617,10 @@ fn keysizes(db: usize, shards: &crate::store::Db) -> String {
     ];
     let mut bins: KeysizeBins = [[0u64; 65]; 5];
     for shard in shards.iter() {
-        for (all, one) in bins.iter_mut().zip(keysizes_of_shard(shard, &mut || {}).iter()) {
+        for (all, one) in bins
+            .iter_mut()
+            .zip(keysizes_of_shard(shard, &mut || {}).iter())
+        {
             for (a, b) in all.iter_mut().zip(one.iter()) {
                 *a += *b;
             }
@@ -6338,7 +6341,9 @@ mod keysizes_tests {
     use std::time::{Duration, Instant};
 
     fn set(store: &crate::store::Store, key: &str, value: &str) {
-        let _ = crate::store::get_shard(&store[0], key).write().set_str(key, value);
+        let _ = crate::store::get_shard(&store[0], key)
+            .write()
+            .set_str(key, value);
     }
 
     /// The kept count of `store` made `by` older.
@@ -6349,7 +6354,11 @@ mod keysizes_tests {
     }
 
     fn counting(store: &crate::store::Store) -> bool {
-        KEYSIZES_LAST.lock().get(&keysizes_key(store)).unwrap().counting
+        KEYSIZES_LAST
+            .lock()
+            .get(&keysizes_key(store))
+            .unwrap()
+            .counting
     }
 
     /// Wait until no count of `store` is under way.
@@ -6419,7 +6428,11 @@ mod keysizes_tests {
     fn a_count_by_name_leaves_one_under_way_alone() {
         let store = crate::store::new_store(1);
         assert_eq!(keysizes_cached(&store, false, keysizes_text), "");
-        KEYSIZES_LAST.lock().get_mut(&keysizes_key(&store)).unwrap().counting = true;
+        KEYSIZES_LAST
+            .lock()
+            .get_mut(&keysizes_key(&store))
+            .unwrap()
+            .counting = true;
         set(&store, "k", "v");
         assert_eq!(keysizes_cached(&store, true, keysizes_text), ONE);
         assert!(counting(&store));
