@@ -151,19 +151,10 @@ fn describe_slot_import(r: &mut impl Read) -> io::Result<String> {
 /// write the master made to the field while it lived (`HINCRBY`,
 /// `HPERSIST`) came out differently there.
 ///
-/// Converted with `clock`, read once for the hash, to the nanosecond (see
-/// `FieldClock`, #448), so that `HPEXPIRETIME` reads back the very
-/// millisecond the file holds. Taken from the clock in whole milliseconds,
-/// it read back one later about every other time.
-pub(super) fn field_deadline(
-    clock: &crate::commands::helpers::FieldClock,
-    at_ms: u64,
-) -> io::Result<std::time::Instant> {
-    match clock.checked_instant_of(at_ms) {
-        Some(Some(at)) => Ok(at),
-        Some(None) => Ok(clock.instant_or_past_of(at_ms)),
-        None => Err(rdb_invalid("hash field expiry out of range")),
-    }
+/// Kept as the file holds it, Unix milliseconds, so that `HPEXPIRETIME`
+/// reads back the very millisecond the file holds (#594).
+pub(super) fn field_deadline(at_ms: u64) -> crate::types::FieldDeadline {
+    at_ms
 }
 
 /// Valkey 9's `RDB_TYPE_HASH_2`: a count, then each field's name, its value
@@ -184,7 +175,6 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         fields.push((field, value, expires_at));
     }
 
-    let clock = crate::commands::helpers::FieldClock::now();
     let mut inner = crate::types::HashInner::new();
     // One named twice is a corrupt file.
     let mut names = std::collections::HashSet::with_capacity(fields.len());
@@ -194,9 +184,7 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            inner
-                .expiries
-                .insert(field.clone(), field_deadline(&clock, at)?);
+            inner.expiries.insert(field.clone(), field_deadline(at));
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
