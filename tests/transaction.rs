@@ -516,6 +516,183 @@ fn test_a_write_that_changes_nothing_does_not_fail_a_watch() {
     assert!(c.cmds(&["EXEC"]).is_nil());
 }
 
+/// `SWAPDB` dirties the watches on the keys of the two databases it swaps
+/// that are in either of them, and no other: not a watch in another
+/// database, nor one on a key in neither. A database swapped with itself
+/// changes nothing (#556). Every watch in every database used to fail.
+#[test]
+fn test_swapdb_dirties_only_the_watches_on_the_swapped_keys() {
+    let port = free_port();
+    start_server(port);
+    let mut other = Conn::connect(port);
+    let watch = |db: &str, key: &str| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["SELECT", db]).is_ok());
+        assert!(c.cmds(&["WATCH", key]).is_ok());
+        c
+    };
+    let exec = |c: &mut Conn| {
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        c.cmds(&["EXEC"])
+    };
+    for (db, key) in [("5", "k"), ("0", "in0"), ("1", "in1")] {
+        assert!(other.cmds(&["SELECT", db]).is_ok());
+        assert!(other.cmds(&["SET", key, "v"]).is_ok());
+    }
+
+    let mut elsewhere = watch("5", "k");
+    let mut in_neither = watch("1", "absent");
+    let mut arrives = watch("1", "in0");
+    let mut leaves = watch("1", "in1");
+    let mut goes = watch("0", "in0");
+    assert!(other.cmds(&["SWAPDB", "0", "1"]).is_ok());
+    assert_eq!(exec(&mut elsewhere).as_array().len(), 1);
+    assert_eq!(exec(&mut in_neither).as_array().len(), 1);
+    assert!(exec(&mut arrives).is_nil());
+    assert!(exec(&mut leaves).is_nil());
+    assert!(exec(&mut goes).is_nil());
+
+    let mut itself = watch("1", "in0");
+    assert!(other.cmds(&["SWAPDB", "1", "1"]).is_ok());
+    assert_eq!(exec(&mut itself).as_array().len(), 1);
+}
+
+/// For `SWAPDB`, a key whose time is up is not there, as for a flush: a
+/// watch on one that had expired, swapped for none, holds, as does a watch
+/// on a key that is in neither database but for an expired one. A key that
+/// was there and is swapped for an expired one is gone: its watch fails
+/// (#556). Active expiry is off, so that the keys stay where they are.
+#[test]
+fn test_swapdb_takes_an_expired_key_as_absent() {
+    let port = free_port();
+    start_server(port);
+    let mut other = Conn::connect(port);
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).is_ok());
+    let watch = |db: &str, key: &str| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["SELECT", db]).is_ok());
+        assert!(c.cmds(&["WATCH", key]).is_ok());
+        c
+    };
+    let exec = |c: &mut Conn| {
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        c.cmds(&["EXEC"])
+    };
+    assert!(other.cmds(&["SELECT", "2"]).is_ok());
+    assert!(other.cmds(&["SET", "gone", "v", "PX", "1"]).is_ok());
+    assert!(other.cmds(&["SET", "live", "v", "PX", "1"]).is_ok());
+    assert!(other.cmds(&["SELECT", "3"]).is_ok());
+    assert!(other.cmds(&["SET", "live", "v"]).is_ok());
+    thread::sleep(Duration::from_millis(20));
+
+    let mut expired_here = watch("2", "gone");
+    let mut expired_there = watch("3", "gone");
+    let mut replaced = watch("3", "live");
+    assert!(other.cmds(&["SWAPDB", "2", "3"]).is_ok());
+    let held = (
+        exec(&mut expired_here),
+        exec(&mut expired_there),
+        exec(&mut replaced),
+    );
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).is_ok());
+    assert_eq!(held.0.as_array().len(), 1);
+    assert_eq!(held.1.as_array().len(), 1);
+    assert!(held.2.is_nil(), "{:?}", held.2);
+}
+
+/// A pop that takes nothing changes nothing, and a watch on its key holds,
+/// as in Redis: a `BLPOP` that times out, an `LPOP` of a missing key, and a
+/// `BLPOP` in a transaction that finds nothing (#558).
+#[test]
+fn test_a_pop_that_takes_nothing_does_not_fail_a_watch() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    assert!(c.cmds(&["WATCH", "empty"]).is_ok());
+    assert!(other.cmds(&["BLPOP", "empty", "0.01"]).is_nil());
+    assert!(other.cmds(&["LPOP", "empty"]).is_nil());
+    assert!(
+        other
+            .cmds(&["BLMOVE", "empty", "d", "LEFT", "LEFT", "0.01"])
+            .is_nil()
+    );
+    assert!(other.cmds(&["MULTI"]).is_ok());
+    other.cmds(&["BLPOP", "empty", "0"]);
+    other.cmds(&["BZPOPMIN", "empty", "0"]);
+    assert_eq!(other.cmds(&["EXEC"]).as_array().len(), 2);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert_eq!(c.cmds(&["EXEC"]).as_array().len(), 1);
+
+    // One that takes something fails it.
+    assert_eq!(other.cmds(&["RPUSH", "full", "a", "b"]).as_int(), 2);
+    assert!(c.cmds(&["WATCH", "full"]).is_ok());
+    assert_eq!(other.cmds(&["BLPOP", "full", "0"]).as_array().len(), 2);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert!(c.cmds(&["EXEC"]).is_nil());
+}
+
+/// A blocking command in a transaction never waits: it runs as its
+/// non-blocking form and takes what is there, as in Redis, and answers its
+/// empty reply when nothing is (#558).
+#[test]
+fn test_blocking_commands_in_a_transaction_take_what_is_there() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmds(&["RPUSH", "l", "a", "b", "c", "d"]).as_int(), 4);
+    assert_eq!(
+        c.cmds(&["ZADD", "z", "1", "m1", "2", "m2", "3", "m3"])
+            .as_int(),
+        3
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    for command in [
+        &["BLPOP", "l", "0"][..],
+        &["BRPOP", "l", "0"],
+        &["BLMOVE", "l", "dst", "LEFT", "RIGHT", "0"],
+        &["BLMPOP", "0", "1", "l", "LEFT"],
+        &["BRPOPLPUSH", "dst", "l", "0"],
+        &["BZPOPMIN", "z", "0"],
+        &["BZPOPMAX", "z", "0"],
+        &["BZMPOP", "0", "1", "z", "MIN"],
+        &["BLPOP", "empty", "0"],
+        &["BRPOPLPUSH", "empty", "dst", "0"],
+    ] {
+        assert_eq!(c.cmds(command).as_str(), "QUEUED");
+    }
+    let replies = c.cmds(&["EXEC"]);
+    let replies = replies.as_array();
+    let strings = |reply: &RespValue| {
+        reply
+            .as_array()
+            .iter()
+            .map(|part| part.as_str().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(strings(&replies[0]), ["l", "a"]);
+    assert_eq!(strings(&replies[1]), ["l", "d"]);
+    assert_eq!(replies[2].as_str(), "b");
+    assert_eq!(replies[3].as_array()[0].as_str(), "l");
+    assert_eq!(strings(&replies[3].as_array()[1]), ["c"]);
+    assert_eq!(replies[4].as_str(), "b");
+    assert_eq!(strings(&replies[5]), ["z", "m1", "1"]);
+    assert_eq!(strings(&replies[6]), ["z", "m3", "3"]);
+    assert_eq!(replies[7].as_array()[0].as_str(), "z");
+    assert_eq!(
+        strings(&replies[7].as_array()[1].as_array()[0]),
+        ["m2", "2"]
+    );
+    assert!(replies[8].is_nil(), "{:?}", replies[8]);
+    assert!(replies[9].is_nil(), "{:?}", replies[9]);
+    assert_eq!(c.cmds(&["LRANGE", "l", "0", "-1"]).as_array().len(), 1);
+    assert_eq!(c.cmds(&["EXISTS", "z", "dst"]).as_int(), 0);
+}
+
 /// A DEL of keys on several shards is one step: a reader never finds some
 /// of them gone and others not. Nor a RENAME, the source gone and the
 /// destination not there yet (#159).
