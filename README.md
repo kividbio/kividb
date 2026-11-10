@@ -23,8 +23,8 @@ libraries work unchanged, and it has full-text and vector search built in. It ru
 core on a sharded in-memory key-value design, and persists to snapshots and an optional
 append-only file.
 
-On the same machines, KiviDB 1.2.0 serves **10.4 million pipelined GETs per second: about 7×
-Redis 8.10 and 1.8× Dragonfly, level with Garnet**, with the lowest p99 latency of the four
+On 32 cores of AWS bare metal, KiviDB 1.2.0 serves **21.2 million pipelined GETs per second:
+9× Redis 8.10 and 2.3× Dragonfly**, ahead of Garnet, at 0.36 ms p99
 ([benchmarks](#performance)).
 
 ```bash
@@ -70,6 +70,29 @@ As of October 2026. Something out of date or wrong? Please [open an issue](https
 
 *KiviDB 1.2.0 against Garnet, Dragonfly, Redis, Redis Cluster and Valkey. Click for the full-resolution video.*
 
+### Bare metal
+
+AWS Graviton3, November 2026: the server on a `c7gn.metal` confined to 32 cores, the load
+generator on a second `c7gn.metal` in the same placement group, one engine at a time,
+persistence off. memtier_benchmark, 10 million keys of 100 bytes, 30 s a run, the mean of
+two rounds; 300 connections pipelined, 1,200 without.
+
+| | KiviDB 1.2.0 | Garnet 2.2.5 | Dragonfly 2.0.2 | Redis 8.10.3 |
+|---|---:|---:|---:|---:|
+| `GET`, pipeline 16 | **21.24M** | 20.82M | 9.31M | 2.36M |
+| `SET`, pipeline 16 | 17.79M | **20.27M** | 8.70M | 1.94M |
+| `GET`, no pipelining | 2.99M | 2.88M | **3.30M** | 1.47M |
+| `SET`, no pipelining | 3.22M | 3.07M | **3.37M** | 1.26M |
+| p99, `GET` / `SET` at pipeline 16 | **0.36 / 0.45 ms** | 0.67 / 0.80 ms | 0.88 / 1.02 ms | 2.29 / 2.72 ms |
+| Bytes a key, 10M keys of 100 B | 143 | | **134** | 178 |
+
+Pipelined, KiviDB served 9.0× Redis's GETs and 9.2× its SETs, and more than twice
+Dragonfly's. Garnet was a close second on `GET` and ahead on pipelined `SET`; without
+pipelining Dragonfly was 5-10% ahead. Scripts and raw results:
+[kivi-benchmark](https://github.com/kividbio/kivi-benchmark).
+
+### The full suite, on Azure VMs
+
 KiviDB 1.2.0 was measured in November 2026 on Azure VMs against Redis 8.10, Redis Cluster,
 Valkey 9.1, Dragonfly 2.0, Garnet 2.2 and kvrocks 2.17, each on the same machines in the same
 hour, with p50/p99/p99.9 latency from two load generators.
@@ -90,7 +113,7 @@ hour, with p50/p99/p99.9 latency from two load generators.
 Where KiviDB loses: Garnet is faster on `SET` at pipeline 16 and on `MSET`; Redis Cluster on
 `HSET` and `INCR`; Dragonfly uses less memory per vector, during a snapshot, and for ASCII
 values; Redis ingests vectors faster and serves 3-9% more cache reads a second. These are
-cloud VMs, so absolute numbers are lower than on the bare-metal machines of the [earlier runs](#earlier-runs).
+cloud VMs, so absolute numbers are lower than on the [bare metal](#bare-metal) above.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/throughput-pipelined-dark.png">
