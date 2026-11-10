@@ -865,24 +865,26 @@ fn test_acl_log_empty_initially() {
     assert_eq!(result.as_array().len(), 0);
 }
 
+/// A failed AUTH is logged: reason `auth`, the command as the client sent
+/// it as the object, as in Redis. A command refused for want of AUTH is
+/// not: no user was refused anything.
 #[test]
-fn test_acl_log_records_noauth_attempt() {
+fn test_acl_log_records_a_failed_auth_and_not_a_noauth() {
     let port = free_port();
     start_server_with_pass(port, "secret");
     let mut c = Conn::connect(port);
 
-    // Try a command without authenticating
-    c.cmds(&["GET", "somekey"]); // will fail with NOAUTH
-
-    // Now authenticate and check log
-    c.cmds(&["AUTH", "secret"]);
+    c.cmds(&["GET", "somekey"]); // NOAUTH
+    assert!(c.cmds(&["AUTH", "wrong"]).is_error());
+    assert!(c.cmds(&["AUTH", "secret"]).is_ok());
     let log = c.cmds(&["ACL", "LOG"]);
     let entries = log.as_array();
-
-    assert!(
-        !entries.is_empty(),
-        "ACL LOG should have recorded the NOAUTH attempt"
-    );
+    assert_eq!(entries.len(), 1, "{log:?}");
+    let entry = entries[0].as_array();
+    assert_eq!(entry[3].as_str(), "auth");
+    assert_eq!(entry[5].as_str(), "toplevel");
+    assert_eq!(entry[7].as_str(), "AUTH");
+    assert_eq!(entry[9].as_str(), "default");
 }
 
 #[test]
@@ -891,7 +893,7 @@ fn test_acl_log_reset_clears() {
     start_server_with_pass(port, "secret");
     let mut c = Conn::connect(port);
 
-    c.cmds(&["GET", "key"]); // NOAUTH
+    c.cmds(&["AUTH", "wrong"]);
     c.cmds(&["AUTH", "secret"]);
 
     // Verify there's something in the log
@@ -910,16 +912,17 @@ fn test_acl_log_with_count() {
     start_server_with_pass(port, "secret");
     let mut c = Conn::connect(port);
 
-    // Generate 3 auth failures
-    for _ in 0..3 {
-        c.cmds(&["GET", "key"]);
+    // Three failed AUTHs as three users: three entries (the same failure
+    // again would be counted in one).
+    for user in ["u1", "u2", "u3"] {
+        c.cmds(&["AUTH", user, "x"]);
     }
     c.cmds(&["AUTH", "secret"]);
 
     let all = c.cmds(&["ACL", "LOG"]).as_array().len();
     let limited = c.cmds(&["ACL", "LOG", "1"]).as_array().len();
 
-    assert!(all >= 1);
+    assert_eq!(all, 3);
     assert_eq!(limited, 1, "ACL LOG 1 should return exactly 1 entry");
 }
 
@@ -1997,7 +2000,7 @@ fn test_channel_patterns_are_enforced() {
     assert!(
         log.as_array().iter().any(|entry| {
             let entry = entry.as_array();
-            entry[9].as_str() == "channel" && entry[13].as_str() == "secret"
+            entry[3].as_str() == "channel" && entry[7].as_str() == "secret"
         }),
         "a refused channel is logged: {log:?}"
     );

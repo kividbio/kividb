@@ -14,7 +14,155 @@ pub const ERR_INVALID_EXPIRE_EXPIRE_CMD: &str = "ERR invalid expire time in 'exp
 pub const ERR_INVALID_EXPIRE_SET_CMD: &str = "ERR invalid expire time in 'set' command";
 pub const ERR_INVALID_EXPIRE_GETEX_CMD: &str = "ERR invalid expire time in 'getex' command";
 pub const ERR_INVALID_EXPIRE_PEXPIRE_CMD: &str = "ERR invalid expire time in 'pexpire' command";
-pub const ERR_INVALID_EXPIRE_PEXPIREAT_CMD: &str = "ERR invalid expire time in PEXPIREAT";
+pub const ERR_INVALID_EXPIRE_PEXPIREAT_CMD: &str = "ERR invalid expire time in 'pexpireat' command";
+pub const ERR_INVALID_EXPIRE_EXPIREAT_CMD: &str = "ERR invalid expire time in 'expireat' command";
+pub const ERR_INVALID_EXPIRE_SETEX_CMD: &str = "ERR invalid expire time in 'setex' command";
+pub const ERR_INVALID_EXPIRE_PSETEX_CMD: &str = "ERR invalid expire time in 'psetex' command";
+pub const ERR_INVALID_EXPIRE_MSETEX_CMD: &str = "ERR invalid expire time in 'msetex' command";
+pub const ERR_INVALID_EXPIRE_INCREX_CMD: &str = "ERR invalid expire time in 'increx' command";
+
+/// How a command gives a key's time: a time to live in seconds (`EX`,
+/// `SETEX`, `EXPIRE`) or milliseconds (`PX`, `PSETEX`, `PEXPIRE`), or a Unix
+/// time in seconds (`EXAT`, `EXPIREAT`) or milliseconds (`PXAT`,
+/// `PEXPIREAT`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TimeArg {
+    Secs,
+    Millis,
+    UnixSecs,
+    UnixMillis,
+}
+
+impl TimeArg {
+    /// `EX`, `PX`, `EXAT` or `PXAT`, in any case.
+    pub fn of_option(token: &[u8]) -> Option<TimeArg> {
+        if token.eq_ignore_ascii_case(b"EX") {
+            Some(TimeArg::Secs)
+        } else if token.eq_ignore_ascii_case(b"PX") {
+            Some(TimeArg::Millis)
+        } else if token.eq_ignore_ascii_case(b"EXAT") {
+            Some(TimeArg::UnixSecs)
+        } else if token.eq_ignore_ascii_case(b"PXAT") {
+            Some(TimeArg::UnixMillis)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether the running command comes from a master's stream or the AOF
+/// being replayed rather than from a client. A time given there is taken as
+/// it comes, within what the clock holds: an earlier version wrote, and a
+/// master a clock tick ahead may send, one this refuses from a client, and
+/// refused there the key or its time to live was lost.
+#[inline]
+pub fn applying_stream(ctx: &crate::commands::ctx::Ctx) -> bool {
+    ctx.apply_replication || crate::expiry::replaying()
+}
+
+/// The deadline, in Unix milliseconds, of the time `n` a command gave a key,
+/// checked as Redis's `getExpireMillisecondsOrReply` and
+/// `expireGenericCommand` check it: past `i64::MAX` milliseconds,
+/// `err_invalid`. With `positive`, a time of zero or less is `err_invalid`
+/// too, as for `SET`, `GETEX`, `SETEX`, `PSETEX` and `MSETEX`.
+///
+/// From a stream ([`applying_stream`]): a deadline past `i64::MAX` ms is
+/// taken as `i64::MAX` ms, and a Unix time of 0 as the epoch. 1.2.0 took
+/// both, and wrote `SET … PXAT` up to `u64::MAX`.
+///
+/// Worked out in 128 bits: nothing here can overflow.
+pub fn deadline_ms_of(
+    n: i128,
+    arg: TimeArg,
+    err_invalid: &'static str,
+    lenient: bool,
+    positive: bool,
+) -> Result<i128, &'static str> {
+    let relative = matches!(arg, TimeArg::Secs | TimeArg::Millis);
+    if positive && n <= 0 && !(lenient && !relative && n == 0) {
+        return Err(err_invalid);
+    }
+    let secs = matches!(arg, TimeArg::Secs | TimeArg::UnixSecs);
+    if secs && !lenient && (n > (i64::MAX / 1000) as i128 || n < (i64::MIN / 1000) as i128) {
+        return Err(err_invalid);
+    }
+    let ms = if secs { n * 1000 } else { n };
+    let when = if relative {
+        wall_now_ms_i128() + ms
+    } else {
+        ms
+    };
+    if when > REDIS_WHEN_MAX_MS {
+        return if lenient {
+            Ok(REDIS_WHEN_MAX_MS)
+        } else {
+            Err(err_invalid)
+        };
+    }
+    if when < i64::MIN as i128 {
+        return Err(err_invalid);
+    }
+    Ok(when)
+}
+
+/// A time argument as Redis reads it, a `long long`: anything else is
+/// `ERR value is not an integer or out of range`, before any bound is
+/// looked at. From a stream, up to `u64::MAX`, which 1.2.0 wrote.
+#[inline]
+pub fn time_arg_of(arg: &[u8], lenient: bool) -> Result<i128, &'static str> {
+    match parse_bytes_as_i128(arg) {
+        Some(n) if i64::try_from(n).is_ok() => Ok(n),
+        Some(n) if lenient && (0..=u64::MAX as i128).contains(&n) => Ok(n),
+        _ => Err(ERR_VALUE_NOT_INTEGER),
+    }
+}
+
+/// `when` (Unix ms) as the `SystemTime` a key keeps. Past what the
+/// platform's clock holds: `err_invalid`, or, from a stream, the furthest
+/// it holds.
+#[inline]
+fn system_time_of(
+    when: i128,
+    err_invalid: &'static str,
+    lenient: bool,
+) -> Result<SystemTime, &'static str> {
+    match system_time_from_unix_millis_i128(when) {
+        Some(t) => Ok(t),
+        None if lenient && when > 0 => Ok(from_unix_ms(when as u64)),
+        None => Err(err_invalid),
+    }
+}
+
+/// The deadline a key is given by `SET`, `GETEX` or `MSETEX` with `EX`,
+/// `PX`, `EXAT` or `PXAT`, or by `SETEX` or `PSETEX`, as Redis's
+/// `getExpireMillisecondsOrReply`: not an integer, then zero or less or past
+/// the latest, refused. See [`deadline_ms_of`] for a stream.
+#[inline]
+pub fn key_deadline(
+    raw: &[u8],
+    arg: TimeArg,
+    err_invalid: &'static str,
+    lenient: bool,
+) -> Result<SystemTime, &'static str> {
+    let n = time_arg_of(raw, lenient)?;
+    let when = deadline_ms_of(n, arg, err_invalid, lenient, true)?;
+    system_time_of(when, err_invalid, lenient)
+}
+
+/// The time `EXPIRE`, `PEXPIRE`, `EXPIREAT` or `PEXPIREAT` gives, as
+/// Redis's `expireGenericCommand` reads it: the number given, and the
+/// deadline. Zero or less is taken; the caller deletes the key for it.
+#[inline]
+pub fn expire_deadline(
+    raw: &[u8],
+    arg: TimeArg,
+    err_invalid: &'static str,
+    lenient: bool,
+) -> Result<(i128, SystemTime), &'static str> {
+    let n = time_arg_of(raw, lenient)?;
+    let when = deadline_ms_of(n, arg, err_invalid, lenient, false)?;
+    Ok((n, system_time_of(when, err_invalid, lenient)?))
+}
 
 /// Optional `[NX | XX | GT | LT]` modifiers on `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT`
 /// (same semantics as Redis `expireGenericCommand`).
@@ -88,36 +236,6 @@ pub fn expire_modifier_allows_set(
     true
 }
 
-/// `EXPIRE`: relative seconds → absolute deadline in ms (`basetime` + `secs * 1000`), Redis bounds.
-pub fn absolute_when_ms_from_expire_secs(secs: i128) -> Result<i128, &'static str> {
-    let lo = (i64::MIN / 1000) as i128;
-    let hi = (i64::MAX / 1000) as i128;
-    if secs < lo || secs > hi {
-        return Err(ERR_INVALID_EXPIRE_EXPIRE_CMD);
-    }
-    let ttl_ms = secs * 1000;
-    let now_ms = wall_now_ms_i128();
-    let when_ms = ttl_ms
-        .checked_add(now_ms)
-        .ok_or(ERR_INVALID_EXPIRE_EXPIRE_CMD)?;
-    if when_ms < i64::MIN as i128 || when_ms > i64::MAX as i128 {
-        return Err(ERR_INVALID_EXPIRE_EXPIRE_CMD);
-    }
-    Ok(when_ms)
-}
-
-/// `PEXPIRE`: relative millis → absolute deadline (`basetime` + `ms`).
-pub fn absolute_when_ms_from_pexpire_ms(ms: i128) -> Result<i128, &'static str> {
-    let now_ms = wall_now_ms_i128();
-    let when_ms = now_ms
-        .checked_add(ms)
-        .ok_or(ERR_INVALID_EXPIRE_PEXPIRE_CMD)?;
-    if when_ms < i64::MIN as i128 || when_ms > i64::MAX as i128 {
-        return Err(ERR_INVALID_EXPIRE_PEXPIRE_CMD);
-    }
-    Ok(when_ms)
-}
-
 /// Wall clock in ms since UNIX epoch, matching [`crate::script_clock::ttl_wall_ms_now`].
 #[inline]
 pub fn wall_now_ms_i128() -> i128 {
@@ -157,43 +275,12 @@ pub fn ttl_remaining_ms(at: u64) -> i64 {
 
 /// `TTL` and `EXPIRETIME`: milliseconds to the nearest second, a half up,
 /// as Redis's `(ms + 500) / 1000`. `SET k v PX 1499` has a `TTL` of 1, and
-/// `PX 1500` one of 2 (#557).
+/// `PX 1500` one of 2 (#557). In 128 bits, as Redis: the latest deadline,
+/// `i64::MAX` ms, is 9223372036854776 s there, where saturating gave one
+/// less.
 #[inline]
 pub fn ms_to_nearest_secs(ms: i64) -> i64 {
-    ms.saturating_add(500) / 1000
-}
-
-/// Relative TTL from seconds (`EXPIRE`): validates overflow against Redis `when` in ms.
-pub fn deadline_after_relative_secs(
-    secs: i128,
-    err_invalid: &'static str,
-) -> Result<SystemTime, &'static str> {
-    if secs <= 0 {
-        return Err(err_invalid);
-    }
-    let now_ms = wall_now_ms_i128();
-    let ttl_ms = secs.checked_mul(1000).ok_or(err_invalid)?;
-    let when_ms = now_ms.checked_add(ttl_ms).ok_or(err_invalid)?;
-    if when_ms > REDIS_WHEN_MAX_MS {
-        return Err(err_invalid);
-    }
-    system_time_from_unix_millis_i128(when_ms).ok_or(err_invalid)
-}
-
-/// Relative deadline from milliseconds (`PEXPIRE`, `SET PX`, …).
-pub fn deadline_after_relative_millis(
-    ms: i128,
-    err_invalid: &'static str,
-) -> Result<SystemTime, &'static str> {
-    if ms <= 0 {
-        return Err(err_invalid);
-    }
-    let now_ms = wall_now_ms_i128();
-    let when_ms = now_ms.checked_add(ms).ok_or(err_invalid)?;
-    if when_ms > REDIS_WHEN_MAX_MS {
-        return Err(err_invalid);
-    }
-    system_time_from_unix_millis_i128(when_ms).ok_or(err_invalid)
+    ((ms as i128 + 500) / 1000) as i64
 }
 
 #[macro_export]
@@ -806,7 +893,28 @@ pub fn field_deadline_ms(n: i64, secs: bool, base_ms: i64) -> Option<i64> {
     } else {
         n
     };
-    (ms <= MAX_FIELD_DEADLINE_MS - base_ms).then_some(ms + base_ms)
+    // Checked: `then_some(ms + base_ms)` added before it compared, and
+    // overflowed for a time to live near `i64::MAX` ms.
+    ms.checked_add(base_ms)
+        .filter(|&at| at <= MAX_FIELD_DEADLINE_MS)
+}
+
+/// The deadline of a hash field given a time to live of `n` seconds if
+/// `secs` and else milliseconds: the `Instant` it is kept as and the Unix
+/// milliseconds it is sent on as. `None` past [`MAX_FIELD_DEADLINE_MS`], or
+/// for a negative `n`. Checked throughout: `Instant::now() + ttl` panics past
+/// what an `Instant` holds, and `HEXPIRE h 9223372036854775807 FIELDS 1 f`
+/// did.
+#[inline]
+pub fn field_deadline_after(n: i64, secs: bool) -> Option<(std::time::Instant, u64)> {
+    if n < 0 {
+        return None;
+    }
+    let now = now_ms() as i64;
+    let at_ms = field_deadline_ms(n, secs, now)?;
+    let ttl = Duration::from_millis((at_ms - now) as u64);
+    let at = std::time::Instant::now().checked_add(ttl)?;
+    Some((at, at_ms as u64))
 }
 
 /// Redis's reply to a hash field TTL past [`MAX_FIELD_DEADLINE_MS`].
@@ -815,24 +923,6 @@ pub fn invalid_field_expire_time(command: &str) -> Vec<u8> {
         "ERR invalid expire time in '{}' command",
         command.to_ascii_lowercase()
     ))
-}
-
-/// Absolute wall time when a key expires (`now + ttl`). Safe across threads (unlike `Instant`).
-#[inline]
-pub fn expiry_at_after(ttl: Duration) -> SystemTime {
-    crate::script_clock::wall_system_time_now()
-        .checked_add(ttl)
-        .unwrap_or_else(|| UNIX_EPOCH + ttl)
-}
-
-#[inline]
-pub fn expiry_unix_secs(ts_secs: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(ts_secs)
-}
-
-#[inline]
-pub fn expiry_unix_millis(ts_ms: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_millis(ts_ms)
 }
 
 /// `t` as a key's entry keeps a time to live: whole milliseconds since the
@@ -1555,6 +1645,8 @@ mod active_expiry_tests {
     /// and so is one given a new value without a time.
     #[test]
     fn a_key_given_a_new_time_is_kept() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
@@ -1604,6 +1696,8 @@ mod active_expiry_tests {
     /// whatever it removed, and keeps what is live.
     #[test]
     fn a_full_round_is_not_behind() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
@@ -1622,6 +1716,8 @@ mod active_expiry_tests {
     /// every due key of the shard, then run out of time after one batch).
     #[test]
     fn a_pass_takes_one_batch_and_stops() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);
@@ -1657,6 +1753,8 @@ mod active_expiry_tests {
     /// Two parts between them go through every shard, each only its own.
     #[test]
     fn parts_share_the_shards() {
+        // Not stopped by a load another test runs (`expiry::LOADING`).
+        let _u = crate::expiry::Undisturbed::here();
         let store = store::new_store(1);
         let index: IndexStore = Default::default();
         let past = SystemTime::now() - Duration::from_secs(5);

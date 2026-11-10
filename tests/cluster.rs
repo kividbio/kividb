@@ -2296,7 +2296,43 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
             .is_ok()
     );
     s.cmd(&["TS.ADD", &k("ts"), "1000", "21.5"]);
-    let names = ["str", "list", "hash", "set", "zset", "stream", "ts"];
+    // A series with settings and a compaction rule (#593).
+    assert!(
+        s.cmd(&[
+            "TS.CREATE",
+            &k("tsr"),
+            "RETENTION",
+            "100000",
+            "CHUNK_SIZE",
+            "256",
+            "DUPLICATE_POLICY",
+            "MIN",
+            "LABELS",
+            "room",
+            "cellar",
+        ])
+        .is_ok()
+    );
+    assert!(s.cmd(&["TS.CREATE", &k("tsavg")]).is_ok());
+    assert!(
+        s.cmd(&[
+            "TS.CREATERULE",
+            &k("tsr"),
+            &k("tsavg"),
+            "AGGREGATION",
+            "avg",
+            "10"
+        ])
+        .is_ok()
+    );
+    for (at, value) in [("1", "1"), ("5", "3"), ("12", "4")] {
+        s.cmd(&["TS.ADD", &k("tsr"), at, value]);
+    }
+    let range_before = s.cmd(&["TS.RANGE", &k("tsr"), "-", "+"]);
+    let avg_before = s.cmd(&["TS.RANGE", &k("tsavg"), "-", "+"]);
+    let names = [
+        "str", "list", "hash", "set", "zset", "stream", "ts", "tsr", "tsavg",
+    ];
 
     // Giving the slot away while its keys are still here is refused.
     let reply = s.cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id]);
@@ -2381,6 +2417,23 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
     // The migrated series is findable by label on its new node.
     let found = d.cmd(&["TS.QUERYINDEX", "room=attic"]);
     assert_eq!(found.array().len(), 1);
+    // With its samples and settings; its rule stays behind, as MIGRATE
+    // goes by DUMP, which RedisTimeSeries leaves links to other keys out of.
+    assert_eq!(d.cmd(&["TS.RANGE", &k("tsr"), "-", "+"]), range_before);
+    assert_eq!(d.cmd(&["TS.RANGE", &k("tsavg"), "-", "+"]), avg_before);
+    let info = d.cmd(&["TS.INFO", &k("tsr")]);
+    assert_eq!(task_field(&info, "retentionTime").text(), "100000");
+    assert_eq!(task_field(&info, "chunkSize").text(), "256");
+    assert_eq!(task_field(&info, "duplicatePolicy").text(), "min");
+    assert_eq!(task_field(&info, "rules"), Resp::Array(vec![]));
+    assert_eq!(
+        task_field(&d.cmd(&["TS.INFO", &k("tsavg")]), "sourceKey"),
+        Resp::Nil
+    );
+    assert_eq!(
+        d.cmd(&["TS.QUERYINDEX", "room=cellar"]).array(),
+        [Resp::Bulk(k("tsr").into_bytes())]
+    );
 
     // The old owner now redirects, by MOVED rather than ASK.
     let reply = s.cmd(&["GET", &k("str")]);
@@ -2388,6 +2441,81 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
         reply.err().is_some_and(|e| e.starts_with("MOVED")),
         "{reply:?}"
     );
+}
+
+/// An atomic slot migration moves time series whole: samples, retention,
+/// chunk size, duplicate policy, labels (found by `TS.QUERYINDEX` on the
+/// new owner), and compaction rules in both directions, whose keys are in
+/// one slot and move together (#593). A sample added on the new owner
+/// still reaches the compaction.
+#[test]
+fn atomic_slot_migration_moves_time_series_with_their_rules() {
+    let (nodes, _) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let tag = key_in(0..=1000, "tstag");
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    assert!(
+        s.cmd(&[
+            "TS.CREATE",
+            &k("raw"),
+            "RETENTION",
+            "100000",
+            "CHUNK_SIZE",
+            "256",
+            "DUPLICATE_POLICY",
+            "MIN",
+            "LABELS",
+            "room",
+            "loft",
+        ])
+        .is_ok()
+    );
+    assert!(s.cmd(&["TS.CREATE", &k("avg")]).is_ok());
+    assert!(
+        s.cmd(&[
+            "TS.CREATERULE",
+            &k("raw"),
+            &k("avg"),
+            "AGGREGATION",
+            "avg",
+            "10"
+        ])
+        .is_ok()
+    );
+    for (at, value) in [("1", "1"), ("5", "3"), ("12", "4")] {
+        s.cmd(&["TS.ADD", &k("raw"), at, value]);
+    }
+    let raw_before = s.cmd(&["TS.RANGE", &k("raw"), "-", "+"]);
+    let avg_before = s.cmd(&["TS.RANGE", &k("avg"), "-", "+"]);
+    assert_eq!(avg_before.array().len(), 1, "{avg_before:?}");
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(dst, &task_id);
+
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["TS.RANGE", &k("raw"), "-", "+"]), raw_before);
+    assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]), avg_before);
+    let info = d.cmd(&["TS.INFO", &k("raw")]);
+    assert_eq!(task_field(&info, "retentionTime").text(), "100000");
+    assert_eq!(task_field(&info, "chunkSize").text(), "256");
+    assert_eq!(task_field(&info, "duplicatePolicy").text(), "min");
+    assert_eq!(task_field(&info, "rules").array().len(), 1);
+    assert_eq!(
+        task_field(&d.cmd(&["TS.INFO", &k("avg")]), "sourceKey").text(),
+        k("raw")
+    );
+    assert_eq!(
+        d.cmd(&["TS.QUERYINDEX", "room=loft"]).array(),
+        [Resp::Bulk(k("raw").into_bytes())]
+    );
+    // The rule works there: a sample in a later bucket closes [10, 20).
+    d.cmd(&["TS.ADD", &k("raw"), "25", "5"]);
+    assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]).array().len(), 2);
 }
 
 /// A slot left open by a reshard that stopped part way, with keys on both

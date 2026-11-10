@@ -162,6 +162,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the writes under way to finish: `FT.CREATE` there fails with an
   error, and works outside the script, or once an index exists.
 
+- **An expire time past the latest one Redis allows is refused, as by
+  Redis (#561).** `SET` and `GETEX` with `EX`, `PX`, `EXAT` or `PXAT`,
+  `SETEX`, `PSETEX`, `MSETEX`, `EXPIREAT`, `PEXPIREAT`, `INCREX`, and the
+  hash field commands now answer `ERR invalid expire time in '<command>'
+  command` for a deadline past `i64::MAX` milliseconds after the epoch, and
+  `ERR value is not an integer or out of range` for a number too large for
+  a 64-bit signed integer, as Redis 8.10 does. Before, some of them closed
+  the client's connection with no reply (`SET k v EXAT
+  18446744073709551615`, `SETEX k 18446744073709551615 v`, `GETEX k EXAT
+  ...`, `MSETEX ... EX` or `EXAT`); the server kept running, and inside
+  `MULTI` the commands queued before it had already run. Others took the
+  time and set a deadline that read back negative: `PSETEX k
+  9223372036854775807 v` then `PEXPIRETIME k` gave -9223370242591131402.
+  `RESTORE` with a time to live that ends past the latest keeps the latest,
+  and `PTTL`, `EXPIRETIME` and `PEXPIRETIME` no longer go negative for a far
+  deadline. A negative `HEXPIREAT` or `HPEXPIREAT` time was already refused
+  (#486).
+
+  The same commands now read their options and their time in Redis's order.
+  A time that is not an integer, or does not fit a 64-bit signed integer,
+  is `ERR value is not an integer or out of range` before any bound is
+  looked at; it was often `ERR invalid expire time` (`SETEX k abc v`,
+  `SET k v EXAT abc`) or `ERR invalid EXAT timestamp` (`MSETEX`). `EXAT 0`
+  and `PXAT 0` of `SET`, `GETEX` and `MSETEX` are refused as an invalid
+  time; the key was set and gone at once. `SET` with `KEEPTTL` and a time,
+  or with two of `EX`, `PX`, `EXAT` and `PXAT`, is `ERR syntax error`; the
+  last one was taken, or `KEEPTTL EX 10` was an invalid time. The same unit
+  given twice is still taken, the last one, as in Redis. `GETEX` reads all
+  its options, where it read only the first and ignored the rest, and on a
+  key that is not there answers nil whatever the time, as Redis does.
+  `MSETEX` takes `NX NX` and `KEEPTTL KEEPTTL`, as Redis does.
+
+  From a master's stream or an AOF being replayed, a time past the latest
+  is taken as the latest, and a Unix time of 0 as one that has passed, as
+  1.2.0 took them: 1.2.0 wrote `SET … PXAT` up to 18446744073709551615 for
+  a large `SETEX`, and refusing it there would lose the key.
+  `EXPIRETIME` of the latest deadline is 9223372036854776, as in Redis,
+  where it was one less.
+
+  What replicas and the AOF get is the time that took effect. `SET` and
+  `MSETEX` are sent with only that one, as `PXAT`: with two, only the first
+  was made a `PXAT` and both were sent, so `SET k v EX 10 EX 20` went out as
+  `SET k v PXAT <t> EX 20`, and a restart started the 20 seconds over.
+  `GETEX` is sent as the deadline it left (`PEXPIREAT`), `PERSIST`, or
+  `DEL`. `GETEX` with an `EXAT` or `PXAT` that has already passed deletes
+  the key at once and says `del`, as Redis does, and `GETEX k PERSIST` on a
+  key with no time to live no longer says `persist`.
+
 - **A replica that falls behind no longer makes its master evict its keys
   and refuse writes (#542).** Under an `allkeys-*` policy, a replica that
   full-synced or lagged under heavy writes made its master evict nearly
@@ -190,6 +238,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replies, keeping 113-139k keys. Once caught up, the replica had the same
   data. 1.2.0 has the same bug.
 
+- **A time series sample's time above `i64::MAX` is refused, not lost
+  on replicas (#592).** `TS.ADD`, `TS.MADD`, `TS.INCRBY` and `TS.DECRBY`
+  took a time up to `u64::MAX`, replied one above `i64::MAX` as a negative
+  number, and sent that to replicas and the AOF, which refused it: the
+  master kept the sample, a replica and a restart lost it. As in
+  RedisTimeSeries, a client's time is now `0` to `i64::MAX`. Times are sent
+  to replicas and the AOF unsigned, and a log or master of 1.2.0 holding a
+  larger one, or a `TS.INCRBY` time 1.2.0 logged as negative, is applied at
+  the time 1.2.0 kept.
+- **`DUMP` of a time series leaves out its compaction rules and source
+  (#593).** `DUMP`, `RESTORE` and `MIGRATE` carried a series' rules and the
+  series it is a compaction of, by key name, wherever it was restored: a
+  copy fed the original's compaction, and a restored compaction kept a
+  source that did not feed it. As in RedisTimeSeries, the payload now holds
+  the samples, retention, chunk size, duplicate policy and labels, and no
+  links to other keys; a restored series is found by its labels at once.
+  `RESTORE` leaves them out of a payload that has them (one 1.2.0 made, or
+  `MIGRATE` from a 1.2.0 node). An atomic slot migration (`CLUSTER
+  MIGRATION`), which moves both ends of a rule together, keeps the rules.
+  An atomic slot migration from a 1.2.0 node, as in a rolling upgrade,
+  loses the moved series' rules: 1.2.0 sends them inside the `RESTORE`s,
+  which leave them out, and sends no `TS.CREATERULE`. Make them again with
+  `TS.CREATERULE` afterwards. And, as in RedisTimeSeries, a link left
+  behind by `DEL`, `RESTORE … REPLACE`, `COPY … REPLACE` or `MIGRATE` of
+  one of its series is dead: the source no longer feeds a destination that
+  names another source, `TS.INFO` no longer shows it, `TS.DELETERULE`
+  refuses it, and `TS.CREATERULE` gives the destination a new source,
+  replacing a dead rule. `RENAME` and `RENAMENX` of a series now take its
+  links and labels along, as in RedisTimeSeries: they stayed on the old
+  name, so a series renamed was no longer found by `TS.QUERYINDEX`, and
+  with this change its compaction would have stopped. `COPY` makes a series
+  without links, found by its labels; the copy was not in the label index.
 - **`TS.INCRBY` and `TS.DECRBY` make a series with the options given
   (#555).** `RETENTION`, `CHUNK_SIZE`, `DUPLICATE_POLICY` and `LABELS` were
   passed over, and a series either command created had the defaults and no
@@ -253,6 +333,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replicas, and a restart from the AOF, kept the members the master had
   popped. So too from a script after `redis.setresp(3)`. It is now sent as
   an `SREM` of the members popped, as from a RESP2 client.
+
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
   `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a
@@ -333,6 +414,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with. Before, the log used the name from before the transaction, even when
   a queued `CLIENT SETNAME` or `HELLO SETNAME` had changed it. Both I/O
   models.
+
+- **`HELLO` and refused commands, as in Redis.** `HELLO` now takes its
+  `AUTH` and `SETNAME` options in any order. It checks the name before it
+  tries the password, writes a failed `AUTH` to the ACL log, and refuses
+  every protocol version but 2 and 3 with `NOPROTO`. It used to take 0 and
+  1 as 2. `HELLO 3 AUTH password`, without a user name, is now
+  a syntax error, as in Redis. A command that does not exist is refused as
+  unknown before the ACL rules are checked, and so is one inside `MULTI` that
+  cannot be part of a transaction (`PSYNC`, `SYNC`). Neither goes to the ACL
+  log. An `EXEC` refused before it runs is shown to `MONITOR`.
+  `BGREWRITEAOF` and `FAILOVER` are queued inside `MULTI`, as in Redis,
+  where they were refused. `AUTH` with more than a user and a password is a
+  syntax error. A password is now any bytes, as in Redis: a `nopass` user
+  takes one that is not UTF-8, and a user set by the hash of such bytes
+  (`#<sha256>`) logs in with them. Before, such a password was read as an
+  empty one. A user name that is not UTF-8 matches no user. Before, it was
+  read as `default`. `ACL SETUSER` takes such a password too (`>` and
+  `<`), where it answered `ERR invalid rule`.
+
+- **The ACL log keeps what Redis's keeps.** A failed `AUTH` or `HELLO ...
+  AUTH` is logged with the command as the object (`AUTH`, `HELLO`), not
+  the user name. A refusal inside `MULTI` or `EXEC` has the context
+  `multi`, and one inside a script has `lua`, where every entry said
+  `toplevel`. A command refused for want of `AUTH` is no longer logged. An
+  event like one of the ten newest entries (same reason, context, object
+  and user, within 60 seconds) is counted in that entry, and moves its
+  `timestamp-last-updated`, instead of adding another. `ACL LOG` answers
+  as Redis does: the fields in Redis's order, `entry-id` (not `id`)
+  counting from 0, `client-info` as `CLIENT INFO` describes the client,
+  `age-seconds` as a double, and a map under RESP3. `acllog-max-len` is
+  now a setting (default 128, 0 keeps nothing) in the configuration file,
+  `CONFIG SET` and `CONFIG GET`, where it was accepted and ignored. A
+  client that reads `ACL LOG` entries by position, or by the name `id`,
+  needs to change. `ACL LOG` without a count gives the ten newest entries,
+  as Redis does, where it gave them all. A negative count gives none, and
+  more arguments are refused.
 
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
@@ -708,7 +825,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   FIELDS 1 f` was saved as a moment from then, so the field was gone after
   a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
   9223372036854775807 FIELDS 1 f` panicked and closed the client's
-  connection, with no reply.
+  connection, with no reply; the server kept running.
 
 - **A search index is seen only from its own database.** `FT._LIST`
   listed the indexes of every database, and the commands that name an

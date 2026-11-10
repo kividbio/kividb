@@ -1436,22 +1436,8 @@ pub async fn handle_client(
             if authenticated_user.is_none()
                 && !matches!(cmd_name.as_str(), "AUTH" | "QUIT" | "HELLO" | "RESET")
             {
-                // Log unauthenticated access attempt
-                let entry = crate::acl::AclLogEntry {
-                    id: acl_log.next_id(),
-                    reason: "auth".into(),
-                    context: "toplevel".into(),
-                    object: cmd_name.to_lowercase(),
-                    username: "default".into(),
-                    age_seconds: 0.0,
-                    client_info: peer_addr.clone(),
-                    timestamp_created: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    count: 1,
-                };
-                acl_log.push(entry);
+                // As in Redis, nothing goes to the ACL log: no user was
+                // refused anything.
                 out_buf.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
                 parse_offset += consumed;
                 continue;
@@ -1471,8 +1457,16 @@ pub async fn handle_client(
                         commands::handler::unknown_command(&cmd)
                     } else if let Some(wrong) = commands::arity::check(&cmd_name, &cmd) {
                         wrong
+                    } else if tx.active && commands::transaction::not_allowed_in_multi(&cmd_name) {
+                        crate::resp::write::resp_error(commands::transaction::NOT_IN_MULTI)
                     } else {
-                        acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                        let _context = tx.active.then(|| crate::acl::log_context("multi"));
+                        acl_log.record(
+                            denied.reason(),
+                            denied.object(),
+                            username,
+                            &crate::acl::log_client_info(&client_registry, client_id, &peer_addr),
+                        );
                         format!("-{}\r\n", denied.message(username)).into_bytes()
                     };
                     // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
@@ -1480,9 +1474,14 @@ pub async fn handle_client(
                     // EXEC discards the transaction, as in Redis.
                     let reply = commands::transaction::reject(
                         &mut tx,
-                        cmd_name == "EXEC",
+                        &cmd,
                         watch_registry.as_ref(),
                         &dirty_flag,
+                        commands::transaction::Monitored {
+                            registry: &monitor_registry,
+                            db: selected_db,
+                            peer_addr: &peer_addr,
+                        },
                         refusal,
                     );
                     out_buf.extend_from_slice(&reply);
@@ -1582,9 +1581,14 @@ pub async fn handle_client(
             {
                 let reply = commands::transaction::reject(
                     &mut tx,
-                    cmd_name == "EXEC",
+                    &cmd,
                     watch_registry.as_ref(),
                     &dirty_flag,
+                    commands::transaction::Monitored {
+                        registry: &monitor_registry,
+                        db: selected_db,
+                        peer_addr: &peer_addr,
+                    },
                     wrong,
                 );
                 out_buf.extend_from_slice(&reply);
@@ -2045,6 +2049,9 @@ pub async fn handle_client(
 
                             // A plain FLUSHALL here is not counted as lazily freed.
                             let _queued = crate::lazyfree::running_queued();
+                            // What the queued commands write to the ACL log is
+                            // in context `multi`, as in Redis.
+                            let _context = crate::acl::log_context("multi");
                             for queued_cmd in queued {
                                 let queued_name = queued_cmd
                                     .first()
@@ -2117,6 +2124,8 @@ pub async fn handle_client(
                                                     .as_deref()
                                                     .unwrap_or("default"),
                                                 peer_addr: &peer_addr,
+                                                client_registry: &client_registry,
+                                                client_id,
                                                 repl_state: &repl_state,
                                                 wait_targets: wait_targets.as_deref(),
                                             },
