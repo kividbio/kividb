@@ -1665,11 +1665,14 @@ fn negative_unix_time(ctx: &Ctx, n: i64) -> Option<Vec<u8>> {
 /// Past Instants saturate to 0; the lazy-eviction sweep already removed the
 /// field by the time we reach this helper, but we still handle it defensively.
 ///
-/// What is left is rounded up, as a key's is: a field given ten seconds is
-/// said, asked at once, to have ten, where cutting the part of a unit that
-/// has gone by since said nine (and 249 of 250 ms). A time of day is rounded
-/// to the nearest millisecond for the same reason: it is worked out from two
-/// clocks read one after the other, and `HPEXPIREAT t` must read back as `t`.
+/// What is left is rounded up, as Redis's `httlGenericCommand` does for a
+/// field (`(expire + 999 - now) / 1000`), not to the nearest second as it
+/// does for a key's `TTL`: a field given ten seconds is said, asked at once,
+/// to have ten, where cutting the part of a unit that has gone by since said
+/// nine (and 249 of 250 ms). `HEXPIRETIME` rounds the time of day up for
+/// the same reason, as Redis does (#557). A time of day is first rounded to
+/// the nearest millisecond: it is worked out from two clocks read one after
+/// the other, and `HPEXPIREAT t` must read back as `t`.
 fn instant_to_hfe_value(exp: Instant, mode: HfeReadMode) -> i64 {
     let now_mono = Instant::now();
     let now_sys = std::time::SystemTime::now();
@@ -1687,7 +1690,7 @@ fn instant_to_hfe_value(exp: Instant, mode: HfeReadMode) -> i64 {
     match mode {
         HfeReadMode::RemainingSecs => saturated(delta.as_micros().div_ceil(1_000_000)),
         HfeReadMode::RemainingMillis => saturated(delta.as_micros().div_ceil(1_000)),
-        HfeReadMode::AbsoluteSecs => at_ms() / 1000,
+        HfeReadMode::AbsoluteSecs => at_ms().saturating_add(999) / 1000,
         HfeReadMode::AbsoluteMillis => at_ms(),
     }
 }

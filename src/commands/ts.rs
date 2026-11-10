@@ -568,6 +568,13 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     let result = {
         let mut ts = series.write();
+        // A sample the policy refuses fails the command before the options
+        // are applied: a failed command must change nothing, as it is not
+        // sent to replicas or the AOF.
+        let policy = dup_policy.as_ref().unwrap_or(&ts.duplicate_policy);
+        if matches!(policy, DuplicatePolicy::Block) && ts.samples.contains_key(&timestamp) {
+            return Some(resp_error(crate::types::BLOCKED_DUPLICATE));
+        }
         if created {
             ts.retention = retention;
             ts.chunk_size = chunk_size;

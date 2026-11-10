@@ -180,19 +180,21 @@ pub fn system_time_from_unix_millis_i128(ms: i128) -> Option<SystemTime> {
     }
 }
 
-/// `TTL`: remaining whole seconds, rounded **up** (Redis semantics).
+/// `PTTL`: what is left of a time to live that ends at `at` (Unix ms), in
+/// milliseconds, as Redis's `ttlGenericCommand` has it: the end less now,
+/// both whole milliseconds, and 0, never less, for a key still there in the
+/// millisecond it ends in.
 #[inline]
-pub fn ttl_remaining_secs_ceil(remaining: Duration) -> i64 {
-    let ms = remaining.as_millis();
-    if ms == 0 {
-        return 0;
-    }
-    let ceil_secs = ms.div_ceil(1000);
-    if ceil_secs > i64::MAX as u128 {
-        i64::MAX
-    } else {
-        ceil_secs as i64
-    }
+pub fn ttl_remaining_ms(at: u64) -> i64 {
+    i64::try_from(at.saturating_sub(now_ms())).unwrap_or(i64::MAX)
+}
+
+/// `TTL` and `EXPIRETIME`: milliseconds to the nearest second, a half up,
+/// as Redis's `(ms + 500) / 1000`. `SET k v PX 1499` has a `TTL` of 1, and
+/// `PX 1500` one of 2 (#557).
+#[inline]
+pub fn ms_to_nearest_secs(ms: i64) -> i64 {
+    ms.saturating_add(500) / 1000
 }
 
 /// Relative TTL from seconds (`EXPIRE`): validates overflow against Redis `when` in ms.
