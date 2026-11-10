@@ -690,14 +690,18 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::TimeSeries(arc) => {
             let inner = arc.read();
+            // Its links to other series, but in a `DUMP` (`dump_payload`).
+            let links = !WITHOUT_LINKS.get();
+            let rules: &[crate::types::CompactionRule] = if links { &inner.rules } else { &[] };
+            let source = if links { inner.source.as_ref() } else { None };
             // The duplicate policy and the compaction rules were not saved at
             // all: after a restart (or on a replica, after a full sync) every
             // series was back on the default policy and no longer fed its
             // compactions — silently.
-            let extended = !inner.rules.is_empty()
+            let extended = !rules.is_empty()
                 || inner.duplicate_policy != crate::types::DuplicatePolicy::Last
-                || inner.source.is_some();
-            w.write_all(&[if inner.source.is_some() {
+                || source.is_some();
+            w.write_all(&[if source.is_some() {
                 TAG_TIMESERIES_V3
             } else if extended {
                 TAG_TIMESERIES_V2
@@ -722,15 +726,15 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             }
             if extended {
                 write_bytes(w, inner.duplicate_policy.as_str().as_bytes())?;
-                w.write_all(&(inner.rules.len() as u32).to_le_bytes())?;
-                for rule in inner.rules.iter() {
+                w.write_all(&(rules.len() as u32).to_le_bytes())?;
+                for rule in rules.iter() {
                     write_bytes(w, &crate::key_bytes::bytes_of(&rule.dest_key))?;
                     write_bytes(w, rule.aggregation.name().as_bytes())?;
                     w.write_all(&rule.bucket_duration.to_le_bytes())?;
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
             }
-            if let Some(source) = &inner.source {
+            if let Some(source) = source {
                 write_bytes(w, &crate::key_bytes::bytes_of(source))?;
             }
         }
@@ -4828,6 +4832,27 @@ fn write_kdb_index_schemas_only(
 /// everything before it.
 const DUMP_VERSION: [u8; 2] = [0x0a, 0x00];
 
+thread_local! {
+    /// Set while [`dump_payload`] writes: a time series is written without
+    /// its compaction rules and source.
+    static WITHOUT_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`WITHOUT_LINKS`], while this lives.
+struct WithoutLinks(bool);
+
+impl WithoutLinks {
+    fn begin() -> Self {
+        WithoutLinks(WITHOUT_LINKS.replace(true))
+    }
+}
+
+impl Drop for WithoutLinks {
+    fn drop(&mut self) {
+        WITHOUT_LINKS.set(self.0);
+    }
+}
+
 /// The key a value is filed under inside a one-entry KDB image. Any non-empty
 /// name will do — an empty one is the format's end-of-database marker.
 const DUMP_IMAGE_KEY: &str = "v";
@@ -4840,6 +4865,14 @@ const DUMP_IMAGE_KEY: &str = "v";
 /// so every type can be dumped, restored and migrated. `RESTORE` tells the two
 /// forms apart by the image's magic.
 pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
+    // A time series goes without its links to other series, its compaction
+    // rules and the series it is a compaction of, as RedisTimeSeries leaves
+    // them out of a `DUMP`: they name keys, which the payload may be
+    // restored beside, under another name or on another server. Restored
+    // with them, a series fed a compaction that had a source of its own
+    // (#593). Its samples, settings and labels go. An atomic slot migration
+    // sends the rules among the keys it moves as `TS.CREATERULE`s.
+    let _without = WithoutLinks::begin();
     let mut out = Vec::new();
     if serialize_value(value, &mut out).is_err() {
         out.clear();
@@ -5463,6 +5496,76 @@ mod dump_payload_tests {
                 let ts = arc.read();
                 assert_eq!(ts.samples.get(&7), Some(&1.5));
                 assert_eq!(ts.labels.get("k").map(String::as_str), Some("v"));
+            }
+            _ => panic!("expected a time series"),
+        }
+    }
+
+    /// A series with a rule to `lp:d` and the source `lp:s`: links.
+    fn linked_series() -> KiviDBValue {
+        let mut ts = TsInner::new();
+        ts.samples.insert(1, 2.5);
+        ts.last_ts = Some(1);
+        ts.labels.insert("k".into(), "v".into());
+        ts.rules.push(crate::types::CompactionRule {
+            dest_key: "lp:d".into(),
+            aggregation: crate::types::TsAggregation::Sum,
+            bucket_duration: 10,
+            align_timestamp: 0,
+        });
+        ts.source = Some("lp:s".into());
+        KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
+    }
+
+    /// The series' KDB image as a snapshot writes it.
+    fn image(value: &KiviDBValue) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, 1).unwrap();
+        write_kdb_entry(&mut out, DUMP_IMAGE_KEY, value.view()).unwrap();
+        write_kdb_db_end(&mut out).unwrap();
+        out
+    }
+
+    /// `DUMP` leaves a series' links out (#593); a snapshot written after
+    /// it on the same thread keeps them.
+    #[test]
+    fn a_dump_leaves_links_out_and_a_snapshot_after_it_keeps_them() {
+        let series = linked_series();
+        let payload = dump_payload(&series).unwrap();
+        match restore_payload(&payload).unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let ts = arc.read();
+                assert!(ts.rules.is_empty() && ts.source.is_none());
+                assert_eq!(ts.samples.get(&1), Some(&2.5));
+                assert_eq!(ts.labels.get("k").map(String::as_str), Some("v"));
+            }
+            _ => panic!("expected a time series"),
+        }
+        let loaded = load_snapshot_from(&image(&series)[..]).unwrap();
+        match loaded.dbs[0].values().next().unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let ts = arc.read();
+                assert_eq!(ts.rules.len(), 1);
+                assert_eq!(ts.source.as_deref(), Some("lp:s"));
+            }
+            _ => panic!("expected a time series"),
+        }
+    }
+
+    /// A payload as 1.2.0's `DUMP` wrote a series with links: the image,
+    /// the version, the checksum. tests/ts.rs restores it.
+    #[test]
+    fn a_payload_with_links_as_1_2_0_wrote_it() {
+        let mut payload = image(&linked_series());
+        let crc = crc64_digest(&payload);
+        payload.extend_from_slice(&DUMP_VERSION);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        println!("LINKED_PAYLOAD={hex}");
+        match restore_payload(&payload).unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                assert_eq!(arc.read().rules.len(), 1);
+                assert_eq!(arc.read().source.as_deref(), Some("lp:s"));
             }
             _ => panic!("expected a time series"),
         }

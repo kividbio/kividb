@@ -164,6 +164,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `HPEXPIRE`, `HGET` and `HPEXPIRETIME` on such hashes cost no more
   instructions than before (1 to 5% fewer).
 
+- **`CONFIG SET appendonly yes` no longer stops other clients being read
+  with `--io-model tokio`.** The enable waits for the checkpoint's turn and
+  then writes the whole dataset out before it answers, and it did so on a
+  worker of the tokio runtime, keeping that worker's place. When the other
+  workers were asleep, nothing polled the sockets until it was done: no
+  client was accepted or read from, and no timer fired, for as long as the
+  checkpoint took. It now runs off the runtime (`block_in_place`), as
+  `MIGRATE` and the pauses of a handoff already did. The io_uring model,
+  the default on Linux, was not affected. The test steps of a checkpoint
+  wait the same way.
+
 - **An expire time past the latest one Redis allows is refused, as by
   Redis (#561).** `SET` and `GETEX` with `EX`, `PX`, `EXAT` or `PXAT`,
   `SETEX`, `PSETEX`, `MSETEX`, `EXPIREAT`, `PEXPIREAT`, `INCREX`, and the
@@ -240,6 +251,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replies, keeping 113-139k keys. Once caught up, the replica had the same
   data. 1.2.0 has the same bug.
 
+- **A time series sample's time above `i64::MAX` is refused, not lost
+  on replicas (#592).** `TS.ADD`, `TS.MADD`, `TS.INCRBY` and `TS.DECRBY`
+  took a time up to `u64::MAX`, replied one above `i64::MAX` as a negative
+  number, and sent that to replicas and the AOF, which refused it: the
+  master kept the sample, a replica and a restart lost it. As in
+  RedisTimeSeries, a client's time is now `0` to `i64::MAX`. Times are sent
+  to replicas and the AOF unsigned, and a log or master of 1.2.0 holding a
+  larger one, or a `TS.INCRBY` time 1.2.0 logged as negative, is applied at
+  the time 1.2.0 kept.
+- **`DUMP` of a time series leaves out its compaction rules and source
+  (#593).** `DUMP`, `RESTORE` and `MIGRATE` carried a series' rules and the
+  series it is a compaction of, by key name, wherever it was restored: a
+  copy fed the original's compaction, and a restored compaction kept a
+  source that did not feed it. As in RedisTimeSeries, the payload now holds
+  the samples, retention, chunk size, duplicate policy and labels, and no
+  links to other keys; a restored series is found by its labels at once.
+  `RESTORE` leaves them out of a payload that has them (one 1.2.0 made, or
+  `MIGRATE` from a 1.2.0 node). An atomic slot migration (`CLUSTER
+  MIGRATION`), which moves both ends of a rule together, keeps the rules.
+  An atomic slot migration from a 1.2.0 node, as in a rolling upgrade,
+  loses the moved series' rules: 1.2.0 sends them inside the `RESTORE`s,
+  which leave them out, and sends no `TS.CREATERULE`. Make them again with
+  `TS.CREATERULE` afterwards. And, as in RedisTimeSeries, a link left
+  behind by `DEL`, `RESTORE … REPLACE`, `COPY … REPLACE` or `MIGRATE` of
+  one of its series is dead: the source no longer feeds a destination that
+  names another source, `TS.INFO` no longer shows it, `TS.DELETERULE`
+  refuses it, and `TS.CREATERULE` gives the destination a new source,
+  replacing a dead rule. `RENAME` and `RENAMENX` of a series now take its
+  links and labels along, as in RedisTimeSeries: they stayed on the old
+  name, so a series renamed was no longer found by `TS.QUERYINDEX`, and
+  with this change its compaction would have stopped. `COPY` makes a series
+  without links, found by its labels; the copy was not in the label index.
 - **`TS.INCRBY` and `TS.DECRBY` make a series with the options given
   (#555).** `RETENTION`, `CHUNK_SIZE`, `DUPLICATE_POLICY` and `LABELS` were
   passed over, and a series either command created had the defaults and no
