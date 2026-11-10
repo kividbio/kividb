@@ -162,10 +162,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   out. `INFO all` and `INFO everything`, which some exporters ask for,
   include `INFO keysizes`, which counts every key. It was already counted
   at most once every 10 seconds; that count now runs on a thread of its
-  own, and `INFO all` returns the last one without waiting for it (only
-  the first `INFO all` waits). The count also holds a shard for 1,024 hash
-  buckets at a time instead of for all of its keys. `INFO keysizes` asked
-  for by name still counts at once. `tracking_total_items` in the clients
+  own, and `INFO all` returns the last one without waiting for it (it
+  waits only when there is none, or when the last is more than 20 seconds
+  old). The count also holds a shard for 1,024 hash buckets at a time
+  instead of for all of its keys, so under concurrent writes it is
+  approximate, as `SCAN` is. `INFO keysizes` asked for by name still
+  counts at once. `tracking_total_items` in the clients
   section is now a running count instead of a pass over the client-side
   caching table.
 - **An idle server with many keys that have a long TTL no longer spends

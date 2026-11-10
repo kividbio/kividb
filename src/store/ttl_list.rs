@@ -245,7 +245,9 @@ impl TtlList {
     /// `entry` taken out.
     #[inline]
     pub(super) fn take(&mut self, entry: Entry) {
-        self.deadlines -= u128::from(deadline(entry));
+        let at = deadline(entry);
+        debug_assert!(self.deadlines >= u128::from(at), "sum of the times");
+        self.deadlines -= u128::from(at);
         let pos = entry.pos();
         if pos & FAR == 0 {
             debug_assert!(self.near[pos] == entry);
@@ -261,6 +263,7 @@ impl TtlList {
     /// its time now ends before the horizon.
     #[inline]
     pub(super) fn retimed(&mut self, entry: Entry, was: u64) {
+        debug_assert!(self.deadlines >= u128::from(was), "sum of the times");
         self.deadlines = self.deadlines - u128::from(was) + u128::from(deadline(entry));
         self.relist(entry);
     }
