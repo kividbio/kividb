@@ -2867,7 +2867,7 @@ mod tests {
             if key == "d347:b" {
                 inner
                     .expiries
-                    .insert("n".into(), Instant::now() + Duration::from_millis(1));
+                    .insert("n".into(), crate::types::field_now() + 1);
             }
             crate::store::get_shard(&store[0], key).write().insert(
                 key,

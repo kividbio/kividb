@@ -266,7 +266,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             entry()
                 + layout::arc_of::<RwLock<HashInner>>()
                 + layout::hash_fields(&inner.fields, samples)
-                + layout::std_hash_map::<String, std::time::Instant>(inner.expiries.capacity())
+                + layout::std_hash_map::<String, crate::types::FieldDeadline>(
+                    inner.expiries.capacity(),
+                )
                 + names
                 + watched
         }

@@ -4700,7 +4700,7 @@ mod past_deadline_replay_tests {
             .insert("g".to_string(), std::sync::Arc::from(&b"5"[..]));
         inner
             .expiries
-            .insert("g".to_string(), std::time::Instant::now());
+            .insert("g".to_string(), crate::types::field_now() - 1);
         {
             let _replay = crate::expiry::replay();
             assert!(!inner.is_field_expired("g"));
