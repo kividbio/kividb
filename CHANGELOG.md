@@ -162,6 +162,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the writes under way to finish: `FT.CREATE` there fails with an
   error, and works outside the script, or once an index exists.
 
+- **`CONFIG SET appendonly yes` no longer stops other clients being read
+  with `--io-model tokio`.** The enable waits for the checkpoint's turn and
+  then writes the whole dataset out before it answers, and it did so on a
+  worker of the tokio runtime, keeping that worker's place. When the other
+  workers were asleep, nothing polled the sockets until it was done: no
+  client was accepted or read from, and no timer fired, for as long as the
+  checkpoint took. It now runs off the runtime (`block_in_place`), as
+  `MIGRATE` and the pauses of a handoff already did. The io_uring model,
+  the default on Linux, was not affected. The test steps of a checkpoint
+  wait the same way.
+
 - **An expire time past the latest one Redis allows is refused, as by
   Redis (#561).** `SET` and `GETEX` with `EX`, `PX`, `EXAT` or `PXAT`,
   `SETEX`, `PSETEX`, `MSETEX`, `EXPIREAT`, `PEXPIREAT`, `INCREX`, and the

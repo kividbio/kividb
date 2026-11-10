@@ -222,7 +222,9 @@ fn info(c: &mut Conn, section: &str, field: &str) -> Option<String> {
 /// `INFO commandstats` counts for the whole process, and every server these
 /// tests start runs in it. A test that reads the counts, and one that sends a
 /// command they count (`HELLO`, `RESET`, `AUTH` ...), take this lock, so that
-/// neither adds to the other's counts while it runs.
+/// neither adds to the other's counts while it runs. So does a test that
+/// reads a counter of `INFO stats`: `CONFIG RESETSTAT`, which a test holding
+/// this lock sends, sets those back to zero too.
 fn stats_lock() -> std::sync::MutexGuard<'static, ()> {
     static STATS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     STATS
@@ -474,6 +476,9 @@ fn a_key_that_expires_is_announced() {
 /// hash with none left goes with them.
 #[test]
 fn hash_fields_expire_on_their_own() {
+    // `expired_subkeys` is counted for the process: no `CONFIG RESETSTAT`
+    // between the two readings.
+    let _stats = stats_lock();
     let mut sub = events();
     let mut c = conn();
     let before: u64 = info(&mut c, "stats", "expired_subkeys")
