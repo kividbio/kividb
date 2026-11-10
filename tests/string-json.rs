@@ -3087,14 +3087,10 @@ fn restore_rejects_an_array_index_out_of_range() {
     let r = c.cmd(&[b"RESTORE", b"bad", b"0", &array_dump(u64::MAX)]);
     assert!(r.is_error(), "expected an error, got {:?}", r);
     assert_eq!(c.cmds(&["EXISTS", "bad"]).as_int(), 0);
-    // Anything above ARRAY_MAX_INDEX (i64::MAX) is refused too.
-    let r = c.cmd(&[
-        b"RESTORE",
-        b"bad2",
-        b"0",
-        &array_dump((i64::MAX as u64) + 1),
-    ]);
-    assert!(r.is_error(), "expected an error, got {:?}", r);
+    // The highest index there is, ARRAY_MAX_INDEX (2^64 - 2), is kept.
+    let r = c.cmd(&[b"RESTORE", b"top", b"0", &array_dump(u64::MAX - 1)]);
+    assert!(r.is_ok(), "expected OK, got {:?}", r);
+    assert_eq!(c.cmds(&["ARCOUNT", "top"]).as_int(), 1);
     assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
 }
 
@@ -3113,6 +3109,8 @@ fn json_moderately_deep_documents_round_trip() {
         c.cmds(&["JSON.GET", "k"]).as_str(),
         c.cmds(&["JSON.GET", "k2"]).as_str()
     );
+}
+
 // ── JSON.MSET is all or nothing (#551) ──────────────────────────────────────
 //
 // A triple that fails fails the whole command, and the triples before it

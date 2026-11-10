@@ -417,7 +417,11 @@ fn check_set_in(root: &Value, query: &Query, value: &Value) -> Result<(), Vec<u8
         };
     }
     match query.new_member(root) {
-        Some((parents, _)) if parents.iter().any(|parent| too_deep(parent.len() + 1, depth)) => {
+        Some((parents, _))
+            if parents
+                .iter()
+                .any(|parent| too_deep(parent.len() + 1, depth)) =>
+        {
             deep()
         }
         None if query.is_legacy() => Err(resp_error("ERR path does not exist")),
