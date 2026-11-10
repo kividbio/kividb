@@ -397,6 +397,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 _ => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            "acllog-max-len" => match value.parse::<usize>() {
+                Ok(v) => {
+                    ctx.acl_log.set_max_len(v);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR value is not an integer or out of range")),
+            },
             "maxmemory" => match memory_size(value) {
                 Some(v) => {
                     crate::RUNTIME_MAXMEMORY.store(v, std::sync::atomic::Ordering::Relaxed);
@@ -1849,6 +1856,7 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             },
         ),
         ("slowlog-max-len", ctx.slowlog.len_cap().to_string()),
+        ("acllog-max-len", ctx.acl_log.max_len().to_string()),
         ("appendonly", yes_no(crate::aof::AOF_ENABLED.load(Relaxed))),
         (
             "loglevel",
@@ -2055,7 +2063,7 @@ fn on_or_off(word: &[u8]) -> Option<bool> {
 
 /// Whether `raw` can stand as one word in a line of `CLIENT LIST`: printable
 /// ASCII, and no spaces.
-fn is_printable_word(raw: &[u8]) -> bool {
+pub(crate) fn is_printable_word(raw: &[u8]) -> bool {
     raw.iter().all(|byte| (b'!'..=b'~').contains(byte))
 }
 
@@ -2137,10 +2145,15 @@ fn client_filter(
 }
 
 /// `FLUSHALL ASYNC` / `FLUSHDB ASYNC`: the values are freed in the
-/// background (`lazyfree`), after the reply.
-fn flush_is_async(cmd: &[&[u8]]) -> bool {
-    cmd.get(1)
-        .is_some_and(|arg| arg.eq_ignore_ascii_case(b"ASYNC"))
+/// background (`lazyfree`), after the reply. `SYNC`, or nothing, frees them
+/// now; anything else, or more, is a syntax error, as in Redis (#561).
+fn flush_is_async(cmd: &[&[u8]]) -> Result<bool, Vec<u8>> {
+    match cmd {
+        [_] => Ok(false),
+        [_, mode] if mode.eq_ignore_ascii_case(b"ASYNC") => Ok(true),
+        [_, mode] if mode.eq_ignore_ascii_case(b"SYNC") => Ok(false),
+        _ => Err(resp_error("ERR syntax error")),
+    }
 }
 
 /// A plain `FLUSHALL` or `FLUSHDB` is, in Redis, an `ASYNC` flush the
@@ -2583,8 +2596,11 @@ fn commands_with_prefix(prefix: &str) -> Vec<&'static str> {
 
 /// The `admin` ACL category.
 /// Whether `name` (upper case) is an administrative command.
+///
+/// `ACL` counts as one here, for MONITOR, which shows none of it: `ACL
+/// SETUSER` carries passwords.
 pub(crate) fn is_admin_command(name: &str) -> bool {
-    ADMIN_COMMANDS.contains(&name)
+    name == "ACL" || ADMIN_COMMANDS.contains(&name)
 }
 
 /// Whether there is a command called `name` (upper case).
@@ -2595,7 +2611,17 @@ pub(crate) fn is_command(name: &str) -> bool {
 }
 
 const ADMIN_COMMANDS: &[&str] = &[
-    "ACL",
+    // Not `ACL` as a whole: `ACL WHOAMI`, `CAT`, `GENPASS` and `HELP` are
+    // not administrative in Redis (#566).
+    "ACL|DELUSER",
+    "ACL|DRYRUN",
+    "ACL|GETUSER",
+    "ACL|LIST",
+    "ACL|LOAD",
+    "ACL|LOG",
+    "ACL|SAVE",
+    "ACL|SETUSER",
+    "ACL|USERS",
     "BACKUP",
     "BGREWRITEAOF",
     "BGSAVE",
@@ -2836,7 +2862,9 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             };
             // One of Redis's commands has Redis's arity. The guess above is
             // for the rest.
-            let arity = crate::commands::arity::of(name).map_or(arity, i64::from);
+            let arity = crate::commands::arity::of(name)
+                .or_else(|| module_arity(name))
+                .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
             // its subcommands'.
             let container = crate::commands::arity::is_container(name);
@@ -2880,6 +2908,21 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             (*name, entry)
         })
         .collect()
+}
+
+/// The arity `COMMAND INFO` reports for a command of a module KiviDB has
+/// built in, as Redis 8.10 reports it with that module loaded (#561). Only
+/// reported: each handler checks its own arguments.
+fn module_arity(name: &str) -> Option<i16> {
+    Some(match name {
+        "JSON.ARRAPPEND" | "JSON.STRAPPEND" | "JSON.MGET" => -3,
+        "JSON.ARRINDEX" | "JSON.SET" | "JSON.MSET" | "JSON.MERGE" => -4,
+        "JSON.ARRINSERT" => -5,
+        "JSON.ARRTRIM" => 5,
+        "JSON.NUMINCRBY" | "JSON.NUMMULTBY" | "JSON.NUMPOWBY" => 4,
+        "JSON.TOGGLE" => 3,
+        _ => return None,
+    })
 }
 
 /// Returns the list of commands in an ACL category, or None for an unknown category.
@@ -3828,9 +3871,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "LASTSAVE" => Some(resp_integer(crate::stats::last_save())),
 
         "FLUSHDB" => {
+            let lazy = match flush_is_async(cmd) {
+                Ok(lazy) => lazy,
+                Err(reply) => return Some(reply),
+            };
             let db = *ctx.selected_db;
             touch_watched_keys(ctx, Some(db));
-            let flushed = if flush_is_async(cmd) {
+            let flushed = if lazy {
                 let (values, flushed) = crate::store::take_db(&ctx.store[db]);
                 crate::lazyfree::free_later(values, flushed.keys as u64);
                 // Nothing to give back to the OS yet: the values are freed
@@ -4831,7 +4878,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // resets its `stat_active_defrag_*` (#370).
                     crate::compaction::reset_stats();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
-                    crate::stats::reset_rdb_changes();
+                    // Not `rdb_changes_since_last_save`: that is not a
+                    // statistic, and Redis keeps it (#566).
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
                     crate::stats::LAST_SAMPLE_COMMANDS.store(0, Ordering::Relaxed);
                     crate::stats::reset_error_reply_stats();
@@ -5096,8 +5144,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "FLUSHALL" => {
+            let lazy = match flush_is_async(cmd) {
+                Ok(lazy) => lazy,
+                Err(reply) => return Some(reply),
+            };
             touch_watched_keys(ctx, None);
-            let flushed = if flush_is_async(cmd) {
+            let flushed = if lazy {
                 let mut values = Vec::with_capacity(ctx.store.len());
                 let mut keys = 0;
                 for db in ctx.store.iter() {
@@ -5854,9 +5906,38 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "LOLWUT" => {
-            // LOLWUT [VERSION version]
-            // Returns some art and the server version. The VERSION arg selects
-            // which art pattern to show — we have one pattern (version 6, the dragon).
+            // LOLWUT [VERSION version] [option ...]
+            // Returns some art and the server version. KiviDB has one
+            // picture, whatever the version; the arguments are checked as
+            // Redis checks them (#561): VERSION takes an integer, and so do
+            // the options of versions 5 (three) and 6 (two).
+            let mut options = &cmd[1..];
+            let mut asked = None;
+            if options.len() >= 2 && options[0].eq_ignore_ascii_case(b"VERSION") {
+                match std::str::from_utf8(options[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(v) => asked = Some(v),
+                    None => {
+                        return Some(resp_error("ERR value is not an integer or out of range"));
+                    }
+                }
+                options = &options[2..];
+            }
+            let numeric = match asked {
+                Some(5) => 3,
+                Some(6) => 2,
+                _ => 0,
+            };
+            if options.iter().take(numeric).any(|o| {
+                std::str::from_utf8(o)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .is_none()
+            }) {
+                return Some(resp_error("ERR value is not an integer or out of range"));
+            }
             let version = env!("CARGO_PKG_VERSION");
             let art = format!(
                 "
@@ -6030,12 +6111,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ],
             ))
         }
-        "MODULE" => Some(resp_error(
-            "ERR MODULE subsystem is not supported by KiviDB. \
-             Dynamic module loading requires dlopen and ABI versioning \
-             which conflicts with KiviDB's safety model. \
-             See COMMANDS.md for the design rationale.",
-        )),
+        "MODULE"
+            if cmd.get(1).is_some_and(|sub| {
+                [&b"LOAD"[..], b"LOADEX", b"UNLOAD"]
+                    .iter()
+                    .any(|known| sub.eq_ignore_ascii_case(known))
+            }) =>
+        {
+            Some(resp_error(
+                "ERR MODULE LOAD, LOADEX and UNLOAD are not supported: KiviDB does not \
+                 load modules. Search, JSON, time series and vector \
+                 sets are built in (MODULE LIST).",
+            ))
+        }
+        "MODULE" => Some(resp_error(&format!(
+            "ERR unknown subcommand '{}'. Try MODULE HELP.",
+            String::from_utf8_lossy(cmd.get(1).copied().unwrap_or_default())
+        ))),
 
         "FAILOVER" => Some(resp_error(
             "ERR FAILOVER is not supported by KiviDB. \

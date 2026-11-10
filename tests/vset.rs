@@ -113,10 +113,6 @@ impl RespValue {
         }
     }
 
-    fn is_ok(&self) -> bool {
-        matches!(self, RespValue::SimpleStr(s) if s == "OK")
-    }
-
     fn is_nil(&self) -> bool {
         matches!(self, RespValue::Nil)
     }
@@ -403,9 +399,10 @@ fn test_vgetattr_vsetattr() {
     assert!(c.cmds(&["VGETATTR", "vs", "elem"]).is_nil());
 
     // Set attrs
-    assert!(
+    assert_eq!(
         c.cmds(&["VSETATTR", "vs", "elem", r#"{"color":"red"}"#])
-            .is_ok()
+            .as_int(),
+        1
     );
 
     // Get attrs
@@ -413,9 +410,10 @@ fn test_vgetattr_vsetattr() {
     assert_eq!(attrs.as_str(), r#"{"color":"red"}"#);
 
     // Update attrs
-    assert!(
+    assert_eq!(
         c.cmds(&["VSETATTR", "vs", "elem", r#"{"color":"blue"}"#])
-            .is_ok()
+            .as_int(),
+        1
     );
     assert_eq!(
         c.cmds(&["VGETATTR", "vs", "elem"]).as_str(),
@@ -423,7 +421,7 @@ fn test_vgetattr_vsetattr() {
     );
 
     // Clear attrs with empty string
-    assert!(c.cmds(&["VSETATTR", "vs", "elem", ""]).is_ok());
+    assert_eq!(c.cmds(&["VSETATTR", "vs", "elem", ""]).as_int(), 1);
     assert!(c.cmds(&["VGETATTR", "vs", "elem"]).is_nil());
 }
 
@@ -1513,4 +1511,48 @@ fn vadd_refuses_what_it_does_not_know() {
     assert_eq!(c.cmds(&["VCARD", "l2"]).as_int(), 3);
     assert_eq!(c.cmds(&vadd("ip", &["DISTANCE", "IP"])).as_int(), 1);
     assert_eq!(c.cmds(&vadd("cos", &["DISTANCE", "COSINE"])).as_int(), 1);
+}
+
+/// What the vector-sets module refuses, and how VSETATTR answers (#561).
+#[test]
+fn vset_arguments_are_checked_as_the_module_checks_them() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let err = |c: &mut Conn, args: &[&str]| match c.cmds(args) {
+        RespValue::Error(e) => e,
+        other => panic!("{args:?}: {other:?}"),
+    };
+    assert_eq!(
+        c.cmds(&["VADD", "v", "VALUES", "2", "1", "2", "e"])
+            .as_int(),
+        1
+    );
+
+    // VSETATTR: 1 when set, 0 for no such element or key; attributes are
+    // stored as given, JSON or not, as the module stores them.
+    assert_eq!(c.cmds(&["VSETATTR", "v", "e", "not json"]).as_int(), 1);
+    assert_eq!(c.cmds(&["VGETATTR", "v", "e"]).as_str(), "not json");
+    assert_eq!(c.cmds(&["VSETATTR", "v", "nope", "{}"]).as_int(), 0);
+    assert_eq!(c.cmds(&["VSETATTR", "nokey", "e", "{}"]).as_int(), 0);
+
+    // VRANDMEMBER key [count]: an integer count, and no more.
+    assert_eq!(
+        err(&mut c, &["VRANDMEMBER", "v", "abc"]),
+        "ERR COUNT value is not an integer"
+    );
+    assert!(err(&mut c, &["VRANDMEMBER", "v", "1", "2"]).starts_with("ERR wrong number"));
+    assert_eq!(c.cmds(&["VRANDMEMBER", "v", "1"]).as_array().len(), 1);
+
+    // VEMB key element [RAW]: nothing else.
+    assert_eq!(
+        err(&mut c, &["VEMB", "v", "e", "foo"]),
+        "ERR invalid option"
+    );
+    assert_eq!(
+        err(&mut c, &["VEMB", "v", "e", "RAW", "x"]),
+        "ERR invalid option"
+    );
+    assert!(!c.cmds(&["VEMB", "v", "e", "RAW"]).is_error());
+    assert_eq!(c.cmds(&["VEMB", "v", "e"]).as_array().len(), 2);
 }

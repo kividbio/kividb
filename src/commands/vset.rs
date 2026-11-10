@@ -410,11 +410,11 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let key: &[u8] = cmd[1];
     let element: &[u8] = cmd[2];
-    let raw = cmd
-        .get(3)
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.eq_ignore_ascii_case("RAW"))
-        .unwrap_or(false);
+    // As the vector-sets module: RAW, as often as given, and nothing else.
+    if cmd[3..].iter().any(|opt| !opt.eq_ignore_ascii_case(b"RAW")) {
+        return Some(resp_error("ERR invalid option"));
+    }
+    let raw = cmd.len() > 3;
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -539,22 +539,24 @@ fn vsetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key.as_slice()) {
         Some(ValueRef::VectorSet(vs)) => {
             let mut inner = vs.write();
+            // 1 when set, 0 when there is no such element or key, as the
+            // vector-sets module replies (#561).
             match inner.entries.get_mut(element.as_slice()) {
-                None => Some(resp_error("ERR no such element")),
+                None => Some(resp_integer(0)),
                 Some(entry) => {
                     entry.attrs = if attr_str.is_empty() {
                         None
                     } else {
                         Some(attr_str)
                     };
-                    Some(resp_simple("OK"))
+                    Some(resp_integer(1))
                 }
             }
         }
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
-        None => Some(resp_error("ERR no such key")),
+        None => Some(resp_integer(0)),
     }
 }
 
@@ -698,17 +700,21 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
-    if cmd.len() < 2 {
+    if cmd.len() != 2 && cmd.len() != 3 {
         return Some(resp_error(
             "ERR wrong number of arguments for 'vrandmember' command",
         ));
     }
     let key: &[u8] = cmd[1];
 
-    let count: Option<i64> = cmd
-        .get(2)
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.parse().ok());
+    let count: Option<i64> = match cmd.get(2) {
+        None => None,
+        Some(arg) => match std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok()) {
+            Some(i64::MIN) => return Some(resp_error("ERR COUNT value is out of range")),
+            Some(n) => Some(n),
+            None => return Some(resp_error("ERR COUNT value is not an integer")),
+        },
+    };
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
