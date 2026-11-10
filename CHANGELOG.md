@@ -145,6 +145,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An expire time past the latest one Redis allows is refused, as by
+  Redis (#561).** `SET` and `GETEX` with `EX`, `PX`, `EXAT` or `PXAT`,
+  `SETEX`, `PSETEX`, `MSETEX`, `EXPIREAT`, `PEXPIREAT`, `INCREX`, and the
+  hash field commands now answer `ERR invalid expire time in '<command>'
+  command` for a deadline past `i64::MAX` milliseconds after the epoch, and
+  `ERR value is not an integer or out of range` for a number too large for
+  a 64-bit signed integer, as Redis 8.10 does. Before, some of them closed
+  the client's connection with no reply (`SET k v EXAT
+  18446744073709551615`, `SETEX k 18446744073709551615 v`, `GETEX k EXAT
+  ...`, `MSETEX ... EX` or `EXAT`); the server kept running, and inside
+  `MULTI` the commands queued before it had already run. Others took the
+  time and set a deadline that read back negative: `PSETEX k
+  9223372036854775807 v` then `PEXPIRETIME k` gave -9223370242591131402.
+  `RESTORE` with a time to live that ends past the latest keeps the latest,
+  and `PTTL`, `EXPIRETIME` and `PEXPIRETIME` no longer go negative for a far
+  deadline. A negative `HEXPIREAT` or `HPEXPIREAT` time was already refused
+  (#486).
+
+  The same commands now read their options and their time in Redis's order.
+  A time that is not an integer, or does not fit a 64-bit signed integer,
+  is `ERR value is not an integer or out of range` before any bound is
+  looked at; it was often `ERR invalid expire time` (`SETEX k abc v`,
+  `SET k v EXAT abc`) or `ERR invalid EXAT timestamp` (`MSETEX`). `EXAT 0`
+  and `PXAT 0` of `SET`, `GETEX` and `MSETEX` are refused as an invalid
+  time; the key was set and gone at once. `SET` with `KEEPTTL` and a time,
+  or with two of `EX`, `PX`, `EXAT` and `PXAT`, is `ERR syntax error`; the
+  last one was taken, or `KEEPTTL EX 10` was an invalid time. The same unit
+  given twice is still taken, the last one, as in Redis. `GETEX` reads all
+  its options, where it read only the first and ignored the rest, and on a
+  key that is not there answers nil whatever the time, as Redis does.
+  `MSETEX` takes `NX NX` and `KEEPTTL KEEPTTL`, as Redis does.
+
+  From a master's stream or an AOF being replayed, a time past the latest
+  is taken as the latest, and a Unix time of 0 as one that has passed, as
+  1.2.0 took them: 1.2.0 wrote `SET … PXAT` up to 18446744073709551615 for
+  a large `SETEX`, and refusing it there would lose the key.
+  `EXPIRETIME` of the latest deadline is 9223372036854776, as in Redis,
+  where it was one less.
+
+  What replicas and the AOF get is the time that took effect. `SET` and
+  `MSETEX` are sent with only that one, as `PXAT`: with two, only the first
+  was made a `PXAT` and both were sent, so `SET k v EX 10 EX 20` went out as
+  `SET k v PXAT <t> EX 20`, and a restart started the 20 seconds over.
+  `GETEX` is sent as the deadline it left (`PEXPIREAT`), `PERSIST`, or
+  `DEL`. `GETEX` with an `EXAT` or `PXAT` that has already passed deletes
+  the key at once and says `del`, as Redis does, and `GETEX k PERSIST` on a
+  key with no time to live no longer says `persist`.
+
 - **A replica that falls behind no longer makes its master evict its keys
   and refuse writes (#542).** Under an `allkeys-*` policy, a replica that
   full-synced or lagged under heavy writes made its master evict nearly
@@ -236,6 +284,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replicas, and a restart from the AOF, kept the members the master had
   popped. So too from a script after `redis.setresp(3)`. It is now sent as
   an `SREM` of the members popped, as from a RESP2 client.
+
 - **`TTL`, `EXPIRETIME` and `HEXPIRETIME` round as Redis does (#557).**
   `TTL` rounded what was left up to the next second: `SET k v PX 1499` then
   `TTL k` gave 2 where Redis gives 1. It now rounds to the nearest second, a
@@ -727,7 +776,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   FIELDS 1 f` was saved as a moment from then, so the field was gone after
   a restart, a full sync, `RESTORE` or `MIGRATE`, and `HEXPIRE h
   9223372036854775807 FIELDS 1 f` panicked and closed the client's
-  connection, with no reply.
+  connection, with no reply; the server kept running.
 
 - **A search index is seen only from its own database.** `FT._LIST`
   listed the indexes of every database, and the commands that name an

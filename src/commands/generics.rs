@@ -1,11 +1,10 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{
-    ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
-    ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
-    expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis, from_unix_ms,
-    get_expiry, is_expired, lazy_expire_on_read, ms_to_nearest_secs, parse_bytes_as_i128,
-    parse_expire_modifier_flags, parse_utf8, set_expiry, system_time_from_unix_millis_i128,
-    take_key, ttl_remaining_ms,
+    ERR_INVALID_EXPIRE_EXPIREAT_CMD, ERR_INVALID_EXPIRE_PEXPIRE_CMD,
+    ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ExpireModifierFlags, TimeArg, applying_stream, delete_key,
+    delete_key_if_expired, expire_deadline, expire_modifier_allows_set, expire_on_read,
+    from_unix_ms, get_expiry, is_expired, lazy_expire_on_read, ms_to_nearest_secs,
+    parse_expire_modifier_flags, parse_utf8, set_expiry, take_key, ttl_remaining_ms,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
@@ -14,7 +13,7 @@ use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What `OBJECT ENCODING` says of a value.
 ///
@@ -633,18 +632,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let ms = match parse_bytes_as_i128(cmd[2]) {
-                Some(m) => m,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
             // The clock is read once, here.
-            let when_ms = match absolute_when_ms_from_pexpire_ms(ms) {
-                Ok(w) => w,
+            let (ms, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::Millis,
+                ERR_INVALID_EXPIRE_PEXPIRE_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
                 Err(e) => return Some(resp_error(e)),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(when_ms) {
-                Some(t) => t,
-                None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIRE_CMD)),
             };
             // Only a time to live of zero or less deletes the key here, as
             // `expire_feed` propagates it. `PEXPIRE k 1` found the clock a
@@ -671,17 +667,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let unix_secs = match parse_bytes_as_i128(cmd[2]) {
-                Some(n) => n,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
-            let unix_ms = match unix_secs.checked_mul(1000) {
-                Some(ms) => ms,
-                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
-                Some(t) => t,
-                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
+            // As Redis's `expireGenericCommand`: not an integer, then a
+            // time in seconds past `LLONG_MAX / 1000` either way, refused.
+            let (_, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::UnixSecs,
+                ERR_INVALID_EXPIRE_EXPIREAT_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
@@ -701,13 +696,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let unix_ms = match parse_bytes_as_i128(cmd[2]) {
-                Some(n) => n,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
-                Some(t) => t,
-                None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIREAT_CMD)),
+            // From a stream, 1.2.0's `PEXPIREAT` up to `u64::MAX` is taken
+            // as the latest (`applying_stream`).
+            let (_, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::UnixMillis,
+                ERR_INVALID_EXPIRE_PEXPIREAT_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
@@ -1256,13 +1254,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 _ => Vec::new(),
             };
 
-            // Store it, with its time to live
+            // Store it, with its time to live: at most `i64::MAX` ms after
+            // the epoch, the latest any command sets. One past it read back
+            // negative, and its `PEXPIREAT` was refused where it was sent on.
             let expires_at = (ttl_ms > 0).then(|| {
-                if absttl {
-                    expiry_unix_millis(ttl_ms)
+                let at_ms = if absttl {
+                    ttl_ms
                 } else {
-                    expiry_at_after(Duration::from_millis(ttl_ms))
-                }
+                    (crate::script_clock::ttl_wall_ms_now() as u64).saturating_add(ttl_ms)
+                };
+                from_unix_ms(at_ms.min(i64::MAX as u64))
             });
             crate::commands::helpers::store_value_expiring(
                 ctx.store, db_idx, &key, value, expires_at,
@@ -1686,11 +1687,12 @@ enum TimeUnit {
 }
 
 fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
+    // Saturated: cut to 64 bits, a far deadline read back negative.
     let d = exp.duration_since(UNIX_EPOCH).unwrap_or_default();
     match unit {
         // To the nearest second, as `TTL` (Redis's `(ms + 500) / 1000`).
-        TimeUnit::Secs => ms_to_nearest_secs(d.as_millis() as i64),
-        TimeUnit::Millis => d.as_millis() as i64,
+        TimeUnit::Secs => ms_to_nearest_secs(i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+        TimeUnit::Millis => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
     }
 }
 
