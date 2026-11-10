@@ -1261,6 +1261,8 @@ where
                         commands::handler::unknown_command(&cmd)
                     } else if let Some(wrong) = commands::arity::check(&cmd_name, &cmd) {
                         wrong
+                    } else if tx.active && commands::transaction::not_allowed_in_multi(&cmd_name) {
+                        crate::resp::write::resp_error(commands::transaction::NOT_IN_MULTI)
                     } else {
                         acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
                         format!("-{}\r\n", denied.message(username)).into_bytes()
@@ -1270,9 +1272,14 @@ where
                     // EXEC discards the transaction, as in Redis.
                     let reply = commands::transaction::reject(
                         &mut tx,
-                        cmd_name == "EXEC",
+                        &cmd,
                         watch_registry.as_ref(),
                         &dirty_flag,
+                        commands::transaction::Monitored {
+                            registry: &monitor_registry,
+                            db: selected_db,
+                            peer_addr: &peer_addr,
+                        },
                         refusal,
                     );
                     combined.extend_from_slice(&reply);
@@ -1372,9 +1379,14 @@ where
             {
                 let reply = commands::transaction::reject(
                     &mut tx,
-                    cmd_name == "EXEC",
+                    &cmd,
                     watch_registry.as_ref(),
                     &dirty_flag,
+                    commands::transaction::Monitored {
+                        registry: &monitor_registry,
+                        db: selected_db,
+                        peer_addr: &peer_addr,
+                    },
                     wrong,
                 );
                 combined.extend_from_slice(&reply);
@@ -1875,6 +1887,7 @@ where
                                             user: &mut authenticated_user,
                                             key_restricted: &mut key_restricted,
                                             cmd_restricted: &mut cmd_restricted,
+                                            in_exec: true,
                                         }
                                         .auth(&args)
                                     } else if queued_name == "HELLO" {
@@ -1887,6 +1900,7 @@ where
                                             user: &mut authenticated_user,
                                             key_restricted: &mut key_restricted,
                                             cmd_restricted: &mut cmd_restricted,
+                                            in_exec: true,
                                         }
                                         .hello(
                                             &args,
@@ -2053,6 +2067,7 @@ where
                     user: &mut authenticated_user,
                     key_restricted: &mut key_restricted,
                     cmd_restricted: &mut cmd_restricted,
+                    in_exec: false,
                 }
                 .auth(&cmd),
 
@@ -2066,6 +2081,7 @@ where
                         user: &mut authenticated_user,
                         key_restricted: &mut key_restricted,
                         cmd_restricted: &mut cmd_restricted,
+                        in_exec: false,
                     }
                     .hello(&cmd, &mut resp_version, &repl_state);
                     // Counted here: the commands below are not.

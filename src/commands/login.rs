@@ -22,11 +22,33 @@ pub struct Login<'a> {
     /// See `acl::track_restriction_counters`.
     pub key_restricted: &'a mut bool,
     pub cmd_restricted: &'a mut bool,
+    /// Run by `EXEC`, from a transaction's queue: the ACL log says
+    /// `multi` for a failed AUTH, as Redis's does.
+    pub in_exec: bool,
 }
 
 const WRONGPASS: &[u8] = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n";
 
 impl Login<'_> {
+    /// A failed AUTH, in the ACL log, as Redis's `ACLAuthenticateUser`
+    /// writes it.
+    fn log_failed_auth(&self, username: &str) {
+        self.acl_log.push(crate::acl::AclLogEntry {
+            id: self.acl_log.next_id(),
+            reason: "auth".into(),
+            context: if self.in_exec { "multi" } else { "toplevel" }.into(),
+            object: username.to_string(),
+            username: username.to_string(),
+            age_seconds: 0.0,
+            client_info: self.peer_addr.to_string(),
+            timestamp_created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            count: 1,
+        });
+    }
+
     /// The connection is now `user`.
     fn become_user(&mut self, user: &crate::acl::AclUser) {
         // The restricted-client counters are adjusted before the user is
@@ -74,83 +96,78 @@ impl Login<'_> {
                 resp_simple("OK")
             }
             None => {
-                let entry = crate::acl::AclLogEntry {
-                    id: self.acl_log.next_id(),
-                    reason: "auth".into(),
-                    context: "toplevel".into(),
-                    object: provided_username.clone(),
-                    username: provided_username,
-                    age_seconds: 0.0,
-                    client_info: self.peer_addr.to_string(),
-                    timestamp_created: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    count: 1,
-                };
-                self.acl_log.push(entry);
+                self.log_failed_auth(&provided_username);
                 WRONGPASS.to_vec()
             }
         }
     }
 
-    /// `HELLO [protover [AUTH username password] [SETNAME clientname]]`.
-    ///
-    /// Protover sets the connection's RESP (`resp_version`, and
-    /// `client_registry.resp`), and is echoed in the `proto` field.
+    /// `HELLO [protover [AUTH username password] [SETNAME clientname]]`, as
+    /// Redis's `helloCommand`: the options in any order, each checked before
+    /// anything changes; then the AUTH; then the name and the protocol
+    /// (`resp_version`, and `client_registry.resp`), which is echoed in the
+    /// `proto` field.
     pub fn hello(
         &mut self,
         cmd: &[&[u8]],
         resp_version: &mut u8,
         repl_state: &crate::replication::ReplState,
     ) -> Vec<u8> {
-        let mut i = 1usize; // index into cmd, past "HELLO"
-
-        let mut proto_reply: i64 = *resp_version as i64;
-
-        // Optional protocol version
-        if let Some(ver_bytes) = cmd.get(i) {
-            let ver = std::str::from_utf8(ver_bytes).unwrap_or("2");
-            // protover 0 is a special case meaning "RESET to defaults"
-            if ver != "0" && ver != "1" && ver != "2" && ver != "3" {
+        let mut protocol: Option<u8> = None;
+        let mut next = 1usize;
+        if let Some(ver) = cmd.get(1) {
+            next = 2;
+            let Some(ver) = std::str::from_utf8(ver)
+                .ok()
+                .and_then(|ver| ver.parse::<i64>().ok())
+            else {
                 return b"-ERR Protocol version is not an integer or out of range\r\n".to_vec();
-            }
-            // "0", "1", "2" — Redis resets/alternate protos to RESP2 wire.
-            proto_reply = if ver == "3" { 3 } else { 2 };
-            i += 1;
-        }
-        // The protocol changes only once the rest of the command has been
-        // accepted, as in Redis: a HELLO 3 whose AUTH fails leaves the
-        // connection on the protocol it had.
-
-        // Optional AUTH username password
-        if cmd
-            .get(i)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.eq_ignore_ascii_case("AUTH"))
-            .unwrap_or(false)
-        {
-            i += 1; // consume "AUTH"
-            let (provided_username, provided_password) = match (cmd.get(i), cmd.get(i + 1)) {
-                (Some(u), Some(p)) => {
-                    i += 2;
-                    (
-                        std::str::from_utf8(u).unwrap_or("default"),
-                        std::str::from_utf8(p).unwrap_or(""),
-                    )
-                }
-                (Some(p), None) => {
-                    i += 1;
-                    ("default", std::str::from_utf8(p).unwrap_or(""))
-                }
-                _ => return b"-ERR Syntax error in HELLO option 'auth'\r\n".to_vec(),
             };
+            if !(2..=3).contains(&ver) {
+                return b"-NOPROTO unsupported protocol version\r\n".to_vec();
+            }
+            protocol = Some(ver as u8);
+        }
 
+        let mut credentials: Option<(&[u8], &[u8])> = None;
+        let mut name: Option<&[u8]> = None;
+        let mut j = next;
+        while j < cmd.len() {
+            let more = cmd.len() - 1 - j;
+            let option = cmd[j];
+            if option.eq_ignore_ascii_case(b"AUTH") && more >= 2 {
+                credentials = Some((cmd[j + 1], cmd[j + 2]));
+                j += 3;
+            } else if option.eq_ignore_ascii_case(b"SETNAME") && more >= 1 {
+                let wanted = cmd[j + 1];
+                // As CLIENT SETNAME: it is printed in `CLIENT LIST`, one
+                // client to a line and one field to a word. Empty removes it.
+                if !wanted.is_empty() && !crate::commands::server::is_printable_word(wanted) {
+                    return b"-ERR Client names cannot contain spaces, newlines or special characters.\r\n"
+                        .to_vec();
+                }
+                name = Some(wanted);
+                j += 2;
+            } else {
+                // Line breaks cannot be part of an error reply.
+                let shown = String::from_utf8_lossy(option).replace(['\r', '\n'], " ");
+                return crate::resp::write::resp_error(&format!(
+                    "ERR Syntax error in HELLO option '{shown}'"
+                ));
+            }
+        }
+
+        if let Some((username, password)) = credentials {
+            let username = std::str::from_utf8(username).unwrap_or("default");
+            let password = std::str::from_utf8(password).unwrap_or("");
             // The user named, and no other. (This used to accept `default`
             // as a name for *any* user whose password matched.)
-            match crate::acl::authenticate(self.acl_store, provided_username, provided_password) {
+            match crate::acl::authenticate(self.acl_store, username, password) {
                 Some(user) => self.become_user(&user),
-                None => return WRONGPASS.to_vec(),
+                None => {
+                    self.log_failed_auth(username);
+                    return WRONGPASS.to_vec();
+                }
             }
         }
 
@@ -164,24 +181,17 @@ impl Login<'_> {
                 .to_vec();
         }
 
-        // Optional SETNAME clientname
-        if cmd
-            .get(i)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.eq_ignore_ascii_case("SETNAME"))
-            .unwrap_or(false)
-        {
-            i += 1;
-            if let Some(name_bytes) = cmd.get(i) {
-                let name = String::from_utf8_lossy(name_bytes).to_string();
-                self.client_registry
-                    .update(self.client_id, |info| info.name = name);
-            }
+        if let Some(name) = name {
+            let name = String::from_utf8_lossy(name).into_owned();
+            self.client_registry
+                .update(self.client_id, |info| info.name = name);
         }
-
-        *resp_version = proto_reply as u8;
-        self.client_registry
-            .update(self.client_id, |info| info.resp = proto_reply as u8);
+        if let Some(protocol) = protocol {
+            *resp_version = protocol;
+            self.client_registry
+                .update(self.client_id, |info| info.resp = protocol);
+        }
+        let proto_reply = *resp_version as i64;
 
         // Build the response — RESP3 clients (e.g. modern redis-py, whose
         // default changed to protocol 3) expect the HELLO reply itself encoded

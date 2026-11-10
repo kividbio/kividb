@@ -1169,3 +1169,210 @@ fn test_arity_and_existence_come_before_acl() {
         );
     });
 }
+
+/// A reply as text: a string as it is, anything else as Rust shows it.
+fn text(v: &RespValue) -> String {
+    match v {
+        RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+        RespValue::SimpleStr(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The entries of the ACL log, newest first, each as its fields by name.
+fn acl_log(c: &mut Conn) -> Vec<Vec<(String, String)>> {
+    let log = c.cmds(&["ACL", "LOG"]);
+    log.as_array()
+        .iter()
+        .map(|entry| {
+            let fields: Vec<(String, String)> = match entry {
+                RespValue::Array(flat) => flat
+                    .chunks(2)
+                    .map(|kv| (kv[0].as_str().to_string(), text(&kv[1])))
+                    .collect(),
+                RespValue::Map(pairs) => pairs
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), text(v)))
+                    .collect(),
+                other => panic!("not an ACL log entry: {other:?}"),
+            };
+            fields
+        })
+        .collect()
+}
+
+fn field<'a>(entry: &'a [(String, String)], name: &str) -> &'a str {
+    &entry.iter().find(|(k, _)| k == name).unwrap().1
+}
+
+/// No such command, the wrong number of arguments, and a command that may
+/// not be part of a transaction are each refused for that, before the
+/// user's ACL rules, as in Redis; and none of them goes to the ACL log.
+#[test]
+fn test_refusals_before_acl_are_not_logged() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "getonly", "on", ">pw", "~*", "-@all", "+get", "+multi",
+                    "+exec"
+                ])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "getonly", "pw"]).is_ok());
+
+        let r = c.cmds(&["FOO", "bar"]);
+        assert!(
+            r.error_msg().starts_with("ERR unknown command 'FOO'"),
+            "{r:?}"
+        );
+        assert_eq!(
+            c.cmds(&["GET"]).error_msg(),
+            "ERR wrong number of arguments for 'get' command"
+        );
+        assert_eq!(
+            c.cmds(&["WAIT"]).error_msg(),
+            "ERR wrong number of arguments for 'wait' command"
+        );
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(
+            c.cmds(&["PSYNC", "?", "-1"]).error_msg(),
+            "ERR Command not allowed inside a transaction"
+        );
+        assert!(c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"));
+        assert!(acl_log(&mut admin).is_empty(), "{:?}", acl_log(&mut admin));
+
+        // What the rules refuse is logged.
+        assert!(c.cmds(&["SET", "k", "v"]).error_msg().starts_with("NOPERM"));
+        assert_eq!(acl_log(&mut admin).len(), 1);
+    });
+}
+
+/// An EXEC refused by the ACL rules drops the connection's watches with the
+/// transaction, and MONITOR sees it, as Redis's `execCommandAbort` does.
+#[test]
+fn test_an_exec_refused_by_acl_drops_its_watches_and_is_monitored() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "noexec2", "on", ">pw", "~*", "+@all", "-exec"
+                ])
+                .is_ok()
+        );
+        let mut monitor = Conn::connect(port);
+        assert!(monitor.cmds(&["MONITOR"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "noexec2", "pw"]).is_ok());
+        assert!(c.cmds(&["WATCH", "aw:k"]).is_ok());
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" watch=1 "), "{}", info.as_str());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["SET", "aw:k", "v"]).as_str(), "QUEUED");
+        assert!(c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"));
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" watch=0 "), "{}", info.as_str());
+        assert!(info.as_str().contains(" multi=-1 "), "{}", info.as_str());
+
+        // MONITOR: the MULTI, and then the EXEC that was refused.
+        let mut seen = Vec::new();
+        loop {
+            let line = monitor.read_value();
+            let line = line.as_str().to_string();
+            if line.contains("\"EXEC\"") {
+                break;
+            }
+            seen.push(line);
+            assert!(seen.len() < 50, "MONITOR never showed the EXEC: {seen:?}");
+        }
+    });
+}
+
+/// A command run by EXEC goes to the slow log under the client's name as
+/// it is when the command runs.
+#[test]
+fn test_the_slow_log_names_the_client_as_it_is_inside_exec() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(
+            c.cmds(&["CONFIG", "SET", "slowlog-log-slower-than", "0"])
+                .is_ok()
+        );
+        assert!(c.cmds(&["CLIENT", "SETNAME", "before"]).is_ok());
+        assert!(c.cmds(&["SLOWLOG", "RESET"]).is_ok());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["CLIENT", "SETNAME", "during"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["ECHO", "slow-name"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["EXEC"]).as_array().len(), 2);
+        let log = c.cmds(&["SLOWLOG", "GET", "100"]);
+        let echoes: Vec<&[RespValue]> = log
+            .as_array()
+            .iter()
+            .map(|entry| entry.as_array())
+            .filter(|entry| entry[3].as_array().first().map(|a| a.as_str()) == Some("ECHO"))
+            .collect();
+        assert!(!echoes.is_empty(), "{log:?}");
+        for entry in echoes {
+            assert_eq!(entry[5].as_str(), "during", "{entry:?}");
+        }
+    });
+}
+
+/// HELLO as Redis's `helloCommand`: protocols 2 and 3 only, AUTH and
+/// SETNAME in any order, the name checked before the AUTH, and a failed
+/// AUTH in the ACL log.
+#[test]
+fn test_hello_options_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "hu2", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+
+        for ver in ["0", "1", "4"] {
+            let r = c.cmds(&["HELLO", ver]);
+            assert!(r.error_msg().starts_with("NOPROTO"), "{ver}: {r:?}");
+        }
+        assert_eq!(
+            c.cmds(&["HELLO", "x"]).error_msg(),
+            "ERR Protocol version is not an integer or out of range"
+        );
+        assert_eq!(
+            c.cmds(&["HELLO", "2", "AUTH", "hu2"]).error_msg(),
+            "ERR Syntax error in HELLO option 'AUTH'"
+        );
+        assert_eq!(
+            c.cmds(&["HELLO", "2", "BOGUS"]).error_msg(),
+            "ERR Syntax error in HELLO option 'BOGUS'"
+        );
+        // The name is refused before the AUTH is tried: nothing logged.
+        assert_eq!(
+            c.cmds(&["HELLO", "2", "SETNAME", "bad name", "AUTH", "hu2", "wrong"])
+                .error_msg(),
+            "ERR Client names cannot contain spaces, newlines or special characters."
+        );
+        assert!(acl_log(&mut admin).is_empty());
+
+        // A failed AUTH is logged.
+        let r = c.cmds(&["HELLO", "2", "AUTH", "hu2", "wrong"]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(field(&log[0], "reason").contains("auth"), "{log:?}");
+        assert!(field(&log[0], "username").contains("hu2"), "{log:?}");
+
+        // SETNAME before AUTH.
+        let hello = c.cmds(&["HELLO", "2", "SETNAME", "n1", "AUTH", "hu2", "pw"]);
+        assert_eq!(hello.as_array()[0].as_str(), "server");
+        assert_eq!(c.cmds(&["CLIENT", "GETNAME"]).as_str(), "n1");
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "hu2");
+    });
+}

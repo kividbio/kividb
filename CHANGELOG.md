@@ -226,6 +226,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a queued `CLIENT SETNAME` or `HELLO SETNAME` had changed it. Both I/O
   models.
 
+- **`HELLO` and refused commands, as in Redis.** `HELLO` now takes its
+  `AUTH` and `SETNAME` options in any order. It checks the name before it
+  tries the password, writes a failed `AUTH` to the ACL log, and refuses
+  every protocol version but 2 and 3 with `NOPROTO`. It used to take 0 and
+  1 as 2. `HELLO 3 AUTH password`, without a user name, is now
+  a syntax error, as in Redis. A command that does not exist is refused as
+  unknown before the ACL rules are checked, and so is one inside `MULTI` that
+  cannot be part of a transaction (`PSYNC`, `SYNC`). Neither goes to the ACL
+  log. An `EXEC` refused before it runs is shown to `MONITOR`.
+
 - **`HSET` is no longer slowed down by a lock every worker shared
   (#544).** Every `HSET`, `HMSET`, `HSETNX`, `HINCRBY` and
   `HINCRBYFLOAT` took the search indexes' lock twice to find out whether

@@ -2052,7 +2052,7 @@ fn on_or_off(word: &[u8]) -> Option<bool> {
 
 /// Whether `raw` can stand as one word in a line of `CLIENT LIST`: printable
 /// ASCII, and no spaces.
-fn is_printable_word(raw: &[u8]) -> bool {
+pub(crate) fn is_printable_word(raw: &[u8]) -> bool {
     raw.iter().all(|byte| (b'!'..=b'~').contains(byte))
 }
 

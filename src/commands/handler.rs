@@ -1180,6 +1180,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             .get(ctx.authenticated_user)
             .and_then(|user| crate::acl::check_permission(user, name, ctx.cmd.as_slice()).err());
         if let Some(denied) = denied {
+            // As in Redis, a command there is no such command as is refused
+            // for that, before the user's rules (and the ACL log). The
+            // wrong number of arguments was refused above.
+            if !crate::commands::server::is_command(name) {
+                return unknown_command(&ctx.cmd);
+            }
             ctx.acl_log.record(
                 denied.reason(),
                 denied.object(),
