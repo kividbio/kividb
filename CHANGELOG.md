@@ -380,10 +380,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     connects while a `WAIT` waits is counted once it has caught up. Only
     replicas that are online and still connected are counted, a replica that
     reconnected is counted once, and one back by partial resync only once it
-    has acknowledged the backlog it was sent. While a replica's old link and
-    the partial resync that replaced it are both registered, the replica is
-    counted once (by the address it announced); Redis counts it twice in that
-    window. `WAIT 0` (and `WAIT` inside
+    has acknowledged the backlog it was sent. `WAIT 0` (and `WAIT` inside
     `MULTI`) answers the number of replicas that have what was written, not
     the number connected. A master that becomes a replica ends a waiting
     `WAIT` with Redis's `-UNBLOCKED` error and closes the connection. A

@@ -4138,21 +4138,7 @@ pub struct WaitTargets(std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64
 impl WaitTargets {
     /// Bring the targets up to date with the replicas connected now, and
     /// count those that have reached theirs.
-    ///
-    /// A replica is counted once even while two of its links are
-    /// registered: one that has gone without this master noticing yet, and
-    /// the one that replaced it by partial resync. They are told apart by
-    /// the address the replica announced (`REPLCONF listening-port`); one
-    /// that announced no port (0) is counted by its link, as there is no
-    /// telling two such replicas apart. Redis counts both links in that
-    /// window; this does not.
     pub fn count(&mut self, state: &ReplState) -> i64 {
-        let peers: std::collections::HashMap<u64, (String, u16)> = state
-            .replica_peers
-            .lock()
-            .iter()
-            .map(|(id, ip, port)| (*id, (ip.clone(), *port)))
-            .collect();
         let live = state.replica_progress.lock();
         self.0.retain(|id, _| live.contains_key(id));
         for (id, p) in live.iter() {
@@ -4160,23 +4146,10 @@ impl WaitTargets {
                 .entry(*id)
                 .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed)));
         }
-        drop(live);
-        let mut counted_peers = std::collections::HashSet::new();
-        let mut acked = 0;
-        for (id, (p, target)) in &self.0 {
-            if p.state() != ReplicaState::Online || p.delivered() < *target {
-                continue;
-            }
-            match peers.get(id) {
-                Some((ip, port)) if *port != 0 => {
-                    if counted_peers.insert((ip.clone(), *port)) {
-                        acked += 1;
-                    }
-                }
-                _ => acked += 1,
-            }
-        }
-        acked
+        self.0
+            .values()
+            .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
+            .count() as i64
     }
 }
 
@@ -5164,11 +5137,11 @@ mod replication_invariants_tests {
         assert_eq!(ReplState::count_reached(&state.wait_targets()), 1);
     }
 
-    /// `register_replica_at` has `sent` and the state in place by the time
-    /// anything can see the replica: a `WAIT` woken by its arrival reads
-    /// them.
+    /// `register_replica_at` registers a replica with the `sent` and state
+    /// it is given, and wakes the waiters: a `WAIT` counts it once it has
+    /// acknowledged that much.
     #[tokio::test]
-    async fn a_replica_is_seen_with_its_backlog_and_state() {
+    async fn a_replica_registered_with_a_backlog_wakes_waiters_and_counts_after_it() {
         let state = Arc::new(ReplState::new_master());
         let woken = state.replicas_changed.notified();
         tokio::pin!(woken);
@@ -5182,24 +5155,6 @@ mod replication_invariants_tests {
         assert_eq!(targets.count(&state), 0);
         seen.acked.store(50 + 37, Ordering::Relaxed);
         assert_eq!(targets.count(&state), 1);
-    }
-
-    /// Two links of one replica (an old one not yet noticed gone, and the
-    /// partial resync that replaced it) are counted once; two replicas that
-    /// announced no port are counted apart.
-    #[test]
-    fn two_links_of_one_replica_count_once() {
-        let state = ReplState::new_master();
-        let old =
-            state.register_replica_at(7005, "10.0.0.1".into(), 6380, 0, 0, ReplicaState::Online);
-        let new =
-            state.register_replica_at(7006, "10.0.0.1".into(), 6380, 0, 0, ReplicaState::Online);
-        let mut targets = super::WaitTargets::default();
-        assert_eq!(targets.count(&state), 1);
-        drop((old, new));
-        state.register_replica_at(7007, "10.0.0.2".into(), 0, 0, 0, ReplicaState::Online);
-        state.register_replica_at(7008, "10.0.0.2".into(), 0, 0, 0, ReplicaState::Online);
-        assert_eq!(targets.count(&state), 3);
     }
 
     /// A master that becomes a replica keeps where its own stream stands as
