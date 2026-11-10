@@ -967,6 +967,14 @@ impl ReplState {
         if acks.contains_key(&replica_id)
             && let Some(existing) = self.replica_progress.lock().get(&replica_id)
         {
+            // Only the registrations that send nothing first (a full sync's)
+            // are ever repeated: one that comes with a backlog (a partial
+            // resync's) is a new connection, with an id of its own. Its
+            // `sent` would be lost here.
+            debug_assert_eq!(
+                sent, 0,
+                "replica {replica_id} registered again with a backlog"
+            );
             return Arc::clone(existing);
         }
         self.repl_stream_last_db.store(u64::MAX, Ordering::Relaxed);
@@ -4130,7 +4138,21 @@ pub struct WaitTargets(std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64
 impl WaitTargets {
     /// Bring the targets up to date with the replicas connected now, and
     /// count those that have reached theirs.
+    ///
+    /// A replica is counted once even while two of its links are
+    /// registered: one that has gone without this master noticing yet, and
+    /// the one that replaced it by partial resync. They are told apart by
+    /// the address the replica announced (`REPLCONF listening-port`); one
+    /// that announced no port (0) is counted by its link, as there is no
+    /// telling two such replicas apart. Redis counts both links in that
+    /// window; this does not.
     pub fn count(&mut self, state: &ReplState) -> i64 {
+        let peers: std::collections::HashMap<u64, (String, u16)> = state
+            .replica_peers
+            .lock()
+            .iter()
+            .map(|(id, ip, port)| (*id, (ip.clone(), *port)))
+            .collect();
         let live = state.replica_progress.lock();
         self.0.retain(|id, _| live.contains_key(id));
         for (id, p) in live.iter() {
@@ -4138,10 +4160,23 @@ impl WaitTargets {
                 .entry(*id)
                 .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed)));
         }
-        self.0
-            .values()
-            .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
-            .count() as i64
+        drop(live);
+        let mut counted_peers = std::collections::HashSet::new();
+        let mut acked = 0;
+        for (id, (p, target)) in &self.0 {
+            if p.state() != ReplicaState::Online || p.delivered() < *target {
+                continue;
+            }
+            match peers.get(id) {
+                Some((ip, port)) if *port != 0 => {
+                    if counted_peers.insert((ip.clone(), *port)) {
+                        acked += 1;
+                    }
+                }
+                _ => acked += 1,
+            }
+        }
+        acked
     }
 }
 
@@ -4384,7 +4419,8 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
 #[cfg(test)]
 mod replication_invariants_tests {
     use super::{
-        HubMsg, ReplPayload, ReplState, propagate, slave_command_allowed_during_loading, start_hub,
+        HubMsg, ReplPayload, ReplState, ReplicaState, propagate,
+        slave_command_allowed_during_loading, start_hub,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4987,6 +5023,183 @@ mod replication_invariants_tests {
         hub.send(HubMsg::Barrier(done_tx)).unwrap();
         done_rx.await.unwrap();
         assert_eq!(ReplState::count_reached(&targets), 1);
+    }
+
+    /// The hub has handled every message sent before this.
+    async fn settle(hub: &super::HubTx) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done_tx)).unwrap();
+        done_rx.await.unwrap();
+    }
+
+    fn registration(
+        id: u64,
+        port: u16,
+    ) -> (
+        super::ReplicaRegistration,
+        tokio::sync::mpsc::UnboundedReceiver<ReplPayload>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
+        (
+            super::ReplicaRegistration {
+                replica_id: id,
+                addr: format!("replica-{id}"),
+                peer_ip: "127.0.0.1".into(),
+                peer_port: port,
+                tx,
+                pending_bytes: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    /// A replica back by partial resync with an N-byte backlog is counted by
+    /// `WAIT` only once it has acknowledged the N bytes: not at the offset it
+    /// continued from, and at that offset plus N.
+    #[tokio::test]
+    async fn a_partial_resync_counts_once_its_backlog_is_acknowledged() {
+        let state = Arc::new(ReplState::new_master());
+        let hub = start_hub(Arc::clone(&state));
+        hub.send(HubMsg::Resume { offset: 100 }).unwrap();
+        let write = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".to_vec();
+        let n = write.len() as u64;
+        propagate(&hub, write);
+        settle(&hub).await;
+
+        let mut targets = super::WaitTargets::default();
+        assert_eq!(targets.count(&state), 0);
+        let (registration, mut rx) = registration(7001, 7001);
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Continue {
+            registration,
+            offset: 100,
+            reply,
+        })
+        .unwrap();
+        assert!(
+            answer.await.unwrap().is_ok(),
+            "the backlog holds offset 100"
+        );
+        assert_eq!(rx.recv().await.unwrap().len() as u64, n);
+
+        let progress = state.replica(7001).unwrap();
+        assert_eq!(progress.sent.load(Ordering::Relaxed), n);
+        assert_eq!(targets.count(&state), 0, "acknowledged nothing yet");
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7001,
+            offset: 100,
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(targets.count(&state), 0, "acknowledged none of the backlog");
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7001,
+            offset: 100 + n - 1,
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(targets.count(&state), 0, "acknowledged part of the backlog");
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7001,
+            offset: 100 + n,
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(targets.count(&state), 1);
+    }
+
+    /// A replica that goes is dropped from a `WAIT`'s targets, and no longer
+    /// counted.
+    #[tokio::test]
+    async fn a_replica_that_goes_leaves_the_wait_targets() {
+        let state = Arc::new(ReplState::new_master());
+        let hub = start_hub(Arc::clone(&state));
+        let (r, _rx) = registration(7002, 7002);
+        hub.send(HubMsg::RegisterChannel {
+            addr: r.addr,
+            peer_ip: r.peer_ip,
+            peer_port: r.peer_port,
+            tx: r.tx,
+            replica_id: 7002,
+            pending_bytes: r.pending_bytes,
+            base: 0,
+        })
+        .unwrap();
+        await_connected(&state, 1).await;
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7002,
+            offset: 0,
+        })
+        .unwrap();
+        settle(&hub).await;
+
+        let mut targets = super::WaitTargets::default();
+        assert_eq!(targets.count(&state), 1);
+        assert!(targets.0.contains_key(&7002));
+        hub.send(HubMsg::Deregister(7002)).unwrap();
+        await_connected(&state, 0).await;
+        assert_eq!(targets.count(&state), 0);
+        assert!(!targets.0.contains_key(&7002));
+    }
+
+    /// A replica still loading its full sync is not counted, however far it
+    /// has acknowledged, until it is online.
+    #[test]
+    fn a_replica_not_online_is_not_counted() {
+        let state = ReplState::new_master();
+        let progress = state.register_replica(7003, "127.0.0.1".into(), 7003, 0);
+        let mut targets = super::WaitTargets::default();
+        for not_yet in [ReplicaState::WaitBgsave, ReplicaState::SendBulk] {
+            progress.set_state(not_yet);
+            progress.acked.store(1_000, Ordering::Relaxed);
+            assert_eq!(targets.count(&state), 0, "{not_yet:?}");
+            assert_eq!(
+                ReplState::count_reached(&state.wait_targets()),
+                0,
+                "{not_yet:?}"
+            );
+        }
+        progress.set_state(ReplicaState::Online);
+        assert_eq!(targets.count(&state), 1);
+        assert_eq!(ReplState::count_reached(&state.wait_targets()), 1);
+    }
+
+    /// `register_replica_at` has `sent` and the state in place by the time
+    /// anything can see the replica: a `WAIT` woken by its arrival reads
+    /// them.
+    #[tokio::test]
+    async fn a_replica_is_seen_with_its_backlog_and_state() {
+        let state = Arc::new(ReplState::new_master());
+        let woken = state.replicas_changed.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        state.register_replica_at(7004, "127.0.0.1".into(), 7004, 50, 37, ReplicaState::Online);
+        woken.await;
+        let seen = state.replica(7004).unwrap();
+        assert_eq!(seen.sent.load(Ordering::Relaxed), 37);
+        assert_eq!(seen.state(), ReplicaState::Online);
+        let mut targets = super::WaitTargets::default();
+        assert_eq!(targets.count(&state), 0);
+        seen.acked.store(50 + 37, Ordering::Relaxed);
+        assert_eq!(targets.count(&state), 1);
+    }
+
+    /// Two links of one replica (an old one not yet noticed gone, and the
+    /// partial resync that replaced it) are counted once; two replicas that
+    /// announced no port are counted apart.
+    #[test]
+    fn two_links_of_one_replica_count_once() {
+        let state = ReplState::new_master();
+        let old =
+            state.register_replica_at(7005, "10.0.0.1".into(), 6380, 0, 0, ReplicaState::Online);
+        let new =
+            state.register_replica_at(7006, "10.0.0.1".into(), 6380, 0, 0, ReplicaState::Online);
+        let mut targets = super::WaitTargets::default();
+        assert_eq!(targets.count(&state), 1);
+        drop((old, new));
+        state.register_replica_at(7007, "10.0.0.2".into(), 0, 0, 0, ReplicaState::Online);
+        state.register_replica_at(7008, "10.0.0.2".into(), 0, 0, 0, ReplicaState::Online);
+        assert_eq!(targets.count(&state), 3);
     }
 
     /// A master that becomes a replica keeps where its own stream stands as
