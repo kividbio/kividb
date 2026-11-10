@@ -146,6 +146,22 @@ fn option_number(value: &[u8]) -> Option<u64> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
 
+/// A sample's time, as a command gives it (`*` is the caller's to read).
+///
+/// From a client, `0` to `i64::MAX`, as RedisTimeSeries, which reads it as
+/// a `long long`: a time above that was taken, and then replied, sent to
+/// replicas and logged as a negative number, which they refused: the
+/// sample lost there (#592). From the AOF or a master, any `u64`, which an
+/// older version took and kept.
+fn sample_time(word: &[u8], strict: bool) -> Option<u64> {
+    let text = std::str::from_utf8(word).ok()?;
+    if strict {
+        text.parse::<i64>().ok().and_then(|t| u64::try_from(t).ok())
+    } else {
+        text.parse().ok()
+    }
+}
+
 /// A chunk size: as RedisTimeSeries, a multiple of 8 from 48 to 1048576.
 /// Not checked when `strict` is off: 1.2.0 took any.
 fn option_chunk_size(value: &[u8], strict: bool) -> Result<usize, Vec<u8>> {
@@ -282,7 +298,7 @@ fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsO
                 let at = if value == b"*" {
                     TsInner::now_ms()
                 } else {
-                    option_number(value).ok_or_else(|| resp_error("ERR invalid TIMESTAMP"))?
+                    sample_time(value, strict).ok_or_else(|| resp_error("ERR invalid TIMESTAMP"))?
                 };
                 options.timestamp = Some(at);
                 options.timestamp_at.push(i);
@@ -354,8 +370,15 @@ fn written_by_1_2_0(tokens: &[&[u8]]) -> Option<TsOptions> {
     if !word.eq_ignore_ascii_case(b"TIMESTAMP") {
         return None;
     }
+    // 1.2.0 sent the time it replied, as an `i64`: one above `i64::MAX` as
+    // a negative number. It is the same 64 bits as the time it kept (#592).
+    let at = std::str::from_utf8(at).ok()?;
+    let at = at
+        .parse::<u64>()
+        .ok()
+        .or_else(|| at.parse::<i64>().ok().map(|t| t as u64))?;
     Some(TsOptions {
-        timestamp: Some(option_number(at)?),
+        timestamp: Some(at),
         ..Default::default()
     })
 }
@@ -484,6 +507,123 @@ fn series_for_append(ctx: &Ctx, key: &[u8]) -> Result<(Series, bool), Vec<u8>> {
     }
 }
 
+/// The series named `name` (`key_bytes::text_of`), past its time to live
+/// or not: what a link is checked against. A key past its time is hidden
+/// from a command on a master and not on a replica or in a replay, which
+/// hold expiry until the master's `DEL` comes; checked by the clock, a link
+/// would be dead on one and alive on the other (#593).
+fn series_named(ctx: &Ctx, name: &str) -> Option<Series> {
+    let key = crate::key_bytes::bytes_of(name);
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], &*key);
+    match read_lock!(shard).peek_expiring(&*key) {
+        Some((ValueRef::TimeSeries(inner), _)) => Some(Arc::clone(inner)),
+        _ => None,
+    }
+}
+
+/// Whether the series `source` has a compaction rule to `dest` (both names).
+fn feeds(ctx: &Ctx, source: &str, dest: &str) -> bool {
+    series_named(ctx, source)
+        .is_some_and(|series| series.read().rules.iter().any(|r| r.dest_key == dest))
+}
+
+/// Whether the series `dest` names `source` as the series it is a
+/// compaction of (both names).
+fn fed_by(ctx: &Ctx, dest: &str, source: &str) -> bool {
+    series_named(ctx, dest).is_some_and(|series| series.read().source.as_deref() == Some(source))
+}
+
+/// A series' links that hold, as RedisTimeSeries checks them where they are
+/// used: its source, if that series has the rule back, and the destinations
+/// of its rules that name it back. A link is left behind by a `DEL`, a
+/// `RESTORE … REPLACE` or a `MIGRATE` of the other series (#593). A dead
+/// rule stays in its source's list until `TS.CREATERULE` replaces it or
+/// `RENAME` revives it: a rule list changes only by a command, which goes
+/// to replicas and the AOF as it is.
+fn live_links(ctx: &Ctx, key: &[u8], series: &Series) -> (Option<String>, Vec<String>) {
+    let name = crate::key_bytes::text_of(key).into_owned();
+    let (source, dests): (Option<String>, Vec<String>) = {
+        let series = series.read();
+        let dests = series.rules.iter().map(|r| r.dest_key.clone()).collect();
+        (series.source.clone(), dests)
+    };
+    let source = source.filter(|source| feeds(ctx, source, &name));
+    let dests = dests
+        .into_iter()
+        .filter(|dest| fed_by(ctx, dest, &name))
+        .collect();
+    (source, dests)
+}
+
+/// After `RENAME` or `RENAMENX` put the series at `from` at `to`: its links
+/// follow it, as RedisTimeSeries's (`RenameSeriesTo`). The source of a
+/// destination renamed has its rule renamed; the destinations of a source
+/// renamed name it by its new name. And it is found by its labels under its
+/// new name. The links used to stay on the old name, dead (#593).
+pub(crate) fn renamed(ctx: &Ctx, from: &[u8], to: &[u8]) {
+    let (from, to) = (
+        crate::key_bytes::text_of(from).into_owned(),
+        crate::key_bytes::text_of(to).into_owned(),
+    );
+    let Some(series) = series_named(ctx, &to) else {
+        return;
+    };
+    let (source, dests, labels) = {
+        let series = series.read();
+        let dests: Vec<String> = series.rules.iter().map(|r| r.dest_key.clone()).collect();
+        let labels: Vec<(String, String)> = series
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (series.source.clone(), dests, labels)
+    };
+    if let Some(source) = source
+        && let Some(source) = series_named(ctx, &source)
+    {
+        let mut source = source.write();
+        if source.rules.iter().any(|r| r.dest_key == from) {
+            // A rule it had to the series the rename replaced goes: two
+            // rules to one destination fed it twice (RedisTimeSeries
+            // deletes the replaced series, and its links, first).
+            source.rules.retain(|r| r.dest_key != to);
+            if let Some(rule) = source.rules.iter_mut().find(|r| r.dest_key == from) {
+                rule.dest_key = to.clone();
+            }
+        }
+    }
+    for dest in dests {
+        if let Some(dest) = series_named(ctx, &dest) {
+            let mut dest = dest.write();
+            if dest.source.as_deref() == Some(from.as_str()) {
+                dest.source = Some(to.clone());
+            }
+        }
+    }
+    update_label_index(
+        ctx.ts_index,
+        &crate::key_bytes::bytes_of(&to),
+        &ahash::AHashMap::new(),
+        &labels,
+    );
+}
+
+/// A series `COPY` made at `to`: without links to other series, as
+/// RedisTimeSeries's (`CopySeries`), and found by its labels.
+pub(crate) fn copied(ctx: &Ctx, to: &[u8], series: &Arc<RwLock<TsInner>>) {
+    let labels: Vec<(String, String)> = {
+        let mut series = series.write();
+        series.rules.clear();
+        series.source = None;
+        series
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    update_label_index(ctx.ts_index, to, &ahash::AHashMap::new(), &labels);
+}
+
 /// What follows every sample written to `series`: its compactions are brought
 /// up to date, and anyone blocked in `TS.READ` on it is woken.
 ///
@@ -534,17 +674,19 @@ fn after_append(ctx: &Ctx, key: &[u8], series: &Series, ts: u64) {
             })
             .collect()
     };
-    for (dest_key, bucket, value) in updates {
+    // A rule whose destination is gone, or names another source (it was
+    // replaced, by `RESTORE … REPLACE` among others), is dead: passed over,
+    // and left in the list (see `live_links`) (#593).
+    let name = crate::key_bytes::text_of(key);
+    for (rule_dest, bucket, value) in updates {
         // A rule names its destination (`key_bytes::text_of`).
-        let dest_key = crate::key_bytes::bytes_of(&dest_key);
-        let dest = {
-            let shard = store::get_shard(&ctx.store[*ctx.selected_db], &*dest_key);
-            match read_lock!(shard).get(&*dest_key) {
-                Some(ValueRef::TimeSeries(inner)) => Arc::clone(inner),
-                // The destination was deleted or replaced; the rule is dead.
-                _ => continue,
-            }
+        let dest_key = crate::key_bytes::bytes_of(&rule_dest);
+        let Some(dest) = series_named(ctx, &rule_dest) else {
+            continue;
         };
+        if dest.read().source.as_deref() != Some(&*name) {
+            continue;
+        }
         {
             let mut dest = dest.write();
             dest.samples.insert(bucket, value);
@@ -696,18 +838,13 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let key: Vec<u8> = cmd[1].to_vec();
 
-    let ts_str = match std::str::from_utf8(cmd[2]) {
-        Ok(s) => s,
-        Err(_) => return Some(resp_error("ERR invalid timestamp")),
-    };
-
     // "*" means current time in milliseconds
-    let timestamp: u64 = if ts_str == "*" {
+    let timestamp: u64 = if cmd[2] == b"*" {
         TsInner::now_ms()
     } else {
-        match ts_str.parse() {
-            Ok(n) => n,
-            Err(_) => return Some(resp_error("ERR invalid timestamp")),
+        match sample_time(cmd[2], strict) {
+            Some(n) => n,
+            None => return Some(resp_error("ERR invalid timestamp")),
         }
     };
 
@@ -781,6 +918,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // under one lock. We process sequentially — each triplet is one write lock.
 
 fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 4 || !(cmd.len() - 1).is_multiple_of(3) {
         return Some(resp_error(
@@ -792,13 +930,12 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut results: Vec<Vec<u8>> = Vec::with_capacity((cmd.len() - 1) / 3);
     for triple in cmd[1..].as_chunks::<3>().0 {
         let key: &[u8] = triple[0];
-        let ts_str = std::str::from_utf8(triple[1]).unwrap_or("bad");
-        let timestamp: u64 = if ts_str == "*" {
+        let timestamp: u64 = if triple[1] == b"*" {
             TsInner::now_ms()
         } else {
-            match ts_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
+            match sample_time(triple[1], strict) {
+                Some(n) => n,
+                None => {
                     results.push(resp_error("ERR invalid timestamp"));
                     continue;
                 }
@@ -1150,6 +1287,12 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let key: &[u8] = cmd[1];
 
+    // Its links that hold, read before the series is, with no lock held.
+    let (live_source, live_dests) = match ts_query::series_at(ctx, key) {
+        Ok(Some(series)) => live_links(ctx, key, &series),
+        _ => (None, Vec::new()),
+    };
+
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
@@ -1190,7 +1333,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
             out.push(resp_array(label_pairs));
 
             out.push(resp_bulk_str("sourceKey"));
-            out.push(match &ts.source {
+            out.push(match &live_source {
                 Some(source) => resp_bulk(&crate::key_bytes::bytes_of(source)),
                 // RESP3's null to a RESP3 client: `$-1` there breaks it.
                 None => crate::resp::write::resp_null_for(resp),
@@ -1201,6 +1344,7 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let rules_resp: Vec<Vec<u8>> = ts
                 .rules
                 .iter()
+                .filter(|r| live_dests.contains(&r.dest_key))
                 .map(|r| {
                     resp_array(vec![
                         resp_bulk(&crate::key_bytes::bytes_of(&r.dest_key)),
@@ -1289,8 +1433,15 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Ok(None) => return Some(resp_error("TSDB: the key does not exist")),
         Err(e) => return Some(e),
     };
-    // As RedisTimeSeries: a compaction has one source.
-    if dest.read().source.is_some() {
+    // As RedisTimeSeries: a compaction has one source, one that still has
+    // the rule to it.
+    let dest_name = crate::key_bytes::text_of(dest_key.as_slice()).into_owned();
+    let src_name = crate::key_bytes::text_of(src_key.as_slice()).into_owned();
+    let source = dest.read().source.clone();
+    if source
+        .as_deref()
+        .is_some_and(|source| feeds(ctx, source, &dest_name))
+    {
         return Some(resp_error(
             "TSDB: the destination key already has a src rule",
         ));
@@ -1316,14 +1467,20 @@ fn ts_createrule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(src_key.as_slice()) {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
-            // Disallow duplicate destination rules
-            if ts.rules.iter().any(|r| r.dest_key == rule.dest_key) {
-                return Some(resp_error("TSDB: compaction rule already exists"));
+            // A rule to this destination already: refused if it holds; a
+            // dead one, whose destination names another source or none, is
+            // replaced, as RedisTimeSeries drops dead links before it adds
+            // one (#593).
+            if let Some(at) = ts.rules.iter().position(|r| r.dest_key == rule.dest_key) {
+                if source.as_deref() == Some(src_name.as_str()) {
+                    return Some(resp_error("TSDB: compaction rule already exists"));
+                }
+                ts.rules.remove(at);
             }
             ts.rules.push(rule);
             drop(ts);
             drop(map);
-            dest.write().source = Some(crate::key_bytes::text_of(src_key.as_slice()).into_owned());
+            dest.write().source = Some(src_name);
             Some(resp_simple("OK"))
         }
         Some(_) => Some(resp_error(
@@ -1344,6 +1501,14 @@ fn ts_deleterule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let src_key: Vec<u8> = cmd[1].to_vec();
     let dest_key: Vec<u8> = cmd[2].to_vec();
+    // A dead rule is not there, as RedisTimeSeries has it after dropping
+    // dead links: refused, and left as it is (#593).
+    let dest_name = crate::key_bytes::text_of(dest_key.as_slice()).into_owned();
+    let live = fed_by(
+        ctx,
+        &dest_name,
+        &crate::key_bytes::text_of(src_key.as_slice()),
+    );
 
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, &src_key);
@@ -1352,15 +1517,18 @@ fn ts_deleterule(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(src_key.as_slice()) {
         Some(ValueRef::TimeSeries(inner)) => {
             let mut ts = inner.write();
+            if !live {
+                return Some(resp_error("TSDB: compaction rule does not exist"));
+            }
             let before = ts.rules.len();
-            let dest_name = crate::key_bytes::text_of(dest_key.as_slice());
-            ts.rules.retain(|r| *r.dest_key != *dest_name);
+            ts.rules.retain(|r| r.dest_key != dest_name);
             if ts.rules.len() == before {
                 Some(resp_error("TSDB: compaction rule does not exist"))
             } else {
                 drop(ts);
                 drop(map);
-                if let Ok(Some(dest)) = ts_query::series_at(ctx, dest_key.as_slice()) {
+                // Past its time or not, as on a replica (`series_named`).
+                if let Some(dest) = series_named(ctx, &dest_name) {
                     let mut dest = dest.write();
                     if dest.source.as_deref()
                         == Some(&*crate::key_bytes::text_of(src_key.as_slice()))
