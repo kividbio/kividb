@@ -6169,3 +6169,272 @@ fn a_document_written_over_leaves_an_index_made_after_the_others_were_dropped() 
     assert!(c.cmds(&["SETEX", "doc:1", "100", "x"]).is_ok());
     assert!(nearest(&mut c).is_empty(), "the index still holds doc:1");
 }
+
+/// Wait for every index to have let go of every document: at once for a
+/// command that deletes, within a sweep for a time to live.
+fn wait_until_none_is_indexed(c: &mut Conn, after: &str) {
+    let gone: [Vec<String>; 5] = Default::default();
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    while indexed(c) != gone {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "after {after}: {:?}",
+            indexed(c)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A document leaves its indexes too when its time to live ends, when its
+/// last field goes, and when its database is swapped for another: none of
+/// these says so itself any more, the store does.
+#[test]
+fn a_document_that_expires_or_is_emptied_leaves_its_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    for command in [
+        "PEXPIRE doc:1 1",
+        "EXPIRE doc:1 -1",
+        "PEXPIREAT doc:1 1",
+        "SET doc:1 x PXAT 1",
+        "HDEL doc:1 vec title kind",
+        "HPEXPIRE doc:1 1 FIELDS 3 vec title kind",
+        "HGETDEL doc:1 FIELDS 3 vec title kind",
+        "SWAPDB 0 1",
+    ] {
+        hash_document(&mut c, "doc:1");
+        let [vectors, words, tags, ..] = indexed(&mut c);
+        assert_eq!(
+            [vectors, words, tags],
+            [["doc:1"], ["doc:1"], ["doc:1"]],
+            "before {command}"
+        );
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = c.cmds(&args);
+        assert!(!reply.is_error(), "{command}: {reply:?}");
+        wait_until_none_is_indexed(&mut c, command);
+        c.cmds(&["SELECT", "1"]);
+        c.cmds(&["DEL", "doc:1"]);
+        c.cmds(&["SELECT", "0"]);
+    }
+    for command in ["PEXPIRE doc:1 1", "JSON.DEL doc:1 $", "JSON.FORGET doc:1"] {
+        json_document(&mut c, "doc:1");
+        let [.., vectors, words] = indexed(&mut c);
+        assert_eq!([vectors, words], [["doc:1"], ["doc:1"]], "before {command}");
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = c.cmds(&args);
+        assert!(!reply.is_error(), "{command}: {reply:?}");
+        wait_until_none_is_indexed(&mut c, command);
+    }
+}
+
+/// `FT.DROPINDEX … DD` deletes the index's documents: they leave the other
+/// indexes that cover them.
+#[test]
+fn a_document_deleted_with_its_index_leaves_the_other_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    hash_document(&mut c, "doc:1");
+    assert!(c.cmds(&["FT.DROPINDEX", "words", "DD"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "doc:1"]).as_int(), 0);
+    let query = pack_f32(&[0.0, 0.0]);
+    let nearest = c.cmd(&[
+        b"FT.SEARCH",
+        b"vectors",
+        b"*=>[KNN 10 @vec $q]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &query,
+        b"NOCONTENT",
+        b"DIALECT",
+        b"2",
+    ]);
+    assert!(found(&nearest).is_empty(), "{nearest:?}");
+}
+
+/// `FLUSHDB` and `FLUSHALL` take the indexes with the documents. An index
+/// made afterwards is told of what leaves it, as one made first is.
+#[test]
+fn a_document_written_over_leaves_an_index_made_after_a_flush() {
+    let mut c = server_with_indexes_over_doc();
+    for flush in ["FLUSHDB", "FLUSHALL"] {
+        hash_document(&mut c, "doc:1");
+        assert!(c.cmds(&[flush]).is_ok());
+        assert_eq!(c.cmds(&["FT._LIST"]).as_array().len(), 0, "{flush}");
+
+        let create = "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE \
+                      FLOAT32 DIM 2 DISTANCE_METRIC L2";
+        let create: Vec<&str> = create.split_whitespace().collect();
+        assert!(c.cmds(&create).is_ok());
+        let query = pack_f32(&[0.0, 0.0]);
+        let nearest = |c: &mut Conn| {
+            found(&c.cmd(&[
+                b"FT.SEARCH",
+                b"vectors",
+                b"*=>[KNN 10 @vec $q]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &query,
+                b"NOCONTENT",
+                b"DIALECT",
+                b"2",
+            ]))
+        };
+        assert!(nearest(&mut c).is_empty(), "after {flush}");
+        hash_document(&mut c, "doc:1");
+        assert_eq!(nearest(&mut c), ["doc:1"], "after {flush}");
+        assert!(c.cmds(&["SETEX", "doc:1", "100", "x"]).is_ok());
+        assert!(nearest(&mut c).is_empty(), "after {flush} and SETEX");
+    }
+}
+
+/// Searches run while other clients write documents, write over them and
+/// delete them. A document nothing touches is in every reply, no reply is
+/// an error, and once the writers are done the indexes hold the documents
+/// that are left and no others.
+#[test]
+fn searches_alongside_writes_over_documents_see_what_is_there() {
+    const WRITERS: usize = 3;
+    const KEYS: usize = 8;
+    const ROUNDS: usize = 150;
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for create in [
+        "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+         DISTANCE_METRIC L2",
+        "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT kind TAG",
+    ] {
+        let create: Vec<&str> = create.split_whitespace().collect();
+        assert!(c.cmds(&create).is_ok(), "{create:?}");
+    }
+    let steady: Vec<String> = (0..4).map(|i| format!("doc:steady{i}")).collect();
+    for key in &steady {
+        hash_document(&mut c, key);
+    }
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let searchers: Vec<_> = (0..2)
+        .map(|_| {
+            let (done, steady) = (std::sync::Arc::clone(&done), steady.clone());
+            thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let query = pack_f32(&[0.0, 0.0]);
+                let mut searches = 0usize;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let nearest = c.cmd(&[
+                        b"FT.SEARCH",
+                        b"vectors",
+                        b"*=>[KNN 100 @vec $q]",
+                        b"PARAMS",
+                        b"2",
+                        b"q",
+                        &query,
+                        b"NOCONTENT",
+                        b"LIMIT",
+                        b"0",
+                        b"100",
+                        b"DIALECT",
+                        b"2",
+                    ]);
+                    let worded = c.cmds(&[
+                        "FT.SEARCH",
+                        "words",
+                        "hello",
+                        "NOCONTENT",
+                        "LIMIT",
+                        "0",
+                        "100",
+                    ]);
+                    let tagged = c.cmds(&[
+                        "FT.SEARCH",
+                        "words",
+                        "@kind:{book}",
+                        "NOCONTENT",
+                        "LIMIT",
+                        "0",
+                        "100",
+                    ]);
+                    for reply in [&nearest, &worded, &tagged] {
+                        assert!(!reply.is_error(), "{reply:?}");
+                        let keys = found(reply);
+                        for key in &steady {
+                            assert!(keys.contains(key), "{key} is not in {keys:?}");
+                        }
+                    }
+                    searches += 1;
+                }
+                searches
+            })
+        })
+        .collect();
+
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                for round in 0..ROUNDS {
+                    for key in 0..KEYS {
+                        let name = format!("doc:w{writer}k{key}");
+                        hash_document(&mut c, &name);
+                        // The last round leaves the even keys documents.
+                        if round + 1 == ROUNDS && key % 2 == 0 {
+                            continue;
+                        }
+                        let reply = match (round + key) % 4 {
+                            0 => c.cmds(&["SET", &name, "x"]),
+                            1 => c.cmds(&["DEL", &name]),
+                            2 => c.cmds(&["SETEX", &name, "100", "x"]),
+                            _ => c.cmds(&["SUNIONSTORE", &name, "nothing"]),
+                        };
+                        assert!(!reply.is_error(), "{reply:?}");
+                    }
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().expect("a writer");
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for searcher in searchers {
+        assert!(searcher.join().expect("a searcher") > 0);
+    }
+
+    let mut left = steady;
+    for writer in 0..WRITERS {
+        for key in (0..KEYS).step_by(2) {
+            left.push(format!("doc:w{writer}k{key}"));
+        }
+    }
+    left.sort();
+    let query = pack_f32(&[0.0, 0.0]);
+    let nearest = found(&c.cmd(&[
+        b"FT.SEARCH",
+        b"vectors",
+        b"*=>[KNN 100 @vec $q]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &query,
+        b"NOCONTENT",
+        b"LIMIT",
+        b"0",
+        b"100",
+        b"DIALECT",
+        b"2",
+    ]));
+    assert_eq!(nearest, left, "the index of vectors");
+    for query in ["hello", "@kind:{book}"] {
+        let reply = c.cmds(&[
+            "FT.SEARCH",
+            "words",
+            query,
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "100",
+        ]);
+        assert_eq!(found(&reply), left, "{query}");
+    }
+}

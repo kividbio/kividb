@@ -1814,3 +1814,75 @@ fn noeviction_refuses_a_growing_sorted_set_at_the_limit_and_memory_usage_says_wh
         cmd_with(c, &["ZADD", "zset"], &pairs)
     });
 }
+
+/// A document that is evicted leaves its indexes with its key: the store
+/// says so for every key it takes out, and eviction no longer does. What
+/// the index of vectors finds, and what the postings list, are the
+/// documents that are left.
+#[test]
+fn an_evicted_document_leaves_its_indexes() {
+    const DOCS: usize = 3000;
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let create = "FT.CREATE docs ON HASH PREFIX 1 doc: SCHEMA kind TAG vec VECTOR FLAT 6 TYPE \
+                  FLOAT32 DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert!(c.cmd(&create).ok());
+    // Two little-endian floats, both 2.0: bytes that are text as well.
+    let vector = "\0\0\0@\0\0\0@";
+    let value = value();
+
+    // Room for about half of the documents.
+    c.limit_to(3 * MB / 2);
+    for i in 0..DOCS {
+        let wrote = c.cmd(&[
+            "HSET",
+            &format!("doc:{i}"),
+            "kind",
+            "book",
+            "vec",
+            vector,
+            "pad",
+            &value,
+        ]);
+        assert_eq!(wrote, V::Int(3), "write {i}");
+    }
+    c.lift_the_limit();
+    let evicted = c.evicted();
+    assert!(evicted > 500, "only {evicted} documents were evicted");
+    let left = c.surviving("doc:", DOCS);
+    assert!(left > 0 && left < DOCS, "{left} documents are left");
+
+    let count = DOCS.to_string();
+    let nearest = c.cmd(&[
+        "FT.SEARCH",
+        "docs",
+        &format!("*=>[KNN {count} @vec $q]"),
+        "PARAMS",
+        "2",
+        "q",
+        vector,
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        &count,
+        "DIALECT",
+        "2",
+    ]);
+    let V::Arr(nearest) = nearest else {
+        panic!("{nearest:?}");
+    };
+    assert_eq!(nearest.len() - 1, left, "the index of vectors");
+    for key in &nearest[1..] {
+        assert_eq!(c.cmd(&["EXISTS", key.s()]), V::Int(1), "{key:?} is gone");
+    }
+
+    let V::Arr(info) = c.cmd(&["FT.INFO", "docs"]) else {
+        panic!("no FT.INFO");
+    };
+    let listed = info
+        .iter()
+        .position(|field| *field == V::Str("doc_ids".into()))
+        .map(|at| info[at + 1].i());
+    assert_eq!(listed, Some(left as i64), "the postings");
+}
