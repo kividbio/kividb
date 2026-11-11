@@ -1846,7 +1846,10 @@ fn replied_within(c: &mut Conn, wait: Duration) -> bool {
         .get_ref()
         .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
         .unwrap();
-    let replied = c.reader.fill_buf().is_ok_and(|buffered| !buffered.is_empty());
+    let replied = c
+        .reader
+        .fill_buf()
+        .is_ok_and(|buffered| !buffered.is_empty());
     c.reader
         .get_ref()
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -1938,7 +1941,11 @@ fn a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
 
 #[test]
 fn a_write_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
-    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(&[], &["SET", "stalled:k", "1"], "stalled:k");
+    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+        &[],
+        &["SET", "stalled:k", "1"],
+        "stalled:k",
+    );
 }
 
 #[test]

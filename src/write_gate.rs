@@ -231,7 +231,10 @@ mod tests {
         let far = || std::time::Instant::now() + Duration::from_secs(30);
         assert!(!wait_out_writes(far(), || false), "it did not give up");
         let soon = std::time::Instant::now() + Duration::from_millis(20);
-        assert!(!wait_out_writes(soon, || true), "it waited past its deadline");
+        assert!(
+            !wait_out_writes(soon, || true),
+            "it waited past its deadline"
+        );
         let started = std::time::Instant::now();
         let releaser = {
             let release = Arc::clone(&release);
