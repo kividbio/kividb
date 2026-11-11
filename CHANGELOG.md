@@ -1056,7 +1056,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   put it. In the last database that is certain; before it, an image that
   does not load is read again (at most 32 times) with the key in each
   place it could be, and one that none of these readings loads is
-  refused as before. An image that goes on past its databases with bytes
+  refused as before. Every such reading is tried, and an image that two
+  of them load with different keys or values is refused, never loaded
+  one way at a guess: the error says so and asks for the data to be
+  restored from another copy (an AOF, a replica or a backup). So is an
+  image that could not be read every way it can be read. Images that
+  1.2.1 writes are read once, as before. An image that goes on past its
+  databases with bytes
   that are not a section is refused, rather than loaded without them.
   Empty hash fields, set and sorted set members and list elements were
   never affected (#441).
