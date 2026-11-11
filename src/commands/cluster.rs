@@ -2232,7 +2232,6 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
             crate::store::Removal::Taken(taken) => {
                 // Freed with the shard unlocked.
                 drop(taken);
-                crate::vector::maybe_unindex(ctx.index_store, db, key);
                 del.push(key.to_vec());
             }
             crate::store::Removal::Kept => kept.push(key),

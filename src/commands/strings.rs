@@ -1316,7 +1316,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             && !applying_stream(ctx) =>
                     {
                         delete_key(ctx.store, db, key);
-                        crate::vector::maybe_unindex(ctx.index_store, db, key);
                         notify(ctx.pubsub, db, KS_GENERIC, "del", key);
                     }
                     Some(at) => {
@@ -1676,7 +1675,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let removed = map.remove(key);
             drop(map);
             drop(removed);
-            crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
             Some(resp_integer(1))
         }
 

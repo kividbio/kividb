@@ -357,7 +357,8 @@ fn expire_ordered(
     // The indexes under the key's order, as a command's write: out of it a
     // write that came between could be written over with what this read.
     if key_removed {
-        crate::vector::maybe_unindex(index_store, db, key);
+        // Out of its indexes when the shard was let go of
+        // (`ShardMap::remove`).
         if marks {
             crate::vector::unmark_leaving(id, db, key);
         }

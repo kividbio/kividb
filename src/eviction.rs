@@ -900,8 +900,9 @@ fn evict(ctx: &mut Ctx, db: usize, key: &[u8], ordered: bool) -> Option<usize> {
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
         .then(|| crate::write_order::lock_keys(db, std::iter::once(key)));
 
+    // A document left its indexes when the shard was let go of
+    // (`ShardMap::remove`).
     let given = crate::commands::helpers::delete_key_sized(ctx.store, db, key)?;
-    crate::vector::maybe_unindex(ctx.index_store, db, key);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
     crate::stats::record_rdb_change();

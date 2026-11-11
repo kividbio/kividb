@@ -298,7 +298,6 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 continue;
             }
             deleted += 1;
-            crate::vector::maybe_unindex(ctx.index_store, db, key);
             crate::stats::record_rdb_change();
             crate::keyspace_events::notify(
                 ctx.pubsub,

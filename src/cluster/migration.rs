@@ -828,7 +828,6 @@ impl Drop for DeleteRun {
 #[allow(clippy::too_many_arguments)]
 fn delete_keys(
     store: &crate::store::Store,
-    index_store: &crate::vector::IndexStore,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
     run: &mut DeleteRun,
@@ -872,8 +871,9 @@ fn delete_keys(
                 checked();
                 let mut del = vec![b"DEL".to_vec()];
                 for (key, _) in chunk.iter().zip(delete).filter(|(_, delete)| *delete) {
+                    // A document leaves its indexes with its key
+                    // (`ShardMap::remove`).
                     if crate::commands::helpers::delete_key(store, 0, key) {
-                        crate::vector::maybe_unindex(index_store, 0, key);
                         del.push(key.as_bytes().to_vec());
                         removed += 1;
                     }
@@ -947,7 +947,6 @@ pub fn delete_before_coming(
     let deleted = off_the_runtime(|| {
         delete_keys(
             &env.store,
-            &env.index_store,
             &env.repl_state,
             &env.hub_tx,
             &mut run,
@@ -1007,7 +1006,6 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
     let _ = start_dropping(
         cluster,
         &starter.store,
-        &starter.index_store,
         &starter.repl_state,
         &starter.hub_tx,
         slots,
@@ -1020,7 +1018,6 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
 fn start_dropping(
     cluster: &ClusterState,
     store: &crate::store::Store,
-    index_store: &crate::vector::IndexStore,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
     slots: Vec<u16>,
@@ -1036,7 +1033,6 @@ fn start_dropping(
         return None;
     }
     let store = Arc::clone(store);
-    let index_store = Arc::clone(index_store);
     let repl_state = Arc::clone(repl_state);
     let hub_tx = hub_tx.clone();
     let spawned = std::thread::Builder::new()
@@ -1044,7 +1040,6 @@ fn start_dropping(
         .spawn(move || {
             let deleted = delete_keys(
                 &store,
-                &index_store,
                 &repl_state,
                 &hub_tx,
                 &mut run,
@@ -1634,7 +1629,6 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         let mut run = DeleteRun::begin(&env.cluster, handed.iter().copied(), None);
         let deleted = delete_keys(
             &env.store,
-            &env.index_store,
             &env.repl_state,
             &env.hub_tx,
             &mut run,
@@ -2128,7 +2122,6 @@ fn delete_unowned(env: &Env, task: &Task) {
     }
     let deleted = delete_keys(
         &env.store,
-        &env.index_store,
         &env.repl_state,
         &env.hub_tx,
         &mut run,
@@ -2708,7 +2701,6 @@ mod tests {
             let (mut checked, mut between) = (Some(checked), Some(between));
             delete_keys(
                 &self.store,
-                &self.index_store,
                 &self.repl_state,
                 &self.hub_tx,
                 &mut run,
@@ -2919,7 +2911,6 @@ mod tests {
             start_dropping(
                 &lost.cluster,
                 &lost.store,
-                &lost.index_store,
                 &lost.repl_state,
                 &lost.hub_tx,
                 vec![LOST],

@@ -2320,7 +2320,6 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &[u8]) -> bool {
         still_empty && map.remove(key).is_some()
     };
     if removed {
-        crate::vector::maybe_unindex(ctx.index_store, db, key);
         crate::keyspace_events::notify(
             ctx.pubsub,
             db,

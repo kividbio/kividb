@@ -433,13 +433,10 @@ fn remove_at(root: &mut Value, location: &Location) -> bool {
     }
 }
 
-/// Delete the whole key: the value, its TTL and whatever indexed it.
+/// Delete the whole key: the value and its TTL. It leaves its indexes with
+/// them (`ShardMap::remove`).
 fn delete_document(ctx: &Ctx, key: &[u8]) -> bool {
-    let removed = delete_key(ctx.store, *ctx.selected_db, key);
-    if removed {
-        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-    }
-    removed
+    delete_key(ctx.store, *ctx.selected_db, key)
 }
 
 /// RFC 7396 JSON Merge Patch.
