@@ -941,6 +941,13 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     // case it has not run yet and is counted when it is resumed.
     let started = std::time::Instant::now();
     let reply = run_command(ctx, name, started);
+    if crate::pause::is_held(&reply) {
+        // Not run: a `CLIENT PAUSE` sent it back to be held, and it is
+        // dispatched again (`blocking::hold_for_pause`). Counted and timed
+        // then.
+        crate::stats::unrecord_command_processed();
+        return reply;
+    }
     let elapsed = started.elapsed();
     // For the connection loop's slow log: see `cmdstats::last_command_us`.
     crate::cmdstats::note_last_command(elapsed);
@@ -1351,6 +1358,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // stream, alone for a command that takes it alone
     // (`applied_takes_the_gate_alone`, #373), and EXEC and a script hold it
     // alone for theirs.
+    #[cfg(debug_assertions)]
+    if gated && !crate::write_gate::held_by_this_thread() {
+        crate::pause::test_stall_before_the_gate(ctx.cmd.as_slice());
+    }
     let gates = if crate::command_gate::skips(name, &ctx.cmd) {
         Some((None, None))
     } else if takes_the_gate_alone(
@@ -1387,9 +1398,30 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // since this write was routed: a whole `MIGRATE` of its key may have run
     // between its routing and the gate. It is routed again, here in the
     // gate, where nothing moves its keys before it is done (#331).
+    //
+    // And a `CLIENT PAUSE` set since it passed the pause check: it would be
+    // applied, and acknowledged, after the pause had been answered and the
+    // master's offset read, and lost by a switchover that promoted a replica
+    // at that offset (#629). It goes back to its connection, out of the
+    // gates, and is held there like any write that comes during the pause
+    // (`pause::pause_clients`). Not a dispatch that resumes a command whose
+    // client has gone, which writes nothing.
     while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
     {
         let handoff = crate::pause::handoff();
+        if !handoff
+            && crate::pause::write_held_in_gate(ctx.cmd.as_slice())
+            && !crate::commands::blocking::client_gone(ctx)
+        {
+            drop(_write_gate);
+            // `ASKING` was used up when it was routed; the dispatch that
+            // runs it is routed as this one was.
+            if routed.asking() {
+                ctx.client_registry
+                    .update(ctx.client_id, |info| info.asking = true);
+            }
+            return crate::commands::blocking::hold_for_pause(ctx);
+        }
         if !handoff
             && !(crate::pause::keys_moving()
                 && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))

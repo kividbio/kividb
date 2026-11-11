@@ -145,6 +145,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CLIENT PAUSE ... WRITE` no longer replies while a write is still on
+  its way (#629).** A switchover (the kividb-operator's, and any that works
+  the same way) pauses writes on the master, reads `master_repl_offset`,
+  waits for the replica to reach it and promotes the replica. A write that
+  had passed the pause check just before the pause was set, and was held up
+  before it was applied (a thread descheduled on a CPU-limited pod, say),
+  was applied and acknowledged after `CLIENT PAUSE` had replied OK and the
+  offset had been read, and the promoted replica did not have it. Now
+  `CLIENT PAUSE` (`WRITE` or `ALL`) waits for the writes already being
+  applied to finish, which takes microseconds, and a write that reaches
+  the store after the pause was set goes back and is held until the pause
+  ends, as a write that arrives during the pause is. When OK is sent, every
+  acknowledged write is in the offset. A write held up for longer, behind a
+  script or a transaction, does not delay the reply. If a write being
+  applied takes longer than 5 seconds (a `FLUSHALL`, a `DEL` of a huge key),
+  or the pause ends first, `CLIENT PAUSE` answers `-ERR writes in progress
+  did not finish before the pause could take hold` and pauses nothing.
+  Writes are still held, not refused, and a transaction or a script that
+  pauses clients does not wait for itself. And `CLIENT REPLY SKIP` before a
+  blocking command that waited now skips that command's reply; the
+  dispatch that parked it used the skip up.
+
 - **A write to a key past its TTL no longer gives a replica a key the
   master does not have (#628).** A key whose TTL had ended but that the
   master had not deleted yet was taken as gone by a write, but the write
