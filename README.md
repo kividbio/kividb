@@ -23,8 +23,9 @@ libraries work unchanged, and it has full-text and vector search built in. It ru
 core on a sharded in-memory key-value design, and persists to snapshots and an optional
 append-only file.
 
-On the same 32 cores, KiviDB serves **21 million pipelined GETs per second: about 9× Redis 8
-and 2.3× Dragonfly**, with under half Dragonfly's p99 latency ([benchmarks](#performance)).
+On 32 cores of AWS bare metal, KiviDB 1.2.0 serves **21.2 million pipelined GETs per second:
+9× Redis 8.10 and 2.3× Dragonfly**, ahead of Garnet, at 0.36 ms p99
+([benchmarks](#performance)).
 
 ```bash
 docker run -d -p 6380:6380 kividb/kividb
@@ -69,6 +70,29 @@ As of October 2026. Something out of date or wrong? Please [open an issue](https
 
 *KiviDB 1.2.0 against Garnet, Dragonfly, Redis, Redis Cluster and Valkey. Click for the full-resolution video.*
 
+### Bare metal
+
+AWS Graviton3, November 2026: the server on a `c7gn.metal` confined to 32 cores, the load
+generator on a second `c7gn.metal` in the same placement group, one engine at a time,
+persistence off. memtier_benchmark, 10 million keys of 100 bytes, 30 s a run, the mean of
+two rounds; 300 connections pipelined, 1,200 without.
+
+| | KiviDB 1.2.0 | Garnet 2.2.5 | Dragonfly 2.0.2 | Redis 8.10.3 |
+|---|---:|---:|---:|---:|
+| `GET`, pipeline 16 | **21.24M** | 20.82M | 9.31M | 2.36M |
+| `SET`, pipeline 16 | 17.79M | **20.27M** | 8.70M | 1.94M |
+| `GET`, no pipelining | 2.99M | 2.88M | **3.30M** | 1.47M |
+| `SET`, no pipelining | 3.22M | 3.07M | **3.37M** | 1.26M |
+| p99, `GET` / `SET` at pipeline 16 | **0.36 / 0.45 ms** | 0.67 / 0.80 ms | 0.88 / 1.02 ms | 2.29 / 2.72 ms |
+| Bytes a key, 10M keys of 100 B | 143 | | **134** | 178 |
+
+Pipelined, KiviDB served 9.0× Redis's GETs and 9.2× its SETs, and more than twice
+Dragonfly's. Garnet was a close second on `GET` and ahead on pipelined `SET`; without
+pipelining Dragonfly was 5-10% ahead. Scripts and raw results:
+[kivi-benchmark](https://github.com/kividbio/kivi-benchmark).
+
+### The full suite, on Azure VMs
+
 KiviDB 1.2.0 was measured in November 2026 on Azure VMs against Redis 8.10, Redis Cluster,
 Valkey 9.1, Dragonfly 2.0, Garnet 2.2 and kvrocks 2.17, each on the same machines in the same
 hour, with p50/p99/p99.9 latency from two load generators.
@@ -89,10 +113,7 @@ hour, with p50/p99/p99.9 latency from two load generators.
 Where KiviDB loses: Garnet is faster on `SET` at pipeline 16 and on `MSET`; Redis Cluster on
 `HSET` and `INCR`; Dragonfly uses less memory per vector, during a snapshot, and for ASCII
 values; Redis ingests vectors faster and serves 3-9% more cache reads a second. These are
-cloud VMs, so absolute numbers are lower than on the bare-metal machines below.
-
-<details>
-<summary>The charts</summary>
+cloud VMs, so absolute numbers are lower than on the [bare metal](#bare-metal) above.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/1.2.0/throughput-pipelined-dark.png">
@@ -139,99 +160,21 @@ cloud VMs, so absolute numbers are lower than on the bare-metal machines below.
   <img src="assets/benchmarks/1.2.0/vector-ingest-light.png" alt="Vector ingest and index build" width="720">
 </picture>
 
-</details>
+### Earlier runs
 
-### Earlier runs: KiviDB 1.1 on bare metal
+KiviDB 1.1 was also measured on AWS Graviton3 bare metal in October 2026, against
+Dragonfly, Redis and Redis Cluster: [benchmarks/1.1-bare-metal.md](benchmarks/1.1-bare-metal.md).
 
-The figures in this section are from one session in October 2026 on AWS Graviton3 bare metal: the
-server on a `c7gn.metal` (64 vCPU), confined to 32 cores, and the load generator on a
-second `c7gn.metal` in the same placement group. Each engine ran alone on the server,
-one after another.
+### Independent reviews
 
-#### Key-value
+Written by others, not by the KiviDB project:
 
-memtier_benchmark through kivi-benchmark's `run-matrix.sh`: 10 million keys, 100-byte
-values, 30 s a scenario, mean of two rounds; 300 connections pipelined, 1,200 without
-pipelining.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/throughput-pipelined-dark.png">
-  <img src="assets/benchmarks/throughput-pipelined-light.png" alt="Pipelined throughput: KiviDB, Dragonfly, Redis, Redis Cluster" width="720">
-</picture>
-
-| ops/s | KiviDB 1.1.0 | Dragonfly 2.0.2 | Redis 8.10 | Redis Cluster (32 shards) |
-|---|------:|------:|------:|------:|
-| GET, pipeline 16 | **21.2M** | 9.1M | 2.4M | 4.7M |
-| SET, pipeline 16 | **19.2M** | 8.5M | 2.0M | 4.7M |
-| GET, no pipelining | 3.07M | **3.35M** | 1.32M | 1.46M |
-| SET, no pipelining | 3.12M | **3.38M** | 1.54M | 1.46M |
-| p99 latency, GET / SET, pipeline 16 | **0.36 / 0.42 ms** | 0.88 / 1.07 ms | 2.2 / 2.7 ms | |
-| Memory per key | 177 B | **134 B** | 178 B | 183 B |
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/latency-p99-pipelined-dark.png">
-  <img src="assets/benchmarks/latency-p99-pipelined-light.png" alt="p99 latency, pipelined" width="720">
-</picture>
-
-#### Vector search
-
-[redis/vector-db-benchmark](https://github.com/redis/vector-db-benchmark) on
-glove-25-angular (1.18M vectors, 25 dimensions): HNSW with M=16 and EF_CONSTRUCTION=256,
-100 clients uploading in batches of 64, then queries at ef 64, 128, 256 and 512.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/vector-qps-recall-dark.png">
-  <img src="assets/benchmarks/vector-qps-recall-light.png" alt="Vector search: queries per second against recall" width="720">
-</picture>
-
-| | KiviDB 1.1.0 | Dragonfly 2.0.2 | Redis 8.10 (query engine) |
-|---|------:|------:|------:|
-| Queries/s at ef 64 (recall@10) | **59.3k** (0.943) | 41.3k (0.912) | 31.8k (0.912) |
-| Queries/s at ef 128 | **50.7k** (0.961) | 40.3k (0.937) | 28.9k (0.937) |
-| Queries/s at ef 256 | 31.5k (0.989) | **36.2k** (0.979) | 21.1k (0.979) |
-| Queries/s at ef 512 | 18.7k (**0.998**) | **29.8k** (0.995) | 13.7k (0.995) |
-| Ingest and index build | 31 s | **13 s** | 38 s |
-| Memory after ingest | 1.66 GB | 1.13 GB | **1.07 GB** |
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/vector-ingest-dark.png">
-  <img src="assets/benchmarks/vector-ingest-light.png" alt="Vector ingest time" width="720">
-</picture>
-
-#### Load rising to saturation
-
-A second setup, on Azure, in the manner of a latency/throughput/saturation test: rather
-than one fixed load, clients are added every 30 seconds, 40 to 1,600 per database, until
-each server can take no more. Each client sends 10 pipelined `SET`+`GET` pairs over 10
-million keys, then sleeps 10 ms. Every single server ran on its own 8 vCPU arm64 VM
-(D8ps_v5); the Redis Cluster had four 2 vCPU VMs, 8 vCPUs in all. KiviDB 1.1.2, October
-2026.
-
-<a href="https://github.com/kividbio/kivi-benchmark/blob/main/ramp-saturation/results/2026-10-24-pipelined/kividb-vs-dragonfly-vs-redis.mp4">
-  <img src="assets/benchmarks/ramp-saturation.webp" alt="KiviDB vs Dragonfly vs Redis vs Redis Cluster as the load rises: throughput, p50 and p99 latency, errors, CPU and memory" width="720">
-</a>
-
-*The whole run, 20 minutes at 60× speed. Click for the full-resolution video.*
-
-| | Peak throughput | p50 / p99 at 1,600 clients | Errors |
-|---|------:|------:|------:|
-| KiviDB 1.1.2 | **2.08M req/s** | **4.3 / 13.9 ms** | 0 |
-| Dragonfly 2.0.2 | 1.56M req/s | 10.1 / 33.9 ms | 0 |
-| Redis 8.10.2 Cluster (4 × 2 vCPU) | 0.97M req/s | 26.8 / 44.9 ms | 0 |
-| Redis 8.10.2 | 0.49M req/s | 55.2 / 72.1 ms | 0 |
-
-Latency is per pipelined batch. Without pipelining, KiviDB measured about 20% below
-Dragonfly on these machines (about 8% below on the bare-metal run above). The harness, the run's raw data and its
-video are in
-[kivi-benchmark/ramp-saturation](https://github.com/kividbio/kivi-benchmark/tree/main/ramp-saturation);
-the run's dashboard is a
-[Grafana snapshot](https://snapshots.raintank.io/dashboard/snapshot/AheJ35tyvNmMmRx3ExXOe2bbsebZIvWg).
-
-- Methodology and scripts: [kivi-benchmark](https://github.com/kividbio/kivi-benchmark)
-- The most recent automated run: [benchmarks/LATEST.md](benchmarks/LATEST.md)
-
-Results depend on the environment. Treat published figures as one controlled capture, not
-a guarantee, and measure on your own hardware and workload.
+- [Redis vs Valkey vs Dragonfly vs KiviDB](https://warefeats.com/posts/2026-11-05-kv-stores-redis-vs-valkey-vs-dragonfly-vs-kividb/)
+  (warefeats, 5 November 2026): KiviDB 1.2.0 measured on AWS Graviton3 against Redis 8.10,
+  Valkey 9.1 and Dragonfly 2.1: throughput, pipelining, latency and memory per key.
+- [KiviDB Review: Rust Redis Alternative With Vector Search](https://andrew.ooo/posts/kividb-review-rust-redis-alternative-vector-search/)
+  (andrew.ooo, 10 November 2026): a review of KiviDB's design, published benchmarks,
+  durability record and where it fits.
 
 ## Vector search (Redis Stack–style `FT.*`)
 
@@ -250,7 +193,9 @@ redis-cli -p 6380 FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA \
 
 2. **Store vectors** as raw **FLOAT32** little-endian bytes in a hash field (**`DIM × 4` bytes**), the same convention as Redis Stack and `redis-py` / `numpy` blobs. Use your client's binary-safe `HSET` (the integration tests under `tests/e2e/` have examples).
 
-3. **Query with KNN** (Dialect 2), passing the query vector as a named binary parameter:
+3. **Query with KNN** (Dialect 2), passing the query vector as a named binary parameter
+   (`<blob>` stands for the query vector's raw bytes, which a shell cannot type: send this
+   from a client library, as in step 2):
 
 ```bash
 redis-cli -p 6380 FT.SEARCH idx '*=>[KNN 10 @vec $q]' PARAMS 2 q <blob> DIALECT 2
@@ -337,7 +282,7 @@ install the binary, a systemd unit, a `kividb` system user, and a default
 starts the unit, and an upgrade restarts it:
 
 ```bash
-sudo apt install ./kividb_amd64.deb     # or: sudo rpm -i kividb.x86_64.rpm
+sudo apt install ./kividb_amd64.deb     # or: sudo dnf install ./kividb.x86_64.rpm
 redis-cli -p 6380 PING
 ```
 
@@ -380,14 +325,20 @@ docker run -p 6380:6380 ghcr.io/kividbio/kividb \
 
 ```bash
 docker run -p 6380:6380 \
-  -v $(pwd)/data:/home/kividb \
+  -v kividb-data:/home/kividb \
   ghcr.io/kividbio/kividb --aof --requirepass "change-me"
 ```
 
-With `--aof`, every write is appended to `appendonly.aof` and the file is replayed on
-startup, so a crash loses at most about the last second of writes (the fsync interval)
-rather than everything since the last snapshot. When an AOF is present it is the source of
-truth and the snapshot is not loaded; see [docs/PERSISTENCE.md](docs/PERSISTENCE.md) for why.
+To keep the data in a host directory instead, create it owned by UID 1000 first
+(`mkdir -p data && sudo chown 1000:1000 data`, then `-v "$(pwd)/data:/home/kividb"`): a
+directory Docker creates for a bind mount belongs to root, and the server stops with
+`Permission denied` when it opens `appendonly.aof`.
+
+With `--aof`, every write is appended to `appendonly.aof`, so a crash loses at most about the
+last second of writes (the fsync interval) rather than everything since the last snapshot.
+On startup the snapshot (`dump.kdb`) is loaded first, and the AOF, which holds the writes
+made since that snapshot, is replayed on top of it; see
+[docs/PERSISTENCE.md](docs/PERSISTENCE.md).
 
 The image is distroless: it has no shell and no `redis-cli`. Connect from another container
 instead, for example `docker run --rm -it --network container:<name> redis redis-cli -p 6380`.
@@ -409,15 +360,21 @@ links below always resolve to the newest release; replace `latest/download` with
 # Linux x86_64
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-x86_64.tar.gz
 tar xzf kividb-linux-x86_64.tar.gz
-./kividb
+./kividb/kividb
 
 # Linux aarch64 (an ARMv8.1 CPU or newer: Graviton2 and later, Ampere; not a Raspberry Pi 4)
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-aarch64.tar.gz
+tar xzf kividb-linux-aarch64.tar.gz
+./kividb/kividb
 
-# macOS, Apple silicon / Intel
+# macOS, Apple silicon (use kividb-darwin-x86_64.tar.gz on Intel)
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-darwin-aarch64.tar.gz
-curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-darwin-x86_64.tar.gz
+tar xzf kividb-darwin-aarch64.tar.gz
+./kividb/kividb
 ```
+
+Each tarball unpacks to a `kividb/` directory holding the `kividb` binary, `LICENSE` and
+`NOTICE`.
 
 Each variant other than the default has its name in the file: `kividb-lua-linux-x86_64.tar.gz`,
 `kividb-tls-…`, `kividb-full-…`. The default variant is also packaged for Linux as
@@ -428,7 +385,7 @@ of every file in a release.
 
 ```bash
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb_amd64.deb && sudo dpkg -i kividb_amd64.deb
-curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb.x86_64.rpm && sudo rpm -i kividb.x86_64.rpm
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb.x86_64.rpm && sudo dnf install ./kividb.x86_64.rpm
 ```
 
 From 1.2.0 on, every file in a release and every image carries signed build provenance: a
@@ -469,8 +426,8 @@ list.
 | `--aclfile <path>` | none | ACL file to load users from |
 | `--replicaof <HOST> <PORT>` | none | Replicate from a primary |
 | `--replica-announced-port <port>` | server port (the TLS port with `--tls-replication yes` or `--port 0`) | Port announced to the primary via `REPLCONF listening-port` |
-| `--replica-priority <n>` | `100` | Sentinel promotes the replica of lowest priority first, and never one of `0` |
-| `--replica-announced <yes\|no>` | `yes` | Whether Sentinel lists this replica |
+| `--replica-priority <n>` | `100` | Sentinel promotes the replica of lowest priority first, and never one of `0`. New in 1.2.1: 1.2.0 has no such flag, and ignores the setting in the file |
+| `--replica-announced <yes\|no>` | `yes` | Whether Sentinel lists this replica. New in 1.2.1, as above |
 | `--slowlog-log-slower-than <us>` | off | Slowlog threshold in microseconds (`0` logs every command) |
 | `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
 | `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
@@ -526,7 +483,8 @@ be loaded or listened on is refused, and nothing changes. `tls-cluster` needs a 
 does `tls-port` on a node with `tls-cluster yes`.
 
 **Clients must use TLS on the TLS port.** A plain connection to it (for example `redis-cli -p 6381`
-without `--tls`) fails the handshake, and the server logs `[TLS] handshake failed`. For
+without `--tls`) fails the handshake; at `--loglevel verbose` the server logs
+`TLS: handshake failed from <address>`. For
 memtier_benchmark, add `--tls` (and `--tls-skip-verify` for a self-signed certificate).
 
 ### Logs and errors

@@ -2026,3 +2026,161 @@ fn debug_pause_cron_1_stops_the_sweep() {
         c.cmd(&["DBSIZE"]).i() == 0 && c.info("stats", "expired_keys_active") == "1"
     });
 }
+
+/// `DUMP key`'s payload, as bytes: `Conn::cmd` reads replies as text.
+fn dump(c: &mut Conn, key: &str) -> Vec<u8> {
+    let cmd = format!("*2\r\n$4\r\nDUMP\r\n${}\r\n{key}\r\n", key.len());
+    c.writer.write_all(cmd.as_bytes()).unwrap();
+    let mut line = String::new();
+    c.reader.read_line(&mut line).unwrap();
+    let len: usize = line
+        .trim_end()
+        .strip_prefix('$')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("DUMP {key}: {line:?}"));
+    let mut payload = vec![0u8; len + 2];
+    c.reader.read_exact(&mut payload).unwrap();
+    payload.truncate(len);
+    payload
+}
+
+/// `args` as a RESP command.
+fn resp(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// `PEXPIRETIME` of each of `keys`.
+fn pexpiretimes(c: &mut Conn, keys: &[String]) -> Vec<i64> {
+    keys.iter()
+        .map(|key| c.cmd(&["PEXPIRETIME", key]).i())
+        .collect()
+}
+
+/// `commands`, each given a relative time to live, run on a master with an
+/// AOF and a replica: every key in `keys` then has, on the replica and
+/// after a replay of the AOF, the very `PEXPIRETIME` it has on the master.
+/// `prepare` runs first, on the master, and gives the commands.
+fn deadlines_reach_the_readers(keys: &[String], prepare: impl FnOnce(&mut Conn) -> Vec<Vec<u8>>) {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    let commands = prepare(&mut m);
+    for chunk in commands.chunks(500) {
+        m.writer.write_all(&chunk.concat()).unwrap();
+        for _ in chunk {
+            let reply = m.read();
+            assert!(!matches!(reply, V::Err(_)), "{reply:?}");
+        }
+    }
+    let want = pexpiretimes(&mut m, keys);
+    assert!(want.iter().all(|at| *at > 0), "every key has a deadline");
+
+    let differ = |got: &[i64]| -> Vec<String> {
+        keys.iter()
+            .zip(want.iter().zip(got))
+            .filter(|(_, (w, g))| w != g)
+            .take(5)
+            .map(|(key, (w, g))| format!("{key}: {g}, master {w}"))
+            .collect()
+    };
+    wait_caught_up(&mut m, &mut r);
+    let wrong = differ(&pexpiretimes(&mut r, keys));
+    assert!(wrong.is_empty(), "the replica: {wrong:?}");
+
+    // Every write is in the AOF: the replica, fed the same stream, has it.
+    std::thread::sleep(Duration::from_millis(1_500));
+    drop(m);
+    master.kill();
+    master.restart();
+    let wrong = differ(&pexpiretimes(&mut master.conn(), keys));
+    assert!(wrong.is_empty(), "after an AOF replay: {wrong:?}");
+}
+
+/// A `RESTORE` with a relative time to live reaches a replica and the AOF
+/// as the very deadline the master gave the key: their `PEXPIRETIME` is
+/// the master's. It was sent as a deadline worked out again from the clock
+/// after the command, a millisecond later whenever the clock had ticked
+/// meanwhile (#602).
+#[test]
+fn a_relative_restore_reaches_a_replica_and_the_aof_as_the_masters_deadline() {
+    let keys: Vec<String> = (0..3_000).map(|i| format!("r:{i}")).collect();
+    deadlines_reach_the_readers(&keys, |m| {
+        assert_eq!(m.cmd(&["SET", "src", "v"]).s(), "OK");
+        let payload = dump(m, "src");
+        keys.iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let ttl = (3_600_000 + i * 7).to_string();
+                resp(&[b"RESTORE", key.as_bytes(), ttl.as_bytes(), &payload])
+            })
+            .collect()
+    });
+}
+
+/// The same for `SET` with `EX` and `PX`, `SETEX`, `PSETEX` and `MSETEX`:
+/// each is sent with the deadline the key was given, read back, not worked
+/// out again from the clock (#602).
+#[test]
+fn a_relative_set_reaches_a_replica_and_the_aof_as_the_masters_deadline() {
+    let keys: Vec<String> = (0..3_000).map(|i| format!("s:{i}")).collect();
+    deadlines_reach_the_readers(&keys, |_| {
+        keys.chunks(2)
+            .enumerate()
+            .flat_map(|(i, pair)| {
+                let (a, b) = (pair[0].as_bytes(), pair[1].as_bytes());
+                let ms = (3_600_000 + i * 7).to_string();
+                let secs = (3_600 + i).to_string();
+                let (ms, secs) = (ms.as_bytes(), secs.as_bytes());
+                match i % 5 {
+                    0 => vec![
+                        resp(&[b"SET", a, b"v", b"PX", ms]),
+                        resp(&[b"SET", b, b"v", b"EX", secs]),
+                    ],
+                    1 => vec![
+                        resp(&[b"SETEX", a, secs, b"v"]),
+                        resp(&[b"PSETEX", b, ms, b"v"]),
+                    ],
+                    2 => vec![resp(&[b"MSETEX", b"2", a, b"v", b, b"v", b"PX", ms])],
+                    3 => vec![resp(&[b"MSETEX", b"2", a, b"v", b, b"v", b"EX", secs])],
+                    _ => vec![
+                        resp(&[b"SET", a, b"v", b"NX", b"PX", ms]),
+                        resp(&[b"SET", b, b"v", b"GET", b"PX", ms]),
+                    ],
+                }
+            })
+            .collect()
+    });
+}
+
+/// Inside a script, whose commands keep time by the clock as the script
+/// began: a `SET ... PX` reaches a replica and the AOF as the deadline the
+/// key was given by that clock. It was sent worked out from the clock as it
+/// was after the command, later by however long the script had run (#602).
+#[cfg(feature = "lua")]
+#[test]
+fn a_relative_set_in_a_script_reaches_a_replica_and_the_aof_as_the_masters_deadline() {
+    let keys: Vec<String> = (0..200).map(|i| format!("{{l}}:{i}")).collect();
+    deadlines_reach_the_readers(&keys, |_| {
+        // Each key set after a few milliseconds of work, so that the script
+        // runs for a good while after its clock was read.
+        const SCRIPT: &[u8] = b"for i = 1, #KEYS do \
+              local x = 0 for j = 1, 20000 do x = x + j end \
+              if i % 2 == 0 then redis.call('SET', KEYS[i], 'v', 'PX', ARGV[1]) \
+              else redis.call('SET', KEYS[i], 'v', 'EX', ARGV[2]) end \
+            end return 1";
+        let n = keys.len().to_string();
+        let mut args: Vec<&[u8]> = vec![b"EVAL", SCRIPT, n.as_bytes()];
+        args.extend(keys.iter().map(|key| key.as_bytes()));
+        args.push(b"3600000");
+        args.push(b"3600");
+        vec![resp(&args)]
+    });
+}

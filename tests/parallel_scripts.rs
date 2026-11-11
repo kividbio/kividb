@@ -798,3 +798,38 @@ fn a_tagged_script_may_not_sort_by_a_pattern_outside_its_tag() {
     let replayed: Vec<String> = keys.iter().map(|key| m.state(key)).collect();
     assert_eq!(replayed, before, "AOF replay: {keys:?}");
 }
+
+/// A script that runs beside others may not create the first search index
+/// (#570): other commands run meanwhile, and the first index waits until
+/// every write already under way is done, which a script holding its keys'
+/// order cannot. Once an index exists, nothing has to be waited for, and it
+/// may.
+#[test]
+fn a_script_beside_others_may_not_create_the_first_index() {
+    const CREATES: &str = "if ARGV[1] == '' then return redis.call('SET', KEYS[1], 'v') end \
+                           return redis.call('FT.CREATE', ARGV[1], 'ON', 'HASH', \
+                           'PREFIX', '1', '{q}:', 'SCHEMA', 'f', 'TEXT')";
+    let server = Server::start(&["--lua-parallel-scripts", "true"]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", CREATES]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // Seen to be quick, so that it is run beside others.
+    for _ in 0..4 {
+        assert!(c.cmd(&["EVALSHA", &sha, "1", "{q}:k", ""]).ok());
+    }
+    let refused = c.cmd(&["EVALSHA", &sha, "1", "{q}:k", "first"]);
+    assert!(
+        refused.is_err() && refused.s().contains("first search index"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        c.cmd(&["FT._LIST"]),
+        V::Arr(Vec::new()),
+        "an index was made"
+    );
+
+    assert!(c.cmd(&["FT.CREATE", "outside", "SCHEMA", "f", "TEXT"]).ok());
+    let second = c.cmd(&["EVALSHA", &sha, "1", "{q}:k", "second"]);
+    assert!(second.ok(), "{second:?}");
+}

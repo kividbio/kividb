@@ -80,10 +80,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 "    Print this help.",
             ]
             .iter()
-            .map(|l| resp_bulk_str(l))
+            .map(|l| resp_simple(l))
             .collect(),
         )),
 
-        _ => Some(resp_error("ERR unknown subcommand for SLOWLOG")),
+        _ => Some(resp_error(&format!(
+            "ERR unknown subcommand '{}'. Try SLOWLOG HELP.",
+            String::from_utf8_lossy(ctx.cmd[1])
+        ))),
     }
 }

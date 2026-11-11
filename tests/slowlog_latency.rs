@@ -1128,9 +1128,9 @@ fn test_latency_history_entry_structure() {
     }
 }
 
-// LATENCY HISTORY is capped at 180 samples per event.
+// LATENCY HISTORY is capped at 160 samples per event, as in Redis.
 #[test]
-fn test_latency_history_capped_at_180() {
+fn test_latency_history_capped_at_160() {
     let port = free_port();
     start_server_log_all(port);
     let mut c = Conn::connect(port);
@@ -1143,8 +1143,8 @@ fn test_latency_history_capped_at_180() {
     for event in &["command", "fast-command"] {
         let history = c.cmd(&["LATENCY", "HISTORY", event]);
         assert!(
-            history.as_array().len() <= 180,
-            "LATENCY HISTORY for '{event}' must not exceed 180 samples, got {}",
+            history.as_array().len() <= 160,
+            "LATENCY HISTORY for '{event}' must not exceed 160 samples, got {}",
             history.as_array().len()
         );
     }

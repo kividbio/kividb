@@ -910,11 +910,28 @@ pub type IndexStore = Arc<Indexes>;
 /// one that took the shared lock before it would be: what the holder does
 /// to the keyspace after taking the lock (a new index's backfill, under
 /// the shards' locks) sees that write's key.
+///
+/// That orders the write's question before the holder, not the write. A
+/// hash write that finds no index takes its key's order shared, beside the
+/// other writes of the key (`handler::atomic_under_its_shard`), and brings
+/// the indexes up to date after it has let go of the shard: one that asked
+/// before an `FT.CREATE` added its index, and wrote after the walk had read
+/// the key, indexed its own fields beside another such write, and the index
+/// could keep the earlier one's (#570). So the first index is added with
+/// [`Indexes::write_to_add`], which makes `none` false and waits out every
+/// write that holds a key's order before it adds anything; and a hash write
+/// that took its key's order shared asks again once it holds it
+/// (`handler::ask_again_for_an_index`), and takes it whole if the answer has
+/// changed.
 #[derive(Default)]
 pub struct Indexes {
     /// Whether the map may have anything in it. On a cache line of its own.
     any: OwnLine,
     map: RwLock<AHashMap<String, IndexDef>>,
+    /// How many [`Indexes::write_to_add`] are waiting out the writes that
+    /// found no index: `any` stays true while there are any. Changed, and
+    /// read, with `map` held to change.
+    raising: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -935,7 +952,48 @@ impl Indexes {
         IndexesWriteGuard {
             map,
             any: &self.any.0,
+            raising: &self.raising,
         }
+    }
+
+    /// The indexes, to add one to: [`Indexes::write`], and, when there is
+    /// none, once every write that may have found none has finished (#570).
+    ///
+    /// `none` is made false first, and stays false; then each key's write
+    /// order is taken whole and let go of (`write_order::barrier`), with the
+    /// lock let go of meanwhile, since a write that holds an order may be
+    /// waiting to read the indexes. A write that held an order shared then
+    /// has finished, before anything was added: it falls before the new
+    /// index, whose walk finds what it wrote. One that takes an order after
+    /// the barrier has passed it finds `none` false, and takes it whole.
+    ///
+    /// Not with the command gate held alone (a transaction, or a script run
+    /// alone): no other command runs then, and every one that runs after
+    /// asks after it.
+    ///
+    /// Refused ([`FIRST_INDEX_BESIDE_OTHERS`]) in a script that runs beside
+    /// others (`tag_locks`): other commands run meanwhile, and the barrier
+    /// cannot, since the script holds its keys' order. With an index there
+    /// already, nothing has to be waited out, and it is not refused.
+    pub fn write_to_add(&self) -> Result<IndexesWriteGuard<'_>, &'static str> {
+        let mut map = self.map.write();
+        let first = map.is_empty() && !crate::command_gate::alone_on_this_thread();
+        if first && (crate::tag_locks::beside_others() || crate::write_order::holds_stripes()) {
+            return Err(FIRST_INDEX_BESIDE_OTHERS);
+        }
+        self.any.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        if first {
+            self.raising.fetch_add(1, Relaxed);
+            drop(map);
+            crate::write_order::barrier();
+            map = self.map.write();
+            self.raising.fetch_sub(1, Relaxed);
+        }
+        Ok(IndexesWriteGuard {
+            map,
+            any: &self.any.0,
+            raising: &self.raising,
+        })
     }
 
     /// Whether there is no index, nor alias, without taking the lock: what
@@ -946,10 +1004,16 @@ impl Indexes {
     }
 }
 
+/// [`Indexes::write_to_add`]'s refusal.
+pub const FIRST_INDEX_BESIDE_OTHERS: &str = "ERR the first search index cannot be created \
+     from a script that runs beside other scripts (lua-parallel-scripts): create it outside \
+     the script";
+
 /// [`Indexes::write`]'s hold of the lock.
 pub struct IndexesWriteGuard<'a> {
     map: parking_lot::RwLockWriteGuard<'a, AHashMap<String, IndexDef>>,
     any: &'a AtomicBool,
+    raising: &'a AtomicUsize,
 }
 
 impl std::ops::Deref for IndexesWriteGuard<'_> {
@@ -968,7 +1032,8 @@ impl std::ops::DerefMut for IndexesWriteGuard<'_> {
 impl Drop for IndexesWriteGuard<'_> {
     fn drop(&mut self) {
         // Before the lock is let go of (`map` is dropped after this).
-        self.any.store(!self.map.is_empty(), Release);
+        let any = !self.map.is_empty() || self.raising.load(Relaxed) > 0;
+        self.any.store(any, Release);
     }
 }
 
@@ -1225,6 +1290,11 @@ pub fn walk_documents(
 
 /// Build every index again from the documents of its database: after
 /// `SWAPDB`, which swaps what two databases hold under the indexes of each.
+///
+/// It replaces indexes that are there, and never adds the first one: a
+/// write that asks finds an index all along, and takes its key's order
+/// whole, so the walks below meet it key by key (`walk_documents`), and
+/// nothing has to be waited out first ([`Indexes::write_to_add`]).
 pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
     let rebuilt: Vec<IndexDef> = {
         let mut indexes = index_store.write();
@@ -1860,7 +1930,11 @@ pub fn register_index_schemas(
     if schemas.is_empty() {
         return;
     }
-    let mut idx = index_store.write();
+    // Possibly the first index: see `Indexes::write_to_add` (#570). Never
+    // from a script, so never refused.
+    let mut idx = index_store
+        .write_to_add()
+        .unwrap_or_else(|_| index_store.write());
     for schema in schemas {
         let mut def = schema.clone().into_def();
         if let Some(field_graphs) = hnsw_graphs.get(&def.name) {
@@ -2476,6 +2550,11 @@ static LEAVING: parking_lot::Mutex<Vec<(usize, usize, Box<str>)>> =
 
 /// Whether `index_store` has an index of database `db`: whether a key of it
 /// that expires is marked leaving ([`mark_leaving`]).
+///
+/// Asked with the keys' write order held. Held shared (a hash write that
+/// found no index, and expires its fields), the write is over before a
+/// first index is added ([`Indexes::write_to_add`]); held whole, it falls
+/// before or after a walk's visit of each key, as any write does (#570).
 pub fn has_index_of(index_store: &IndexStore, db: usize) -> bool {
     !index_store.none() && index_store.read().values().any(|def| def.db_index == db)
 }
@@ -2600,6 +2679,59 @@ mod indexes_tests {
         assert_eq!(drop_all_indexes(&store), 1);
         assert!(store.none());
         assert!(!has_index_of(&store, 0));
+    }
+
+    /// The first index is added only once every write that holds a key's
+    /// order (a hash write that found no index holds it shared) is done;
+    /// meanwhile `none` is false, so a write that asks then takes its order
+    /// whole (#570). With an index there, nothing is waited for.
+    #[test]
+    fn the_first_index_waits_for_the_writes_that_found_none() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::time::{Duration, Instant};
+        let store = new_index_store();
+        // An `HSET` that found no index, holding its key's order shared.
+        let writing = crate::write_order::lock_key_shared(0, b"doc:570");
+        let added = Arc::new(AtomicBool::new(false));
+        let adder = {
+            let (store, added) = (Arc::clone(&store), Arc::clone(&added));
+            std::thread::spawn(move || {
+                store
+                    .write_to_add()
+                    .unwrap()
+                    .insert("idx".into(), schema("idx"));
+                added.store(true, SeqCst);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.none() {
+            assert!(Instant::now() < deadline, "none never became false");
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !added.load(SeqCst),
+            "added beside a write that found no index"
+        );
+        assert!(store.read().is_empty());
+        assert!(!store.none(), "none while the adder waits");
+        drop(writing);
+        adder.join().unwrap();
+        assert!(store.read().contains_key("idx"));
+        assert!(!store.none());
+
+        let writing = crate::write_order::lock_key_shared(0, b"doc:570");
+        let more = Arc::clone(&store);
+        std::thread::spawn(move || {
+            more.write_to_add()
+                .unwrap()
+                .insert("other".into(), schema("other"));
+        })
+        .join()
+        .unwrap();
+        drop(writing);
+        assert_eq!(drop_all_indexes(&store), 2);
+        assert!(store.none());
     }
 }
 

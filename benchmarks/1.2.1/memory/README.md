@@ -1,5 +1,8 @@
 # Memory: bytes per key, 1.2.1 against 1.2.0
 
+> The rest of the memory suite (snapshots, the AOF rewrite, eviction during a snapshot, active defrag) and the
+> competitors were rerun later on commit `ccba20e2`: see [full/](full/README.md).
+
 The memory suite of `benchmarks/1.2.0/memory/` was run on **1.2.1 (878746e4)** and on the **1.2.0 release
 binary**. The builds alternated on the same two VMs in one session on 2026-11-09. It used the 1.2.0 round's
 harness, the same VM sizes and region as its last round ("pair A"), and the same scenarios:

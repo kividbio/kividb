@@ -562,10 +562,21 @@ impl Subscriptions {
         self.forwarder = Some(task);
     }
 
-    /// Channels, patterns and shard channels together: the count every
-    /// reply to a (un)subscribe carries.
+    /// Channels, patterns and shard channels together: while it is not 0,
+    /// the connection is subscribed.
     pub fn total(&self) -> usize {
         self.names.iter().map(Vec::len).sum()
+    }
+
+    /// The count a reply to a (un)subscribe of `kind` carries, as in Redis:
+    /// shard channels for `SSUBSCRIBE`/`SUNSUBSCRIBE`, channels and patterns
+    /// together for the others.
+    fn count_for(&self, kind: usize) -> usize {
+        if kind == SHARD {
+            self.names[SHARD].len()
+        } else {
+            self.names[CHANNEL].len() + self.names[PATTERN].len()
+        }
     }
 
     /// The replies written so far have reached the socket: messages may
@@ -619,14 +630,20 @@ impl Subscriptions {
                     self.names[kind].push(Arc::clone(&target));
                     self.hub.add(kind, &target, &self.me);
                 }
-                write_ack(&mut out, resp, word, Some(target.as_ref()), self.total());
+                write_ack(
+                    &mut out,
+                    resp,
+                    word,
+                    Some(target.as_ref()),
+                    self.count_for(kind),
+                );
             }
         } else if cmd.len() == 1 {
             let all = std::mem::take(&mut self.names[kind]);
             if all.is_empty() {
-                write_ack(&mut out, resp, word, None, self.total());
+                write_ack(&mut out, resp, word, None, self.count_for(kind));
             }
-            let others = self.total();
+            let others = self.count_for(kind);
             for (done, target) in all.iter().enumerate() {
                 self.forget(kind, target);
                 write_ack(
@@ -643,7 +660,7 @@ impl Subscriptions {
                     let target = self.names[kind].remove(at);
                     self.forget(kind, &target);
                 }
-                write_ack(&mut out, resp, word, Some(raw), self.total());
+                write_ack(&mut out, resp, word, Some(raw), self.count_for(kind));
             }
         }
 
@@ -906,6 +923,36 @@ mod tests {
                 .unwrap()
                 .starts_with("-ERR wrong number of arguments")
         );
+    }
+
+    /// As in Redis, shard (un)subscribes count shard channels only, and
+    /// the others count channels and patterns only (#564).
+    #[test]
+    fn shard_subscriptions_are_counted_apart_from_channels_and_patterns() {
+        let hub = PubSubHub::new();
+        let (mut subs, _outbox) = subscriber(&hub, 1);
+        subs.handle(&[b"SUBSCRIBE", b"a"], 2);
+        assert_eq!(
+            subs.handle(&[b"SSUBSCRIBE", b"s"], 2),
+            b"*3\r\n$10\r\nssubscribe\r\n$1\r\ns\r\n:1\r\n"
+        );
+        assert_eq!(
+            subs.handle(&[b"PSUBSCRIBE", b"p"], 2),
+            b"*3\r\n$10\r\npsubscribe\r\n$1\r\np\r\n:2\r\n"
+        );
+        assert_eq!(
+            subs.handle(&[b"SSUBSCRIBE", b"t"], 2),
+            b"*3\r\n$10\r\nssubscribe\r\n$1\r\nt\r\n:2\r\n"
+        );
+        assert_eq!(
+            subs.handle(&[b"SUNSUBSCRIBE"], 2),
+            b"*3\r\n$12\r\nsunsubscribe\r\n$1\r\ns\r\n:1\r\n*3\r\n$12\r\nsunsubscribe\r\n$1\r\nt\r\n:0\r\n"
+        );
+        assert_eq!(
+            subs.handle(&[b"UNSUBSCRIBE", b"a"], 2),
+            b"*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:1\r\n"
+        );
+        assert_eq!(subs.total(), 1);
     }
 
     #[test]

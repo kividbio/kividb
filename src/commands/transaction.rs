@@ -61,13 +61,8 @@ pub fn queue_refusal(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
     // What cannot be one step of several: it ends the process, or takes
     // the connection over. (`MONITOR` is queued, as in Redis, and refused
     // when `EXEC` runs it: see `connection_reply_in_exec`.)
-    if matches!(
-        name,
-        "SAVE" | "SHUTDOWN" | "BGREWRITEAOF" | "FAILOVER" | "SYNC" | "PSYNC"
-    ) {
-        return Some(crate::resp::write::resp_error(
-            "ERR Command not allowed inside a transaction",
-        ));
+    if not_allowed_in_multi(name) {
+        return Some(crate::resp::write::resp_error(NOT_IN_MULTI));
     }
     if busy(cmd) {
         return Some(crate::resp::write::resp_error(BUSY));
@@ -77,6 +72,16 @@ pub fn queue_refusal(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 
 const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
+/// The refusal of a command that may not be part of a transaction.
+pub const NOT_IN_MULTI: &str = "ERR Command not allowed inside a transaction";
+
+/// Whether `name` (in capitals) may not be part of a transaction: the
+/// commands Redis flags `no-multi`. They end the process, write a
+/// snapshot in the foreground, or take the connection over.
+pub fn not_allowed_in_multi(name: &str) -> bool {
+    matches!(name, "SAVE" | "SHUTDOWN" | "SYNC" | "PSYNC")
+}
+
 /// What a transaction's queued command is run with, when the connection loop
 /// answers it itself rather than `execute_command`.
 pub struct InExec<'a> {
@@ -84,6 +89,8 @@ pub struct InExec<'a> {
     pub acl_log: &'a crate::acl::SharedAclLog,
     pub user: &'a str,
     pub peer_addr: &'a str,
+    pub client_registry: &'a crate::client_registry::ClientRegistry,
+    pub client_id: u64,
     pub repl_state: &'a crate::replication::ReplState,
     /// For a queued `WAIT`: the replicas, and what each had been sent, as
     /// `EXEC` began (see `queues_wait`). None when nothing queued waits.
@@ -131,8 +138,12 @@ pub fn connection_reply_in_exec(name: &str, cmd: &[&[u8]], env: &InExec) -> Opti
             .get(env.user)
             .and_then(|user| crate::acl::check_permission(user, name, cmd).err());
         if let Some(denied) = denied {
-            env.acl_log
-                .record(denied.reason(), denied.object(), env.user, env.peer_addr);
+            env.acl_log.record(
+                denied.reason(),
+                denied.object(),
+                env.user,
+                &crate::acl::log_client_info(env.client_registry, env.client_id, env.peer_addr),
+            );
             return Some(crate::resp::write::resp_error(&denied.message(env.user)));
         }
     }
@@ -147,17 +158,17 @@ pub fn connection_reply_in_exec(name: &str, cmd: &[&[u8]], env: &InExec) -> Opti
         "MONITOR" => {
             crate::resp::write::resp_error("ERR MONITOR isn't allowed for DENY BLOCKING client")
         }
-        "WAIT" => {
-            let connected = env.repl_state.connected_replicas.load(Ordering::Relaxed);
-            if number(1) == 0 || connected == 0 {
-                crate::resp::write::resp_integer(connected)
-            } else {
-                crate::resp::write::resp_integer(
-                    env.wait_targets
-                        .map_or(0, crate::replication::ReplState::count_reached),
-                )
-            }
-        }
+        // Its arguments checked as outside a transaction (#561), and refused
+        // on a replica.
+        "WAIT" => match crate::replication::wait_args(cmd, env.repl_state.is_slave()) {
+            Err(refusal) => refusal,
+            // Whatever the number asked for: the replicas that have what
+            // was written before this `EXEC`, now, as Redis answers.
+            Ok(_) => crate::resp::write::resp_integer(
+                env.wait_targets
+                    .map_or(0, crate::replication::ReplState::count_reached),
+            ),
+        },
         _ => {
             if !crate::aof::AOF_ENABLED.load(Ordering::Relaxed) {
                 if number(1) != 0 {
@@ -257,6 +268,53 @@ impl TxState {
         self.dirty = false;
         self.aborted = false;
     }
+}
+
+/// Where a refused `EXEC` is shown to MONITOR: see [`reject`].
+pub struct Monitored<'a> {
+    pub registry: &'a crate::monitor::SharedMonitorRegistry,
+    pub db: usize,
+    pub peer_addr: &'a str,
+}
+
+/// A command refused before it ran — no such command, the wrong number of
+/// arguments, not allowed inside MULTI, not allowed to the user — as Redis's
+/// `rejectCommand` refuses it. Inside MULTI the transaction is failed, and
+/// `EXEC` will refuse it. A refused `EXEC` itself discards the transaction,
+/// watches and all, and says why: `-EXECABORT Transaction discarded because
+/// of: <the refusal>`, and MONITOR sees it, as it sees an `EXEC` that ran.
+/// `refusal` is the error reply; what is returned is the reply to send.
+pub fn reject(
+    tx: &mut TxState,
+    cmd: &[&[u8]],
+    watches: &dyn crate::watch::WatchNotifier,
+    dirty_flag: &Arc<std::sync::atomic::AtomicBool>,
+    monitor: Monitored<'_>,
+    refusal: Vec<u8>,
+) -> Vec<u8> {
+    let is_exec = cmd
+        .first()
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"EXEC"));
+    if !is_exec {
+        if tx.active {
+            tx.aborted = true;
+        }
+        return refusal;
+    }
+    watches.unwatch_all(
+        &tx.watched_keys
+            .iter()
+            .map(|_| Arc::clone(dirty_flag))
+            .collect::<Vec<_>>(),
+    );
+    tx.reset();
+    dirty_flag.store(false, Ordering::Release);
+    crate::monitor::feed(monitor.registry, cmd, monitor.db, monitor.peer_addr);
+    let why = String::from_utf8_lossy(&refusal);
+    crate::resp::write::resp_error(&format!(
+        "EXECABORT Transaction discarded because of: {}",
+        why.trim_start_matches('-').trim_end()
+    ))
 }
 
 impl Default for TxState {

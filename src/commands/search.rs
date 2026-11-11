@@ -430,10 +430,11 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     // write. The walk takes each key's write order and reads it as it is
     // then (`vector::walk_documents`), so it cannot put back what a write
     // to the key has replaced. A clone of the definition shares its live
-    // indexes.
+    // indexes. Added once the writes that found no index are done, if it is
+    // the first (`vector::Indexes::write_to_add`, #570).
     def.name = name.clone();
     {
-        let mut store = ctx.index_store.write();
+        let mut store = ctx.index_store.write_to_add()?;
         if store.contains_key(&name) {
             return Err("Index already exists".into());
         }
@@ -464,7 +465,11 @@ fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<V
 }
 
 /// Documents the index covers: hashes, or JSON documents, under its prefixes.
-fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
+pub(crate) fn count_docs(
+    db: &Db,
+    def: &IndexDef,
+    cluster: Option<&crate::cluster::ClusterState>,
+) -> usize {
     // Read before any shard is locked: not the slot table with one held
     // (see `ClusterState`).
     let served = cluster.map(crate::cluster::search::served_slots);
@@ -2867,7 +2872,7 @@ mod tests {
             if key == "d347:b" {
                 inner
                     .expiries
-                    .insert("n".into(), Instant::now() + Duration::from_millis(1));
+                    .insert("n".into(), crate::types::field_now() + 1);
             }
             crate::store::get_shard(&store[0], key).write().insert(
                 key,

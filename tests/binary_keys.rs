@@ -239,10 +239,12 @@ impl Server {
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
                 s.set_read_timeout(Some(Duration::from_secs(10)))?;
-                s.write_all(b"*1\r\n$4\r\nPING\r\n")?;
-                let mut reply = [0u8; 7];
+                // DBSIZE, not PING: PING is answered while the dataset is
+                // still loading, and the tests read the data straight away.
+                s.write_all(b"*1\r\n$6\r\nDBSIZE\r\n")?;
+                let mut reply = [0u8; 1];
                 s.read_exact(&mut reply)?;
-                Ok(&reply == b"+PONG\r\n")
+                Ok(reply[0] == b':')
             });
             if up.unwrap_or(false) {
                 return;

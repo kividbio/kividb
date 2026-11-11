@@ -25,6 +25,13 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Unique temp path per test — avoids collisions during parallel runs.
@@ -1521,11 +1528,9 @@ fn kdb_hashex_with_field_ttls() {
     inner
         .fields
         .insert("b".to_string(), Arc::from(b"2".as_slice()));
-    // Set field "a" to expire ~5 minutes from now.
-    inner.expiries.insert(
-        "a".to_string(),
-        std::time::Instant::now() + std::time::Duration::from_secs(300),
-    );
+    // Set field "a" to expire 5 minutes from now.
+    let at = unix_ms_now() + 300_000;
+    inner.expiries.insert("a".to_string(), at);
 
     let v = roundtrip_one("hxttl", KiviDBValue::HashEx(Arc::new(RwLock::new(inner))));
     match v {
@@ -1534,10 +1539,8 @@ fn kdb_hashex_with_field_ttls() {
             assert_eq!(read.fields.len(), 2);
             assert_eq!(read.expiries.len(), 1);
             assert!(read.expiries.contains_key("a"));
-            // Re-anchored TTL should still be in the future, in the rough
-            // ballpark of 5 minutes (allow generous slack for slow CI).
-            let remaining = read.expiries["a"].saturating_duration_since(std::time::Instant::now());
-            assert!(remaining.as_secs() >= 250 && remaining.as_secs() <= 305);
+            // The very deadline, Unix milliseconds as it is kept (#594).
+            assert_eq!(read.expiries["a"], at);
         }
         _ => panic!("wrong variant after round-trip"),
     }
@@ -1553,12 +1556,10 @@ fn kdb_hashex_already_expired_ttl_is_dropped_on_load() {
     inner
         .fields
         .insert("a".to_string(), Arc::from(b"1".as_slice()));
-    // Manually craft an expiry in the past by anchoring an Instant just
-    // before now. (The serializer converts to abs_ms via SystemTime.)
-    inner.expiries.insert(
-        "a".to_string(),
-        std::time::Instant::now() - std::time::Duration::from_secs(10),
-    );
+    // An expiry ten seconds in the past.
+    inner
+        .expiries
+        .insert("a".to_string(), unix_ms_now() - 10_000);
 
     let mut map = HashMap::new();
     map.insert(
