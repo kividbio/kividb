@@ -660,6 +660,11 @@ impl ShardMap {
                         Ttl::Set(expires) => expires.is_some() == old.has_ttl(),
                     };
                     if room_stays && old.fits_in_place(bytes.len()) {
+                        // The time it had, for the list's sum of them.
+                        let was = match ttl {
+                            Ttl::Set(Some(_)) => old.expires(),
+                            _ => None,
+                        };
                         // SAFETY: the shard is locked for writing (`&mut
                         // self`), the table alone holds the entry, and the
                         // bytes keep it in its class; a time to live it
@@ -671,8 +676,8 @@ impl ShardMap {
                             }
                         }
                         // A time that now ends before the horizon.
-                        if let Ttl::Set(Some(_)) = ttl {
-                            list.retimed(old);
+                        if let Some(was) = was {
+                            list.retimed(old, was);
                         }
                         used(old, hash, map);
                         return Written::InPlace;
@@ -864,10 +869,11 @@ impl ShardMap {
             return false;
         }
         if old.has_ttl() && old.holders() == 1 {
+            let was = old.expires().unwrap_or(0);
             // SAFETY: the shard is locked for writing, and nothing but the
             // table holds the entry.
             unsafe { old.set_expires(expires) };
-            self.ttl.retimed(old);
+            self.ttl.retimed(old, was);
             used(old, hash, map);
             return true;
         }
@@ -912,6 +918,15 @@ impl ShardMap {
     #[inline]
     pub fn ttl_len(&self) -> usize {
         self.ttl.len()
+    }
+
+    /// The sum of when the times to live of the [`ShardMap::ttl_len`] keys
+    /// that have one end (milliseconds since the Unix epoch), kept as they
+    /// change: `INFO keyspace`'s `avg_ttl` without a pass over them (#622).
+    /// Keys past their time that expiry has not taken out yet are in it.
+    #[inline]
+    pub fn ttl_deadline_sum(&self) -> u128 {
+        self.ttl.deadline_sum()
     }
 
     /// The entry at place `index` of the list of keys with a time to live:
@@ -1930,6 +1945,16 @@ mod tests {
                     map.expiring().map(|(k, at)| (k.to_vec(), at)).collect();
                 listed.sort();
                 assert_eq!(listed, table, "step {step}");
+                // And the sum of their times, kept as they changed, is the
+                // table's (#622).
+                let sum: u128 = table.iter().map(|&(_, at)| u128::from(at)).sum();
+                assert_eq!(map.ttl_deadline_sum(), sum, "step {step}");
+                assert_eq!(map.ttl_len(), table.len(), "step {step}");
+            }
+            if step % 20_000 == 19_999 {
+                // Everything taken out at once, as `FLUSHDB` does.
+                map.clear();
+                assert_eq!((map.ttl_len(), map.ttl_deadline_sum()), (0, 0));
             }
         }
         // The near part is no bigger than what can come due before the
@@ -1942,6 +1967,59 @@ mod tests {
             .filter(|&&(_, at)| at < now + super::super::ttl_list::HORIZON_MS)
             .count();
         assert_eq!(map.ttl.near_len(), soon);
+    }
+
+    /// The sum of the times to live is kept through every way a key gets,
+    /// changes and loses one: what `avg_ttl` is made of (#622).
+    #[test]
+    fn the_sum_of_the_times_follows_every_change() {
+        let mut map = ShardMap::new();
+        let now = crate::commands::helpers::now_ms() + 1_000_000_000;
+        let sum = |map: &ShardMap| {
+            map.ttl.check();
+            map.ttl_deadline_sum()
+        };
+        assert_eq!(sum(&map), 0);
+        map.insert_expiring("a", s("v"), Some(now + 100));
+        map.set_str_expiring("b", "v", Some(now + 200));
+        map.set_str("c", "v");
+        assert_eq!(sum(&map), u128::from(2 * now + 300));
+        // Written over in place with a new time, and with none given (the
+        // time stays).
+        map.set_str_expiring("b", "w", Some(now + 250));
+        assert_eq!(sum(&map), u128::from(2 * now + 350));
+        map.set_str("b", "y");
+        assert_eq!(sum(&map), u128::from(2 * now + 350));
+        // A new time, in place and on an entry held elsewhere.
+        assert!(map.set_expires("a", now + 50_000));
+        let held = map.get_ref("a");
+        assert!(map.set_expires("a", now + 60_000));
+        drop(held);
+        assert_eq!(sum(&map), u128::from(2 * now + 60_250));
+        // A key without one given one, and one losing it.
+        assert!(map.set_expires("c", now + 1));
+        assert!(map.persist("a"));
+        assert_eq!(sum(&map), u128::from(2 * now + 251));
+        // Written over with its time taken away.
+        map.set_str_expiring("b", "x", None);
+        assert_eq!(sum(&map), u128::from(now + 1));
+        // Taken out and put back, as `MOVE` does.
+        let taken = map.remove("c").unwrap();
+        assert_eq!(sum(&map), 0);
+        assert!(map.put_back(taken).is_ok());
+        assert_eq!(sum(&map), u128::from(now + 1));
+        // A sweep moves entries between the lists and leaves the sum.
+        for i in 0..100u64 {
+            map.insert_expiring(format!("k{i}"), s("v"), Some(now + i * 1_000));
+        }
+        let before = sum(&map);
+        while !map.sweep_ttl(now, 7) {}
+        assert_eq!(sum(&map), before);
+        // Times up to the largest there is do not overflow it.
+        map.insert_expiring("max", s("v"), Some(u64::MAX - 1));
+        assert_eq!(sum(&map), before + u128::from(u64::MAX - 1));
+        map.clear();
+        assert_eq!(sum(&map), 0);
     }
 
     /// A clock stepped forward, a sweep, then the clock stepped back: the
