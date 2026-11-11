@@ -58,8 +58,15 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
 
     // Anything past this point requires cluster mode for now.
     // (ADDSLOTS / SETSLOT / MEET come in later steps; until they exist we
-    // return the same error redis-cli expects, instead of "unknown".)
+    // return the same error redis-cli expects, instead of "unknown".) A
+    // subcommand there is no such thing as is unknown either way, as in
+    // Redis.
     if !state.enabled {
+        if crate::commands::arity::of(&format!("CLUSTER|{sub}")).is_none()
+            && !matches!(sub, "MIGRATION" | "SYNCSLOTS")
+        {
+            return unknown_cluster_subcommand(ctx);
+        }
         return resp_error("ERR This instance has cluster support disabled");
     }
 
@@ -86,8 +93,87 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "MIGRATION" => cmd_migration(ctx),
         // Node-to-node half of CLUSTER MIGRATION; not for clients.
         "SYNCSLOTS" => cmd_syncslots(ctx),
-        other => resp_error(&format!("ERR Unknown CLUSTER subcommand '{other}'")),
+        "HELP" if ctx.cmd.len() == 2 => cluster_help(),
+        _ => unknown_cluster_subcommand(ctx),
     }
+}
+
+/// Redis's reply to a `CLUSTER` subcommand there is no such thing as.
+fn unknown_cluster_subcommand(ctx: &Ctx) -> Vec<u8> {
+    resp_error(&format!(
+        "ERR unknown subcommand '{}'. Try CLUSTER HELP.",
+        String::from_utf8_lossy(ctx.cmd[1])
+    ))
+}
+
+/// `CLUSTER HELP`, Redis 8.10's lines (#562).
+fn cluster_help() -> Vec<u8> {
+    const LINES: &[&str] = &[
+        "CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "COUNTKEYSINSLOT <slot>",
+        "    Return the number of keys in <slot>.",
+        "GETKEYSINSLOT <slot> <count>",
+        "    Return key names stored by current node in a slot.",
+        "INFO",
+        "    Return information about the cluster.",
+        "KEYSLOT <key>",
+        "    Return the hash slot for <key>.",
+        "MYID",
+        "    Return the node id.",
+        "MYSHARDID",
+        "    Return the node's shard id.",
+        "NODES",
+        "    Return cluster configuration seen by node. Output format:",
+        "    <id> <ip:port@bus-port[,hostname]> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ...",
+        "REPLICAS <node-id>",
+        "    Return <node-id> replicas.",
+        "SLOTS",
+        "    Return information about slots range mappings. Each range is made of:",
+        "    start, end, master and replicas IP addresses, ports and ids",
+        "SLOT-STATS",
+        "    Return an array of slot usage statistics for slots assigned to the current node.",
+        "SHARDS",
+        "    Return information about slot range mappings and the nodes associated with them.",
+        "ADDSLOTS <slot> [<slot> ...]",
+        "    Assign slots to current node.",
+        "ADDSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...]",
+        "    Assign slots which are between <start-slot> and <end-slot> to current node.",
+        "BUMPEPOCH",
+        "    Advance the cluster config epoch.",
+        "COUNT-FAILURE-REPORTS <node-id>",
+        "    Return number of failure reports for <node-id>.",
+        "DELSLOTS <slot> [<slot> ...]",
+        "    Delete slots information from current node.",
+        "DELSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...]",
+        "    Delete slots information which are between <start-slot> and <end-slot> from current node.",
+        "FAILOVER [FORCE|TAKEOVER]",
+        "    Promote current replica node to being a master.",
+        "FORGET <node-id>",
+        "    Remove a node from the cluster.",
+        "FLUSHSLOTS",
+        "    Delete current node own slots information.",
+        "MEET <ip> <port> [<bus-port>]",
+        "    Connect nodes into a working cluster.",
+        "REPLICATE <node-id>",
+        "    Configure current node as replica to <node-id>.",
+        "RESET [HARD|SOFT]",
+        "    Reset current node (default: soft).",
+        "SET-CONFIG-EPOCH <epoch>",
+        "    Set config epoch of current node.",
+        "SETSLOT <slot> (IMPORTING <node-id>|MIGRATING <node-id>|STABLE|NODE <node-id>)",
+        "    Set slot state.",
+        "SAVECONFIG",
+        "    Force saving cluster configuration on disk.",
+        "LINKS",
+        "    Return information about all network links between this node and its peers.",
+        "    Output format is an array where each array element is a map containing attributes of a link",
+        "MIGRATION IMPORT <start-slot end-slot [start-slot end-slot ...]> |",
+        "          STATUS [ID <task-id> | ALL] | CANCEL [ID <task-id> | ALL]",
+        "    Start, monitor and cancel slot migration.",
+        "HELP",
+        "    Print this help.",
+    ];
+    resp_array(LINES.iter().map(|line| resp_simple(line)).collect())
 }
 
 // ── CLUSTER MYID ─────────────────────────────────────────────────────────────
@@ -2048,12 +2134,11 @@ fn hold_while_moving(db: usize, keys: &[&[u8]]) -> Option<MoveHold> {
 }
 
 /// How near its time a hash's field may be and still be on one side only of
-/// [`same_hash_but_for_expired_fields`], and how far apart its two times may
-/// be. The payload's copy of a field's time is up to 2 ms early (the dump
-/// rounds it down to the millisecond twice), the decoder reads it back
-/// against a clock rounded down to the millisecond, and the two sides are
-/// read a moment apart.
-const FIELD_TIME_SLACK: std::time::Duration = std::time::Duration::from_millis(5);
+/// [`same_hash_but_for_expired_fields`]: the two sides are read a moment
+/// apart, and a read between them may have dropped a field that ran out.
+/// Its time, kept as the Unix milliseconds the payload carries, is the
+/// same on both sides to the millisecond (#594).
+const FIELD_TIME_SLACK_MS: u64 = 5;
 
 /// Whether `value`, a hash, holds what `payload` held but for fields whose
 /// time has run out since: a read (`HGETALL`) drops those, and that is no
@@ -2065,24 +2150,18 @@ const FIELD_TIME_SLACK: std::time::Duration = std::time::Duration::from_millis(5
 /// field with each side's own rule, an unchanged hash with a field in its
 /// last 2 ms looked written, and `MIGRATE` answered `TRYAGAIN` (#332). So
 /// the two sides are compared by one clock and one rule: every field that is
-/// not within [`FIELD_TIME_SLACK`] of its time, on either side, is on the
+/// not within [`FIELD_TIME_SLACK_MS`] of its time, on either side, is on the
 /// other side too, with the same value and a time (or none) that agrees.
 fn same_hash_but_for_expired_fields(value: &crate::types::KiviDBValue, payload: &[u8]) -> bool {
     use crate::types::{HashInner, KiviDBValue};
-    use std::time::Instant;
     let (KiviDBValue::HashEx(now), Some(KiviDBValue::HashEx(then))) =
         (value, crate::snapshot::restore_payload(payload))
     else {
         return false;
     };
     let (now, then) = (now.read(), then.read());
-    // The decoder has turned the payload's times into `Instant`s.
-    let soon = Instant::now() + FIELD_TIME_SLACK;
-    let same_time = |a: Option<&Instant>, b: Option<&Instant>| match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.max(b).duration_since(*a.min(b)) <= FIELD_TIME_SLACK,
-        _ => false,
-    };
+    let soon = crate::types::field_now().saturating_add(FIELD_TIME_SLACK_MS);
+    let same_time = |a: Option<&u64>, b: Option<&u64>| a == b;
     // Every field of `a` not about to go is in `b`, the same.
     let held_by = |a: &HashInner, b: &HashInner| {
         a.fields.iter().all(|(field, val)| {
@@ -2561,10 +2640,10 @@ pub(crate) fn key_counts_per_slot(
 mod tests {
     use super::*;
     use crate::types::{HashInner, KiviDBValue};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// A hash of `(field, value, time)`.
-    fn hash(fields: &[(&str, &str, Option<Instant>)]) -> KiviDBValue {
+    fn hash(fields: &[(&str, &str, Option<u64>)]) -> KiviDBValue {
         let mut inner = HashInner::new();
         for (field, value, time) in fields {
             inner
@@ -2581,30 +2660,27 @@ mod tests {
         crate::snapshot::dump_payload(value).unwrap()
     }
 
-    /// A field a few milliseconds from its time: the payload's copy of the
-    /// time was rounded down past now, and the decoder drops the field,
-    /// while here it is still live. The hash is unchanged (#332).
+    /// A field a few milliseconds from its time, on one side and not the
+    /// other, or with times that differ: a read between the two may have
+    /// dropped it. The hash is unchanged (#332).
     #[test]
     fn a_hash_whose_field_is_about_to_expire_is_unchanged() {
-        let now = Instant::now();
-        let later = now + Duration::from_secs(3600);
+        let now = crate::types::field_now();
+        let later = now + 3_600_000;
         let sent = payload(&hash(&[
             ("kept", "1", None),
             ("timed", "2", Some(later)),
-            ("brief", "3", Some(now - Duration::from_millis(1))),
+            ("brief", "3", Some(now - 1)),
         ]));
         let here = hash(&[
             ("kept", "1", None),
             ("timed", "2", Some(later)),
-            ("brief", "3", Some(now + Duration::from_millis(3))),
+            ("brief", "3", Some(now + 3)),
         ]);
         assert!(same_hash_but_for_expired_fields(&here, &sent));
         // And the other way round: the field is gone here, and still in the
         // payload, a moment from its time.
-        let sent = payload(&hash(&[
-            ("kept", "1", None),
-            ("brief", "3", Some(now + Duration::from_millis(3))),
-        ]));
+        let sent = payload(&hash(&[("kept", "1", None), ("brief", "3", Some(now + 3))]));
         let here = hash(&[("kept", "1", None)]);
         assert!(same_hash_but_for_expired_fields(&here, &sent));
     }
@@ -2613,7 +2689,7 @@ mod tests {
     /// the edge, is a write.
     #[test]
     fn a_hash_written_while_it_travelled_is_not_the_same() {
-        let later = Instant::now() + Duration::from_secs(3600);
+        let later = crate::types::field_now() + 3_600_000;
         let sent = payload(&hash(&[("a", "1", None), ("b", "2", Some(later))]));
         for here in [
             hash(&[("a", "9", None), ("b", "2", Some(later))]),
@@ -2622,10 +2698,10 @@ mod tests {
             hash(&[("a", "1", None)]),
             hash(&[("a", "1", None), ("b", "2", None)]),
             hash(&[("a", "1", Some(later)), ("b", "2", Some(later))]),
-            hash(&[
-                ("a", "1", None),
-                ("b", "2", Some(later + Duration::from_secs(1))),
-            ]),
+            hash(&[("a", "1", None), ("b", "2", Some(later + 1_000))]),
+            // Given another time a millisecond off: a write too, now that
+            // both sides keep the very millisecond (#594).
+            hash(&[("a", "1", None), ("b", "2", Some(later + 1))]),
         ] {
             assert!(!same_hash_but_for_expired_fields(&here, &sent));
         }

@@ -341,6 +341,29 @@ fn blocking_commands_in_a_script_take_what_is_there() {
     assert_eq!(c.cmds(&["LLEN", "l"]).as_int(), 1);
 }
 
+/// A key a script's call left as it was (a `DEL` of a key that is not
+/// there) and a later call changed (a `SET` of it) has changed: a `WATCH` on
+/// it fails (#584). What the first call said held for the next.
+#[test]
+fn a_script_that_deletes_a_missing_key_then_sets_it_fails_a_watch() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut watcher = Conn::connect(port);
+    assert_eq!(watcher.cmds(&["WATCH", "made"]).as_str(), "OK");
+    let reply = c.cmds(&[
+        "EVAL",
+        "redis.call('DEL', KEYS[1]) return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        "made",
+    ]);
+    assert!(!reply.is_error(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(watcher.cmds(&["EXEC"]).is_nil());
+}
+
 // ── Nil bulk → Lua false ──────────────────────────────────────────────────────
 
 /// When a Redis command returns nil (key not found), Lua must see false, not nil.
@@ -2212,4 +2235,32 @@ fn test_script_help_lists_subcommands() {
         c.cmds(&["SCRIPT", "HELP", "extra"]).as_error(),
         "ERR wrong number of arguments for 'script|help' command"
     );
+}
+
+/// From a script, a time series sample's time above `i64::MAX` is refused,
+/// as from a client (#592).
+#[test]
+fn a_ts_time_above_i64_max_is_refused_in_a_script() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let over = (i64::MAX as u64 + 1).to_string();
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.pcall('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        &over,
+    ]);
+    assert!(matches!(reply, RespValue::Error(_)), "{reply:?}");
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.call('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        "5",
+    ]);
+    assert!(matches!(reply, RespValue::Int(5)), "{reply:?}");
 }

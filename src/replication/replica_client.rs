@@ -148,6 +148,15 @@ impl ReplicaStarter {
         self.repl_state.set_master_addr(&host, port);
         self.repl_state.become_slave();
         self.repl_state.set_link_state(LinkState::Connect);
+        // As Redis ends them: a client blocked on a master waits for what
+        // only a master is written (#591). Counted first: a command that
+        // parks from here on, before it is listed as blocked, sees the
+        // count change and ends as the sweep would have ended it.
+        crate::commands::blocking::note_role_change(&self.repl_state);
+        let ended = self.client_registry.end_blocked_for_role_change();
+        if ended > 0 {
+            log_info!("Replication: ended {ended} blocked client(s): this node is now a replica");
+        }
 
         let starter = self.clone();
         let spawned = std::thread::Builder::new()
@@ -173,6 +182,8 @@ enum SessionEnd {
     MasterClosed,
     /// A newer `REPLICAOF` or a promotion took over; this task must stop.
     Superseded,
+    /// `CLIENT KILL` ended the link to the master; it is made again.
+    Killed,
 }
 
 #[derive(Debug)]
@@ -287,6 +298,14 @@ pub async fn start_replica(
             }
             Ok(SessionEnd::MasterClosed) => {
                 log_warn!("Replication: Master closed the connection — reconnecting");
+                failures = 0;
+                unfollowable = 0;
+                RECONNECT_DELAY
+            }
+            Ok(SessionEnd::Killed) => {
+                log_warn!(
+                    "Replication: The link to the master was killed (CLIENT KILL) — reconnecting"
+                );
                 failures = 0;
                 unfollowable = 0;
                 RECONNECT_DELAY
@@ -482,6 +501,16 @@ async fn run_replication_session(
     .await?;
     stream.set_nodelay(true)?;
     tune_replication_socket(&stream, timeout);
+    // How the link is listed among this node's clients, once it streams.
+    let link_addrs = (
+        stream
+            .peer_addr()
+            .map_or_else(|_| addr.clone(), |a| a.to_string()),
+        stream
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
+    );
 
     // Over TLS with `tls-replication` (or `tls-cluster`): see `node_tls`.
     type Reader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
@@ -1269,7 +1298,13 @@ async fn run_replication_session(
     send_ack(&mut writer, applied, timeout).await?;
     let mut last_ack = Instant::now();
 
-    // The link is up from here: synced, and about to stream.
+    // The link is up from here: synced, and about to stream. Listed among
+    // the clients as the master (`flags=M`), as Redis lists it.
+    let mut master_link = crate::client_registry::MasterLink::register(
+        &starter.client_registry,
+        link_addrs.0,
+        link_addrs.1,
+    );
     upstream.mark_synced();
     repl_state.note_master_io();
     log_info!("Replication: Synced with {addr}. Entering command stream.");
@@ -1322,6 +1357,12 @@ async fn run_replication_session(
             let read_n = tokio::select! {
                 res = inner.read(&mut temp) => Some(res?),
                 _ = tokio::time::sleep(EPOCH_CHECK_INTERVAL) => None,
+                // `CLIENT KILL` of the master link: dropped where it stands,
+                // between commands, and continued from there.
+                () = master_link.killed() => {
+                    log_info!("Replication: Link to {addr} killed by CLIENT KILL");
+                    return Ok(SessionEnd::Killed);
+                }
             };
             match read_n {
                 Some(0) => {
@@ -1332,6 +1373,7 @@ async fn run_replication_session(
                     offset += n as u64;
                     last_io = Instant::now();
                     repl_state.note_master_io();
+                    master_link.touch();
                     pending_input = true;
                     drained = n < temp.len();
                 }
@@ -2302,6 +2344,8 @@ pub async fn handle_replica_connection<R, W>(
     listening_port: Option<u16>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
+    // The connection's `CLIENT KILL` signal: it ends the link (#595).
+    mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -2316,12 +2360,14 @@ where
     // ── 1. The stream queue. The hub starts filling it at the cut below.
     // Must be **unbounded**: the forwarding task doesn't drain until the payload is sent; a bounded
     // queue hits capacity during long dumps and evicts the replica (connected_slaves goes to 0).
-    let (replica_tx, mut replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
+    let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel();
     // Shared with the hub: it increments this on enqueue, we decrement it after each
     // successful flush. Lets the hub evict us if we fall far enough behind instead of
     // queueing an unbounded backlog — see `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the forwarder ends, and says so.
+    let mut replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // The forwarder writes to the socket itself, one batch at a time, as the
     // io_uring loop's does. Handed to the writer task, the replica's queue
@@ -2351,26 +2397,40 @@ where
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes_fwd.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
+                return;
+            }
 
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
 
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
-                        write_batch(batch).await;
+                        pending_bytes_fwd.taken(batch.len(), held);
+                        if !pending_bytes_fwd.abandoned() {
+                            write_batch(batch).await;
+                        }
                         return;
                     }
                 }
             }
 
-            pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+            pending_bytes_fwd.taken(batch.len(), held);
             if !write_batch(batch).await {
                 break;
             }
@@ -2458,17 +2518,37 @@ where
     // counted against `maxmemory`, rather than in the writer's behind the
     // payload, which was; and the payload is let go of once it is written.
     // Nothing is queued for the writer task before these.
-    {
+    //
+    // Raced against the replica going silent or being let go of: one that
+    // stops reading during its full sync is let go of once its queue passes
+    // its limit, and the write is given up then, rather than waited on for
+    // good with its queue and the payload held (#542).
+    let sent = {
         use tokio::io::AsyncWriteExt;
         let mut out = writer.lock().await;
-        for frame in frames {
-            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(frame.len() as u64, Ordering::Relaxed);
-            if out.write_all(&frame).await.is_err() {
-                rollback_hub(&hub_tx, replica_id);
-                drop(rdb_enqueued_tx);
-                return Ok(());
+        let write_frames = async {
+            for frame in frames {
+                crate::stats::TOTAL_NET_OUTPUT_BYTES
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                if out.write_all(&frame).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        };
+        tokio::select! {
+            sent = write_frames => sent,
+            _ = repl_state.replica_timed_out(replica_id) => {
+                log_warn!("Replication: replica {endpoint} let go of during its full sync");
+                false
             }
         }
+    };
+    if !sent {
+        rollback_hub(&hub_tx, replica_id);
+        drop(rdb_enqueued_tx);
+        forward_task.abort();
+        return Ok(());
     }
     drop(payload_not_counted);
 
@@ -2537,16 +2617,30 @@ where
         _ = &mut forward_task => {
             drop(resp_tx);
         }
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        // `CLIENT KILL`: the link ends here, as on the io_uring loop, where
+        // the kill shuts the socket. The replica connects again and is
+        // continued from the backlog.
+        Ok(()) = &mut kill_rx => {
+            log_info!("Replication: Link to replica {endpoint} killed by CLIENT KILL");
+            forward_task.abort();
+            write_task.abort();
+        }
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
             forward_task.abort();
             write_task.abort();
         }
     }
+    // However the connection ended, its forwarder ends with it: left
+    // running, it held the replica's queue after the hub had forgotten it.
+    forward_task.abort();
     ack_reader_task.abort();
 
     // Hub drops channel list + ACK + connected_slaves (paired with hub RegisterChannel fetch_add).

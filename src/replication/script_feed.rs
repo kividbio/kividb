@@ -161,14 +161,15 @@ pub fn commands_for_propagation(
         // runs the command later — a replica a moment behind, or an AOF
         // replayed after a restart, where every TTL would start over. These
         // are sent with the moment of expiry instead.
-        "SET" => set_feed(cmd),
-        "SETEX" | "PSETEX" => setex_feed(name, cmd),
-        "GETEX" => getex_feed(cmd, resp),
+        "SET" => set_feed(ctx, cmd),
+        "SETEX" | "PSETEX" => setex_feed(ctx, name, cmd),
+        "GETEX" => getex_feed(ctx, cmd, resp),
         "MSETEX" => vec![absolute_ttl_options(
+            ctx,
             cmd,
             msetex_options_start(cmd),
             &[],
-            None,
+            cmd.get(2).copied(),
         )],
         // Sent as what they did, recorded by the commands themselves: the
         // fields whose deadline changed (`HPEXPIREAT … FIELDS`, with no
@@ -179,7 +180,7 @@ pub fn commands_for_propagation(
         }
         // A SET of the result, or DEL/UNLINK; see `cmd_increx`.
         "INCREX" => effects_take(),
-        "RESTORE" => restore_feed(cmd),
+        "RESTORE" => restore_feed(ctx, cmd),
         "INCRBYFLOAT" => incrbyfloat_feed(cmd, resp),
         "XADD" => xadd_feed(cmd, resp),
         // A `~` trim is sent as what it removed; see `exact_trim_args`.
@@ -375,32 +376,53 @@ fn ts_add_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
         && cmd[2] == b"*"
         && let Some(ts) = parse_resp_integer(resp)
     {
-        parts[2] = ts.to_string().into_bytes();
+        parts[2] = sample_time(ts);
     }
     vec![parts]
 }
 
+/// A sample's time as a TS command replied it, an `i64`, as the `u64` the
+/// series holds. A time above `i64::MAX`, which a replica or a replayed AOF
+/// takes from a record an older version wrote, is replied as a negative
+/// number, which no TS command takes (#592).
+fn sample_time(replied: i64) -> Vec<u8> {
+    (replied as u64).to_string().into_bytes()
+}
+
 /// `TS.MADD` with `*` timestamps: each replaced by the one it was given, read
 /// from the matching element of the reply.
+///
+/// A sample that was refused is left out, as RedisTimeSeries leaves it out:
+/// it changed nothing. Sent with its `*`, a replica stamped it with its own
+/// clock and could add a sample the master had refused.
 fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
-    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
-    if !cmd.iter().skip(2).step_by(3).any(|ts| *ts == b"*") {
-        return vec![parts];
+    if resp.first() != Some(&b'*') || cmd.is_empty() {
+        return vec![cmd.iter().map(|b| b.to_vec()).collect()];
     }
     // The reply is an array with one element per sample: `:timestamp`, or an
     // error for a sample that was refused.
     let mut lines = resp.split(|b| *b == b'\n');
     lines.next(); // the array header
-    for (sample, line) in lines.enumerate() {
-        let ts_index = 2 + sample * 3;
-        if ts_index >= parts.len() {
-            break;
+    let mut parts: Vec<Vec<u8>> = vec![cmd[0].to_vec()];
+    for (sample, line) in cmd[1..].chunks(3).zip(lines) {
+        match line.first() {
+            Some(b'-') => continue,
+            Some(b':') if sample.len() == 3 => {
+                let replied = line[1..].trim_ascii();
+                parts.push(sample[0].to_vec());
+                parts.push(
+                    std::str::from_utf8(replied)
+                        .ok()
+                        .and_then(|t| t.parse::<i64>().ok())
+                        .map_or_else(|| replied.to_vec(), sample_time),
+                );
+                parts.push(sample[2].to_vec());
+            }
+            _ => parts.extend(sample.iter().map(|b| b.to_vec())),
         }
-        if cmd[ts_index] == b"*"
-            && let Some(assigned) = line.strip_prefix(b":")
-        {
-            parts[ts_index] = assigned.trim_ascii().to_vec();
-        }
+    }
+    if parts.len() == 1 {
+        return Vec::new();
     }
     vec![parts]
 }
@@ -411,19 +433,21 @@ fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     let Some(ts) = parse_resp_integer(resp) else {
         return verbatim();
     };
-    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() + 2);
-    let mut i = 0;
-    while i < cmd.len() {
-        if i >= 3 && cmd[i].eq_ignore_ascii_case(b"TIMESTAMP") {
-            // Dropped here, re-added below with the concrete value.
-            i += 2;
-            continue;
-        }
-        parts.push(cmd[i].to_vec());
-        i += 1;
+    // Each `TIMESTAMP` option the command read is given the time it used, in
+    // its place, so every other word is where it was and reads as it did; a
+    // word `TIMESTAMP` that is a label's value is left alone. And the time
+    // goes right after the value, before any option, behind 1.2.1's mark
+    // (`ts::INCRBY_MARK`), which tells the record from one 1.2.0 sent. Added
+    // at the end, as 1.2.0 did, it made a label of a word left over from
+    // `LABELS` (#555).
+    let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
+    let ts = sample_time(ts);
+    for at in crate::commands::ts::incrby_timestamp_options(cmd) {
+        parts[at + 1] = ts.clone();
     }
-    parts.push(b"TIMESTAMP".to_vec());
-    parts.push(ts.to_string().into_bytes());
+    let at = parts.len().min(3);
+    parts.insert(at, ts);
+    parts.insert(at, crate::commands::ts::INCRBY_MARK.to_vec());
     vec![parts]
 }
 
@@ -480,57 +504,90 @@ fn expiry_ms(ctx: &Ctx<'_>, key: &[u8]) -> Option<u64> {
     read_lock!(shard).expires(key)
 }
 
-/// `cmd` with a relative `EX seconds` / `PX milliseconds` option, looked for
-/// from `start`, replaced by `PXAT <unix-ms>`.
+/// `cmd` with its time option, looked for from `start`, sent as
+/// `PXAT <unix-ms>`, as Redis sends `SET`: the last one given, which is the
+/// one that took effect, and none of the others. Only the first was
+/// rewritten, so `SET k v EX 10 EX 20` went out as `SET k v PXAT <t> EX 20`,
+/// which a replica or a replayed AOF refused.
 ///
 /// `with_argument` names the options that take an argument, so that argument
-/// is not read as an option; the scan stops at `stop`, if given.
+/// is not read as an option. A relative time (`EX`, `PX`) is sent as the
+/// deadline `key` was given here ([`stored_deadline`]).
 fn absolute_ttl_options(
+    ctx: &Ctx<'_>,
     cmd: &[&[u8]],
     start: usize,
     with_argument: &[&str],
-    stop: Option<&str>,
+    key: Option<&[u8]>,
 ) -> Vec<Vec<u8>> {
-    let mut out = owned(cmd);
+    let mut times = Vec::new();
     let mut i = start;
     while i < cmd.len() {
         let token = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
-        if stop == Some(token.as_str()) {
-            break;
+        if matches!(token.as_str(), "EX" | "PX" | "EXAT" | "PXAT") {
+            times.push(i);
+            i += 2;
+            continue;
         }
-        if token == "EX" || token == "PX" {
-            if let Some(ttl) = cmd.get(i + 1).and_then(|arg| integer_arg(arg)) {
-                let ms = if token == "EX" {
-                    ttl.saturating_mul(1000)
-                } else {
-                    ttl
-                };
-                out[i] = b"PXAT".to_vec();
-                out[i + 1] = now_ms().saturating_add(ms).to_string().into_bytes();
-            }
-            break;
-        }
-        i += if with_argument.contains(&token.as_str()) || token == "EXAT" || token == "PXAT" {
+        i += if with_argument.contains(&token.as_str()) {
             2
         } else {
             1
         };
     }
+    let Some(&last) = times.last() else {
+        return owned(cmd);
+    };
+    let Some(n) = cmd.get(last + 1).and_then(|arg| integer_arg(arg)) else {
+        return owned(cmd);
+    };
+    let at = if cmd[last].eq_ignore_ascii_case(b"EX") {
+        stored_deadline(ctx, key, n.saturating_mul(1000))
+    } else if cmd[last].eq_ignore_ascii_case(b"PX") {
+        stored_deadline(ctx, key, n)
+    } else if cmd[last].eq_ignore_ascii_case(b"EXAT") {
+        n.saturating_mul(1000)
+    } else {
+        n
+    };
+    let mut out: Vec<Vec<u8>> = cmd
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| !times.iter().any(|&t| *j == t || *j == t + 1))
+        .map(|(_, arg)| arg.to_vec())
+        .collect();
+    out.push(b"PXAT".to_vec());
+    out.push(at.to_string().into_bytes());
     out
 }
 
-/// `SET key value [...] EX|PX ttl` → the same with `PXAT`.
-fn set_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
+/// The deadline a command with a relative time to live of `ms` gave `key`,
+/// read back from the key, as `expire_feed` and `getex_feed` send theirs:
+/// worked out again here from the clock, it was later than the master's by
+/// however long had gone by since, a millisecond now and then, and inside a
+/// script, whose commands keep time by the script's frozen clock, by how
+/// long the script had run (#602). From the clock only when the key has no
+/// deadline (a write that did not happen: a condition that did not hold,
+/// which the reader of the stream weighs again and refuses too).
+fn stored_deadline(ctx: &Ctx<'_>, key: Option<&[u8]>, ms: i64) -> i64 {
+    key.and_then(|key| expiry_ms(ctx, key))
+        .and_then(|at| i64::try_from(at).ok())
+        .unwrap_or_else(|| now_ms().saturating_add(ms))
+}
+
+/// `SET key value [...] EX|PX|EXAT|PXAT time` → the same with `PXAT`.
+fn set_feed(ctx: &Ctx<'_>, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     vec![absolute_ttl_options(
+        ctx,
         cmd,
         3,
         &["IFEQ", "IFNE", "IFDEQ", "IFDNE"],
-        None,
+        cmd.get(1).copied(),
     )]
 }
 
 /// `SETEX key seconds value` / `PSETEX key ms value` → `SET key value PXAT at`.
-fn setex_feed(name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
+fn setex_feed(ctx: &Ctx<'_>, name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     let ttl = match cmd.get(2).and_then(|arg| integer_arg(arg)) {
         Some(ttl) if cmd.len() == 4 => ttl,
         _ => return vec![owned(cmd)],
@@ -545,35 +602,44 @@ fn setex_feed(name: &str, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
         cmd[1].to_vec(),
         cmd[3].to_vec(),
         b"PXAT".to_vec(),
-        now_ms().saturating_add(ms).to_string().into_bytes(),
+        stored_deadline(ctx, Some(cmd[1]), ms)
+            .to_string()
+            .into_bytes(),
     ]]
 }
 
-/// `GETEX` reads; what it changes is the key's TTL, and that is what is sent.
-fn getex_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
+/// `GETEX` reads; what it changes is the key's TTL, and that is what is sent:
+/// `PERSIST`, or the deadline the key was left with, whichever option gave
+/// it, or `DEL` for a time that had already come. Only the first option was
+/// read, so `GETEX k EX 40 EX 50` went out as 40.
+fn getex_feed(ctx: &Ctx<'_>, cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     // Nothing there, or no option: nothing changed.
     if cmd.len() < 3 || resp.starts_with(b"$-1") || resp.starts_with(b"_") {
         return Vec::new();
     }
-    let option = String::from_utf8_lossy(cmd[2]).to_ascii_uppercase();
-    if option == "PERSIST" {
-        return vec![vec![b"PERSIST".to_vec(), cmd[1].to_vec()]];
+    let key = cmd[1];
+    if cmd[2..]
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case(b"PERSIST"))
+    {
+        return vec![vec![b"PERSIST".to_vec(), key.to_vec()]];
     }
-    let Some(n) = cmd.get(3).and_then(|arg| integer_arg(arg)) else {
-        return vec![owned(cmd)];
-    };
-    let at = match option.as_str() {
-        "EX" => now_ms().saturating_add(n.saturating_mul(1000)),
-        "PX" => now_ms().saturating_add(n),
-        "EXAT" => n.saturating_mul(1000),
-        "PXAT" => n,
-        _ => return vec![owned(cmd)],
-    };
-    vec![vec![
-        b"PEXPIREAT".to_vec(),
-        cmd[1].to_vec(),
-        at.to_string().into_bytes(),
-    ]]
+    match expiry_ms(ctx, key) {
+        Some(at) => vec![vec![
+            b"PEXPIREAT".to_vec(),
+            key.to_vec(),
+            at.to_string().into_bytes(),
+        ]],
+        None => {
+            let shard = crate::store::get_shard(&ctx.store[*ctx.selected_db], key);
+            if read_lock!(shard).contains_key(key) {
+                // Not what GETEX with a time leaves; sent as it came.
+                vec![owned(cmd)]
+            } else {
+                vec![vec![b"DEL".to_vec(), key.to_vec()]]
+            }
+        }
+    }
 }
 
 /// Where the options of `MSETEX numkeys key value [key value ...] [options]`
@@ -589,8 +655,11 @@ fn msetex_options_start(cmd: &[&[u8]]) -> usize {
 
 /// `INCREX` can refuse to move (a bound), can round (BYFLOAT), and can set a
 /// TTL only when there is none (ENX): what is sent is where it left the key.
-/// `RESTORE key ttl payload …` with a relative TTL → the same with `ABSTTL`.
-fn restore_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
+/// `RESTORE key ttl payload …` with a relative TTL → the same with `ABSTTL`
+/// and the deadline the key was given here, read back from the key as
+/// `expire_feed` does: worked out again from the clock, it was up to 1 ms
+/// off what the master keeps, on every replica and in the AOF (#602).
+fn restore_feed(ctx: &Ctx<'_>, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     let mut out = owned(cmd);
     let absolute = cmd
         .iter()
@@ -600,7 +669,9 @@ fn restore_feed(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
         && let Some(ttl) = cmd.get(2).and_then(|arg| integer_arg(arg))
         && ttl > 0
     {
-        out[2] = now_ms().saturating_add(ttl).to_string().into_bytes();
+        out[2] = stored_deadline(ctx, cmd.get(1).copied(), ttl)
+            .to_string()
+            .into_bytes();
         out.push(b"ABSTTL".to_vec());
     }
     vec![out]
@@ -869,7 +940,7 @@ mod tests {
         let c = cmd(&["TS.INCRBY", "k", "2"]);
         assert_eq!(
             ts_incrby_feed(&refs(&c), b":42\r\n"),
-            vec![cmd(&["TS.INCRBY", "k", "2", "TIMESTAMP", "42"])]
+            vec![cmd(&["TS.INCRBY", "k", "2", "timestamp", "42"])]
         );
         let c = cmd(&["TS.DECRBY", "k", "2", "TIMESTAMP", "*", "RETENTION", "9"]);
         assert_eq!(
@@ -878,12 +949,148 @@ mod tests {
                 "TS.DECRBY",
                 "k",
                 "2",
-                "RETENTION",
-                "9",
+                "timestamp",
+                "42",
                 "TIMESTAMP",
-                "42"
+                "42",
+                "RETENTION",
+                "9"
             ])]
         );
+    }
+
+    /// A sample `TS.MADD` refused is left out of what is sent; `*` is the
+    /// time the master gave.
+    /// A time above `i64::MAX`, replied as a negative number, is sent as
+    /// the `u64` the series holds (#592).
+    #[test]
+    fn ts_feeds_send_times_above_i64_max_unsigned() {
+        let max = u64::MAX.to_string();
+        let c = cmd(&["TS.MADD", "a", &max, "1"]);
+        assert_eq!(
+            ts_madd_feed(&refs(&c), b"*1\r\n:-1\r\n"),
+            vec![cmd(&["TS.MADD", "a", &max, "1"])]
+        );
+        let c = cmd(&["TS.INCRBY", "a", "1", "TIMESTAMP", &max]);
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":-1\r\n"),
+            vec![cmd(&[
+                "TS.INCRBY",
+                "a",
+                "1",
+                "timestamp",
+                &max,
+                "TIMESTAMP",
+                &max
+            ])]
+        );
+    }
+
+    #[test]
+    fn ts_madd_feed_leaves_out_refused_samples() {
+        let c = cmd(&["TS.MADD", "a", "*", "1", "b", "*", "2", "c", "5", "3"]);
+        let resp = b"*3\r\n-TSDB: Duplicate sample in BLOCK policy\r\n:101\r\n:5\r\n";
+        assert_eq!(
+            ts_madd_feed(&refs(&c), resp),
+            vec![cmd(&["TS.MADD", "b", "101", "2", "c", "5", "3"])]
+        );
+        let c = cmd(&["TS.MADD", "a", "*", "1"]);
+        assert!(ts_madd_feed(&refs(&c), b"*1\r\n-TSDB: the key does not exist\r\n").is_empty());
+    }
+
+    /// Each `TIMESTAMP` option the command read is given the time, where it
+    /// is, and the time goes right after the value behind 1.2.1's mark. Not
+    /// after a `LABELS` list, where a word left over from the list, which
+    /// the command passed over, became a label with it on a replica. A
+    /// label's value `TIMESTAMP` is not an option (#555).
+    #[test]
+    fn ts_incrby_feed_gives_the_time_without_moving_a_word() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a"],
+                &["TS.INCRBY", "k", "2", "timestamp", "42", "LABELS", "a"],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "c"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "c",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "b", "UNCOMPRESSED"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "UNCOMPRESSED",
+                ],
+            ),
+            (
+                &["TS.INCRBY", "k", "2", "LABELS", "a", "TIMESTAMP", "*"],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "TIMESTAMP",
+                    "*",
+                ],
+            ),
+            (
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "TIMESTAMP",
+                    "5",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "*",
+                    "c",
+                ],
+                &[
+                    "TS.INCRBY",
+                    "k",
+                    "2",
+                    "timestamp",
+                    "42",
+                    "TIMESTAMP",
+                    "42",
+                    "LABELS",
+                    "a",
+                    "b",
+                    "TIMESTAMP",
+                    "42",
+                    "c",
+                ],
+            ),
+        ];
+        for (given, sent) in cases {
+            let c = cmd(given);
+            assert_eq!(
+                ts_incrby_feed(&refs(&c), b":42\r\n"),
+                vec![cmd(sent)],
+                "{given:?}"
+            );
+        }
     }
 
     #[test]

@@ -68,6 +68,12 @@ pub struct BlockingWait {
     timeout: Option<Duration>,
     /// Carried across the park and handed back on resume. See [`BlockState`].
     state: Option<BlockState>,
+    /// [`role_changes`] when the command parked: see
+    /// [`ended_by_role_change`].
+    role_epoch: u64,
+    /// Not a wait: a write that got past a `CLIENT PAUSE` before it was set
+    /// is to be read again and held by the pause ([`hold_for_pause`]).
+    held_by_pause: bool,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -134,10 +140,70 @@ pub enum Unblock {
     Timeout,
     /// With `-UNBLOCKED`.
     Error,
+    /// This node has become a replica (`REPLICAOF`, `CLUSTER REPLICATE`, a
+    /// failover that demotes it): with [`ROLE_CHANGED`], and the connection
+    /// is then closed, as Redis's `disconnectAllBlockedClients` ends every
+    /// blocked client.
+    RoleChange,
 }
 
 /// The reply to a client unblocked with `ERROR`.
 pub const UNBLOCKED: &[u8] = b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n";
+
+/// The reply to a client whose wait is ended because this node became a
+/// replica. Its connection is closed once this is written (#591). The
+/// same reply `WAIT` gives then.
+pub const ROLE_CHANGED: &[u8] = crate::replication::UNBLOCKED_ROLE_CHANGE;
+
+/// This node has become a replica (or been pointed at another master):
+/// its count of role changes (`ReplState::role_changes`) goes up. Called
+/// with the role already changed, before the blocked clients are swept.
+///
+/// The count is the node's own, not the process's: several servers run in
+/// one test process, and a role change of one must end nothing on another.
+pub fn note_role_change(repl_state: &crate::replication::ReplState) {
+    repl_state.role_changes.fetch_add(1, Ordering::SeqCst);
+}
+
+/// How many times this node has become a replica, or been pointed at
+/// another master. Read when a command parks, and again once its client is
+/// listed as blocked: a role change between the two, which the sweep that
+/// ends the blocked clients (`ClientRegistry::end_blocked_for_role_change`)
+/// cannot have seen, ends the wait as the sweep would have.
+#[inline]
+pub fn role_changes(repl_state: &crate::replication::ReplState) -> u64 {
+    repl_state.role_changes.load(Ordering::Relaxed)
+}
+
+/// Whether a parked wait ends because this node became a replica: the
+/// role changed since the command parked (`park_epoch`), or the command is
+/// one a replica refuses and this node is a replica now (it was let through
+/// by the look at the role just before a demotion). Asked once the client
+/// is listed as blocked, and again when the wait ends, however it ended: a
+/// wake-up at the moment of the change must not hand the client what it
+/// waited for and leave it connected.
+pub fn ended_by_role_change(
+    park_epoch: u64,
+    refused_on_replica: bool,
+    repl_state: &crate::replication::ReplState,
+) -> bool {
+    role_changes(repl_state) != park_epoch || (refused_on_replica && repl_state.is_slave())
+}
+
+/// Test builds only: `KIVIDB_TEST_PARK_DELAY_MS` holds every parked command
+/// this long before its client is listed as blocked, so that a test can
+/// change the role in between.
+#[cfg(debug_assertions)]
+pub fn test_park_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_PARK_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
 
 /// How a wait ended, when it was not by what was waited for or by its
 /// timeout. Kept by the connection loop across the dispatch that resumes
@@ -149,6 +215,9 @@ pub struct Interrupted {
     pub gone: bool,
     /// `CLIENT UNBLOCK … ERROR`: the reply is [`UNBLOCKED`].
     pub unblocked_with_error: bool,
+    /// This node became a replica while the command waited: the reply is
+    /// [`ROLE_CHANGED`], and the connection is closed after it.
+    pub role_changed: bool,
 }
 
 /// The timeout of a blocking command, in seconds, as Redis reads one: any
@@ -275,6 +344,19 @@ impl BlockingSlot {
         self.pending.is_some()
     }
 
+    /// The dispatch just completed was sent back to be held by a pause
+    /// ([`hold_for_pause`]): the command is dispatched again once the pause
+    /// lets it, as it was dispatched this time. A resume is a resume again,
+    /// with what its wait produced: the handler had not yet taken it.
+    pub fn held_by_pause(&mut self) {
+        if self.in_resume {
+            if let Some(delivery) = self.ctl.resume.take() {
+                self.pending = Some((delivery, self.ctl.state.take(), self.ctl.gone));
+            }
+            self.in_resume = false;
+        }
+    }
+
     /// Clear the resume flag after the guard has fired.
     pub fn clear_resume(&mut self) {
         self.in_resume = false;
@@ -352,6 +434,8 @@ pub fn park_with_state(
                 rxs,
                 timeout,
                 state,
+                role_epoch: role_changes(ctx.repl_state),
+                held_by_pause: false,
             });
             ParkOutcome::Parked
         }
@@ -360,6 +444,29 @@ pub fn park_with_state(
             ParkOutcome::CannotWait
         }
     }
+}
+
+/// The reply of a write that has found, inside the write gate, that a
+/// `CLIENT PAUSE` was set after it passed the pause check
+/// (`pause::held_in_gate`): it does not run now. A connection that can
+/// park a command is asked to read it again, its pause check holding it
+/// until the pause ends: parked, with nothing to wait for
+/// ([`BlockingWait::held_by_pause`]). Any other caller takes the reply,
+/// `pause::HELD_IN_GATE`, the same way: a script, a command on the slow
+/// path. It is never sent.
+pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
+    if let Some(slot) = ctx.blocking.as_mut()
+        && slot.awaitable
+    {
+        slot.parked = Some(BlockingWait {
+            rxs: Vec::new(),
+            timeout: None,
+            state: None,
+            role_epoch: 0,
+            held_by_pause: true,
+        });
+    }
+    crate::pause::HELD_IN_GATE.to_vec()
 }
 
 /// Run a command that waits until one of `keys` has something for it.
@@ -640,6 +747,29 @@ impl BlockingWait {
         self.timeout.is_some()
     }
 
+    /// [`role_changes`] when the command parked.
+    pub fn role_epoch(&self) -> u64 {
+        self.role_epoch
+    }
+
+    /// Whether this is no wait, but a write sent back to be held by a
+    /// pause ([`hold_for_pause`]): the connection reads the command again,
+    /// as it is, and its pause check holds it.
+    pub fn held_by_pause(&self) -> bool {
+        self.held_by_pause
+    }
+
+    /// Whether the command is one a replica refuses (`READONLY`): the
+    /// blocking list and sorted-set commands and `XREADGROUP`, which write.
+    /// `XREAD BLOCK` and `TS.READ BLOCK` may wait on a replica. Asked before
+    /// [`take_state`](Self::take_state).
+    pub fn refused_on_replica(&self) -> bool {
+        matches!(
+            self.state,
+            Some(BlockState::Queued { .. } | BlockState::GroupRead { .. })
+        )
+    }
+
     /// Whether parking this from a resume dispatch is intended rather than a
     /// handler that forgot its resume check. Each such park awaits a new
     /// signal, so it cannot spin.
@@ -733,6 +863,8 @@ mod tests {
                 rxs,
                 timeout,
                 state: None,
+                role_epoch: 0,
+                held_by_pause: false,
             }
             .wait(),
         )
@@ -813,6 +945,9 @@ mod gone_resume_tests {
 
     /// A server's shared state, and `run`, which dispatches one command on it.
     fn with_server(test: impl FnOnce(Run<'_>, &Arc<crate::wait_table::WaitTable>)) {
+        // The pause is the process's: a unit test pausing writes would hold
+        // these commands back (`pause::held_in_gate`).
+        let _pause = crate::pause::TEST_LOCK.lock();
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
         let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();

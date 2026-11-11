@@ -441,7 +441,9 @@ fn config_help(name: &str) -> &'static str {
             "Enable commands filter which optimize indexing on partial hash updates"
         }
         "UNION_ITERATOR_HEAP" => {
-            "minimum number of iterators in a union from which the iterator will switch to heap \
+            // RediSearch's C source runs "will" and "switch" together, and so
+            // does its reply; as do the two below ("values.Can", "scorer.The").
+            "minimum number of iterators in a union from which the iterator willswitch to heap \
              based implementation."
         }
         "VSS_MAX_RESIZE" => "Set RediSearch vector indexes max resize (in bytes).",
@@ -451,13 +453,13 @@ fn config_help(name: &str) -> &'static str {
         }
         "MULTI_TEXT_SLOP" => {
             "Set RediSearch delta used to increase positional offsets between array slots for \
-             multi text values. Can control the level of separation between phrases in \
+             multi text values.Can control the level of separation between phrases in \
              different array slots (related to the SLOP parameter of ft.search command)"
         }
         "BM25STD_TANH_FACTOR" => {
             "Set the BM25STD.TANH stretch factor. This is an integer value that divides the \
              argument of the tanh function that is used to normalize the score computed by the \
-             BM25STD scorer. The default value is 4."
+             BM25STD scorer.The default value is 4."
         }
         _ => "",
     }

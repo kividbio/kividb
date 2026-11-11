@@ -90,6 +90,7 @@ impl Conn {
                 RespValue::Map(pairs)
             }
             Some(b'_') => RespValue::Nil,
+            Some(b',') => RespValue::SimpleStr(line[1..].to_string()),
             _ => panic!("unexpected RESP line: {:?}", line),
         }
     }
@@ -556,6 +557,267 @@ fn test_swapdb_dirties_only_the_watches_on_the_swapped_keys() {
     let mut itself = watch("1", "in0");
     assert!(other.cmds(&["SWAPDB", "1", "1"]).is_ok());
     assert_eq!(exec(&mut itself).as_array().len(), 1);
+}
+
+/// A write fails the watches on the keys it changed and on no other key it
+/// names, as Redis signals them (#584): of a pop from the first of several
+/// keys that has something, the key it took from; of `SUNIONSTORE`, `COPY`,
+/// `BITOP`, `PFMERGE`, `SORT … STORE` and the like, the destination and not
+/// the sources; of a `DEL`, the keys that were there; of `SMOVE`, the
+/// destination only if the member was not in it. `MOVE` and `COPY … DB`
+/// change the key in the other database too. Every key named used to fail.
+#[test]
+fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
+    let port = free_port();
+    start_server(port);
+    let mut setup = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    // Which of `watched` (database, key) fail once `command` has run.
+    let mut failed = |watched: &[(&str, &str)], command: &[&str]| -> Vec<String> {
+        let mut watchers: Vec<(String, Conn)> = watched
+            .iter()
+            .map(|(db, key)| {
+                let mut w = Conn::connect(port);
+                assert!(w.cmds(&["SELECT", db]).is_ok());
+                assert!(w.cmds(&["WATCH", key]).is_ok());
+                (format!("{db}/{key}"), w)
+            })
+            .collect();
+        let reply = c.cmds(command);
+        assert!(!reply.is_error(), "{command:?}: {reply:?}");
+        watchers
+            .iter_mut()
+            .filter_map(|(name, w)| {
+                assert!(w.cmds(&["MULTI"]).is_ok());
+                w.cmds(&["PING"]);
+                w.cmds(&["EXEC"]).is_nil().then(|| name.clone())
+            })
+            .collect()
+    };
+    let mut set_up = |commands: &[&[&str]]| {
+        for command in commands {
+            let reply = setup.cmds(command);
+            assert!(!reply.is_error(), "{command:?}: {reply:?}");
+        }
+    };
+
+    // Pops from the first of several keys that has something.
+    set_up(&[&["RPUSH", "p:b", "x"], &["RPUSH", "r:b", "x", "y"]]);
+    set_up(&[
+        &["ZADD", "z:b", "1", "m"],
+        &["ZADD", "zx:b", "1", "m", "2", "n"],
+    ]);
+    set_up(&[&["RPUSH", "lm:b", "x"], &["ZADD", "zm:b", "1", "m"]]);
+    set_up(&[&["RPUSH", "blm:b", "x"], &["ZADD", "bzm:b", "1", "m"]]);
+    for (command, a, b) in [
+        (&["BLPOP", "p:a", "p:b", "0"][..], "p:a", "p:b"),
+        (&["BRPOP", "r:a", "r:b", "0"], "r:a", "r:b"),
+        (&["BZPOPMIN", "z:a", "z:b", "0"], "z:a", "z:b"),
+        (&["BZPOPMAX", "zx:a", "zx:b", "0"], "zx:a", "zx:b"),
+        (&["LMPOP", "2", "lm:a", "lm:b", "LEFT"], "lm:a", "lm:b"),
+        (&["ZMPOP", "2", "zm:a", "zm:b", "MIN"], "zm:a", "zm:b"),
+        (
+            &["BLMPOP", "0", "2", "blm:a", "blm:b", "LEFT"],
+            "blm:a",
+            "blm:b",
+        ),
+        (
+            &["BZMPOP", "0", "2", "bzm:a", "bzm:b", "MIN"],
+            "bzm:a",
+            "bzm:b",
+        ),
+    ] {
+        assert_eq!(
+            failed(&[("0", a), ("0", b)], command),
+            [format!("0/{b}")],
+            "{command:?}"
+        );
+    }
+
+    // Commands that read some keys and write another.
+    set_up(&[&["SADD", "s:1", "a"], &["SADD", "s:2", "b"]]);
+    assert_eq!(
+        failed(
+            &[("0", "s:1"), ("0", "s:2"), ("0", "s:d")],
+            &["SUNIONSTORE", "s:d", "s:1", "s:2"]
+        ),
+        ["0/s:d"]
+    );
+    set_up(&[&["ZADD", "zs:1", "1", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "zs:1"), ("0", "zs:d")],
+            &["ZUNIONSTORE", "zs:d", "1", "zs:1"]
+        ),
+        ["0/zs:d"]
+    );
+    set_up(&[&["ZADD", "zr:s", "1", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "zr:s"), ("0", "zr:d")],
+            &["ZRANGESTORE", "zr:d", "zr:s", "0", "-1"]
+        ),
+        ["0/zr:d"]
+    );
+    set_up(&[&["SET", "bo:1", "a"], &["SET", "bo:2", "b"]]);
+    assert_eq!(
+        failed(
+            &[("0", "bo:1"), ("0", "bo:2"), ("0", "bo:d")],
+            &["BITOP", "AND", "bo:d", "bo:1", "bo:2"]
+        ),
+        ["0/bo:d"]
+    );
+    set_up(&[&["PFADD", "hl:1", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "hl:1"), ("0", "hl:d")],
+            &["PFMERGE", "hl:d", "hl:1"]
+        ),
+        ["0/hl:d"]
+    );
+    set_up(&[&["RPUSH", "so:s", "3", "1", "2"]]);
+    assert_eq!(
+        failed(
+            &[("0", "so:s"), ("0", "so:d")],
+            &["SORT", "so:s", "STORE", "so:d"]
+        ),
+        ["0/so:d"]
+    );
+    set_up(&[&["GEOADD", "g:s", "13.36", "38.11", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "g:s"), ("0", "g:d")],
+            &[
+                "GEOSEARCHSTORE",
+                "g:d",
+                "g:s",
+                "FROMLONLAT",
+                "13.36",
+                "38.11",
+                "BYRADIUS",
+                "10",
+                "km"
+            ]
+        ),
+        ["0/g:d"]
+    );
+    set_up(&[&["SET", "cp:s", "v"]]);
+    assert_eq!(
+        failed(&[("0", "cp:s"), ("0", "cp:d")], &["COPY", "cp:s", "cp:d"]),
+        ["0/cp:d"]
+    );
+    assert_eq!(
+        failed(
+            &[("0", "cp:s"), ("0", "cp:e"), ("3", "cp:e")],
+            &["COPY", "cp:s", "cp:e", "DB", "3"]
+        ),
+        ["3/cp:e"]
+    );
+    // Not copied: the destination is there.
+    assert!(failed(&[("0", "cp:s"), ("0", "cp:d")], &["COPY", "cp:s", "cp:d"]).is_empty());
+
+    // DEL: the keys that were there.
+    set_up(&[&["SET", "de:x", "v"]]);
+    assert_eq!(
+        failed(
+            &[("0", "de:x"), ("0", "de:missing")],
+            &["DEL", "de:x", "de:missing"]
+        ),
+        ["0/de:x"]
+    );
+    // A key named twice, deleted the first time: it changed.
+    set_up(&[&["SET", "de:twice", "v"], &["SET", "un:twice", "v"]]);
+    assert_eq!(
+        failed(&[("0", "de:twice")], &["DEL", "de:twice", "de:twice"]),
+        ["0/de:twice"]
+    );
+    assert_eq!(
+        failed(&[("0", "un:twice")], &["UNLINK", "un:twice", "un:twice"]),
+        ["0/un:twice"]
+    );
+    // XGROUP CREATE … MKSTREAM of a stream that is not there makes it.
+    assert_eq!(
+        failed(
+            &[("0", "xs:new")],
+            &["XGROUP", "CREATE", "xs:new", "g", "$", "MKSTREAM"]
+        ),
+        ["0/xs:new"]
+    );
+    // MOVE: the key here and in the other database.
+    set_up(&[&["SET", "mv:k", "v"]]);
+    assert_eq!(
+        failed(
+            &[("0", "mv:k"), ("4", "mv:k"), ("4", "mv:other")],
+            &["MOVE", "mv:k", "4"]
+        ),
+        ["0/mv:k", "4/mv:k"]
+    );
+    // SMOVE of a member the destination has: the source only.
+    set_up(&[&["SADD", "sm:s", "a"], &["SADD", "sm:d", "a"]]);
+    assert_eq!(
+        failed(
+            &[("0", "sm:s"), ("0", "sm:d")],
+            &["SMOVE", "sm:s", "sm:d", "a"]
+        ),
+        ["0/sm:s"]
+    );
+
+    // Consumer-group commands do not fail a watch on the stream, as in
+    // Redis (#588); XADD does.
+    set_up(&[
+        &["XADD", "xs:1", "1-1", "f", "v"],
+        &["XADD", "xs:2", "1-1", "f", "v"],
+        &["XGROUP", "CREATE", "xs:1", "g", "0"],
+        &["XGROUP", "CREATE", "xs:2", "g", "0"],
+    ]);
+    for command in [
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "STREAMS",
+            "xs:1",
+            "xs:2",
+            ">",
+            ">",
+        ][..],
+        &["XACK", "xs:1", "g", "1-1"],
+        &["XCLAIM", "xs:2", "g", "c2", "0", "1-1"],
+        &["XAUTOCLAIM", "xs:2", "g", "c3", "0", "0"],
+        &["XGROUP", "CREATECONSUMER", "xs:1", "g", "c4"],
+        &["XSETID", "xs:1", "5-0"],
+    ] {
+        assert!(
+            failed(&[("0", "xs:1"), ("0", "xs:2")], command).is_empty(),
+            "{command:?}"
+        );
+    }
+    assert_eq!(
+        failed(
+            &[("0", "xs:1"), ("0", "xs:2")],
+            &["XADD", "xs:1", "*", "f", "v"]
+        ),
+        ["0/xs:1"]
+    );
+
+    // Writes that change every key they name still fail every watch.
+    set_up(&[&["RPUSH", "lmv:a", "x"], &["SET", "rn:a", "v"]]);
+    for (command, a, b) in [
+        (&["MSET", "ms:a", "1", "ms:b", "2"][..], "ms:a", "ms:b"),
+        (&["RENAME", "rn:a", "rn:b"], "rn:a", "rn:b"),
+        (
+            &["LMOVE", "lmv:a", "lmv:b", "LEFT", "RIGHT"],
+            "lmv:a",
+            "lmv:b",
+        ),
+    ] {
+        assert_eq!(
+            failed(&[("0", a), ("0", b)], command),
+            [format!("0/{a}"), format!("0/{b}")],
+            "{command:?}"
+        );
+    }
 }
 
 /// For `SWAPDB`, a key whose time is up is not there, as for a flush: a
@@ -1344,5 +1606,627 @@ fn test_arity_and_existence_come_before_acl() {
                 .error_msg()
                 .starts_with("NOPERM")
         );
+    });
+}
+
+/// A reply as text: a string as it is, anything else as Rust shows it.
+fn text(v: &RespValue) -> String {
+    match v {
+        RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+        RespValue::SimpleStr(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The entries of the ACL log, newest first, each as its fields by name.
+fn acl_log(c: &mut Conn) -> Vec<Vec<(String, String)>> {
+    let log = c.cmds(&["ACL", "LOG"]);
+    log.as_array()
+        .iter()
+        .map(|entry| {
+            let fields: Vec<(String, String)> = match entry {
+                RespValue::Array(flat) => flat
+                    .chunks(2)
+                    .map(|kv| (kv[0].as_str().to_string(), text(&kv[1])))
+                    .collect(),
+                RespValue::Map(pairs) => pairs
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), text(v)))
+                    .collect(),
+                other => panic!("not an ACL log entry: {other:?}"),
+            };
+            fields
+        })
+        .collect()
+}
+
+fn field<'a>(entry: &'a [(String, String)], name: &str) -> &'a str {
+    &entry.iter().find(|(k, _)| k == name).unwrap().1
+}
+
+/// No such command, the wrong number of arguments, and a command that may
+/// not be part of a transaction are each refused for that, before the
+/// user's ACL rules, as in Redis; and none of them goes to the ACL log.
+#[test]
+fn test_refusals_before_acl_are_not_logged() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "getonly", "on", ">pw", "~*", "-@all", "+get", "+multi",
+                    "+exec"
+                ])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "getonly", "pw"]).is_ok());
+
+        let r = c.cmds(&["FOO", "bar"]);
+        assert!(
+            r.error_msg().starts_with("ERR unknown command 'FOO'"),
+            "{r:?}"
+        );
+        assert_eq!(
+            c.cmds(&["GET"]).error_msg(),
+            "ERR wrong number of arguments for 'get' command"
+        );
+        assert_eq!(
+            c.cmds(&["WAIT"]).error_msg(),
+            "ERR wrong number of arguments for 'wait' command"
+        );
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(
+            c.cmds(&["PSYNC", "?", "-1"]).error_msg(),
+            "ERR Command not allowed inside a transaction"
+        );
+        assert!(c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"));
+        assert!(acl_log(&mut admin).is_empty(), "{:?}", acl_log(&mut admin));
+
+        // What the rules refuse is logged.
+        assert!(c.cmds(&["SET", "k", "v"]).error_msg().starts_with("NOPERM"));
+        assert_eq!(acl_log(&mut admin).len(), 1);
+    });
+}
+
+/// An EXEC refused by the ACL rules drops the connection's watches with the
+/// transaction, and MONITOR sees it, as Redis's `execCommandAbort` does.
+#[test]
+fn test_an_exec_refused_by_acl_drops_its_watches_and_is_monitored() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "noexec2", "on", ">pw", "~*", "+@all", "-exec"
+                ])
+                .is_ok()
+        );
+        let mut monitor = Conn::connect(port);
+        assert!(monitor.cmds(&["MONITOR"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "noexec2", "pw"]).is_ok());
+        assert!(c.cmds(&["WATCH", "aw:k"]).is_ok());
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" watch=1 "), "{}", info.as_str());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["SET", "aw:k", "v"]).as_str(), "QUEUED");
+        assert!(c.cmds(&["EXEC"]).error_msg().starts_with("EXECABORT"));
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" watch=0 "), "{}", info.as_str());
+        assert!(info.as_str().contains(" multi=-1 "), "{}", info.as_str());
+
+        // MONITOR: the MULTI, and then the EXEC that was refused.
+        let mut seen = Vec::new();
+        loop {
+            let line = monitor.read_value();
+            let line = line.as_str().to_string();
+            if line.contains("\"EXEC\"") {
+                break;
+            }
+            seen.push(line);
+            assert!(seen.len() < 50, "MONITOR never showed the EXEC: {seen:?}");
+        }
+    });
+}
+
+/// A command run by EXEC goes to the slow log under the client's name as
+/// it is when the command runs.
+#[test]
+fn test_the_slow_log_names_the_client_as_it_is_inside_exec() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(
+            c.cmds(&["CONFIG", "SET", "slowlog-log-slower-than", "0"])
+                .is_ok()
+        );
+        assert!(c.cmds(&["CLIENT", "SETNAME", "before"]).is_ok());
+        assert!(c.cmds(&["SLOWLOG", "RESET"]).is_ok());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["CLIENT", "SETNAME", "during"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["ECHO", "slow-name"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["EXEC"]).as_array().len(), 2);
+        let log = c.cmds(&["SLOWLOG", "GET", "100"]);
+        let echoes: Vec<&[RespValue]> = log
+            .as_array()
+            .iter()
+            .map(|entry| entry.as_array())
+            .filter(|entry| entry[3].as_array().first().map(|a| a.as_str()) == Some("ECHO"))
+            .collect();
+        assert!(!echoes.is_empty(), "{log:?}");
+        for entry in echoes {
+            assert_eq!(entry[5].as_str(), "during", "{entry:?}");
+        }
+    });
+}
+
+/// HELLO as Redis's `helloCommand`: protocols 2 and 3 only, AUTH and
+/// SETNAME in any order, the name checked before the AUTH, and a failed
+/// AUTH in the ACL log.
+#[test]
+fn test_hello_options_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "hu2", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+
+        for ver in ["0", "1", "4"] {
+            let r = c.cmds(&["HELLO", ver]);
+            assert!(r.error_msg().starts_with("NOPROTO"), "{ver}: {r:?}");
+        }
+        assert_eq!(
+            c.cmds(&["HELLO", "x"]).error_msg(),
+            "ERR Protocol version is not an integer or out of range"
+        );
+        assert_eq!(
+            c.cmds(&["HELLO", "2", "AUTH", "hu2"]).error_msg(),
+            "ERR Syntax error in HELLO option 'AUTH'"
+        );
+        assert_eq!(
+            c.cmds(&["HELLO", "2", "BOGUS"]).error_msg(),
+            "ERR Syntax error in HELLO option 'BOGUS'"
+        );
+        // The name is refused before the AUTH is tried: nothing logged.
+        assert_eq!(
+            c.cmds(&["HELLO", "2", "SETNAME", "bad name", "AUTH", "hu2", "wrong"])
+                .error_msg(),
+            "ERR Client names cannot contain spaces, newlines or special characters."
+        );
+        assert!(acl_log(&mut admin).is_empty());
+
+        // A failed AUTH is logged.
+        let r = c.cmds(&["HELLO", "2", "AUTH", "hu2", "wrong"]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(field(&log[0], "reason").contains("auth"), "{log:?}");
+        assert!(field(&log[0], "username").contains("hu2"), "{log:?}");
+        assert_eq!(field(&log[0], "object"), "HELLO", "{log:?}");
+        assert_eq!(field(&log[0], "context"), "toplevel", "{log:?}");
+
+        // SETNAME before AUTH.
+        let hello = c.cmds(&["HELLO", "2", "SETNAME", "n1", "AUTH", "hu2", "pw"]);
+        assert_eq!(hello.as_array()[0].as_str(), "server");
+        assert_eq!(c.cmds(&["CLIENT", "GETNAME"]).as_str(), "n1");
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "hu2");
+    });
+}
+
+/// A failed AUTH or HELLO AUTH run by EXEC is logged in context `multi`,
+/// with the command as the client sent it as the object.
+#[test]
+fn test_a_failed_auth_inside_exec_is_logged_in_context_multi() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "mu", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["auth", "mu", "wrong"]).as_str(), "QUEUED");
+        assert_eq!(
+            c.cmds(&["Hello", "2", "AUTH", "mu", "bad"]).as_str(),
+            "QUEUED"
+        );
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert!(replies[0].error_msg().starts_with("WRONGPASS"));
+        assert!(replies[1].error_msg().starts_with("WRONGPASS"));
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 2, "{log:?}");
+        // Newest first.
+        assert_eq!(field(&log[0], "object"), "Hello");
+        assert_eq!(field(&log[1], "object"), "auth");
+        for entry in &log {
+            assert_eq!(field(entry, "reason"), "auth");
+            assert_eq!(field(entry, "context"), "multi");
+            assert_eq!(field(entry, "username"), "mu");
+        }
+    });
+}
+
+/// More of HELLO, as Redis's `helloCommand`.
+#[test]
+fn test_hello_edge_cases_as_redis() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        // No version: the protocol stays as it is.
+        let hello = c.cmds(&["HELLO"]);
+        let fields = hello.as_array();
+        let proto = fields.iter().position(|f| f.as_str() == "proto").unwrap();
+        assert_eq!(fields[proto + 1], RespValue::Int(2));
+        // An option without its value.
+        assert_eq!(
+            c.cmds(&["HELLO", "3", "SETNAME"]).error_msg(),
+            "ERR Syntax error in HELLO option 'SETNAME'"
+        );
+        // The version is checked before the options.
+        assert!(
+            c.cmds(&["HELLO", "4", "BOGUS"])
+                .error_msg()
+                .starts_with("NOPROTO")
+        );
+        // An integer as Redis reads one.
+        for ver in ["+3", "03", " 3", "3 "] {
+            assert_eq!(
+                c.cmds(&["HELLO", ver]).error_msg(),
+                "ERR Protocol version is not an integer or out of range",
+                "{ver:?}"
+            );
+        }
+        // Options given twice: the last one counts.
+        assert!(matches!(
+            c.cmds(&["HELLO", "2", "SETNAME", "first", "SETNAME", "second"]),
+            RespValue::Array(_)
+        ));
+        assert_eq!(c.cmds(&["CLIENT", "GETNAME"]).as_str(), "second");
+        let info = c.cmds(&["CLIENT", "INFO"]);
+        assert!(info.as_str().contains(" resp=2 "), "{}", info.as_str());
+    });
+}
+
+/// AUTH as Redis: no more than a user and a password; a password is any
+/// bytes, so a `nopass` user takes one that is not UTF-8, and a user set
+/// by the hash of such bytes is logged in with them; a user name that is
+/// not UTF-8 is nobody's, not `default`'s.
+#[test]
+fn test_auth_arguments_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "au", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert_eq!(
+            c.cmds(&["AUTH", "au", "pw", "extra"]).error_msg(),
+            "ERR syntax error"
+        );
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "default");
+        let r = c.cmd(&[&b"AUTH"[..], &b"\xff\xfe"[..], &b"pw"[..]]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        let r = c.cmd(&[&b"AUTH"[..], &b"au"[..], &b"\xff"[..]]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "default");
+        assert!(c.cmds(&["AUTH", "au", "pw"]).is_ok());
+
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "np", "on", "nopass", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(c.cmd(&[&b"AUTH"[..], &b"np"[..], &b"\xff"[..]]).is_ok());
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "np");
+
+        let raw_password = b"\xff\x00pw";
+        let hash = format!("#{}", kividb::acl::sha256_hex(raw_password));
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "hb", "on", &hash, "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(
+            c.cmd(&[&b"AUTH"[..], &b"hb"[..], &raw_password[..]])
+                .is_ok()
+        );
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "hb");
+    });
+}
+
+/// The ACL log merges an event into an entry like it, as Redis does: same
+/// reason, context, object and user, within 60 s. A refusal inside MULTI is
+/// in context `multi`, and so a separate entry.
+#[test]
+fn test_the_acl_log_merges_entries_like_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "lu", "on", ">pw", "~*", "+@all", "-get"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "lu", "pw"]).is_ok());
+        for _ in 0..3 {
+            assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        }
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(field(&log[0], "count"), "Int(3)");
+        assert_eq!(field(&log[0], "context"), "toplevel");
+        assert_eq!(field(&log[0], "object"), "get");
+        let created: u64 = field(&log[0], "timestamp-created")
+            .trim_start_matches("Int(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
+        let updated: u64 = field(&log[0], "timestamp-last-updated")
+            .trim_start_matches("Int(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
+        assert!(updated >= created);
+
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        assert!(c.cmds(&["DISCARD"]).is_ok());
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(field(&log[0], "context"), "multi");
+        assert_eq!(field(&log[0], "count"), "Int(1)");
+    });
+}
+
+/// A command refused for want of AUTH is not in the ACL log, as in Redis:
+/// no user was refused anything.
+#[test]
+fn test_noauth_writes_no_acl_log_entry() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "default", "resetpass", ">pw"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOAUTH"));
+        assert!(c.cmds(&["SET", "k", "v"]).error_msg().starts_with("NOAUTH"));
+        assert!(acl_log(&mut admin).is_empty());
+    });
+}
+
+/// BGREWRITEAOF and FAILOVER are not `no-multi` in Redis: they are queued,
+/// and run by EXEC.
+#[test]
+fn test_bgrewriteaof_and_failover_are_queued() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["BGREWRITEAOF"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["FAILOVER"]).as_str(), "QUEUED");
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[2].as_str(), "PONG");
+    });
+}
+
+/// A queued command refused by rules changed since it was queued is
+/// logged in context `multi`, as Redis's EXEC re-check logs it.
+#[test]
+fn test_the_exec_recheck_is_logged_in_context_multi() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "rc", "on", ">pw", "~*", "+@all"])
+                .is_ok()
+        );
+        assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "rc", "pw"]).is_ok());
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["GET", "rc:k"]).as_str(), "QUEUED");
+        assert!(admin.cmds(&["ACL", "SETUSER", "rc", "-get"]).is_ok());
+        let exec = c.cmds(&["EXEC"]);
+        let replies = exec.as_array();
+        assert!(replies[0].error_msg().starts_with("NOPERM"), "{replies:?}");
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(field(&log[0], "context"), "multi");
+        assert_eq!(field(&log[0], "object"), "get");
+    });
+}
+
+/// ACL LOG as Redis writes it: ten fields, in its order, `entry-id` from
+/// 0, the client as CLIENT INFO describes it, `age-seconds` a double.
+#[test]
+fn test_acl_log_reply_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "lf", "on", ">pw", "~*", "+@all", "-get"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "lf", "pw"]).is_ok());
+        assert!(c.cmds(&["CLIENT", "SETNAME", "logged"]).is_ok());
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        let log = acl_log(&mut admin);
+        assert_eq!(log.len(), 1);
+        let names: Vec<&str> = log[0].iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "count",
+                "reason",
+                "context",
+                "object",
+                "username",
+                "age-seconds",
+                "client-info",
+                "entry-id",
+                "timestamp-created",
+                "timestamp-last-updated"
+            ]
+        );
+        assert_eq!(field(&log[0], "entry-id"), "Int(0)");
+        let client = field(&log[0], "client-info");
+        assert!(
+            client.starts_with("id=")
+                && client.contains(" addr=")
+                && client.contains(" name=logged "),
+            "{client}"
+        );
+        assert!(field(&log[0], "age-seconds").parse::<f64>().is_ok());
+    });
+}
+
+/// `acllog-max-len`: the ACL log keeps that many entries, and none at 0.
+#[test]
+fn test_acllog_max_len() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        let got = admin.cmds(&["CONFIG", "GET", "acllog-max-len"]);
+        assert_eq!(got.as_array()[1].as_str(), "128");
+        assert!(
+            admin
+                .cmds(&[
+                    "ACL", "SETUSER", "ml", "on", ">pw", "~*", "+@all", "-get", "-set", "-del"
+                ])
+                .is_ok()
+        );
+        assert!(
+            admin
+                .cmds(&["CONFIG", "SET", "acllog-max-len", "2"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "ml", "pw"]).is_ok());
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        assert!(c.cmds(&["SET", "k", "v"]).error_msg().starts_with("NOPERM"));
+        assert!(c.cmds(&["DEL", "k"]).error_msg().starts_with("NOPERM"));
+        let log = acl_log(&mut admin);
+        let objects: Vec<&str> = log.iter().map(|e| field(e, "object")).collect();
+        assert_eq!(objects, ["del", "set"]);
+        assert!(
+            admin
+                .cmds(&["CONFIG", "SET", "acllog-max-len", "0"])
+                .is_ok()
+        );
+        assert!(c.cmds(&["GET", "k"]).error_msg().starts_with("NOPERM"));
+        assert!(acl_log(&mut admin).is_empty());
+    });
+}
+
+/// ACL LOG's count, as Redis's: ten entries without one, none for a
+/// negative one, and nothing after it.
+#[test]
+fn test_acl_log_count_as_redis() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        assert!(
+            admin
+                .cmds(&["ACL", "SETUSER", "none", "on", ">pw", "~*", "-@all"])
+                .is_ok()
+        );
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["AUTH", "none", "pw"]).is_ok());
+        let refused: [&[&str]; 12] = [
+            &["GET", "k"],
+            &["SET", "k", "v"],
+            &["DEL", "k"],
+            &["INCR", "k"],
+            &["DECR", "k"],
+            &["APPEND", "k", "v"],
+            &["STRLEN", "k"],
+            &["LPUSH", "k", "v"],
+            &["RPUSH", "k", "v"],
+            &["SADD", "k", "v"],
+            &["HSET", "k", "f", "v"],
+            &["ZADD", "k", "1", "m"],
+        ];
+        for cmd in refused {
+            assert!(c.cmds(cmd).error_msg().starts_with("NOPERM"), "{cmd:?}");
+        }
+        assert_eq!(admin.cmds(&["ACL", "LOG"]).as_array().len(), 10);
+        assert_eq!(admin.cmds(&["ACL", "LOG", "20"]).as_array().len(), 12);
+        assert_eq!(admin.cmds(&["ACL", "LOG", "-1"]).as_array().len(), 0);
+        assert_eq!(
+            admin.cmds(&["ACL", "LOG", "+1"]).error_msg(),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            admin.cmds(&["ACL", "log", "1", "2"]).error_msg(),
+            "ERR unknown subcommand or wrong number of arguments for 'log'. Try ACL HELP."
+        );
+
+        // Under RESP3, each entry is a map.
+        assert!(matches!(admin.cmds(&["HELLO", "3"]), RespValue::Map(_)));
+        let log = admin.cmds(&["ACL", "LOG", "1"]);
+        let RespValue::Map(entry) = &log.as_array()[0] else {
+            panic!("not a map: {log:?}");
+        };
+        assert_eq!(entry.len(), 10);
+        assert_eq!(entry[0].0.as_str(), "count");
+        assert_eq!(entry[5].0.as_str(), "age-seconds");
+        assert!(entry[5].1.as_str().parse::<f64>().is_ok(), "{entry:?}");
+    });
+}
+
+/// A negative `acllog-max-len` is refused, and changes nothing.
+#[test]
+fn test_a_negative_acllog_max_len_is_refused() {
+    on_each_io_model(|port| {
+        let mut c = Conn::connect(port);
+        assert!(
+            c.cmds(&["CONFIG", "SET", "acllog-max-len", "-1"])
+                .is_error()
+        );
+        let got = c.cmds(&["CONFIG", "GET", "acllog-max-len"]);
+        assert_eq!(got.as_array()[1].as_str(), "128");
+    });
+}
+
+/// ACL SETUSER takes a password that is not UTF-8, as Redis does, to add
+/// (`>`) and to remove (`<`).
+#[test]
+fn test_setuser_takes_a_binary_password() {
+    on_each_io_model(|port| {
+        let mut admin = Conn::connect(port);
+        let set = |admin: &mut Conn, rule: &[u8]| {
+            admin.cmd(&[
+                &b"ACL"[..],
+                &b"SETUSER"[..],
+                &b"bu"[..],
+                &b"on"[..],
+                rule,
+                &b"~*"[..],
+                &b"+@all"[..],
+            ])
+        };
+        assert!(set(&mut admin, b">\xff\x01").is_ok());
+        let mut c = Conn::connect(port);
+        assert!(c.cmd(&[&b"AUTH"[..], &b"bu"[..], &b"\xff\x01"[..]]).is_ok());
+        assert_eq!(c.cmds(&["ACL", "WHOAMI"]).as_str(), "bu");
+        assert!(set(&mut admin, b"<\xff\x01").is_ok());
+        let r = c.cmd(&[&b"AUTH"[..], &b"bu"[..], &b"\xff\x01"[..]]);
+        assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
+        // Anything else that is not UTF-8 is still no rule.
+        assert_eq!(set(&mut admin, b"~\xff").error_msg(), "ERR invalid rule");
     });
 }

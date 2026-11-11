@@ -746,6 +746,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let latency = crate::latency::new_latency_tracker();
     let monitor_registry = crate::monitor::new_monitor_registry();
@@ -1641,6 +1642,7 @@ async fn async_main_tokio(
     let client_registry = crate::client_registry::new_client_registry();
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let monitor_registry = crate::monitor::new_monitor_registry();
     let tracking_table = crate::tracking::new_tracking_table();

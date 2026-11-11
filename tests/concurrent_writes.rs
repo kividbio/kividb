@@ -804,3 +804,162 @@ fn hset_beside_the_field_expiry_sweep_keeps_the_new_field() {
         );
     }
 }
+
+/// `FT.CREATE`, again and again, while clients write the hashes it covers:
+/// hashes there before it and hashes made while it runs, several clients on
+/// each (#570). A hash write that found no index took its key's order
+/// shared; one that asked before the index was added, and wrote after its
+/// walk had read the key, indexed its fields beside another such write, and
+/// the index could keep the earlier one's, until the key's next write. Each
+/// round checks every hash the index has against its value, and that a
+/// round whose index walked the keys has every one of them.
+///
+/// The window is a few instructions wide. Before the fix, on 16 vCPUs, 1500
+/// rounds found 5 to 8 hashes indexed with an earlier value, every run, all
+/// in rounds with `SKIPINITIALSCAN`; with a delay put into the window, 300
+/// rounds found 8 to 10. `KIVIDB_570_ROUNDS` sets the number of rounds.
+#[test]
+fn ft_create_beside_hset_indexes_each_hash_as_it_now_is() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    let server = Server::start();
+    const WRITERS: usize = 8;
+    const HOT: usize = 8;
+    const FRESH: usize = 32;
+    let rounds: usize = std::env::var("KIVIDB_570_ROUNDS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(600);
+
+    // The round, which names the hashes made in it.
+    let round = Arc::new(AtomicUsize::new(0));
+    let paused = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    // Held by each writer while it writes; all of them, to stop the writes.
+    let turns: Arc<Vec<Mutex<()>>> = Arc::new((0..WRITERS).map(|_| Mutex::new(())).collect());
+    let hot = |i: usize| format!("doc:h:{i}");
+    let fresh = |r: usize, i: usize| format!("doc:f:{r}:{i}");
+
+    let mut one = server.conn();
+    let seed: Vec<Vec<String>> = (0..HOT)
+        .map(|i| args(&["HSET", &hot(i), "v", "0"]))
+        .collect();
+    one.pipeline(&seed);
+
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let mut conn = server.conn();
+            let (round, paused, done, turns) = (
+                Arc::clone(&round),
+                Arc::clone(&paused),
+                Arc::clone(&done),
+                Arc::clone(&turns),
+            );
+            std::thread::spawn(move || {
+                let mut n = 0usize;
+                while !done.load(SeqCst) {
+                    if paused.load(SeqCst) {
+                        std::thread::sleep(Duration::from_micros(200));
+                        continue;
+                    }
+                    let _turn = turns[w].lock().unwrap();
+                    let r = round.load(SeqCst);
+                    // Every writer on the same hashes, half of them made in
+                    // this round. Each value is written once, by one writer.
+                    let batch: Vec<Vec<String>> = (0..8)
+                        .map(|_| {
+                            n += 1;
+                            let key = if n.is_multiple_of(2) {
+                                format!("doc:h:{}", (n / 2) % HOT)
+                            } else {
+                                format!("doc:f:{r}:{}", (n / 2) % FRESH)
+                            };
+                            args(&["HSET", &key, "v", &(n * WRITERS + w + 1).to_string()])
+                        })
+                        .collect();
+                    for reply in conn.pipeline(&batch) {
+                        assert!(matches!(reply, V::Int(_)), "HSET: {reply:?}");
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let indexed = |one: &mut Conn, query: &str| -> Vec<String> {
+        match one.cmd(&[
+            "FT.SEARCH",
+            "idx",
+            query,
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "10000",
+        ]) {
+            V::Arr(items) => items[1..]
+                .iter()
+                .map(|item| match item {
+                    V::Str(key) => key.clone(),
+                    other => panic!("not a key: {other:?}"),
+                })
+                .collect(),
+            other => panic!("FT.SEARCH {query}: {other:?}"),
+        }
+    };
+    let mut wrong = Vec::new();
+    for r in 0..rounds {
+        // Some rounds index only what is written from here on.
+        let skip = r % 3 == 2;
+        std::thread::sleep(Duration::from_micros(300 + (r as u64 * 7919) % 1500));
+        let mut create = vec!["FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:"];
+        if skip {
+            create.push("SKIPINITIALSCAN");
+        }
+        create.extend(["SCHEMA", "v", "NUMERIC"]);
+        assert_eq!(one.cmd(&create), V::Str("OK".into()), "round {r}");
+        // Stopped at once: a later write of a hash would put right what
+        // the race left in the index.
+        paused.store(true, SeqCst);
+        let held: Vec<_> = turns.iter().map(|t| t.lock().unwrap()).collect();
+        let all = indexed(&mut one, "@v:[-inf +inf]");
+        let keys: Vec<String> = (0..HOT)
+            .map(hot)
+            .chain((0..FRESH).map(|i| fresh(r, i)))
+            .collect();
+        for key in &keys {
+            let value = match one.cmd(&["HGET", key, "v"]) {
+                V::Str(value) => value,
+                V::Nil => continue,
+                other => panic!("HGET {key}: {other:?}"),
+            };
+            let present = all.contains(key);
+            if !present && !skip {
+                wrong.push(format!("round {r}: {key} = {value} is in no index"));
+            }
+            if present && !indexed(&mut one, &format!("@v:[{value} {value}]")).contains(key) {
+                wrong.push(format!(
+                    "round {r}: {key} = {value} is indexed with another value"
+                ));
+            }
+        }
+        assert_eq!(one.cmd(&["FT.DROPINDEX", "idx"]), V::Str("OK".into()));
+        // The round's new hashes go, so that each walk has as much to do.
+        let fresh_keys: Vec<String> = (0..FRESH).map(|i| fresh(r, i)).collect();
+        let mut del = vec!["DEL"];
+        del.extend(fresh_keys.iter().map(String::as_str));
+        assert!(matches!(one.cmd(&del), V::Int(_)));
+        round.store(r + 1, SeqCst);
+        drop(held);
+        paused.store(false, SeqCst);
+    }
+    done.store(true, SeqCst);
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

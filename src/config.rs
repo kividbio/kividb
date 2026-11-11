@@ -254,6 +254,11 @@ pub struct Config {
     #[arg(long, default_value_t = 128)]
     pub slowlog_max_len: usize,
 
+    /// Maximum number of ACL LOG entries to keep (`acllog-max-len`); 0
+    /// keeps none
+    #[arg(long, default_value_t = 128)]
+    pub acllog_max_len: usize,
+
     /// True iff the server should run as a cluster node.
     /// Activated by `--cluster-enabled yes`. Defaults to false (standalone).
     #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args=1)]
@@ -610,6 +615,7 @@ impl Default for Config {
             aclfile: "".into(),
             slowlog_log_slower_than: u64::MAX,
             slowlog_max_len: 128,
+            acllog_max_len: 128,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "/etc/kividb/kividb.conf".into(),
@@ -853,6 +859,7 @@ impl Config {
             aclfile: "".to_string(),
             slowlog_log_slower_than: 10_000,
             slowlog_max_len: 128,
+            acllog_max_len: 128,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
@@ -1247,6 +1254,7 @@ impl Config {
             us => out.push_str(&format!("slowlog-log-slower-than {us}\n")),
         }
         out.push_str(&format!("slowlog-max-len {}\n", self.slowlog_max_len));
+        out.push_str(&format!("acllog-max-len {}\n", self.acllog_max_len));
         out.push_str(&format!(
             "cluster-enabled {}\n",
             if self.cluster_enabled { "yes" } else { "no" }
@@ -1644,6 +1652,7 @@ impl Config {
                 )
             }
             "slowlog-max-len" => set!(slowlog_max_len, number(key, one()?)?),
+            "acllog-max-len" => set!(acllog_max_len, number(key, one()?)?),
             "slowlog-entry-max-argc" => set!(slowlog_entry_max_argc, number(key, one()?)?),
             "slowlog-entry-max-string-len" => {
                 set!(slowlog_entry_max_string_len, number(key, one()?)?)
@@ -2512,8 +2521,8 @@ mod config_file_tests {
         .unwrap();
         // All but maxclients, latency-tracking and latency-monitor-threshold,
         // which the latency monitor and `INFO latencystats` go by (#158,
-        // #232).
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        // #232), and acllog-max-len, which the ACL log goes by.
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].contains("'hash-max-listpack-entries'"),
             "{warnings:?}"
