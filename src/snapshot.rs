@@ -607,6 +607,33 @@ pub const KDB_MAGIC: &[u8; 8] = b"KIVIDB01";
 // reads them in.
 
 /// Magic plus the number of database sections that follow.
+/// The key of the entry that opens database 0 of every image 1.2.1 writes
+/// of a dataset, an empty hash with field expiries: its mark (#441).
+///
+/// 1.2.0 wrote the empty key with the length that ends a database, so an
+/// image without the mark can be one that reads more than one way, even
+/// where the reading as 1.2.1 writes loads it; an image with it is read
+/// that way only (see [`read_retrying`]). 1.2.0 and 1.1 read the entry as a
+/// hash with no fields and drop it, as they drop any such hash, and the
+/// key, in UTF-8, is one they read: they load the image as it is. It is
+/// the image's first entry, before any byte of the data: no value of a
+/// 1.2.0 image can stand for it. It is never a key (see [`read_image`]).
+const IMAGE_MARK_KEY: &[u8] = b"\0kividb:image:1.2.1";
+
+/// The bytes of [`IMAGE_MARK_KEY`]'s entry: the key's length and bytes, the
+/// tag, no fields and no expiries.
+#[cfg(test)]
+const IMAGE_MARK_LEN: usize = 4 + IMAGE_MARK_KEY.len() + 1 + 4 + 4;
+
+/// [`IMAGE_MARK_KEY`]'s entry: the key, then an empty hash with field
+/// expiries, no fields and no expiries.
+fn write_image_mark(w: &mut impl Write) -> io::Result<()> {
+    write_key(w, IMAGE_MARK_KEY)?;
+    w.write_all(&[TAG_HASH_EX])?;
+    w.write_all(&0u32.to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())
+}
+
 pub fn write_kdb_header(w: &mut impl Write, db_count: u32) -> io::Result<()> {
     w.write_all(KDB_MAGIC)?;
     w.write_all(&db_count.to_le_bytes())
@@ -930,6 +957,9 @@ pub fn write_kdb_image<K: AsRef<[u8]>>(
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
     write_kdb_header(w, maps.len() as u32)?;
+    if !maps.is_empty() {
+        write_image_mark(w)?;
+    }
     for map in maps {
         for (k, v) in map {
             write_kdb_entry(w, k, v.view())?;
@@ -1616,7 +1646,15 @@ pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
 /// follows the end is the end of the image or a section, which opens with
 /// `KIVI`, never with a type tag.
 pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
-    read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
+    read_image(
+        r,
+        true,
+        &[],
+        &mut Vec::new(),
+        server_databases(),
+        &mut false,
+    )
+    .map(|(loaded, _)| loaded)
 }
 
 /// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]).
@@ -1696,8 +1734,13 @@ fn readings_for(databases: usize) -> usize {
 /// reading alone loads it is it read again, that once, to keep what it
 /// reads: no more memory is taken than one reading of it takes.
 ///
-/// An image that the first reading loads, as every image 1.2.1 writes, is
-/// read once.
+/// An image with 1.2.1's mark ([`IMAGE_MARK_KEY`]), as every image 1.2.1
+/// writes of a dataset, is read once, as 1.2.1 writes it: 1.2.1 writes the
+/// empty key one way only. So is one that, read that way, has no database
+/// end 1.2.0's empty key could be. Any other image that loads read that way
+/// is read the other ways too, as above, and refused if one of them loads
+/// it as well: 1.2.0 wrote it, and loading it as 1.2.1 writes could load it
+/// wrong. Without them, it is loaded from that first reading.
 fn read_retrying<R: Read>(
     open: impl FnMut() -> io::Result<R>,
     keep: bool,
@@ -1715,13 +1758,23 @@ fn read_retrying_within<R: Read>(
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
     let mut reader = open()?;
     let mut ends = Vec::new();
-    let first_error = match read_image(&mut reader, keep, &[], &mut ends, databases) {
-        Ok((loaded, keys)) => return Ok((loaded, keys, reader)),
-        // Read whole, and refused for its databases (#482).
-        Err(e) if is_past_databases(&e) => return Err(e),
-        Err(e) if !is_layout(&e) => return Err(e),
-        Err(e) => e,
-    };
+    let mut marked = false;
+    // What the reading as 1.2.1 writes loads, if it loads the image; the
+    // error it fails with, if not.
+    let (strict, first_error) =
+        match read_image(&mut reader, keep, &[], &mut ends, databases, &mut marked) {
+            // Read one way only (see above).
+            Ok((loaded, keys)) if marked || ends.is_empty() => {
+                return Ok((loaded, keys, reader));
+            }
+            Ok((loaded, keys)) => (Some((loaded, keys, reader)), None),
+            // Read whole, and refused for its databases (#482).
+            Err(e) if is_past_databases(&e) => return Err(e),
+            Err(e) if !is_layout(&e) => return Err(e),
+            Err(e) => (None, Some(e)),
+        };
+    let first_error =
+        || first_error.unwrap_or_else(|| io::Error::other("the snapshot could not be read"));
     // Readings still to make, latest pushed first: each a reading made
     // before, with one database more read as holding the empty key. Never
     // more than the readings left.
@@ -1732,7 +1785,8 @@ fn read_retrying_within<R: Read>(
     // The reading that loads the image, if one does: the databases it reads
     // the empty key in, and its refusal for a key or an index in a database
     // past the server's (#482), if it is refused for that.
-    let mut loads: Option<(Vec<usize>, Option<io::Error>)> = None;
+    let mut loads: Option<(Vec<usize>, Option<io::Error>)> =
+        strict.is_some().then(|| (Vec::new(), None));
     while let Some(plan) = plans.pop() {
         if readings == most {
             left_out = true;
@@ -1742,10 +1796,10 @@ fn read_retrying_within<R: Read>(
         let mut reader = match open() {
             Ok(reader) => reader,
             Err(e) if loads.is_some() => return Err(not_all_read(e)),
-            Err(_) => return Err(first_error),
+            Err(_) => return Err(first_error()),
         };
         let mut ends = Vec::new();
-        let past = match read_image(&mut reader, false, &plan, &mut ends, databases) {
+        let past = match read_image(&mut reader, false, &plan, &mut ends, databases, &mut false) {
             Ok(_) => None,
             // Read whole: it loads but for its databases.
             Err(e) if is_past_databases(&e) => Some(e),
@@ -1785,7 +1839,7 @@ fn read_retrying_within<R: Read>(
                 }
             );
         }
-        return Err(first_error);
+        return Err(first_error());
     };
     if left_out {
         return Err(not_all_read(io::Error::new(
@@ -1796,9 +1850,24 @@ fn read_retrying_within<R: Read>(
     if let Some(past) = past {
         return Err(past);
     }
+    if let Some(strict) = strict {
+        log_warn!(
+            "snapshot has no mark of KiviDB 1.2.1, and could have been written by 1.2.0 with \
+             the empty key where a database ends (#441): of {readings} readings of it, only the \
+             one as KiviDB writes it loads it"
+        );
+        return Ok(strict);
+    }
     // The one reading that loads it, made again to keep what it reads.
     let mut reader = open()?;
-    let (loaded, keys) = read_image(&mut reader, keep, &plan, &mut Vec::new(), databases)?;
+    let (loaded, keys) = read_image(
+        &mut reader,
+        keep,
+        &plan,
+        &mut Vec::new(),
+        databases,
+        &mut false,
+    )?;
     log_warn!(
         "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) {plan:?}, \
          where 1.2.0 ends a database (#441): read as the empty key, the one reading of {} that \
@@ -1888,9 +1957,17 @@ pub fn refusal_of_payload(e: io::Error) -> io::Error {
 /// The refusal of an image that the readings `first` and `other` (the
 /// databases each reads 1.2.0's empty key in) both load.
 fn reads_more_than_one_way_error(first: &[usize], other: &[usize]) -> io::Error {
+    let way = |plan: &[usize]| {
+        if plan.is_empty() {
+            "as KiviDB writes it".to_string()
+        } else {
+            format!("as written by KiviDB 1.2.0 with the empty key (#441) in database(s) {plan:?}")
+        }
+    };
     let why = format!(
-        "the snapshot can be read more than one way, with different keys: as written by KiviDB \
-         1.2.0 with the empty key (#441) in database(s) {first:?}, or in database(s) {other:?}"
+        "the snapshot can be read more than one way, with different keys: {}, or {}",
+        way(first),
+        way(other)
     );
     log_error!("{why}; it is not loaded");
     io::Error::new(io::ErrorKind::InvalidData, ReadsMoreThanOneWay(why))
@@ -2010,12 +2087,18 @@ fn skip_value(r: &mut impl Read, tag: u8) -> io::Result<()> {
 /// libraries are passed over, not read into memory, with what reading them
 /// refuses refused all the same (see [`skip_value`]): a reading of a 1.2.0
 /// image that misread a length does not take memory for it.
+///
+/// `marked` is set if database 0 opens with [`IMAGE_MARK_KEY`]'s entry, as
+/// it does in every image 1.2.1 writes of a dataset. The entry is read past,
+/// not kept, nor counted as a key; the key or an empty hash anywhere else is
+/// read as any other.
 fn read_image(
     r: impl Read,
     keep: bool,
     legacy: &[usize],
     ends: &mut Vec<usize>,
     databases: usize,
+    marked: &mut bool,
 ) -> io::Result<(LoadedSnapshot, usize)> {
     let mut r = r;
     let mut keys_read = 0usize;
@@ -2046,6 +2129,9 @@ fn read_image(
         let last = db + 1 == db_count;
         // Whether this database's 1.2.0 empty key has been read.
         let mut legacy_read = false;
+        // Whether the next entry is the first of database 0, where 1.2.1's
+        // mark is.
+        let mut first = db == 0;
 
         loop {
             // Read key length — if EOF here, we're done
@@ -2132,12 +2218,15 @@ fn read_image(
                 klen as usize
             };
 
-            let kbuf = if keep {
+            let may_be_mark =
+                std::mem::take(&mut first) && legacy_tag.is_none() && klen == IMAGE_MARK_KEY.len();
+            let kbuf = if keep || may_be_mark {
                 read_exactly(&mut r, klen)?
             } else {
                 skip_exactly(&mut r, klen)?;
                 Vec::new()
             };
+            let mark_key = may_be_mark && kbuf == IMAGE_MARK_KEY;
             // Any bytes: a key need not be text.
             let key = Key::from(kbuf);
 
@@ -2419,6 +2508,12 @@ fn read_image(
                     ));
                 }
             };
+
+            // 1.2.1's mark: not a key.
+            if mark_key && matches!(&value, KiviDBValue::HashEx(hash) if hash.read().is_empty()) {
+                *marked = true;
+                continue;
+            }
 
             // A key in a database past the server's (#482): not kept, and
             // the image refused once it is read.
@@ -4995,6 +5090,9 @@ impl FrozenDataset {
         // deletes keys the capture holds here.
         crate::aof::failpoint("snapshot-writing");
         write_kdb_header(out, self.dbs.len() as u32)?;
+        if !self.dbs.is_empty() {
+            write_image_mark(out)?;
+        }
         // The times to live of the strings, for the expiry section after
         // the keys: each string's hold goes as soon as it is written, so
         // that a key written over or deleted since the capture is freed
@@ -6686,6 +6784,7 @@ mod verify_tests {
         // after the first database's end.
         let one = image(1);
         let entry = 4 + "key:0".len() + 1 + 4 + "value 0".len();
+        let entry = IMAGE_MARK_LEN + entry;
         assert!(load_snapshot_from(&one[..8 + 4 + entry + 8]).is_ok());
         assert!(load_snapshot_from(&one[..8 + 4 + entry]).is_err());
         assert!(load_snapshot_from(&one[..8 + 4 + entry + 4]).is_err());
@@ -7096,7 +7195,7 @@ mod empty_key_tests {
     #[test]
     fn a_reader_before_the_marker_runs_out_of_image_at_it() {
         let whole = image(&[HashMap::from([(String::new(), string("x"))])]);
-        let at = KDB_MAGIC.len() + 4;
+        let at = KDB_MAGIC.len() + 4 + IMAGE_MARK_LEN;
         assert_eq!(&whole[at..at + 4], &u32::MAX.to_le_bytes());
         let mut rest = &whole[at + 4..];
         let err = read_exactly(&mut rest, u32::MAX as usize).unwrap_err();
@@ -7157,9 +7256,10 @@ mod empty_key_tests {
             .unwrap()
             .into_payload()
             .unwrap();
-        // The header, then database 0's one entry: the stand-in and no key
-        // bytes, a string of one byte, the database's end.
-        let header = KDB_MAGIC.len() + 4;
+        // The header and the mark, then database 0's one entry: the
+        // stand-in and no key bytes, a string of one byte, the database's
+        // end.
+        let header = KDB_MAGIC.len() + 4 + IMAGE_MARK_LEN;
         assert_eq!(&image[header..header + 4], &u32::MAX.to_le_bytes());
         assert_eq!(image[header + 4], TAG_STRING);
         let db1 = header + 4 + 1 + 4 + 1 + 4;
@@ -7263,7 +7363,7 @@ mod empty_key_tests {
         let old = image_1_2_0(&[vec![("", string("")), ("\0", string("v"))], vec![]], &[]);
         // The first reading alone: past database 0, then a failure on what
         // it misread, not the refusal.
-        let first = read_image(old.as_slice(), true, &[], &mut Vec::new(), 1)
+        let first = read_image(old.as_slice(), true, &[], &mut Vec::new(), 1, &mut false)
             .err()
             .expect("the first reading loaded");
         assert!(!is_past_databases(&first), "{first}");
@@ -7559,7 +7659,7 @@ mod empty_key_tests {
 
         // Cut anywhere between the marker and the database's end.
         let whole = image(&[HashMap::from([(String::new(), string("x"))])]);
-        let db_end = header.len() + 4 + 1 + 4 + 1 + 4;
+        let db_end = header.len() + IMAGE_MARK_LEN + 4 + 1 + 4 + 1 + 4;
         assert_eq!(&whole[db_end - 4..db_end], &0u32.to_le_bytes());
         for end in header.len() + 1..db_end {
             assert!(
@@ -7654,13 +7754,29 @@ pub(crate) mod readings_tests {
         let image = two_ways();
         // The image as built: the reading as 1.2.1 writes fails, and both
         // readings with the empty key load it, differently.
-        assert!(read_image(image.as_slice(), true, &[], &mut Vec::new(), 16).is_err());
-        let (first, _) = read_image(image.as_slice(), true, &[0], &mut Vec::new(), 16).unwrap();
+        assert!(read_image(image.as_slice(), true, &[], &mut Vec::new(), 16, &mut false).is_err());
+        let (first, _) = read_image(
+            image.as_slice(),
+            true,
+            &[0],
+            &mut Vec::new(),
+            16,
+            &mut false,
+        )
+        .unwrap();
         assert_eq!(get_string(&first.dbs[0], b""), b"x");
         // `k` runs to database 1's end, which is followed by database 2's.
         let k_end = image.len() - 8;
         assert_eq!(get_string(&first.dbs[1], b"k"), &image[k_end - 255..k_end]);
-        let (second, _) = read_image(image.as_slice(), true, &[1], &mut Vec::new(), 16).unwrap();
+        let (second, _) = read_image(
+            image.as_slice(),
+            true,
+            &[1],
+            &mut Vec::new(),
+            16,
+            &mut false,
+        )
+        .unwrap();
         assert!(second.dbs[0].is_empty());
         assert_eq!(second.dbs[1].len(), 2);
         assert_eq!(get_string(&second.dbs[1], b""), b"");
@@ -7896,6 +8012,246 @@ pub(crate) mod readings_tests {
         assert!(skip_value(&mut zset.as_slice(), TAG_SORTEDSET).is_err());
         let cut = field(b"value");
         assert!(skip_value(&mut &cut[..cut.len() - 1], TAG_STRING).is_err());
+    }
+
+    /// The review's image: 1.2.0 wrote the empty key in database 0 (`""`,
+    /// `"x"`, then `k` in database 1), and read as 1.2.1 writes, it loads
+    /// too, as one key of 257 bytes in database 1.
+    fn reviewers() -> Vec<u8> {
+        let mut out = header(3);
+        out.extend(ZERO);
+        out.push(TAG_STRING);
+        out.extend(1u32.to_le_bytes());
+        out.push(b'x');
+        out.extend(ZERO);
+        out.extend(1u32.to_le_bytes());
+        out.push(b'k');
+        out.push(TAG_STRING);
+        out.extend(0xF6u32.to_le_bytes());
+        out.extend([b'v'; 241]);
+        out.push(TAG_STRING);
+        out.extend(ZERO);
+        out.extend(ZERO);
+        out.extend(ZERO);
+        out
+    }
+
+    /// An image without 1.2.1's mark that loads as 1.2.1 writes is read the
+    /// ways 1.2.0 could have written it too, and refused if one of them
+    /// loads it as well.
+    #[test]
+    fn an_unmarked_image_that_also_reads_as_1_2_0_wrote_it_is_refused() {
+        let image = reviewers();
+        let mut marked = false;
+        let (strict, _) = read_image(
+            image.as_slice(),
+            true,
+            &[],
+            &mut Vec::new(),
+            16,
+            &mut marked,
+        )
+        .unwrap();
+        assert!(!marked);
+        assert_eq!(strict.dbs[1].len(), 1);
+        let (old, _) = read_image(
+            image.as_slice(),
+            true,
+            &[0],
+            &mut Vec::new(),
+            16,
+            &mut false,
+        )
+        .unwrap();
+        assert_eq!(get_string(&old.dbs[0], b""), b"x");
+
+        for err in [
+            load_snapshot_bytes(&image).err().expect("loaded"),
+            verify_snapshot(&image).expect_err("verified"),
+        ] {
+            assert!(reads_more_than_one_way(&err), "{err}");
+            let text = err.to_string();
+            assert!(text.contains("as KiviDB writes it"), "{text}");
+            assert!(text.contains("database(s) [0]"), "{text}");
+        }
+    }
+
+    /// Every image 1.2.1 writes of a dataset opens with the mark: an image
+    /// of owned values, and a capture of the keyspace (a dump, the AOF's
+    /// checkpoint and preamble, a full sync). A `DUMP` payload does not.
+    #[test]
+    fn the_images_1_2_1_writes_are_marked_and_a_dump_payload_is_not() {
+        let mut mark = Vec::new();
+        write_image_mark(&mut mark).unwrap();
+        assert_eq!(mark.len(), IMAGE_MARK_LEN);
+        let at = KDB_MAGIC.len() + 4;
+
+        let mut owned = Vec::new();
+        write_kdb_image(&mut owned, &[HashMap::<String, KiviDBValue>::new()], None).unwrap();
+        assert_eq!(&owned[at..at + mark.len()], mark.as_slice());
+
+        let store = crate::store::new_store(2);
+        restore_into_store(
+            vec![
+                HashMap::from([(
+                    Key::from(String::from("a")),
+                    KiviDBValue::String(SharedBytes::from(&b"1"[..])),
+                )]),
+                HashMap::new(),
+            ],
+            &store,
+        );
+        let captured = freeze_dataset_for_disk(&store, None)
+            .unwrap()
+            .into_payload()
+            .unwrap();
+        assert_eq!(&captured[at..at + mark.len()], mark.as_slice());
+        let mut marked = false;
+        let (loaded, keys) = read_image(
+            captured.as_slice(),
+            true,
+            &[],
+            &mut Vec::new(),
+            16,
+            &mut marked,
+        )
+        .unwrap();
+        assert!(marked);
+        // The mark is not a key: not loaded, not counted.
+        assert_eq!(keys, 1);
+        assert_eq!(loaded.dbs[0].len(), 1);
+        assert!(!loaded.dbs[0].contains_key(IMAGE_MARK_KEY));
+        assert_eq!(verify_snapshot(&captured).unwrap(), 1);
+
+        let payload = dump_payload(&KiviDBValue::String(SharedBytes::from(&b"v"[..]))).unwrap();
+        assert!(
+            !payload
+                .windows(IMAGE_MARK_KEY.len())
+                .any(|w| w == IMAGE_MARK_KEY)
+        );
+        // No image of no databases has room for it.
+        let mut none = Vec::new();
+        write_kdb_image(&mut none, &[] as &[HashMap<String, KiviDBValue>], None).unwrap();
+        assert!(
+            !none
+                .windows(IMAGE_MARK_KEY.len())
+                .any(|w| w == IMAGE_MARK_KEY)
+        );
+    }
+
+    /// The mark is the first entry of database 0, with its key and an empty
+    /// hash with field expiries, and nothing else: the key with a value, or
+    /// after another key, or in another database, is a key as before.
+    #[test]
+    fn the_mark_is_only_the_first_entry_of_database_0() {
+        let empty_hash_ex = |out: &mut Vec<u8>| {
+            out.push(TAG_HASH_EX);
+            out.extend(ZERO);
+            out.extend(ZERO);
+        };
+        let string = |out: &mut Vec<u8>, v: &[u8]| {
+            out.push(TAG_STRING);
+            write_bytes(out, v).unwrap();
+        };
+        let read = |image: &[u8]| {
+            let mut marked = false;
+            let (loaded, keys) =
+                read_image(image, true, &[], &mut Vec::new(), 16, &mut marked).unwrap();
+            (loaded, keys, marked)
+        };
+
+        // First, with a value: a key.
+        let mut image = header(1);
+        write_key(&mut image, IMAGE_MARK_KEY).unwrap();
+        string(&mut image, b"v");
+        image.extend(ZERO);
+        let (loaded, keys, marked) = read(&image);
+        assert!(!marked);
+        assert_eq!(
+            (keys, get_string(&loaded.dbs[0], IMAGE_MARK_KEY)),
+            (1, b"v".to_vec())
+        );
+
+        // Second in database 0: an empty hash, dropped as ever, and counted.
+        let mut image = header(1);
+        write_key(&mut image, b"a").unwrap();
+        string(&mut image, b"1");
+        write_key(&mut image, IMAGE_MARK_KEY).unwrap();
+        empty_hash_ex(&mut image);
+        image.extend(ZERO);
+        let (loaded, keys, marked) = read(&image);
+        assert!(!marked);
+        assert_eq!((keys, loaded.dbs[0].len()), (2, 1));
+
+        // First in database 1: the same.
+        let mut image = header(2);
+        image.extend(ZERO);
+        write_key(&mut image, IMAGE_MARK_KEY).unwrap();
+        empty_hash_ex(&mut image);
+        image.extend(ZERO);
+        let (_, keys, marked) = read(&image);
+        assert!(!marked);
+        assert_eq!(keys, 1);
+
+        // Another key first, with an empty hash: no mark.
+        let mut image = header(1);
+        write_key(&mut image, b"\0kividb:image:1.2.0").unwrap();
+        empty_hash_ex(&mut image);
+        image.extend(ZERO);
+        assert!(!read(&image).2);
+
+        // The mark itself.
+        let mut image = header(1);
+        write_image_mark(&mut image).unwrap();
+        image.extend(ZERO);
+        let (loaded, keys, marked) = read(&image);
+        assert!(marked);
+        assert_eq!((keys, loaded.dbs[0].len()), (0, 0));
+    }
+
+    /// An image without the mark that loads as 1.2.1 writes, with ends that
+    /// 1.2.0's empty key could be (first keys of 1 to 15 bytes), and that
+    /// no other reading loads, loads from that first reading. One with no
+    /// such end is read once.
+    #[test]
+    fn an_unmarked_image_that_reads_one_way_loads() {
+        // No empty key; databases 0 to 3 hold `k<db>`.
+        let mut image = header(16);
+        for db in 0..16u32 {
+            if db < 4 {
+                let value = KiviDBValue::String(SharedBytes::from(format!("v{db}").as_bytes()));
+                write_kdb_entry(&mut image, format!("k{db}").as_str(), value.view()).unwrap();
+            }
+            image.extend(ZERO);
+        }
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        // As written, then with the empty key in database 0, 1 and 2.
+        assert_eq!(opened, 4);
+        for db in 0..4 {
+            assert_eq!(
+                get_string(&loaded.dbs[db], format!("k{db}").as_bytes()),
+                format!("v{db}").into_bytes()
+            );
+        }
+        // Only database 0 holds keys: no end before them could be one.
+        let mut image = header(16);
+        let value = KiviDBValue::String(SharedBytes::from(&b"v"[..]));
+        write_kdb_entry(&mut image, "k", value.view()).unwrap();
+        for _ in 0..16 {
+            image.extend(ZERO);
+        }
+        let mut opened = 0;
+        load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        assert_eq!(opened, 1);
     }
 
     /// An image as 1.2.1 writes it, the empty key in every database and
