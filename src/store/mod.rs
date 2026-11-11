@@ -125,7 +125,7 @@ impl Drop for ShardWrite<'_> {
         if self.lock.keys.load(Ordering::Relaxed) != keys {
             self.lock.keys.store(keys, Ordering::Release);
         }
-        if self.map.wrote_over_expired() {
+        if self.map.has_to_announce() {
             return self.unlock_and_announce();
         }
         // SAFETY: dropped once, here; `map` is not used after.
@@ -141,11 +141,28 @@ impl ShardWrite<'_> {
     #[cold]
     #[inline(never)]
     fn unlock_and_announce(&mut self) {
-        let keys = self.map.take_written_over();
+        let left = self.map.take_left();
         // SAFETY: dropped once, here, from `drop`; `map` is not used after.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
-        if let Some(&(store, db)) = self.lock.place.get() {
+        let Some(&(store, db)) = self.lock.place.get() else {
+            return;
+        };
+        let of = |what: shard_map::ToSay| {
+            left.iter()
+                .filter(move |(said, _)| *said == what)
+                .map(|(_, key)| key)
+        };
+        if of(shard_map::ToSay::PastItsTime).next().is_some() {
+            let keys: Vec<Key> = of(shard_map::ToSay::PastItsTime).cloned().collect();
             crate::expiry::written_over(store, db, &keys);
+        }
+        if of(shard_map::ToSay::Document).next().is_some() {
+            // By what each key holds now: a command that took a document
+            // out and put it back under the lock lost nothing.
+            let documents = of(shard_map::ToSay::Document).map(|key| key.as_bytes());
+            crate::vector::documents_left(store, db, documents, |key| {
+                self.lock.map.read().document_at(key)
+            });
         }
     }
 }

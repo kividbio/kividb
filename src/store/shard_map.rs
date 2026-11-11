@@ -56,6 +56,7 @@ use crate::types::{
     ArrayInner, HashFields, HashInner, KiviDBValue, SortedSetInner, StreamInner, TsInner,
     VectorSetInner,
 };
+use crate::vector::IndexOn;
 
 /// A key's string value, borrowed from its shard: its bytes, kept in the
 /// key's entry, or a `SharedBytes` of their own when they are too long.
@@ -315,9 +316,22 @@ pub struct ShardMap {
     /// written under the write lock, so a reader, which only ever finds
     /// [`UNPINNED`] here, never writes it.
     now: AtomicU64,
-    /// Keys past their time that writes under this lock put new values
-    /// over, to be expired when it lets go (`expiry::written_over`).
-    written_over: Vec<crate::store::Key>,
+    /// Keys a write under this lock has something to say of when it lets
+    /// go, and what ([`ToSay`]). One list, so that a write that leaves none
+    /// reads one word to find that out.
+    left: Vec<(ToSay, crate::store::Key)>,
+}
+
+/// What a write lock has to say of a key once it lets go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToSay {
+    /// It was past its time, and a write put a new value over it: to be
+    /// expired (`expiry::written_over`).
+    PastItsTime,
+    /// Its document (a hash, a JSON document) was taken out, or a value of
+    /// another kind put over it: to leave its indexes
+    /// (`vector::documents_left`).
+    Document,
 }
 
 /// What [`ShardMap::lookup`] finds under a key.
@@ -380,9 +394,32 @@ fn now_at(now: &AtomicU64) -> u64 {
 /// the `DEL` propagated before the write's own record.
 #[cold]
 #[inline(never)]
-fn written_over_expired(over: &mut Vec<crate::store::Key>, key: &[u8]) {
+fn written_over_expired(left: &mut Vec<(ToSay, crate::store::Key)>, key: &[u8]) {
     crate::stats::record_expired();
-    over.push(crate::store::Key::new(key));
+    left.push((ToSay::PastItsTime, crate::store::Key::new(key)));
+}
+
+/// A live key's document was taken out, or written over by a value of
+/// another kind: whatever command did it, the document is no longer there
+/// to find. Kept for the write lock to take out of the search indexes once
+/// it lets go (`ShardWrite`). Not every command that can do this to a
+/// document told the indexes, and a search went on finding the key (#619).
+#[cold]
+#[inline(never)]
+fn document_left(left: &mut Vec<(ToSay, crate::store::Key)>, key: &[u8]) {
+    if !crate::vector::none_anywhere() {
+        left.push((ToSay::Document, crate::store::Key::new(key)));
+    }
+}
+
+/// The kind of document a value is to the search indexes, if it is one.
+#[inline(always)]
+fn document_on(value: ValueRef<'_>) -> Option<IndexOn> {
+    match value {
+        ValueRef::Hash(_) | ValueRef::HashEx(_) => Some(IndexOn::Hash),
+        ValueRef::Json(_) => Some(IndexOn::Json),
+        _ => None,
+    }
 }
 
 impl Default for ShardMap {
@@ -404,7 +441,7 @@ impl ShardMap {
             hash: ahash::RandomState::new(),
             ttl: TtlList::new(),
             now: AtomicU64::new(UNPINNED),
-            written_over: Vec::new(),
+            left: Vec::new(),
         }
     }
 
@@ -414,7 +451,7 @@ impl ShardMap {
             hash: ahash::RandomState::new(),
             ttl: TtlList::new(),
             now: AtomicU64::new(UNPINNED),
-            written_over: Vec::new(),
+            left: Vec::new(),
         }
     }
 
@@ -451,15 +488,24 @@ impl ShardMap {
         *self.now.get_mut() = UNPINNED;
     }
 
-    /// Whether [`written_over_expired`] kept any keys.
+    /// Whether a write has anything to say once the lock lets go: a key
+    /// past its time that it put a value over ([`written_over_expired`]),
+    /// or a document that left ([`document_left`]).
     #[inline(always)]
-    pub(super) fn wrote_over_expired(&self) -> bool {
-        !self.written_over.is_empty()
+    pub(super) fn has_to_announce(&self) -> bool {
+        !self.left.is_empty()
     }
 
-    /// The keys [`written_over_expired`] kept, taken.
-    pub(super) fn take_written_over(&mut self) -> Vec<crate::store::Key> {
-        std::mem::take(&mut self.written_over)
+    /// The kind of document `key` holds, if it holds one. Not a use of the
+    /// key.
+    pub(super) fn document_at(&self, key: &[u8]) -> Option<IndexOn> {
+        self.find_live(self.hash_of(key), key)
+            .and_then(|slot| document_on(slot.entry().value()))
+    }
+
+    /// The keys [`written_over_expired`] and [`document_left`] kept, taken.
+    pub(super) fn take_left(&mut self) -> Vec<(ToSay, crate::store::Key)> {
+        std::mem::take(&mut self.left)
     }
 
     /// This table, as a number: which table a key is in, for `access`.
@@ -639,7 +685,7 @@ impl ShardMap {
         let map = self.id();
         let hasher = &self.hash;
         let list = &mut self.ttl;
-        let over = &mut self.written_over;
+        let left = &mut self.left;
         match self.table.entry(
             hash,
             |s| s.may_be(hash) && s.entry().has_key(key),
@@ -649,7 +695,7 @@ impl ShardMap {
                 let old = at.get().entry();
                 let stale = expired(old, now);
                 if stale {
-                    written_over_expired(over, key);
+                    written_over_expired(left, key);
                 }
                 if !stale && let Some(bytes) = in_place {
                     // The time to live is in the block before the key: a
@@ -697,6 +743,10 @@ impl ShardMap {
                 // starts where a new key does.
                 if !stale {
                     entry.set_access(old.access());
+                    let was = document_on(old.value());
+                    if was.is_some() && was != document_on(entry.value()) {
+                        document_left(left, key);
+                    }
                 }
                 used(entry, hash, map);
                 *at.get_mut() = Slot::new(entry, hash);
@@ -989,6 +1039,9 @@ impl ShardMap {
                 if entry.has_ttl() {
                     self.ttl.take(entry);
                 }
+                if document_on(entry.value()).is_some() {
+                    document_left(&mut self.left, key);
+                }
                 // SAFETY: the table's hold goes to the caller.
                 Some(unsafe { Taken::new(entry) })
             }
@@ -1027,6 +1080,9 @@ impl ShardMap {
                 if entry.has_ttl() {
                     self.ttl.take(entry);
                 }
+                if document_on(entry.value()).is_some() {
+                    document_left(&mut self.left, key);
+                }
                 // SAFETY: the table's hold goes to the caller.
                 Removal::Taken(unsafe { Taken::new(entry) })
             }
@@ -1046,7 +1102,7 @@ impl ShardMap {
         let now = &self.now;
         let hasher = &self.hash;
         let list = &mut self.ttl;
-        let over = &mut self.written_over;
+        let left = &mut self.left;
         let key = taken.key();
         match self.table.entry(
             hash,
@@ -1058,7 +1114,7 @@ impl ShardMap {
                 if !expired(old, now) {
                     return Err(taken);
                 }
-                written_over_expired(over, key);
+                written_over_expired(left, key);
                 let entry = taken.into_entry();
                 *at.get_mut() = Slot::new(entry, hash);
                 list.replaced(old, entry);
@@ -1734,8 +1790,8 @@ mod tests {
         map.insert_str_expiring("rng", "5", Some(1));
         assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
         assert_eq!(
-            map.take_written_over(),
-            vec![crate::store::Key::from("set")]
+            map.take_left(),
+            vec![(ToSay::PastItsTime, crate::store::Key::from("set"))]
         );
         // A live key is still written in place.
         map.insert_str_expiring("live", "5", Some(u64::MAX - 1));

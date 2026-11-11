@@ -967,8 +967,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 } else {
                     delete_key(ctx.store, *ctx.selected_db, key)
                 };
+                // A document that was deleted left its indexes when the
+                // shard was let go of (`ShardMap::remove`).
                 if deleted {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
