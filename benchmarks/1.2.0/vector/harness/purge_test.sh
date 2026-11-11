@@ -14,7 +14,7 @@ $SSH 'echo 150 > ~/linger'
 SERVER_IP=$SERVER_IP PASS=$PASS MODE=upload DATASETS=$DS ENGINES=$ENGINE bash ~/run_suite.sh &
 SUITE=$!
 LOGF=~/out/$PASS/$ENGINE/$DS/tool.log
-until grep -q "Experiment stage: Done" $LOGF 2>/dev/null; do sleep 1; done
+for _ in $(seq 1 3600); do grep -q "Experiment stage: Done" $LOGF 2>/dev/null && break; sleep 1; done   # at most an hour
 sleep 60
 echo "$(date +%s.%N | cut -c1-14) MEMORY PURGE -> $($SSH 'redis-cli -p 6380 MEMORY PURGE')" >> ~/out/$PASS/$ENGINE/$DS/purge.log
 wait $SUITE
