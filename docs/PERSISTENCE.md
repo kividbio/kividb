@@ -46,6 +46,12 @@ If a checkpoint is stopped part way (a crash, a kill), the previous log is
 kept as `appendonly.aof.prev`. At the next start it is replayed, and then
 the new log, on top of the snapshot the checkpoint started from.
 
+The snapshot such a checkpoint, or a save with the AOF off, was writing is
+left in `dir` as `dump.kdb.<pid>.<n>.tmp`, as big as `dump.kdb`. Nothing
+reads it. The next start removes those files, once it holds the data
+directory's lock (`kividb.lock`) and before it saves anything, and a
+`[WARN]` names each one. A start that could not take the lock leaves them.
+
 ## How recovery works
 
 On startup, `dump.kdb` (or `dump.rdb`) is loaded first if it is present.

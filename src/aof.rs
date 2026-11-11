@@ -1999,12 +1999,7 @@ fn checkpoint_inner(
         );
     }
 
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp_path = format!(
-        "dump.kdb.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let tmp_path = temp_dump_name();
     let written = frozen
         .write_file(&tmp_path)
         .and_then(|()| install_dump(&tmp_path, generation, !aof_on));
@@ -2129,6 +2124,63 @@ fn logs_as_saved() -> std::io::Result<LogsAtSave> {
         }
     }
     logs_on_disk()
+}
+
+/// The name a dump is written under before [`install_dump`] puts it in
+/// place, `dump.kdb.<pid>.<n>.tmp`: one of its own for each writer, since a
+/// checkpoint and a save with the AOF off can overlap, and two writing one
+/// file would interleave.
+pub(crate) fn temp_dump_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "dump.kdb.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Whether `name` is one of [`temp_dump_name`]'s, of any process.
+fn is_temp_dump(name: &str) -> bool {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("dump.kdb.")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(pid, n)| number(pid) && number(n))
+}
+
+/// Remove the dumps that saves cut short (a kill -9, the OOM killer, a
+/// Kubernetes liveness probe) left in the data directory, naming each in
+/// the log. Each is as big as the dataset, and nothing reads it: recovery
+/// goes by `dump.kdb` and the save number beside it. Left there, each crash
+/// during a save added one, until the volume was full (#545).
+///
+/// Only at start, by the process holding the data directory's lock, and
+/// before it saves anything: every such file is then another process's, one
+/// with this pid included, as every start in a container has the same.
+pub fn remove_cut_short_dumps() {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return;
+    };
+    let mut cut_short: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            is_temp_dump(&name).then(|| (name, entry.metadata().map_or(0, |meta| meta.len())))
+        })
+        .collect();
+    cut_short.sort();
+    for (name, len) in cut_short {
+        match std::fs::remove_file(&name) {
+            Ok(()) => log_warn!(
+                "Removed {name} ({len} bytes), the dump of a save that did not finish: nothing \
+                 reads it"
+            ),
+            Err(e) => log_warn!(
+                "Can't remove {name}, the dump of a save that did not finish ({e}): nothing \
+                 reads it, remove it by hand"
+            ),
+        }
+    }
 }
 
 /// Put the dump written to `tmp` in place as save number `generation`, with

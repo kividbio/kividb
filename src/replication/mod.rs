@@ -1598,12 +1598,7 @@ fn save_dataset_with(
             let _cut = crate::write_gate::cut();
             crate::snapshot::freeze_dataset_for_disk(store, Some(index_store))
         }?;
-        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp = format!(
-            "dump.kdb.{}.{}.tmp",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
+        let tmp = crate::aof::temp_dump_name();
         // With a save number of its own, as a checkpoint's: put in place
         // without one, the dump kept the number of the log beside it, and a
         // start with the AOF on replayed that log over it (#354).

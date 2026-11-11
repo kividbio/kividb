@@ -145,6 +145,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A save cut short no longer leaves its snapshot in the data directory
+  for good (#545).** A `BGSAVE`, `BGREWRITEAOF` or other checkpoint stopped
+  part way (a kill -9, the OOM killer, a Kubernetes liveness probe) left the
+  file it was writing, `dump.kdb.<pid>.<n>.tmp`, as big as the dataset's
+  snapshot. Nothing read it and nothing removed it, so each such crash
+  added one until the volume was full. A start now removes them once it
+  holds `kividb.lock`, before it saves anything, and logs a `[WARN]` naming
+  each file and its size. It removes only files with that exact name: the
+  AOF's own temporary files keep fixed names that the next write reuses,
+  and recovery reads one of them (`appendonly.aof.rewrite.tmp`), so they
+  are left alone.
+
 - **`CLIENT PAUSE ... WRITE` no longer replies while a write is still on
   its way (#629).** A switchover (the kividb-operator's, and any that works
   the same way) pauses writes on the master, reads `master_repl_offset`,
