@@ -3038,7 +3038,8 @@ pub fn replay_aof(
     };
 
     if let Some(image) = image {
-        let loaded = crate::snapshot::load_snapshot_bytes(image)?;
+        let loaded = crate::snapshot::load_snapshot_bytes(image)
+            .map_err(|e| crate::snapshot::refusal_of_file(e, "the AOF's preamble"))?;
         let crate::snapshot::LoadedSnapshot {
             dbs,
             index_schemas,

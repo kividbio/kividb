@@ -1537,7 +1537,8 @@ pub fn load_dump(
     let (loaded, reader) = crate::snapshot::load_snapshot_with(|| {
         let file = std::fs::File::open(path)?;
         Ok(std::io::BufReader::new(FingerprintReader::new(file)))
-    })?;
+    })
+    .map_err(|e| crate::snapshot::refusal_of_file(e, path))?;
     // What the buffer holds beyond what was parsed has been fingerprinted.
     let fingerprint = reader.into_inner().finish()?;
     Ok((loaded, fingerprint))
