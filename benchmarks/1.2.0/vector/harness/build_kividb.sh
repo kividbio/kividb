@@ -3,15 +3,20 @@
 # default features, release profile, LSE atomics.
 # Runs on the BUILDER VM (same image as the server); copy ~/bins/<name>/ to
 # the server afterwards, so nothing compiles on the server.
-# Usage: build_kividb.sh <git ref> <name>   -> ~/bins/<name>/{kividb,commit,rustc}
+# Usage: [TOOLCHAIN=1.99.1] build_kividb.sh <git ref> <name>   -> ~/bins/<name>/{kividb,commit,rustc}
+# TOOLCHAIN defaults to rustc 1.99.1, the compiler of the published runs; plain rustup "stable" moves on
+# and would build a different binary.
 set -euo pipefail
 REF=$1 NAME=$2
+TOOLCHAIN=${TOOLCHAIN:-1.99.1}
 if [ ! -f ~/.cargo/env ]; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential cmake clang pkg-config git
-  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$TOOLCHAIN" >/dev/null
 fi
 . ~/.cargo/env
+rustup toolchain install --profile minimal "$TOOLCHAIN" >/dev/null
+export RUSTUP_TOOLCHAIN=$TOOLCHAIN
 [ -d ~/kividb-src ] || git clone -q https://github.com/kividbio/kividb ~/kividb-src
 cd ~/kividb-src
 git fetch -q --tags origin
