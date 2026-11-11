@@ -1594,7 +1594,15 @@ fn write_index_schema(w: &mut impl Write, def: &crate::vector::IndexDef) -> io::
 }
 
 pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
-    load_snapshot_with(|| File::open(path).map(BufReader::new)).map(|(loaded, _)| loaded)
+    load_snapshot_with(|| File::open(path).map(BufReader::new))
+        .map(|(loaded, _)| loaded)
+        .map_err(|e| {
+            if reads_more_than_one_way(&e) {
+                io::Error::new(e.kind(), ReadsMoreThanOneWay(format!("{path}: {e}")))
+            } else {
+                e
+            }
+        })
 }
 
 /// Read a KDB image from anything byte-shaped.
@@ -1607,8 +1615,12 @@ pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
 /// database before its last one is not read (see [`read_retrying`]). The
 /// server reads its images with [`load_snapshot`], [`load_snapshot_bytes`]
 /// and [`load_snapshot_with`].
+///
+/// One reading cannot be one of several: it reads only what 1.2.1 writes,
+/// and the 1.2.0 empty key only in the last database, where the byte after
+/// its 0 tells it apart from the database's end.
 pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
-    read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
+    read_image(r, true, &[], &mut Vec::new(), server_databases(), &mut ()).map(|(loaded, _)| loaded)
 }
 
 /// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]).
@@ -1663,64 +1675,120 @@ const READINGS: usize = 32;
 /// [`READINGS`] times. A reading that fails other than on what it read (the
 /// disk, the network) ends it. If none loads the image, the first reading's
 /// error is returned.
+///
+/// A reading that loads does not end it: an image can be read more than one
+/// way, and every other reading is made as well, a reading that loaded read
+/// again with one more such end (#441). If two load different keys or values
+/// (see [`Fingerprint`]), the image is refused (see [`ReadsMoreThanOneWay`]),
+/// as it is if they could not all be made: the readings run out, or one fails
+/// on the disk. Readings that load the same keys and values load it. The
+/// first reading that loads is kept, and those after it only compared with
+/// it: one dataset is held at a time. The two are compared only once a
+/// second reading loads, by reading both again for their fingerprints, so a
+/// 1.2.0 image that one reading alone loads costs no hashing.
+///
+/// An image that the first reading loads, as every image 1.2.1 writes, is
+/// read once, and nothing of it is compared.
 fn read_retrying<R: Read>(
     mut open: impl FnMut() -> io::Result<R>,
     keep: bool,
     databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
-    let mut first_error: Option<io::Error> = None;
-    // Readings still to make, latest pushed first: each a reading that
-    // failed, with one database more read as holding the empty key. Never
+    let mut reader = open()?;
+    let mut ends = Vec::new();
+    let first_error = match read_image(&mut reader, keep, &[], &mut ends, databases, &mut ()) {
+        Ok((loaded, keys)) => return Ok((loaded, keys, reader)),
+        // Read whole, and refused for its databases (#482).
+        Err(e) if is_past_databases(&e) => return Err(e),
+        Err(e) if !is_layout(&e) => return Err(e),
+        Err(e) => e,
+    };
+    // Readings still to make, latest pushed first: each a reading made
+    // before, with one database more read as holding the empty key. Never
     // more than the readings left.
-    let mut plans: Vec<Vec<usize>> = vec![Vec::new()];
-    let mut readings = 0;
+    let mut plans: Vec<Vec<usize>> = Vec::new();
+    // Whether a reading there was no room for was left out.
+    let mut left_out = !push_plans(&mut plans, &[], &ends, READINGS - 1);
+    let mut readings = 1;
+    // The first reading that loaded the image, and what it read.
+    let mut loaded: Option<Reading<R>> = None;
     while let Some(plan) = plans.pop() {
         if readings == READINGS {
+            left_out = true;
             break;
         }
         readings += 1;
         let mut reader = match open() {
             Ok(reader) => reader,
-            Err(e) => return Err(first_error.unwrap_or(e)),
+            Err(e) if loaded.is_some() => return Err(not_all_read(e)),
+            Err(_) => return Err(first_error),
         };
         let mut ends = Vec::new();
-        match read_image(&mut reader, keep, &plan, &mut ends, databases) {
-            Ok((loaded, keys)) => {
-                if !plan.is_empty() {
-                    log_warn!(
-                        "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) \
-                         {plan:?}, where 1.2.0 ends a database (#441): read as the empty key"
-                    );
+        let keep_this = keep && loaded.is_none();
+        match read_image(&mut reader, keep_this, &plan, &mut ends, databases, &mut ()) {
+            Ok((dataset, keys)) => match &mut loaded {
+                None => {
+                    loaded = Some(Reading {
+                        plan: plan.clone(),
+                        dataset,
+                        keys,
+                        reader,
+                        print: None,
+                    })
                 }
-                return Ok((loaded, keys, reader));
-            }
+                // Another reading loads it: the two are read again, to be
+                // compared. Not before, for the readings that load to be
+                // read no slower than the others.
+                Some(first) => {
+                    let first_print = match first.print {
+                        Some(print) => print,
+                        None => fingerprint(&mut open, &first.plan, databases)?,
+                    };
+                    first.print = Some(first_print);
+                    if fingerprint(&mut open, &plan, databases)? != first_print {
+                        return Err(reads_more_than_one_way_error(&first.plan, &plan));
+                    }
+                }
+            },
             // Read whole, and refused for its databases (#482): this
             // reading's error, whichever reading it is.
             Err(e) if is_past_databases(&e) => return Err(e),
-            Err(e) => {
-                let layout = matches!(
-                    e.kind(),
-                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            Err(e) if !is_layout(&e) => {
+                if loaded.is_some() {
+                    return Err(not_all_read(e));
+                }
+                log_warn!(
+                    "snapshot: reading it again failed ({e}); what the first reading found is \
+                     returned"
                 );
-                if first_error.is_none() {
-                    if !layout {
-                        return Err(e);
-                    }
-                    first_error = Some(e);
-                    push_plans(&mut plans, &plan, &ends, READINGS - readings);
-                    continue;
-                }
-                if !layout {
-                    log_warn!(
-                        "snapshot: reading it again failed ({e}); what the first reading \
-                         found is returned"
-                    );
-                    break;
-                }
-                let room = READINGS.saturating_sub(readings + plans.len());
-                push_plans(&mut plans, &plan, &ends, room);
+                break;
             }
+            Err(_) => {}
         }
+        let room = READINGS.saturating_sub(readings + plans.len());
+        left_out |= !push_plans(&mut plans, &plan, &ends, room);
+    }
+    if let Some(Reading {
+        plan,
+        dataset,
+        keys,
+        reader,
+        ..
+    }) = loaded
+    {
+        if left_out {
+            return Err(not_all_read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("it has more than the {READINGS} readings that are made of an image"),
+            )));
+        }
+        log_warn!(
+            "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) {plan:?}, \
+             where 1.2.0 ends a database (#441): read as the empty key, the one reading of {} \
+             that loads it",
+            readings
+        );
+        return Ok((dataset, keys, reader));
     }
     if readings > 1 {
         log_warn!(
@@ -1734,24 +1802,210 @@ fn read_retrying<R: Read>(
             }
         );
     }
-    Err(first_error.unwrap_or_else(|| io::Error::other("snapshot could not be read")))
+    Err(first_error)
 }
 
-/// [`read_retrying`]'s next readings after one with `plan` failed: `plan` and
-/// one of the databases in `ends` after the last in it, the earliest `room`
-/// of them, pushed so that the earliest is read first.
-fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room: usize) {
+/// A reading of [`read_retrying`]'s that loaded the image.
+struct Reading<R> {
+    /// The databases whose end it read as 1.2.0's empty key.
+    plan: Vec<usize>,
+    dataset: LoadedSnapshot,
+    keys: usize,
+    reader: R,
+    /// Its [`Fingerprint`], once another reading has loaded the image too.
+    print: Option<[u8; 32]>,
+}
+
+/// The [`Fingerprint`] of the reading of the image `open` opens with 1.2.0's
+/// empty key in the databases `plan` names; that it cannot be had refuses
+/// the image (see [`not_all_read`]).
+fn fingerprint<R: Read>(
+    open: &mut impl FnMut() -> io::Result<R>,
+    plan: &[usize],
+    databases: usize,
+) -> io::Result<[u8; 32]> {
+    let mut print = Fingerprint::default();
+    open()
+        .and_then(|mut reader| {
+            read_image(
+                &mut reader,
+                false,
+                plan,
+                &mut Vec::new(),
+                databases,
+                &mut print,
+            )
+        })
+        .map_err(not_all_read)?;
+    Ok(print.finish())
+}
+
+/// Whether a reading failed on what it read, not on the disk or the network.
+fn is_layout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// [`read_retrying`]'s next readings after one with `plan`: `plan` and one of
+/// the databases in `ends` after the last in it, the earliest `room` of them,
+/// pushed so that the earliest is read first. Whether every one was pushed.
+fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room: usize) -> bool {
     let after = plan.last().map_or(0, |&db| db + 1);
-    let next: Vec<usize> = ends
-        .iter()
-        .copied()
-        .filter(|&db| db >= after)
-        .take(room)
-        .collect();
-    for db in next.into_iter().rev() {
+    let all: Vec<usize> = ends.iter().copied().filter(|&db| db >= after).collect();
+    // `read_image` notes no more than READINGS ends: there can be more.
+    let whole = all.len() <= room && ends.len() < READINGS;
+    for &db in all.iter().take(room).rev() {
         let mut more = plan.to_vec();
         more.push(db);
         plans.push(more);
+    }
+    whole
+}
+
+/// The refusal of an image that two readings of [`read_retrying`]'s load
+/// with different keys or values, or that it could not read every way it
+/// can be read. Loading one of them could load keys under other names, or
+/// other values, than were saved.
+#[derive(Debug)]
+struct ReadsMoreThanOneWay(String);
+
+impl std::fmt::Display for ReadsMoreThanOneWay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReadsMoreThanOneWay {}
+
+/// Whether `e` is the refusal of an image that reads more than one way.
+fn reads_more_than_one_way(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ReadsMoreThanOneWay>())
+}
+
+/// What the operator is told to do with an image that reads more than one way.
+const RESTORE_ELSEWHERE: &str = "It is not loaded: restore the data from another copy \
+     (an AOF, a replica or a backup)";
+
+/// The refusal of an image that the readings `first` and `other` (the
+/// databases each read 1.2.0's empty key in) load with different contents.
+fn reads_more_than_one_way_error(first: &[usize], other: &[usize]) -> io::Error {
+    let why = format!(
+        "the snapshot can be read more than one way, with different keys or values: as \
+         written by KiviDB 1.2.0 with the empty key (#441) in database(s) {first:?}, or in \
+         database(s) {other:?}. {RESTORE_ELSEWHERE}"
+    );
+    log_error!("{why}");
+    io::Error::new(io::ErrorKind::InvalidData, ReadsMoreThanOneWay(why))
+}
+
+/// The refusal of an image that one reading loads, and that could not be
+/// read every other way it can be read, for `e`.
+fn not_all_read(e: io::Error) -> io::Error {
+    let why = format!(
+        "the snapshot was written by KiviDB 1.2.0 with the empty key (#441), and could not be \
+         read every way it can be read to make sure that it reads one way only ({e}). \
+         {RESTORE_ELSEWHERE}"
+    );
+    log_error!("{why}");
+    io::Error::new(e.kind(), ReadsMoreThanOneWay(why))
+}
+
+/// What [`read_image`] tells of what it reads, for [`read_retrying`] to
+/// compare two readings. `()` is told nothing, and costs nothing: the
+/// reading of an image as 1.2.1 writes it is not compared.
+trait Tally {
+    /// An entry of database `db` begins, with this key and type tag. What is
+    /// read from here until [`Tally::pause`] is its value.
+    fn entry(&mut self, _db: usize, _key: &[u8], _tag: u8) {}
+    /// The sections after the databases begin, with `first` of them read
+    /// already. What is read from here to the end is theirs.
+    fn sections(&mut self, _first: &[u8]) {}
+    /// What is read next is neither a value nor a section.
+    fn pause(&mut self) {}
+    /// These bytes were read.
+    fn bytes(&mut self, _read: &[u8]) {}
+}
+
+impl Tally for () {}
+
+/// A digest of what a reading loads: each entry's database, key, type and
+/// value as the image holds it, in the order read, and the sections after
+/// the databases. Two readings with the same digest load the same keys and
+/// values. It costs a SHA-256 of what is read and nothing held, so that a
+/// reading is compared with another without a second dataset in memory.
+#[derive(Default)]
+struct Fingerprint {
+    all: sha2::Sha256,
+    /// The digest of the value or the sections being read.
+    part: Option<sha2::Sha256>,
+}
+
+impl Fingerprint {
+    fn finish(mut self) -> [u8; 32] {
+        use sha2::Digest;
+        self.pause();
+        self.all.finalize().into()
+    }
+}
+
+impl Tally for Fingerprint {
+    fn entry(&mut self, db: usize, key: &[u8], tag: u8) {
+        use sha2::Digest;
+        self.pause();
+        self.all.update(b"E");
+        self.all.update((db as u64).to_le_bytes());
+        self.all.update((key.len() as u64).to_le_bytes());
+        self.all.update(key);
+        self.all.update([tag]);
+        self.part = Some(sha2::Sha256::new());
+    }
+
+    fn sections(&mut self, first: &[u8]) {
+        use sha2::Digest;
+        self.pause();
+        self.all.update(b"S");
+        let mut part = sha2::Sha256::new();
+        part.update(first);
+        self.part = Some(part);
+    }
+
+    fn pause(&mut self) {
+        use sha2::Digest;
+        if let Some(part) = self.part.take() {
+            self.all.update(part.finalize());
+        }
+    }
+
+    fn bytes(&mut self, read: &[u8]) {
+        use sha2::Digest;
+        if let Some(part) = &mut self.part {
+            part.update(read);
+        }
+    }
+}
+
+/// A reader that tells its [`Tally`] what is read through it.
+struct Tapped<'t, R, T> {
+    inner: R,
+    tally: &'t mut T,
+}
+
+impl<R: Read, T: Tally> Read for Tapped<'_, R, T> {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.tally.bytes(&buf[..n]);
+        Ok(n)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read_exact(buf)?;
+        self.tally.bytes(buf);
+        Ok(())
     }
 }
 
@@ -1771,14 +2025,18 @@ fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room:
 /// holds only sections 1.2.0 knows: it does not pass over a section it does
 /// not know, as other readings do. No reading passes over a section that is
 /// cut short or cannot be used.
+///
+/// What it reads is told to `tally` (see [`Tally`]): `&mut ()` for a reading
+/// that is not compared with another, at no cost.
 fn read_image(
     r: impl Read,
     keep: bool,
     legacy: &[usize],
     ends: &mut Vec<usize>,
     databases: usize,
+    tally: &mut impl Tally,
 ) -> io::Result<(LoadedSnapshot, usize)> {
-    let mut r = r;
+    let mut r = Tapped { inner: r, tally };
     let mut keys_read = 0usize;
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
@@ -1809,6 +2067,8 @@ fn read_image(
         let mut legacy_read = false;
 
         loop {
+            // The value before, if any, is all read.
+            r.tally.pause();
             // Read key length — if EOF here, we're done
             let mut len_buf = [0u8; 4];
             let read = match next_byte.take() {
@@ -1894,8 +2154,6 @@ fn read_image(
             };
 
             let kbuf = read_exactly(&mut r, klen)?;
-            // Any bytes: a key need not be text.
-            let key = Key::from(kbuf);
 
             // Read type tag
             let mut tag = [0u8];
@@ -1903,6 +2161,9 @@ fn read_image(
                 Some(legacy_tag) => tag[0] = legacy_tag,
                 None => r.read_exact(&mut tag)?,
             }
+            r.tally.entry(db, &kbuf, tag[0]);
+            // Any bytes: a key need not be text.
+            let key = Key::from(kbuf);
 
             let value = match tag[0] {
                 TAG_STRING => {
@@ -2206,6 +2467,8 @@ fn read_image(
     let mut dictionaries = Vec::new();
     let mut expiries: ExpiryMaps = (0..result.len()).map(|_| HashMap::new()).collect();
     let mut functions = None;
+    // What follows the databases, the byte of it already read included.
+    r.tally.sections(next_byte.as_slice());
     loop {
         let mut magic = [0u8; 8];
         let from = match next_byte.take() {
@@ -7003,7 +7266,7 @@ mod empty_key_tests {
         let old = image_1_2_0(&[vec![("", string("")), ("\0", string("v"))], vec![]], &[]);
         // The first reading alone: past database 0, then a failure on what
         // it misread, not the refusal.
-        let first = read_image(old.as_slice(), true, &[], &mut Vec::new(), 1)
+        let first = read_image(old.as_slice(), true, &[], &mut Vec::new(), 1, &mut ())
             .err()
             .expect("the first reading loaded");
         assert!(!is_past_databases(&first), "{first}");
@@ -7302,5 +7565,305 @@ mod empty_key_tests {
                 whole.len()
             );
         }
+    }
+}
+
+/// An image that 1.2.0's empty key lets be read more than one way (#441).
+#[cfg(test)]
+mod readings_tests {
+    use super::*;
+
+    const ZERO: [u8; 4] = [0; 4];
+
+    fn header(dbs: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, dbs).unwrap();
+        out
+    }
+
+    fn get_string(map: &HashMap<Key, KiviDBValue>, key: &[u8]) -> Vec<u8> {
+        match map.get(key) {
+            Some(KiviDBValue::String(bytes)) => bytes.as_ref().to_vec(),
+            _ => panic!("{key:?} is not a string"),
+        }
+    }
+
+    /// Three databases, of which the reading as 1.2.1 writes fails, and two
+    /// readings with 1.2.0's empty key load, with different keys:
+    ///
+    /// - in database 0: the empty key, `"x"`; in database 1, `k`, a string
+    ///   of 255 bytes;
+    /// - in database 1: a key of 257 bytes, `""`, and the empty key, `""`.
+    ///
+    /// The second reading takes database 0's first 4 bytes for its end, and
+    /// what the first reads as the empty key's value, database 0's end and
+    /// `k` for the bytes of a key.
+    fn two_ways() -> Vec<u8> {
+        let mut out = header(3);
+        // Database 0: its end, or the empty key: a string, of one byte.
+        out.extend(ZERO);
+        out.push(TAG_STRING);
+        // Its length (1), or with the tag before it, the length of a key of
+        // 257 bytes, which starts with the length's last byte.
+        out.extend([1, 0, 0, 0]);
+        let key_from = out.len() - 1;
+        out.push(b'x');
+        // Database 0's end, then `k` in database 1, a string of 255 bytes
+        // that runs to database 1's end.
+        out.extend(ZERO);
+        out.extend(1u32.to_le_bytes());
+        out.push(b'k');
+        out.push(TAG_STRING);
+        out.extend(255u32.to_le_bytes());
+        let value_from = out.len();
+        out.resize(key_from + 257, b'v');
+        // The long key's value, `""`; then database 1's end, or the empty
+        // key, `""`; then its end.
+        out.push(TAG_STRING);
+        out.extend(ZERO);
+        out.extend(ZERO);
+        out.push(TAG_STRING);
+        out.extend(ZERO);
+        assert_eq!(out.len() - value_from, 255);
+        out.extend(ZERO);
+        // Database 2, empty.
+        out.extend(ZERO);
+        out
+    }
+
+    /// The image reads two ways, and loading it would load either: it is
+    /// refused, saying so, wherever it is loaded or verified.
+    #[test]
+    fn an_image_that_two_readings_load_differently_is_refused() {
+        let image = two_ways();
+        // The image as built: the reading as 1.2.1 writes fails, and both
+        // readings with the empty key load it, differently.
+        assert!(read_image(image.as_slice(), true, &[], &mut Vec::new(), 16, &mut ()).is_err());
+        let (first, _) =
+            read_image(image.as_slice(), true, &[0], &mut Vec::new(), 16, &mut ()).unwrap();
+        assert_eq!(get_string(&first.dbs[0], b""), b"x");
+        // `k` runs to database 1's end, which is followed by database 2's.
+        let k_end = image.len() - 8;
+        assert_eq!(get_string(&first.dbs[1], b"k"), &image[k_end - 255..k_end]);
+        let (second, _) =
+            read_image(image.as_slice(), true, &[1], &mut Vec::new(), 16, &mut ()).unwrap();
+        assert!(second.dbs[0].is_empty());
+        assert_eq!(second.dbs[1].len(), 2);
+        assert_eq!(get_string(&second.dbs[1], b""), b"");
+
+        let refused = |err: io::Error| {
+            assert!(reads_more_than_one_way(&err), "{err}");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+            let text = err.to_string();
+            assert!(text.contains("can be read more than one way"), "{text}");
+            assert!(text.contains("database(s) [0]"), "{text}");
+            assert!(text.contains("database(s) [1]"), "{text}");
+            assert!(
+                text.contains("restore the data from another copy"),
+                "{text}"
+            );
+            text
+        };
+        refused(load_snapshot_bytes(&image).err().expect("loaded"));
+        refused(verify_snapshot(&image).expect_err("verified"));
+        let mut opened = 0;
+        refused(
+            load_snapshot_with(|| {
+                opened += 1;
+                Ok(image.as_slice())
+            })
+            .err()
+            .expect("loaded"),
+        );
+        // Three readings, and the two that load, again, to be compared.
+        assert_eq!(opened, 5);
+        // From a file, as at startup: the error names it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        std::fs::write(&path, &image).unwrap();
+        let path = path.to_str().unwrap();
+        let text = refused(load_snapshot(path).err().expect("loaded"));
+        assert!(text.starts_with(path), "{text}");
+        // As before: one reading, which fails.
+        assert!(load_snapshot_from(image.as_slice()).is_err());
+    }
+
+    /// An image whose readings that load would load the same keys and values
+    /// is loaded. Two readings of one image never do (the one that takes a
+    /// database's 0 for 1.2.0's empty key has an entry more in it), so here
+    /// each reading opens other bytes: the second has the empty key in
+    /// database 0 as 1.2.0 wrote it, and in database 1 as 1.2.1 does; the
+    /// third the other way around.
+    #[test]
+    fn readings_that_load_the_same_keys_and_values_load() {
+        fn entry(out: &mut Vec<u8>, legacy: bool, value: u8) {
+            out.extend(if legacy { ZERO } else { u32::MAX.to_le_bytes() });
+            out.push(TAG_STRING);
+            out.extend(1u32.to_le_bytes());
+            out.push(value);
+            out.extend(ZERO);
+        }
+        let image = |legacy: usize, db1: u8| {
+            let mut out = header(3);
+            entry(&mut out, legacy == 0, b'a');
+            entry(&mut out, legacy == 1, db1);
+            out.extend(ZERO);
+            out
+        };
+        let first = two_ways();
+        let (zero, one) = (image(0, b'b'), image(1, b'b'));
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            // The two that load are read again, in the same order.
+            Ok(match opened {
+                1 => first.as_slice(),
+                2 | 4 => zero.as_slice(),
+                _ => one.as_slice(),
+            })
+        })
+        .unwrap();
+        assert_eq!(opened, 5);
+        assert_eq!(get_string(&loaded.dbs[0], b""), b"a");
+        assert_eq!(get_string(&loaded.dbs[1], b""), b"b");
+
+        // The same, with another value in the third: refused.
+        let other = image(1, b'c');
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            Ok(match opened {
+                1 => first.as_slice(),
+                2 | 4 => zero.as_slice(),
+                _ => other.as_slice(),
+            })
+        })
+        .err()
+        .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+    }
+
+    /// A reading that loads is not taken for the only one if the others
+    /// cannot all be made: the image cannot be opened again, or a reading
+    /// fails on the disk.
+    #[test]
+    fn an_image_not_read_every_way_it_can_be_is_refused() {
+        let image = two_ways();
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            if opened > 2 {
+                return Err(io::Error::other("cannot open it again"));
+            }
+            Ok(image.as_slice())
+        })
+        .err()
+        .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert!(err.to_string().contains("cannot open it again"), "{err}");
+
+        struct Failing<'a>(&'a [u8]);
+        impl Read for Failing<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.len() < 20 {
+                    return Err(io::Error::other("the disk failed"));
+                }
+                self.0.read(buf)
+            }
+        }
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            Ok(if opened > 2 {
+                Box::new(Failing(&image)) as Box<dyn Read + '_>
+            } else {
+                Box::new(image.as_slice())
+            })
+        })
+        .err()
+        .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert!(err.to_string().contains("the disk failed"), "{err}");
+    }
+
+    /// A 1.2.0 image with the empty key in database 0, and databases after
+    /// it whose first keys' lengths begin with a tag: once the reading with
+    /// the empty key in database 0 loads, it is read again with those ends
+    /// taken for the empty key too. Those readings fail, and it loads.
+    #[test]
+    fn a_1_2_0_image_whose_other_readings_fail_loads() {
+        let mut image = header(4);
+        image.extend(ZERO);
+        let e0 = KiviDBValue::String(SharedBytes::from(&b"e0"[..]));
+        write_kdb_value(&mut image, e0.view()).unwrap();
+        for db in 0..4u8 {
+            let key = [b'k', b'0' + db];
+            let value = KiviDBValue::String(SharedBytes::from(&[b'v', b'0' + db][..]));
+            write_kdb_entry(&mut image, &key[..], value.view()).unwrap();
+            image.extend(ZERO);
+        }
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        assert!(opened >= 4, "{opened} readings");
+        assert_eq!(get_string(&loaded.dbs[0], b""), b"e0");
+        for db in 0..4u8 {
+            assert_eq!(
+                get_string(&loaded.dbs[db as usize], &[b'k', b'0' + db]),
+                [b'v', b'0' + db]
+            );
+        }
+        assert_eq!(verify_snapshot(&image).unwrap(), 5);
+    }
+
+    /// The readings that are to be made but there is no room for are noted,
+    /// so that a reading that loads is not taken for the only one.
+    #[test]
+    fn readings_left_out_are_noted() {
+        let mut plans = Vec::new();
+        assert!(push_plans(&mut plans, &[], &[0, 2], 2));
+        assert_eq!(plans, vec![vec![2], vec![0]]);
+        let mut plans = Vec::new();
+        assert!(!push_plans(&mut plans, &[], &[0, 2, 3], 2));
+        assert_eq!(plans, vec![vec![2], vec![0]]);
+        let mut plans = Vec::new();
+        assert!(push_plans(&mut plans, &[2], &[0, 2, 3], 1));
+        assert_eq!(plans, vec![vec![2, 3]]);
+        let ends: Vec<usize> = (0..READINGS).collect();
+        assert!(!push_plans(&mut Vec::new(), &[], &ends, READINGS));
+    }
+
+    /// An image as 1.2.1 writes it, the empty key in every database and
+    /// first keys whose length begins with a tag, is read once, as before,
+    /// and not compared with any other reading.
+    #[test]
+    fn an_image_as_1_2_1_writes_it_is_read_once() {
+        let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+        let dbs: Vec<HashMap<String, KiviDBValue>> = (0..16)
+            .map(|db| {
+                HashMap::from([
+                    (String::new(), string(&format!("e{db}"))),
+                    ("k".to_string(), string("v")),
+                ])
+            })
+            .collect();
+        let mut image = Vec::new();
+        write_kdb_image(&mut image, &dbs, None).unwrap();
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        assert_eq!(opened, 1);
+        for (db, map) in loaded.dbs.iter().enumerate() {
+            assert_eq!(get_string(map, b""), format!("e{db}").into_bytes());
+            assert_eq!(get_string(map, b"k"), b"v");
+        }
+        assert_eq!(verify_snapshot(&image).unwrap(), 32);
+        assert_eq!(load_snapshot_bytes(&image).unwrap().dbs.len(), 16);
     }
 }
