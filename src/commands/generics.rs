@@ -149,7 +149,10 @@ pub(crate) fn apply_expire(
         }
         return resp_integer(if removed { 1 } else { 0 });
     }
-    set_expiry(ctx.store, *ctx.selected_db, key, new_abs);
+    // Past its time since it was looked at: gone, and deleted (#628).
+    if !set_expiry(ctx.store, *ctx.selected_db, key, new_abs) {
+        return resp_integer(0);
+    }
     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
     resp_integer(1)
 }

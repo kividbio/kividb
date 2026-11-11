@@ -5,28 +5,24 @@ use crate::resp::write::*;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Average remaining TTL in milliseconds for keys with a future expiry (Redis `avg_ttl`).
-fn avg_ttl_ms(db: &crate::store::Db) -> i64 {
-    let now = crate::commands::helpers::unix_ms(std::time::SystemTime::now());
-    let mut sum_ms: u128 = 0;
-    let mut n = 0usize;
-    for shard in db.iter() {
-        if shard.holds_no_ttl() {
-            continue;
-        }
-        let map = read_lock!(shard);
-        for (_, at) in map.expiring() {
-            if at >= now {
-                sum_ms += u128::from(at - now);
-                n += 1;
-            }
-        }
+/// Redis's `avg_ttl`: how long the `expires` keys with a time to live have
+/// left on average, in milliseconds, at `now` (milliseconds since the Unix
+/// epoch), given the sum of when their times end (`ttl_deadline_sum`, kept
+/// by each shard as times come, change and go).
+///
+/// It went over every key with a time to live, holding each shard while it
+/// did: at 5 million such keys `INFO` took 45-70 ms, and writes to each
+/// shard waited for it (#622). Now it is a sum and a count a shard. The
+/// mean of the times, less `now`, is the mean of what is left, rounded down
+/// as before. Keys past their time that expiry has not taken out yet (a
+/// cycle or so) count as having less than nothing left, and the whole is
+/// at least 0; the pass left them out.
+fn avg_ttl_ms(expires: usize, deadlines: u128, now: u64) -> i64 {
+    if expires == 0 {
+        return 0;
     }
-    if n == 0 {
-        0
-    } else {
-        (sum_ms / n as u128) as i64
-    }
+    let mean = deadlines / expires as u128;
+    mean.saturating_sub(u128::from(now)).min(i64::MAX as u128) as i64
 }
 
 /// Replication, cluster and slowlog settings as `CONFIG GET` reports them.
@@ -1671,30 +1667,130 @@ fn config_set_tls_replication(_ctx: &Ctx, on: bool) -> Vec<u8> {
     }
 }
 
+/// The last `INFO keysizes` of each server (by its store's address): when
+/// it was counted, what it said, and whether a count is under way.
+struct KeysizesCount {
+    /// The store counted, held weakly: while the count is kept, no other
+    /// store can be at its address, which is the key (`Arc::as_ptr`). A
+    /// server started after another has stopped, in the same process, could
+    /// otherwise be given the stopped one's count.
+    store: std::sync::Weak<Vec<crate::store::Db>>,
+    /// When the pass that made `text` began.
+    at: std::time::Instant,
+    text: String,
+    counting: bool,
+}
+
+static KEYSIZES_LAST: std::sync::LazyLock<
+    parking_lot::Mutex<ahash::AHashMap<usize, KeysizesCount>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// `INFO keysizes` of every database of `store`: a pass over every key.
+fn keysizes_text(store: &crate::store::Store) -> String {
+    store
+        .iter()
+        .enumerate()
+        .map(|(i, db)| keysizes(i, db))
+        .collect()
+}
+
 /// `INFO keysizes`: a pass over every key. Asked for by name it is counted
 /// now; as part of `INFO all` or `everything`, which exporters scrape every
 /// few seconds, a count up to [`KEYSIZES_REUSED_FOR`] old is given again,
 /// so that they cost one pass per that time and not one each (#158).
+///
+/// Nor does `INFO all` wait for that pass, but for the first (#622): an
+/// older count starts a new one on a thread of its own, and is given
+/// meanwhile. The pass took 100-200 ms at 5 million keys, on the thread
+/// that serves the connection, and every connection that thread serves
+/// waited for it.
+///
+/// A count older than twice that is not given: the keys may have changed
+/// past recognition since (a `FLUSHALL`, a load), and `INFO all` waits for
+/// a new one, as before.
 fn keysizes_section(ctx: &Ctx, fresh: bool) -> String {
-    static LAST: std::sync::LazyLock<
-        parking_lot::Mutex<ahash::AHashMap<usize, (std::time::Instant, String)>>,
-    > = std::sync::LazyLock::new(Default::default);
-    let server = Arc::as_ptr(ctx.store) as *const () as usize;
-    if !fresh
-        && let Some((at, text)) = LAST.lock().get(&server)
-        && at.elapsed() < KEYSIZES_REUSED_FOR
-    {
-        return text.clone();
+    keysizes_cached(ctx.store, fresh, keysizes_text)
+}
+
+/// What makes the text of a count: [`keysizes_text`], or a test's.
+type KeysizesCounter = fn(&crate::store::Store) -> String;
+
+/// [`keysizes_section`] for `store`, counted by `count`.
+fn keysizes_cached(store: &crate::store::Store, fresh: bool, count: KeysizesCounter) -> String {
+    if !fresh {
+        let mut last = KEYSIZES_LAST.lock();
+        if let Some(kept) = last.get_mut(&keysizes_key(store)) {
+            let age = kept.at.elapsed();
+            if age < 2 * KEYSIZES_REUSED_FOR {
+                if age >= KEYSIZES_REUSED_FOR && !kept.counting {
+                    // No thread: the count is tried again on the next ask.
+                    kept.counting = keysizes_count_aside(store, count);
+                }
+                return kept.text.clone();
+            }
+        }
     }
-    let text: String = ctx
-        .store
-        .iter()
-        .enumerate()
-        .map(|(i, db)| keysizes(i, db))
-        .collect();
-    LAST.lock()
-        .insert(server, (std::time::Instant::now(), text.clone()));
+    let began = std::time::Instant::now();
+    let text = count(store);
+    keysizes_keep(store, began, text.clone());
     text
+}
+
+/// The key of `store`'s count in [`KEYSIZES_LAST`].
+fn keysizes_key(store: &crate::store::Store) -> usize {
+    Arc::as_ptr(store) as *const () as usize
+}
+
+/// Keep `text`, the count of `store` begun at `began`, unless the one kept
+/// was begun later. A count under way elsewhere stays under way. Counts
+/// of stores that are gone are let go of.
+fn keysizes_keep(store: &crate::store::Store, began: std::time::Instant, text: String) {
+    let mut last = KEYSIZES_LAST.lock();
+    last.retain(|_, kept| kept.store.strong_count() > 0);
+    match last.get_mut(&keysizes_key(store)) {
+        Some(kept) => {
+            if began >= kept.at {
+                kept.at = began;
+                kept.text = text;
+            }
+        }
+        None => {
+            last.insert(
+                keysizes_key(store),
+                KeysizesCount {
+                    store: Arc::downgrade(store),
+                    at: began,
+                    text,
+                    counting: false,
+                },
+            );
+        }
+    }
+}
+
+/// Count `store` on a thread of its own. Returns whether the thread
+/// started. However the count ends, a panic in it too, its `counting` is
+/// put back, so that the next ask can start another.
+fn keysizes_count_aside(store: &crate::store::Store, count: KeysizesCounter) -> bool {
+    struct Done(usize);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            if let Some(kept) = KEYSIZES_LAST.lock().get_mut(&self.0) {
+                kept.counting = false;
+            }
+        }
+    }
+    let store = Arc::clone(store);
+    std::thread::Builder::new()
+        .name("keysizes".to_string())
+        .spawn(move || {
+            // Dropped last, after the count is kept.
+            let _done = Done(keysizes_key(&store));
+            let began = std::time::Instant::now();
+            let text = count(&store);
+            keysizes_keep(&store, began, text);
+        })
+        .is_ok()
 }
 
 const KEYSIZES_REUSED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
@@ -3426,6 +3522,86 @@ fn in_module(module: &str, name: &str) -> bool {
     }
 }
 
+/// `INFO keysizes` counts: by type, then by bin. Bin 0 is the empty, bin n
+/// holds 2^(n-1) to 2^n - 1.
+type KeysizeBins = [[u64; 65]; 5];
+
+/// How many buckets of a shard `INFO keysizes` goes over in one hold of it.
+const KEYSIZES_BUCKETS: usize = 1024;
+
+/// `value` counted in its type's bin.
+fn keysize_count(bins: &mut KeysizeBins, value: crate::store::ValueRef<'_>) {
+    let (kind, len) = match value {
+        crate::store::ValueRef::String(b) => (0, b.len()),
+        crate::store::ValueRef::List(l) => (1, l.read().len()),
+        crate::store::ValueRef::Set(s) => (2, s.read().len()),
+        crate::store::ValueRef::SortedSet(z) => (3, z.read().len()),
+        crate::store::ValueRef::Hash(h) => (4, h.read().len()),
+        crate::store::ValueRef::HashEx(h) => (4, h.read().len()),
+        _ => return,
+    };
+    let bin = (usize::BITS - len.leading_zeros()) as usize;
+    bins[kind][bin] += 1;
+}
+
+/// One shard's `INFO keysizes` counts, gone over [`KEYSIZES_BUCKETS`]
+/// buckets at a time and let go of in between. It was held for the whole
+/// of its keys, and writes to it waited: tens of milliseconds a shard at
+/// millions of keys, every time an exporter scraped `INFO all` (#622).
+///
+/// A shard nobody writes to meanwhile is counted exactly. Under writes the
+/// count is approximate, as a `SCAN` is: a key written or deleted
+/// meanwhile is counted or not, and keys move between buckets when the
+/// table is rehashed. A resize changes how many buckets there are, and the
+/// shard is then counted again (in one hold after a few tries); a rehash
+/// in place, at the same size, which the table does when deleted keys
+/// have used up its room to grow, cannot be seen from here, and in the
+/// part not yet counted a key may then be counted twice or not at all.
+///
+/// One hold for the whole shard would be exact: about 20 ms for a shard
+/// of a million keys (21 ns a key measured, 5 million keys on 8 vCPUs), a
+/// wait for every write to it, every 10 s while `INFO all` is asked. A
+/// count of rehashes kept by the table would let the walk start again on
+/// one too, but needs a check on every insert, the `SET` path. For a
+/// distribution refreshed every 10 seconds neither is worth it.
+///
+/// `between` is called with no lock held after each part (for tests).
+fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> KeysizeBins {
+    let mut tries = 0;
+    'shard: loop {
+        let mut bins: KeysizeBins = [[0u64; 65]; 5];
+        let mut at = 0;
+        let mut size = None;
+        loop {
+            let map = read_lock!(shard);
+            let buckets = map.buckets();
+            if *size.get_or_insert(buckets) != buckets {
+                tries += 1;
+                if tries < 3 {
+                    continue 'shard;
+                }
+                let mut bins: KeysizeBins = [[0u64; 65]; 5];
+                for value in map.values() {
+                    keysize_count(&mut bins, value);
+                }
+                return bins;
+            }
+            let end = buckets.min(at + KEYSIZES_BUCKETS);
+            for index in at..end {
+                if let Some((_, value)) = map.bucket(index) {
+                    keysize_count(&mut bins, value);
+                }
+            }
+            at = end;
+            if at >= buckets {
+                return bins;
+            }
+            drop(map);
+            between();
+        }
+    }
+}
+
 /// `INFO keysizes` for database `db`: for strings, lists, sets, sorted sets
 /// and hashes, how many keys have a length (bytes, or items) in each
 /// power-of-two bin, as Redis 8.10 writes it:
@@ -3439,21 +3615,15 @@ fn keysizes(db: usize, shards: &crate::store::Db) -> String {
         "distrib_zsets_items",
         "distrib_hashes_items",
     ];
-    // Bin 0 is the empty, bin n holds 2^(n-1) to 2^n - 1.
-    let mut bins = [[0u64; 65]; 5];
+    let mut bins: KeysizeBins = [[0u64; 65]; 5];
     for shard in shards.iter() {
-        for value in read_lock!(shard).values() {
-            let (kind, len) = match value {
-                crate::store::ValueRef::String(b) => (0, b.len()),
-                crate::store::ValueRef::List(l) => (1, l.read().len()),
-                crate::store::ValueRef::Set(s) => (2, s.read().len()),
-                crate::store::ValueRef::SortedSet(z) => (3, z.read().len()),
-                crate::store::ValueRef::Hash(h) => (4, h.read().len()),
-                crate::store::ValueRef::HashEx(h) => (4, h.read().len()),
-                _ => continue,
-            };
-            let bin = (usize::BITS - len.leading_zeros()) as usize;
-            bins[kind][bin] += 1;
+        for (all, one) in bins
+            .iter_mut()
+            .zip(keysizes_of_shard(shard, &mut || {}).iter())
+        {
+            for (a, b) in all.iter_mut().zip(one.iter()) {
+                *a += *b;
+            }
         }
     }
     let mut out = String::new();
@@ -4046,13 +4216,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("keyspace") {
                 out.push_str("# Keyspace\r\n");
+                let now = crate::commands::helpers::unix_ms(std::time::SystemTime::now());
                 for (i, db) in ctx.store.iter().enumerate() {
-                    let (keys, expires) = db.iter().fold((0usize, 0usize), |(k, e), shard| {
-                        let map = read_lock!(shard);
-                        (k + map.len(), e + map.ttl_len())
-                    });
+                    // Three numbers a shard, each kept as keys change.
+                    let (keys, expires, deadlines) =
+                        db.iter().fold((0usize, 0usize, 0u128), |(k, e, d), shard| {
+                            let map = read_lock!(shard);
+                            (k + map.len(), e + map.ttl_len(), d + map.ttl_deadline_sum())
+                        });
                     if keys > 0 || expires > 0 {
-                        let avg_ttl = if expires > 0 { avg_ttl_ms(db) } else { 0 };
+                        let avg_ttl = avg_ttl_ms(expires, deadlines, now);
                         out.push_str(&format!(
                             "db{}:keys={},expires={},avg_ttl={}\r\n",
                             i, keys, expires, avg_ttl
@@ -6162,4 +6335,201 @@ pub fn acl_cat_commands_pub(category: &str) -> Vec<&'static str> {
 
 pub fn acl_cat_commands_opt(category: &str) -> Option<Vec<&'static str>> {
     acl_cat_commands(category)
+}
+
+#[cfg(test)]
+mod keysizes_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn set(store: &crate::store::Store, key: &str, value: &str) {
+        let _ = crate::store::get_shard(&store[0], key)
+            .write()
+            .set_str(key, value);
+    }
+
+    /// The kept count of `store` made `by` older.
+    fn age(store: &crate::store::Store, by: Duration) {
+        let mut last = KEYSIZES_LAST.lock();
+        let kept = last.get_mut(&keysizes_key(store)).unwrap();
+        kept.at = Instant::now().checked_sub(by).unwrap();
+    }
+
+    fn counting(store: &crate::store::Store) -> bool {
+        KEYSIZES_LAST
+            .lock()
+            .get(&keysizes_key(store))
+            .unwrap()
+            .counting
+    }
+
+    /// Wait until no count of `store` is under way.
+    fn settled(store: &crate::store::Store) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while counting(store) {
+            assert!(Instant::now() < until, "the count never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    const ONE: &str = "db0_distrib_strings_sizes:1=1\r\n";
+
+    /// A count is given again while fresh, counted aside once it is older
+    /// than `KEYSIZES_REUSED_FOR`, and counted at once, waited for, once
+    /// it is older than twice that. Each store has its own.
+    #[test]
+    fn a_count_is_given_again_counted_aside_or_waited_for_by_its_age() {
+        let store = crate::store::new_store(1);
+        let other = crate::store::new_store(1);
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        assert_eq!(keysizes_cached(&other, false, keysizes_text), "");
+        // Fresh: given again, though the keys have gone.
+        let _ = crate::store::clear_db(&store[0]);
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        // Older: given again, and counted aside.
+        age(&store, KEYSIZES_REUSED_FOR + Duration::from_secs(1));
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        settled(&store);
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), "");
+        // Asked for by name: counted at once.
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, true, keysizes_text), ONE);
+        // Much older, the keys gone since: waited for.
+        let _ = crate::store::clear_db(&store[0]);
+        age(&store, 2 * KEYSIZES_REUSED_FOR + Duration::from_secs(1));
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), "");
+        assert_eq!(keysizes_cached(&other, false, keysizes_text), "");
+    }
+
+    fn panics(_: &crate::store::Store) -> String {
+        panic!("a count that fails")
+    }
+
+    /// A count that panics on its thread lets the next one start.
+    #[test]
+    fn a_count_that_panics_does_not_stop_the_next() {
+        let store = crate::store::new_store(1);
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        age(&store, KEYSIZES_REUSED_FOR + Duration::from_secs(1));
+        assert_eq!(keysizes_cached(&store, false, panics), ONE);
+        settled(&store);
+        // Still the old one, still older: counted aside again, and kept.
+        set(&store, "j", "vv");
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        settled(&store);
+        assert_eq!(
+            keysizes_cached(&store, false, keysizes_text),
+            "db0_distrib_strings_sizes:1=1,2=1\r\n"
+        );
+    }
+
+    /// A count by name while one is under way aside leaves it under way.
+    #[test]
+    fn a_count_by_name_leaves_one_under_way_alone() {
+        let store = crate::store::new_store(1);
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), "");
+        KEYSIZES_LAST
+            .lock()
+            .get_mut(&keysizes_key(&store))
+            .unwrap()
+            .counting = true;
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, true, keysizes_text), ONE);
+        assert!(counting(&store));
+    }
+
+    fn shard_of(keys: impl Iterator<Item = (String, &'static str)>) -> crate::store::Shard {
+        let shard: crate::store::Shard = Arc::new(crate::store::ShardLock::default());
+        {
+            let mut map = shard.write();
+            for (key, value) in keys {
+                let _ = map.set_str(key, value);
+            }
+        }
+        shard
+    }
+
+    /// Strings of `len` bytes counted.
+    fn of_len(bins: &KeysizeBins, len: usize) -> u64 {
+        bins[0][(usize::BITS - len.leading_zeros()) as usize]
+    }
+
+    /// The table grown between two parts: the shard is counted again, and
+    /// the count is exact.
+    #[test]
+    fn the_walk_counts_a_resized_shard_again() {
+        let shard = shard_of((0..5_000).map(|i| (format!("stay{i}"), "xxxxxxxxxx")));
+        let before = shard.read().buckets();
+        assert!(before > 2 * KEYSIZES_BUCKETS);
+        let mut calls = 0;
+        let bins = keysizes_of_shard(&shard, &mut || {
+            calls += 1;
+            if calls == 1 {
+                let mut map = shard.write();
+                for i in 0..20_000 {
+                    let _ = map.set_str(format!("new{i}"), "x");
+                }
+            }
+        });
+        assert!(shard.read().buckets() > before);
+        assert_eq!((of_len(&bins, 10), of_len(&bins, 1)), (5_000, 20_000));
+    }
+
+    /// Writes and deletes between the parts, with room in the table, so
+    /// that it is neither resized nor rehashed: every key there all along
+    /// is counted once.
+    #[test]
+    fn the_walk_counts_untouched_keys_once_under_writes() {
+        let shard = shard_of(
+            (0..5_000)
+                .map(|i| (format!("stay{i}"), "xxxxxxxxxx"))
+                .chain((0..500).map(|i| (format!("gone{i}"), "xxxxx"))),
+        );
+        let (buckets, room) = {
+            let map = shard.read();
+            (map.buckets(), map.capacity() - map.len())
+        };
+        let parts = buckets.div_ceil(KEYSIZES_BUCKETS);
+        let per_part = (room / parts).min(100);
+        assert!(per_part > 0);
+        let mut call = 0;
+        let bins = keysizes_of_shard(&shard, &mut || {
+            let mut map = shard.write();
+            for i in 0..per_part {
+                let _ = map.set_str(format!("new{call}-{i}"), "x");
+            }
+            for i in 0..50 {
+                drop(map.remove(&format!("gone{}", call * 50 + i)));
+            }
+            call += 1;
+        });
+        assert_eq!(shard.read().buckets(), buckets);
+        assert_eq!(of_len(&bins, 10), 5_000);
+        assert!(of_len(&bins, 1) <= (per_part * parts) as u64);
+        assert!(of_len(&bins, 5) <= 500);
+    }
+
+    /// Heavy churn between the parts, many keys in and out, which can make
+    /// the table rehash in place: the walk ends, and its count is the
+    /// approximation documented, no more than twice the keys there all
+    /// along.
+    #[test]
+    fn the_walk_ends_under_churn() {
+        let shard = shard_of((0..5_000).map(|i| (format!("stay{i}"), "xxxxxxxxxx")));
+        let mut call = 0;
+        let bins = keysizes_of_shard(&shard, &mut || {
+            let mut map = shard.write();
+            for i in 0..2_000 {
+                let _ = map.set_str(format!("churn{call}-{i}"), "x");
+            }
+            for i in 0..2_000 {
+                drop(map.remove(&format!("churn{call}-{i}")));
+            }
+            call += 1;
+        });
+        assert!(of_len(&bins, 10) <= 10_000);
+        assert_eq!(shard.read().len(), 5_000);
+    }
 }

@@ -771,6 +771,11 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
 
     // Unknown-command message must match Redis's wording (Tcl tests use glob `*Unknown Redis*`).
     let started = std::time::Instant::now();
+    // A write takes the keys it names that are past their time as gone,
+    // and they go first, as from a client (`expire_named_keys_first`).
+    if replication::command_mutates_for_replication(name2, ctx.cmd.as_slice()) {
+        expire_named_keys_first(ctx, name2, None);
+    }
     // What the command records of its effects is read below whether or not
     // the write is observed (`script_feed::effects_begin_if_read`).
     let script_call = replication::script_feed::ScriptCall::enter();
@@ -804,13 +809,14 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         );
     }
 
-    // A pop that took nothing changed nothing: not sent, not counted, and
-    // a `WATCH` on its keys holds (`popped_nothing`).
+    // A write that changed nothing — a pop that took nothing, a `PERSIST`
+    // that answered 0 — is not sent, not counted, and a `WATCH` on its keys
+    // holds (`changed_nothing`).
     #[cfg(feature = "lua")]
     if !result.starts_with(b"-")
         && !repl_is_slave
         && !ctx.apply_replication
-        && !popped_nothing(name2, &result)
+        && !propagates_nothing(name2, ctx.cmd.as_slice(), &result)
         && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
     {
         let feeds = replication::script_feed::commands_for_propagation(
@@ -1502,6 +1508,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // Whether a hash command took its key's order shared, having found no
     // search index: see `ask_again_for_an_index`.
     let mut hash_beside_others = false;
+    // The keys it names, if they were looked for here: for
+    // `expire_named_keys_first`, which would look for them again.
+    let mut named: Option<crate::keyspec::Keys> = None;
     let mut _write_order = if crate::command_gate::alone_on_this_thread() {
         // No other command is running: there is nothing to be ordered
         // against, and the writes made from inside this one take nothing.
@@ -1532,7 +1541,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // write stream, as every other write is.
         Some(order_of_pairs_shared(ctx))
     } else if keys_ordered {
-        let keys = crate::keyspec::key_positions(name, &ctx.cmd);
+        let keys = named.insert(crate::keyspec::key_positions(name, &ctx.cmd));
         let here = *ctx.selected_db;
         match database_written_too(ctx, name) {
             // The key's record is ordered where it goes as well: see
@@ -1551,6 +1560,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     };
     if hash_beside_others && !ctx.index_store.none() {
         ask_again_for_an_index(ctx, &mut _write_order);
+    }
+    // The keys it names that are past their time go first, their deletions
+    // sent ahead of it (`expire_named_keys_first`, #628). In the gate and
+    // the order of its keys: the deletion falls where it did among the
+    // writes to them.
+    if gated && writes_operation {
+        expire_named_keys_first(ctx, name, named);
     }
 
     // HOTKEYS: one relaxed load when no session is running.
@@ -1779,34 +1795,131 @@ fn makes_the_switch(ctx: &Ctx) -> Option<usize> {
 /// Redis does not touch such a key, and a `WATCH` on it holds (#159). Only
 /// replies that cannot mean a change are listed: `ZADD` and `HSET` answer
 /// `0` for updates too.
+///
+/// Nor is such a write propagated, as Redis does not propagate it (#628).
+/// A replica, and a replay of the AOF, never take a key as gone because of
+/// its time: a `PERSIST` that found its key past its time, answered 0 and
+/// left the key for the sweep, took the key's time away on the replica, and
+/// the key lived there with no time to live until the sweep's `UNLINK`
+/// came. A `MOVE` or `COPY` that answered 0 moved the key on the replica,
+/// where the sweep's `DEL` then deleted nothing, and the key stayed in the
+/// other database for good.
 fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
     let nil = result == b"$-1\r\n" || result == b"_\r\n";
     let zero = result == b":0\r\n";
     match name {
-        "SET" => {
-            nil && cmd[3..]
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(b"NX") || a.eq_ignore_ascii_case(b"XX"))
-        }
+        "SET" => nil && !set_wrote_answering_nil(cmd),
+        // `SMOVE`: no source, the member not in it, or moved to where it
+        // is and not there. `LPUSHX` / `RPUSHX`: no list (a push to one
+        // answers its new length, at least 1).
         "SETNX" | "MSETNX" | "HSETNX" | "RENAMENX" | "PERSIST" | "EXPIRE" | "PEXPIRE"
         | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" | "DEL"
-        | "UNLINK" | "COPY" | "MOVE" => zero,
+        | "UNLINK" | "COPY" | "MOVE" | "SMOVE" | "LPUSHX" | "RPUSHX" => zero,
+        // No list (0), or no such pivot (-1).
+        "LINSERT" => zero || result == b":-1\r\n",
         _ => popped_nothing(name, result),
     }
 }
 
-/// Whether a `MOVE` or a `COPY` answered `0`: it moved or copied nothing,
-/// and is not propagated, as Redis does not propagate it. A replica, and a
-/// replay of the AOF, never take a key as gone because of its time: a key
-/// past its time that the master's `MOVE` had found gone, and left where it
-/// was for the sweep, was moved by the replica. The sweep's `DEL` then
-/// deleted nothing there, and the replica kept the key in the other
-/// database for good; and when the key's name was used again, the
-/// replica's `MOVE` of the new key found the old one in its way and left
-/// the new one behind, for good too.
+/// Whether a `SET` (`cmd`) that answered nil wrote all the same. Without
+/// `GET` it did not: a `SET` that writes answers `OK`, and nil is a
+/// condition (`NX`, `XX`, `IFEQ`, ...) not met. With `GET` nil is the old
+/// value of a key that was not there, and the `SET` wrote unless its
+/// condition needs the key (`XX`, `IFEQ`, `IFDEQ`): `SET k v NX GET` on a
+/// missing key writes and answers nil. The options are read as `SET` reads
+/// them: the argument of `EX`, `IFEQ`, ... is not an option.
+fn set_wrote_answering_nil(cmd: &[&[u8]]) -> bool {
+    let (mut get, mut needs_the_key) = (false, false);
+    let mut i = 3;
+    while i < cmd.len() {
+        let option = cmd[i];
+        let is = |name: &[u8]| option.eq_ignore_ascii_case(name);
+        if is(b"GET") {
+            get = true;
+        } else if is(b"XX") {
+            needs_the_key = true;
+        } else if is(b"IFEQ") || is(b"IFDEQ") {
+            needs_the_key = true;
+            i += 1;
+        } else if is(b"IFNE")
+            || is(b"IFDNE")
+            || is(b"EX")
+            || is(b"PX")
+            || is(b"EXAT")
+            || is(b"PXAT")
+        {
+            i += 1;
+        }
+        i += 1;
+    }
+    get && !needs_the_key
+}
+
+/// Before a write runs on a master whose write stream something reads (the
+/// AOF, a replica, a tap): each key it names that is past its time is
+/// deleted, and its `UNLINK` (or `DEL`) sent, as a read that finds one
+/// deletes it (`helpers::delete_key_if_expired`), and as Redis expires every
+/// key a write looks up (`expireIfNeeded`).
+///
+/// A write takes such a key as gone. One that then wrote over it sent the
+/// deletion first already (`expiry::written_over`), but one that did
+/// nothing, or something that needed no new value, left the key there for
+/// the sweep and was sent as it came (#628): `PERSIST` answered 0 and took
+/// the key's time away on a replica, which still had the key, and `SET … XX`
+/// gave the replica's key a new value with no time to live, where the
+/// master had neither. Until the sweep's `UNLINK` came the replica had a key
+/// the master did not, with no time to live, and a failover in between
+/// brought it back for good. With the key deleted first, the replica
+/// applies the write to what the master did.
+///
+/// Nothing when nothing reads the stream: the key stays for the sweep, or
+/// for the read or write that finds it, as before. Under the write gate and
+/// the order of the command's keys, which the deletion takes again for
+/// nothing (both nest).
+///
+/// Not for a `SET` with no condition, the commonest write: it writes its
+/// key whatever is there, over a key past its time too, and that sends the
+/// deletion first (`expiry::written_over`). Looking first cost every such
+/// `SET` about 200 instructions more (3%, with the AOF on).
 #[inline]
-fn moved_nothing(name: &str, result: &[u8]) -> bool {
-    matches!(name, "MOVE" | "COPY") && result == b":0\r\n"
+fn expire_named_keys_first(ctx: &Ctx, name: &str, named: Option<crate::keyspec::Keys>) {
+    if ctx.apply_replication || ctx.repl_state.is_slave() || !replication::write_is_observed(ctx) {
+        return;
+    }
+    if name == "SET" && !set_has_a_condition(&ctx.cmd) {
+        return;
+    }
+    let db = *ctx.selected_db;
+    let named = named.unwrap_or_else(|| crate::keyspec::key_positions(name, &ctx.cmd));
+    for pos in named.iter() {
+        let key = ctx.cmd[pos];
+        if crate::commands::helpers::is_expired(ctx.store, db, key) {
+            crate::commands::helpers::delete_key_if_expired(ctx.store, db, key);
+        }
+    }
+}
+
+/// Whether `SET` `cmd` writes only on a condition: `NX`, `XX`, `IFEQ`,
+/// `IFNE`, `IFDEQ` or `IFDNE`. The argument of an option (`EX 10`, `IFEQ
+/// NX`) is taken as an option too, which only makes a `SET` look first that
+/// need not have.
+fn set_has_a_condition(cmd: &[&[u8]]) -> bool {
+    cmd.iter().skip(3).any(|arg| {
+        arg.eq_ignore_ascii_case(b"NX")
+            || arg.eq_ignore_ascii_case(b"XX")
+            || (arg.len() >= 4 && arg[..2].eq_ignore_ascii_case(b"IF"))
+    })
+}
+
+/// Whether a write's reply (`result`) says it changed nothing
+/// ([`changed_nothing`]), and so is not propagated. A reply that could say
+/// so is short and is a number, a null or an empty array: the common reply,
+/// `+OK` or a value, is passed over without looking at the command.
+#[inline]
+fn propagates_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
+    result.len() <= 5
+        && matches!(result.first(), Some(b':' | b'$' | b'_' | b'*' | b'~'))
+        && changed_nothing(name, cmd, result)
 }
 
 /// Whether a pop answered that it took nothing: a null (a `BLPOP` that
@@ -2428,10 +2541,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         // `write_is_observed`), but reaching that no-op used to cost a
         // `Vec<Vec<u8>>` clone of every argument here *plus* a full RESP encode
         // inside — allocations on every single write, discarded immediately.
-        if replication::write_is_observed(ctx)
-            && !moved_nothing(name, result)
-            && !popped_nothing(name, result)
-        {
+        if replication::write_is_observed(ctx) && !propagates_nothing(name, &ctx.cmd, result) {
             // Propagate the command's *effect*, not the bytes the client sent.
             // `SPOP` and `XADD … *` produce a different result each time they
             // run, so a replica re-executing them diverges (measured: a replica
@@ -2452,9 +2562,10 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
 
         // An XREADGROUP that only re-read pending entries, or found nothing
         // new, changed nothing Redis counts (#27); nor did a pop that took
-        // nothing.
+        // nothing, nor any write whose reply says it changed nothing
+        // (`changed_nothing`), as from a script.
         if (name != "XREADGROUP" || replication::script_feed::effects_changed_data())
-            && !popped_nothing(name, result)
+            && !propagates_nothing(name, &ctx.cmd, result)
         {
             crate::stats::record_rdb_change();
         }
@@ -2885,5 +2996,99 @@ mod replica_loading_gate_tests {
             "applier must not hit LOADING gate, got {}",
             String::from_utf8_lossy(&out)
         );
+    }
+}
+
+#[cfg(test)]
+mod changed_nothing_tests {
+    use super::*;
+
+    fn cmd(args: &[&'static str]) -> Vec<&'static [u8]> {
+        args.iter().map(|&a| a.as_bytes()).collect()
+    }
+
+    /// What a `SET` that answered nil did: with `GET` it wrote unless its
+    /// condition needs the key; an option's argument is not an option.
+    #[test]
+    fn a_set_that_answered_nil_wrote_only_with_get_and_a_condition_a_missing_key_meets() {
+        let wrote = |args: &[&'static str]| set_wrote_answering_nil(&cmd(args));
+        // GET with no condition, or one a missing key meets: written.
+        assert!(wrote(&["SET", "k", "v", "GET"]));
+        assert!(wrote(&["SET", "k", "v", "NX", "GET"]));
+        assert!(wrote(&["SET", "k", "v", "GET", "NX"]));
+        assert!(wrote(&["SET", "k", "v", "IFNE", "x", "GET"]));
+        assert!(wrote(&[
+            "SET",
+            "k",
+            "v",
+            "IFDNE",
+            "0123456789abcdef",
+            "GET"
+        ]));
+        assert!(wrote(&["SET", "k", "v", "EX", "10", "GET"]));
+        // `XX` here is what IFNE compares with, not the option.
+        assert!(wrote(&["SET", "k", "v", "IFNE", "XX", "GET"]));
+        assert!(wrote(&["set", "k", "v", "ifne", "IFEQ", "get"]));
+        // A condition a missing key does not meet: not written.
+        assert!(!wrote(&["SET", "k", "v", "XX", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "IFEQ", "x", "GET"]));
+        assert!(!wrote(&[
+            "SET",
+            "k",
+            "v",
+            "IFDEQ",
+            "0123456789abcdef",
+            "GET"
+        ]));
+        // No GET: nil is a condition not met. `GET` as an argument is not
+        // the option.
+        assert!(!wrote(&["SET", "k", "v", "NX"]));
+        assert!(!wrote(&["SET", "k", "v", "IFNE", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "IFEQ", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "PX", "100", "XX"]));
+    }
+
+    #[test]
+    fn replies_that_change_nothing() {
+        let nothing = |args: &[&'static str], reply: &[u8]| {
+            let cmd = cmd(args);
+            assert_eq!(
+                changed_nothing(&args[0].to_ascii_uppercase(), &cmd, reply),
+                propagates_nothing(&args[0].to_ascii_uppercase(), &cmd, reply),
+                "{args:?}"
+            );
+            changed_nothing(&args[0].to_ascii_uppercase(), &cmd, reply)
+        };
+        assert!(nothing(&["SMOVE", "a", "b", "m"], b":0\r\n"));
+        assert!(!nothing(&["SMOVE", "a", "b", "m"], b":1\r\n"));
+        assert!(nothing(&["LPUSHX", "l", "x"], b":0\r\n"));
+        assert!(nothing(&["RPUSHX", "l", "x"], b":0\r\n"));
+        assert!(!nothing(&["RPUSHX", "l", "x"], b":1\r\n"));
+        assert!(nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":0\r\n"));
+        assert!(nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":-1\r\n"));
+        assert!(!nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":3\r\n"));
+        assert!(nothing(&["PERSIST", "k"], b":0\r\n"));
+        assert!(nothing(&["SET", "k", "v", "XX"], b"$-1\r\n"));
+        assert!(nothing(&["SET", "k", "v", "IFEQ", "x"], b"_\r\n"));
+        assert!(!nothing(&["SET", "k", "v", "NX", "GET"], b"$-1\r\n"));
+        assert!(!nothing(&["SET", "k", "v"], b"+OK\r\n"));
+        assert!(nothing(&["LPOP", "l"], b"$-1\r\n"));
+        // A count that is not 0 is a change; an INCR to 0 is one too.
+        assert!(!nothing(&["SADD", "s", "a"], b":1\r\n"));
+        assert!(!nothing(&["INCRBY", "n", "-1"], b":0\r\n"));
+    }
+
+    #[test]
+    fn only_a_set_with_a_condition_looks_for_its_key_first() {
+        let conditional = |args: &[&'static str]| set_has_a_condition(&cmd(args));
+        assert!(!conditional(&["SET", "k", "v"]));
+        assert!(!conditional(&["SET", "k", "v", "EX", "10"]));
+        assert!(!conditional(&["SET", "k", "v", "KEEPTTL", "GET"]));
+        // The value is not an option.
+        assert!(!conditional(&["SET", "k", "NX"]));
+        assert!(conditional(&["SET", "k", "v", "NX"]));
+        assert!(conditional(&["SET", "k", "v", "xx", "PX", "5"]));
+        assert!(conditional(&["SET", "k", "v", "IFEQ", "old"]));
+        assert!(conditional(&["SET", "k", "v", "ifdne", "0123456789abcdef"]));
     }
 }

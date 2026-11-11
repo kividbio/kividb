@@ -920,18 +920,25 @@ pub fn store_value_expiring(
 }
 
 /// Give `key` the time to live that ends at `expires_at`. A key that is not
-/// there is given none: a time to live is the key's.
+/// there is given none: a time to live is the key's. Returns whether it was
+/// given it. A key found past its time is taken as gone, and is deleted
+/// ([`expire_if_past`]).
 pub fn set_expiry(
     store: &Store,
     db: usize,
     key: &(impl AsRef<[u8]> + ?Sized),
     expires_at: SystemTime,
-) {
+) -> bool {
     let shard = store::get_shard(&store[db], key);
-    write_lock!(shard).set_expires(key, unix_ms(expires_at));
+    let set = write_lock!(shard).set_expires(key, unix_ms(expires_at));
+    if !set {
+        expire_if_past(store, db, key);
+    }
+    set
 }
 
-/// Take `key`'s time to live away. Returns whether it had one.
+/// Take `key`'s time to live away. Returns whether it had one. A key found
+/// past its time is taken as gone, and is deleted ([`expire_if_past`]).
 pub fn clear_expiry(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
     let shard = store::get_shard(&store[db], key);
     if shard.holds_no_ttl() {
@@ -942,7 +949,27 @@ pub fn clear_expiry(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized))
         }
         return false;
     }
-    write_lock!(shard).persist(key)
+    let cleared = write_lock!(shard).persist(key);
+    if !cleared {
+        expire_if_past(store, db, key);
+    }
+    cleared
+}
+
+/// After a write to `key`'s time to live that found the key past its time
+/// and left it alone (`PERSIST`, `EXPIRE`, `GETEX`): the key is deleted,
+/// and its deletion sent, as a read that finds it so deletes it
+/// ([`delete_key_if_expired`]). Left for the sweep, the key was still there
+/// on a replica, and the write that had changed nothing on the master was
+/// sent, and took the key's time away there (#628). Usually the write found
+/// the key so before it ran, and it is gone already
+/// (`handler::expire_named_keys_first`); this is for one whose time ran out
+/// while it ran.
+#[cold]
+fn expire_if_past(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    if is_expired(store, db, key) {
+        delete_key_if_expired(store, db, key);
+    }
 }
 
 pub fn delete_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
@@ -1472,6 +1499,38 @@ mod active_expiry_tests {
 
     fn times(store: &Store) -> usize {
         store[0].iter().map(|s| s.read().ttl_len()).sum()
+    }
+
+    /// A time to live set on, or taken from, a key past its time that the
+    /// sweep has not taken out yet: the key is gone, so neither is done,
+    /// and it is deleted then and there (#628). It was left in place, and
+    /// `EXPIRE` answered 1 for a time it had not set.
+    #[test]
+    fn a_time_to_live_set_or_taken_away_finds_a_key_past_its_time_gone() {
+        let store = store::new_store(1);
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        put(&store, "persisted", past);
+        put(&store, "expired", past);
+        put(&store, "live", later);
+        assert_eq!(keys(&store), 3);
+        assert!(!clear_expiry(&store, 0, "persisted"));
+        assert!(!set_expiry(&store, 0, "expired", later));
+        assert_eq!(keys(&store), 1, "both deleted");
+        assert_eq!(times(&store), 1);
+        // A live key is given its time, or has it taken away, as before.
+        assert!(set_expiry(
+            &store,
+            0,
+            "live",
+            later + Duration::from_secs(1)
+        ));
+        assert!(clear_expiry(&store, 0, "live"));
+        assert_eq!((keys(&store), times(&store)), (1, 0));
+        // A key that is not there: nothing, and nothing deleted.
+        assert!(!set_expiry(&store, 0, "missing", later));
+        assert!(!clear_expiry(&store, 0, "missing"));
+        assert_eq!(keys(&store), 1);
     }
 
     /// Times as entries keep them come back as they went in, and one past

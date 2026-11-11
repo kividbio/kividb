@@ -1059,3 +1059,356 @@ fn each_expiry_is_announced_counted_and_logged_once() {
         );
     }
 }
+
+// ── A write that finds its key past its time and changes nothing (#628) ──
+
+/// A key, the commands that make it, a write that will find it past its
+/// time, and the master's reply to that (`None`: not looked at).
+struct Case {
+    key: String,
+    make: Vec<Vec<String>>,
+    write: Vec<String>,
+    reply: Option<V>,
+}
+
+/// Every command that can find its key past its time and do nothing to it.
+fn writes_that_find_their_key_gone(far: &str, far_ms: &str) -> Vec<Case> {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let string = |key: &str| vec![s(&["SET", key, "old", "PX", "100"])];
+    let hash = |key: &str| vec![s(&["HSET", key, "f", "old"]), s(&["PEXPIRE", key, "100"])];
+    let set = |key: &str| vec![s(&["SADD", key, "a", "b"]), s(&["PEXPIRE", key, "100"])];
+    let zero = Some(V::Int(0));
+    let mut cases = vec![
+        (
+            "persist",
+            string("persist"),
+            s(&["PERSIST", "persist"]),
+            zero.clone(),
+        ),
+        (
+            "expire",
+            string("expire"),
+            s(&["EXPIRE", "expire", "1000"]),
+            zero.clone(),
+        ),
+        (
+            "pexpire",
+            string("pexpire"),
+            s(&["PEXPIRE", "pexpire", "1000000"]),
+            zero.clone(),
+        ),
+        (
+            "expireat",
+            string("expireat"),
+            s(&["EXPIREAT", "expireat", far]),
+            zero.clone(),
+        ),
+        (
+            "pexpireat",
+            string("pexpireat"),
+            s(&["PEXPIREAT", "pexpireat", far_ms]),
+            zero.clone(),
+        ),
+        (
+            "getex-persist",
+            string("getex-persist"),
+            s(&["GETEX", "getex-persist", "PERSIST"]),
+            Some(V::Nil),
+        ),
+        (
+            "getex-ex",
+            string("getex-ex"),
+            s(&["GETEX", "getex-ex", "EX", "1000"]),
+            Some(V::Nil),
+        ),
+        (
+            "set-xx",
+            string("set-xx"),
+            s(&["SET", "set-xx", "new", "XX"]),
+            Some(V::Nil),
+        ),
+        (
+            "set-xx-keepttl",
+            string("set-xx-keepttl"),
+            s(&["SET", "set-xx-keepttl", "new", "XX", "KEEPTTL"]),
+            Some(V::Nil),
+        ),
+        (
+            "set-ifeq",
+            string("set-ifeq"),
+            s(&["SET", "set-ifeq", "new", "IFEQ", "old"]),
+            Some(V::Nil),
+        ),
+        ("del", string("del"), s(&["DEL", "del"]), zero.clone()),
+        (
+            "hpersist",
+            hash("hpersist"),
+            s(&["HPERSIST", "hpersist", "FIELDS", "1", "f"]),
+            None,
+        ),
+        (
+            "hexpire",
+            hash("hexpire"),
+            s(&["HEXPIRE", "hexpire", "1000", "FIELDS", "1", "f"]),
+            None,
+        ),
+        (
+            "hdel",
+            hash("hdel"),
+            s(&["HDEL", "hdel", "f"]),
+            zero.clone(),
+        ),
+        ("srem", set("srem"), s(&["SREM", "srem", "a"]), zero.clone()),
+    ];
+    for cond in ["NX", "XX", "GT", "LT"] {
+        let key = format!("expire-{}", cond.to_ascii_lowercase());
+        cases.push((
+            "",
+            string(&key),
+            s(&["EXPIRE", &key, "1000", cond]),
+            zero.clone(),
+        ));
+    }
+    cases
+        .into_iter()
+        .map(|(name, make, write, reply)| Case {
+            key: if name.is_empty() {
+                write[1].clone()
+            } else {
+                name.to_string()
+            },
+            make,
+            write,
+            reply,
+        })
+        .collect()
+}
+
+/// After a write that found `key` past its time: the AOF holds the key's
+/// deletion after the commands that made it, and nothing of the key after
+/// them comes before the deletion.
+fn deleted_before_anything_else(aof: &[Vec<String>], key: &str, made_by: usize) {
+    let records: Vec<&Vec<String>> = aof.iter().filter(|r| r.len() >= 2 && r[1] == key).collect();
+    assert!(records.len() >= made_by, "{key}: {records:?}");
+    let after = &records[made_by..];
+    assert!(
+        after.first().is_some_and(
+            |r| r[0].eq_ignore_ascii_case("UNLINK") || r[0].eq_ignore_ascii_case("DEL")
+        ),
+        "{key}: deleted first, then nothing that needs the key: {after:?}"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|r| r[0].eq_ignore_ascii_case("UNLINK"))
+            .count(),
+        1,
+        "{key}: one deletion: {after:?}"
+    );
+}
+
+/// The master's sweep held off, each write finds its key past its time
+/// itself, and takes it as gone. The replica, which has applied nothing but
+/// what the master sent, does not end with the key: `PERSIST` answered 0 and
+/// was sent on, with no `UNLINK` before it, and the replica, which still had
+/// the key, took its time away; `SET … XX` gave it a new value with no time
+/// to live (#628). The AOF holds the key's deletion ahead of anything else
+/// of it, and a replay has none of the keys.
+#[test]
+fn a_write_that_finds_its_key_past_its_time_reaches_no_replica_as_a_change() {
+    let mut master = Server::with_aof();
+    let replica = Server::replica_of(&master);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    m.ok(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);
+    let far = (now_ms() / 1000 + 100_000).to_string();
+    let far_ms = (now_ms() + 100_000_000).to_string();
+    let cases = writes_that_find_their_key_gone(&far, &far_ms);
+    for case in &cases {
+        for c in &case.make {
+            let args: Vec<&str> = c.iter().map(String::as_str).collect();
+            assert!(!matches!(m.cmd(&args), V::Error(_)), "{args:?}");
+        }
+    }
+    caught_up(&mut m, &mut r);
+    thread::sleep(Duration::from_millis(300));
+    for case in &cases {
+        let args: Vec<&str> = case.write.iter().map(String::as_str).collect();
+        let got = m.cmd(&args);
+        assert!(!matches!(got, V::Error(_)), "{args:?}: {got:?}");
+        if let Some(reply) = &case.reply {
+            assert_eq!(&got, reply, "{args:?}");
+        }
+    }
+    // The replica first: a read of the key on the master would delete it,
+    // and send its `UNLINK`, and the replica would then agree whatever the
+    // write had done there.
+    caught_up(&mut m, &mut r);
+    for case in &cases {
+        let key = &case.key;
+        assert_eq!(r.cmd(&["EXISTS", key]).int(), 0, "{key} on the replica");
+        assert_eq!(r.cmd(&["PTTL", key]).int(), -2, "{key} on the replica");
+        assert_eq!(m.cmd(&["EXISTS", key]).int(), 0, "{key} on the master");
+    }
+    // Nothing but `caught-up` on either, the keys past their time deleted
+    // by the writes, not left for a sweep.
+    assert_eq!(m.cmd(&["DBSIZE"]).int(), 1);
+    assert_eq!(r.cmd(&["DBSIZE"]).int(), 1);
+    assert_eq!(dataset(&mut r), dataset(&mut m));
+
+    aof_holds(&master, "UNLINK", cases.len());
+    let aof = master.aof();
+    for case in &cases {
+        deleted_before_anything_else(&aof, &case.key, case.make.len());
+    }
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(m.cmd(&["DBSIZE"]).int(), 1, "the replay");
+}
+
+/// The same from a transaction and, with Lua, from a script.
+#[test]
+fn a_write_in_a_transaction_or_a_script_that_finds_its_key_past_its_time() {
+    let master = Server::with_aof();
+    let replica = Server::replica_of(&master);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    m.ok(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);
+    for key in ["in-multi", "in-script", "undeclared", "set-in-multi"] {
+        m.ok(&["SET", key, "old", "PX", "100"]);
+    }
+    caught_up(&mut m, &mut r);
+    thread::sleep(Duration::from_millis(300));
+    m.ok(&["MULTI"]);
+    assert_eq!(m.cmd(&["PERSIST", "in-multi"]), V::Simple("QUEUED".into()));
+    assert_eq!(
+        m.cmd(&["SET", "set-in-multi", "new", "XX"]),
+        V::Simple("QUEUED".into())
+    );
+    assert_eq!(m.cmd(&["EXEC"]), V::Array(vec![V::Int(0), V::Nil]));
+    let keys: Vec<&str> = ["in-multi", "set-in-multi"]
+        .into_iter()
+        .chain(cfg!(feature = "lua").then_some("in-script"))
+        .chain(cfg!(feature = "lua").then_some("undeclared"))
+        .collect();
+    #[cfg(feature = "lua")]
+    {
+        assert_eq!(
+            m.cmd(&[
+                "EVAL",
+                "return redis.call('PERSIST', KEYS[1])",
+                "1",
+                "in-script"
+            ]),
+            V::Int(0)
+        );
+        // A key the script does not declare is found so too.
+        assert_eq!(
+            m.cmd(&[
+                "EVAL",
+                "return redis.call('SET', 'undeclared', 'new', 'XX')",
+                "0"
+            ]),
+            V::Nil
+        );
+    }
+    caught_up(&mut m, &mut r);
+    let aof = master.aof();
+    for key in keys {
+        assert_eq!(r.cmd(&["EXISTS", key]).int(), 0, "{key} on the replica");
+        assert_eq!(r.cmd(&["PTTL", key]).int(), -2, "{key} on the replica");
+        deleted_before_anything_else(&aof, key, 1);
+    }
+}
+
+/// A write whose reply says it changed nothing is not sent on, as in Redis:
+/// `PERSIST` of a key with no time to live, `SET … NX` of one that is there,
+/// `SET … IFEQ` that does not match, `EXPIRE … NX` of one with a time, and
+/// every other reply `changed_nothing` lists (with Lua, `MOVE` and `COPY`
+/// from a script too). Nor is it counted as a change since the last save. A
+/// `SET … NX GET` of a missing key answers nil and writes, and is sent, and
+/// fails a `WATCH` on its key; it was taken as a write that changed nothing.
+#[test]
+fn a_write_that_changed_nothing_is_not_sent_on() {
+    let master = Server::with_aof();
+    let replica = Server::replica_of(&master);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    m.ok(&["SET", "k", "v"]);
+    m.ok(&["SET", "t", "v", "EX", "1000"]);
+    assert_eq!(m.cmd(&["PERSIST", "k"]), V::Int(0));
+    assert_eq!(m.cmd(&["SET", "k", "w", "NX"]), V::Nil);
+    assert_eq!(m.cmd(&["SET", "k", "w", "IFEQ", "nope"]), V::Nil);
+    assert_eq!(m.cmd(&["SET", "missing", "w", "XX", "GET"]), V::Nil);
+    assert_eq!(m.cmd(&["EXPIRE", "t", "5000", "NX"]), V::Int(0));
+    assert_eq!(m.cmd(&["SADD", "s", "a"]), V::Int(1));
+    assert_eq!(m.cmd(&["SADD", "s", "a"]), V::Int(0));
+    assert_eq!(m.cmd(&["DEL", "missing"]), V::Int(0));
+    assert_eq!(m.cmd(&["HSET", "h", "f", "v"]), V::Int(1));
+    assert_eq!(m.cmd(&["ZADD", "z", "1", "a"]), V::Int(1));
+    assert_eq!(m.cmd(&["RPUSH", "l", "a"]), V::Int(1));
+    let changes = m.info("rdb_changes_since_last_save");
+    let nothing: &[&[&str]] = &[
+        &["SETNX", "k", "w"],
+        &["MSETNX", "k", "w", "fresh", "w"],
+        &["HSETNX", "h", "f", "w"],
+        &["RENAMENX", "t", "k"],
+        &["ZREM", "z", "b"],
+        &["LREM", "l", "0", "b"],
+        &["UNLINK", "missing"],
+        &["HDEL", "h", "nope"],
+        &["SMOVE", "s", "s2", "nope"],
+        &["SMOVE", "missing", "s2", "a"],
+        &["LPUSHX", "missing", "a"],
+        &["RPUSHX", "missing", "a"],
+        &["SREM", "s", "nope"],
+    ];
+    for args in nothing {
+        assert_eq!(m.cmd(args), V::Int(0), "{args:?}");
+    }
+    assert_eq!(m.cmd(&["LINSERT", "l", "BEFORE", "nope", "x"]), V::Int(-1));
+    assert_eq!(
+        m.cmd(&["LINSERT", "missing", "BEFORE", "a", "x"]),
+        V::Int(0)
+    );
+    assert_eq!(
+        m.info("rdb_changes_since_last_save"),
+        changes,
+        "nothing changed since the last save"
+    );
+    #[cfg(feature = "lua")]
+    for script in [
+        "return redis.call('MOVE', 'missing', '1')",
+        "return redis.call('COPY', 's', 'k')",
+        "return redis.call('COPY', 'missing', 'elsewhere')",
+    ] {
+        assert_eq!(m.cmd(&["EVAL", script, "0"]), V::Int(0), "{script}");
+    }
+
+    let mut watcher = master.conn();
+    watcher.ok(&["WATCH", "nx-get"]);
+    assert_eq!(m.cmd(&["SET", "nx-get", "new", "NX", "GET"]), V::Nil);
+    watcher.ok(&["MULTI"]);
+    assert_eq!(watcher.cmd(&["PING"]), V::Simple("QUEUED".into()));
+    assert_eq!(watcher.cmd(&["EXEC"]), V::Nil, "SET … NX GET wrote nx-get");
+
+    caught_up(&mut m, &mut r);
+    assert_eq!(r.get("nx-get").as_deref(), Some("new"));
+    assert_eq!(dataset(&mut r), dataset(&mut m));
+    let aof = master.aof();
+    assert_eq!(positions(&aof, "SET", "k").len(), 1, "{aof:?}");
+    assert!(positions(&aof, "PERSIST", "k").is_empty(), "{aof:?}");
+    assert!(positions(&aof, "SET", "missing").is_empty(), "{aof:?}");
+    assert!(positions(&aof, "DEL", "missing").is_empty(), "{aof:?}");
+    assert!(positions(&aof, "EXPIRE", "t").is_empty(), "{aof:?}");
+    assert!(positions(&aof, "PEXPIREAT", "t").is_empty(), "{aof:?}");
+    assert_eq!(positions(&aof, "SADD", "s").len(), 1, "{aof:?}");
+    assert_eq!(positions(&aof, "SET", "nx-get").len(), 1, "{aof:?}");
+    for args in nothing {
+        let record: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        assert!(!aof.contains(&record), "{args:?} in the AOF: {aof:?}");
+    }
+    for command in ["LINSERT", "MOVE", "COPY", "MSETNX", "SMOVE"] {
+        assert!(
+            !aof.iter().any(|record| record[0] == command),
+            "{command} in the AOF: {aof:?}"
+        );
+    }
+}
