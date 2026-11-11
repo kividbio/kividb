@@ -145,6 +145,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A write to a key past its TTL no longer gives a replica a key the
+  master does not have (#628).** A key whose TTL had ended but that the
+  master had not deleted yet was taken as gone by a write, but the write
+  was still sent on as it came, with no `UNLINK` ahead of it. A replica,
+  which still had the key, applied it to the key: `PERSIST` answered 0 on
+  the master and took the key's TTL away on the replica, and `SET ... XX`
+  or `SET ... IFEQ` answered nil and gave the replica's key a new value
+  with no TTL. Until the master's own `UNLINK` arrived the replica held a
+  key the master did not, with no TTL, and a failover in that window
+  brought back a key that had expired. Under load about 1 key in 500,000
+  was caught so. Now, when the AOF or a replica follows the master, a
+  write first deletes each key it names that is already past its TTL when
+  it starts, and sends its `UNLINK` (or `DEL`) ahead of the write, as a
+  read already did. `PERSIST`, `EXPIRE` and its family, and `GETEX` also
+  delete a key whose TTL ends while they run. And a write whose reply says
+  it changed nothing (`PERSIST` or `EXPIRE` answering 0, `SET` with `NX`,
+  `XX` or `IFEQ` answering nil, `SADD`, `DEL`, `SMOVE`, `LPUSHX` and the
+  like answering 0, `LINSERT` answering 0 or -1) is no longer sent on, nor
+  counted in `rdb_changes_since_last_save`, as in Redis. `SET ... NX GET`
+  that wrote a missing key and answered nil now counts as a change for
+  `WATCH` and client-side caching; it was taken as one that changed
+  nothing. Present since 1.2.0. Not covered yet: a key whose TTL ends in
+  the moment between the start of a write and its own look at the key,
+  in a write that reads one key and writes another (`SUNIONSTORE`,
+  `ZUNIONSTORE`, `BITOP`, `PFMERGE`, `SORT ... STORE`, `GEOSEARCHSTORE`):
+  the master can leave that key out where a replica still counts it.
+  That window is older than this fix.
+
 - **`INFO` no longer stalls writes on a server with many keys that have a
   TTL (#622).** To report `avg_ttl` in the keyspace section, `INFO` and
   `INFO keyspace` went over every key with a TTL, holding each shard's
