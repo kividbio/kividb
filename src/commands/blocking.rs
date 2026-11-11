@@ -945,6 +945,9 @@ mod gone_resume_tests {
 
     /// A server's shared state, and `run`, which dispatches one command on it.
     fn with_server(test: impl FnOnce(Run<'_>, &Arc<crate::wait_table::WaitTable>)) {
+        // The pause is the process's: a unit test pausing writes would hold
+        // these commands back (`pause::held_in_gate`).
+        let _pause = crate::pause::TEST_LOCK.lock();
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
         let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -210,9 +210,8 @@ fn pause_clients_within(
 ) -> Result<(), &'static str> {
     let (before, ours) = {
         let _flag = FLAG_LOCK.lock();
-        let before = active().map(|was_write_only| {
-            (PAUSE_UNTIL_MS.load(Ordering::SeqCst), was_write_only)
-        });
+        let before =
+            active().map(|was_write_only| (PAUSE_UNTIL_MS.load(Ordering::SeqCst), was_write_only));
         set_pause(duration_ms, write_only);
         // After the pause, before the wait: a write that enters the gate once
         // the wait has passed its slot sees both.
@@ -221,10 +220,15 @@ fn pause_clients_within(
     };
     let deadline = std::time::Instant::now() + limit;
     // A pause of no time is over at once: its writes are waited out all the
-    // same, and it answers OK, as in Redis.
-    let waited_out = crate::cluster::migration::off_the_runtime(|| {
-        crate::write_gate::wait_out_writes(deadline, || duration_ms == 0 || active().is_some())
-    });
+    // same, and it answers OK, as in Redis. Nothing to wait for in a
+    // transaction or a script that runs alone: no other command is running,
+    // and the ones waiting for the command gate find the flag in the write
+    // gate. (A wait from there could also wait for a cut, of a full sync
+    // say, that is itself waiting for this thread's slot.)
+    let waited_out = crate::command_gate::alone_on_this_thread()
+        || crate::cluster::migration::off_the_runtime(|| {
+            crate::write_gate::wait_out_writes(deadline, || duration_ms == 0 || active().is_some())
+        });
     if waited_out {
         return Ok(());
     }
@@ -929,7 +933,10 @@ mod tests {
         {
             let _setting = FLAG_LOCK.lock();
             end_client_pause_flag();
-            assert!(client_flag(), "taken down while a CLIENT PAUSE held the lock");
+            assert!(
+                client_flag(),
+                "taken down while a CLIENT PAUSE held the lock"
+            );
         }
         end_client_pause_flag();
         assert!(!client_flag());
@@ -937,13 +944,16 @@ mod tests {
 
         // A write still in the gate when the time runs out: the pause fails,
         // and is undone, back to the pause there was before it.
-        let in_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (in_gate, out) = (
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+        );
         let writer = {
-            let in_gate = std::sync::Arc::clone(&in_gate);
+            let (in_gate, out) = (std::sync::Arc::clone(&in_gate), std::sync::Arc::clone(&out));
             std::thread::spawn(move || {
                 let _gate = crate::write_gate::enter();
                 in_gate.wait();
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                out.wait();
             })
         };
         in_gate.wait();
@@ -963,6 +973,7 @@ mod tests {
         assert_eq!(active(), Some(false));
         assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), before);
         clear_pause();
+        out.wait();
         writer.join().unwrap();
         let enough = std::time::Duration::from_secs(5);
         assert_eq!(pause_clients_within(60_000, true, enough), Ok(()));

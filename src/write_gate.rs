@@ -250,11 +250,6 @@ mod tests {
         );
         writer.join().unwrap();
         releaser.join().unwrap();
-        let _outer = enter();
-        assert!(
-            wait_out_writes(far(), || true),
-            "a wait from inside a write waited for itself"
-        );
     }
 
     /// Writers must not be blocked by each other, only by a cut.

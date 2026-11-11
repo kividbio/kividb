@@ -1975,7 +1975,11 @@ fn writes_on_their_way_are_held_by_a_pause_set_meanwhile(
         assert!(!matches!(reply, V::Err(_)), "{writes:?}: {replies:?}");
     }
     if let Some(last) = last {
-        assert_eq!(replies.last().unwrap().s(), last, "out of order: {replies:?}");
+        assert_eq!(
+            replies.last().unwrap().s(),
+            last,
+            "out of order: {replies:?}"
+        );
     }
     assert_eq!(a.cmd(&["GET", key]).s(), "1");
     let mut r = wait_replica_at(&replica, master_offset(&mut a));
