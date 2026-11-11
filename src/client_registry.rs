@@ -183,6 +183,17 @@ impl ReplyGate {
         }
     }
 
+    /// The command that began last is dispatched again (a parked command
+    /// resumed, a write a pause sent back): not a new command, so neither
+    /// settled nor begun again, which would use up a `CLIENT REPLY SKIP`
+    /// on the dispatch that did not reply. Its reply starts where `out`
+    /// ends now: what was before it may have been sent meanwhile.
+    pub fn again(&mut self, out: &[u8]) {
+        if self.open {
+            self.mark = out.len();
+        }
+    }
+
     /// Drop the reply of the command that has just run, if it is not wanted.
     #[inline(always)]
     pub fn settle(&mut self, out: &mut Vec<u8>) {

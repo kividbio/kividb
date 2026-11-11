@@ -158,10 +158,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the store after the pause was set goes back and is held until the pause
   ends, as a write that arrives during the pause is. When OK is sent, every
   acknowledged write is in the offset. A write held up for longer, behind a
-  script or a transaction, does not delay the reply; and the wait for the
-  writes being applied ends when the pause ends, or after 5 seconds, with a
-  warning in the log. Writes are still held, not refused, and a
-  transaction or a script that pauses clients does not wait for itself.
+  script or a transaction, does not delay the reply. If a write being
+  applied takes longer than 5 seconds (a `FLUSHALL`, a `DEL` of a huge key),
+  or the pause ends first, `CLIENT PAUSE` answers `-ERR writes in progress
+  did not finish before the pause could take hold` and pauses nothing.
+  Writes are still held, not refused, and a transaction or a script that
+  pauses clients does not wait for itself. And `CLIENT REPLY SKIP` before a
+  blocking command that waited now skips that command's reply; the
+  dispatch that parked it used the skip up.
 
 - **A write to a key past its TTL no longer gives a replica a key the
   master does not have (#628).** A key whose TTL had ended but that the

@@ -144,8 +144,32 @@ pub fn set_pause(duration_ms: i64, write_only: bool) {
 /// How long `CLIENT PAUSE` waits at most for the writes that are in the
 /// write gate when it pauses clients: the default `busy-reply-threshold`,
 /// past which a command still running is taken to be stuck. They are
-/// normally gone in microseconds.
-const IN_FLIGHT_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+/// normally gone in microseconds. In debug builds a test may set it
+/// (`KIVIDB_TEST_IN_FLIGHT_WAIT_MS`).
+fn in_flight_wait_max() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    {
+        static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        if let Some(ms) = *SET.get_or_init(|| {
+            std::env::var("KIVIDB_TEST_IN_FLIGHT_WAIT_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+        }) {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    std::time::Duration::from_secs(5)
+}
+
+/// Held while `CLIENT PAUSE` raises [`CLIENT_PAUSE`] with its pause, and
+/// while the flag is taken down: a pause ending must not take down the flag
+/// of one being set (see [`end_client_pause_flag`]).
+static FLAG_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+/// What `CLIENT PAUSE` answers when the writes in progress did not finish in
+/// time ([`pause_clients`]).
+pub const PAUSE_DID_NOT_TAKE_HOLD: &str =
+    "ERR writes in progress did not finish before the pause could take hold";
 
 /// `CLIENT PAUSE timeout [WRITE | ALL]`: pause clients ([`set_pause`]), and
 /// return once every write that got past the pause before it was set has
@@ -164,27 +188,65 @@ const IN_FLIGHT_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(5
 ///
 /// The wait is for the writes in the gate, which take microseconds, and not
 /// for one held up before it, however long: behind a script or a
-/// transaction, on a stalled thread, parked in a blocking command. It ends
-/// when the pause does, and after [`IN_FLIGHT_WAIT_MAX`] in any case, with a
-/// warning. It does not wait for itself: inside a transaction or a script,
-/// which hold the gate, the slot of this thread is passed over (their
-/// writes are done before they reply, and nothing runs beside them).
-pub fn pause_clients(duration_ms: i64, write_only: bool) {
-    set_pause(duration_ms, write_only);
-    // After the pause, before the wait: a write that enters the gate once
-    // the wait has passed its slot sees both.
-    HANDOFF.fetch_or(CLIENT_PAUSE, Ordering::SeqCst);
-    let deadline = std::time::Instant::now() + IN_FLIGHT_WAIT_MAX;
+/// transaction, on a stalled thread, parked in a blocking command. It does
+/// not wait for itself: inside a transaction or a script, which hold the
+/// gate, the slot of this thread is passed over (their writes are done
+/// before they reply, and nothing runs beside them).
+///
+/// A write still in the gate after [`in_flight_wait_max`] (a `FLUSHALL`, a
+/// `DEL` of a huge key, a long script), or a pause (not of no time) that
+/// ended before the writes did, fails it with [`PAUSE_DID_NOT_TAKE_HOLD`]: the write would
+/// be acknowledged after the offset a switchover reads. What this call
+/// paused is then undone, if nothing has changed the pause since, so a
+/// `CLIENT PAUSE` that failed has paused nothing.
+pub fn pause_clients(duration_ms: i64, write_only: bool) -> Result<(), &'static str> {
+    pause_clients_within(duration_ms, write_only, in_flight_wait_max())
+}
+
+fn pause_clients_within(
+    duration_ms: i64,
+    write_only: bool,
+    limit: std::time::Duration,
+) -> Result<(), &'static str> {
+    let (before, ours) = {
+        let _flag = FLAG_LOCK.lock();
+        let before = active().map(|was_write_only| {
+            (PAUSE_UNTIL_MS.load(Ordering::SeqCst), was_write_only)
+        });
+        set_pause(duration_ms, write_only);
+        // After the pause, before the wait: a write that enters the gate once
+        // the wait has passed its slot sees both.
+        HANDOFF.fetch_or(CLIENT_PAUSE, Ordering::SeqCst);
+        (before, PAUSE_UNTIL_MS.load(Ordering::SeqCst))
+    };
+    let deadline = std::time::Instant::now() + limit;
+    // A pause of no time is over at once: its writes are waited out all the
+    // same, and it answers OK, as in Redis.
     let waited_out = crate::cluster::migration::off_the_runtime(|| {
-        crate::write_gate::wait_out_writes(deadline, || active().is_some())
+        crate::write_gate::wait_out_writes(deadline, || duration_ms == 0 || active().is_some())
     });
-    if !waited_out && active().is_some() {
-        log_warn!(
-            "CLIENT PAUSE: a write in progress when clients were paused had not finished after \
-             {} seconds; replying OK without waiting for it any longer",
-            IN_FLIGHT_WAIT_MAX.as_secs()
-        );
+    if waited_out {
+        return Ok(());
     }
+    log_warn!(
+        "CLIENT PAUSE refused: a write in progress when clients were paused had not finished \
+         after {} ms, or the pause ended first; nothing is paused by it",
+        limit.as_millis()
+    );
+    let _flag = FLAG_LOCK.lock();
+    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ours {
+        match before {
+            Some((until, was_write_only)) => {
+                PAUSE_MODE_WRITE_ONLY.store(was_write_only, Ordering::Relaxed);
+                PAUSE_UNTIL_MS.store(until, Ordering::SeqCst);
+            }
+            None => {
+                clear_pause();
+                lower_client_pause_flag();
+            }
+        }
+    }
+    Err(PAUSE_DID_NOT_TAKE_HOLD)
 }
 
 /// What a write that got past a `CLIENT PAUSE` before it was set returns
@@ -236,18 +298,29 @@ pub fn exec_held_in_gate(queued: &[Vec<Vec<u8>>]) -> bool {
     !handoff() && held_in_gate(&[b"EXEC"], queued)
 }
 
-/// Take [`CLIENT_PAUSE`] down: the pause has ended. It goes up again at
-/// once if another pause has begun meanwhile ([`pause_clients`] may have
-/// raised it just before it was taken down here). A flag left up while
-/// nothing is paused costs every write a look at it in the gate, until a
-/// write takes it down ([`held_in_gate`]).
+/// Take [`CLIENT_PAUSE`] down: the pause has ended. Under [`FLAG_LOCK`],
+/// and only if no pause runs on: a `CLIENT PAUSE` being set holds the lock
+/// from its pause to its flag, so the flag is never down, even for an
+/// instant, while a pause that raised it is in force. (A write that entered
+/// a slot its sweep had passed would otherwise find nothing, run, and be
+/// acknowledged after the reply.) Not waited for: a `CLIENT PAUSE` holding
+/// the lock raises the flag itself, and so does one that is being undone
+/// take it down. A flag left up while nothing is paused costs every write a
+/// look at it in the gate, until a write takes it down ([`held_in_gate`]).
 fn end_client_pause_flag() {
     if HANDOFF.load(Ordering::Relaxed) & CLIENT_PAUSE == 0 {
         return;
     }
-    HANDOFF.fetch_and(!CLIENT_PAUSE, Ordering::SeqCst);
-    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) > 0 {
-        HANDOFF.fetch_or(CLIENT_PAUSE, Ordering::SeqCst);
+    let Some(_flag) = FLAG_LOCK.try_lock() else {
+        return;
+    };
+    lower_client_pause_flag();
+}
+
+/// [`end_client_pause_flag`], with [`FLAG_LOCK`] held.
+fn lower_client_pause_flag() {
+    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) <= now_ms() {
+        HANDOFF.fetch_and(!CLIENT_PAUSE, Ordering::SeqCst);
     }
 }
 
@@ -817,7 +890,7 @@ mod tests {
         // pause, however that ends.
         let client_flag = || HANDOFF.load(Ordering::SeqCst) & CLIENT_PAUSE != 0;
         assert!(!client_flag());
-        pause_clients(60_000, true);
+        pause_clients(60_000, true).unwrap();
         assert!(client_flag() && !handoff());
         assert!(write_held_in_gate(&[b"SET", b"k", b"v"]));
         assert!(!write_held_in_gate(&[b"GET", b"k"]));
@@ -826,22 +899,75 @@ mod tests {
         clear_pause();
         assert!(!client_flag() && !write_held_in_gate(&[b"SET", b"k", b"v"]));
         // Ended by its time: taken down by the first write that looks.
-        pause_clients(1, false);
+        let _ = pause_clients(1, false);
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(!write_held_in_gate(&[b"SET", b"k", b"v"]));
         assert!(!client_flag());
         // A handoff during a CLIENT PAUSE is a handoff, and a write in the
         // gate waits it out rather than going back to be held.
-        pause_clients(60_000, true);
+        pause_clients(60_000, true).unwrap();
         set_handoff_pause(60_000);
         assert!(handoff() && !exec_held_in_gate(&writes));
         clear_pause();
         assert!(!handoff() && !client_flag());
         // Neither moves the routes the count of which is above the flags.
         let routed = routes_now();
-        pause_clients(60_000, true);
+        pause_clients(60_000, true).unwrap();
         assert!(!routes_moved_since(routed));
         clear_pause();
+
+        // The flag is not taken down while a pause runs on, nor while a
+        // CLIENT PAUSE is raising it with its pause (it holds FLAG_LOCK): a
+        // pause that had ended could otherwise take down the flag of the
+        // one being set, after its sweep had passed a write's slot.
+        pause_clients(60_000, true).unwrap();
+        end_client_pause_flag();
+        assert!(client_flag(), "the flag of a pause in force came down");
+        clear_pause();
+        HANDOFF.fetch_or(CLIENT_PAUSE, Ordering::SeqCst);
+        PAUSE_UNTIL_MS.store(now_ms() - 10, Ordering::SeqCst);
+        {
+            let _setting = FLAG_LOCK.lock();
+            end_client_pause_flag();
+            assert!(client_flag(), "taken down while a CLIENT PAUSE held the lock");
+        }
+        end_client_pause_flag();
+        assert!(!client_flag());
+        PAUSE_UNTIL_MS.store(0, Ordering::SeqCst);
+
+        // A write still in the gate when the time runs out: the pause fails,
+        // and is undone, back to the pause there was before it.
+        let in_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer = {
+            let in_gate = std::sync::Arc::clone(&in_gate);
+            std::thread::spawn(move || {
+                let _gate = crate::write_gate::enter();
+                in_gate.wait();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            })
+        };
+        in_gate.wait();
+        let limit = std::time::Duration::from_millis(30);
+        assert_eq!(
+            pause_clients_within(60_000, true, limit),
+            Err(PAUSE_DID_NOT_TAKE_HOLD)
+        );
+        assert_eq!(active(), None, "a failed CLIENT PAUSE left clients paused");
+        assert!(!client_flag());
+        set_pause(60_000, false);
+        let before = PAUSE_UNTIL_MS.load(Ordering::SeqCst);
+        assert_eq!(
+            pause_clients_within(120_000, true, limit),
+            Err(PAUSE_DID_NOT_TAKE_HOLD)
+        );
+        assert_eq!(active(), Some(false));
+        assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), before);
+        clear_pause();
+        writer.join().unwrap();
+        let enough = std::time::Duration::from_secs(5);
+        assert_eq!(pause_clients_within(60_000, true, enough), Ok(()));
+        clear_pause();
+        assert!(!client_flag());
 
         // A write that waits out a handoff on a worker of the multi-threaded
         // runtime leaves that worker's other tasks to run. Here the one that

@@ -1076,6 +1076,10 @@ pub async fn handle_client(
         // Outside the parse loop: a park in one turn hands its delivery to
         // the re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
+        // The next turn dispatches the command of this one again: a parked
+        // command resumed, or a write a pause sent back to be held. It is
+        // the same command: not recorded, settled or begun again.
+        let mut redispatch = false;
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
@@ -1134,7 +1138,7 @@ pub async fn handle_client(
             // For `CLIENT LIST`'s `cmd=` and `db=`, and `tot-cmds`. Not again
             // for a blocked command dispatched once more with what it waited
             // for: it is one command.
-            if !blocking_slot.resuming() {
+            if !redispatch && !blocking_slot.resuming() {
                 activity.record(&cmd, selected_db);
             }
             if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(cmd[0]) {
@@ -1142,15 +1146,21 @@ pub async fn handle_client(
             }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
-            reply_gate.settle(&mut out_buf);
-            crate::tracking::after_command(
-                &tracking_table,
-                &client_registry,
-                client_id,
-                &activity,
-                &mut out_buf,
-            );
-            reply_gate.begin(&cmd, &mut out_buf);
+            if std::mem::take(&mut redispatch) {
+                // A `CLIENT REPLY SKIP` before it is for the dispatch that
+                // replies, not used up by the one that did not.
+                reply_gate.again(&out_buf);
+            } else {
+                reply_gate.settle(&mut out_buf);
+                crate::tracking::after_command(
+                    &tracking_table,
+                    &client_registry,
+                    client_id,
+                    &activity,
+                    &mut out_buf,
+                );
+                reply_gate.begin(&cmd, &mut out_buf);
+            }
             // ── ACL changes reach connections that are already open ──────────────
             // One relaxed load per command when nothing has changed.
             if crate::acl::ACL_EPOCH.load(std::sync::atomic::Ordering::Relaxed) != acl_epoch_seen
@@ -1288,6 +1298,7 @@ pub async fn handle_client(
                     // set, and did not run (`pause::HELD_IN_GATE`): read
                     // again, and held by the pause check.
                     if crate::pause::is_held(&response) {
+                        redispatch = true;
                         continue;
                     }
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
@@ -1358,7 +1369,10 @@ pub async fn handle_client(
                         {
                             // `parse_offset` deliberately not advanced: the same
                             // command is re-dispatched, now carrying the delivery.
-                            Ok(()) => continue,
+                            Ok(()) => {
+                                redispatch = true;
+                                continue;
+                            }
                             Err(reply) => response = reply,
                         }
                     }
@@ -1438,7 +1452,10 @@ pub async fn handle_client(
                     .await
                     {
                         // See the note at the non-slowlog site above.
-                        Ok(()) => continue,
+                        Ok(()) => {
+                            redispatch = true;
+                            continue;
+                        }
                         Err(reply) => response = reply,
                     }
                 }
@@ -1886,6 +1903,7 @@ pub async fn handle_client(
                         if crate::pause::writes_must_check(routed.at())
                             && crate::pause::exec_held_in_gate(&tx.queue)
                         {
+                            redispatch = true;
                             continue;
                         }
                         // And to replicas and the AOF as one: its writes in the
@@ -2670,7 +2688,8 @@ pub async fn handle_client(
                         (r, cmd_start.elapsed().as_micros() as u64)
                     };
 
-                    if elapsed_us >= slowlog.threshold_us() {
+                    // Not a write a pause sent back: it is timed when it runs.
+                    if elapsed_us >= slowlog.threshold_us() && !crate::pause::is_held(&result) {
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -2685,6 +2704,7 @@ pub async fn handle_client(
             // A write that got past a `CLIENT PAUSE` before it was set, and
             // went no further (`pause::HELD_IN_GATE`): read again, and held.
             if crate::pause::is_held(&response) {
+                redispatch = true;
                 continue;
             }
             // The other commands answered here, and not by `execute_command`,

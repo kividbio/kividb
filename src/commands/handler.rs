@@ -941,22 +941,23 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     // case it has not run yet and is counted when it is resumed.
     let started = std::time::Instant::now();
     let reply = run_command(ctx, name, started);
+    if crate::pause::is_held(&reply) {
+        // Not run: a `CLIENT PAUSE` sent it back to be held, and it is
+        // dispatched again (`blocking::hold_for_pause`). Counted and timed
+        // then.
+        crate::stats::unrecord_command_processed();
+        return reply;
+    }
     let elapsed = started.elapsed();
     // For the connection loop's slow log: see `cmdstats::last_command_us`.
     crate::cmdstats::note_last_command(elapsed);
     crate::latency::note_command(ctx.latency, name, elapsed);
-    // Nor if a `CLIENT PAUSE` sent it back to be held (`pause::is_held`):
-    // it is counted when it runs.
-    if !crate::commands::blocking::parked(ctx) && !crate::pause::is_held(&reply) {
+    if !crate::commands::blocking::parked(ctx) {
         crate::cmdstats::record(name, &ctx.cmd, &reply, elapsed);
     }
     // An index definition goes to the rest of the cluster once it is made
     // here, with nothing held: see `cluster::ddl`.
-    if ctx.cluster.enabled
-        && crate::cluster::ddl::is_definition_command(name)
-        && !crate::commands::blocking::parked(ctx)
-        && !crate::pause::is_held(&reply)
-    {
+    if ctx.cluster.enabled && crate::cluster::ddl::is_definition_command(name) {
         return crate::cluster::ddl::spread(ctx, reply);
     }
     reply
@@ -1413,6 +1414,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             && !crate::commands::blocking::client_gone(ctx)
         {
             drop(_write_gate);
+            // `ASKING` was used up when it was routed; the dispatch that
+            // runs it is routed as this one was.
+            if routed.asking() {
+                ctx.client_registry
+                    .update(ctx.client_id, |info| info.asking = true);
+            }
             return crate::commands::blocking::hold_for_pause(ctx);
         }
         if !handoff

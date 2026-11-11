@@ -451,23 +451,22 @@ pub fn park_with_state(
 /// (`pause::held_in_gate`): it does not run now. A connection that can
 /// park a command is asked to read it again, its pause check holding it
 /// until the pause ends: parked, with nothing to wait for
-/// ([`BlockingWait::held_by_pause`]); what is returned is not sent. Any
-/// other caller is answered `pause::HELD_IN_GATE`, which the connection
-/// takes the same way: a script, a command on the slow path.
+/// ([`BlockingWait::held_by_pause`]). Any other caller takes the reply,
+/// `pause::HELD_IN_GATE`, the same way: a script, a command on the slow
+/// path. It is never sent.
 pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
-    match ctx.blocking.as_mut() {
-        Some(slot) if slot.awaitable => {
-            slot.parked = Some(BlockingWait {
-                rxs: Vec::new(),
-                timeout: None,
-                state: None,
-                role_epoch: 0,
-                held_by_pause: true,
-            });
-            Vec::new()
-        }
-        _ => crate::pause::HELD_IN_GATE.to_vec(),
+    if let Some(slot) = ctx.blocking.as_mut()
+        && slot.awaitable
+    {
+        slot.parked = Some(BlockingWait {
+            rxs: Vec::new(),
+            timeout: None,
+            state: None,
+            role_epoch: 0,
+            held_by_pause: true,
+        });
     }
+    crate::pause::HELD_IN_GATE.to_vec()
 }
 
 /// Run a command that waits until one of `keys` has something for it.

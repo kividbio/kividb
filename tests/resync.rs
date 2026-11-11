@@ -1861,45 +1861,89 @@ fn master_offset(c: &mut Conn) -> u64 {
     c.info("replication", "master_repl_offset").parse().unwrap()
 }
 
-/// A master started with `env` (its test hooks), and a replica that
-/// follows it, its link up.
-fn master_and_replica(env: &[(&str, &str)]) -> (Server, Server) {
-    let master = Server::start_with_env(&[], env);
+/// A master started with `extra` and `env` (its test hooks), and a replica
+/// that follows it, its link up.
+fn master_and_replica(extra: &[&str], env: &[(&str, &str)]) -> (Server, Server) {
+    let master = Server::start_with_env(extra, env);
     let port = master.port.to_string();
     let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     wait_link_up(&mut replica.conn());
     (master, replica)
 }
 
-/// A write held up on its way to the write gate while another client
-/// pauses writes (#629). It passed the pause check before the pause was
-/// set, and the test hook holds it there (`KIVIDB_TEST_PRE_GATE_DELAY_MS`,
-/// arguments beginning with `stalled:`). `CLIENT PAUSE` answers at once —
-/// it does not wait for a write that has not reached the gate — and once
-/// the write gets there it is held with the others: not applied, not
-/// answered, and not in `master_repl_offset`, until the pause ends. It used
-/// to be applied and answered during the pause, after `CLIENT PAUSE` had
-/// replied and the offset had been read: a switchover that promoted a
-/// replica at that offset lost it.
+/// A connection to `server` that is answered now. On the io_uring loop a
+/// test hook that holds a command up holds its whole worker thread, and
+/// with it every connection the worker has: a connection that answers a
+/// `PING` at once is on another.
+fn answered_conn(server: &Server) -> Conn {
+    for _ in 0..40 {
+        let mut c = server.conn();
+        send_only(&mut c, &["PING"]);
+        if replied_within(&mut c, Duration::from_millis(150)) {
+            assert_eq!(c.read().s(), "PONG");
+            return c;
+        }
+    }
+    panic!("no connection was answered");
+}
+
+/// The replica's offset reaches `offset`.
+fn wait_replica_at(replica: &Server, offset: u64) -> Conn {
+    let mut r = replica.conn();
+    wait_until("the replica to reach the offset", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    r
+}
+
+/// Writes held up on their way to the write gate while another client
+/// pauses writes (#629). The first passed the pause check before the pause
+/// was set, and the test hook holds it there for `stall_ms`
+/// (`KIVIDB_TEST_PRE_GATE_DELAY_MS`, arguments beginning with `stalled:`).
+/// `CLIENT PAUSE` answers at once — it does not wait for a write that has
+/// not reached the gate — and once the write gets there it is held with the
+/// others: not applied, not answered, and not in `master_repl_offset`, until
+/// the pause ends. It used to be applied and answered during the pause,
+/// after `CLIENT PAUSE` had replied and the offset had been read: a
+/// switchover that promoted a replica at that offset lost it.
 ///
-/// `before` is sent first, its replies read; then `write`, whose reply is
-/// read once the pause has ended; `key` is what it sets to "1".
-fn a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+/// `before` is sent first, its replies read; then `writes`, in one go,
+/// whose replies are read once the pause has ended (the last of them
+/// `last`, if given). `key` is what the first of them sets to "1".
+fn writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+    extra: &[&str],
+    stall_ms: u64,
     before: &[&[&str]],
-    write: &[&str],
+    writes: &[&[&str]],
     key: &str,
+    last: Option<&str>,
 ) {
-    let (master, replica) = master_and_replica(&[("KIVIDB_TEST_PRE_GATE_DELAY_MS", "1500")]);
-    let mut a = master.conn();
-    assert!(a.cmd(&["SET", "first", "0"]).ok());
+    let stall = stall_ms.to_string();
+    let (master, replica) =
+        master_and_replica(extra, &[("KIVIDB_TEST_PRE_GATE_DELAY_MS", stall.as_str())]);
+    assert!(master.conn().cmd(&["SET", "first", "0"]).ok());
     let mut b = master.conn();
     for args in before {
         let reply = b.cmd(args);
         assert!(!matches!(reply, V::Err(_)), "{args:?}: {reply:?}");
     }
     let sent = Instant::now();
-    send_only(&mut b, write);
-    std::thread::sleep(Duration::from_millis(300));
+    let mut pipelined = Vec::new();
+    for args in writes {
+        pipelined.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+        for a in *args {
+            pipelined.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+        }
+    }
+    b.writer.write_all(&pipelined).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = answered_conn(&master);
+    assert!(
+        sent.elapsed() < Duration::from_millis(stall_ms) - Duration::from_millis(500),
+        "too late to pause before the write reaches the gate"
+    );
 
     let pausing = Instant::now();
     assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
@@ -1911,14 +1955,14 @@ fn a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
     let offset = master_offset(&mut a);
     assert_eq!(master_offset(&mut a), offset);
     // Past the end of the hold-up: the write has reached the gate.
-    std::thread::sleep(Duration::from_millis(1500).saturating_sub(sent.elapsed()));
+    std::thread::sleep(Duration::from_millis(stall_ms).saturating_sub(sent.elapsed()));
     std::thread::sleep(Duration::from_millis(700));
     assert!(
         !replied_within(&mut b, Duration::ZERO),
-        "{write:?} was answered while writes were paused\n{}",
+        "{writes:?} was answered while writes were paused\n{}",
         master.log()
     );
-    assert_eq!(a.cmd(&["GET", key]), V::Nil, "{write:?} was applied");
+    assert_eq!(a.cmd(&["GET", key]), V::Nil, "{writes:?} was applied");
     assert_eq!(
         master_offset(&mut a),
         offset,
@@ -1926,49 +1970,98 @@ fn a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
     );
 
     assert!(a.cmd(&["CLIENT", "UNPAUSE"]).ok());
-    let reply = b.read();
-    assert!(!matches!(reply, V::Err(_)), "{write:?}: {reply:?}");
+    let replies: Vec<V> = writes.iter().map(|_| b.read()).collect();
+    for reply in &replies {
+        assert!(!matches!(reply, V::Err(_)), "{writes:?}: {replies:?}");
+    }
+    if let Some(last) = last {
+        assert_eq!(replies.last().unwrap().s(), last, "out of order: {replies:?}");
+    }
     assert_eq!(a.cmd(&["GET", key]).s(), "1");
-    let offset = master_offset(&mut a);
-    let mut r = replica.conn();
-    wait_until("the replica to catch up", || {
-        r.info("replication", "slave_repl_offset")
-            .parse::<u64>()
-            .is_ok_and(|applied| applied >= offset)
-    });
+    let mut r = wait_replica_at(&replica, master_offset(&mut a));
     assert_eq!(r.cmd(&["GET", key]).s(), "1");
 }
 
 #[test]
 fn a_write_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
-    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
         &[],
-        &["SET", "stalled:k", "1"],
+        1500,
+        &[],
+        &[&["SET", "stalled:k", "1"]],
         "stalled:k",
+        None,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends_on_io_uring() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &["--io-model", "uring"],
+        3000,
+        &[],
+        &[&["SET", "stalled:k", "1"]],
+        "stalled:k",
+        None,
+    );
+}
+
+/// What a client sent behind a held write waits behind it, and runs in its
+/// order: the `GET` (which the pause does not hold) answers what the `SET`
+/// wrote.
+#[test]
+fn a_command_pipelined_behind_a_held_write_runs_after_it() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &[],
+        1500,
+        &[],
+        &[&["SET", "stalled:p", "1"], &["GET", "stalled:p"]],
+        "stalled:p",
+        Some("1"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_pipelined_behind_a_held_write_runs_after_it_on_io_uring() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &["--io-model", "uring"],
+        3000,
+        &[],
+        &[&["SET", "stalled:p", "1"], &["GET", "stalled:p"]],
+        "stalled:p",
+        Some("1"),
     );
 }
 
 #[test]
 fn a_transaction_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
-    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &[],
+        1500,
         &[&["MULTI"], &["SET", "stalled:t", "1"]],
-        &["EXEC"],
+        &[&["EXEC"]],
         "stalled:t",
+        None,
     );
 }
 
 #[cfg(feature = "lua")]
 #[test]
 fn a_script_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
-    a_write_on_its_way_is_held_by_a_pause_set_meanwhile(
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
         &[],
-        &[
+        1500,
+        &[],
+        &[&[
             "EVAL",
             "return redis.call('SET', KEYS[1], '1')",
             "1",
             "stalled:s",
-        ],
+        ]],
         "stalled:s",
+        None,
     );
 }
 
@@ -1979,15 +2072,15 @@ fn a_script_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
 /// used to be answered at once; the write was then queued and answered after
 /// the offset had been read, and a replica promoted at that offset did not
 /// have it.
-#[test]
-fn client_pause_answers_once_the_writes_in_the_gate_are_done() {
-    let (master, replica) = master_and_replica(&[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
-    let mut a = master.conn();
-    assert!(a.cmd(&["SET", "first", "0"]).ok());
+fn client_pause_answers_once_the_writes_in_the_gate_are_done_with(extra: &[&str]) {
+    let (master, replica) =
+        master_and_replica(extra, &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
+    assert!(master.conn().cmd(&["SET", "first", "0"]).ok());
     let mut b = master.conn();
     let sent = Instant::now();
     send_only(&mut b, &["SET", "delayed:k", "1"]);
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = answered_conn(&master);
 
     assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
     assert!(
@@ -2002,14 +2095,88 @@ fn client_pause_answers_once_the_writes_in_the_gate_are_done() {
         offset,
         "the write was queued after CLIENT PAUSE had replied"
     );
-    let mut r = replica.conn();
-    wait_until("the replica to reach the offset", || {
-        r.info("replication", "slave_repl_offset")
-            .parse::<u64>()
-            .is_ok_and(|applied| applied >= offset)
-    });
+    let mut r = wait_replica_at(&replica, offset);
     assert_eq!(r.cmd(&["GET", "delayed:k"]).s(), "1", "{}", master.log());
     assert!(a.cmd(&["CLIENT", "UNPAUSE"]).ok());
+}
+
+#[test]
+fn client_pause_answers_once_the_writes_in_the_gate_are_done() {
+    client_pause_answers_once_the_writes_in_the_gate_are_done_with(&[]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn client_pause_answers_once_the_writes_in_the_gate_are_done_on_io_uring() {
+    client_pause_answers_once_the_writes_in_the_gate_are_done_with(&["--io-model", "uring"]);
+}
+
+/// A write still in the gate when `CLIENT PAUSE`'s time to wait for it runs
+/// out (`KIVIDB_TEST_IN_FLIGHT_WAIT_MS` here; 5 seconds otherwise) fails the
+/// pause: answered OK, the switchover would read an offset that the write,
+/// acknowledged a moment later, is not in (#629). And the failed pause has
+/// paused nothing: another client's write goes through at once.
+#[test]
+fn client_pause_fails_and_pauses_nothing_if_a_write_in_the_gate_takes_too_long() {
+    let (master, _replica) = master_and_replica(
+        &[],
+        &[
+            ("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500"),
+            ("KIVIDB_TEST_IN_FLIGHT_WAIT_MS", "300"),
+        ],
+    );
+    assert!(master.conn().cmd(&["SET", "first", "0"]).ok());
+    let mut b = master.conn();
+    send_only(&mut b, &["SET", "delayed:k", "1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = answered_conn(&master);
+    let reply = a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]);
+    assert!(
+        matches!(&reply, V::Err(why) if why.contains("did not finish")),
+        "{reply:?}"
+    );
+    let mut c = answered_conn(&master);
+    send_only(&mut c, &["SET", "other", "1"]);
+    assert!(
+        replied_within(&mut c, Duration::from_millis(1000)),
+        "a write was held by a CLIENT PAUSE that failed"
+    );
+    assert!(c.read().ok());
+    assert!(b.read().ok());
+}
+
+/// `CLIENT PAUSE` inside a transaction answers at once: it does not wait
+/// for its own transaction, which holds the gate. The commands after it in
+/// the transaction run, and other clients' writes are held.
+#[test]
+fn client_pause_inside_a_transaction_does_not_wait_for_it() {
+    let (master, _replica) = master_and_replica(&[], &[]);
+    let mut c = master.conn();
+    assert!(c.cmd(&["MULTI"]).ok());
+    for args in [
+        &["SET", "m1", "1"][..],
+        &["CLIENT", "PAUSE", "30000", "WRITE"],
+        &["SET", "m2", "1"],
+    ] {
+        assert_eq!(c.cmd(args).s(), "QUEUED", "{args:?}");
+    }
+    let started = Instant::now();
+    let replies = c.cmd(&["EXEC"]);
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "EXEC waited {:?}",
+        started.elapsed()
+    );
+    assert!(replies.arr().iter().all(V::ok), "{replies:?}");
+    assert_eq!(c.cmd(&["GET", "m2"]).s(), "1");
+    let mut d = master.conn();
+    send_only(&mut d, &["SET", "m3", "1"]);
+    assert!(
+        !replied_within(&mut d, Duration::from_millis(500)),
+        "a write went through the pause"
+    );
+    assert!(c.cmd(&["CLIENT", "UNPAUSE"]).ok());
+    assert!(d.read().ok());
 }
 
 /// The keys of database `db`, sorted.

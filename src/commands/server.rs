@@ -5594,8 +5594,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     };
                     // Once the writes on their way have been applied or
                     // will be held: see `pause_clients` (#629).
-                    crate::pause::pause_clients(ms, write_only);
-                    Some(resp_simple("OK"))
+                    match crate::pause::pause_clients(ms, write_only) {
+                        Ok(()) => Some(resp_simple("OK")),
+                        Err(why) => Some(resp_error(why)),
+                    }
                 }
 
                 "UNPAUSE" => {
