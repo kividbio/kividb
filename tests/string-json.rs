@@ -73,6 +73,13 @@ impl Conn {
                 let items = (0..count).map(|_| self.read_value()).collect();
                 RespValue::Array(items)
             }
+            // RESP3: a double as its text, a map as its keys and values.
+            Some(b',') => RespValue::Bulk(line.as_bytes()[1..].to_vec()),
+            Some(b'_') => RespValue::Nil,
+            Some(b'%') => {
+                let count: usize = line[1..].parse().unwrap();
+                RespValue::Array((0..2 * count).map(|_| self.read_value()).collect())
+            }
             _ => panic!("unexpected RESP: {:?}", line),
         }
     }
@@ -1050,7 +1057,7 @@ fn test_json_numincrby_nummultby() {
     assert_eq!(
         c.cmds(&["JSON.NUMMULTBY", "doc", "$.score", "0.5"])
             .as_str(),
-        "[12]"
+        "[12.0]"
     );
     assert_eq!(
         c.cmds(&["JSON.NUMINCRBY", "doc", "$.score", "0.5"])
@@ -1062,6 +1069,161 @@ fn test_json_numincrby_nummultby() {
         c.cmds(&["JSON.NUMINCRBY", "doc", ".score", "1"]).as_str(),
         "13.5"
     );
+}
+
+/// A float stays a float, even when the result is whole (#470). The expected
+/// replies are those of Redis 8.10.3.
+#[test]
+fn json_arithmetic_keeps_a_float_result_a_float() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (start, op, operand, want, kind) in [
+        ("1.0", "JSON.NUMINCRBY", "0", "[1.0]", "number"),
+        ("1.5", "JSON.NUMINCRBY", "1.5", "[3.0]", "number"),
+        ("1e5", "JSON.NUMINCRBY", "0", "[100000.0]", "number"),
+        ("-0.0", "JSON.NUMMULTBY", "1", "[-0.0]", "number"),
+        ("-0", "JSON.NUMINCRBY", "0", "[0.0]", "number"),
+        ("2", "JSON.NUMINCRBY", "1.0", "[3.0]", "number"),
+        ("24", "JSON.NUMMULTBY", "0.5", "[12.0]", "number"),
+        ("2", "JSON.NUMINCRBY", "1", "[3]", "integer"),
+        ("24", "JSON.NUMMULTBY", "2", "[48]", "integer"),
+        (
+            "9007199254740992.0",
+            "JSON.NUMINCRBY",
+            "1",
+            "[9007199254740992.0]",
+            "number",
+        ),
+    ] {
+        assert!(c.cmds(&["JSON.SET", "k", "$", start]).is_ok());
+        assert_eq!(
+            c.cmds(&[op, "k", "$", operand]).as_str(),
+            want,
+            "{start} {op} {operand}"
+        );
+        assert_eq!(
+            c.cmds(&["JSON.GET", "k", "$"]).as_str(),
+            want,
+            "stored value of {start} {op} {operand}"
+        );
+        let RespValue::Array(types) = c.cmds(&["JSON.TYPE", "k", "$"]) else {
+            panic!("JSON.TYPE");
+        };
+        assert_eq!(types[0].as_str(), kind, "{start} {op} {operand}");
+    }
+}
+
+/// An integer result that does not fit an `i64` is refused and the document
+/// stays as it was, on every path, and an integer held as a `u64` counts
+/// (#536). Redis 8.10.3 stores a `u64` for some array elements, gives a float
+/// for some integers past `i64::MAX`, and can leave a multi-match path half
+/// done: none of that is copied, see docs/COMPATIBILITY.md.
+#[test]
+fn json_arithmetic_refuses_an_integer_overflow_and_changes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    const MAX: &str = "9223372036854775807";
+    const MIN: &str = "-9223372036854775808";
+    // Integers past `i64::MAX`, which are held as a `u64`.
+    const ABOVE: &str = "9223372036854775808";
+    const U64: &str = "18446744073709551615";
+    for (doc, op, path, operand) in [
+        (MAX.to_string(), "JSON.NUMINCRBY", "$", "1"),
+        (MAX.to_string(), "JSON.NUMINCRBY", ".", "1"),
+        (MIN.to_string(), "JSON.NUMINCRBY", "$", "-1"),
+        (MAX.to_string(), "JSON.NUMMULTBY", "$", "2"),
+        (MIN.to_string(), "JSON.NUMMULTBY", "$", "-1"),
+        (format!(r#"{{"a":{MAX}}}"#), "JSON.NUMINCRBY", "$.a", "1"),
+        (format!(r#"{{"a":{MAX}}}"#), "JSON.NUMINCRBY", ".a", "1"),
+        (format!("[{MAX}]"), "JSON.NUMINCRBY", "$[0]", "1"),
+        (format!("[{MAX},1]"), "JSON.NUMMULTBY", "$[*]", "2"),
+        (format!("[{MAX},1]"), "JSON.NUMMULTBY", "$[*]", "3"),
+        (format!("[{MAX},{MAX}]"), "JSON.NUMINCRBY", "$[*]", "1"),
+        // The match that overflows comes after one that fits.
+        (format!("[1,{MAX}]"), "JSON.NUMINCRBY", "$[*]", "1"),
+        (
+            format!(r#"{{"x":{{"a":{MAX}}},"a":1}}"#),
+            "JSON.NUMINCRBY",
+            "$..a",
+            "1",
+        ),
+        (
+            format!(r#"{{"x":{{"a":1}},"a":{MAX}}}"#),
+            "JSON.NUMINCRBY",
+            "..a",
+            "1",
+        ),
+        (U64.to_string(), "JSON.NUMINCRBY", "$", "1"),
+        (U64.to_string(), "JSON.NUMINCRBY", ".", "1"),
+        (ABOVE.to_string(), "JSON.NUMMULTBY", "$", "2"),
+        ("0".to_string(), "JSON.NUMINCRBY", "$", ABOVE),
+        // Too big even for the `i128` the result is worked out in.
+        (U64.to_string(), "JSON.NUMMULTBY", "$", U64),
+        (format!(r#"{{"a":{ABOVE}}}"#), "JSON.NUMINCRBY", "$.a", "0"),
+        (format!("[{U64},1]"), "JSON.NUMINCRBY", "$[*]", "1"),
+        (format!("[1,{U64}]"), "JSON.NUMINCRBY", "$[*]", "1"),
+    ] {
+        assert!(c.cmds(&["JSON.SET", "k", "$", &doc]).is_ok());
+        assert_eq!(
+            c.cmds(&[op, "k", path, operand]).error_str(),
+            "ERR numeric overflow",
+            "{doc} {op} {path} {operand}"
+        );
+        assert_eq!(
+            c.cmds(&["JSON.GET", "k"]).as_str(),
+            doc,
+            "{doc} {op} {path} {operand} changed the document"
+        );
+    }
+
+    // At the limit, without going over, the result is still an integer.
+    assert!(
+        c.cmds(&["JSON.SET", "k", "$", "9223372036854775806"])
+            .is_ok()
+    );
+    assert_eq!(
+        c.cmds(&["JSON.NUMINCRBY", "k", "$", "1"]).as_str(),
+        format!("[{MAX}]")
+    );
+
+    // A `u64` is an integer too: a result that fits is exact, not a float.
+    for (doc, op, path, operand, want) in [
+        (ABOVE, "JSON.NUMINCRBY", "$", "-1", format!("[{MAX}]")),
+        ("-1", "JSON.NUMINCRBY", "$", ABOVE, format!("[{MAX}]")),
+        (U64, "JSON.NUMMULTBY", "$", "0", "[0]".to_string()),
+        (
+            "[9223372036854775808,1]",
+            "JSON.NUMINCRBY",
+            "$[*]",
+            "-1",
+            format!("[{MAX},0]"),
+        ),
+    ] {
+        assert!(c.cmds(&["JSON.SET", "k", "$", doc]).is_ok());
+        assert_eq!(
+            c.cmds(&[op, "k", path, operand]).as_str(),
+            want,
+            "{doc} {op} {path} {operand}"
+        );
+        assert_eq!(
+            c.cmds(&["JSON.GET", "k", path]).as_str(),
+            want,
+            "stored value of {doc} {op} {path} {operand}"
+        );
+    }
+
+    // A float operand is floating-point arithmetic, not an integer overflow.
+    assert!(c.cmds(&["JSON.SET", "k", "$", MAX]).is_ok());
+    let reply = c.cmds(&["JSON.NUMINCRBY", "k", "$", "1.0"]);
+    assert!(!reply.is_error(), "{reply:?}");
+    let RespValue::Array(types) = c.cmds(&["JSON.TYPE", "k", "$"]) else {
+        panic!("JSON.TYPE");
+    };
+    assert_eq!(types[0].as_str(), "number");
 }
 
 // Manual test scenario:
@@ -1387,7 +1549,7 @@ fn test_json_merge() {
 // Manual test scenario:
 //   JSON.SET doc $ '{"name":"alice"}'
 //   JSON.DEBUG MEMORY doc $   → (positive integer, bytes)
-//   JSON.DEBUG MEMORY nosuch  → nil
+//   JSON.DEBUG MEMORY nosuch $ → [], and 0 by a legacy path, as RedisJSON
 #[test]
 fn test_json_debug_memory() {
     let port = free_port();
@@ -1398,7 +1560,139 @@ fn test_json_debug_memory() {
     let mem = c.cmds(&["JSON.DEBUG", "MEMORY", "doc", "$"]).as_array()[0].as_int();
     assert!(mem > 0);
     assert_eq!(c.cmds(&["JSON.DEBUG", "MEMORY", "doc"]).as_int(), mem);
-    assert!(c.cmds(&["JSON.DEBUG", "MEMORY", "nosuch", "$"]).is_nil());
+    assert!(
+        c.cmds(&["JSON.DEBUG", "MEMORY", "nosuch", "$"])
+            .as_array()
+            .is_empty()
+    );
+    assert_eq!(c.cmds(&["JSON.DEBUG", "MEMORY", "nosuch"]).as_int(), 0);
+    assert_eq!(
+        c.cmds(&["JSON.DEBUG", "MEMORY", "doc", ".nope"])
+            .error_str(),
+        "ERR Path does not exist"
+    );
+}
+
+/// `JSON.DEBUG MEMORY` is the memory the value takes, not the length of its
+/// JSON text (#567): a long string is about its length either way, but
+/// numbers and containers take more than their text.
+#[test]
+fn json_debug_memory_is_the_values_memory() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "JSON.SET",
+        "doc",
+        "$",
+        r#"{"n":1,"a":[1,2,3],"s":"0123456789"}"#,
+    ]);
+    let mem = |c: &mut Conn, path: &str| c.cmds(&["JSON.DEBUG", "MEMORY", "doc", path]).as_int();
+    // A number is a whole node, more than its one character of text.
+    assert!(mem(&mut c, ".n") > 1);
+    // An array holds its elements' nodes.
+    assert!(mem(&mut c, ".a") > 3 * mem(&mut c, ".n"));
+    // A string holds its bytes too.
+    assert!(mem(&mut c, ".s") >= mem(&mut c, ".n") + 10);
+    // The document is more than its members.
+    let members = mem(&mut c, ".n") + mem(&mut c, ".a") + mem(&mut c, ".s");
+    assert!(mem(&mut c, ".") > members);
+}
+
+/// `JSON.ARRINDEX` of a key that does not exist is `ERR Path does not exist`,
+/// by a legacy path and a JSONPath alike, as in RedisJSON (#583). It was nil.
+#[test]
+fn json_arrindex_of_a_missing_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for path in [".a", "$.a"] {
+        assert_eq!(
+            c.cmds(&["JSON.ARRINDEX", "nosuch", path, "1"]).error_str(),
+            "ERR Path does not exist",
+            "{path}"
+        );
+    }
+}
+
+/// A legacy path that matches nothing, or matches a value of the wrong type,
+/// answers as RedisJSON 8.10 does: an error for most reads, where it used
+/// to be nil (#567).
+#[test]
+fn legacy_path_reads_of_a_missing_or_wrong_value() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "JSON.SET",
+        "d",
+        "$",
+        r#"{"a":1,"s":"str","o":{"x":1},"l":[1,2]}"#,
+    ]);
+    let err = |c: &mut Conn, args: &[&str]| c.cmds(args).error_str().to_string();
+    const MISSING: &str = "ERR Path does not exist";
+
+    // JSON.STRLEN
+    assert_eq!(
+        err(&mut c, &["JSON.STRLEN", "d", ".a"]),
+        "WRONGTYPE wrong type of path value - expected string"
+    );
+    assert_eq!(err(&mut c, &["JSON.STRLEN", "d", ".nope"]), MISSING);
+    assert_eq!(c.cmds(&["JSON.STRLEN", "d", ".s"]).as_int(), 3);
+
+    // JSON.OBJLEN: a missing path is nil.
+    assert_eq!(
+        err(&mut c, &["JSON.OBJLEN", "d", ".a"]),
+        "WRONGTYPE wrong type of path value - expected object"
+    );
+    assert!(c.cmds(&["JSON.OBJLEN", "d", ".nope"]).is_nil());
+
+    // JSON.ARRLEN
+    assert_eq!(
+        err(&mut c, &["JSON.ARRLEN", "d", ".a"]),
+        "ERR Path does not exist or not an array"
+    );
+    assert_eq!(err(&mut c, &["JSON.ARRLEN", "d", ".nope"]), MISSING);
+
+    // JSON.OBJKEYS: a missing path is nil.
+    assert_eq!(
+        err(&mut c, &["JSON.OBJKEYS", "d", ".a"]),
+        "ERR Path does not exist or not an object"
+    );
+    assert!(c.cmds(&["JSON.OBJKEYS", "d", ".nope"]).is_nil());
+
+    // JSON.ARRINDEX
+    assert_eq!(
+        err(&mut c, &["JSON.ARRINDEX", "d", ".a", "1"]),
+        "WRONGTYPE wrong type of path value - expected array"
+    );
+    assert_eq!(err(&mut c, &["JSON.ARRINDEX", "d", ".nope", "1"]), MISSING);
+    assert_eq!(c.cmds(&["JSON.ARRINDEX", "d", ".l", "2"]).as_int(), 1);
+
+    // JSON.RESP
+    assert_eq!(err(&mut c, &["JSON.RESP", "d", ".nope"]), MISSING);
+
+    // JSON.TYPE: a missing path is nil.
+    assert!(c.cmds(&["JSON.TYPE", "d", ".nope"]).is_nil());
+
+    // A key that does not exist is nil, as before.
+    for cmd in ["JSON.STRLEN", "JSON.OBJLEN", "JSON.ARRLEN", "JSON.OBJKEYS"] {
+        assert!(c.cmds(&[cmd, "nosuch", ".a"]).is_nil(), "{cmd}");
+    }
+
+    // A JSONPath still has nil for each value of the wrong type, and no
+    // entries for a path that matches nothing.
+    assert_eq!(
+        c.cmds(&["JSON.STRLEN", "d", "$.a"]).as_array(),
+        &[RespValue::Nil]
+    );
+    assert!(
+        c.cmds(&["JSON.STRLEN", "d", "$.nope"])
+            .as_array()
+            .is_empty()
+    );
 }
 
 // Manual test scenario:
@@ -2441,4 +2735,361 @@ fn test_incr_of_an_expired_key_starts_fresh_and_stays() {
         assert_eq!(c.cmds(&["GET", key]).as_str(), "1", "GET {key}");
         assert_eq!(c.cmds(&["TTL", key]).as_int(), -1, "TTL {key}");
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// JSON NUMBERS ARE KEPT EXACTLY (#445)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Finite doubles, the same each run: any bit pattern (every exponent, and
+/// subnormals), and the magnitudes documents mostly hold.
+fn test_doubles(n: usize) -> Vec<f64> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+        let d = match out.len() % 3 {
+            0 => f64::from_bits(state),
+            1 => unit * 2e6 - 1e6,
+            _ => unit * 10f64.powi((state % 41) as i32 - 20),
+        };
+        if d.is_finite() {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// `doubles` as a JSON array: shortest round-trip text, half of it with an
+/// exponent (`1.3326500000000001e1`).
+fn json_array(doubles: &[f64]) -> String {
+    let items: Vec<String> = doubles
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            if i % 2 == 0 {
+                format!("{d:?}")
+            } else {
+                format!("{d:e}")
+            }
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// The numbers of a JSON array of numbers, read exactly.
+fn numbers(text: &str) -> Vec<f64> {
+    text.trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|n| {
+            n.parse::<f64>()
+                .unwrap_or_else(|_| panic!("not a number: {n}"))
+        })
+        .collect()
+}
+
+fn assert_exact(what: &str, want: &[f64], got: &[f64]) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    let changed: Vec<(f64, f64)> = want
+        .iter()
+        .zip(got)
+        .filter(|(w, g)| w.to_bits() != g.to_bits())
+        .map(|(w, g)| (*w, *g))
+        .take(5)
+        .collect();
+    assert!(changed.is_empty(), "{what}: changed, e.g. {changed:?}");
+}
+
+/// Every finite double comes back from `JSON.SET` exactly: from `JSON.GET`,
+/// `JSON.MGET`, in RESP3, after `DUMP` and `RESTORE`, and as the operand and
+/// result of `JSON.NUMINCRBY` and `JSON.NUMMULTBY`. A number that needed 17
+/// significant digits was often read as its neighbour: `13.326500000000001`
+/// came back `13.3265`, and 435 of 2,000 random doubles changed (#445).
+#[test]
+fn json_numbers_keep_every_double_exactly() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for text in [
+        "13.326500000000001",
+        "123456789.12345679",
+        "0.30000000000000004",
+    ] {
+        assert!(c.cmds(&["JSON.SET", "n445:one", "$", text]).is_ok());
+        assert_eq!(c.cmds(&["JSON.GET", "n445:one"]).as_str(), text);
+        assert_eq!(
+            c.cmds(&["JSON.GET", "n445:one", "$"]).as_str(),
+            format!("[{text}]")
+        );
+    }
+
+    let doubles = test_doubles(10_000);
+    for (i, chunk) in doubles.chunks(100).enumerate() {
+        let key = format!("n445:{i}");
+        assert!(c.cmds(&["JSON.SET", &key, "$", &json_array(chunk)]).is_ok());
+        assert_exact(&key, chunk, &numbers(c.cmds(&["JSON.GET", &key]).as_str()));
+    }
+    let mget = c.cmds(&["JSON.MGET", "n445:0", "n445:1", "$"]);
+    for (i, reply) in mget.as_array().iter().enumerate() {
+        let text = reply.as_str();
+        assert_exact("MGET", &doubles[i * 100..(i + 1) * 100], &numbers(text));
+    }
+
+    // DUMP and RESTORE.
+    let RespValue::Bulk(payload) = c.cmds(&["DUMP", "n445:2"]) else {
+        panic!("DUMP");
+    };
+    assert!(
+        c.cmd(&[
+            b"RESTORE".as_slice(),
+            b"n445:copy",
+            b"0",
+            payload.as_slice()
+        ])
+        .is_ok()
+    );
+    assert_exact(
+        "RESTORE",
+        &doubles[200..300],
+        &numbers(c.cmds(&["JSON.GET", "n445:copy"]).as_str()),
+    );
+
+    // Arithmetic: on the double read, by the double read.
+    for pair in doubles[..2000].chunks(2) {
+        let (a, b) = (pair[0], pair[1] / 1e3);
+        for (command, result) in [("JSON.NUMINCRBY", a + b), ("JSON.NUMMULTBY", a * b)] {
+            assert!(
+                c.cmds(&["JSON.SET", "n445:n", "$", &format!("{a:?}")])
+                    .is_ok()
+            );
+            let reply = c.cmds(&[command, "n445:n", "$", &format!("{b:e}")]);
+            if !result.is_finite() {
+                assert!(reply.is_error(), "{command} {a:?} {b:e}: {reply:?}");
+                continue;
+            }
+            // A float stays a float, even when it is whole. -0 is compared as 0.
+            if result == 0.0 {
+                assert_eq!(numbers(reply.as_str()), [0.0], "{command} {a:?} {b:e}");
+                continue;
+            }
+            assert_exact(
+                &format!("{command} {a:?} {b:e}"),
+                &[result],
+                &numbers(reply.as_str()),
+            );
+        }
+    }
+
+    // RESP3: the document as text, and the new values as doubles.
+    let mut c3 = Conn::connect(port);
+    c3.cmds(&["HELLO", "3"]);
+    assert_eq!(
+        c3.cmds(&["JSON.GET", "n445:3"]),
+        c.cmds(&["JSON.GET", "n445:3"])
+    );
+    for &d in &doubles[..1000] {
+        assert!(
+            c3.cmds(&["JSON.SET", "n445:r3", "$", &format!("{d:?}")])
+                .is_ok()
+        );
+        let reply = c3.cmds(&["JSON.NUMINCRBY", "n445:r3", "$", "0"]);
+        // A float stays a float, so this is a double, even when it is whole.
+        let got = match &reply.as_array()[0] {
+            RespValue::Int(n) => *n as f64,
+            other => other.as_f64(),
+        };
+        assert_eq!(got.to_bits(), (d + 0.0).to_bits(), "RESP3 {d:?}: {reply:?}");
+    }
+}
+
+/// A NUMERIC field of a JSON document indexes the number the document holds:
+/// `13.326500000000001`, not the `13.3265` it used to be read as (#445).
+#[test]
+fn a_numeric_field_of_a_json_document_holds_the_exact_double() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "n445idx",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "n445doc:",
+            "SCHEMA",
+            "$.v",
+            "AS",
+            "v",
+            "NUMERIC",
+        ])
+        .is_ok()
+    );
+    assert!(
+        c.cmds(&["JSON.SET", "n445doc:1", "$", r#"{"v":13.326500000000001}"#])
+            .is_ok()
+    );
+    let count = |c: &mut Conn, query: &str| {
+        c.cmds(&["FT.SEARCH", "n445idx", query, "NOCONTENT"])
+            .as_array()[0]
+            .as_int()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while count(&mut c, "@v:[13 14]") != 1 {
+        assert!(std::time::Instant::now() < deadline, "not indexed");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        count(&mut c, "@v:[13.326500000000001 13.326500000000001]"),
+        1
+    );
+    assert_eq!(count(&mut c, "@v:[13.3265 13.3265]"), 0);
+}
+
+/// A snapshot keeps a document's numbers as they are (#445).
+#[test]
+fn a_snapshot_keeps_json_numbers_exactly() {
+    use kividb::types::KiviDBValue;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let doubles = test_doubles(10_000);
+    let value = serde_json::Value::Array(doubles.iter().map(|&d| d.into()).collect());
+    let mut db = HashMap::new();
+    db.insert(
+        "doc".to_string(),
+        KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(value))),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dump.kdb");
+    let path = path.to_str().unwrap();
+    kividb::snapshot::write_snapshot(path, &[db], None).unwrap();
+    let loaded = kividb::snapshot::load_snapshot(path).unwrap();
+    let KiviDBValue::Json(doc) = &loaded.dbs[0][&b"doc"[..]] else {
+        panic!("not a document");
+    };
+    let got: Vec<f64> = doc
+        .read()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_f64().unwrap())
+        .collect();
+    assert_exact("snapshot", &doubles, &got);
+}
+
+// ── JSON.MSET is all or nothing (#551) ──────────────────────────────────────
+//
+// A triple that fails fails the whole command, and the triples before it
+// are not written: an error reply is not sent to replicas or the AOF, so a
+// write kept on the master would be on the master alone.
+
+fn json_doc(c: &mut Conn, key: &str) -> Option<serde_json::Value> {
+    match c.cmds(&["JSON.GET", key]) {
+        RespValue::Nil => None,
+        v => Some(serde_json::from_str(v.as_str()).unwrap()),
+    }
+}
+
+#[test]
+fn test_json_mset_that_fails_writes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["JSON.SET", "a", "$", r#"{"keep":1}"#]).is_ok());
+    assert!(c.cmds(&["SET", "s", "plain"]).is_ok());
+
+    // A new key needs the root path: the issue's case.
+    let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "c", "$.x", "1"]);
+    assert!(
+        r.error_str()
+            .contains("new objects must be created at the root"),
+        "{r:?}"
+    );
+    // WRONGTYPE on a later key.
+    let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "s", "$", "1"]);
+    assert!(r.error_str().starts_with("WRONGTYPE"), "{r:?}");
+    // A legacy path whose parent is not there.
+    let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "a", ".no.such", "1"]);
+    assert!(r.error_str().contains("path does not exist"), "{r:?}");
+    // A new key created by an earlier triple, then a path its value does
+    // not have: the creation is not kept either.
+    let r = c.cmds(&["JSON.MSET", "b", "$", "{}", "b", ".x.y", "1"]);
+    assert!(r.error_str().contains("path does not exist"), "{r:?}");
+    // An earlier triple of the same key takes away what a later one needs.
+    assert!(c.cmds(&["JSON.SET", "d", "$", r#"{"x":{}}"#]).is_ok());
+    let r = c.cmds(&["JSON.MSET", "d", "$", "{}", "d", ".x.y", "1"]);
+    assert!(r.error_str().contains("path does not exist"), "{r:?}");
+
+    assert_eq!(json_doc(&mut c, "a"), Some(serde_json::json!({"keep": 1})));
+    assert_eq!(json_doc(&mut c, "d"), Some(serde_json::json!({"x": {}})));
+    assert_eq!(c.cmds(&["EXISTS", "b", "c"]).as_int(), 0);
+    assert_eq!(c.cmds(&["GET", "s"]).as_str(), "plain");
+}
+
+#[test]
+fn test_json_mset_triples_see_the_ones_before() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // A key made by an earlier triple, then written below the root.
+    assert!(
+        c.cmds(&[
+            "JSON.MSET",
+            "n",
+            "$",
+            "{}",
+            "n",
+            "$.x",
+            "1",
+            "n",
+            ".y",
+            "[1]",
+            "m",
+            "$",
+            "2"
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        json_doc(&mut c, "n"),
+        Some(serde_json::json!({"x": 1, "y": [1]}))
+    );
+    assert_eq!(json_doc(&mut c, "m"), Some(serde_json::json!(2)));
+
+    // An existing key, named twice, and another named once.
+    assert!(c.cmds(&["JSON.SET", "e", "$", r#"{"a":{"b":1}}"#]).is_ok());
+    assert!(
+        c.cmds(&[
+            "JSON.MSET",
+            "e",
+            "$.a.b",
+            "2",
+            "m",
+            "$",
+            "3",
+            "e",
+            "$.a.c",
+            "4"
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        json_doc(&mut c, "e"),
+        Some(serde_json::json!({"a": {"b": 2, "c": 4}}))
+    );
+    assert_eq!(json_doc(&mut c, "m"), Some(serde_json::json!(3)));
+
+    // A TTL on a key that MSET writes stays.
+    assert_eq!(c.cmds(&["EXPIRE", "e", "1000"]).as_int(), 1);
+    assert!(c.cmds(&["JSON.MSET", "e", "$", "1", "e", "$", "5"]).is_ok());
+    assert_eq!(json_doc(&mut c, "e"), Some(serde_json::json!(5)));
+    assert!(c.cmds(&["TTL", "e"]).as_int() > 0);
 }

@@ -117,9 +117,7 @@ fn atoi(arg: &[u8]) -> i64 {
 }
 
 fn object(ctx: &mut Ctx) -> Vec<u8> {
-    let Ok(key) = std::str::from_utf8(ctx.cmd[2]) else {
-        return resp_error("ERR no such key");
-    };
+    let key: &[u8] = ctx.cmd[2];
     let db = &ctx.store[*ctx.selected_db];
     let map = crate::read_lock!(crate::store::get_shard(db, key));
     let Some((value, _)) = map.peek_expiring(key) else {
@@ -153,11 +151,12 @@ fn digest_value(ctx: &mut Ctx) -> Vec<u8> {
     let digests = ctx.cmd[2..]
         .iter()
         .map(|key| {
-            let hex = std::str::from_utf8(key).ok().and_then(|key| {
-                let shard = crate::store::get_shard(&ctx.store[db], key);
+            // Any bytes: a key that was not UTF-8 read as missing.
+            let hex = {
+                let shard = crate::store::get_shard(&ctx.store[db], *key);
                 let map = crate::read_lock!(shard);
-                map.get(key).map(crate::replication::digest::value_hex)
-            });
+                map.get(*key).map(crate::replication::digest::value_hex)
+            };
             resp_bulk_str(hex.as_deref().unwrap_or(MISSING))
         })
         .collect();
@@ -181,13 +180,8 @@ fn populate(ctx: &mut Ctx) -> Vec<u8> {
     if count < 0 {
         return resp_error("ERR value is out of range, must be positive");
     }
-    let prefix = match cmd.get(3) {
-        Some(prefix) => match std::str::from_utf8(prefix) {
-            Ok(prefix) => prefix.to_string(),
-            Err(_) => return resp_error("ERR must be valid UTF-8"),
-        },
-        None => "key".to_string(),
-    };
+    // Any bytes, as in Redis.
+    let prefix: &[u8] = cmd.get(3).copied().unwrap_or(b"key");
     let size = match cmd.get(4).map(|arg| number(arg)) {
         None => 0,
         Some(Some(size)) if size >= 0 => size as usize,
@@ -195,15 +189,15 @@ fn populate(ctx: &mut Ctx) -> Vec<u8> {
     };
     let db = &ctx.store[*ctx.selected_db];
     for i in 0..count as u64 {
-        let key = format!("{prefix}:{i}");
+        let key = [prefix, b":", i.to_string().as_bytes()].concat();
         let mut value = format!("value:{i}").into_bytes();
         if size > 0 {
             value.resize(size, 0);
         }
         let shard = crate::store::get_shard(db, &key);
         let mut map = crate::write_lock!(shard);
-        if !map.contains_key(key.as_str()) {
-            map.insert_str(key.as_str(), &value[..]);
+        if !map.contains_key(&key) {
+            map.insert_str(&key, &value[..]);
         }
     }
     resp_simple("OK")

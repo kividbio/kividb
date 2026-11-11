@@ -846,8 +846,8 @@ impl IndexDef {
 
     /// Whether `key` is under one of the index's prefixes.
     #[inline]
-    pub fn covers(&self, key: &str) -> bool {
-        self.prefixes.is_empty() || self.prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    pub fn covers(&self, key: &[u8]) -> bool {
+        self.prefixes.is_empty() || self.prefixes.iter().any(|p| key.starts_with(p.as_bytes()))
     }
 
     /// Whether `token` is one of this index's stopwords.
@@ -889,7 +889,153 @@ impl IndexDef {
         self.vector_fields().next()
     }
 }
-pub type IndexStore = Arc<RwLock<AHashMap<String, IndexDef>>>;
+/// The search indexes of a store, and their aliases, by name.
+pub type IndexStore = Arc<Indexes>;
+
+/// [`IndexStore`]: the indexes behind their lock, and whether there may be
+/// any, which a write can ask without the lock ([`Indexes::none`]).
+///
+/// Every `HSET` used to ask the lock whether it had an index to bring up to
+/// date, twice (`handler::atomic_under_its_shard`, [`maybe_index`]). A
+/// shared lock taken is a write to the lock's cache line, and every worker
+/// took the one lock, so that line went from core to core with each write
+/// of a hash: `HSET` at pipeline 16 lost 10% of its rate on 14 workers, as
+/// much or as little as where the allocator put the lock decided (#544).
+/// With no index, as nearly always, a write now loads a line that nothing
+/// writes to.
+///
+/// [`Indexes::write`] makes [`Indexes::none`] false while it holds the
+/// lock, and true again before it lets go if the map is empty then. A
+/// write that finds it true is ordered before the holder of the lock as
+/// one that took the shared lock before it would be: what the holder does
+/// to the keyspace after taking the lock (a new index's backfill, under
+/// the shards' locks) sees that write's key.
+///
+/// That orders the write's question before the holder, not the write. A
+/// hash write that finds no index takes its key's order shared, beside the
+/// other writes of the key (`handler::atomic_under_its_shard`), and brings
+/// the indexes up to date after it has let go of the shard: one that asked
+/// before an `FT.CREATE` added its index, and wrote after the walk had read
+/// the key, indexed its own fields beside another such write, and the index
+/// could keep the earlier one's (#570). So the first index is added with
+/// [`Indexes::write_to_add`], which makes `none` false and waits out every
+/// write that holds a key's order before it adds anything; and a hash write
+/// that took its key's order shared asks again once it holds it
+/// (`handler::ask_again_for_an_index`), and takes it whole if the answer has
+/// changed.
+#[derive(Default)]
+pub struct Indexes {
+    /// Whether the map may have anything in it. On a cache line of its own.
+    any: OwnLine,
+    map: RwLock<AHashMap<String, IndexDef>>,
+    /// How many [`Indexes::write_to_add`] are waiting out the writes that
+    /// found no index: `any` stays true while there are any. Changed, and
+    /// read, with `map` held to change.
+    raising: AtomicUsize,
+}
+
+#[derive(Default)]
+#[repr(align(128))]
+struct OwnLine(AtomicBool);
+
+impl Indexes {
+    /// The indexes, shared.
+    #[inline]
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, AHashMap<String, IndexDef>> {
+        self.map.read()
+    }
+
+    /// The indexes, to change.
+    pub fn write(&self) -> IndexesWriteGuard<'_> {
+        let map = self.map.write();
+        self.any.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        IndexesWriteGuard {
+            map,
+            any: &self.any.0,
+            raising: &self.raising,
+        }
+    }
+
+    /// The indexes, to add one to: [`Indexes::write`], and, when there is
+    /// none, once every write that may have found none has finished (#570).
+    ///
+    /// `none` is made false first, and stays false; then each key's write
+    /// order is taken whole and let go of (`write_order::barrier`), with the
+    /// lock let go of meanwhile, since a write that holds an order may be
+    /// waiting to read the indexes. A write that held an order shared then
+    /// has finished, before anything was added: it falls before the new
+    /// index, whose walk finds what it wrote. One that takes an order after
+    /// the barrier has passed it finds `none` false, and takes it whole.
+    ///
+    /// Not with the command gate held alone (a transaction, or a script run
+    /// alone): no other command runs then, and every one that runs after
+    /// asks after it.
+    ///
+    /// Refused ([`FIRST_INDEX_BESIDE_OTHERS`]) in a script that runs beside
+    /// others (`tag_locks`): other commands run meanwhile, and the barrier
+    /// cannot, since the script holds its keys' order. With an index there
+    /// already, nothing has to be waited out, and it is not refused.
+    pub fn write_to_add(&self) -> Result<IndexesWriteGuard<'_>, &'static str> {
+        let mut map = self.map.write();
+        let first = map.is_empty() && !crate::command_gate::alone_on_this_thread();
+        if first && (crate::tag_locks::beside_others() || crate::write_order::holds_stripes()) {
+            return Err(FIRST_INDEX_BESIDE_OTHERS);
+        }
+        self.any.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        if first {
+            self.raising.fetch_add(1, Relaxed);
+            drop(map);
+            crate::write_order::barrier();
+            map = self.map.write();
+            self.raising.fetch_sub(1, Relaxed);
+        }
+        Ok(IndexesWriteGuard {
+            map,
+            any: &self.any.0,
+            raising: &self.raising,
+        })
+    }
+
+    /// Whether there is no index, nor alias, without taking the lock: what
+    /// a write asks before it looks for indexes to bring up to date.
+    #[inline]
+    pub fn none(&self) -> bool {
+        !self.any.0.load(Acquire)
+    }
+}
+
+/// [`Indexes::write_to_add`]'s refusal.
+pub const FIRST_INDEX_BESIDE_OTHERS: &str = "ERR the first search index cannot be created \
+     from a script that runs beside other scripts (lua-parallel-scripts): create it outside \
+     the script";
+
+/// [`Indexes::write`]'s hold of the lock.
+pub struct IndexesWriteGuard<'a> {
+    map: parking_lot::RwLockWriteGuard<'a, AHashMap<String, IndexDef>>,
+    any: &'a AtomicBool,
+    raising: &'a AtomicUsize,
+}
+
+impl std::ops::Deref for IndexesWriteGuard<'_> {
+    type Target = AHashMap<String, IndexDef>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for IndexesWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl Drop for IndexesWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Before the lock is let go of (`map` is dropped after this).
+        let any = !self.map.is_empty() || self.raising.load(Relaxed) > 0;
+        self.any.store(any, Release);
+    }
+}
 
 // ── Aliases ──────────────────────────────────────────────────────────────────
 //
@@ -968,7 +1114,7 @@ pub fn remove_index(store: &mut AHashMap<String, IndexDef>, index: &str) -> bool
 }
 
 pub fn new_index_store() -> IndexStore {
-    Arc::new(RwLock::new(AHashMap::new()))
+    Arc::new(Indexes::default())
 }
 
 /// Drop every search index, including HNSW/FLAT graphs, inverted indexes,
@@ -1119,14 +1265,16 @@ pub fn walk_documents(
     mut visit: impl FnMut(&str, DocFields<'_>),
 ) {
     for shard in db.iter() {
-        let keys: Vec<String> = shard
+        // The keys themselves, for their order and for reading them; the
+        // visit is given the document's name (`key_bytes::text_of`).
+        let keys: Vec<crate::store::Key> = shard
             .read()
             .keys()
             .filter(|key| def.covers(key))
-            .map(str::to_string)
+            .map(crate::store::Key::new)
             .collect();
         for key in keys {
-            let _order = crate::write_order::lock_key_for_walk(def.db_index, key.as_bytes());
+            let _order = crate::write_order::lock_key_for_walk(def.db_index, &key);
             let map = shard.read();
             let Some(inner) = map
                 .peek(&key)
@@ -1135,13 +1283,18 @@ pub fn walk_documents(
                 continue;
             };
             crate::aof::failpoint("index-walk-read");
-            visit(&key, inner);
+            visit(&crate::key_bytes::text_of(&key), inner);
         }
     }
 }
 
 /// Build every index again from the documents of its database: after
 /// `SWAPDB`, which swaps what two databases hold under the indexes of each.
+///
+/// It replaces indexes that are there, and never adds the first one: a
+/// write that asks finds an index all along, and takes its key's order
+/// whole, so the walks below meet it key by key (`walk_documents`), and
+/// nothing has to be waited out first ([`Indexes::write_to_add`]).
 pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
     let rebuilt: Vec<IndexDef> = {
         let mut indexes = index_store.write();
@@ -1319,10 +1472,12 @@ pub fn backfill_from_db_progress(
         };
         let keys: Vec<String> = idx.key_to_id.read().keys().cloned().collect();
         for key in keys {
-            let map = crate::store::get_shard(db, &key).read();
-            let holds = def.covers(&key)
+            // A document's key is kept as text (`key_bytes::text_of`).
+            let raw = crate::key_bytes::bytes_of(&key);
+            let map = crate::store::get_shard(db, &*raw).read();
+            let holds = def.covers(&raw)
                 && map
-                    .peek(&key)
+                    .peek(&*raw)
                     .and_then(|value| doc_fields(&def.on, &def.fields, value))
                     .and_then(|inner| {
                         inner
@@ -1775,7 +1930,11 @@ pub fn register_index_schemas(
     if schemas.is_empty() {
         return;
     }
-    let mut idx = index_store.write();
+    // Possibly the first index: see `Indexes::write_to_add` (#570). Never
+    // from a script, so never refused.
+    let mut idx = index_store
+        .write_to_add()
+        .unwrap_or_else(|_| index_store.write());
     for schema in schemas {
         let mut def = schema.clone().into_def();
         if let Some(field_graphs) = hnsw_graphs.get(&def.name) {
@@ -2005,8 +2164,14 @@ pub fn json_return_value(doc: &serde_json::Value, path: &str) -> Option<Vec<u8>>
 
 /// A JSON document was written: bring the `ON JSON` indexes of database
 /// `db` that cover its key up to date with it.
-pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &serde_json::Value) {
-    if indexing_deferred() {
+pub fn maybe_index_json(
+    index_store: &IndexStore,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+    doc: &serde_json::Value,
+) {
+    let key = key.as_ref();
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let store = index_store.read();
@@ -2019,7 +2184,7 @@ pub fn maybe_index_json(index_store: &IndexStore, db: usize, key: &str, doc: &se
             continue;
         }
         let fields: Vec<(String, Arc<[u8]>)> = project_json(&def.fields, doc).into_iter().collect();
-        index_fields(def, key, &fields, Write::Whole);
+        index_fields(def, &crate::key_bytes::text_of(key), &fields, Write::Whole);
     }
 }
 
@@ -2033,9 +2198,11 @@ pub fn reindex_json_key(
     index_store: &IndexStore,
     store: &crate::store::Store,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
 ) {
+    let key = key.as_ref();
     if indexing_deferred()
+        || index_store.none()
         || !index_store
             .read()
             .values()
@@ -2067,10 +2234,11 @@ pub fn reindex_key(
     index_store: &IndexStore,
     store: &crate::store::Store,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     how: Write,
 ) {
-    if indexing_deferred() {
+    let key = key.as_ref();
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let indexes = index_store.read();
@@ -2098,7 +2266,7 @@ pub fn reindex_key(
                     .iter()
                     .map(|(field, value)| (field.to_string(), Arc::clone(value)))
                     .collect();
-                index_fields(def, key, &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
             (IndexOn::Hash, Some(crate::types::KiviDBValue::HashEx(hash))) => {
                 let pairs: Vec<(String, Arc<[u8]>)> = hash
@@ -2107,14 +2275,14 @@ pub fn reindex_key(
                     .iter()
                     .map(|(field, value)| (field.to_string(), Arc::clone(value)))
                     .collect();
-                index_fields(def, key, &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
             (IndexOn::Json, Some(crate::types::KiviDBValue::Json(doc))) => {
                 let fields: Vec<(String, Arc<[u8]>)> =
                     project_json(&def.fields, &doc.read()).into_iter().collect();
-                index_fields(def, key, &fields, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &fields, how);
             }
-            _ => unindex_from(def, key),
+            _ => unindex_from(def, &crate::key_bytes::text_of(key)),
         }
     }
 }
@@ -2140,11 +2308,12 @@ pub enum Write {
 pub fn maybe_index(
     index_store: &IndexStore,
     db: usize,
-    key: &str,
+    key: &(impl AsRef<[u8]> + ?Sized),
     fields: &[(String, Arc<[u8]>)],
     how: Write,
 ) {
-    if indexing_deferred() {
+    let key = key.as_ref();
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let store = index_store.read();
@@ -2157,7 +2326,7 @@ pub fn maybe_index(
         {
             continue;
         }
-        index_fields(def, key, fields, how);
+        index_fields(def, &crate::key_bytes::text_of(key), fields, how);
     }
 }
 
@@ -2346,7 +2515,7 @@ pub fn register_index_store(store: &crate::store::Store, index_store: &IndexStor
 
 /// `key` of database `db` of the store at address `id` ([`store_id`])
 /// expired and was deleted: out of its indexes too.
-pub fn unindex_expired_in(id: usize, db: usize, key: &str) {
+pub fn unindex_expired_in(id: usize, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
     let index_store = INDEX_STORES
         .read()
         .iter()
@@ -2381,8 +2550,13 @@ static LEAVING: parking_lot::Mutex<Vec<(usize, usize, Box<str>)>> =
 
 /// Whether `index_store` has an index of database `db`: whether a key of it
 /// that expires is marked leaving ([`mark_leaving`]).
+///
+/// Asked with the keys' write order held. Held shared (a hash write that
+/// found no index, and expires its fields), the write is over before a
+/// first index is added ([`Indexes::write_to_add`]); held whole, it falls
+/// before or after a walk's visit of each key, as any write does (#570).
 pub fn has_index_of(index_store: &IndexStore, db: usize) -> bool {
-    index_store.read().values().any(|def| def.db_index == db)
+    !index_store.none() && index_store.read().values().any(|def| def.db_index == db)
 }
 
 /// The index store of the store at address `id` ([`store_id`]), if it has an
@@ -2398,12 +2572,15 @@ pub fn indexes_of(id: usize, db: usize) -> Option<IndexStore> {
 
 /// `key` of database `db` of the store at address `id` is gone from the
 /// store and not yet from its indexes: under the shard's lock that took it.
-pub fn mark_leaving(id: usize, db: usize, key: &str) {
-    LEAVING.lock().push((id, db, key.into()));
+pub fn mark_leaving(id: usize, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    let key: Box<str> = crate::key_bytes::text_of(key.as_ref()).into();
+    LEAVING.lock().push((id, db, key));
 }
 
 /// `key` has left its indexes: what [`mark_leaving`] marked, unmarked.
-pub fn unmark_leaving(id: usize, db: usize, key: &str) {
+pub fn unmark_leaving(id: usize, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    let key = crate::key_bytes::text_of(key.as_ref());
+    let key: &str = &key;
     let mut leaving = LEAVING.lock();
     if let Some(at) = leaving
         .iter()
@@ -2445,6 +2622,116 @@ mod leaving_tests {
         unmark_leaving(id, 1, "a");
         assert!(leaving(id, 0).is_empty());
         assert!(leaving(id, 1).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod indexes_tests {
+    use super::*;
+
+    fn schema(name: &str) -> IndexDef {
+        IndexSchema {
+            name: name.into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: Vec::new(),
+            fields: Vec::new(),
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        }
+        .into_def()
+    }
+
+    /// `none` is what the map holds whenever the lock is free, and false
+    /// for as long as anything holds it to change it (#544).
+    #[test]
+    fn none_follows_the_map_and_is_false_while_it_is_changed() {
+        let store = new_index_store();
+        assert!(store.none());
+        {
+            let mut indexes = store.write();
+            assert!(!store.none(), "held to change: not none");
+            indexes.insert("idx".into(), schema("idx"));
+        }
+        assert!(!store.none());
+        set_alias(&mut store.write(), "al", &schema("idx"));
+        assert!(!store.none());
+        {
+            let indexes = store.write();
+            assert!(!store.none());
+            drop(indexes);
+        }
+        assert!(!store.none(), "still has its index");
+        assert!(remove_index(&mut store.write(), "idx"));
+        assert!(store.none(), "the index and its alias are gone");
+        assert!(store.read().is_empty());
+        {
+            let _held = store.write();
+            assert!(!store.none());
+        }
+        assert!(store.none(), "nothing was added");
+        store.write().insert("other".into(), schema("other"));
+        assert!(has_index_of(&store, 0));
+        assert_eq!(drop_all_indexes(&store), 1);
+        assert!(store.none());
+        assert!(!has_index_of(&store, 0));
+    }
+
+    /// The first index is added only once every write that holds a key's
+    /// order (a hash write that found no index holds it shared) is done;
+    /// meanwhile `none` is false, so a write that asks then takes its order
+    /// whole (#570). With an index there, nothing is waited for.
+    #[test]
+    fn the_first_index_waits_for_the_writes_that_found_none() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::time::{Duration, Instant};
+        let store = new_index_store();
+        // An `HSET` that found no index, holding its key's order shared.
+        let writing = crate::write_order::lock_key_shared(0, b"doc:570");
+        let added = Arc::new(AtomicBool::new(false));
+        let adder = {
+            let (store, added) = (Arc::clone(&store), Arc::clone(&added));
+            std::thread::spawn(move || {
+                store
+                    .write_to_add()
+                    .unwrap()
+                    .insert("idx".into(), schema("idx"));
+                added.store(true, SeqCst);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.none() {
+            assert!(Instant::now() < deadline, "none never became false");
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !added.load(SeqCst),
+            "added beside a write that found no index"
+        );
+        assert!(store.read().is_empty());
+        assert!(!store.none(), "none while the adder waits");
+        drop(writing);
+        adder.join().unwrap();
+        assert!(store.read().contains_key("idx"));
+        assert!(!store.none());
+
+        let writing = crate::write_order::lock_key_shared(0, b"doc:570");
+        let more = Arc::clone(&store);
+        std::thread::spawn(move || {
+            more.write_to_add()
+                .unwrap()
+                .insert("other".into(), schema("other"));
+        })
+        .join()
+        .unwrap();
+        drop(writing);
+        assert_eq!(drop_all_indexes(&store), 2);
+        assert!(store.none());
     }
 }
 
@@ -3535,8 +3822,9 @@ const DEADLINE_EXPANSIONS: usize = 64;
 /// Only the indexes of database `db`: the same key in another database is
 /// another document. A `DEL` in one database used to take the document of
 /// the same name out of an index of another.
-pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &str) {
-    if indexing_deferred() {
+pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
+    let key = key.as_ref();
+    if indexing_deferred() || index_store.none() {
         return;
     }
     let store = index_store.read();
@@ -3548,7 +3836,7 @@ pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &str) {
         // Every vector field's, its postings, and what its TEXT fields put
         // in: the words it held, from the inverted index and the BM25
         // statistics.
-        unindex_from(def, key);
+        unindex_from(def, &crate::key_bytes::text_of(key));
     }
 }
 // ── HNSW compaction ───────────────────────────────────────────────────────────
@@ -3705,7 +3993,9 @@ pub fn compact_hnsw(
 
             for (key, value) in map.iter() {
                 let matches =
-                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_str()));
+                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
+                let key = crate::key_bytes::text_of(key);
+                let key: &str = &key;
                 if !matches || already.contains(key) {
                     continue;
                 }
@@ -3774,10 +4064,14 @@ pub fn spawn_compaction_worker(
 pub fn maybe_request_compaction(
     index_store: &IndexStore,
     compaction_tx: &CompactionTx,
-    deleted_key: &str,
+    deleted_key: &(impl AsRef<[u8]> + ?Sized),
 ) {
+    let deleted_key = deleted_key.as_ref();
     use std::sync::atomic::Ordering::Relaxed;
 
+    if index_store.none() {
+        return;
+    }
     let store = index_store.read();
     for (name, def) in store.iter() {
         if is_alias(name, def) {
@@ -3787,7 +4081,7 @@ pub fn maybe_request_compaction(
             || def
                 .prefixes
                 .iter()
-                .any(|p| deleted_key.starts_with(p.as_str()));
+                .any(|p| deleted_key.starts_with(p.as_bytes()));
         if !matches {
             continue;
         }

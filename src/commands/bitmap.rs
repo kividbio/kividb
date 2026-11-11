@@ -46,10 +46,7 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 3 {
         return resp_error("ERR wrong number of arguments for 'getbit' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let offset: u64 = match std::str::from_utf8(cmd[2])
         .ok()
         .and_then(|s| s.parse().ok())
@@ -93,10 +90,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'setbit' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let offset: u64 = match std::str::from_utf8(cmd[2])
         .ok()
         .and_then(|s| s.parse().ok())
@@ -112,7 +106,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
         _ => return resp_error("ERR bit is not an integer or out of range"),
     };
 
-    let key_owned = key.to_string();
+    let key_owned = key.to_vec();
     let (byte_idx, mask) = bit_byte_and_mask(offset);
 
     let db = &ctx.store[*ctx.selected_db];
@@ -172,10 +166,7 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR syntax error");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     // Hot path: whole string — no range parsing
     if cmd.len() == 2 {
@@ -310,10 +301,7 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR syntax error");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let bit_ll: i64 = match parse_i64_arg(cmd[2]) {
         Ok(v) => v,
@@ -465,10 +453,7 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
     let op = std::str::from_utf8(cmd[1])
         .unwrap_or("")
         .to_ascii_uppercase();
-    let dest_key = match parse_utf8(cmd[2]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR dest key must be valid UTF-8"),
-    };
+    let dest_key: Vec<u8> = cmd[2].to_vec();
 
     if op == "NOT" && cmd.len() != 4 {
         return resp_error("ERR BITOP NOT must be called with a single source key");
@@ -486,13 +471,7 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
     // Collect all source byte arrays (under their respective read locks)
     let mut sources: Vec<Vec<u8>> = Vec::new();
     for src_raw in &cmd[3..] {
-        let key = match parse_utf8(src_raw) {
-            Some(k) => k,
-            None => {
-                sources.push(vec![]);
-                continue;
-            }
-        };
+        let key: &[u8] = src_raw;
         if is_expired(ctx.store, *ctx.selected_db, key) {
             delete_key_if_expired(ctx.store, *ctx.selected_db, key);
             sources.push(vec![]);
@@ -604,10 +583,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'bitfield' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // We'll accumulate results for each subcommand
     let mut results: Vec<Vec<u8>> = Vec::new();
@@ -619,7 +595,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
 
     let mut current_bytes: Vec<u8> = {
         let map = read_lock!(shard);
-        match map.get(key.as_str()) {
+        match map.get(key.as_slice()) {
             Some(ValueRef::String(b)) => b.to_vec(),
             None => vec![],
             _ => {

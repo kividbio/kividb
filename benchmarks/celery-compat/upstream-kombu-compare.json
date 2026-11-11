@@ -1,0 +1,1224 @@
+{
+ "summary": {
+  "redis8": {
+   "skipped": 117,
+   "error": 1,
+   "passed": 129
+  },
+  "kividb-lua": {
+   "skipped": 117,
+   "error": 1,
+   "passed": 129
+  },
+  "kividb": {
+   "skipped": 117,
+   "error": 1,
+   "passed": 99,
+   "failed": 30
+  }
+ },
+ "differences": [
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[None]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[connection1]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis_brpop_qos::test_drain_events_resumes_pending_brpop_without_resending",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[message]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[nil]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis_brpop_qos::test_paused_channel_does_not_block_other_channels",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[cancel]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  },
+  {
+   "test": "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[close]",
+   "redis8": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb-lua": {
+    "status": "passed",
+    "message": ""
+   },
+   "kividb": {
+    "status": "failed",
+    "message": "redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)"
+   }
+  }
+ ],
+ "failing_everywhere": [
+  "::t.integration.test_sqs"
+ ],
+ "tests": {
+  "redis8": {
+   "::t.integration.test_pgmq": "skipped",
+   "::t.integration.test_sqs": "error",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_to_dotted_alternate_keeps_transport": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_to_alias_alternate_is_allowed": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_connection": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_switches_to_alternate_url": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_reject_requeue": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_ack": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_consume_empty_queue": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_rejects_dotted_alternate": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_requeue": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_requeue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_publish_requeue_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_connection": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_autoretry_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_switches_to_alternate_url": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_ack": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_consume_empty_queue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_rejects_dotted_alternate": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_to_dotted_alternate_keeps_transport": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_connect": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_reject_requeue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_reject_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_to_alias_alternate_is_allowed": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_publish_requeue_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPAutoRetry::test_initial_connection_retry_policy[2]": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPConsumerRevive::test_revive_resumes_active_queue_only": "skipped",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[connection1-BRPOP]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_connect[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_channel[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_ack": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_requeue": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel_autoconnect[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPEventLoop::test_ack_from_another_thread": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_autoretry_default_channel[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_queue_publish_consume[None]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[connection1-LISTEN]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[None-BRPOP]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_connect[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_channel[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel_autoconnect[connection1]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPAutoRetry::test_initial_connection_retry_policy[0]": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_autoretry_default_channel[connection1]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPConnectionPool::test_publish_confirm_does_not_block": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_queue_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_buffer_publish_consume[None]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[None-LISTEN]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_publish_empty_exchange[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_publish_empty_exchange[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_buffer_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_fanout[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_manual_flush_sends_and_batch_continues[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_topic_routing[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_fanout_is_deferred_until_flush[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_ack[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_ack[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_no_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_no_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_queue_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_queue_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_buffer_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_retry_on_timeout_keeps_publication_immediate[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_retry_on_timeout_keeps_publication_immediate[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_manual_flush_sends_and_batch_continues[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_requeue_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_requeue_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_direct_priority_and_fifo[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_topic_routing[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_fanout_is_deferred_until_flush[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expires_for_all_priorities[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_consume_empty_queue[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_topic[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_topic[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_buffer_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisEventLoop::test_ack_from_another_thread[None]": "passed",
+   "t.integration.test_redis::test_failed_credentials": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connect": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_channel": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_consume_empty_queue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connection__ConnectionError": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[connection1]": "passed",
+   "t.integration.test_redis::test_RedisConnectTimeout": "passed",
+   "t.integration.test_redis.test_RedisEventLoop::test_ack_from_another_thread[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct_routing_keys[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_fanout[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_requeue_requeues_message[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct_routing_keys[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_direct_priority_and_fifo[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_requeue_keeps_message_unacked[connection1]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_requeue_keeps_message_unacked[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreAtShutdown::test_unacked_message_requeued_on_connection_close[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_get[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_get[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expires_for_all_priorities[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[connection1]": "passed",
+   "t.integration.test_redis.test_RedisRestoreAtShutdown::test_unacked_message_requeued_on_connection_close[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_missed_pongs_drop_connection_and_resubscribe[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_missed_pongs_drop_connection_and_resubscribe[None]": "passed",
+   "t.integration.test_redis::test_failed_health_check_raises_connection_error": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connection": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_default_channel": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[connection1]": "passed",
+   "t.integration.test_redis::test_RedisConnection_check_hostname": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[None]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_healthy_subclient_connection_not_dropped[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_healthy_subclient_connection_not_dropped[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_legacy_consumer_receives_compat_publisher": "passed",
+   "t.integration.test_redis_brpop_qos::test_drain_events_resumes_pending_brpop_without_resending": "passed",
+   "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[close]": "passed",
+   "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[cancel]": "passed",
+   "t.integration.test_redis_brpop_qos::test_paused_channel_does_not_block_other_channels": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_live_connection_with_unread_reply_not_dropped[None]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_live_connection_with_unread_reply_not_dropped[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_cancelled_consumer_no_longer_receives": "passed",
+   "t.integration.test_redis.test_SentinelManagerClose::test_disconnect_pools_closes_both_managers": "passed",
+   "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_and_consumption_resumes[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_compat_consumer_receives_legacy_publisher": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_without_compat_legacy_and_current_topics_are_isolated": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_compat_peers_receive_each_message_once": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_put[None]": "passed",
+   "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[message]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_and_consumption_resumes[None]": "passed",
+   "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[nil]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_by_drain_events[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expiration_set[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_by_drain_events[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expiration_set[connection1]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_requeue_requeues_message[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_put[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[connection1]": "passed"
+  },
+  "kividb-lua": {
+   "::t.integration.test_pgmq": "skipped",
+   "::t.integration.test_sqs": "error",
+   "t.integration.test_kafka.test_KafkaFailover::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_connect": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_to_dotted_alternate_keeps_transport": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_switches_to_alternate_url": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_connection": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_reject_requeue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_autoretry_default_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_to_alias_alternate_is_allowed": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_consume_empty_queue": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_rejects_dotted_alternate": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_requeue": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_ack": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_publish_requeue_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_connection": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_autoretry_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_switches_to_alternate_url": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_ack": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_consume_empty_queue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_rejects_dotted_alternate": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_to_dotted_alternate_keeps_transport": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_reject_requeue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_to_alias_alternate_is_allowed": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_publish_requeue_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_reject_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPAutoRetry::test_initial_connection_retry_policy[2]": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPConsumerRevive::test_revive_resumes_active_queue_only": "skipped",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[connection1-BRPOP]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel_autoconnect[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_channel[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_connect[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_ack": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_requeue": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_autoretry_default_channel[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPEventLoop::test_ack_from_another_thread": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_queue_publish_consume[None]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[connection1-LISTEN]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[None-BRPOP]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel_autoconnect[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_connect[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_channel[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_autoretry_default_channel[connection1]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPAutoRetry::test_initial_connection_retry_policy[0]": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPConnectionPool::test_publish_confirm_does_not_block": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_queue_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_buffer_publish_consume[None]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[None-LISTEN]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_publish_empty_exchange[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_fanout[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_buffer_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_publish_empty_exchange[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_manual_flush_sends_and_batch_continues[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_topic_routing[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_fanout_is_deferred_until_flush[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_ack[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_ack[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_no_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_no_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_queue_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_queue_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_buffer_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_retry_on_timeout_keeps_publication_immediate[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_retry_on_timeout_keeps_publication_immediate[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_manual_flush_sends_and_batch_continues[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_buffer_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_topic_routing[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_direct_priority_and_fifo[None]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_requeue_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expires_for_all_priorities[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_fanout_is_deferred_until_flush[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expires_for_all_priorities[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_consume_empty_queue[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_topic[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_topic[None]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_requeue_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[connection1]": "passed",
+   "t.integration.test_redis.test_RedisEventLoop::test_ack_from_another_thread[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[None]": "passed",
+   "t.integration.test_redis::test_failed_credentials": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connect": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_channel": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_consume_empty_queue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connection__ConnectionError": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct[None]": "passed",
+   "t.integration.test_redis::test_RedisConnectTimeout": "passed",
+   "t.integration.test_redis.test_RedisEventLoop::test_ack_from_another_thread[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreAtShutdown::test_unacked_message_requeued_on_connection_close[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct_routing_keys[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_fanout[None]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_healthy_subclient_connection_not_dropped[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct_routing_keys[None]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_missed_pongs_drop_connection_and_resubscribe[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_direct_priority_and_fifo[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_healthy_subclient_connection_not_dropped[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_get[None]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_missed_pongs_drop_connection_and_resubscribe[connection1]": "passed",
+   "t.integration.test_redis::test_failed_health_check_raises_connection_error": "passed",
+   "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_requeue_requeues_message[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connection": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_default_channel": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_requeue_requeues_message[connection1]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_requeue_keeps_message_unacked[None]": "passed",
+   "t.integration.test_redis.test_SentinelManagerClose::test_disconnect_pools_closes_both_managers": "passed",
+   "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[message]": "passed",
+   "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[cancel]": "passed",
+   "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[close]": "passed",
+   "t.integration.test_redis_brpop_qos::test_paused_channel_does_not_block_other_channels": "passed",
+   "t.integration.test_redis::test_RedisConnection_check_hostname": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_live_connection_with_unread_reply_not_dropped[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_compat_peers_receive_each_message_once": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_live_connection_with_unread_reply_not_dropped[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[connection1]": "passed",
+   "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[nil]": "passed",
+   "t.integration.test_redis_brpop_qos::test_drain_events_resumes_pending_brpop_without_resending": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_get[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_and_consumption_resumes[None]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_compat_consumer_receives_legacy_publisher": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_cancelled_consumer_no_longer_receives": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[None]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_legacy_consumer_receives_compat_publisher": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_requeue_keeps_message_unacked[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_put[None]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_without_compat_legacy_and_current_topics_are_isolated": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_and_consumption_resumes[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_by_drain_events[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expiration_set[None]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_by_drain_events[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expiration_set[connection1]": "passed",
+   "t.integration.test_redis.test_RedisRestoreAtShutdown::test_unacked_message_requeued_on_connection_close[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_put[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[connection1]": "passed"
+  },
+  "kividb": {
+   "::t.integration.test_pgmq": "skipped",
+   "::t.integration.test_sqs": "error",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_to_dotted_alternate_keeps_transport": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_to_alias_alternate_is_allowed": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_reject_requeue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_switches_to_alternate_url": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_connection": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_consume_empty_queue": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_ack": "skipped",
+   "t.integration.test_kafka.test_KafkaBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaMessage::test_requeue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failover_rejects_dotted_alternate": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_kafka.test_KafkaBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_failed_channel": "skipped",
+   "t.integration.test_kafka.test_KafkaFailover::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_publish_requeue_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_fanout": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_connection": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_autoretry_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_switches_to_alternate_url": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_ack": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_autoretry_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_consume_empty_queue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_rejects_dotted_alternate": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_simple_queue_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_topic": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_connect": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_default_channel_autoconnect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_direct": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_connect": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failed_default_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_to_dotted_alternate_keeps_transport": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBasicFunctionality::test_simple_buffer_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBBaseExchangeTypes::test_publish_empty_exchange": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_failed_connection": "skipped",
+   "t.integration.test_mongodb.test_MongoDBPriority::test_publish_consume": "skipped",
+   "t.integration.test_mongodb.test_MongoDBMessage::test_reject_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPPriority::test_publish_requeue_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_channel": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBasicFunctionality::test_consume_empty_queue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPBaseExchangeTypes::test_direct_routing_keys": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPTimeToLive::test_publish_consume": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPFailover::test_failover_to_alias_alternate_is_allowed": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_reject_requeue": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPAutoRetry::test_initial_connection_retry_policy[2]": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPConsumerRevive::test_revive_resumes_active_queue_only": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_connect[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel_autoconnect[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_channel[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_ack": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_requeue": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel[None]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPEventLoop::test_ack_from_another_thread": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_autoretry_default_channel[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_queue_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_connect[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_channel[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel_autoconnect[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_default_channel[connection1]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPMessage::test_reject_no_requeue": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_autoretry_default_channel[connection1]": "passed",
+   "t.integration.test_py_amqp.test_PyAMQPConnectionPool::test_publish_confirm_does_not_block": "skipped",
+   "t.integration.test_py_amqp.test_PyAMQPAutoRetry::test_initial_connection_retry_policy[0]": "skipped",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_queue_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_buffer_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_publish_empty_exchange[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_publish_empty_exchange[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_fanout[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_simple_buffer_publish_consume[connection1]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[connection1-BRPOP]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[None-BRPOP]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_queue_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_buffer_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_manual_flush_sends_and_batch_continues[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_retry_on_timeout_keeps_publication_immediate[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_manual_flush_sends_and_batch_continues[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_requeue_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_direct_priority_and_fifo[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_topic_routing[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_topic_routing[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_no_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_ack[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_fanout_is_deferred_until_flush[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_ack[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_no_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_fanout_is_deferred_until_flush[connection1]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_reject_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_requeue[None]": "passed",
+   "t.integration.test_redis.test_RedisMessage::test_requeue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_consume_empty_queue[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_topic[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_topic[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_publish_requeue_consume[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_direct_priority_and_fifo[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expires_for_all_priorities[connection1]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[connection1-LISTEN]": "passed",
+   "t.integration.test_redis::test_event_loop_consumes_after_connection_reconnect[None-LISTEN]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[None]": "failed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_queue_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisPriority::test_simple_buffer_publish_consume[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expires_for_all_priorities[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[None]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_consumer_is_paused[connection1]": "failed",
+   "t.integration.test_redis::test_failed_credentials": "passed",
+   "t.integration.test_redis.test_RedisEventLoop::test_ack_from_another_thread[None]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connect": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_channel": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[connection1]": "failed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_consume_empty_queue[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connection__ConnectionError": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[None]": "failed",
+   "t.integration.test_redis::test_RedisConnectTimeout": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct_routing_keys[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_fanout[None]": "passed",
+   "t.integration.test_redis.test_RedisBaseExchangeTypes::test_direct_routing_keys[None]": "passed",
+   "t.integration.test_redis.test_RedisPublishBatch::test_retry_on_timeout_keeps_publication_immediate[None]": "passed",
+   "t.integration.test_redis.test_RedisEventLoop::test_ack_from_another_thread[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[connection1]": "failed",
+   "t.integration.test_redis::test_failed_health_check_raises_connection_error": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[connection1]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[None]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[connection1]": "failed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_connection": "passed",
+   "t.integration.test_redis.test_RedisBasicFunctionality::test_failed_default_channel": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_get[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[None]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_its_queue_without_expires_is_deleted[connection1]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_a_callback_blocks[None]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_get[None]": "passed",
+   "t.integration.test_redis::test_RedisConnection_check_hostname": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_deleting_an_expiring_queue_removes_its_binding[connection1]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_put[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_and_sweep_binding_scripts[None]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_expiration_gets_reset_on_put[connection1]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expiration_set[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[connection1]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_swept_after_consumer_stops[connection1]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[None]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_kept_while_drain_events_has_prefetch_full[connection1]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_binding_table_shared_with_queue_without_expires_never_swept[None]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_refresh_keeps_a_topic_binding_as_bound[connection1]": "failed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_queue_expiration_set[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_healthy_subclient_connection_not_dropped[None]": "passed",
+   "t.integration.test_redis.test_RedisQueueExpiration::test_sweep_script_honors_its_limit[None]": "failed",
+   "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[None]": "failed",
+   "t.integration.test_redis.test_RedisRestoreVisible::test_restore_visible_requeues_expired_unacked[connection1]": "failed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_requeue_requeues_message[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_requeue_keeps_message_unacked[None]": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_requeue_requeues_message[connection1]": "passed",
+   "t.integration.test_redis.test_SentinelManagerClose::test_disconnect_pools_closes_both_managers": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_requeue_keeps_message_unacked[connection1]": "passed",
+   "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[nil]": "failed",
+   "t.integration.test_redis_brpop_qos::test_drain_events_resumes_pending_brpop_without_resending": "failed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_compat_consumer_receives_legacy_publisher": "passed",
+   "t.integration.test_redis.test_RedisRestoreAtShutdown::test_unacked_message_requeued_on_connection_close[None]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_and_consumption_resumes[None]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_compat_peers_receive_each_message_once": "passed",
+   "t.integration.test_redis_brpop_qos::test_paused_channel_does_not_block_other_channels": "failed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_without_compat_legacy_and_current_topics_are_isolated": "passed",
+   "t.integration.test_redis.test_RedisRestoreBindingLookupFailure::test_failed_restore_visible_keeps_message_unacked[None]": "failed",
+   "t.integration.test_redis_brpop_qos::test_hub_pauses_pending_brpop_until_ack[message]": "failed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_cancelled_consumer_no_longer_receives": "passed",
+   "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[cancel]": "failed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_and_consumption_resumes[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_healthy_subclient_connection_not_dropped[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_missed_pongs_drop_connection_and_resubscribe[None]": "passed",
+   "t.integration.test_redis.test_RedisSubclientHealthCheck::test_missed_pongs_drop_connection_and_resubscribe[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_live_connection_with_unread_reply_not_dropped[None]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_live_connection_with_unread_reply_not_dropped[connection1]": "passed",
+   "t.integration.test_redis.test_RedisSentinelFanoutCompat::test_legacy_consumer_receives_compat_publisher": "passed",
+   "t.integration.test_redis.test_RedisRestoreAtShutdown::test_unacked_message_requeued_on_connection_close[connection1]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_by_drain_events[None]": "passed",
+   "t.integration.test_redis.test_RedisBrpopHealthCheck::test_half_open_connection_dropped_by_drain_events[connection1]": "passed",
+   "t.integration.test_redis_brpop_qos::test_pending_message_survives_cancel_or_close[close]": "failed"
+  }
+ }
+}

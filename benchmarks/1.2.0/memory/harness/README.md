@@ -30,9 +30,16 @@ Reproduce, with `KEY` an SSH key pair whose public half is `KEY.pub`:
 ```
 bash create-vms.sh kividb-rc7-memory germanywestcentral KEY.pub
 bash create-vms-b.sh kividb-rc7-memory polandcentral KEY.pub
-# copy *.sh *.py to /opt/mem on all four VMs; give each client an ssh key (~/.ssh/id_mem) that its engine VM accepts
+# (KEY.pub is read by az itself: on Windows give a native path. Both scripts accept an existing resource group.)
+# copy *.sh *.py to /opt/mem on all four VMs:
+for h in <four public IPs>; do ssh azureuser@$h 'sudo mkdir -p /opt/mem && sudo chown azureuser /opt/mem'; scp *.sh *.py azureuser@$h:/opt/mem/; done
+# give each client an ssh key (~/.ssh/id_mem) that its engine VM accepts (pair A: 10.30.0.4, pair B: 10.31.0.4):
+ssh azureuser@<client> 'ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_mem; cat ~/.ssh/id_mem.pub' | ssh azureuser@<its engine> 'cat >> ~/.ssh/authorized_keys'
 engine$ sudo bash /opt/mem/setup-common.sh && sudo bash /opt/mem/setup-server.sh kividb-cand=75482abb kividb-rc4=v1.2.0-rc4
 client$ sudo bash /opt/mem/setup-common.sh && sudo bash /opt/mem/setup-client.sh
+# setup-common.sh adds azureuser to the docker group: log in again before running the drivers (they call docker
+# without sudo). Run long jobs detached: put the lines below in /var/tmp/mem/queue.txt and start
+# `cd /opt/mem && nohup ./queue.sh &`; it works through them one at a time (STOP ends it).
 # pair A client, in /opt/mem (rounds alternate candidate and rc4; r1 also runs every other engine):
 ./warefeats.sh 10.30.0.4 25 full kividb-cand kividb-rc4            # then kividb-rc4-run2 kividb-cand-run2, ...-run3
 ./warefeats.sh 10.30.0.4 25 full redis valkey dragonfly kividb-1.1.3
@@ -56,3 +63,8 @@ for e in kividb-cand kividb-rc4; do SRV=10.31.0.4 R=p1 PERF=1 ./aoflat.sh $e; do
 bash make-report.sh   # PY=python on Windows
 az group delete -n kividb-rc7-memory --yes
 ```
+
+Other builds: `setup-server.sh` here builds each KiviDB under test from a git ref with the repo's Dockerfile, and
+`warefeats.sh` and `analyze.py` know only the labels `kividb-cand` and `kividb-rc4`. To measure published release
+binaries instead (checked against their SHA-256), with the labels `kividb-1.2.1`/`kividb-1.2.0`, use the copies in
+[`../../../1.2.1/memory/full/harness/`](../../../1.2.1/memory/full/harness/).

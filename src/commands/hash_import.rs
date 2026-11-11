@@ -20,7 +20,7 @@
 //! Redis with no effect on any reply; hashes created here are ordinary hashes.
 
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{parse_utf8, store_value};
+use crate::commands::helpers::store_value;
 use crate::keyspace_events::{KS_HASH, notify};
 use crate::resp::write::*;
 use crate::types::KiviDBValue;
@@ -116,16 +116,19 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let mut fields = Vec::with_capacity(cmd.len() - 3);
             let mut seen = ahash::AHashSet::with_capacity(cmd.len() - 3);
+            // Field names are any bytes, kept in a hash's own spelling of
+            // them (`name_from_bytes`), as HSET keeps them. They were kept
+            // as the text that came, so a name with a character of the
+            // escape's block in it read back as other bytes, on this node
+            // and on its replicas alike.
             for raw in &cmd[3..] {
-                let Some(field) = parse_utf8(raw) else {
-                    return Some(resp_error("ERR field names must be valid UTF-8"));
-                };
-                if !seen.insert(field) {
-                    return Some(resp_error(&format!(
-                        "ERR duplicate field name '{field}' in fieldset"
-                    )));
+                let raw: &[u8] = raw;
+                if !seen.insert(raw) {
+                    return Some(resp_error_bytes(
+                        &[&b"ERR duplicate field name '"[..], raw, b"' in fieldset"].concat(),
+                    ));
                 }
-                fields.push(field.to_string());
+                fields.push(crate::commands::helpers::name_from_bytes(raw).into_owned());
             }
             // Preparing an existing name replaces its definition.
             SESSIONS
@@ -141,9 +144,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if cmd.len() < 5 {
                 return Some(wrong_arity("set"));
             }
-            let Some(key) = parse_utf8(cmd[2]) else {
-                return Some(resp_error("ERR must be valid UTF-8"));
-            };
+            let key: &[u8] = cmd[2];
             let Some(fields) = fieldset(ctx.client_id, cmd[3]) else {
                 return Some(resp_error(&format!(
                     "ERR no such fieldset '{}'; define it with HIMPORT PREPARE on this connection",

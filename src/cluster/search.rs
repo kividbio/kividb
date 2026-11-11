@@ -147,14 +147,14 @@ pub fn served_slots(cluster: &ClusterState) -> Vec<u64> {
 /// It reads the slot table: never with a shard locked (see `ClusterState`).
 /// A walk of the keyspace takes [`served_slots`] before, and asks
 /// [`in_served`].
-pub fn serves(cluster: &ClusterState, key: &str) -> bool {
-    let owner = cluster.slot_owner(crate::cluster::key_hash_slot(key.as_bytes()));
+pub fn serves(cluster: &ClusterState, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+    let owner = cluster.slot_owner(crate::cluster::key_hash_slot(key.as_ref()));
     owner.is_some() && (owner == Some(cluster.myself()) || owner == cluster.my_master_id())
 }
 
 /// Whether `key`'s slot is one of `served` ([`served_slots`]).
-pub fn in_served(served: &[u64], key: &str) -> bool {
-    let slot = crate::cluster::key_hash_slot(key.as_bytes()) as usize;
+pub fn in_served(served: &[u64], key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+    let slot = crate::cluster::key_hash_slot(key.as_ref()) as usize;
     served[slot / 64] & (1 << (slot % 64)) != 0
 }
 

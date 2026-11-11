@@ -227,6 +227,143 @@ fn test_fcall_select_does_not_leak_db() {
     assert_eq!(val.as_str(), "db0_value");
 }
 
+// ── Blocking commands in a script ────────────────────────────────────────────
+
+/// A blocking command a script calls runs as its non-blocking form, as in
+/// Redis: it takes what is there, and answers its empty reply when nothing
+/// is. It used to answer nil without running, whatever the key held (#558).
+#[test]
+fn blocking_commands_in_a_script_take_what_is_there() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmds(&["RPUSH", "l", "a", "b", "c", "d"]).as_int(), 4);
+    assert_eq!(
+        c.cmds(&["ZADD", "z", "1", "m1", "2", "m2", "3", "m3"])
+            .as_int(),
+        3
+    );
+    let mut eval = |call: &str, keys: &[&str]| {
+        let script = format!("return redis.call({call})");
+        let numkeys = keys.len().to_string();
+        let mut args = vec!["EVAL", script.as_str(), numkeys.as_str()];
+        args.extend_from_slice(keys);
+        c.cmds(&args)
+    };
+    let strings = |reply: &RespValue| match reply {
+        RespValue::Array(parts) => parts
+            .iter()
+            .map(|part| part.as_str().to_string())
+            .collect::<Vec<_>>(),
+        other => panic!("not an array: {other:?}"),
+    };
+
+    let reply = eval("'BLPOP', KEYS[1], 0", &["l"]);
+    assert_eq!(strings(&reply), ["l", "a"]);
+    let reply = eval("'BRPOP', KEYS[1], 0", &["l"]);
+    assert_eq!(strings(&reply), ["l", "d"]);
+    let reply = eval(
+        "'BLMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT', 0",
+        &["l", "dst"],
+    );
+    assert_eq!(reply.as_str(), "b");
+    let reply = eval("'BRPOPLPUSH', KEYS[1], KEYS[2], 0", &["l", "dst"]);
+    assert_eq!(reply.as_str(), "c");
+    let reply = eval("'BLMPOP', 0, 1, KEYS[1], 'RIGHT', 'COUNT', 5", &["dst"]);
+    match &reply {
+        RespValue::Array(parts) => {
+            assert_eq!(parts[0].as_str(), "dst");
+            assert_eq!(strings(&parts[1]), ["b", "c"]);
+        }
+        other => panic!("BLMPOP: {other:?}"),
+    }
+    let reply = eval("'BZPOPMIN', KEYS[1], 0", &["z"]);
+    assert_eq!(strings(&reply), ["z", "m1", "1"]);
+    let reply = eval("'BZPOPMAX', KEYS[1], 0", &["z"]);
+    assert_eq!(strings(&reply), ["z", "m3", "3"]);
+    let reply = eval("'BZMPOP', 0, 1, KEYS[1], 'MIN'", &["z"]);
+    match &reply {
+        RespValue::Array(parts) => {
+            assert_eq!(parts[0].as_str(), "z");
+            match &parts[1] {
+                RespValue::Array(members) => assert_eq!(strings(&members[0]), ["m2", "2"]),
+                other => panic!("BZMPOP members: {other:?}"),
+            }
+        }
+        other => panic!("BZMPOP: {other:?}"),
+    }
+    // Nothing there: the empty reply, which reaches Lua as false.
+    assert!(eval("'BLPOP', KEYS[1], 0", &["l"]).is_nil());
+    assert!(eval("'BZPOPMIN', KEYS[1], 0", &["z"]).is_nil());
+    assert!(
+        eval(
+            "'BLMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT', 0",
+            &["l", "dst"]
+        )
+        .is_nil()
+    );
+
+    assert_eq!(c.cmds(&["EXISTS", "l", "dst", "z"]).as_int(), 0);
+
+    // A pop in a script that takes nothing leaves a watch on its key alone;
+    // one that takes something fails it, as in Redis.
+    let mut watcher = Conn::connect(port);
+    assert_eq!(watcher.cmds(&["WATCH", "l"]).as_str(), "OK");
+    let reply = c.cmds(&["EVAL", "return redis.call('BLPOP', KEYS[1], 0)", "1", "l"]);
+    assert!(reply.is_nil(), "{reply:?}");
+    let reply = c.cmds(&["EVAL", "return redis.call('LPOP', KEYS[1])", "1", "l"]);
+    assert!(reply.is_nil(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(matches!(watcher.cmds(&["EXEC"]), RespValue::Array(ref r) if r.len() == 1));
+    assert_eq!(c.cmds(&["RPUSH", "other", "y"]).as_int(), 1);
+    assert_eq!(watcher.cmds(&["WATCH", "other"]).as_str(), "OK");
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.call('BLPOP', KEYS[1], 0)",
+        "1",
+        "other",
+    ]);
+    assert!(!reply.is_nil(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(watcher.cmds(&["EXEC"]).is_nil());
+    // A write, which a read-only script may not make.
+    assert_eq!(c.cmds(&["RPUSH", "l", "a"]).as_int(), 1);
+    let reply = c.cmds(&[
+        "EVAL_RO",
+        "return redis.call('BLPOP', KEYS[1], 0)",
+        "1",
+        "l",
+    ]);
+    assert!(reply.is_error(), "{reply:?}");
+    assert_eq!(c.cmds(&["LLEN", "l"]).as_int(), 1);
+}
+
+/// A key a script's call left as it was (a `DEL` of a key that is not
+/// there) and a later call changed (a `SET` of it) has changed: a `WATCH` on
+/// it fails (#584). What the first call said held for the next.
+#[test]
+fn a_script_that_deletes_a_missing_key_then_sets_it_fails_a_watch() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut watcher = Conn::connect(port);
+    assert_eq!(watcher.cmds(&["WATCH", "made"]).as_str(), "OK");
+    let reply = c.cmds(&[
+        "EVAL",
+        "redis.call('DEL', KEYS[1]) return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        "made",
+    ]);
+    assert!(!reply.is_error(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(watcher.cmds(&["EXEC"]).is_nil());
+}
+
 // ── Nil bulk → Lua false ──────────────────────────────────────────────────────
 
 /// When a Redis command returns nil (key not found), Lua must see false, not nil.
@@ -477,6 +614,15 @@ fn redis_function_dump_payloads_restore_and_run() {
         (
             "8.10",
             &include_bytes!("fixtures/redis-8.10-function-dump.bin")[..],
+        ),
+        // Valkey 9 seals its payloads with its RDB version, 80 (#449).
+        (
+            "Valkey 9.0",
+            &include_bytes!("fixtures/valkey-9.0-function-dump.bin")[..],
+        ),
+        (
+            "Valkey 9.1",
+            &include_bytes!("fixtures/valkey-9.1-function-dump.bin")[..],
         ),
     ] {
         let restored = c.cmd(&[b"FUNCTION", b"RESTORE", payload, b"FLUSH"]);
@@ -2089,4 +2235,32 @@ fn test_script_help_lists_subcommands() {
         c.cmds(&["SCRIPT", "HELP", "extra"]).as_error(),
         "ERR wrong number of arguments for 'script|help' command"
     );
+}
+
+/// From a script, a time series sample's time above `i64::MAX` is refused,
+/// as from a client (#592).
+#[test]
+fn a_ts_time_above_i64_max_is_refused_in_a_script() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let over = (i64::MAX as u64 + 1).to_string();
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.pcall('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        &over,
+    ]);
+    assert!(matches!(reply, RespValue::Error(_)), "{reply:?}");
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.call('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        "5",
+    ]);
+    assert!(matches!(reply, RespValue::Int(5)), "{reply:?}");
 }

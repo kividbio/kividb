@@ -5,28 +5,24 @@ use crate::resp::write::*;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Average remaining TTL in milliseconds for keys with a future expiry (Redis `avg_ttl`).
-fn avg_ttl_ms(db: &crate::store::Db) -> i64 {
-    let now = crate::commands::helpers::unix_ms(std::time::SystemTime::now());
-    let mut sum_ms: u128 = 0;
-    let mut n = 0usize;
-    for shard in db.iter() {
-        if shard.holds_no_ttl() {
-            continue;
-        }
-        let map = read_lock!(shard);
-        for (_, at) in map.expiring() {
-            if at >= now {
-                sum_ms += u128::from(at - now);
-                n += 1;
-            }
-        }
+/// Redis's `avg_ttl`: how long the `expires` keys with a time to live have
+/// left on average, in milliseconds, at `now` (milliseconds since the Unix
+/// epoch), given the sum of when their times end (`ttl_deadline_sum`, kept
+/// by each shard as times come, change and go).
+///
+/// It went over every key with a time to live, holding each shard while it
+/// did: at 5 million such keys `INFO` took 45-70 ms, and writes to each
+/// shard waited for it (#622). Now it is a sum and a count a shard. The
+/// mean of the times, less `now`, is the mean of what is left, rounded down
+/// as before. Keys past their time that expiry has not taken out yet (a
+/// cycle or so) count as having less than nothing left, and the whole is
+/// at least 0; the pass left them out.
+fn avg_ttl_ms(expires: usize, deadlines: u128, now: u64) -> i64 {
+    if expires == 0 {
+        return 0;
     }
-    if n == 0 {
-        0
-    } else {
-        (sum_ms / n as u128) as i64
-    }
+    let mean = deadlines / expires as u128;
+    mean.saturating_sub(u128::from(now)).min(i64::MAX as u128) as i64
 }
 
 /// Replication, cluster and slowlog settings as `CONFIG GET` reports them.
@@ -75,6 +71,19 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         (
             "shutdown-timeout",
             rs.shutdown_timeout_secs.load(Relaxed).to_string(),
+        ),
+        // Under both of its names, as Redis lists it.
+        (
+            "replica-priority",
+            rs.replica_priority.load(Relaxed).to_string(),
+        ),
+        (
+            "slave-priority",
+            rs.replica_priority.load(Relaxed).to_string(),
+        ),
+        (
+            "replica-announced",
+            yes_no(rs.replica_announced.load(Relaxed)),
         ),
         (
             "replica-full-sync-guard",
@@ -279,6 +288,12 @@ fn config_set_array(param: &str, value: &str) -> Vec<u8> {
 
 const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
 
+/// The Redis release whose commands and replies this server follows: `INFO`'s
+/// `redis_version`, and `HELLO`'s `version`. Clients read it to decide what
+/// they may send; redis-py and Jedis turn on their client-side caches only
+/// for a `server` of `redis` at 7.4 or later (#451).
+pub(crate) const REDIS_VERSION: &str = "8.10.0";
+
 /// The reply to a script command in a build without Lua. Job queues such as
 /// BullMQ and Sidekiq show it to their users, so it names the build to use.
 #[cfg(not(feature = "lua"))]
@@ -315,6 +330,48 @@ fn config_name(name: &str) -> &str {
     }
 }
 
+/// `CONFIG SET appendonly yes` with the AOF off: the log made, and the
+/// dataset written out under it, before the reply.
+fn enable_aof(ctx: &Ctx) -> Vec<u8> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The checkpoint's turn, from before the log is made to the end of the
+    // checkpoint: no other checkpoint, or other enable, between the two.
+    let turn = match crate::aof::checkpoint_turn() {
+        Ok(turn) => turn,
+        Err(e) => return resp_error(&format!("ERR enabling AOF failed: {e}")),
+    };
+    if crate::aof::AOF_ENABLED.load(Relaxed) {
+        return resp_simple("OK");
+    }
+    // The log, before the flag goes up: a new one, unless the one kept open
+    // is still current (#350). One that cannot be made is an error and the
+    // AOF stays off, as in Redis, not an exit (#47).
+    if let Err(e) = crate::aof::open_log(&turn) {
+        log_warn!("CONFIG SET appendonly yes: {e}");
+        return resp_error(&format!(
+            "ERR CONFIG SET failed (possibly related to argument 'appendonly') - Unable to turn on AOF: {e}"
+        ));
+    }
+    crate::aof::AOF_ENABLED.store(true, Relaxed);
+    crate::aof::failpoint("aof-enabling");
+    // Redis CONFIG SET appendonly yes rewrites before OK. Returning first
+    // left a window where the next write could miss both the dump and the
+    // delta — and on io_uring the connection still carried the boot-time
+    // aof_enabled=false, so that write was never logged at all.
+    if let Err(e) = crate::aof::checkpoint_noting(&turn, ctx.store, ctx.index_store, &mut || {}) {
+        crate::aof::AOF_ENABLED.store(false, Relaxed);
+        return resp_error(&format!("ERR enabling AOF failed: {e}"));
+    }
+    // A `CONFIG SET appendonly no` took no turn, and may have come in the
+    // meantime: then the AOF is off, and saying OK would say otherwise.
+    if !crate::aof::AOF_ENABLED.load(Relaxed) {
+        return resp_error(
+            "ERR enabling AOF failed: the AOF was turned off while it was being turned on",
+        );
+    }
+    resp_simple("OK")
+}
+
 /// `CONFIG SET` of one setting.
 fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
     let param = param.to_string();
@@ -332,6 +389,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             "slowlog-max-len" => match value.parse::<usize>() {
                 Ok(v) => {
                     ctx.slowlog.set_max_len(v);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR value is not an integer or out of range")),
+            },
+            "acllog-max-len" => match value.parse::<usize>() {
+                Ok(v) => {
+                    ctx.acl_log.set_max_len(v);
                     Some(resp_simple("OK"))
                 }
                 _ => Some(resp_error("ERR value is not an integer or out of range")),
@@ -444,55 +508,16 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             }
             "appendonly" => match value {
                 "yes" | "1" | "true" => {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    if crate::aof::AOF_ENABLED.load(Relaxed) {
+                    if crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
                         return Some(resp_simple("OK"));
                     }
-                    // The checkpoint's turn, from before the log is made
-                    // to the end of the checkpoint: no other checkpoint, or
-                    // other enable, between the two.
-                    let turn = match crate::aof::checkpoint_turn() {
-                        Ok(turn) => turn,
-                        Err(e) => {
-                            return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
-                        }
-                    };
-                    if crate::aof::AOF_ENABLED.load(Relaxed) {
-                        return Some(resp_simple("OK"));
-                    }
-                    // The log, before the flag goes up: a new one, unless
-                    // the one kept open is still current (#350). One that
-                    // cannot be made is an error and the AOF stays off, as
-                    // in Redis, not an exit (#47).
-                    if let Err(e) = crate::aof::open_log(&turn) {
-                        log_warn!("CONFIG SET appendonly yes: {e}");
-                        return Some(resp_error(&format!(
-                            "ERR CONFIG SET failed (possibly related to argument 'appendonly') - Unable to turn on AOF: {e}"
-                        )));
-                    }
-                    crate::aof::AOF_ENABLED.store(true, Relaxed);
-                    crate::aof::failpoint("aof-enabling");
-                    // Redis CONFIG SET appendonly yes rewrites before
-                    // OK. Returning first left a window where the next
-                    // write could miss both the dump and the delta —
-                    // and on io_uring the connection still carried the
-                    // boot-time aof_enabled=false, so that write was
-                    // never logged at all.
-                    if let Err(e) =
-                        crate::aof::checkpoint_noting(&turn, ctx.store, ctx.index_store, &mut || {})
-                    {
-                        crate::aof::AOF_ENABLED.store(false, Relaxed);
-                        return Some(resp_error(&format!("ERR enabling AOF failed: {e}")));
-                    }
-                    // A `CONFIG SET appendonly no` took no turn, and may have
-                    // come in the meantime: then the AOF is off, and saying
-                    // OK would say otherwise.
-                    if !crate::aof::AOF_ENABLED.load(Relaxed) {
-                        return Some(resp_error(
-                            "ERR enabling AOF failed: the AOF was turned off while it was being turned on",
-                        ));
-                    }
-                    Some(resp_simple("OK"))
+                    // It waits for the checkpoint's turn, and then writes
+                    // the whole dataset out: off the runtime, so that the
+                    // other clients are read from meanwhile (as `MIGRATE`
+                    // does, see `off_the_runtime`).
+                    Some(crate::cluster::migration::off_the_runtime(|| {
+                        enable_aof(ctx)
+                    }))
                 }
                 "no" | "0" | "false" => {
                     crate::aof::AOF_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -666,6 +691,32 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                  'repl-diskless-load') - argument must be one of: disabled, \
                                  on-empty-db, swapdb, flushdb",
                 )),
+            },
+            // What `INFO replication` tells Sentinel (#443): it used to be
+            // remembered for `CONFIG GET` only, and `INFO` said 100 whatever
+            // was set, so a replica set to 0 could still be promoted.
+            "replica-priority" | "slave-priority" => match value.parse::<i64>() {
+                Ok(v) if (0..=i64::from(i32::MAX)).contains(&v) => {
+                    ctx.repl_state
+                        .replica_priority
+                        .store(v as u32, std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                Ok(_) => Some(resp_error(
+                    "ERR argument must be between 0 and 2147483647 inclusive",
+                )),
+                Err(_) => Some(resp_error(
+                    "ERR argument couldn't be parsed into an integer",
+                )),
+            },
+            "replica-announced" => match value.to_ascii_lowercase().as_str() {
+                yes_no @ ("yes" | "no") => {
+                    ctx.repl_state
+                        .replica_announced
+                        .store(yes_no == "yes", std::sync::atomic::Ordering::Relaxed);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
             },
             "repl-timeout" => match value.parse::<u64>() {
                 Ok(v) if v >= 1 => {
@@ -1117,8 +1168,27 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                                  9223372036854775807 inclusive",
                 )),
             },
-            // What the latency monitor records (#158): remembered too, for
-            // `CONFIG GET`.
+            // When the AOF is synced (#513): under `always`, before each
+            // reply to a write, as in Redis. `no` is taken as `everysec`.
+            "appendfsync" => match value.to_ascii_lowercase().as_str() {
+                policy @ ("always" | "everysec" | "no") => {
+                    if policy == "no" {
+                        log_warn!(
+                            "'appendfsync no' syncs the append-only file once a second, as \
+                             'everysec' does"
+                        );
+                    }
+                    crate::aof::set_fsync_always(policy == "always");
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), policy.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'appendfsync') - \
+                     argument(s) must be one of the following: always, everysec, no",
+                )),
+            },
             // Whether a reply to a write waits for its AOF record (#147).
             "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
                 "yes" | "no" => {
@@ -1134,13 +1204,16 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             // effect where KiviDB has what they set (`lazyfree-lazy-expire`
             // decides whether a key that expires is propagated as `UNLINK`
             // or `DEL`; `latency-tracking`, whether `INFO latencystats`
-            // reports). Anything else is refused, as Redis refuses it.
+            // reports; `rdbchecksum no`, that an RDB file's checksum is not
+            // checked as it is loaded). Anything else is refused, as Redis
+            // refuses it.
             "lazyfree-lazy-eviction"
             | "lazyfree-lazy-expire"
             | "lazyfree-lazy-server-del"
             | "lazyfree-lazy-user-del"
             | "lazyfree-lazy-user-flush"
-            | "latency-tracking" => match value.to_ascii_lowercase().as_str() {
+            | "latency-tracking"
+            | "rdbchecksum" => match value.to_ascii_lowercase().as_str() {
                 yes_no @ ("yes" | "no") => {
                     REMEMBERED_CONFIG
                         .lock()
@@ -1594,30 +1667,130 @@ fn config_set_tls_replication(_ctx: &Ctx, on: bool) -> Vec<u8> {
     }
 }
 
+/// The last `INFO keysizes` of each server (by its store's address): when
+/// it was counted, what it said, and whether a count is under way.
+struct KeysizesCount {
+    /// The store counted, held weakly: while the count is kept, no other
+    /// store can be at its address, which is the key (`Arc::as_ptr`). A
+    /// server started after another has stopped, in the same process, could
+    /// otherwise be given the stopped one's count.
+    store: std::sync::Weak<Vec<crate::store::Db>>,
+    /// When the pass that made `text` began.
+    at: std::time::Instant,
+    text: String,
+    counting: bool,
+}
+
+static KEYSIZES_LAST: std::sync::LazyLock<
+    parking_lot::Mutex<ahash::AHashMap<usize, KeysizesCount>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// `INFO keysizes` of every database of `store`: a pass over every key.
+fn keysizes_text(store: &crate::store::Store) -> String {
+    store
+        .iter()
+        .enumerate()
+        .map(|(i, db)| keysizes(i, db))
+        .collect()
+}
+
 /// `INFO keysizes`: a pass over every key. Asked for by name it is counted
 /// now; as part of `INFO all` or `everything`, which exporters scrape every
 /// few seconds, a count up to [`KEYSIZES_REUSED_FOR`] old is given again,
 /// so that they cost one pass per that time and not one each (#158).
+///
+/// Nor does `INFO all` wait for that pass, but for the first (#622): an
+/// older count starts a new one on a thread of its own, and is given
+/// meanwhile. The pass took 100-200 ms at 5 million keys, on the thread
+/// that serves the connection, and every connection that thread serves
+/// waited for it.
+///
+/// A count older than twice that is not given: the keys may have changed
+/// past recognition since (a `FLUSHALL`, a load), and `INFO all` waits for
+/// a new one, as before.
 fn keysizes_section(ctx: &Ctx, fresh: bool) -> String {
-    static LAST: std::sync::LazyLock<
-        parking_lot::Mutex<ahash::AHashMap<usize, (std::time::Instant, String)>>,
-    > = std::sync::LazyLock::new(Default::default);
-    let server = Arc::as_ptr(ctx.store) as *const () as usize;
-    if !fresh
-        && let Some((at, text)) = LAST.lock().get(&server)
-        && at.elapsed() < KEYSIZES_REUSED_FOR
-    {
-        return text.clone();
+    keysizes_cached(ctx.store, fresh, keysizes_text)
+}
+
+/// What makes the text of a count: [`keysizes_text`], or a test's.
+type KeysizesCounter = fn(&crate::store::Store) -> String;
+
+/// [`keysizes_section`] for `store`, counted by `count`.
+fn keysizes_cached(store: &crate::store::Store, fresh: bool, count: KeysizesCounter) -> String {
+    if !fresh {
+        let mut last = KEYSIZES_LAST.lock();
+        if let Some(kept) = last.get_mut(&keysizes_key(store)) {
+            let age = kept.at.elapsed();
+            if age < 2 * KEYSIZES_REUSED_FOR {
+                if age >= KEYSIZES_REUSED_FOR && !kept.counting {
+                    // No thread: the count is tried again on the next ask.
+                    kept.counting = keysizes_count_aside(store, count);
+                }
+                return kept.text.clone();
+            }
+        }
     }
-    let text: String = ctx
-        .store
-        .iter()
-        .enumerate()
-        .map(|(i, db)| keysizes(i, db))
-        .collect();
-    LAST.lock()
-        .insert(server, (std::time::Instant::now(), text.clone()));
+    let began = std::time::Instant::now();
+    let text = count(store);
+    keysizes_keep(store, began, text.clone());
     text
+}
+
+/// The key of `store`'s count in [`KEYSIZES_LAST`].
+fn keysizes_key(store: &crate::store::Store) -> usize {
+    Arc::as_ptr(store) as *const () as usize
+}
+
+/// Keep `text`, the count of `store` begun at `began`, unless the one kept
+/// was begun later. A count under way elsewhere stays under way. Counts
+/// of stores that are gone are let go of.
+fn keysizes_keep(store: &crate::store::Store, began: std::time::Instant, text: String) {
+    let mut last = KEYSIZES_LAST.lock();
+    last.retain(|_, kept| kept.store.strong_count() > 0);
+    match last.get_mut(&keysizes_key(store)) {
+        Some(kept) => {
+            if began >= kept.at {
+                kept.at = began;
+                kept.text = text;
+            }
+        }
+        None => {
+            last.insert(
+                keysizes_key(store),
+                KeysizesCount {
+                    store: Arc::downgrade(store),
+                    at: began,
+                    text,
+                    counting: false,
+                },
+            );
+        }
+    }
+}
+
+/// Count `store` on a thread of its own. Returns whether the thread
+/// started. However the count ends, a panic in it too, its `counting` is
+/// put back, so that the next ask can start another.
+fn keysizes_count_aside(store: &crate::store::Store, count: KeysizesCounter) -> bool {
+    struct Done(usize);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            if let Some(kept) = KEYSIZES_LAST.lock().get_mut(&self.0) {
+                kept.counting = false;
+            }
+        }
+    }
+    let store = Arc::clone(store);
+    std::thread::Builder::new()
+        .name("keysizes".to_string())
+        .spawn(move || {
+            // Dropped last, after the count is kept.
+            let _done = Done(keysizes_key(&store));
+            let began = std::time::Instant::now();
+            let text = count(&store);
+            keysizes_keep(&store, began, text);
+        })
+        .is_ok()
 }
 
 const KEYSIZES_REUSED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1779,6 +1952,7 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             },
         ),
         ("slowlog-max-len", ctx.slowlog.len_cap().to_string()),
+        ("acllog-max-len", ctx.acl_log.max_len().to_string()),
         ("appendonly", yes_no(crate::aof::AOF_ENABLED.load(Relaxed))),
         (
             "loglevel",
@@ -1985,7 +2159,7 @@ fn on_or_off(word: &[u8]) -> Option<bool> {
 
 /// Whether `raw` can stand as one word in a line of `CLIENT LIST`: printable
 /// ASCII, and no spaces.
-fn is_printable_word(raw: &[u8]) -> bool {
+pub(crate) fn is_printable_word(raw: &[u8]) -> bool {
     raw.iter().all(|byte| (b'!'..=b'~').contains(byte))
 }
 
@@ -2067,10 +2241,15 @@ fn client_filter(
 }
 
 /// `FLUSHALL ASYNC` / `FLUSHDB ASYNC`: the values are freed in the
-/// background (`lazyfree`), after the reply.
-fn flush_is_async(cmd: &[&[u8]]) -> bool {
-    cmd.get(1)
-        .is_some_and(|arg| arg.eq_ignore_ascii_case(b"ASYNC"))
+/// background (`lazyfree`), after the reply. `SYNC`, or nothing, frees them
+/// now; anything else, or more, is a syntax error, as in Redis (#561).
+fn flush_is_async(cmd: &[&[u8]]) -> Result<bool, Vec<u8>> {
+    match cmd {
+        [_] => Ok(false),
+        [_, mode] if mode.eq_ignore_ascii_case(b"ASYNC") => Ok(true),
+        [_, mode] if mode.eq_ignore_ascii_case(b"SYNC") => Ok(false),
+        _ => Err(resp_error("ERR syntax error")),
+    }
 }
 
 /// A plain `FLUSHALL` or `FLUSHDB` is, in Redis, an `ASYNC` flush the
@@ -2513,8 +2692,11 @@ fn commands_with_prefix(prefix: &str) -> Vec<&'static str> {
 
 /// The `admin` ACL category.
 /// Whether `name` (upper case) is an administrative command.
+///
+/// `ACL` counts as one here, for MONITOR, which shows none of it: `ACL
+/// SETUSER` carries passwords.
 pub(crate) fn is_admin_command(name: &str) -> bool {
-    ADMIN_COMMANDS.contains(&name)
+    name == "ACL" || ADMIN_COMMANDS.contains(&name)
 }
 
 /// Whether there is a command called `name` (upper case).
@@ -2525,7 +2707,17 @@ pub(crate) fn is_command(name: &str) -> bool {
 }
 
 const ADMIN_COMMANDS: &[&str] = &[
-    "ACL",
+    // Not `ACL` as a whole: `ACL WHOAMI`, `CAT`, `GENPASS` and `HELP` are
+    // not administrative in Redis (#566).
+    "ACL|DELUSER",
+    "ACL|DRYRUN",
+    "ACL|GETUSER",
+    "ACL|LIST",
+    "ACL|LOAD",
+    "ACL|LOG",
+    "ACL|SAVE",
+    "ACL|SETUSER",
+    "ACL|USERS",
     "BACKUP",
     "BGREWRITEAOF",
     "BGSAVE",
@@ -2772,7 +2964,9 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             };
             // One of Redis's commands has Redis's arity. The guess above is
             // for the rest.
-            let arity = crate::commands::arity::of(name).map_or(arity, i64::from);
+            let arity = crate::commands::arity::of(name)
+                .or_else(|| module_arity(name))
+                .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
             // its subcommands'.
             let container = crate::commands::arity::is_container(name);
@@ -2816,6 +3010,21 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             (*name, entry)
         })
         .collect()
+}
+
+/// The arity `COMMAND INFO` reports for a command of a module KiviDB has
+/// built in, as Redis 8.10 reports it with that module loaded (#561). Only
+/// reported: each handler checks its own arguments.
+fn module_arity(name: &str) -> Option<i16> {
+    Some(match name {
+        "JSON.ARRAPPEND" | "JSON.STRAPPEND" | "JSON.MGET" => -3,
+        "JSON.ARRINDEX" | "JSON.SET" | "JSON.MSET" | "JSON.MERGE" => -4,
+        "JSON.ARRINSERT" => -5,
+        "JSON.ARRTRIM" => 5,
+        "JSON.NUMINCRBY" | "JSON.NUMMULTBY" | "JSON.NUMPOWBY" => 4,
+        "JSON.TOGGLE" => 3,
+        _ => return None,
+    })
 }
 
 /// Returns the list of commands in an ACL category, or None for an unknown category.
@@ -3343,6 +3552,86 @@ fn in_module(module: &str, name: &str) -> bool {
     }
 }
 
+/// `INFO keysizes` counts: by type, then by bin. Bin 0 is the empty, bin n
+/// holds 2^(n-1) to 2^n - 1.
+type KeysizeBins = [[u64; 65]; 5];
+
+/// How many buckets of a shard `INFO keysizes` goes over in one hold of it.
+const KEYSIZES_BUCKETS: usize = 1024;
+
+/// `value` counted in its type's bin.
+fn keysize_count(bins: &mut KeysizeBins, value: crate::store::ValueRef<'_>) {
+    let (kind, len) = match value {
+        crate::store::ValueRef::String(b) => (0, b.len()),
+        crate::store::ValueRef::List(l) => (1, l.read().len()),
+        crate::store::ValueRef::Set(s) => (2, s.read().len()),
+        crate::store::ValueRef::SortedSet(z) => (3, z.read().len()),
+        crate::store::ValueRef::Hash(h) => (4, h.read().len()),
+        crate::store::ValueRef::HashEx(h) => (4, h.read().len()),
+        _ => return,
+    };
+    let bin = (usize::BITS - len.leading_zeros()) as usize;
+    bins[kind][bin] += 1;
+}
+
+/// One shard's `INFO keysizes` counts, gone over [`KEYSIZES_BUCKETS`]
+/// buckets at a time and let go of in between. It was held for the whole
+/// of its keys, and writes to it waited: tens of milliseconds a shard at
+/// millions of keys, every time an exporter scraped `INFO all` (#622).
+///
+/// A shard nobody writes to meanwhile is counted exactly. Under writes the
+/// count is approximate, as a `SCAN` is: a key written or deleted
+/// meanwhile is counted or not, and keys move between buckets when the
+/// table is rehashed. A resize changes how many buckets there are, and the
+/// shard is then counted again (in one hold after a few tries); a rehash
+/// in place, at the same size, which the table does when deleted keys
+/// have used up its room to grow, cannot be seen from here, and in the
+/// part not yet counted a key may then be counted twice or not at all.
+///
+/// One hold for the whole shard would be exact: about 20 ms for a shard
+/// of a million keys (21 ns a key measured, 5 million keys on 8 vCPUs), a
+/// wait for every write to it, every 10 s while `INFO all` is asked. A
+/// count of rehashes kept by the table would let the walk start again on
+/// one too, but needs a check on every insert, the `SET` path. For a
+/// distribution refreshed every 10 seconds neither is worth it.
+///
+/// `between` is called with no lock held after each part (for tests).
+fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> KeysizeBins {
+    let mut tries = 0;
+    'shard: loop {
+        let mut bins: KeysizeBins = [[0u64; 65]; 5];
+        let mut at = 0;
+        let mut size = None;
+        loop {
+            let map = read_lock!(shard);
+            let buckets = map.buckets();
+            if *size.get_or_insert(buckets) != buckets {
+                tries += 1;
+                if tries < 3 {
+                    continue 'shard;
+                }
+                let mut bins: KeysizeBins = [[0u64; 65]; 5];
+                for value in map.values() {
+                    keysize_count(&mut bins, value);
+                }
+                return bins;
+            }
+            let end = buckets.min(at + KEYSIZES_BUCKETS);
+            for index in at..end {
+                if let Some((_, value)) = map.bucket(index) {
+                    keysize_count(&mut bins, value);
+                }
+            }
+            at = end;
+            if at >= buckets {
+                return bins;
+            }
+            drop(map);
+            between();
+        }
+    }
+}
+
 /// `INFO keysizes` for database `db`: for strings, lists, sets, sorted sets
 /// and hashes, how many keys have a length (bytes, or items) in each
 /// power-of-two bin, as Redis 8.10 writes it:
@@ -3356,21 +3645,15 @@ fn keysizes(db: usize, shards: &crate::store::Db) -> String {
         "distrib_zsets_items",
         "distrib_hashes_items",
     ];
-    // Bin 0 is the empty, bin n holds 2^(n-1) to 2^n - 1.
-    let mut bins = [[0u64; 65]; 5];
+    let mut bins: KeysizeBins = [[0u64; 65]; 5];
     for shard in shards.iter() {
-        for value in read_lock!(shard).values() {
-            let (kind, len) = match value {
-                crate::store::ValueRef::String(b) => (0, b.len()),
-                crate::store::ValueRef::List(l) => (1, l.read().len()),
-                crate::store::ValueRef::Set(s) => (2, s.read().len()),
-                crate::store::ValueRef::SortedSet(z) => (3, z.read().len()),
-                crate::store::ValueRef::Hash(h) => (4, h.read().len()),
-                crate::store::ValueRef::HashEx(h) => (4, h.read().len()),
-                _ => continue,
-            };
-            let bin = (usize::BITS - len.leading_zeros()) as usize;
-            bins[kind][bin] += 1;
+        for (all, one) in bins
+            .iter_mut()
+            .zip(keysizes_of_shard(shard, &mut || {}).iter())
+        {
+            for (a, b) in all.iter_mut().zip(one.iter()) {
+                *a += *b;
+            }
         }
     }
     let mut out = String::new();
@@ -3788,9 +4071,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "LASTSAVE" => Some(resp_integer(crate::stats::last_save())),
 
         "FLUSHDB" => {
+            let lazy = match flush_is_async(cmd) {
+                Ok(lazy) => lazy,
+                Err(reply) => return Some(reply),
+            };
             let db = *ctx.selected_db;
             touch_watched_keys(ctx, Some(db));
-            let flushed = if flush_is_async(cmd) {
+            let flushed = if lazy {
                 let (values, flushed) = crate::store::take_db(&ctx.store[db]);
                 crate::lazyfree::free_later(values, flushed.keys as u64);
                 // Nothing to give back to the OS yet: the values are freed
@@ -3840,7 +4127,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("# Server\r\n");
                 // The Redis release whose commands and replies this server
                 // follows. Clients read it to decide what they may send.
-                out.push_str("redis_version:8.10.0\r\n");
+                out.push_str(&format!("redis_version:{REDIS_VERSION}\r\n"));
                 // There is no Redis build behind that version: these are
                 // the fields a Redis build fills in, for the clients and
                 // tools that read them.
@@ -3862,6 +4149,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // (`replication::expiry_propagated_by`).
                 out.push_str(crate::replication::EXPIRY_PROPAGATED_INFO);
                 out.push_str("\r\n");
+                // And each hash field expired here, as an `HDEL`
+                // (`replication::field_expiry_propagated_by`). Not said under
+                // `KIVIDB_TEST_NO_FIELD_EXPIRY_CAPABILITY`, for the tests of a
+                // replica of a master that does not say it.
+                if !crate::replication::hides_field_expiry_capability() {
+                    out.push_str(crate::replication::FIELD_EXPIRY_PROPAGATED_INFO);
+                    out.push_str("\r\n");
+                }
                 out.push_str(&format!(
                     "os:{} {}\r\n",
                     std::env::consts::OS,
@@ -3888,8 +4183,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("atomicvar_api:atomic-builtin\r\n");
                 out.push_str("gcc_version:0.0.0\r\n");
                 // The file it was started with, if there is one.
-                let config_file = Some(std::path::Path::new(&ctx.config.configfile))
-                    .filter(|path| path.is_file())
+                let config_file = ctx
+                    .config
+                    .configfile_loaded
+                    .then_some(std::path::Path::new(&ctx.config.configfile))
                     .and_then(|path| std::path::absolute(path).ok())
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default();
@@ -3949,13 +4246,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("keyspace") {
                 out.push_str("# Keyspace\r\n");
+                let now = crate::commands::helpers::unix_ms(std::time::SystemTime::now());
                 for (i, db) in ctx.store.iter().enumerate() {
-                    let (keys, expires) = db.iter().fold((0usize, 0usize), |(k, e), shard| {
-                        let map = read_lock!(shard);
-                        (k + map.len(), e + map.ttl_len())
-                    });
+                    // Three numbers a shard, each kept as keys change.
+                    let (keys, expires, deadlines) =
+                        db.iter().fold((0usize, 0usize, 0u128), |(k, e, d), shard| {
+                            let map = read_lock!(shard);
+                            (k + map.len(), e + map.ttl_len(), d + map.ttl_deadline_sum())
+                        });
                     if keys > 0 || expires > 0 {
-                        let avg_ttl = if expires > 0 { avg_ttl_ms(db) } else { 0 };
+                        let avg_ttl = avg_ttl_ms(expires, deadlines, now);
                         out.push_str(&format!(
                             "db{}:keys={},expires={},avg_ttl={}\r\n",
                             i, keys, expires, avg_ttl
@@ -4267,8 +4567,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if let Some(down_for) = ctx.repl_state.master_link_down_since_seconds() {
                         out.push_str(&format!("master_link_down_since_seconds:{down_for}\r\n"));
                     }
-                    out.push_str("slave_priority:100\r\n");
+                    // Sentinel never promotes a replica of priority 0, and
+                    // lists only one that is announced (#443).
+                    out.push_str(&format!(
+                        "slave_priority:{}\r\n",
+                        ctx.repl_state
+                            .replica_priority
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    ));
                     out.push_str("slave_read_only:1\r\n");
+                    out.push_str(&format!(
+                        "replica_announced:{}\r\n",
+                        ctx.repl_state
+                            .replica_announced
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u8
+                    ));
                     // KiviDB extensions: the full-resync dataset guard.
                     out.push_str(&format!(
                         "replica_full_sync_guard:{}\r\n",
@@ -4423,7 +4737,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             if want("clients") {
-                let count = ctx.client_registry.len();
+                let count = ctx.client_registry.connected_clients();
                 let blocked = crate::stats::BLOCKED_CLIENTS.load(Ordering::Relaxed);
                 let tracking = crate::tracking::tracking_client_count();
                 out.push_str("# Clients\r\n");
@@ -4767,7 +5081,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // resets its `stat_active_defrag_*` (#370).
                     crate::compaction::reset_stats();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
-                    crate::stats::reset_rdb_changes();
+                    // Not `rdb_changes_since_last_save`: that is not a
+                    // statistic, and Redis keeps it (#566).
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
                     crate::stats::LAST_SAMPLE_COMMANDS.store(0, Ordering::Relaxed);
                     crate::stats::reset_error_reply_stats();
@@ -4778,6 +5093,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     use crate::config::RewriteError;
                     match ctx.config.with_values(&config_rows(ctx)).rewrite_to_disk() {
                         Ok(()) => Some(resp_simple("OK")),
+                        Err(RewriteError::NoConfigFile) => Some(resp_error(
+                            "ERR The server is running without a config file",
+                        )),
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }
@@ -5029,8 +5347,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "FLUSHALL" => {
+            let lazy = match flush_is_async(cmd) {
+                Ok(lazy) => lazy,
+                Err(reply) => return Some(reply),
+            };
             touch_watched_keys(ctx, None);
-            let flushed = if flush_is_async(cmd) {
+            let flushed = if lazy {
                 let mut values = Vec::with_capacity(ctx.store.len());
                 let mut keys = 0;
                 for db in ctx.store.iter() {
@@ -5300,8 +5622,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(mode) if cmd.len() == 4 && mode.eq_ignore_ascii_case(b"ALL") => false,
                         Some(_) => return Some(resp_error("ERR syntax error")),
                     };
-                    crate::pause::set_pause(ms, write_only);
-                    Some(resp_simple("OK"))
+                    // Once the writes on their way have been applied or
+                    // will be held: see `pause_clients` (#629).
+                    match crate::pause::pause_clients(ms, write_only) {
+                        Ok(()) => Some(resp_simple("OK")),
+                        Err(why) => Some(resp_error(why)),
+                    }
                 }
 
                 "UNPAUSE" => {
@@ -5374,7 +5700,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let (mut optin, mut optout, mut noloop, mut bcast) =
                         (false, false, false, false);
                     let mut redirect: Option<u64> = None;
-                    let mut prefixes: Vec<String> = Vec::new();
+                    let mut prefixes: Vec<Vec<u8>> = Vec::new();
                     let mut i = 3usize;
                     while i < cmd.len() {
                         let word = cmd[i].to_ascii_uppercase();
@@ -5394,7 +5720,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 i += 1;
                             }
                             (b"PREFIX", Some(prefix)) => {
-                                prefixes.push(String::from_utf8_lossy(prefix).into_owned());
+                                prefixes.push(prefix.to_vec());
                                 i += 1;
                             }
                             (b"BCAST", _) => bcast = true,
@@ -5487,15 +5813,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if bcast {
                         // No prefix is the prefix of every key.
                         if prefixes.is_empty() && had_prefixes.is_empty() {
-                            prefixes.push(String::new());
+                            prefixes.push(Vec::new());
                         }
                         // One prefix of a client must not be the start of
                         // another: a key would be announced twice.
-                        let overlap = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
+                        let overlap = |a: &[u8], b: &[u8]| a.starts_with(b) || b.starts_with(a);
                         for (n, prefix) in prefixes.iter().enumerate() {
                             if let Some(other) =
                                 had_prefixes.iter().find(|other| overlap(prefix, other))
                             {
+                                let (prefix, other) = (
+                                    String::from_utf8_lossy(prefix),
+                                    String::from_utf8_lossy(other),
+                                );
                                 return Some(resp_error(&format!(
                                     "ERR Prefix '{prefix}' overlaps with an existing prefix \
                                      '{other}'. Prefixes for a single client must not overlap."
@@ -5505,6 +5835,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 .iter()
                                 .find(|other| overlap(prefix, other))
                             {
+                                let (prefix, other) = (
+                                    String::from_utf8_lossy(prefix),
+                                    String::from_utf8_lossy(other),
+                                );
                                 return Some(resp_error(&format!(
                                     "ERR Prefix '{prefix}' overlaps with another provided \
                                      prefix '{other}'. Prefixes for a single client must not \
@@ -5542,7 +5876,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let info = ctx.client_registry.get(ctx.client_id);
                     let mut flags: Vec<&str> = Vec::new();
                     let mut redirect = -1;
-                    let mut prefixes: Vec<String> = Vec::new();
+                    let mut prefixes: Vec<Vec<u8>> = Vec::new();
                     match &info {
                         Some(info) if info.tracking => {
                             flags.push("on");
@@ -5581,7 +5915,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             resp_bulk_str("redirect"),
                             resp_integer(redirect),
                             resp_bulk_str("prefixes"),
-                            resp_array(prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
+                            resp_array(prefixes.iter().map(|p| resp_bulk(p)).collect()),
                         ],
                     ))
                 }
@@ -5753,8 +6087,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // rather than an error, so clients don't break.
             Some(resp_array(vec![
                 resp_bulk_str("server"),
-                resp_bulk_str("kividb"),
+                resp_bulk_str("redis"),
                 resp_bulk_str("version"),
+                resp_bulk_str(REDIS_VERSION),
+                resp_bulk_str("kividb_version"),
                 resp_bulk_str(env!("CARGO_PKG_VERSION")),
                 resp_bulk_str("proto"),
                 resp_integer(2),
@@ -5777,9 +6113,38 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "LOLWUT" => {
-            // LOLWUT [VERSION version]
-            // Returns some art and the server version. The VERSION arg selects
-            // which art pattern to show — we have one pattern (version 6, the dragon).
+            // LOLWUT [VERSION version] [option ...]
+            // Returns some art and the server version. KiviDB has one
+            // picture, whatever the version; the arguments are checked as
+            // Redis checks them (#561): VERSION takes an integer, and so do
+            // the options of versions 5 (three) and 6 (two).
+            let mut options = &cmd[1..];
+            let mut asked = None;
+            if options.len() >= 2 && options[0].eq_ignore_ascii_case(b"VERSION") {
+                match std::str::from_utf8(options[1])
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    Some(v) => asked = Some(v),
+                    None => {
+                        return Some(resp_error("ERR value is not an integer or out of range"));
+                    }
+                }
+                options = &options[2..];
+            }
+            let numeric = match asked {
+                Some(5) => 3,
+                Some(6) => 2,
+                _ => 0,
+            };
+            if options.iter().take(numeric).any(|o| {
+                std::str::from_utf8(o)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .is_none()
+            }) {
+                return Some(resp_error("ERR value is not an integer or out of range"));
+            }
             let version = env!("CARGO_PKG_VERSION");
             let art = format!(
                 "
@@ -5953,12 +6318,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ],
             ))
         }
-        "MODULE" => Some(resp_error(
-            "ERR MODULE subsystem is not supported by KiviDB. \
-             Dynamic module loading requires dlopen and ABI versioning \
-             which conflicts with KiviDB's safety model. \
-             See COMMANDS.md for the design rationale.",
-        )),
+        "MODULE"
+            if cmd.get(1).is_some_and(|sub| {
+                [&b"LOAD"[..], b"LOADEX", b"UNLOAD"]
+                    .iter()
+                    .any(|known| sub.eq_ignore_ascii_case(known))
+            }) =>
+        {
+            Some(resp_error(
+                "ERR MODULE LOAD, LOADEX and UNLOAD are not supported: KiviDB does not \
+                 load modules. Search, JSON, time series and vector \
+                 sets are built in (MODULE LIST).",
+            ))
+        }
+        "MODULE" => Some(resp_error(&format!(
+            "ERR unknown subcommand '{}'. Try MODULE HELP.",
+            String::from_utf8_lossy(cmd.get(1).copied().unwrap_or_default())
+        ))),
 
         "FAILOVER" => Some(resp_error(
             "ERR FAILOVER is not supported by KiviDB. \
@@ -5991,4 +6367,201 @@ pub fn acl_cat_commands_pub(category: &str) -> Vec<&'static str> {
 
 pub fn acl_cat_commands_opt(category: &str) -> Option<Vec<&'static str>> {
     acl_cat_commands(category)
+}
+
+#[cfg(test)]
+mod keysizes_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn set(store: &crate::store::Store, key: &str, value: &str) {
+        let _ = crate::store::get_shard(&store[0], key)
+            .write()
+            .set_str(key, value);
+    }
+
+    /// The kept count of `store` made `by` older.
+    fn age(store: &crate::store::Store, by: Duration) {
+        let mut last = KEYSIZES_LAST.lock();
+        let kept = last.get_mut(&keysizes_key(store)).unwrap();
+        kept.at = Instant::now().checked_sub(by).unwrap();
+    }
+
+    fn counting(store: &crate::store::Store) -> bool {
+        KEYSIZES_LAST
+            .lock()
+            .get(&keysizes_key(store))
+            .unwrap()
+            .counting
+    }
+
+    /// Wait until no count of `store` is under way.
+    fn settled(store: &crate::store::Store) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while counting(store) {
+            assert!(Instant::now() < until, "the count never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    const ONE: &str = "db0_distrib_strings_sizes:1=1\r\n";
+
+    /// A count is given again while fresh, counted aside once it is older
+    /// than `KEYSIZES_REUSED_FOR`, and counted at once, waited for, once
+    /// it is older than twice that. Each store has its own.
+    #[test]
+    fn a_count_is_given_again_counted_aside_or_waited_for_by_its_age() {
+        let store = crate::store::new_store(1);
+        let other = crate::store::new_store(1);
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        assert_eq!(keysizes_cached(&other, false, keysizes_text), "");
+        // Fresh: given again, though the keys have gone.
+        let _ = crate::store::clear_db(&store[0]);
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        // Older: given again, and counted aside.
+        age(&store, KEYSIZES_REUSED_FOR + Duration::from_secs(1));
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        settled(&store);
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), "");
+        // Asked for by name: counted at once.
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, true, keysizes_text), ONE);
+        // Much older, the keys gone since: waited for.
+        let _ = crate::store::clear_db(&store[0]);
+        age(&store, 2 * KEYSIZES_REUSED_FOR + Duration::from_secs(1));
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), "");
+        assert_eq!(keysizes_cached(&other, false, keysizes_text), "");
+    }
+
+    fn panics(_: &crate::store::Store) -> String {
+        panic!("a count that fails")
+    }
+
+    /// A count that panics on its thread lets the next one start.
+    #[test]
+    fn a_count_that_panics_does_not_stop_the_next() {
+        let store = crate::store::new_store(1);
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        age(&store, KEYSIZES_REUSED_FOR + Duration::from_secs(1));
+        assert_eq!(keysizes_cached(&store, false, panics), ONE);
+        settled(&store);
+        // Still the old one, still older: counted aside again, and kept.
+        set(&store, "j", "vv");
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), ONE);
+        settled(&store);
+        assert_eq!(
+            keysizes_cached(&store, false, keysizes_text),
+            "db0_distrib_strings_sizes:1=1,2=1\r\n"
+        );
+    }
+
+    /// A count by name while one is under way aside leaves it under way.
+    #[test]
+    fn a_count_by_name_leaves_one_under_way_alone() {
+        let store = crate::store::new_store(1);
+        assert_eq!(keysizes_cached(&store, false, keysizes_text), "");
+        KEYSIZES_LAST
+            .lock()
+            .get_mut(&keysizes_key(&store))
+            .unwrap()
+            .counting = true;
+        set(&store, "k", "v");
+        assert_eq!(keysizes_cached(&store, true, keysizes_text), ONE);
+        assert!(counting(&store));
+    }
+
+    fn shard_of(keys: impl Iterator<Item = (String, &'static str)>) -> crate::store::Shard {
+        let shard: crate::store::Shard = Arc::new(crate::store::ShardLock::default());
+        {
+            let mut map = shard.write();
+            for (key, value) in keys {
+                let _ = map.set_str(key, value);
+            }
+        }
+        shard
+    }
+
+    /// Strings of `len` bytes counted.
+    fn of_len(bins: &KeysizeBins, len: usize) -> u64 {
+        bins[0][(usize::BITS - len.leading_zeros()) as usize]
+    }
+
+    /// The table grown between two parts: the shard is counted again, and
+    /// the count is exact.
+    #[test]
+    fn the_walk_counts_a_resized_shard_again() {
+        let shard = shard_of((0..5_000).map(|i| (format!("stay{i}"), "xxxxxxxxxx")));
+        let before = shard.read().buckets();
+        assert!(before > 2 * KEYSIZES_BUCKETS);
+        let mut calls = 0;
+        let bins = keysizes_of_shard(&shard, &mut || {
+            calls += 1;
+            if calls == 1 {
+                let mut map = shard.write();
+                for i in 0..20_000 {
+                    let _ = map.set_str(format!("new{i}"), "x");
+                }
+            }
+        });
+        assert!(shard.read().buckets() > before);
+        assert_eq!((of_len(&bins, 10), of_len(&bins, 1)), (5_000, 20_000));
+    }
+
+    /// Writes and deletes between the parts, with room in the table, so
+    /// that it is neither resized nor rehashed: every key there all along
+    /// is counted once.
+    #[test]
+    fn the_walk_counts_untouched_keys_once_under_writes() {
+        let shard = shard_of(
+            (0..5_000)
+                .map(|i| (format!("stay{i}"), "xxxxxxxxxx"))
+                .chain((0..500).map(|i| (format!("gone{i}"), "xxxxx"))),
+        );
+        let (buckets, room) = {
+            let map = shard.read();
+            (map.buckets(), map.capacity() - map.len())
+        };
+        let parts = buckets.div_ceil(KEYSIZES_BUCKETS);
+        let per_part = (room / parts).min(100);
+        assert!(per_part > 0);
+        let mut call = 0;
+        let bins = keysizes_of_shard(&shard, &mut || {
+            let mut map = shard.write();
+            for i in 0..per_part {
+                let _ = map.set_str(format!("new{call}-{i}"), "x");
+            }
+            for i in 0..50 {
+                drop(map.remove(&format!("gone{}", call * 50 + i)));
+            }
+            call += 1;
+        });
+        assert_eq!(shard.read().buckets(), buckets);
+        assert_eq!(of_len(&bins, 10), 5_000);
+        assert!(of_len(&bins, 1) <= (per_part * parts) as u64);
+        assert!(of_len(&bins, 5) <= 500);
+    }
+
+    /// Heavy churn between the parts, many keys in and out, which can make
+    /// the table rehash in place: the walk ends, and its count is the
+    /// approximation documented, no more than twice the keys there all
+    /// along.
+    #[test]
+    fn the_walk_ends_under_churn() {
+        let shard = shard_of((0..5_000).map(|i| (format!("stay{i}"), "xxxxxxxxxx")));
+        let mut call = 0;
+        let bins = keysizes_of_shard(&shard, &mut || {
+            let mut map = shard.write();
+            for i in 0..2_000 {
+                let _ = map.set_str(format!("churn{call}-{i}"), "x");
+            }
+            for i in 0..2_000 {
+                drop(map.remove(&format!("churn{call}-{i}")));
+            }
+            call += 1;
+        });
+        assert!(of_len(&bins, 10) <= 10_000);
+        assert_eq!(shard.read().len(), 5_000);
+    }
 }

@@ -17,7 +17,7 @@ other files:
 | Area | Status |
 |---|---|
 | Protocol | RESP2 and RESP3 (`HELLO`). Redis clients, `redis-cli` and cluster-aware clients work unchanged. |
-| Core data types | Strings, lists, sets, sorted sets, hashes (with per-field TTLs), streams and consumer groups, bitmaps, geo, Pub/Sub (including sharded). HyperLogLog works, but its encoding isn't Redis's yet: see *Differences*. |
+| Core data types | Strings, lists, sets, sorted sets, hashes (with per-field TTLs), streams and consumer groups, bitmaps, geo, Pub/Sub (including sharded). HyperLogLog, which reads Redis's encoding: see *Differences*. |
 | Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`). All built in, nothing to load. |
 | Transactions and scripts | `MULTI`/`EXEC`/`WATCH` and scripts run as one step, as in Redis ([EXEC_ATOMICITY.md](EXEC_ATOMICITY.md)). Lua (`EVAL`, `FUNCTION`, `FCALL`) needs the `lua` or `full` build. |
 | Security | `AUTH`, ACLs (users, key and channel patterns, ACL file), protected mode, TLS in the `tls` and `full` builds. |
@@ -32,7 +32,9 @@ other files:
 - Redis's own test suite: [REDIS_TEST_SUITE.md](REDIS_TEST_SUITE.md).
 - BullMQ's and Sidekiq's own test suites, and kill-and-restart soaks
   (`scripts/client_compat/`).
-- LiteLLM's semantic cache: [benchmarks/litellm-compat/REPORT.md](../benchmarks/litellm-compat/REPORT.md).
+- LiteLLM's caches (exact and semantic), router counters and proxy rate limiter (the `lua` build for the
+  proxy), with LiteLLM's own Redis tests: [benchmarks/litellm-compat/REPORT.md](../benchmarks/litellm-compat/REPORT.md)
+  and [docs/integrations/litellm.md](integrations/litellm.md).
 - LangChain's Redis integration (`langchain-redis`): vector store, LLM and semantic cache, chat history:
   [benchmarks/langchain-compat/REPORT.md](../benchmarks/langchain-compat/REPORT.md) and
   [docs/integrations/langchain.md](integrations/langchain.md).
@@ -77,6 +79,23 @@ other files:
 - Self-hosted Firecrawl (BullMQ, crawl state, rate limits; the `lua` build) with its own test suite and
   its docker compose: [benchmarks/firecrawl-compat/](../benchmarks/firecrawl-compat/) and
   [docs/integrations/firecrawl.md](integrations/firecrawl.md).
+- Celery and kombu (broker and result backend; the `lua` build), with their own Redis integration suites
+  and a real worker through a SIGKILL and server restarts. Chords need the result backend on RESP2 on
+  1.2.0 ([#431](https://github.com/kividbio/kividb/issues/431), fixed in 1.2.1):
+  [benchmarks/celery-compat/](../benchmarks/celery-compat/) and [docs/integrations/celery.md](integrations/celery.md).
+- Semantic Kernel's Redis vector store (Python; JSON and hash collections), with its own Redis tests:
+  [benchmarks/semantic-kernel-compat/](../benchmarks/semantic-kernel-compat/) and
+  [docs/integrations/semantic-kernel.md](integrations/semantic-kernel.md).
+- Spring AI's Redis vector store and chat memory repository (the `lua` build for chat memory), with its own
+  Redis integration tests: [benchmarks/spring-ai-compat/](../benchmarks/spring-ai-compat/) and
+  [docs/integrations/spring-ai.md](integrations/spring-ai.md).
+- GPTCache's Redis scalar store, vector store and distributed eviction, with its own Redis tests:
+  [benchmarks/gptcache-compat/](../benchmarks/gptcache-compat/) and [docs/integrations/gptcache.md](integrations/gptcache.md).
+- `@upstash/ratelimit` 2.0 through the Serverless Redis HTTP proxy (KiviDB has no REST API; the `lua`
+  build), with its own test suite: [benchmarks/upstash-ratelimit-compat/](../benchmarks/upstash-ratelimit-compat/)
+  and [docs/integrations/upstash-ratelimit.md](integrations/upstash-ratelimit.md).
+- Not compatible: Haystack's Valkey document store, which needs valkey-search's reply formats (it fails on
+  Redis 8 too): [docs/integrations/haystack.md](integrations/haystack.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
 
 ## Differences you may notice
@@ -88,7 +107,8 @@ other files:
   runs scripts.
 - `save <points>` has no effect: KiviDB doesn't snapshot on a schedule. Use
   the AOF or `BGSAVE`.
-- `appendfsync` is always `everysec`.
+- `appendfsync no` is taken as `everysec`; `always` and `everysec` do what
+  they do in Redis.
 - The config file is read strictly: an unknown directive stops the server.
 
 **Durability**
@@ -103,10 +123,24 @@ other files:
   does that, for more writes a second.
 
 **Data**
-- HyperLogLog registers aren't in Redis's layout
-  ([#62](https://github.com/kividbio/kividb/issues/62)). `PFADD`, `PFCOUNT`
-  and `PFMERGE` work within KiviDB, but an HLL moved between Redis and KiviDB
-  (`DUMP`/`RESTORE`, an RDB, replication) gives wrong counts or is refused.
+- Keys, values, hash fields, set and sorted-set members, list elements,
+  stream consumer group and consumer names and vector-set element names are
+  any bytes, as in Redis. What is still text: ACL rules (a key or channel
+  pattern in `ACL SETUSER` that is not UTF-8 is refused,
+  [#437](https://github.com/kividbio/kividb/issues/437)), search index
+  names, prefixes and field names, and time-series label names and values.
+- A HyperLogLog copied from Redis (`DUMP`/`RESTORE`, an RDB, replication)
+  loads and counts as it did on Redis. By default KiviDB writes new
+  HyperLogLogs in its own format, which Redis refuses (`INVALIDOBJ`), and
+  `PFMERGE` or a multi-key `PFCOUNT` refuses to combine the two formats. After
+  moving from Redis, set `hll-write-format redis` so new and copied
+  HyperLogLogs mix and can move back ([PERSISTENCE.md](PERSISTENCE.md)).
+- Valkey 9.2's RDB format (version 81) isn't read yet: a file, full sync
+  or `DUMP` payload from it is refused. Valkey 9.0's and 9.1's (version 80,
+  a `VALKEY080` header) is read, hash field TTLs included.
+- Redis and Valkey can't read KiviDB's `DUMP` payloads or replicate from
+  KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
+  data back off KiviDB means copying it key by key.
 - `DUMP`/`RESTORE` doesn't support time series and vector sets.
 - Search: no stemming or phonetic matching (`NOSTEM` and `PHONETIC` are
   accepted and change nothing). `GEO` and `GEOSHAPE` fields, `GEOFILTER` and
@@ -115,14 +149,37 @@ other files:
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. One with other module data (time series, vector sets,
   Bloom) is refused.
+- Set and sorted-set members can't have their own TTLs. A Dragonfly file
+  with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
+  or sorted-set member, is refused, naming the key. Hash field TTLs from
+  either load. Dragonfly's Bloom, Cuckoo, count-min and top-k keys and its
+  compressed snapshot blocks are refused (save with `--compression_mode=0`).
+- KiviDB can't be a replica of a KeyDB primary in active replication
+  (`active-replica yes`): the link ends at its first `RREPLAY`, saying so.
+  Move that data by RDB file or with `MIGRATE`.
+- `JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse any integer result that does
+  not fit an `i64` with `ERR numeric overflow`, and change nothing. Redis
+  returns that error too, with three exceptions KiviDB doesn't copy: it
+  stores a `u64` for some array elements (`JSON.NUMINCRBY k $[0] 1` on
+  `[9223372036854775807]` succeeds), it gives a float for some integers
+  above `i64::MAX`, losing precision, and it can leave a multi-match path
+  half done ([#536](https://github.com/kividbio/kividb/issues/536)).
 
 **Server and introspection**
+- `HELLO` and `INFO`'s `redis_version` report the Redis release KiviDB
+  follows (`server: redis`, `version: 8.10.0`), as Dragonfly does, so that
+  clients use what that release has: redis-py's and Jedis's client-side
+  caches need Redis 7.4 or later. KiviDB's own release is `kividb_version`,
+  in `HELLO` and in `INFO`.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set.
 - `client-output-buffer-limit` isn't configurable.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica
   of a KiviDB master older than 1.1.3 expires keys by its own clock (such a
-  master sends no `DEL` for the keys it expires).
+  master sends no `DEL` for the keys it expires). A replica of a 1.2.0
+  master, and a 1.2.0 replica, expire hash fields by their own clock (1.2.0
+  sends no `HDEL` for the fields it expires, and a 1.2.0 replica does not
+  wait for one).
 
 **Cluster**
 - `FT.SPELLCHECK`, `FT.PROFILE`, `FT.HYBRID` and `FT.SYNDUMP` answer from the

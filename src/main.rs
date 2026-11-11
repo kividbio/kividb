@@ -24,6 +24,7 @@ mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
 pub mod keyspec;
@@ -333,6 +334,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     crate::protected_mode::set(cfg.protected_mode);
     crate::protected_mode::set_bind_explicit(cfg.bind_explicit);
+    // `appendfsync`, from the command line or the file (#513). The file's
+    // `no` has been warned about as it was read; the command line's is here.
+    if from_cli("appendfsync") && cfg.appendfsync.eq_ignore_ascii_case("no") {
+        log_warn!(
+            "'--appendfsync no' syncs the append-only file once a second, as 'everysec' does"
+        );
+    }
+    let _ = crate::commands::server::config_set_global("appendfsync", &cfg.appendfsync);
     let threads = cfg.resolve_threads();
     let config = Arc::new(cfg);
     RUNTIME_MAXMEMORY.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);
@@ -341,6 +350,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
     compaction::configure(&config);
+    snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -372,7 +382,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         update_check::variant(),
-        if std::path::Path::new(&config.configfile).is_file() {
+        if config.configfile_loaded {
             format!("'{}'", config.configfile)
         } else {
             "none".to_string()
@@ -732,6 +742,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let latency = crate::latency::new_latency_tracker();
     let monitor_registry = crate::monitor::new_monitor_registry();
@@ -1627,6 +1638,7 @@ async fn async_main_tokio(
     let client_registry = crate::client_registry::new_client_registry();
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let monitor_registry = crate::monitor::new_monitor_registry();
     let tracking_table = crate::tracking::new_tracking_table();

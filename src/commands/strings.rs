@@ -3,24 +3,23 @@ use crate::commands::helpers::*;
 use crate::keyspace_events::{KS_GENERIC, KS_STRING, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The longest a string value may be: Redis's default `proto-max-bulk-len`.
 const MAX_STRING_LEN: usize = 512 * 1024 * 1024;
 
 /// The key and value pairs of an `MSET`-shaped command, or `None` if a key
 /// is not UTF-8.
-fn utf8_pairs<'a>(cmd: &[&'a [u8]]) -> Option<Vec<(&'a str, &'a [u8])>> {
+fn key_value_pairs<'a>(cmd: &[&'a [u8]]) -> Vec<(&'a [u8], &'a [u8])> {
     cmd[1..]
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|pair| Some((parse_utf8(pair[0])?, pair[1])))
+        .map(|pair| (pair[0], pair[1]))
         .collect()
 }
 
@@ -30,7 +29,7 @@ fn utf8_pairs<'a>(cmd: &[&'a [u8]]) -> Option<Vec<(&'a str, &'a [u8])>> {
 /// That is the order to lock them in. Whatever else holds more than one
 /// shard at a time (a snapshot, a rewrite of the AOF) takes them in that
 /// order too, so no two of them can each hold what the other waits for.
-fn shards_of<'k>(db: &store::Db, keys: impl Iterator<Item = &'k str>) -> Vec<usize> {
+fn shards_of<'k>(db: &store::Db, keys: impl Iterator<Item = &'k [u8]>) -> Vec<usize> {
     let mut indexes: Vec<usize> = keys.map(|key| store::shard_index(db.len(), key)).collect();
     indexes.sort_unstable();
     indexes.dedup();
@@ -45,7 +44,7 @@ struct ReadShards<'a> {
 }
 
 impl<'a> ReadShards<'a> {
-    fn lock<'k>(db: &'a store::Db, keys: impl Iterator<Item = &'k str>) -> Self {
+    fn lock<'k>(db: &'a store::Db, keys: impl Iterator<Item = &'k [u8]>) -> Self {
         let held = shards_of(db, keys)
             .into_iter()
             .map(|index| (index, db[index].read()))
@@ -57,7 +56,7 @@ impl<'a> ReadShards<'a> {
     }
 
     /// The table `key` is in, if it is a key this was locked for.
-    fn map(&self, key: &str) -> Option<&store::ShardMap> {
+    fn map(&self, key: &[u8]) -> Option<&store::ShardMap> {
         let index = store::shard_index(self.shards, key);
         let at = self
             .held
@@ -68,7 +67,7 @@ impl<'a> ReadShards<'a> {
 }
 
 /// The same for writing: what makes a write of several keys one step.
-struct WriteShards<'a> {
+pub(super) struct WriteShards<'a> {
     shards: usize,
     held: Vec<(usize, store::ShardWrite<'a>)>,
 }
@@ -94,7 +93,7 @@ impl<'a> WriteShards<'a> {
     ///
     /// Out of line: `SET` is in the same `handle`, and must not pay for it.
     #[inline(never)]
-    fn lock<'k>(db: &'a store::Db, keys: impl Iterator<Item = &'k str>) -> Self {
+    pub(super) fn lock<'k>(db: &'a store::Db, keys: impl Iterator<Item = &'k [u8]>) -> Self {
         let indexes = shards_of(db, keys);
         let mut held = Vec::with_capacity(indexes.len());
         // The shard last found busy, held from when it was waited for.
@@ -127,7 +126,7 @@ impl<'a> WriteShards<'a> {
     }
 
     /// The table `key` is in. The key must be one this was locked for.
-    fn map(&mut self, key: &str) -> &mut store::ShardMap {
+    pub(super) fn map(&mut self, key: &[u8]) -> &mut store::ShardMap {
         let index = store::shard_index(self.shards, key);
         let at = self
             .held
@@ -178,10 +177,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
 
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // ── parse options (everything after the value) ────────────────────────
             // We use indices into cmd to avoid allocating strings for option names.
@@ -200,7 +196,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut cond_arg: Option<&[u8]> = None; // points into cmd — zero-copy
             let mut want_get = false;
             let mut keepttl = false;
-            let mut expiry: Option<SystemTime> = None;
+            // The time option and its argument: read once every option has
+            // been, as Redis reads them.
+            let mut expire: Option<(TimeArg, &[u8])> = None;
 
             let mut i = 3usize;
             while i < cmd.len() {
@@ -226,6 +224,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         want_get = true;
                     }
                     "KEEPTTL" => {
+                        if expire.is_some() {
+                            return Some(resp_error("ERR syntax error"));
+                        }
                         keepttl = true;
                     }
 
@@ -246,60 +247,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         };
                     }
 
-                    "EX" => {
-                        i += 1;
-                        let secs = match cmd.get(i) {
-                            Some(b) => match parse_bytes_as_i128(b) {
-                                Some(s) => s,
-                                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-                            },
-                            None => return Some(resp_error("ERR syntax error")),
-                        };
-                        match deadline_after_relative_secs(secs, ERR_INVALID_EXPIRE_SET_CMD) {
-                            Ok(t) => expiry = Some(t),
-                            Err(e) => return Some(resp_error(e)),
-                        }
-                    }
-
-                    "PX" => {
-                        i += 1;
-                        let ms = match cmd.get(i) {
-                            Some(b) => match parse_bytes_as_i128(b) {
-                                Some(m) => m,
-                                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-                            },
-                            None => return Some(resp_error("ERR syntax error")),
-                        };
-                        match deadline_after_relative_millis(ms, ERR_INVALID_EXPIRE_SET_CMD) {
-                            Ok(t) => expiry = Some(t),
-                            Err(e) => return Some(resp_error(e)),
-                        }
-                    }
-
-                    "EXAT" => {
-                        i += 1;
-                        let ts: u64 = match cmd
-                            .get(i)
-                            .and_then(|b| std::str::from_utf8(b).ok())
-                            .and_then(|s| s.parse().ok())
+                    // One unit, and not with KEEPTTL, as Redis parses them;
+                    // the same one again replaces it. `EX 10 PX 10` was the
+                    // last one, and `KEEPTTL EX 10` an invalid time. From a
+                    // stream, mixed units are still the last one: 1.2.0 took
+                    // them, and logged `SET k v EX 10 EX 20` as `SET k v PXAT
+                    // <t> EX 20`.
+                    "EX" | "PX" | "EXAT" | "PXAT" => {
+                        let arg = TimeArg::of_option(cmd[i]);
+                        if keepttl
+                            || i + 1 >= cmd.len()
+                            || (expire.is_some_and(|(unit, _)| Some(unit) != arg)
+                                && !applying_stream(ctx))
                         {
-                            Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in SET")),
-                        };
-                        expiry = Some(expiry_unix_secs(ts));
-                    }
-
-                    "PXAT" => {
+                            return Some(resp_error("ERR syntax error"));
+                        }
+                        expire = arg.map(|arg| (arg, cmd[i + 1]));
                         i += 1;
-                        let ts_ms: u64 = match cmd
-                            .get(i)
-                            .and_then(|b| std::str::from_utf8(b).ok())
-                            .and_then(|s| s.parse().ok())
-                        {
-                            Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in SET")),
-                        };
-                        expiry = Some(expiry_unix_millis(ts_ms));
                     }
 
                     _ => {
@@ -310,10 +274,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 i += 1;
             }
 
-            // ── expiry sanity ─────────────────────────────────────────────────────
-            if keepttl && expiry.is_some() {
-                return Some(resp_error("ERR invalid expire time in SET"));
-            }
+            // ── the time, as Redis reads it: an integer, then in bounds ──────────
+            let expiry = match expire {
+                Some((arg, raw)) => {
+                    match key_deadline(raw, arg, ERR_INVALID_EXPIRE_SET_CMD, applying_stream(ctx)) {
+                        Ok(t) => Some(t),
+                        Err(e) => return Some(resp_error(e)),
+                    }
+                }
+                None => None,
+            };
 
             // ── check & handle expiry on the existing key ─────────────────────────
             // Do this before taking the write lock so we don't hold it longer than needed.
@@ -485,10 +455,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if cmd.len() != 2 {
                 return Some(resp_error("ERR wrong number of args for 'get' command"));
             }
-            let key = match std::str::from_utf8(cmd[1]) {
-                Ok(k) => k,
-                Err(_) => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
@@ -523,27 +490,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'expire' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             // The options are read before the time, as in Redis.
             let flags = match parse_expire_modifier_flags(cmd.as_slice(), 3) {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let secs = match parse_bytes_as_i128(cmd[2]) {
-                Some(s) => s,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
             // The clock is read once, here.
-            let when_ms = match absolute_when_ms_from_expire_secs(secs) {
-                Ok(w) => w,
+            let (secs, new_abs) = match expire_deadline(
+                cmd[2],
+                TimeArg::Secs,
+                ERR_INVALID_EXPIRE_EXPIRE_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
                 Err(e) => return Some(resp_error(e)),
-            };
-            let new_abs = match system_time_from_unix_millis_i128(when_ms) {
-                Some(t) => t,
-                None => return Some(resp_error(ERR_INVALID_EXPIRE_EXPIRE_CMD)),
             };
             // Only a time to live of zero or less deletes the key here, as in
             // Redis, and as `expire_feed` propagates it. A positive one ends
@@ -567,15 +528,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'setex' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
+            let key: &[u8] = cmd[1];
+            let expires_at = match key_deadline(
+                cmd[2],
+                TimeArg::Secs,
+                ERR_INVALID_EXPIRE_SETEX_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
-            let secs: u64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
-                Some(n) if n > 0 => n,
-                _ => return Some(resp_error("ERR invalid expire time in SETEX")),
-            };
-            let expires_at = expiry_at_after(Duration::from_secs(secs));
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
             let replaced =
                 write_lock!(shard).set_str_expiring(key, cmd[3], Some(unix_ms(expires_at)));
@@ -596,11 +558,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
 
             for k in cmd.iter().skip(1) {
-                // The key as it stands in the command: each was copied to a
-                // string of its own to be looked up.
-                let Some(key) = parse_utf8(k) else {
-                    continue;
-                };
+                // The key as it stands in the command, whatever its bytes.
+                let key: &[u8] = k;
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     expire_on_read(ctx.store, *ctx.selected_db, key);
                     continue;
@@ -624,10 +583,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
 
             let db = &ctx.store[*ctx.selected_db];
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
 
@@ -677,10 +633,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'strlen' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_integer(0));
@@ -707,10 +660,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'append' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let suffix = &cmd[2];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 delete_key_if_expired(ctx.store, *ctx.selected_db, key);
@@ -742,7 +692,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
             let len = new_val.len() as i64;
-            map.insert(Key::from(key), KiviDBValue::String(new_val));
+            map.insert(key, KiviDBValue::String(new_val));
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
             Some(resp_integer(len))
@@ -757,10 +707,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'getdel' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
@@ -802,10 +749,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'getset' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
@@ -844,10 +788,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'setnx' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             // Check expiry first — an expired key counts as non-existent
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 delete_key_if_expired(ctx.store, *ctx.selected_db, key);
@@ -865,22 +806,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         // ── PSETEX ────────────────────────────────────────────────────────────────────
-        // Like SETEX but the TTL is in milliseconds. Uses Duration::from_millis.
+        // Like SETEX but the TTL is in milliseconds.
         "PSETEX" => {
             if cmd.len() != 4 {
                 return Some(resp_error(
                     "ERR wrong number of arguments for 'psetex' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
+            let key: &[u8] = cmd[1];
+            let expires_at = match key_deadline(
+                cmd[2],
+                TimeArg::Millis,
+                ERR_INVALID_EXPIRE_PSETEX_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
-            let millis: u64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
-                Some(n) if n > 0 => n,
-                _ => return Some(resp_error("ERR invalid expire time in PSETEX")),
-            };
-            let expires_at = expiry_at_after(Duration::from_millis(millis));
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
             let replaced =
                 write_lock!(shard).set_str_expiring(key, cmd[3], Some(unix_ms(expires_at)));
@@ -905,9 +847,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // All of it or none: a key that cannot be one is found before
             // anything is written. (It used to be passed over, and the rest
             // written, with `OK` for an answer.)
-            let Some(pairs) = utf8_pairs(cmd) else {
-                return Some(resp_error("ERR must be valid UTF-8"));
-            };
+            let pairs = key_value_pairs(cmd);
             let db = *ctx.selected_db;
             {
                 // Every shard the keys are in, locked together: nobody sees
@@ -942,15 +882,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut results: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() - 1);
             // Every shard the keys are in, locked together: the values are
             // those of one moment, not of as many moments as there are keys.
-            let shards = ReadShards::lock(db, cmd[1..].iter().filter_map(|key| parse_utf8(key)));
+            let shards = ReadShards::lock(db, cmd[1..].iter().copied());
             for k in cmd[1..].iter() {
-                let key = match parse_utf8(k) {
-                    Some(k) => k,
-                    None => {
-                        results.push(nil.clone());
-                        continue;
-                    }
-                };
+                let key: &[u8] = k;
                 // A key past its time is not there. It is left for the next
                 // command on it, or the sweep, to remove: that takes its
                 // shard for writing, which this holds for reading.
@@ -978,9 +912,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'msetnx' command",
                 ));
             }
-            let Some(pairs) = utf8_pairs(cmd) else {
-                return Some(resp_error("ERR must be valid UTF-8"));
-            };
+            let pairs = key_value_pairs(cmd);
             let db = *ctx.selected_db;
             {
                 // Looked at and written under the same locks: no key can
@@ -1013,10 +945,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'incrby' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -1059,10 +988,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'decr' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
@@ -1098,10 +1024,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'decrby' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -1144,10 +1067,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'incrbyfloat' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let delta: f64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not a valid float")),
@@ -1201,10 +1121,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'getrange' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -1264,10 +1181,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'setrange' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let offset: usize = match parse_utf8(cmd[2]).and_then(|s| s.parse::<i64>().ok()) {
                 Some(n) if n >= 0 => n as usize,
                 Some(_) => return Some(resp_error("ERR offset is out of range")),
@@ -1333,10 +1247,32 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'getex' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
+            // The options first, as Redis's `getexCommand` reads them: one
+            // of EX, PX, EXAT, PXAT and PERSIST (the same one again
+            // replaces it), anything else a syntax error. Only the first was
+            // read: `GETEX k EX 10 PX 5` was taken. The time itself is read
+            // once the key is found, as there.
+            let mut expire: Option<(TimeArg, &[u8])> = None;
+            let mut persist = false;
+            let mut j = 2;
+            while j < cmd.len() {
+                match TimeArg::of_option(cmd[j]) {
+                    Some(arg)
+                        if !persist
+                            && expire.is_none_or(|(unit, _)| unit == arg)
+                            && j + 1 < cmd.len() =>
+                    {
+                        expire = Some((arg, cmd[j + 1]));
+                        j += 1;
+                    }
+                    None if cmd[j].eq_ignore_ascii_case(b"PERSIST") && expire.is_none() => {
+                        persist = true;
+                    }
+                    _ => return Some(resp_error("ERR syntax error")),
+                }
+                j += 1;
+            }
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
@@ -1365,100 +1301,42 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
 
-            // Parse and apply the optional expiry modifier
-            if cmd.len() >= 3 {
-                let opt = match parse_utf8(cmd[2]) {
-                    Some(s) => s.to_ascii_uppercase(),
-                    None => return Some(resp_error("ERR syntax error")),
-                };
-
-                match opt.as_str() {
-                    "EX" => {
-                        let secs = match cmd.get(3) {
-                            Some(b) => match parse_bytes_as_i128(b) {
-                                Some(s) => s,
-                                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-                            },
-                            None => return Some(resp_error("ERR syntax error")),
-                        };
-                        let exp = match deadline_after_relative_secs(
-                            secs,
-                            ERR_INVALID_EXPIRE_GETEX_CMD,
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => return Some(resp_error(e)),
-                        };
-                        set_expiry(ctx.store, *ctx.selected_db, key, exp);
+            // The time, for a key that is there: a missing one is nil
+            // whatever the time, as in Redis.
+            let deadline = match expire {
+                Some((arg, raw)) if val.is_some() => {
+                    match key_deadline(raw, arg, ERR_INVALID_EXPIRE_GETEX_CMD, applying_stream(ctx))
+                    {
+                        Ok(at) => Some(at),
+                        Err(e) => return Some(resp_error(e)),
                     }
-
-                    "PX" => {
-                        let millis = match cmd.get(3) {
-                            Some(b) => match parse_bytes_as_i128(b) {
-                                Some(m) => m,
-                                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-                            },
-                            None => return Some(resp_error("ERR syntax error")),
-                        };
-                        let exp = match deadline_after_relative_millis(
-                            millis,
-                            ERR_INVALID_EXPIRE_GETEX_CMD,
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => return Some(resp_error(e)),
-                        };
-                        set_expiry(ctx.store, *ctx.selected_db, key, exp);
-                    }
-
-                    // EXAT / PXAT: store absolute wall times (scripts see frozen wall clock).
-                    "EXAT" => {
-                        let unix_secs: u64 = match cmd
-                            .get(3)
-                            .and_then(|b| parse_utf8(b))
-                            .and_then(|s| s.parse().ok())
-                        {
-                            Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in GETEX")),
-                        };
-                        set_expiry(
-                            ctx.store,
-                            *ctx.selected_db,
-                            key,
-                            expiry_unix_secs(unix_secs),
-                        );
-                    }
-
-                    "PXAT" => {
-                        let unix_millis: u64 = match cmd
-                            .get(3)
-                            .and_then(|b| parse_utf8(b))
-                            .and_then(|s| s.parse().ok())
-                        {
-                            Some(n) => n,
-                            None => return Some(resp_error("ERR invalid expire time in GETEX")),
-                        };
-                        set_expiry(
-                            ctx.store,
-                            *ctx.selected_db,
-                            key,
-                            expiry_unix_millis(unix_millis),
-                        );
-                    }
-
-                    "PERSIST" => {
-                        clear_expiry(ctx.store, *ctx.selected_db, key);
-                    }
-
-                    _ => return Some(resp_error("ERR syntax error")),
                 }
-            }
-
-            // What it did to the expiry, as Redis says it.
-            if val.is_some() && cmd.len() >= 3 {
-                let persisted = cmd[2..]
-                    .iter()
-                    .any(|arg| arg.eq_ignore_ascii_case(b"PERSIST"));
-                let event = if persisted { "persist" } else { "expire" };
-                notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, event, key);
+                _ => None,
+            };
+            // Apply it, and say so as Redis does: a time that has already
+            // come deletes the key now (`del`), where it was kept to expire
+            // later, and `persist` only when there was a time to take away.
+            // From a stream the time is set as it is (`expiry::held`).
+            if val.is_some() {
+                let db = *ctx.selected_db;
+                match deadline {
+                    Some(at)
+                        if at <= crate::script_clock::wall_system_time_now()
+                            && !applying_stream(ctx) =>
+                    {
+                        delete_key(ctx.store, db, key);
+                        crate::vector::maybe_unindex(ctx.index_store, db, key);
+                        notify(ctx.pubsub, db, KS_GENERIC, "del", key);
+                    }
+                    Some(at) => {
+                        set_expiry(ctx.store, db, key, at);
+                        notify(ctx.pubsub, db, KS_GENERIC, "expire", key);
+                    }
+                    None if persist && clear_expiry(ctx.store, db, key) => {
+                        notify(ctx.pubsub, db, KS_GENERIC, "persist", key);
+                    }
+                    None => {}
+                }
             }
             match val {
                 Some(v) => Some(resp_bulk(&v)),
@@ -1477,14 +1355,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'lcs' command",
                 ));
             }
-            let key1 = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key1 must be valid UTF-8")),
-            };
-            let key2 = match parse_utf8(cmd[2]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key2 must be valid UTF-8")),
-            };
+            let key1: &[u8] = cmd[1];
+            let key2: &[u8] = cmd[2];
 
             // Parse options
             let mut want_len = false;
@@ -1728,10 +1600,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'digest' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
@@ -1764,10 +1633,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'delex' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             let db_idx = *ctx.selected_db;
 
             // An expired key does not exist; the reply is 0, not nil.
@@ -1842,100 +1708,48 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if cmd.len() < pairs_end {
                 return Some(resp_error("ERR wrong number of key-value pairs"));
             }
-            // NX or XX, and one of EX, PX, EXAT, PXAT and KEEPTTL: each once,
-            // anything else a syntax error, as Redis parses them.
-            {
-                let (mut condition, mut ttl) = (false, false);
-                let mut j = pairs_end;
-                while j < cmd.len() {
-                    let opt = String::from_utf8_lossy(cmd[j]).to_ascii_uppercase();
-                    match opt.as_str() {
-                        "NX" | "XX" if !condition => condition = true,
-                        "KEEPTTL" if !ttl => ttl = true,
-                        "EX" | "PX" | "EXAT" | "PXAT" if !ttl && j + 1 < cmd.len() => {
-                            ttl = true;
-                            j += 1;
-                        }
-                        _ => return Some(resp_error("ERR syntax error")),
-                    }
-                    j += 1;
-                }
-            }
-
-            // Parse options after the pairs
+            // NX or XX, and KEEPTTL or one unit of EX, PX, EXAT and PXAT,
+            // anything else a syntax error, as Redis parses them. The same
+            // option again is taken, and a time given again replaces the
+            // first; only the last is read.
             let mut nx = false;
             let mut xx = false;
-            let mut expiry: Option<SystemTime> = None;
             let mut keepttl = false;
-
+            let mut expire: Option<(TimeArg, &[u8])> = None;
             let mut i = pairs_end;
             while i < cmd.len() {
-                match std::str::from_utf8(cmd[i])
-                    .unwrap_or("")
-                    .to_ascii_uppercase()
-                    .as_str()
+                let opt = cmd[i];
+                let arg = TimeArg::of_option(opt);
+                if opt.eq_ignore_ascii_case(b"NX") && !xx {
+                    nx = true;
+                } else if opt.eq_ignore_ascii_case(b"XX") && !nx {
+                    xx = true;
+                } else if opt.eq_ignore_ascii_case(b"KEEPTTL") && expire.is_none() {
+                    keepttl = true;
+                } else if let Some(arg) = arg
+                    && !keepttl
+                    && i + 1 < cmd.len()
+                    && (expire.is_none_or(|(unit, _)| unit == arg) || applying_stream(ctx))
                 {
-                    "NX" => {
-                        nx = true;
-                    }
-                    "XX" => {
-                        xx = true;
-                    }
-                    "KEEPTTL" => {
-                        keepttl = true;
-                    }
-                    "EX" => {
-                        i += 1;
-                        let secs: u64 = match cmd
-                            .get(i)
-                            .and_then(|b| std::str::from_utf8(b).ok())
-                            .and_then(|s| s.parse().ok())
-                        {
-                            Some(n) if n > 0 => n,
-                            _ => return Some(resp_error("ERR invalid expire time in MSETEX")),
-                        };
-                        expiry = Some(expiry_at_after(Duration::from_secs(secs)));
-                    }
-                    "PX" => {
-                        i += 1;
-                        let ms: u64 = match cmd
-                            .get(i)
-                            .and_then(|b| std::str::from_utf8(b).ok())
-                            .and_then(|s| s.parse().ok())
-                        {
-                            Some(n) if n > 0 => n,
-                            _ => return Some(resp_error("ERR invalid expire time in MSETEX")),
-                        };
-                        expiry = Some(expiry_at_after(Duration::from_millis(ms)));
-                    }
-                    "EXAT" => {
-                        i += 1;
-                        let ts: u64 = match cmd
-                            .get(i)
-                            .and_then(|b| std::str::from_utf8(b).ok())
-                            .and_then(|s| s.parse().ok())
-                        {
-                            Some(n) => n,
-                            None => return Some(resp_error("ERR invalid EXAT timestamp")),
-                        };
-                        expiry = Some(expiry_unix_secs(ts));
-                    }
-                    "PXAT" => {
-                        i += 1;
-                        let ts_ms: u64 = match cmd
-                            .get(i)
-                            .and_then(|b| std::str::from_utf8(b).ok())
-                            .and_then(|s| s.parse().ok())
-                        {
-                            Some(n) => n,
-                            None => return Some(resp_error("ERR invalid PXAT timestamp")),
-                        };
-                        expiry = Some(expiry_unix_millis(ts_ms));
-                    }
-                    _ => {}
+                    expire = Some((arg, cmd[i + 1]));
+                    i += 1;
+                } else {
+                    return Some(resp_error("ERR syntax error"));
                 }
                 i += 1;
             }
+            let expiry: Option<SystemTime> = match expire {
+                Some((arg, raw)) => match key_deadline(
+                    raw,
+                    arg,
+                    ERR_INVALID_EXPIRE_MSETEX_CMD,
+                    applying_stream(ctx),
+                ) {
+                    Ok(t) => Some(t),
+                    Err(e) => return Some(resp_error(e)),
+                },
+                None => None,
+            };
 
             if nx && xx {
                 return Some(resp_error("ERR NX and XX options are mutually exclusive"));
@@ -1947,10 +1761,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if nx || xx {
                 for pair in pairs.as_chunks::<2>().0 {
-                    let key = match parse_utf8(pair[0]) {
-                        Some(k) => k,
-                        None => continue,
-                    };
+                    let key: &[u8] = pair[0];
                     let exists = if is_expired(ctx.store, *ctx.selected_db, key) {
                         delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                         false
@@ -1970,10 +1781,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Write pass
             for pair in pairs.as_chunks::<2>().0 {
-                let key = match parse_utf8(pair[0]) {
-                    Some(k) => k,
-                    None => continue,
-                };
+                let key: &[u8] = pair[0];
                 let value = KiviDBValue::String(SharedBytes::from(pair[1]));
 
                 if keepttl {
@@ -1981,7 +1789,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key);
                     let mut map = write_lock!(shard);
-                    map.insert(Key::from(key), value);
+                    map.insert(key, value);
                 } else {
                     store_value_expiring(ctx.store, *ctx.selected_db, key, value, expiry);
                 }
@@ -2051,10 +1859,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'increx' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // The options as Redis 8.10's `parseIncrExArgumentsOrReply` takes them:
     // each at most once, BYINT or BYFLOAT, one expiration or PERSIST, ENX
@@ -2191,14 +1996,21 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
                 None => return resp_error(ERR_VALUE_NOT_INTEGER),
             };
             if n <= 0 || (matches!(unit, "EX" | "EXAT") && n > i64::MAX / 1000) {
-                return resp_error("ERR invalid expire time in 'increx' command");
+                return resp_error(ERR_INVALID_EXPIRE_INCREX_CMD);
             }
-            IncrexExpiry::Set(match unit {
-                "EX" => expiry_at_after(Duration::from_secs(n as u64)),
-                "PX" => expiry_at_after(Duration::from_millis(n as u64)),
-                "EXAT" => UNIX_EPOCH + Duration::from_secs(n as u64),
-                _ => UNIX_EPOCH + Duration::from_millis(n as u64),
-            })
+            let arg = match unit {
+                "EX" => TimeArg::Secs,
+                "PX" => TimeArg::Millis,
+                "EXAT" => TimeArg::UnixSecs,
+                _ => TimeArg::UnixMillis,
+            };
+            let at = deadline_ms_of(n as i128, arg, ERR_INVALID_EXPIRE_INCREX_CMD, false, true)
+                .ok()
+                .and_then(system_time_from_unix_millis_i128);
+            match at {
+                Some(at) => IncrexExpiry::Set(at),
+                None => return resp_error(ERR_INVALID_EXPIRE_INCREX_CMD),
+            }
         }
     };
 
@@ -2212,7 +2024,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db, &key);
     let mut map = write_lock!(shard);
 
-    let existing: Option<&[u8]> = match map.get(key.as_str()) {
+    let existing: Option<&[u8]> = match map.get(key.as_slice()) {
         None => None,
         Some(ValueRef::String(v)) => Some(v.as_bytes()),
         Some(_) => {
@@ -2309,12 +2121,12 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
 
     // ENX: only set a TTL when the key has none, so a window rate limiter
     // creates a new window without extending a live one.
-    let has_ttl = existed && map.expires(key.as_str()).is_some();
+    let has_ttl = existed && map.expires(key.as_slice()).is_some();
     let new_expiry = match expiry {
         IncrexExpiry::Set(at) if !(enx && has_ttl) => Some(at),
         _ => None,
     };
-    let as_bytes = |s: &str| s.as_bytes().to_vec();
+    let as_bytes = |s: &[u8]| s.to_vec();
 
     // A TTL already past: the key goes, and is propagated as DEL, or UNLINK
     // with `lazyfree-lazy-expire` (Redis 8.10).
@@ -2322,13 +2134,13 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         && at <= SystemTime::now()
     {
         if existed {
-            let removed = map.remove(key.as_str());
+            let removed = map.remove(key.as_slice());
             drop(map);
             drop(removed);
             let lazy = crate::commands::server::remembered_config("lazyfree-lazy-expire")
                 .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
             effect(vec![
-                as_bytes(if lazy { "UNLINK" } else { "DEL" }),
+                as_bytes(if lazy { b"UNLINK" } else { b"DEL" }),
                 as_bytes(&key),
             ]);
             notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", &key);
@@ -2350,15 +2162,19 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
 
     // Propagated as a SET of the result, so float formatting cannot drift on
     // replicas or an AOF replay, with the TTL as it now is (Redis 8.10).
-    let mut set = vec![as_bytes("SET"), as_bytes(&key), as_bytes(&new_repr)];
+    let mut set = vec![
+        as_bytes(b"SET"),
+        as_bytes(&key),
+        as_bytes(new_repr.as_bytes()),
+    ];
     let mut persisted = false;
     if persist {
         persisted = has_ttl;
     } else if let Some(at) = new_expiry {
         let ms = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        set.extend([as_bytes("PXAT"), as_bytes(&ms.to_string())]);
+        set.extend([as_bytes(b"PXAT"), as_bytes(ms.to_string().as_bytes())]);
     } else {
-        set.push(as_bytes("KEEPTTL"));
+        set.push(as_bytes(b"KEEPTTL"));
     }
     effect(set);
 
@@ -2425,10 +2241,14 @@ mod write_shards_tests {
         let mset = {
             let (db, keys, locked) = (Arc::clone(&db), keys.clone(), Arc::clone(&locked));
             std::thread::spawn(move || {
-                let mut shards = WriteShards::lock(&db, keys.iter().map(String::as_str));
+                let mut shards = WriteShards::lock(&db, keys.iter().map(String::as_bytes));
                 locked.store(true, Ordering::SeqCst);
                 for key in &keys {
-                    drop(shards.map(key).set_str_expiring(key.as_str(), b"v", None));
+                    drop(
+                        shards
+                            .map(key.as_bytes())
+                            .set_str_expiring(key.as_str(), b"v", None),
+                    );
                 }
             })
         };
@@ -2477,8 +2297,8 @@ mod write_shards_tests {
                         // A different window of the keys each time, so the
                         // writers overlap in some shards and not others.
                         let from = (w * 3 + round) % keys.len();
-                        let mine: Vec<&str> = (0..5)
-                            .map(|i| keys[(from + i * 2) % keys.len()].as_str())
+                        let mine: Vec<&[u8]> = (0..5)
+                            .map(|i| keys[(from + i * 2) % keys.len()].as_bytes())
                             .collect();
                         let _shards = WriteShards::lock(&db, mine.iter().copied());
                         let held: Vec<usize> = shards_of(&db, mine.iter().copied());

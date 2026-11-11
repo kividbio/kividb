@@ -520,7 +520,9 @@ fn himport_creates_hashes_from_a_prepared_fieldset() {
 #[test]
 fn hsetex_takes_its_ttl_as_an_option() {
     let mut c = conn();
-    let far = "99999999999"; // a Unix time in seconds, comfortably in the future
+    // A Unix time in seconds, comfortably in the future, and before the
+    // latest Redis lets a field have (2^46 - 1 ms, in 4199).
+    let far = "70000000000";
     assert_eq!(
         c.cmd(&[
             "HSETEX", "hx:k", "EXAT", far, "FIELDS", "2", "f1", "Hello", "f2", "World"
@@ -2132,6 +2134,247 @@ fn new_commands_reach_a_replica_as_their_effects() {
         r.cmd(&["TS.GET", "rp:counter"]),
         m.cmd(&["TS.GET", "rp:counter"])
     );
+}
+
+/// A series `TS.INCRBY` makes with options, and one `TS.ALTER` changes to a
+/// default value, are the same on a replica (#555, #565): its settings, its
+/// labels, and its samples, trimmed to the retention.
+#[test]
+fn time_series_options_reach_a_replica() {
+    let master_port = free_port();
+    start(master_port, None);
+    let replica_port = free_port();
+    start(replica_port, Some(master_port));
+    let mut m = Conn::connect(master_port);
+    let mut r = Conn::connect(replica_port);
+    wait_until("the replica to sync", || {
+        r.cmd(&["INFO", "replication"])
+            .s()
+            .contains("master_link_status:up")
+    });
+
+    // A label whose value is `TIMESTAMP`, and no TIMESTAMP option: the
+    // master's clock is sent, and the label kept.
+    m.cmd(&[
+        "TS.INCRBY",
+        "rp:ts:c",
+        "5",
+        "RETENTION",
+        "100000000",
+        "CHUNK_SIZE",
+        "128",
+        "LABELS",
+        "kind",
+        "TIMESTAMP",
+    ]);
+    m.cmd(&["TS.CREATE", "rp:ts:r", "RETENTION", "1000"]);
+    m.cmd(&["TS.INCRBY", "rp:ts:r", "1", "TIMESTAMP", "1000"]);
+    m.cmd(&["TS.INCRBY", "rp:ts:r", "1", "TIMESTAMP", "5000"]);
+    m.cmd(&[
+        "TS.CREATE",
+        "rp:ts:a",
+        "RETENTION",
+        "5000",
+        "CHUNK_SIZE",
+        "128",
+        "LABELS",
+        "x",
+        "y",
+    ]);
+    assert!(
+        m.cmd(&[
+            "TS.ALTER",
+            "rp:ts:a",
+            "RETENTION",
+            "0",
+            "CHUNK_SIZE",
+            "4096",
+            "LABELS"
+        ])
+        .ok()
+    );
+    // A word left over from `LABELS` is passed over, on the replica too:
+    // the timestamp the master used is sent before the list, not after it,
+    // where the word became a label with it.
+    for (key, labels) in [
+        ("rp:ts:o1", &["a"][..]),
+        ("rp:ts:o2", &["a", "b", "c"]),
+        ("rp:ts:o3", &["a", "b", "UNCOMPRESSED"]),
+        ("rp:ts:o4", &["a", "TIMESTAMP", "*"]),
+    ] {
+        let mut cmd = vec!["TS.INCRBY", key, "2", "LABELS"];
+        cmd.extend_from_slice(labels);
+        assert!(m.cmd(&cmd).i() > 0, "{cmd:?}");
+    }
+    // `TS.MADD` with a sample BLOCK refuses in the middle, on a series whose
+    // retention would trim at its time: refused alone, nothing trimmed, and
+    // the others added, on both.
+    m.cmd(&["TS.CREATE", "rp:ts:m", "DUPLICATE_POLICY", "BLOCK"]);
+    m.cmd(&["TS.ADD", "rp:ts:m", "1", "1"]);
+    m.cmd(&["TS.ADD", "rp:ts:m", "100", "1"]);
+    m.cmd(&["TS.ALTER", "rp:ts:m", "RETENTION", "10"]);
+    m.cmd(&["TS.CREATE", "rp:ts:x"]);
+    let replies = m.cmd(&[
+        "TS.MADD", "rp:ts:x", "1", "1", "rp:ts:m", "100", "5", "rp:ts:x", "2", "2",
+    ]);
+    let replies = replies.arr();
+    assert_eq!(replies[0].i(), 1);
+    assert!(replies[1].is_err(), "{replies:?}");
+    assert_eq!(replies[2].i(), 2);
+    assert_eq!(m.cmd(&["TS.RANGE", "rp:ts:m", "-", "+"]).arr().len(), 2);
+    // `ON_DUPLICATE`: for the sample; the series keeps `BLOCK`.
+    m.cmd(&["TS.CREATE", "rp:ts:d", "DUPLICATE_POLICY", "BLOCK"]);
+    m.cmd(&["TS.ADD", "rp:ts:d", "1", "1"]);
+    assert_eq!(
+        m.cmd(&["TS.ADD", "rp:ts:d", "1", "5", "ON_DUPLICATE", "SUM"])
+            .i(),
+        1
+    );
+    assert_eq!(m.cmd(&["WAIT", "1", "5000"]).i(), 1);
+
+    for key in [
+        "rp:ts:c", "rp:ts:r", "rp:ts:a", "rp:ts:o1", "rp:ts:o2", "rp:ts:o3", "rp:ts:o4", "rp:ts:d",
+        "rp:ts:m", "rp:ts:x",
+    ] {
+        let (on_master, on_replica) = (m.cmd(&["TS.INFO", key]), r.cmd(&["TS.INFO", key]));
+        for field in [
+            "retentionTime",
+            "chunkSize",
+            "duplicatePolicy",
+            "labels",
+            "lastTimestamp",
+            "totalSamples",
+        ] {
+            assert_eq!(
+                on_replica.field(field),
+                on_master.field(field),
+                "{key} {field}"
+            );
+        }
+        assert_eq!(
+            r.cmd(&["TS.RANGE", key, "-", "+"]),
+            m.cmd(&["TS.RANGE", key, "-", "+"]),
+            "{key}"
+        );
+    }
+    let info = m.cmd(&["TS.INFO", "rp:ts:c"]);
+    assert_eq!(info.field("retentionTime").s(), "100000000");
+    assert_eq!(info.field("chunkSize").s(), "128");
+    assert_eq!(
+        r.cmd(&["TS.QUERYINDEX", "kind=TIMESTAMP"]).strings(),
+        ["rp:ts:c"]
+    );
+    assert_eq!(m.cmd(&["TS.RANGE", "rp:ts:r", "-", "+"]).arr().len(), 1);
+    let altered = r.cmd(&["TS.INFO", "rp:ts:a"]);
+    assert_eq!(altered.field("retentionTime").s(), "0");
+    assert_eq!(altered.field("chunkSize").s(), "4096");
+    assert_eq!(altered.field("labels"), &V::Arr(vec![]));
+    // The labels `TS.ALTER` took away are out of the index, on both.
+    for c in [&mut m, &mut r] {
+        assert!(c.cmd(&["TS.QUERYINDEX", "x=y"]).arr().is_empty());
+    }
+    assert_eq!(
+        r.cmd(&["TS.QUERYINDEX", "a=b"]).strings(),
+        ["rp:ts:o2", "rp:ts:o3"]
+    );
+    assert_eq!(
+        r.cmd(&["TS.QUERYINDEX", "a=TIMESTAMP"]).strings(),
+        ["rp:ts:o4"]
+    );
+    assert_eq!(
+        r.cmd(&["TS.RANGE", "rp:ts:d", "-", "+"]),
+        m.cmd(&["TS.RANGE", "rp:ts:d", "-", "+"])
+    );
+    assert_eq!(r.cmd(&["TS.GET", "rp:ts:d"]).arr()[1].s(), "6");
+    assert_eq!(
+        r.cmd(&["TS.INFO", "rp:ts:d"]).field("duplicatePolicy").s(),
+        "block"
+    );
+}
+
+/// A compaction's destination past its time and not yet reaped, then made
+/// again and given its source again; one deleted and made again; a source
+/// and a destination renamed: the replica's links and compactions are the
+/// master's (#593). Active expiry is off meanwhile, so the destination is
+/// still there, past its time, when its source closes a bucket.
+#[test]
+fn time_series_links_reach_a_replica() {
+    let master_port = free_port();
+    start(master_port, None);
+    let replica_port = free_port();
+    start(replica_port, Some(master_port));
+    let mut m = Conn::connect(master_port);
+    let mut r = Conn::connect(replica_port);
+    wait_until("the replica to sync", || {
+        r.cmd(&["INFO", "replication"])
+            .s()
+            .contains("master_link_status:up")
+    });
+    let rule = |c: &mut Conn, s: &str, d: &str| {
+        c.cmd(&["TS.CREATERULE", s, d, "AGGREGATION", "sum", "10"])
+    };
+
+    assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).ok());
+    for key in [
+        "rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s", "rl:z:d", "rl:w:s", "rl:w:a", "rl:w:b",
+    ] {
+        m.cmd(&["TS.CREATE", key]);
+    }
+    // A destination renamed onto another of its source's: one rule left.
+    for dest in ["rl:w:a", "rl:w:b"] {
+        assert!(rule(&mut m, "rl:w:s", dest).ok());
+    }
+    assert!(m.cmd(&["RENAME", "rl:w:a", "rl:w:b"]).ok());
+    m.cmd(&["TS.ADD", "rl:w:s", "1", "1"]);
+    m.cmd(&["TS.ADD", "rl:w:s", "15", "1"]);
+    assert_eq!(m.cmd(&["TS.INFO", "rl:w:s"]).field("rules").arr().len(), 1);
+    for tag in ["x", "y", "z"] {
+        let (s, d) = (format!("rl:{tag}:s"), format!("rl:{tag}:d"));
+        assert!(rule(&mut m, &s, &d).ok());
+        m.cmd(&["TS.ADD", &s, "1", "1"]);
+    }
+    // Expired, not reaped.
+    assert_eq!(m.cmd(&["PEXPIRE", "rl:x:d", "1"]).i(), 1);
+    thread::sleep(Duration::from_millis(50));
+    m.cmd(&["TS.ADD", "rl:x:s", "15", "1"]);
+    assert!(m.cmd(&["TS.CREATE", "rl:x:d"]).ok());
+    assert!(rule(&mut m, "rl:x:s", "rl:x:d").ok());
+    m.cmd(&["TS.ADD", "rl:x:s", "25", "1"]);
+    // Deleted.
+    assert_eq!(m.cmd(&["DEL", "rl:y:d"]).i(), 1);
+    m.cmd(&["TS.ADD", "rl:y:s", "15", "1"]);
+    assert!(m.cmd(&["TS.CREATE", "rl:y:d"]).ok());
+    assert!(rule(&mut m, "rl:y:s", "rl:y:d").ok());
+    m.cmd(&["TS.ADD", "rl:y:s", "25", "1"]);
+    // Renamed.
+    assert!(m.cmd(&["RENAME", "rl:z:s", "rl:z:s2"]).ok());
+    assert_eq!(m.cmd(&["RENAMENX", "rl:z:d", "rl:z:d2"]).i(), 1);
+    m.cmd(&["TS.ADD", "rl:z:s2", "15", "1"]);
+    assert!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).ok());
+    assert_eq!(m.cmd(&["WAIT", "1", "5000"]).i(), 1);
+
+    for key in [
+        "rl:x:s", "rl:x:d", "rl:y:s", "rl:y:d", "rl:z:s2", "rl:z:d2", "rl:w:s", "rl:w:b",
+    ] {
+        let (on_master, on_replica) = (m.cmd(&["TS.INFO", key]), r.cmd(&["TS.INFO", key]));
+        for field in ["sourceKey", "rules", "totalSamples"] {
+            assert_eq!(
+                on_replica.field(field),
+                on_master.field(field),
+                "{key} {field}"
+            );
+        }
+        assert_eq!(
+            r.cmd(&["TS.RANGE", key, "-", "+"]),
+            m.cmd(&["TS.RANGE", key, "-", "+"]),
+            "{key}"
+        );
+    }
+    for key in ["rl:x:d", "rl:y:d"] {
+        let range = m.cmd(&["TS.RANGE", key, "-", "+"]);
+        assert_eq!(range.arr().len(), 1, "{key}: {range:?}");
+    }
+    assert_eq!(m.cmd(&["TS.RANGE", "rl:z:d2", "-", "+"]).arr().len(), 1);
 }
 
 /// Writes that give a TTL as "this long from now", in every spelling, and the

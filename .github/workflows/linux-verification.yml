@@ -120,10 +120,13 @@ jobs:
           cache: pip
 
       - name: Install client deps
+        # A stalled mirror once held this step until the job's own limit
+        # (45 min); fail fast instead, so a rerun is quick.
+        timeout-minutes: 10
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq redis-tools
-          pip install -r tests/e2e/requirements.txt
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y -qq redis-tools
+          pip install --timeout 30 --retries 5 -r tests/e2e/requirements.txt
 
       - name: Report kernel io_uring support
         # Informational, but printed before the server starts so a uring

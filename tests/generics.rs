@@ -1853,6 +1853,45 @@ fn test_expiretime_already_expired() {
     assert!(c.cmds(&["GET", "k"]).is_nil());
 }
 
+/// `TTL` rounds what is left to the nearest second, as Redis's
+/// `(ms + 500) / 1000`: 1400 ms is 1, where it was rounded up to 2, and
+/// 1900 ms is 2. `PTTL` is the whole milliseconds, as given (#557).
+#[test]
+fn ttl_rounds_to_the_nearest_second_as_in_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (px, secs) in [("1400", 1), ("1900", 2), ("100", 0), ("10000", 10)] {
+        c.cmds(&["SET", "k", "v", "PX", px]);
+        assert_eq!(c.cmds(&["TTL", "k"]).as_int(), secs, "TTL of PX {px}");
+    }
+    c.cmds(&["SET", "k", "v", "PX", "1499"]);
+    let pttl = c.cmds(&["PTTL", "k"]).as_int();
+    assert!((1000..=1499).contains(&pttl), "PTTL {pttl}");
+}
+
+/// `EXPIRETIME` rounds the time of day to the nearest second, as `TTL`
+/// does and as Redis does; `PEXPIRETIME` is the millisecond given (#557).
+#[test]
+fn expiretime_rounds_to_the_nearest_second_as_in_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "v"]);
+    for (at, secs) in [
+        ("4102444800000", 4102444800),
+        ("4102444800499", 4102444800),
+        ("4102444800500", 4102444801),
+        ("4102444800999", 4102444801),
+    ] {
+        assert_eq!(c.cmds(&["PEXPIREAT", "k", at]).as_int(), 1);
+        assert_eq!(c.cmds(&["EXPIRETIME", "k"]).as_int(), secs, "of {at}");
+        assert_eq!(c.cmds(&["PEXPIRETIME", "k"]).as_int().to_string(), at);
+    }
+}
+
 // Wrong arity — both commands take exactly one argument
 #[test]
 fn test_expiretime_arity() {
@@ -2187,6 +2226,146 @@ fn test_resp2_tracking_without_redirect_is_sent_nothing() {
     assert!(try_read_with_timeout(&mut c1, Duration::from_millis(300)).is_none());
     // And its next reply is the reply.
     assert_eq!(c1.cmds(&["GET", "quiet"]).as_str(), "v2");
+}
+
+/// Client-side caching is told of the keys a write changed, the keys a
+/// `WATCH` on fails for, and of no other key it names, as Redis tells it
+/// from `signalModifiedKey` (#584): of `BLPOP a b` that takes from `b`, `b`;
+/// of `SUNIONSTORE`, the destination; of a `DEL`, the keys that were there;
+/// of a write that changed nothing, nothing.
+#[test]
+fn test_tracking_is_told_only_of_the_keys_a_write_changed() {
+    let port = free_port();
+    start_server(port);
+    let mut tracker = Conn::connect(port);
+    let mut told = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    let told_id = told.cmds(&["CLIENT", "ID"]).as_int().to_string();
+    told.cmds(&["SUBSCRIBE", "__redis__:invalidate"]);
+    let tracking = tracker.cmds(&[
+        "CLIENT", "TRACKING", "ON", "REDIRECT", &told_id, "BCAST", "PREFIX", "t584:",
+    ]);
+    assert!(tracking.is_ok(), "{tracking:?}");
+    // Everything `told` is sent until it has been quiet for a while.
+    let drain = |told: &mut Conn| {
+        let mut all = Vec::new();
+        while let Some(more) = try_read_with_timeout(told, Duration::from_millis(200)) {
+            all.extend(more);
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    };
+    let named = |frames: &str, key: &str| frames.contains(&format!("${}\r\n{key}\r\n", key.len()));
+
+    c.cmds(&["RPUSH", "t584:b", "x"]);
+    c.cmds(&["SADD", "t584:s1", "a"]);
+    c.cmds(&["SADD", "t584:s2", "b"]);
+    c.cmds(&["SET", "t584:x", "v"]);
+    c.cmds(&["SET", "t584:n", "v"]);
+    drain(&mut told);
+
+    c.cmds(&["BLPOP", "t584:a", "t584:b", "0"]);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:b"), "{frames:?}");
+    assert!(!named(&frames, "t584:a"), "{frames:?}");
+
+    c.cmds(&["SUNIONSTORE", "t584:d", "t584:s1", "t584:s2"]);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:d"), "{frames:?}");
+    assert!(
+        !named(&frames, "t584:s1") && !named(&frames, "t584:s2"),
+        "{frames:?}"
+    );
+
+    c.cmds(&["DEL", "t584:x", "t584:missing"]);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:x"), "{frames:?}");
+    assert!(!named(&frames, "t584:missing"), "{frames:?}");
+
+    // A key named twice and deleted the first time has changed.
+    c.cmds(&["SET", "t584:twice", "v"]);
+    drain(&mut told);
+    assert_eq!(c.cmds(&["DEL", "t584:twice", "t584:twice"]).as_int(), 1);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:twice"), "{frames:?}");
+    c.cmds(&["SET", "t584:twice", "v"]);
+    drain(&mut told);
+    assert_eq!(c.cmds(&["UNLINK", "t584:twice", "t584:twice"]).as_int(), 1);
+    let frames = drain(&mut told);
+    assert!(named(&frames, "t584:twice"), "{frames:?}");
+
+    assert!(c.cmds(&["SET", "t584:n", "w", "NX"]).is_nil());
+    c.cmds(&["LPOP", "t584:missing"]);
+    let frames = drain(&mut told);
+    assert!(frames.is_empty(), "{frames:?}");
+}
+
+/// The same in the default mode, where a client is told of the keys it has
+/// read: of the keys a write names, only those it changed (#584).
+#[test]
+fn test_default_tracking_is_told_only_of_the_keys_a_write_changed() {
+    let port = free_port();
+    start_server(port);
+    let mut tracker = Conn::connect(port);
+    let mut told = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    let told_id = told.cmds(&["CLIENT", "ID"]).as_int().to_string();
+    told.cmds(&["SUBSCRIBE", "__redis__:invalidate"]);
+    let tracking = tracker.cmds(&["CLIENT", "TRACKING", "ON", "REDIRECT", &told_id]);
+    assert!(tracking.is_ok(), "{tracking:?}");
+    let drain = |told: &mut Conn| {
+        let mut all = Vec::new();
+        while let Some(more) = try_read_with_timeout(told, Duration::from_millis(200)) {
+            all.extend(more);
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    };
+    let named = |frames: &str, key: &str| frames.contains(&format!("${}\r\n{key}\r\n", key.len()));
+    // The tracker reads `keys`, `c` runs `command`: the keys `told` hears of.
+    let mut told_of = |keys: &[&str], command: &[&str]| -> Vec<String> {
+        for key in keys {
+            tracker.cmds(&["EXISTS", key]);
+        }
+        drain(&mut told);
+        let reply = c.cmds(command);
+        assert!(
+            !matches!(reply, RespValue::Error(_)),
+            "{command:?}: {reply:?}"
+        );
+        let frames = drain(&mut told);
+        keys.iter()
+            .filter(|key| named(&frames, key))
+            .map(|key| key.to_string())
+            .collect()
+    };
+
+    let mut setup = Conn::connect(port);
+    setup.cmds(&["RPUSH", "dt:b", "x"]);
+    setup.cmds(&["SADD", "dt:s1", "a"]);
+    setup.cmds(&["SET", "dt:x", "v"]);
+    setup.cmds(&["SET", "dt:twice", "v"]);
+    setup.cmds(&["SET", "dt:unlinked", "v"]);
+    setup.cmds(&["SET", "dt:n", "v"]);
+    assert_eq!(
+        told_of(&["dt:a", "dt:b"], &["BLPOP", "dt:a", "dt:b", "0"]),
+        ["dt:b"]
+    );
+    assert_eq!(
+        told_of(&["dt:s1", "dt:d"], &["SUNIONSTORE", "dt:d", "dt:s1"]),
+        ["dt:d"]
+    );
+    assert_eq!(
+        told_of(&["dt:x", "dt:missing"], &["DEL", "dt:x", "dt:missing"]),
+        ["dt:x"]
+    );
+    assert_eq!(
+        told_of(&["dt:twice"], &["DEL", "dt:twice", "dt:twice"]),
+        ["dt:twice"]
+    );
+    assert_eq!(
+        told_of(&["dt:unlinked"], &["UNLINK", "dt:unlinked", "dt:unlinked"]),
+        ["dt:unlinked"]
+    );
+    assert!(told_of(&["dt:n"], &["SET", "dt:n", "w", "NX"]).is_empty());
 }
 
 // RESP3 target: must get a 2-element push frame with no literal "push" element.
@@ -3055,4 +3234,33 @@ fn test_client_list_reports_transactions_and_blocked_clients() {
     }
     observer.cmds(&["LPUSH", "never-pushed", "x"]);
     blocked.join().unwrap();
+}
+
+/// `DUMP` and `RESTORE` of the empty key (#441). `MIGRATE` of it is in
+/// tests/backup.rs: it needs two processes.
+#[test]
+fn test_dump_and_restore_of_the_empty_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmds(&["SET", "", "x"]).is_ok());
+    let RespValue::Bulk(payload) = c.cmds(&["DUMP", ""]) else {
+        panic!("DUMP of the empty key");
+    };
+    assert!(
+        c.cmd(&[b"RESTORE", b"", b"0", &payload, b"REPLACE"])
+            .is_ok()
+    );
+    assert_eq!(c.cmds(&["GET", ""]).as_str(), "x");
+    assert!(c.cmd(&[b"RESTORE", b"copy", b"0", &payload]).is_ok());
+    assert_eq!(c.cmds(&["GET", "copy"]).as_str(), "x");
+
+    // A hash with an empty field, under the empty key.
+    assert_eq!(c.cmds(&["DEL", ""]).as_int(), 1);
+    assert_eq!(c.cmds(&["HSET", "", "", "v"]).as_int(), 1);
+    let RespValue::Bulk(payload) = c.cmds(&["DUMP", ""]) else {
+        panic!("DUMP of the empty key");
+    };
+    assert!(c.cmd(&[b"RESTORE", b"hcopy", b"0", &payload]).is_ok());
+    assert_eq!(c.cmds(&["HGET", "hcopy", ""]).as_str(), "v");
 }

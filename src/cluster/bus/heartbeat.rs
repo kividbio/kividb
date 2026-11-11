@@ -399,7 +399,9 @@ async fn check_election(
             // Election timeout: 10 seconds. After that, abandon and re-start
             // next tick if master is still FAIL.
             let now = now_ms_local();
-            if now.saturating_sub(election.started_at_ms) > 10_000 {
+            if now.saturating_sub(election.started_at_ms)
+                > crate::cluster::ELECTION_LIFETIME.as_millis() as u64
+            {
                 log_warn!(
                     "Cluster: Election at epoch {} timed out with {} of {} votes — abandoning",
                     election.epoch,
@@ -719,6 +721,15 @@ pub(crate) async fn answer_mfstart(
         }
         (replica.ip.clone(), replica.client_port)
     };
+    // Not while an atomic slot migration away from this node hands slots
+    // over (#516): see `ClusterState::failover_may_begin`.
+    if let Err(why) = state.failover_may_begin() {
+        log_warn!(
+            "Cluster: Manual failover requested by {} refused: {why}",
+            node_id_str(&replica_id)
+        );
+        return None;
+    }
 
     // Held until the replica has taken over (this node follows it then), or,
     // once the replica's time is up, until this node has made sure it still
@@ -807,7 +818,16 @@ pub async fn run_manual_failover(
     .await?;
     let target_offset = match reply {
         Some(BusMessage::MfAck { target_offset, .. }) => target_offset,
-        _ => return Err("master did not acknowledge the failover request".into()),
+        _ => {
+            return Err(
+                "the master did not acknowledge the failover request. It refuses one \
+                        while an atomic slot migration away from it hands slots over, and for \
+                        a few seconds after one, or while an import into it takes slots \
+                        over; its log says why (\"Manual failover requested by ... refused\"). \
+                        Ask again in a few seconds"
+                    .into(),
+            );
+        }
     };
 
     // Catch up to the point the master stopped at.

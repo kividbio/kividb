@@ -38,10 +38,7 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
     match sub {
         // Read-only — work in both standalone and cluster modes
         "INFO" => return cmd_info(state),
-        "MYID" => return cmd_myid(state),
         "KEYSLOT" => return cmd_keyslot(&ctx.cmd),
-        "COUNTKEYSINSLOT" => return cmd_countkeysinslot(ctx),
-        "GETKEYSINSLOT" => return cmd_getkeysinslot(ctx),
         "NODES" => return cmd_nodes(state),
         "SLOTS" => return cmd_slots(state),
         "SHARDS" => return cmd_shards(state),
@@ -51,7 +48,7 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "DELSLOTS" => return cmd_delslots(state, &ctx.cmd),
         "ADDSLOTSRANGE" => return cmd_addslotsrange(ctx),
         "DELSLOTSRANGE" => return cmd_delslotsrange(state, &ctx.cmd),
-        "FLUSHSLOTS" => return cmd_flushslots(state),
+        "FLUSHSLOTS" => return cmd_flushslots(ctx),
         "BUMPEPOCH" => return cmd_bumpepoch(state),
         "SET-CONFIG-EPOCH" => return cmd_set_config_epoch(state, &ctx.cmd),
         "SAVECONFIG" => return cmd_saveconfig(state),
@@ -61,12 +58,24 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
 
     // Anything past this point requires cluster mode for now.
     // (ADDSLOTS / SETSLOT / MEET come in later steps; until they exist we
-    // return the same error redis-cli expects, instead of "unknown".)
+    // return the same error redis-cli expects, instead of "unknown".) A
+    // subcommand there is no such thing as is unknown either way, as in
+    // Redis.
     if !state.enabled {
+        if crate::commands::arity::of(&format!("CLUSTER|{sub}")).is_none()
+            && !matches!(sub, "MIGRATION" | "SYNCSLOTS")
+        {
+            return unknown_cluster_subcommand(ctx);
+        }
         return resp_error("ERR This instance has cluster support disabled");
     }
 
     match sub {
+        // As in Redis, these refuse on a node with cluster support disabled
+        // (#563): there is no node id, and a slot means nothing.
+        "MYID" => cmd_myid(state),
+        "COUNTKEYSINSLOT" => cmd_countkeysinslot(ctx),
+        "GETKEYSINSLOT" => cmd_getkeysinslot(ctx),
         "MEET" => cmd_meet(ctx),
         "FORGET" => cmd_forget(ctx),
         "COUNT-FAILURE-REPORTS" => cmd_count_failure_reports(ctx),
@@ -84,8 +93,87 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "MIGRATION" => cmd_migration(ctx),
         // Node-to-node half of CLUSTER MIGRATION; not for clients.
         "SYNCSLOTS" => cmd_syncslots(ctx),
-        other => resp_error(&format!("ERR Unknown CLUSTER subcommand '{other}'")),
+        "HELP" if ctx.cmd.len() == 2 => cluster_help(),
+        _ => unknown_cluster_subcommand(ctx),
     }
+}
+
+/// Redis's reply to a `CLUSTER` subcommand there is no such thing as.
+fn unknown_cluster_subcommand(ctx: &Ctx) -> Vec<u8> {
+    resp_error(&format!(
+        "ERR unknown subcommand '{}'. Try CLUSTER HELP.",
+        String::from_utf8_lossy(ctx.cmd[1])
+    ))
+}
+
+/// `CLUSTER HELP`, Redis 8.10's lines (#562).
+fn cluster_help() -> Vec<u8> {
+    const LINES: &[&str] = &[
+        "CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "COUNTKEYSINSLOT <slot>",
+        "    Return the number of keys in <slot>.",
+        "GETKEYSINSLOT <slot> <count>",
+        "    Return key names stored by current node in a slot.",
+        "INFO",
+        "    Return information about the cluster.",
+        "KEYSLOT <key>",
+        "    Return the hash slot for <key>.",
+        "MYID",
+        "    Return the node id.",
+        "MYSHARDID",
+        "    Return the node's shard id.",
+        "NODES",
+        "    Return cluster configuration seen by node. Output format:",
+        "    <id> <ip:port@bus-port[,hostname]> <flags> <master> <pings> <pongs> <epoch> <link> <slot> ...",
+        "REPLICAS <node-id>",
+        "    Return <node-id> replicas.",
+        "SLOTS",
+        "    Return information about slots range mappings. Each range is made of:",
+        "    start, end, master and replicas IP addresses, ports and ids",
+        "SLOT-STATS",
+        "    Return an array of slot usage statistics for slots assigned to the current node.",
+        "SHARDS",
+        "    Return information about slot range mappings and the nodes associated with them.",
+        "ADDSLOTS <slot> [<slot> ...]",
+        "    Assign slots to current node.",
+        "ADDSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...]",
+        "    Assign slots which are between <start-slot> and <end-slot> to current node.",
+        "BUMPEPOCH",
+        "    Advance the cluster config epoch.",
+        "COUNT-FAILURE-REPORTS <node-id>",
+        "    Return number of failure reports for <node-id>.",
+        "DELSLOTS <slot> [<slot> ...]",
+        "    Delete slots information from current node.",
+        "DELSLOTSRANGE <start slot> <end slot> [<start slot> <end slot> ...]",
+        "    Delete slots information which are between <start-slot> and <end-slot> from current node.",
+        "FAILOVER [FORCE|TAKEOVER]",
+        "    Promote current replica node to being a master.",
+        "FORGET <node-id>",
+        "    Remove a node from the cluster.",
+        "FLUSHSLOTS",
+        "    Delete current node own slots information.",
+        "MEET <ip> <port> [<bus-port>]",
+        "    Connect nodes into a working cluster.",
+        "REPLICATE <node-id>",
+        "    Configure current node as replica to <node-id>.",
+        "RESET [HARD|SOFT]",
+        "    Reset current node (default: soft).",
+        "SET-CONFIG-EPOCH <epoch>",
+        "    Set config epoch of current node.",
+        "SETSLOT <slot> (IMPORTING <node-id>|MIGRATING <node-id>|STABLE|NODE <node-id>)",
+        "    Set slot state.",
+        "SAVECONFIG",
+        "    Force saving cluster configuration on disk.",
+        "LINKS",
+        "    Return information about all network links between this node and its peers.",
+        "    Output format is an array where each array element is a map containing attributes of a link",
+        "MIGRATION IMPORT <start-slot end-slot [start-slot end-slot ...]> |",
+        "          STATUS [ID <task-id> | ALL] | CANCEL [ID <task-id> | ALL]",
+        "    Start, monitor and cancel slot migration.",
+        "HELP",
+        "    Print this help.",
+    ];
+    resp_array(LINES.iter().map(|line| resp_simple(line)).collect())
 }
 
 // ── CLUSTER MYID ─────────────────────────────────────────────────────────────
@@ -185,7 +273,7 @@ fn cmd_countkeysinslot(ctx: &Ctx) -> Vec<u8> {
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            if key_hash_slot(k.as_bytes()) == slot {
+            if key_hash_slot(k) == slot {
                 count += 1;
             }
         }
@@ -203,21 +291,30 @@ fn cmd_getkeysinslot(ctx: &Ctx) -> Vec<u8> {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let count: usize = match std::str::from_utf8(ctx.cmd[3])
+    let count: i64 = match std::str::from_utf8(ctx.cmd[3])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
         None => return resp_error("ERR value is not an integer or out of range"),
     };
+    if count < 0 {
+        return resp_error("ERR Invalid slot or number of keys");
+    }
+    let count = count as usize;
 
     let db = &ctx.store[*ctx.selected_db];
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(count.min(64));
+    // A count of 0 is an empty array, as in Redis: the loop below pushes
+    // a key before it compares (#563).
+    if count == 0 {
+        return resp_array(out);
+    }
     'outer: for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            if key_hash_slot(k.as_bytes()) == slot {
-                out.push(resp_bulk_str(k));
+            if key_hash_slot(k) == slot {
+                out.push(resp_bulk(k));
                 if out.len() >= count {
                     break 'outer;
                 }
@@ -592,23 +689,18 @@ fn cmd_addslots(ctx: &mut Ctx) -> Vec<u8> {
             Err(e) => return e,
         }
     }
-    // Reject duplicates inside the same call. Real Redis returns this error.
-    {
-        let mut seen = std::collections::HashSet::with_capacity(slots.len());
-        for &s in &slots {
-            if !seen.insert(s) {
-                return resp_error(&format!("ERR Slot {s} specified multiple times"));
-            }
-        }
+    // Every slot is checked (free, and named once) before any is claimed,
+    // as in Redis: one busy slot claims none of them. The earlier ones used
+    // to stay claimed, unsaved and with `cluster_state` stale (#553).
+    if let Err(e) = state.check_slots_claimable(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTS") {
         return refused;
     }
     let state: &ClusterState = ctx.cluster;
-    for s in &slots {
-        if let Err(e) = state.claim_slot(*s) {
-            return resp_error(&format!("ERR {e}"));
-        }
+    if let Err(e) = state.claim_slots(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
@@ -676,7 +768,9 @@ fn cmd_addslotsrange(ctx: &mut Ctx) -> Vec<u8> {
             Err(e) => return e,
         };
         if start > end {
-            return resp_error(&format!("ERR Invalid range {start}-{end}"));
+            return resp_error(&format!(
+                "ERR start slot number {start} is greater than end slot number {end}"
+            ));
         }
         ranges.push((start, end));
         i += 2;
@@ -686,17 +780,17 @@ fn cmd_addslotsrange(ctx: &mut Ctx) -> Vec<u8> {
         .iter()
         .flat_map(|&(start, end)| start..=end)
         .collect();
+    // All the ranges or none, as in Redis. A busy slot in a later range
+    // used to leave the earlier ranges claimed, unsaved (#553).
+    if let Err(e) = state.check_slots_claimable(&slots) {
+        return resp_error(&format!("ERR {e}"));
+    }
     if let Some(refused) = before_slots_come(ctx, &slots, "ADDSLOTSRANGE") {
         return refused;
     }
     let state: &ClusterState = ctx.cluster;
-    // Apply each range. claim_slot_range is itself atomic per-range; if a
-    // later range fails, earlier ones stay claimed. That matches Redis's
-    // observable behavior.
-    for (start, end) in ranges {
-        if let Err(e) = state.claim_slot_range(start, end) {
-            return resp_error(&format!("ERR {e}"));
-        }
+    if let Err(e) = state.claim_slots(&slots) {
+        return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
@@ -753,12 +847,31 @@ fn cmd_delslotsrange(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
     resp_simple("OK")
 }
 
-/// CLUSTER FLUSHSLOTS — clear all our slot assignments.
-fn cmd_flushslots(state: &ClusterState) -> Vec<u8> {
+/// CLUSTER FLUSHSLOTS — give up every slot this node owns, as Redis's
+/// `clusterDelNodeSlots(myself)`. Refused while the node holds keys, as in
+/// Redis. It used to unassign every slot in this node's view, the other
+/// masters' too, keys or not, and the node went to `cluster_state:fail`
+/// (#552).
+fn cmd_flushslots(ctx: &Ctx) -> Vec<u8> {
+    let state: &ClusterState = ctx.cluster;
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
-    state.flush_slots();
+    {
+        // No write lands between the check and the flush: the writes in
+        // the gate are waited for, and the next ones held back, until the
+        // slots are gone. Those find them gone, and are refused. (Not
+        // inside a transaction or a script: nothing runs beside them.)
+        let _cut = (!crate::command_gate::alone_on_this_thread()).then(crate::write_gate::cut);
+        let has_keys = ctx
+            .store
+            .iter()
+            .any(|db| db.iter().any(|shard| !crate::read_lock!(shard).is_empty()));
+        if has_keys {
+            return resp_error("ERR DB must be empty to perform CLUSTER FLUSHSLOTS.");
+        }
+        state.flush_slots();
+    }
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
             "ERR FLUSHSLOTS persisted in memory but disk save failed: {e}"
@@ -767,27 +880,31 @@ fn cmd_flushslots(state: &ClusterState) -> Vec<u8> {
     resp_simple("OK")
 }
 
-/// CLUSTER BUMPEPOCH — increment current_epoch and return the new value.
-/// Real Redis only bumps if it's actually higher than known epochs in the
-/// cluster; with no gossip yet, ours always succeeds. Returns "BUMPED <n>"
-/// or "STILL <n>" — matching Redis's wire format exactly so cluster scripts
-/// that parse this string keep working.
+/// CLUSTER BUMPEPOCH — give this node a config epoch of its own, above
+/// every other one, unless it has one already: `BUMPED <n>` or `STILL <n>`,
+/// with this node's config epoch, as Redis's
+/// `clusterBumpConfigEpochWithoutConsensus`. It used to raise only the
+/// current epoch, and always said `BUMPED` (#563).
 fn cmd_bumpepoch(state: &ClusterState) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
-    let new = state.bump_epoch();
+    let (bumped, epoch) = state.bump_config_epoch_without_consensus();
+    if !bumped {
+        return resp_simple(&format!("STILL {epoch}"));
+    }
     // Save to disk so the bump survives restart.
     if let Err(e) = state.save_to_disk() {
         return resp_error(&format!(
             "ERR BUMPEPOCH persisted in memory but disk save failed: {e}"
         ));
     }
-    resp_simple(&format!("BUMPED {new}"))
+    resp_simple(&format!("BUMPED {epoch}"))
 }
 
 /// CLUSTER SET-CONFIG-EPOCH <epoch>
-/// Only valid when our current config_epoch is 0 (i.e. fresh node).
+/// Only on a fresh node: one that knows no other node and has no config
+/// epoch yet, as in Redis.
 fn cmd_set_config_epoch(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(state) {
         return err;
@@ -795,14 +912,17 @@ fn cmd_set_config_epoch(state: &ClusterState, cmd: &[&[u8]]) -> Vec<u8> {
     if cmd.len() != 3 {
         return resp_error("ERR wrong number of arguments for 'cluster|set-config-epoch' command");
     }
-    let new_epoch: u64 = match std::str::from_utf8(cmd[2])
+    let new_epoch: i64 = match std::str::from_utf8(cmd[2])
         .ok()
         .and_then(|s| s.parse().ok())
     {
         Some(n) => n,
         None => return resp_error("ERR value is not an integer or out of range"),
     };
-    if let Err(e) = state.set_my_config_epoch(new_epoch) {
+    if new_epoch < 0 {
+        return resp_error(&format!("ERR Invalid config epoch specified: {new_epoch}"));
+    }
+    if let Err(e) = state.set_my_config_epoch(new_epoch as u64) {
         return resp_error(&format!("ERR {e}"));
     }
     if let Err(e) = state.save_to_disk() {
@@ -931,9 +1051,15 @@ fn cmd_count_failure_reports(ctx: &mut Ctx) -> Vec<u8> {
             "ERR wrong number of arguments for 'cluster|count-failure-reports' command",
         );
     }
-    let id = match crate::cluster::node::parse_node_id(cmd[2]) {
-        Some(id) => id,
-        None => return resp_error("ERR Invalid node id"),
+    // A node this one does not know is an error, as in Redis; it used to
+    // count 0 failure reports for it (#563).
+    let id = crate::cluster::node::parse_node_id(cmd[2])
+        .filter(|id| ctx.cluster.nodes.read().contains_key(id));
+    let Some(id) = id else {
+        return resp_error(&format!(
+            "ERR Unknown node {}",
+            String::from_utf8_lossy(cmd[2])
+        ));
     };
     let count = ctx.cluster.failure_report_count(id);
     resp_integer(count as i64)
@@ -1169,6 +1295,9 @@ fn cmd_failover(ctx: &mut Ctx) -> Vec<u8> {
 // the next command runs, whether it succeeded or not.
 
 fn cmd_asking(ctx: &mut Ctx) -> Vec<u8> {
+    if let Some(err) = require_cluster_mode(ctx.cluster) {
+        return err;
+    }
     ctx.client_registry.update(ctx.client_id, |info| {
         info.asking = true;
     });
@@ -1185,7 +1314,14 @@ fn cmd_asking(ctx: &mut Ctx) -> Vec<u8> {
 // later: "if asking_flag OR (readonly_flag AND slot owned by my master),
 // accept the read."
 
+//
+// All three refuse on a node with cluster support disabled, as in Redis
+// (#563).
+
 fn cmd_readonly(ctx: &mut Ctx) -> Vec<u8> {
+    if let Some(err) = require_cluster_mode(ctx.cluster) {
+        return err;
+    }
     ctx.client_registry.update(ctx.client_id, |info| {
         info.readonly = true;
     });
@@ -1193,6 +1329,9 @@ fn cmd_readonly(ctx: &mut Ctx) -> Vec<u8> {
 }
 
 fn cmd_readwrite(ctx: &mut Ctx) -> Vec<u8> {
+    if let Some(err) = require_cluster_mode(ctx.cluster) {
+        return err;
+    }
     ctx.client_registry.update(ctx.client_id, |info| {
         info.readonly = false;
     });
@@ -1467,7 +1606,7 @@ fn cmd_migration(ctx: &mut Ctx) -> Vec<u8> {
 //     source → destination: a key, or a write, belonging to the slots
 // CLUSTER SYNCSLOTS TAKEOVER <task-id>
 //     source → destination: that was everything; the slots are yours
-// CLUSTER SYNCSLOTS FAIL <task-id> <reason> [start end ...]
+// CLUSTER SYNCSLOTS FAIL <task-id> <reason> [start end ...] [FROM <node-id>]
 //     source → destination: I have given up on this attempt. OK promises the
 //     slots were not taken and will not be in this attempt; an error says
 //     they have been, or are being, taken over
@@ -1515,19 +1654,33 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
                 .get(4)
                 .map(|r| String::from_utf8_lossy(r).into_owned())
                 .unwrap_or_default();
+            let mut rest: &[&[u8]] = ctx.cmd.get(5..).unwrap_or_default();
+            // Who asks, from a source that says (#516).
+            let mut from = None;
+            if let [head @ .., word, id] = rest
+                && word.eq_ignore_ascii_case(b"FROM")
+            {
+                let Some(id) = crate::cluster::node::parse_node_id(id) else {
+                    return resp_error("ERR Invalid node id");
+                };
+                from = Some(id);
+                rest = head;
+            }
             // The slots, from a source that sends them (#278).
-            let ranges = match ctx.cmd.get(5..) {
-                Some(ranges) if !ranges.is_empty() => match migration::parse_ranges(ranges) {
+            let ranges = if rest.is_empty() {
+                Vec::new()
+            } else {
+                match migration::parse_ranges(rest) {
                     Ok(r) => r,
                     Err(e) => return resp_error(&format!("ERR {e}")),
-                },
-                _ => Vec::new(),
+                }
             };
             done(migration::source_failed(
                 ctx.cluster,
                 &task_id,
                 &reason,
                 &ranges,
+                from,
             ))
         }
         "APPLY" => syncslots_apply(ctx, &task_id),
@@ -1546,7 +1699,7 @@ fn syncslots_apply(ctx: &mut Ctx, task_id: &str) -> Vec<u8> {
     if ctx.cmd.len() < 5 {
         return resp_error("ERR syntax error");
     }
-    if let Err(e) = migration::accept_apply(ctx.cluster, task_id) {
+    if let Err(e) = migration::accept_apply(ctx.cluster, task_id, ctx.client_id) {
         return resp_error(&format!("ERR {e}"));
     }
     let inner: Vec<&[u8]> = ctx.cmd[4..].to_vec();
@@ -1599,7 +1752,7 @@ fn slot_has_keys(ctx: &Ctx, slot: u16) -> bool {
     ctx.store[*ctx.selected_db].iter().any(|shard| {
         crate::read_lock!(shard)
             .keys()
-            .any(|k| key_hash_slot(k.as_bytes()) == slot)
+            .any(|k| key_hash_slot(k) == slot)
     })
 }
 
@@ -1651,7 +1804,7 @@ fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
 
 /// One key on its way out: name, serialised value, absolute expiry (0 = none).
 struct Outgoing {
-    key: String,
+    key: crate::store::Key,
     payload: Vec<u8>,
     expires_at_ms: u64,
 }
@@ -1761,10 +1914,9 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut outgoing: Vec<Outgoing> = Vec::with_capacity(keys.len());
-    for key in &keys {
-        let Ok(key) = std::str::from_utf8(key) else {
-            continue;
-        };
+    for &key in &keys {
+        // Any bytes: a key that is not text was skipped here, and the
+        // command answered OK without moving it.
         if crate::commands::helpers::lazy_expire_key(ctx.store, db, key) {
             continue;
         }
@@ -1781,10 +1933,13 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         }
         let payload = match crate::snapshot::dump_payload(&value) {
             Ok(p) => p,
-            Err(e) => return resp_error(&format!("ERR could not serialise '{key}': {e}")),
+            Err(e) => {
+                let key = String::from_utf8_lossy(key);
+                return resp_error(&format!("ERR could not serialise '{key}': {e}"));
+            }
         };
         outgoing.push(Outgoing {
-            key: key.to_string(),
+            key: crate::store::Key::new(key),
             payload,
             expires_at_ms,
         });
@@ -1907,7 +2062,7 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     let taken_back = !not_deleted.kept.is_empty()
         && only_here(ctx, &not_deleted.kept)
         && take_back_copies(&mut reader, &not_deleted.kept);
-    let written: Vec<&str> = not_deleted
+    let written: Vec<&[u8]> = not_deleted
         .kept
         .iter()
         .chain(&not_deleted.gone)
@@ -1979,12 +2134,11 @@ fn hold_while_moving(db: usize, keys: &[&[u8]]) -> Option<MoveHold> {
 }
 
 /// How near its time a hash's field may be and still be on one side only of
-/// [`same_hash_but_for_expired_fields`], and how far apart its two times may
-/// be. The payload's copy of a field's time is up to 2 ms early (the dump
-/// rounds it down to the millisecond twice), the decoder reads it back
-/// against a clock rounded down to the millisecond, and the two sides are
-/// read a moment apart.
-const FIELD_TIME_SLACK: std::time::Duration = std::time::Duration::from_millis(5);
+/// [`same_hash_but_for_expired_fields`]: the two sides are read a moment
+/// apart, and a read between them may have dropped a field that ran out.
+/// Its time, kept as the Unix milliseconds the payload carries, is the
+/// same on both sides to the millisecond (#594).
+const FIELD_TIME_SLACK_MS: u64 = 5;
 
 /// Whether `value`, a hash, holds what `payload` held but for fields whose
 /// time has run out since: a read (`HGETALL`) drops those, and that is no
@@ -1996,24 +2150,18 @@ const FIELD_TIME_SLACK: std::time::Duration = std::time::Duration::from_millis(5
 /// field with each side's own rule, an unchanged hash with a field in its
 /// last 2 ms looked written, and `MIGRATE` answered `TRYAGAIN` (#332). So
 /// the two sides are compared by one clock and one rule: every field that is
-/// not within [`FIELD_TIME_SLACK`] of its time, on either side, is on the
+/// not within [`FIELD_TIME_SLACK_MS`] of its time, on either side, is on the
 /// other side too, with the same value and a time (or none) that agrees.
 fn same_hash_but_for_expired_fields(value: &crate::types::KiviDBValue, payload: &[u8]) -> bool {
     use crate::types::{HashInner, KiviDBValue};
-    use std::time::Instant;
     let (KiviDBValue::HashEx(now), Some(KiviDBValue::HashEx(then))) =
         (value, crate::snapshot::restore_payload(payload))
     else {
         return false;
     };
     let (now, then) = (now.read(), then.read());
-    // The decoder has turned the payload's times into `Instant`s.
-    let soon = Instant::now() + FIELD_TIME_SLACK;
-    let same_time = |a: Option<&Instant>, b: Option<&Instant>| match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.max(b).duration_since(*a.min(b)) <= FIELD_TIME_SLACK,
-        _ => false,
-    };
+    let soon = crate::types::field_now().saturating_add(FIELD_TIME_SLACK_MS);
+    let same_time = |a: Option<&u64>, b: Option<&u64>| a == b;
     // Every field of `a` not about to go is in `b`, the same.
     let held_by = |a: &HashInner, b: &HashInner| {
         a.fields.iter().all(|(field, val)| {
@@ -2062,10 +2210,10 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut del: Vec<Vec<u8>> = vec![b"DEL".to_vec()];
-    let mut kept: Vec<&'a str> = Vec::new();
-    let mut gone: Vec<&'a str> = Vec::new();
+    let mut kept: Vec<&'a [u8]> = Vec::new();
+    let mut gone: Vec<&'a [u8]> = Vec::new();
     for item in moved {
-        let key = item.key.as_str();
+        let key = item.key.as_bytes();
         let shard = crate::store::get_shard(&ctx.store[db], key);
         let removal = {
             let mut map = crate::write_lock!(shard);
@@ -2085,7 +2233,7 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
                 // Freed with the shard unlocked.
                 drop(taken);
                 crate::vector::maybe_unindex(ctx.index_store, db, key);
-                del.push(key.as_bytes().to_vec());
+                del.push(key.to_vec());
             }
             crate::store::Removal::Kept => kept.push(key),
             crate::store::Removal::Absent => {
@@ -2116,10 +2264,10 @@ fn delete_moved<'a>(ctx: &Ctx, db: usize, moved: &[&'a Outgoing], held: bool) ->
 /// What [`delete_moved`] left here.
 struct NotDeleted<'a> {
     /// Keys written while they travelled: here, with their newest value.
-    kept: Vec<&'a str>,
+    kept: Vec<&'a [u8]>,
     /// Keys that went from here meanwhile, other than by their time running
     /// out.
-    gone: Vec<&'a str>,
+    gone: Vec<&'a [u8]>,
     /// The order of the keys, still held: nothing writes them here, or
     /// deletes them, until it is let go of (see [`take_back_copies`]).
     _order: crate::write_order::OrderGuard,
@@ -2138,12 +2286,11 @@ struct NotDeleted<'a> {
 /// a node that is not the owner, which clients do not reach anyway), and
 /// not outside cluster mode, where clients may write at the destination
 /// directly.
-fn only_here(ctx: &Ctx, keys: &[&str]) -> bool {
+fn only_here(ctx: &Ctx, keys: &[&[u8]]) -> bool {
     ctx.cluster.enabled
-        && keys.iter().all(|key| {
-            ctx.cluster
-                .owns_slot(crate::cluster::key_hash_slot(key.as_bytes()))
-        })
+        && keys
+            .iter()
+            .all(|key| ctx.cluster.owns_slot(crate::cluster::key_hash_slot(key)))
 }
 
 /// Delete at the destination the copies of `keys` that this `MIGRATE` sent,
@@ -2159,7 +2306,7 @@ fn only_here(ctx: &Ctx, keys: &[&str]) -> bool {
 /// (#295).
 fn take_back_copies(
     reader: &mut std::io::BufReader<Box<dyn crate::node_tls::ReadWrite>>,
-    keys: &[&str],
+    keys: &[&[u8]],
 ) -> bool {
     use std::io::Write;
     let mut pipeline = Vec::new();
@@ -2169,7 +2316,7 @@ fn take_back_copies(
         ]));
         pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(&[
             b"DEL".to_vec(),
-            key.as_bytes().to_vec(),
+            key.to_vec(),
         ]));
     }
     let sock = reader.get_mut();
@@ -2193,12 +2340,12 @@ fn take_back_copies(
 /// keys as though the slot were empty here; run again (with `REPLACE`, or
 /// `--cluster-replace`, as the destination holds a copy) it takes the keys
 /// along with their writes.
-fn written_while_moving(keys: &[&str], addr: &str, taken_back: bool) -> String {
+fn written_while_moving(keys: &[&[u8]], addr: &str, taken_back: bool) -> String {
     const SHOWN: usize = 5;
     let mut names = keys
         .iter()
         .take(SHOWN)
-        .map(|k| format!("'{k}'"))
+        .map(|k| format!("'{}'", String::from_utf8_lossy(k)))
         .collect::<Vec<_>>()
         .join(", ");
     if keys.len() > SHOWN {
@@ -2262,6 +2409,10 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'cluster|reset' command");
     };
 
+    // As in FLUSHSLOTS: no write lands between the check for keys below
+    // and the reset dropping the slots.
+    let cut = (!crate::command_gate::alone_on_this_thread()).then(crate::write_gate::cut);
+
     // Redis refuses to reset a master that holds keys: the reset drops its
     // slots, and the keys would be left belonging to nothing. (A replica's
     // dataset is flushed by the reset instead.)
@@ -2295,6 +2446,7 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
         ctx.cluster.soft_reset();
         log_info!("Cluster: Soft reset performed");
     }
+    drop(cut);
 
     // Drop our replica relationship if any.
     ctx.repl_state.become_master();
@@ -2475,7 +2627,7 @@ pub(crate) fn key_counts_per_slot(
     for shard in db.iter() {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
-            let slot = key_hash_slot(k.as_bytes());
+            let slot = key_hash_slot(k);
             if owned[slot as usize] {
                 *counts.entry(slot).or_insert(0) += 1;
             }
@@ -2488,10 +2640,10 @@ pub(crate) fn key_counts_per_slot(
 mod tests {
     use super::*;
     use crate::types::{HashInner, KiviDBValue};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// A hash of `(field, value, time)`.
-    fn hash(fields: &[(&str, &str, Option<Instant>)]) -> KiviDBValue {
+    fn hash(fields: &[(&str, &str, Option<u64>)]) -> KiviDBValue {
         let mut inner = HashInner::new();
         for (field, value, time) in fields {
             inner
@@ -2508,30 +2660,27 @@ mod tests {
         crate::snapshot::dump_payload(value).unwrap()
     }
 
-    /// A field a few milliseconds from its time: the payload's copy of the
-    /// time was rounded down past now, and the decoder drops the field,
-    /// while here it is still live. The hash is unchanged (#332).
+    /// A field a few milliseconds from its time, on one side and not the
+    /// other, or with times that differ: a read between the two may have
+    /// dropped it. The hash is unchanged (#332).
     #[test]
     fn a_hash_whose_field_is_about_to_expire_is_unchanged() {
-        let now = Instant::now();
-        let later = now + Duration::from_secs(3600);
+        let now = crate::types::field_now();
+        let later = now + 3_600_000;
         let sent = payload(&hash(&[
             ("kept", "1", None),
             ("timed", "2", Some(later)),
-            ("brief", "3", Some(now - Duration::from_millis(1))),
+            ("brief", "3", Some(now - 1)),
         ]));
         let here = hash(&[
             ("kept", "1", None),
             ("timed", "2", Some(later)),
-            ("brief", "3", Some(now + Duration::from_millis(3))),
+            ("brief", "3", Some(now + 3)),
         ]);
         assert!(same_hash_but_for_expired_fields(&here, &sent));
         // And the other way round: the field is gone here, and still in the
         // payload, a moment from its time.
-        let sent = payload(&hash(&[
-            ("kept", "1", None),
-            ("brief", "3", Some(now + Duration::from_millis(3))),
-        ]));
+        let sent = payload(&hash(&[("kept", "1", None), ("brief", "3", Some(now + 3))]));
         let here = hash(&[("kept", "1", None)]);
         assert!(same_hash_but_for_expired_fields(&here, &sent));
     }
@@ -2540,7 +2689,7 @@ mod tests {
     /// the edge, is a write.
     #[test]
     fn a_hash_written_while_it_travelled_is_not_the_same() {
-        let later = Instant::now() + Duration::from_secs(3600);
+        let later = crate::types::field_now() + 3_600_000;
         let sent = payload(&hash(&[("a", "1", None), ("b", "2", Some(later))]));
         for here in [
             hash(&[("a", "9", None), ("b", "2", Some(later))]),
@@ -2549,10 +2698,10 @@ mod tests {
             hash(&[("a", "1", None)]),
             hash(&[("a", "1", None), ("b", "2", None)]),
             hash(&[("a", "1", Some(later)), ("b", "2", Some(later))]),
-            hash(&[
-                ("a", "1", None),
-                ("b", "2", Some(later + Duration::from_secs(1))),
-            ]),
+            hash(&[("a", "1", None), ("b", "2", Some(later + 1_000))]),
+            // Given another time a millisecond off: a write too, now that
+            // both sides keep the very millisecond (#594).
+            hash(&[("a", "1", None), ("b", "2", Some(later + 1))]),
         ] {
             assert!(!same_hash_but_for_expired_fields(&here, &sent));
         }

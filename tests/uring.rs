@@ -230,6 +230,27 @@ fn the_server_is_running_on_io_uring() {
     assert!(!log.contains("io_uring unavailable"), "{log}");
 }
 
+/// `HELLO` reports the Redis release this server follows, as `INFO`'s
+/// `redis_version` does, on this loop too (#451).
+#[test]
+fn hello_reports_the_release_it_follows() {
+    let server = Server::start();
+    let mut c = Conn::connect(server.port);
+    let V::Map(pairs) = c.cmd(&["HELLO", "3"]) else {
+        panic!("HELLO 3 is not a map");
+    };
+    let get = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == s(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("no {name} in HELLO: {pairs:?}"))
+    };
+    assert_eq!(get("server"), s("redis"));
+    assert_eq!(get("version"), s("8.10.0"));
+    assert_eq!(get("kividb_version"), s(env!("CARGO_PKG_VERSION")));
+}
+
 fn client_list_line<'a>(list: &'a V, identity: &str) -> Option<&'a str> {
     let V::Str(list) = list else {
         panic!("CLIENT LIST did not return a string: {list:?}");
@@ -807,6 +828,21 @@ fn the_shared_machinery_is_reached() {
         panic!("INFO commandstats");
     };
     assert!(stats.contains("cmdstat_append:calls=2,"), "{stats}");
+
+    // The commands the connection answers itself are counted too.
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+    assert!(c.cmd(&["WATCH", "us:s"]).ok());
+    assert!(c.cmd(&["UNWATCH"]).ok());
+    assert!(matches!(c.cmd(&["HELLO", "2"]), V::Arr(_)));
+    let V::Str(stats) = c.cmd(&["INFO", "commandstats"]) else {
+        panic!("INFO commandstats");
+    };
+    for name in ["watch", "unwatch", "hello"] {
+        assert!(
+            stats.contains(&format!("cmdstat_{name}:calls=1,")),
+            "{name}: {stats}"
+        );
+    }
 }
 
 // ── What this loop got wrong, or made easy to get wrong ───────────────────────

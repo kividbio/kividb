@@ -430,10 +430,11 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     // write. The walk takes each key's write order and reads it as it is
     // then (`vector::walk_documents`), so it cannot put back what a write
     // to the key has replaced. A clone of the definition shares its live
-    // indexes.
+    // indexes. Added once the writes that found no index are done, if it is
+    // the first (`vector::Indexes::write_to_add`, #570).
     def.name = name.clone();
     {
-        let mut store = ctx.index_store.write();
+        let mut store = ctx.index_store.write_to_add()?;
         if store.contains_key(&name) {
             return Err("Index already exists".into());
         }
@@ -464,7 +465,11 @@ fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<V
 }
 
 /// Documents the index covers: hashes, or JSON documents, under its prefixes.
-fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
+pub(crate) fn count_docs(
+    db: &Db,
+    def: &IndexDef,
+    cluster: Option<&crate::cluster::ClusterState>,
+) -> usize {
     // Read before any shard is locked: not the slot table with one held
     // (see `ClusterState`).
     let served = cluster.map(crate::cluster::search::served_slots);
@@ -475,7 +480,7 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
                 .iter()
                 .filter(|(key, value)| {
                     crate::vector::is_document(&def.on, *value)
-                        && covers(def, key)
+                        && def.covers(key)
                         && served
                             .as_deref()
                             .is_none_or(|served| crate::cluster::search::in_served(served, key))
@@ -485,8 +490,10 @@ fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterS
         .sum()
 }
 
+/// Whether the index covers the document named `key` (a name: see
+/// `key_bytes::text_of`).
 fn covers(def: &IndexDef, key: &str) -> bool {
-    def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    def.covers(&crate::key_bytes::bytes_of(key))
 }
 
 pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
@@ -503,7 +510,8 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let def = &def;
     let resp = ctx.resp;
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
-    let mut num_docs = count_docs(&ctx.store[*ctx.selected_db], def, cluster);
+    // The index's own database, whichever the client has selected.
+    let mut num_docs = count_docs(&ctx.store[def.db_index], def, cluster);
     // In a cluster, the documents of every master.
     if crate::cluster::search::coordinates(ctx) {
         let owned: Vec<Vec<u8>> = ctx.cmd.iter().map(|a| a.to_vec()).collect();
@@ -810,10 +818,12 @@ pub(crate) fn scan_docs(
             let this_run = left.min(run);
             if expired.is_empty() {
                 for (key, value) in docs.by_ref().take(this_run) {
-                    each(key, value);
+                    each(&crate::key_bytes::text_of(key), value);
                 }
             } else {
                 for (key, value) in docs.by_ref().take(this_run) {
+                    let key = crate::key_bytes::text_of(key);
+                    let key: &str = &key;
                     if !expired.contains(key) {
                         each(key, value);
                     }
@@ -834,7 +844,9 @@ fn expired_in(map: &crate::store::ShardMap) -> AHashSet<String> {
     }
     let now = crate::commands::helpers::now_ms();
     let (due, _) = map.due(now, usize::MAX);
-    due.into_iter().map(|key| key.to_string()).collect()
+    due.into_iter()
+        .map(|key| crate::key_bytes::text_of(&key).into_owned())
+        .collect()
 }
 
 /// Whether a step over `n` items that cannot stop part-way (a sort) is to
@@ -1089,7 +1101,10 @@ fn plan_in(
     // a hash whose sweep ran in between, its write queued behind this read:
     // the postings had it as it was, and it was not tried. FT.AGGREGATE then
     // counted a document the filter no longer matched (#347).
-    let watched = crate::field_expiry::watched_keys(store, db);
+    let watched: Vec<String> = crate::field_expiry::watched_keys(store, db)
+        .iter()
+        .map(|key| crate::key_bytes::text_of(key).into_owned())
+        .collect();
     let (mut ids, exact, volatile) = {
         let p = def.postings.read();
         if !p.enabled() || p.unused {
@@ -1252,6 +1267,9 @@ pub(crate) fn filter_each(
     // up in it by key (#371).
     let watched = if has_words(filter) {
         crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
+            .iter()
+            .map(|key| crate::key_bytes::text_of(key).into_owned())
+            .collect()
     } else {
         Vec::new()
     };
@@ -1337,9 +1355,11 @@ pub(crate) fn with_doc<R>(
     // Out of the shard, so that its lock is not held while `f` runs. A key
     // whose time to live has ended is no document, though nothing has
     // deleted it yet.
+    // A document is named by `key_bytes::text_of` of its key.
+    let key = crate::key_bytes::bytes_of(key);
     let value = {
-        let map = crate::store::get_shard(db, key).read();
-        let (value, expires) = map.get_expiring(key)?;
+        let map = crate::store::get_shard(db, &*key).read();
+        let (value, expires) = map.get_expiring(&*key)?;
         if expires.is_some_and(crate::commands::helpers::is_past) {
             return None;
         }
@@ -1561,7 +1581,7 @@ fn page_from_postings(
         // Documents that left the index since the plan was made.
         ids.and_with(p.live());
         for key in &expired {
-            if let Some(id) = p.id(key) {
+            if let Some(id) = p.id(&crate::key_bytes::text_of(key)) {
                 ids.unset(id);
             }
         }
@@ -1928,10 +1948,12 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 if n > cmd.len().saturating_sub(i + 2) {
                     return Err("Bad arguments for INKEYS: not enough keys".into());
                 }
+                // Named as documents are (`key_bytes::text_of`), so a key
+                // that is not plain UTF-8 still finds its document.
                 args.inkeys = Some(
                     cmd[i + 2..i + 2 + n]
                         .iter()
-                        .map(|a| text(a).to_string())
+                        .map(|a| crate::key_bytes::text_of(a).into_owned())
                         .collect(),
                 );
                 i += 2 + n;
@@ -2336,7 +2358,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     // In a cluster, only the keys of the slots this node serves: a key part
     // of the way through a migration is not counted twice.
     if ctx.cluster.enabled {
-        hits.retain(|hit| crate::cluster::search::serves(ctx.cluster, &hit.key));
+        hits.retain(|hit| {
+            crate::cluster::search::serves(ctx.cluster, &*crate::key_bytes::bytes_of(&hit.key))
+        });
     }
     let scores_matter = shard
         .then(|| crate::cluster::search::scores_matter(&ctx.cmd))
@@ -2550,7 +2574,10 @@ fn encode_page(
         let results: Vec<Vec<u8>> = page
             .iter()
             .map(|hit| {
-                let mut entry = vec![resp_bulk_str("id"), resp_bulk_str(&hit.key)];
+                let mut entry = vec![
+                    resp_bulk_str("id"),
+                    resp_bulk(&crate::key_bytes::bytes_of(&hit.key)),
+                ];
                 if args.withscores {
                     entry.push(resp_bulk_str("score"));
                     entry.push(resp3_score(hit.score));
@@ -2598,7 +2625,7 @@ fn encode_page(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + page.len() * 2);
     out.push(resp_integer(total as i64));
     for hit in page {
-        out.push(resp_bulk_str(&hit.key));
+        out.push(resp_bulk(&crate::key_bytes::bytes_of(&hit.key)));
         if args.withscores {
             out.push(resp_bulk_str(&score_text(hit.score)));
         }
@@ -2704,7 +2731,15 @@ fn coordinate(
             total += n.max(0) as usize;
         }
         while let Some(key) = items.next() {
-            let key = key.text().unwrap_or_default();
+            // A master sends the key's bytes (`bytes_of` of its name): it is
+            // a name again by `text_of`, as `encode_page` expects. It was
+            // decoded lossily, so a key that is not text came back as
+            // U+FFFD, and one with a character of the escape's block in it
+            // as other bytes.
+            let key = match key {
+                Reply::Bulk(Some(raw)) => crate::key_bytes::text_of(&raw).into_owned(),
+                other => other.text().unwrap_or_default(),
+            };
             let score = items
                 .next()
                 .and_then(|s| s.text())
@@ -2837,7 +2872,7 @@ mod tests {
             if key == "d347:b" {
                 inner
                     .expiries
-                    .insert("n".into(), Instant::now() + Duration::from_millis(1));
+                    .insert("n".into(), crate::types::field_now() + 1);
             }
             crate::store::get_shard(&store[0], key).write().insert(
                 key,

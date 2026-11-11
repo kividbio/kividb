@@ -529,10 +529,128 @@ fn test_flushdb_drops_indexes_for_selected_db_only() {
         !names.contains(&"idx:db1"),
         "FLUSHDB on db 1 must drop idx:db1, got {names:?}"
     );
+    // `FT._LIST` lists the selected database's indexes.
+    c.cmds(&["SELECT", "0"]);
+    let list = c.cmds(&["FT._LIST"]);
+    let names: Vec<&str> = list.as_array().iter().map(|v| v.as_str()).collect();
     assert!(
         names.contains(&"idx:db0"),
         "FLUSHDB on db 1 must keep idx:db0, got {names:?}"
     );
+}
+
+/// An index is its database's (#447). `FT._LIST` lists the selected
+/// database's indexes only: it used to list those of every database. From
+/// another database, an index, or an alias of one, is not there: every
+/// command that names one replies as for an index that does not exist, and
+/// none of them reads, changes or drops it.
+#[test]
+fn an_index_is_seen_only_from_its_own_database() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let names = |c: &mut Conn| -> Vec<String> {
+        let mut names: Vec<String> = c
+            .cmds(&["FT._LIST"])
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let create = |c: &mut Conn, name: &str, prefix: &str| {
+        let reply = c.cmds(&[
+            "FT.CREATE",
+            name,
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            prefix,
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "tag",
+            "TAG",
+        ]);
+        assert!(reply.is_ok(), "{reply:?}");
+    };
+    create(&mut c, "idx:zero", "z:");
+    c.cmds(&["HSET", "z:1", "t", "hello", "tag", "a"]);
+    assert!(c.cmds(&["FT.ALIASADD", "al:zero", "idx:zero"]).is_ok());
+
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert!(names(&mut c).is_empty());
+    let missing = |name: &str| format!("SEARCH_INDEX_NOT_FOUND Index not found: {name}");
+    for (args, name) in [
+        (vec!["FT.INFO", "idx:zero"], "idx:zero"),
+        (vec!["FT.SEARCH", "idx:zero", "hello"], "idx:zero"),
+        (vec!["FT.SEARCH", "al:zero", "hello"], "al:zero"),
+        (vec!["FT.AGGREGATE", "idx:zero", "*"], "idx:zero"),
+        (vec!["FT.EXPLAIN", "idx:zero", "hello"], "idx:zero"),
+        (vec!["FT.TAGVALS", "idx:zero", "tag"], "idx:zero"),
+        (vec!["FT.ALIASLIST", "idx:zero"], "idx:zero"),
+        (
+            vec!["FT.ALTER", "idx:zero", "SCHEMA", "ADD", "u", "TEXT"],
+            "idx:zero",
+        ),
+        (vec!["FT.ALIASADD", "al:one", "idx:zero"], "idx:zero"),
+        (vec!["FT.ALIASUPDATE", "al:one", "al:zero"], "al:zero"),
+        (vec!["FT.CURSOR", "READ", "idx:zero", "1"], "idx:zero"),
+        (vec!["FT.DEBUG", "POSTINGS", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "PAGE", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "COMPACT", "idx:zero", "t"], "idx:zero"),
+        (vec!["FT.DROPINDEX", "idx:zero"], "idx:zero"),
+        (vec!["FT.DROPINDEX", "idx:zero", "DD"], "idx:zero"),
+    ] {
+        let reply = c.cmds(&args);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if *e == missing(name)),
+            "{args:?}: {reply:?}"
+        );
+    }
+    let reply = c.cmds(&["FT.ALIASDEL", "al:zero"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Alias does not exist"),
+        "{reply:?}"
+    );
+
+    create(&mut c, "idx:one", "o:");
+    c.cmds(&["HSET", "o:1", "t", "hello"]);
+    assert_eq!(names(&mut c), ["idx:one"]);
+    assert_eq!(
+        c.cmds(&["FT.SEARCH", "idx:one", "hello", "NOCONTENT"])
+            .as_array()[0]
+            .as_int(),
+        1
+    );
+    // Database 0's alias is not moved to this database's index: it used to
+    // be, and was then gone from database 0.
+    let reply = c.cmds(&["FT.ALIASUPDATE", "al:zero", "idx:one"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Alias already exists"),
+        "{reply:?}"
+    );
+
+    // Nothing above reached database 0's index, nor its alias.
+    assert!(c.cmds(&["SELECT", "0"]).is_ok());
+    assert_eq!(names(&mut c), ["idx:zero"]);
+    for index in ["idx:zero", "al:zero"] {
+        let found = c.cmds(&["FT.SEARCH", index, "hello", "NOCONTENT"]);
+        assert_eq!(found.as_array()[0].as_int(), 1, "{index}: {found:?}");
+    }
+    assert_eq!(c.cmds(&["EXISTS", "z:1"]).as_int(), 1);
+    let reply = c.cmds(&["FT.INFO", "idx:one"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if *e == missing("idx:one")),
+        "{reply:?}"
+    );
+    assert!(c.cmds(&["FT.DROPINDEX", "idx:zero"]).is_ok());
+    assert!(names(&mut c).is_empty());
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert_eq!(names(&mut c), ["idx:one"]);
 }
 
 #[test]
@@ -1050,18 +1168,18 @@ fn test_ft_spellcheck_uses_incremental_vocab() {
         "newly added word should be found in vocabulary"
     );
 
-    // Document deletion should NOT remove tokens from vocabulary
-    // (this is intentional — see comments in vector/mod.rs).
+    // A word no document holds any more is not offered, as in RediSearch
+    // once its GC has run (#583).
     c.cmds(&["DEL", "doc:1"]);
     let r3 = c.cmds(&["FT.SPELLCHECK", "idx", "helo", "DISTANCE", "1"]);
     let arr3 = r3.as_array();
-    assert!(!arr3.is_empty(), "vocab should retain tokens after delete");
+    assert!(!arr3.is_empty(), "helo is still misspelled");
     let suggestions3 = arr3[0].as_array()[2].as_array();
     assert!(
-        suggestions3
+        !suggestions3
             .iter()
             .any(|s| s.as_array()[1].as_str() == "hello"),
-        "hello should still be in vocab after doc:1 delete (append-only vocab)"
+        "hello is in no document after doc:1 is deleted: {r3:?}"
     );
 }
 
@@ -4780,8 +4898,38 @@ fn a_fields_time_is_told_in_full_when_asked_at_once() {
             .as_array()[0]
             .as_int();
         assert_eq!(told.to_string(), at, "HPEXPIRETIME");
+        // Rounded up, as Redis does: (expire + 999) / 1000.
         let told = c.cmds(&["HEXPIRETIME", "h", "FIELDS", "1", "c"]).as_array()[0].as_int();
-        assert_eq!(told, 4102444800, "HEXPIRETIME");
+        assert_eq!(told, 4102444801, "HEXPIRETIME");
+    }
+}
+
+/// A field's time is rounded as Redis's `httlGenericCommand` rounds it:
+/// `HTTL` and `HEXPIRETIME` up to the next second, `HPTTL` and
+/// `HPEXPIRETIME` in whole milliseconds. Not to the nearest second, as a
+/// key's `TTL` and `EXPIRETIME` are (#557).
+#[test]
+fn a_fields_time_is_rounded_up_as_in_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["HSET", "h", "a", "x", "b", "y", "c", "z"]);
+    c.cmds(&["HPEXPIRE", "h", "1400", "FIELDS", "1", "a"]);
+    let told = c.cmds(&["HTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
+    assert_eq!(told, 2, "HTTL of 1400 ms");
+    let told = c.cmds(&["HPTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
+    assert!((1000..=1400).contains(&told), "HPTTL {told}");
+    // A whole second reads back as itself; a millisecond past it, as the
+    // next.
+    for (at, secs) in [("4102444800000", 4102444800), ("4102444800001", 4102444801)] {
+        c.cmds(&["HPEXPIREAT", "h", at, "FIELDS", "1", "b"]);
+        let told = c.cmds(&["HEXPIRETIME", "h", "FIELDS", "1", "b"]).as_array()[0].as_int();
+        assert_eq!(told, secs, "HEXPIRETIME of {at}");
+        let told = c
+            .cmds(&["HPEXPIRETIME", "h", "FIELDS", "1", "b"])
+            .as_array()[0]
+            .as_int();
+        assert_eq!(told.to_string(), at, "HPEXPIRETIME of {at}");
     }
 }
 

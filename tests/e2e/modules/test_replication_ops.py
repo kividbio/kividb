@@ -76,8 +76,8 @@ def make_client(port: int, **kwargs) -> redis.Redis:
 # ── WAIT tests ────────────────────────────────────────────────────────────────
 
 class TestWait:
-    def test_wait_no_replicas_returns_zero_immediately(self):
-        """WAIT on a standalone master returns 0 without blocking."""
+    def test_wait_no_replicas_returns_zero_after_the_timeout(self):
+        """WAIT on a standalone master waits out its timeout and returns 0, as Redis does."""
         port = free_port()
         proc = start_server(port)
         try:

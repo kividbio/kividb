@@ -46,7 +46,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.extend_from_slice(&resp_integer(e.duration_us as i64));
 
                 // The command as a nested array
-                let cmd_arr: Vec<Vec<u8>> = e.cmd.iter().map(|s| resp_bulk_str(s)).collect();
+                let cmd_arr: Vec<Vec<u8>> = e.cmd.iter().map(|s| resp_bulk(s)).collect();
                 out.extend_from_slice(&resp_array(cmd_arr));
 
                 out.extend_from_slice(&resp_bulk_str(&e.client_addr));
@@ -80,10 +80,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 "    Print this help.",
             ]
             .iter()
-            .map(|l| resp_bulk_str(l))
+            .map(|l| resp_simple(l))
             .collect(),
         )),
 
-        _ => Some(resp_error("ERR unknown subcommand for SLOWLOG")),
+        _ => Some(resp_error(&format!(
+            "ERR unknown subcommand '{}'. Try SLOWLOG HELP.",
+            String::from_utf8_lossy(ctx.cmd[1])
+        ))),
     }
 }

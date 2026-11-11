@@ -30,13 +30,14 @@ pub(crate) mod key_specs;
 pub mod latency;
 mod list_move;
 mod lists;
+pub(crate) mod login;
 #[cfg(feature = "lua")]
 mod lua;
 #[cfg(feature = "lua")]
 pub(crate) use lua::{
     cached_script_declares_no_writes, cached_script_declares_writes, function_declares_no_writes,
     library_snapshot, lua_command_runs_long_sync_vm, restore_library_snapshot,
-    script_declares_no_writes, script_declares_writes, take_last_vm_run_us,
+    script_declares_no_writes, script_declares_writes, take_last_vm_run_us, with_client_resp,
 };
 #[cfg(not(feature = "lua"))]
 mod lua {
@@ -58,6 +59,7 @@ mod lua {
 // `purge_allocator` after it swaps the old dataset out; the MEMORY subcommand
 // handlers themselves stay internal.
 pub(crate) mod memory;
+mod memory_layout;
 mod pubsub;
 pub(crate) mod search;
 pub(crate) mod search_tools;
@@ -72,7 +74,9 @@ pub(crate) mod streams;
 mod strftime;
 mod strings;
 pub mod transaction;
-mod ts;
+// `pub(crate)` only so `replication::script_feed` finds where a
+// `TS.INCRBY` has its `TIMESTAMP`, as the command reads it.
+pub(crate) mod ts;
 mod ts_query;
 mod vector;
 mod vset;

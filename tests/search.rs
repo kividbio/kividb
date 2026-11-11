@@ -2718,6 +2718,137 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     }
 }
 
+/// A cursor is found by the index's name and by an alias of it, whichever
+/// the aggregation was run by. It was found only by the name the cursor was
+/// opened with (#567).
+#[test]
+fn a_cursor_is_found_through_an_alias() {
+    let mut c = conn();
+    movies(&mut c, "a5", "a5:");
+    assert!(c.cmd(&["FT.ALIASADD", "a5al", "a5"]).ok());
+    let open = |c: &mut Conn, index: &str| -> String {
+        let reply = c.cmd(&[
+            "FT.AGGREGATE",
+            index,
+            "*",
+            "LOAD",
+            "1",
+            "@title",
+            "WITHCURSOR",
+            "COUNT",
+            "1",
+        ]);
+        let cursor = reply.arr()[1].i();
+        assert!(cursor > 0, "{reply:?}");
+        cursor.to_string()
+    };
+    for (opened_by, read_by) in [("a5al", "a5"), ("a5", "a5al"), ("a5al", "a5al")] {
+        let cursor = open(&mut c, opened_by);
+        let reply = c.cmd(&["FT.CURSOR", "READ", read_by, &cursor, "COUNT", "1"]);
+        assert!(!reply.is_err_reply(), "{opened_by} {read_by}: {reply:?}");
+        assert_eq!(reply.arr()[1].i().to_string(), cursor);
+        assert!(
+            c.cmd(&["FT.CURSOR", "DEL", read_by, &cursor]).ok(),
+            "{opened_by} {read_by}"
+        );
+    }
+}
+
+/// `FT.CONFIG HELP` describes every setting, in RediSearch's words. The
+/// descriptions were all empty (#567).
+#[test]
+fn the_query_engine_settings_are_described() {
+    let mut c = conn();
+    let reply = c.cmd(&["FT.CONFIG", "HELP", "TIMEOUT"]);
+    let entry = reply.arr()[0].arr();
+    assert_eq!(entry[0].s(), "TIMEOUT");
+    assert_eq!(entry[1].s(), "Description");
+    assert_eq!(entry[2].s(), "Query (search) timeout");
+    assert_eq!(entry[3].s(), "Value");
+    let all = c.cmd(&["FT.CONFIG", "HELP", "*"]);
+    assert!(all.arr().len() > 10);
+    for entry in all.arr() {
+        let entry = entry.arr();
+        assert!(
+            !entry[2].s().is_empty(),
+            "{} has no description",
+            entry[0].s()
+        );
+    }
+    // Byte for byte, the words RediSearch's C source runs together too
+    // (#583).
+    for (name, run_together) in [
+        ("UNION_ITERATOR_HEAP", "the iterator willswitch to heap"),
+        ("MULTI_TEXT_SLOP", "multi text values.Can control"),
+        (
+            "BM25STD_TANH_FACTOR",
+            "BM25STD scorer.The default value is 4.",
+        ),
+    ] {
+        let reply = c.cmd(&["FT.CONFIG", "HELP", name]);
+        let text = reply.arr()[0].arr()[2].s().to_string();
+        assert!(text.contains(run_together), "{name}: {text}");
+    }
+}
+
+/// `FT.SPELLCHECK` writes a small score as RediSearch does, in scientific
+/// notation (1 document of 1024 is `9.765625e-4`), divides by every
+/// document of the index, including those with no word near the query,
+/// and answers RESP3 with RediSearch's maps and doubles (#583).
+#[test]
+fn spellcheck_scores_as_redisearch_writes_them() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sp7",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sp7:",
+            "SCHEMA",
+            "body",
+            "TEXT",
+        ])
+        .ok()
+    );
+    c.cmd(&["HSET", "sp7:0", "body", "zebra"]);
+    for i in 1..1024 {
+        c.cmd(&["HSET", &format!("sp7:{i}"), "body", "plain"]);
+    }
+    // A document with no TEXT value counts too.
+    c.cmd(&["HSET", "sp7:none", "other", "x"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let reply = c.cmd(&["FT.SPELLCHECK", "sp7", "zebrb"]);
+    let term = reply.arr()[0].arr();
+    assert_eq!(term[0].s(), "TERM");
+    assert_eq!(term[1].s(), "zebrb");
+    let suggestion = term[2].arr()[0].arr();
+    assert_eq!(suggestion[0].s(), "9.75609756097561e-4", "{reply:?}");
+    assert_eq!(suggestion[1].s(), "zebra");
+
+    c.cmd(&["DEL", "sp7:none"]);
+    let reply = c.cmd(&["FT.SPELLCHECK", "sp7", "zebrb"]);
+    let suggestion = reply.arr()[0].arr()[2].arr()[0].arr().to_vec();
+    assert_eq!(suggestion[0].s(), "9.765625e-4", "{reply:?}");
+
+    let mut c3 = conn();
+    assert!(matches!(c3.cmd(&["HELLO", "3"]), V::Map(_)));
+    let reply = c3.cmd(&["FT.SPELLCHECK", "sp7", "zebrb plain"]);
+    let V::Map(results) = reply.get("results") else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(results.len(), 1, "{reply:?}");
+    assert_eq!(results[0].0.s(), "zebrb");
+    let V::Map(entry) = &results[0].1.arr()[0] else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(entry[0].0.s(), "zebra");
+    assert_eq!(entry[0].1, V::Double(1.0 / 1024.0));
+}
+
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.
 #[test]
 fn explain_and_profile_describe_the_query() {

@@ -2,11 +2,10 @@
 
 use crate::commands::blocking;
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{format_score, parse_utf8};
+use crate::commands::helpers::format_score;
 use crate::keyspace_events::{KS_SORTED_SET, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, SortedSetInner, ZMember};
 use crate::{read_lock, write_lock};
@@ -155,7 +154,7 @@ fn pairs_reply<'a>(
 /// of a key that is not there makes nothing.
 fn write_zset<R>(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     mut write: impl FnMut(&mut SortedSetInner) -> R,
 ) -> Result<R, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
@@ -179,10 +178,7 @@ fn write_zset<R>(
             let mut zs = SortedSetInner::new();
             let out = write(&mut zs);
             if !zs.is_empty() {
-                map.insert(
-                    Key::from(key),
-                    KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))),
-                );
+                map.insert(key, KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))));
             }
             Ok(out)
         }
@@ -191,11 +187,15 @@ fn write_zset<R>(
 
 /// The first bulk string of an array reply: the key, in the reply of a
 /// command that takes several and answers with the one it used.
-fn first_bulk(reply: &[u8]) -> Option<&str> {
-    let mut lines = reply.split(|b| *b == b'\n');
-    lines.next().filter(|line| line.first() == Some(&b'*'))?;
-    lines.next().filter(|line| line.first() == Some(&b'$'))?;
-    std::str::from_utf8(lines.next()?.strip_suffix(b"\r")?).ok()
+fn first_bulk(reply: &[u8]) -> Option<&[u8]> {
+    // `*n\r\n$len\r\n` and then `len` bytes, which may hold anything,
+    // line breaks too: the key is read by its length, not by lines.
+    let rest = reply.strip_prefix(b"*")?;
+    let rest = &rest[memchr::memmem::find(rest, b"\r\n")? + 2..];
+    let rest = rest.strip_prefix(b"$")?;
+    let end = memchr::memmem::find(rest, b"\r\n")?;
+    let len: usize = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+    rest.get(end + 2..end + 2 + len)
 }
 
 /// The keyspace event of a sorted-set command that has just answered
@@ -209,9 +209,9 @@ fn announce(ctx: &Ctx, name: &str, reply: &[u8]) {
     let popped_some = || {
         reply.first() == Some(&b'*') && !reply.starts_with(b"*0\r\n") && !reply.starts_with(b"*-1")
     };
-    let key_argument = || ctx.cmd.get(1).and_then(|raw| std::str::from_utf8(raw).ok());
+    let key_argument = || ctx.cmd.get(1).copied();
     let lower;
-    let (event, key): (&str, Option<&str>) = match name {
+    let (event, key): (&str, Option<&[u8]>) = match name {
         "ZINCRBY" if reply.first() != Some(&b'-') => ("zincr", key_argument()),
         "ZREM" if removed_some() => ("zrem", key_argument()),
         "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYLEX" | "ZUNIONSTORE"
@@ -548,10 +548,7 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'zadd' command");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // ── Parse optional flags before the score/member pairs ──────────────────
     // We scan from index 2 until we find something that parses as f64,
@@ -720,10 +717,7 @@ fn zcard(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 2 {
         return resp_error("ERR wrong number of arguments for 'zcard' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return resp_integer(0);
@@ -746,10 +740,7 @@ fn zscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 3 {
         return resp_error("ERR wrong number of arguments for 'zscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let resp = reply_resp(ctx);
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -783,10 +774,7 @@ fn zmscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'zmscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     // Nils here sit *inside* the array, so `resp3_normalize_null` (which only
     // rewrites a reply that is nothing but a null) never sees them — they have
@@ -837,10 +825,7 @@ fn zrank(ctx: &mut Ctx) -> Vec<u8> {
         }
     };
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -901,10 +886,7 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
         true
     };
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1157,10 +1139,7 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zcount' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let min = match parse_score_bound(cmd[2]) {
         Ok(v) => v,
         Err(e) => return e,
@@ -1195,10 +1174,7 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zincrby' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let Some(incr) = parse_score(cmd[2]) else {
         return resp_error("ERR value is not a valid float");
     };
@@ -1225,10 +1201,7 @@ fn zrem(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'zrem' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1255,10 +1228,7 @@ fn zrange(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrange' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let RangeOptions {
         by_score,
@@ -1316,10 +1286,7 @@ fn zset_pop(ctx: &mut Ctx, max: bool) -> Vec<u8> {
     if cmd.len() < 2 || cmd.len() > 3 {
         return resp_error("ERR wrong number of arguments");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let count = match cmd.get(2) {
         None => 1,
         Some(raw) => match std::str::from_utf8(raw)
@@ -1391,10 +1358,7 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'zscan' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let (cursor, options) = match crate::commands::helpers::scan_arguments(cmd, 2, &["NOSCORES"]) {
         Ok(parsed) => parsed,
         Err(e) => return e,
@@ -1430,9 +1394,11 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
             );
             let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
             for (member, score) in page {
-                if options.pattern.as_deref().is_some_and(|pat| {
-                    !crate::commands::helpers::glob_match(pat, &String::from_utf8_lossy(member))
-                }) {
+                if options
+                    .pattern
+                    .as_deref()
+                    .is_some_and(|pat| !crate::commands::helpers::glob_match_bytes(pat, member))
+                {
                     continue;
                 }
                 // ZSCAN keeps the flat, all-bulk-string shape under RESP3
@@ -1483,10 +1449,7 @@ fn zunion(ctx: &mut Ctx) -> Vec<u8> {
     let mut result: ahash::AHashMap<Vec<u8>, f64> = ahash::AHashMap::new();
 
     for (idx, key_bytes) in cmd[2..2 + num_keys].iter().enumerate() {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         let snapshot = match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => s,
             Ok(None) => continue, // missing key contributes nothing to union
@@ -1522,10 +1485,7 @@ fn zunionstore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zunionstore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR destination must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
     let num_keys = match numkeys(cmd, 2, "zunionstore") {
         Ok(n) => n,
         Err(e) => return e,
@@ -1541,10 +1501,7 @@ fn zunionstore(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut result: ahash::AHashMap<Vec<u8>, f64> = ahash::AHashMap::new();
     for (idx, key_bytes) in cmd[3..3 + num_keys].iter().enumerate() {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         let snapshot = match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => s,
             Ok(None) => continue,
@@ -1588,10 +1545,7 @@ fn zinter(ctx: &mut Ctx) -> Vec<u8> {
     // Load all snapshots first
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
             Ok(None) => return resp_array(vec![]), // any missing key → empty intersection
@@ -1622,10 +1576,7 @@ fn zinterstore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zinterstore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR destination must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
     let num_keys = match numkeys(cmd, 2, "zinterstore") {
         Ok(n) => n,
         Err(e) => return e,
@@ -1640,10 +1591,7 @@ fn zinterstore(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[3..3 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
             Ok(None) => {
@@ -1697,10 +1645,7 @@ fn zintercard(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
             Ok(None) => return resp_integer(0), // any missing = empty intersection
@@ -1747,10 +1692,7 @@ fn zdiff(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut snapshots: Vec<Option<std::collections::BTreeMap<Vec<u8>, f64>>> = Vec::new();
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(s) => snapshots.push(s),
             Err(e) => return e,
@@ -1766,10 +1708,7 @@ fn zdiff(ctx: &mut Ctx) -> Vec<u8> {
     // Load the rest as membership sets (we only need to check presence)
     let mut others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[3..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         if let Ok(Some(s)) = read_zset_snapshot(ctx, key) {
             others.push(s);
         }
@@ -1797,10 +1736,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zdiffstore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR destination must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
     let num_keys = match numkeys(cmd, 2, "zdiffstore") {
         Ok(n) => n,
         Err(e) => return e,
@@ -1809,13 +1745,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR syntax error");
     }
 
-    let base = match read_zset_snapshot(
-        ctx,
-        match std::str::from_utf8(cmd[3]) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        },
-    ) {
+    let base = match read_zset_snapshot(ctx, cmd[3]) {
         Ok(Some(s)) => s,
         Ok(None) => {
             store_zset(ctx, &dst, ahash::AHashMap::new());
@@ -1826,10 +1756,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[4..3 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         if let Ok(Some(s)) = read_zset_snapshot(ctx, key) {
             others.push(s);
         }
@@ -1851,10 +1778,7 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zremrangebyscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let min = match parse_score_bound(cmd[2]) {
         Ok(v) => v,
         Err(e) => return e,
@@ -1897,10 +1821,7 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zremrangebyrank' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1962,10 +1883,7 @@ fn zremrangebylex(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zremrangebylex' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let (min, max) = match (parse_lex_bound(cmd[2]), parse_lex_bound(cmd[3])) {
         (Ok(min), Ok(max)) => (min, max),
         (Err(e), _) | (_, Err(e)) => return e,
@@ -2006,10 +1924,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'zrandmember' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     // `[count [WITHSCORES]]`
     let count_arg: Option<i64> = match cmd.get(2) {
@@ -2122,10 +2037,7 @@ fn zlexcount(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zlexcount' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let (min, max) = match (parse_lex_bound(cmd[2]), parse_lex_bound(cmd[3])) {
         (Ok(min), Ok(max)) => (min, max),
         (Err(e), _) | (_, Err(e)) => return e,
@@ -2156,14 +2068,8 @@ fn zrangestore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 5 {
         return resp_error("ERR wrong number of arguments for 'zrangestore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR dst must be valid UTF-8"),
-    };
-    let src = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR src must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
+    let src: &[u8] = cmd[2];
 
     let RangeOptions {
         by_score,
@@ -2219,7 +2125,7 @@ fn zrangestore(ctx: &mut Ctx) -> Vec<u8> {
 /// Returns None if key doesn't exist, Err if wrong type.
 fn read_zset_snapshot(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
 ) -> Result<Option<std::collections::BTreeMap<Vec<u8>, f64>>, Vec<u8>> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -2401,7 +2307,7 @@ fn parse_weights_aggregate(cmd: &[&[u8]], start: usize, num_keys: usize) -> Weig
 /// Overwrites whatever was at dst_key — matches Redis STORE semantics: the
 /// destination's previous value and TTL go, and an empty result leaves no key
 /// behind rather than an empty sorted set.
-fn store_zset(ctx: &mut Ctx, dst_key: &str, members: ahash::AHashMap<Vec<u8>, f64>) {
+fn store_zset(ctx: &mut Ctx, dst_key: &[u8], members: ahash::AHashMap<Vec<u8>, f64>) {
     if members.is_empty() {
         crate::commands::helpers::delete_key(ctx.store, *ctx.selected_db, dst_key);
         return;
@@ -2414,8 +2320,7 @@ fn store_zset(ctx: &mut Ctx, dst_key: &str, members: ahash::AHashMap<Vec<u8>, f6
     let zs = Arc::new(RwLock::new(inner));
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, dst_key);
-    let replaced =
-        write_lock!(shard).insert_expiring(Key::from(dst_key), KiviDBValue::SortedSet(zs), None);
+    let replaced = write_lock!(shard).insert_expiring(dst_key, KiviDBValue::SortedSet(zs), None);
     drop(replaced);
 }
 
@@ -2425,10 +2330,7 @@ fn zrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrangebyscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut with_scores = false;
     let mut limit_offset = 0usize;
@@ -2475,10 +2377,7 @@ fn zrevrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrevrangebyscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut with_scores = false;
     let mut limit_offset = 0usize;
@@ -2524,10 +2423,7 @@ fn zrevrange(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrevrange' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let with_scores = match &cmd[4..] {
         [] => false,
         [word] if word.eq_ignore_ascii_case(b"WITHSCORES") => true,
@@ -2553,10 +2449,7 @@ fn zrangebylex(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrangebylex' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut limit_offset = 0usize;
     let mut limit_count = usize::MAX;
@@ -2599,10 +2492,7 @@ fn zrevrangebylex(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrevrangebylex' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut limit_offset = 0usize;
     let mut limit_count = usize::MAX;
@@ -2639,7 +2529,7 @@ fn zrevrangebylex(ctx: &mut Ctx) -> Vec<u8> {
 
 /// Look up key, call zrange_pairs, format as RESP array.
 /// All public range commands funnel through here after building RangeParams.
-fn execute_range(ctx: &Ctx, key: &str, params: &RangeParams, with_scores: bool) -> Vec<u8> {
+fn execute_range(ctx: &Ctx, key: &[u8], params: &RangeParams, with_scores: bool) -> Vec<u8> {
     if let Some(error) = range_error(params) {
         return error;
     }
@@ -2675,7 +2565,7 @@ type PoppedMember = (Vec<u8>, Vec<u8>);
 fn pop_members(
     ctx: &Ctx,
     resp: u8,
-    key: &str,
+    key: &[u8],
     want_max: bool,
     count: usize,
 ) -> Result<Vec<PoppedMember>, Vec<u8>> {
@@ -2721,10 +2611,7 @@ fn zset_blocking_pop(ctx: &mut Ctx, want_max: bool) -> Vec<u8> {
         Err(e) => return e,
     };
 
-    let keys: Vec<String> = cmd[1..cmd.len() - 1]
-        .iter()
-        .filter_map(|b| parse_utf8(b).map(|s| s.to_string()))
-        .collect();
+    let keys: Vec<Vec<u8>> = cmd[1..cmd.len() - 1].iter().map(|b| b.to_vec()).collect();
 
     // `[key, member, score]` from the first key, in the order given, that
     // has a member.
@@ -2737,7 +2624,7 @@ fn zset_blocking_pop(ctx: &mut Ctx, want_max: bool) -> Vec<u8> {
                 match pop_members(ctx, resp, key, want_max, 1) {
                     Ok(mut popped) => {
                         if let Some((member, score)) = popped.pop() {
-                            return Some(resp_array(vec![resp_bulk_str(key), member, score]));
+                            return Some(resp_array(vec![resp_bulk(key), member, score]));
                         }
                     }
                     Err(e) => return Some(e),
@@ -2764,10 +2651,7 @@ fn zmpop(ctx: &mut Ctx) -> Vec<u8> {
 
     // Try each key in order, pop from the first non-empty one
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
 
         let db_ref = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db_ref, key);
@@ -2805,7 +2689,7 @@ fn zmpop(ctx: &mut Ctx) -> Vec<u8> {
                     continue;
                 }
 
-                return resp_array(vec![resp_bulk_str(key), resp_array(popped_pairs)]);
+                return resp_array(vec![resp_bulk(key), resp_array(popped_pairs)]);
             }
             Some(_) => {
                 return resp_error(
@@ -2836,10 +2720,7 @@ fn bzmpop(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return e,
     };
 
-    let keys: Vec<String> = cmd[3..3 + num_keys]
-        .iter()
-        .filter_map(|b| std::str::from_utf8(b).ok().map(|s| s.to_string()))
-        .collect();
+    let keys: Vec<Vec<u8>> = cmd[3..3 + num_keys].iter().map(|b| b.to_vec()).collect();
 
     // `[key, [[member, score], ...]]`: up to `count` members from the first
     // key that has any.
@@ -2856,7 +2737,7 @@ fn bzmpop(ctx: &mut Ctx) -> Vec<u8> {
                             .into_iter()
                             .map(|(member, score)| resp_array(vec![member, score]))
                             .collect();
-                        return Some(resp_array(vec![resp_bulk_str(key), resp_array(pairs)]));
+                        return Some(resp_array(vec![resp_bulk(key), resp_array(pairs)]));
                     }
                     Err(e) => return Some(e),
                 }

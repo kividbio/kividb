@@ -65,10 +65,26 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   ERR Script attempted to run 'keys', which looks at keys it does not name, while running under the hash tag 'orders' of its KEYS (lua-parallel-scripts)
   ```
 
-  This is the one
-  thing a script may do without the setting that it may not do with it. It
-  is the rule a Redis Cluster applies to a key in another slot, and it
-  applies from a script's first run, inside a transaction or not.
+  This is the rule a Redis Cluster applies to a key in another slot, and
+  it applies from a script's first run, inside a transaction or not.
+
+- **A script running beside others may not be the first to leave database
+  0.** Until something on the server has selected a database other than 0,
+  a `SELECT` of another database from a script that is running beside
+  others (see below) fails:
+
+  ```
+  ERR Script attempted to SELECT 3, the first database other than 0 selected on this server, while running beside other scripts under the hash tag 'orders' of its KEYS (lua-parallel-scripts)
+  ```
+
+  A script's first run is always alone, so this only reaches a script that
+  selects another database only sometimes, after it has started running
+  beside others. Once any client or script has selected a database other
+  than 0, scripts may select any database. To avoid it, send `SELECT N`
+  once from a client at start-up, or use `lua-parallel-scripts no`.
+
+  These two are the only things a script may do without the setting that
+  it may not do with it.
 
 - **Such scripts run beside each other.** Two scripts on different tags run
   at the same time, on different cores. Two on the same tag run one after
