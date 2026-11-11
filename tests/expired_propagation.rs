@@ -1272,7 +1272,7 @@ fn a_write_in_a_transaction_or_a_script_that_finds_its_key_past_its_time() {
     let replica = Server::replica_of(&master);
     let (mut m, mut r) = (master.conn(), replica.conn());
     m.ok(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);
-    for key in ["in-multi", "in-script", "set-in-multi"] {
+    for key in ["in-multi", "in-script", "undeclared", "set-in-multi"] {
         m.ok(&["SET", key, "old", "PX", "100"]);
     }
     caught_up(&mut m, &mut r);
@@ -1287,6 +1287,7 @@ fn a_write_in_a_transaction_or_a_script_that_finds_its_key_past_its_time() {
     let keys: Vec<&str> = ["in-multi", "set-in-multi"]
         .into_iter()
         .chain(cfg!(feature = "lua").then_some("in-script"))
+        .chain(cfg!(feature = "lua").then_some("undeclared"))
         .collect();
     #[cfg(feature = "lua")]
     {
@@ -1298,6 +1299,15 @@ fn a_write_in_a_transaction_or_a_script_that_finds_its_key_past_its_time() {
                 "in-script"
             ]),
             V::Int(0)
+        );
+        // A key the script does not declare is found so too.
+        assert_eq!(
+            m.cmd(&[
+                "EVAL",
+                "return redis.call('SET', 'undeclared', 'new', 'XX')",
+                "0"
+            ]),
+            V::Nil
         );
     }
     caught_up(&mut m, &mut r);
@@ -1311,7 +1321,9 @@ fn a_write_in_a_transaction_or_a_script_that_finds_its_key_past_its_time() {
 
 /// A write whose reply says it changed nothing is not sent on, as in Redis:
 /// `PERSIST` of a key with no time to live, `SET … NX` of one that is there,
-/// `SET … IFEQ` that does not match, `EXPIRE … NX` of one with a time. A
+/// `SET … IFEQ` that does not match, `EXPIRE … NX` of one with a time, and
+/// every other reply `changed_nothing` lists (with Lua, `MOVE` and `COPY`
+/// from a script too). Nor is it counted as a change since the last save. A
 /// `SET … NX GET` of a missing key answers nil and writes, and is sent, and
 /// fails a `WATCH` on its key; it was taken as a write that changed nothing.
 #[test]
@@ -1329,6 +1341,46 @@ fn a_write_that_changed_nothing_is_not_sent_on() {
     assert_eq!(m.cmd(&["SADD", "s", "a"]), V::Int(1));
     assert_eq!(m.cmd(&["SADD", "s", "a"]), V::Int(0));
     assert_eq!(m.cmd(&["DEL", "missing"]), V::Int(0));
+    assert_eq!(m.cmd(&["HSET", "h", "f", "v"]), V::Int(1));
+    assert_eq!(m.cmd(&["ZADD", "z", "1", "a"]), V::Int(1));
+    assert_eq!(m.cmd(&["RPUSH", "l", "a"]), V::Int(1));
+    let changes = m.info("rdb_changes_since_last_save");
+    let nothing: &[&[&str]] = &[
+        &["SETNX", "k", "w"],
+        &["MSETNX", "k", "w", "fresh", "w"],
+        &["HSETNX", "h", "f", "w"],
+        &["RENAMENX", "t", "k"],
+        &["ZREM", "z", "b"],
+        &["LREM", "l", "0", "b"],
+        &["UNLINK", "missing"],
+        &["HDEL", "h", "nope"],
+        &["SMOVE", "s", "s2", "nope"],
+        &["SMOVE", "missing", "s2", "a"],
+        &["LPUSHX", "missing", "a"],
+        &["RPUSHX", "missing", "a"],
+        &["SREM", "s", "nope"],
+    ];
+    for args in nothing {
+        assert_eq!(m.cmd(args), V::Int(0), "{args:?}");
+    }
+    assert_eq!(m.cmd(&["LINSERT", "l", "BEFORE", "nope", "x"]), V::Int(-1));
+    assert_eq!(
+        m.cmd(&["LINSERT", "missing", "BEFORE", "a", "x"]),
+        V::Int(0)
+    );
+    assert_eq!(
+        m.info("rdb_changes_since_last_save"),
+        changes,
+        "nothing changed since the last save"
+    );
+    #[cfg(feature = "lua")]
+    for script in [
+        "return redis.call('MOVE', 'missing', '1')",
+        "return redis.call('COPY', 's', 'k')",
+        "return redis.call('COPY', 'missing', 'elsewhere')",
+    ] {
+        assert_eq!(m.cmd(&["EVAL", script, "0"]), V::Int(0), "{script}");
+    }
 
     let mut watcher = master.conn();
     watcher.ok(&["WATCH", "nx-get"]);
@@ -1349,4 +1401,14 @@ fn a_write_that_changed_nothing_is_not_sent_on() {
     assert!(positions(&aof, "PEXPIREAT", "t").is_empty(), "{aof:?}");
     assert_eq!(positions(&aof, "SADD", "s").len(), 1, "{aof:?}");
     assert_eq!(positions(&aof, "SET", "nx-get").len(), 1, "{aof:?}");
+    for args in nothing {
+        let record: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        assert!(!aof.contains(&record), "{args:?} in the AOF: {aof:?}");
+    }
+    for command in ["LINSERT", "MOVE", "COPY", "MSETNX", "SMOVE"] {
+        assert!(
+            !aof.iter().any(|record| record[0] == command),
+            "{command} in the AOF: {aof:?}"
+        );
+    }
 }

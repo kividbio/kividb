@@ -1784,9 +1784,14 @@ fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
     let zero = result == b":0\r\n";
     match name {
         "SET" => nil && !set_wrote_answering_nil(cmd),
+        // `SMOVE`: no source, the member not in it, or moved to where it
+        // is and not there. `LPUSHX` / `RPUSHX`: no list (a push to one
+        // answers its new length, at least 1).
         "SETNX" | "MSETNX" | "HSETNX" | "RENAMENX" | "PERSIST" | "EXPIRE" | "PEXPIRE"
         | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" | "DEL"
-        | "UNLINK" | "COPY" | "MOVE" => zero,
+        | "UNLINK" | "COPY" | "MOVE" | "SMOVE" | "LPUSHX" | "RPUSHX" => zero,
+        // No list (0), or no such pivot (-1).
+        "LINSERT" => zero || result == b":-1\r\n",
         _ => popped_nothing(name, result),
     }
 }
@@ -2532,9 +2537,10 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
 
         // An XREADGROUP that only re-read pending entries, or found nothing
         // new, changed nothing Redis counts (#27); nor did a pop that took
-        // nothing.
+        // nothing, nor any write whose reply says it changed nothing
+        // (`changed_nothing`), as from a script.
         if (name != "XREADGROUP" || replication::script_feed::effects_changed_data())
-            && !popped_nothing(name, result)
+            && !propagates_nothing(name, &ctx.cmd, result)
         {
             crate::stats::record_rdb_change();
         }
@@ -2965,5 +2971,99 @@ mod replica_loading_gate_tests {
             "applier must not hit LOADING gate, got {}",
             String::from_utf8_lossy(&out)
         );
+    }
+}
+
+#[cfg(test)]
+mod changed_nothing_tests {
+    use super::*;
+
+    fn cmd(args: &[&'static str]) -> Vec<&'static [u8]> {
+        args.iter().map(|&a| a.as_bytes()).collect()
+    }
+
+    /// What a `SET` that answered nil did: with `GET` it wrote unless its
+    /// condition needs the key; an option's argument is not an option.
+    #[test]
+    fn a_set_that_answered_nil_wrote_only_with_get_and_a_condition_a_missing_key_meets() {
+        let wrote = |args: &[&'static str]| set_wrote_answering_nil(&cmd(args));
+        // GET with no condition, or one a missing key meets: written.
+        assert!(wrote(&["SET", "k", "v", "GET"]));
+        assert!(wrote(&["SET", "k", "v", "NX", "GET"]));
+        assert!(wrote(&["SET", "k", "v", "GET", "NX"]));
+        assert!(wrote(&["SET", "k", "v", "IFNE", "x", "GET"]));
+        assert!(wrote(&[
+            "SET",
+            "k",
+            "v",
+            "IFDNE",
+            "0123456789abcdef",
+            "GET"
+        ]));
+        assert!(wrote(&["SET", "k", "v", "EX", "10", "GET"]));
+        // `XX` here is what IFNE compares with, not the option.
+        assert!(wrote(&["SET", "k", "v", "IFNE", "XX", "GET"]));
+        assert!(wrote(&["set", "k", "v", "ifne", "IFEQ", "get"]));
+        // A condition a missing key does not meet: not written.
+        assert!(!wrote(&["SET", "k", "v", "XX", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "IFEQ", "x", "GET"]));
+        assert!(!wrote(&[
+            "SET",
+            "k",
+            "v",
+            "IFDEQ",
+            "0123456789abcdef",
+            "GET"
+        ]));
+        // No GET: nil is a condition not met. `GET` as an argument is not
+        // the option.
+        assert!(!wrote(&["SET", "k", "v", "NX"]));
+        assert!(!wrote(&["SET", "k", "v", "IFNE", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "IFEQ", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "PX", "100", "XX"]));
+    }
+
+    #[test]
+    fn replies_that_change_nothing() {
+        let nothing = |args: &[&'static str], reply: &[u8]| {
+            let cmd = cmd(args);
+            assert_eq!(
+                changed_nothing(&args[0].to_ascii_uppercase(), &cmd, reply),
+                propagates_nothing(&args[0].to_ascii_uppercase(), &cmd, reply),
+                "{args:?}"
+            );
+            changed_nothing(&args[0].to_ascii_uppercase(), &cmd, reply)
+        };
+        assert!(nothing(&["SMOVE", "a", "b", "m"], b":0\r\n"));
+        assert!(!nothing(&["SMOVE", "a", "b", "m"], b":1\r\n"));
+        assert!(nothing(&["LPUSHX", "l", "x"], b":0\r\n"));
+        assert!(nothing(&["RPUSHX", "l", "x"], b":0\r\n"));
+        assert!(!nothing(&["RPUSHX", "l", "x"], b":1\r\n"));
+        assert!(nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":0\r\n"));
+        assert!(nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":-1\r\n"));
+        assert!(!nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":3\r\n"));
+        assert!(nothing(&["PERSIST", "k"], b":0\r\n"));
+        assert!(nothing(&["SET", "k", "v", "XX"], b"$-1\r\n"));
+        assert!(nothing(&["SET", "k", "v", "IFEQ", "x"], b"_\r\n"));
+        assert!(!nothing(&["SET", "k", "v", "NX", "GET"], b"$-1\r\n"));
+        assert!(!nothing(&["SET", "k", "v"], b"+OK\r\n"));
+        assert!(nothing(&["LPOP", "l"], b"$-1\r\n"));
+        // A count that is not 0 is a change; an INCR to 0 is one too.
+        assert!(!nothing(&["SADD", "s", "a"], b":1\r\n"));
+        assert!(!nothing(&["INCRBY", "n", "-1"], b":0\r\n"));
+    }
+
+    #[test]
+    fn only_a_set_with_a_condition_looks_for_its_key_first() {
+        let conditional = |args: &[&'static str]| set_has_a_condition(&cmd(args));
+        assert!(!conditional(&["SET", "k", "v"]));
+        assert!(!conditional(&["SET", "k", "v", "EX", "10"]));
+        assert!(!conditional(&["SET", "k", "v", "KEEPTTL", "GET"]));
+        // The value is not an option.
+        assert!(!conditional(&["SET", "k", "NX"]));
+        assert!(conditional(&["SET", "k", "v", "NX"]));
+        assert!(conditional(&["SET", "k", "v", "xx", "PX", "5"]));
+        assert!(conditional(&["SET", "k", "v", "IFEQ", "old"]));
+        assert!(conditional(&["SET", "k", "v", "ifdne", "0123456789abcdef"]));
     }
 }

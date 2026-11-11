@@ -155,16 +155,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with no TTL. Until the master's own `UNLINK` arrived the replica held a
   key the master did not, with no TTL, and a failover in that window
   brought back a key that had expired. Under load about 1 key in 500,000
-  was caught so. Now, when the AOF or a replica follows the master, every
-  write first deletes each key it names that is past its TTL and sends its
-  `UNLINK` (or `DEL`) ahead of the write, as a read already did; a write
-  whose key ran out while it ran deletes it too (`PERSIST`, `EXPIRE` and
-  its family, `GETEX`). And a write whose reply says it changed nothing
-  (`PERSIST` or `EXPIRE` answering 0, `SET` with `NX`, `XX` or `IFEQ`
-  answering nil, `SADD`, `DEL` and the like answering 0) is no longer
-  sent on at all, as in Redis. `SET ... NX GET` that wrote a missing key
-  and answered nil now counts as a change for `WATCH` and client-side
-  caching; it was taken as one that changed nothing. Present since 1.2.0.
+  was caught so. Now, when the AOF or a replica follows the master, a
+  write first deletes each key it names that is already past its TTL when
+  it starts, and sends its `UNLINK` (or `DEL`) ahead of the write, as a
+  read already did. `PERSIST`, `EXPIRE` and its family, and `GETEX` also
+  delete a key whose TTL ends while they run. And a write whose reply says
+  it changed nothing (`PERSIST` or `EXPIRE` answering 0, `SET` with `NX`,
+  `XX` or `IFEQ` answering nil, `SADD`, `DEL`, `SMOVE`, `LPUSHX` and the
+  like answering 0, `LINSERT` answering 0 or -1) is no longer sent on, nor
+  counted in `rdb_changes_since_last_save`, as in Redis. `SET ... NX GET`
+  that wrote a missing key and answered nil now counts as a change for
+  `WATCH` and client-side caching; it was taken as one that changed
+  nothing. Present since 1.2.0. Not covered yet: a key whose TTL ends in
+  the moment between the start of a write and its own look at the key,
+  in a write that reads one key and writes another (`SUNIONSTORE`,
+  `ZUNIONSTORE`, `BITOP`, `PFMERGE`, `SORT ... STORE`, `GEOSEARCHSTORE`):
+  the master can leave that key out where a replica still counts it.
+  That window is older than this fix.
 
 - **An idle server with many keys that have a long TTL no longer spends
   CPU on them (#618).** Every active-expiry cycle, ten times a second,

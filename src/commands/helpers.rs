@@ -1501,6 +1501,38 @@ mod active_expiry_tests {
         store[0].iter().map(|s| s.read().ttl_len()).sum()
     }
 
+    /// A time to live set on, or taken from, a key past its time that the
+    /// sweep has not taken out yet: the key is gone, so neither is done,
+    /// and it is deleted then and there (#628). It was left in place, and
+    /// `EXPIRE` answered 1 for a time it had not set.
+    #[test]
+    fn a_time_to_live_set_or_taken_away_finds_a_key_past_its_time_gone() {
+        let store = store::new_store(1);
+        let past = SystemTime::now() - Duration::from_secs(5);
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        put(&store, "persisted", past);
+        put(&store, "expired", past);
+        put(&store, "live", later);
+        assert_eq!(keys(&store), 3);
+        assert!(!clear_expiry(&store, 0, "persisted"));
+        assert!(!set_expiry(&store, 0, "expired", later));
+        assert_eq!(keys(&store), 1, "both deleted");
+        assert_eq!(times(&store), 1);
+        // A live key is given its time, or has it taken away, as before.
+        assert!(set_expiry(
+            &store,
+            0,
+            "live",
+            later + Duration::from_secs(1)
+        ));
+        assert!(clear_expiry(&store, 0, "live"));
+        assert_eq!((keys(&store), times(&store)), (1, 0));
+        // A key that is not there: nothing, and nothing deleted.
+        assert!(!set_expiry(&store, 0, "missing", later));
+        assert!(!clear_expiry(&store, 0, "missing"));
+        assert_eq!(keys(&store), 1);
+    }
+
     /// Times as entries keep them come back as they went in, and one past
     /// what the clock can hold does not panic (it did on Windows).
     #[test]
