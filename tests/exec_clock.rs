@@ -533,6 +533,59 @@ fn a_watched_key_is_judged_by_the_time_its_exec_begins() {
     }
 }
 
+/// A replica keeps a key whose time has run out until its master's `DEL`
+/// comes. Watched once its time had run out, the key's `DEL` is no change,
+/// and the `EXEC` runs, as in Redis 8.10 (`touchWatchedKey`: "Already expired
+/// key is deleted, so logically no change"). It was refused (#666). Once the
+/// key is gone, a write to it is a change; and a key that was alive when it
+/// was watched is changed by the same `DEL`. Active expiry is off on the
+/// master, so that only its `GET` deletes the keys.
+#[test]
+fn a_replica_runs_an_exec_whose_key_had_expired_when_watched_and_then_went() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for io_model in io_models() {
+        let Pair {
+            master: mut m,
+            replica: mut r,
+            _dir,
+        } = pair(&io_model);
+        assert_eq!(m.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]), ok());
+
+        // Expired when watched, then deleted: it runs.
+        assert_eq!(m.cmds(&["SET", "wr", "v", "PX", "100"]), ok());
+        caught_up(&mut m);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(r.cmds(&["WATCH", "wr"]), ok());
+        assert_eq!(m.cmds(&["GET", "wr"]), Resp::Nil);
+        caught_up(&mut m);
+        let exec = r.transaction(&[&["GET", "wr"]]);
+        assert_eq!(exec, Resp::Array(vec![Resp::Nil]), "{io_model:?}");
+
+        // Expired when watched, deleted, then written: refused.
+        assert_eq!(m.cmds(&["SET", "ws", "v", "PX", "100"]), ok());
+        caught_up(&mut m);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(r.cmds(&["WATCH", "ws"]), ok());
+        assert_eq!(m.cmds(&["GET", "ws"]), Resp::Nil);
+        assert_eq!(m.cmds(&["SET", "ws", "w"]), ok());
+        caught_up(&mut m);
+        let exec = r.transaction(&[&["GET", "ws"]]);
+        assert_eq!(exec, Resp::Nil, "{io_model:?}");
+
+        // Alive when watched, then expired and deleted: refused.
+        assert_eq!(m.cmds(&["SET", "wl", "v", "PX", "300"]), ok());
+        caught_up(&mut m);
+        assert_eq!(r.cmds(&["WATCH", "wl"]), ok());
+        thread::sleep(Duration::from_millis(450));
+        assert_eq!(m.cmds(&["GET", "wl"]), Resp::Nil);
+        caught_up(&mut m);
+        let exec = r.transaction(&[&["GET", "wl"]]);
+        assert_eq!(exec, Resp::Nil, "{io_model:?}");
+
+        assert_eq!(m.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]), ok());
+    }
+}
+
 /// A script run by an EXEC runs at the EXEC's time, as in Redis, where a
 /// script inside a transaction is a nested call and reads the same
 /// `commandTimeSnapshot`.

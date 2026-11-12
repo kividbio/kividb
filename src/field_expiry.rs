@@ -1731,7 +1731,7 @@ mod propagation_tests {
         crate::watch::register_for(&m.store, &registry);
         m.with_due_field("h");
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        crate::watch::WatchNotifier::watch(&*registry, 0, b"h", Arc::clone(&flag));
+        crate::watch::WatchNotifier::watch(&*registry, 0, b"h", Arc::clone(&flag), false);
         m.run(&["HGET", "h", "keep"]);
         assert!(flag.load(Ordering::SeqCst), "the watch was not broken");
         crate::watch::WatchNotifier::unwatch_all(&*registry, &[flag]);

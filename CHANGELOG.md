@@ -9,6 +9,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A watch on a key that had already expired when it was watched holds
+  when the key is then deleted, on a replica too (#666).** A replica keeps
+  such a key until its master's `DEL` arrives, and that `DEL` made the
+  watching client's `EXEC` fail. Redis runs it: the key had already run out
+  of time, so its deletion is no change (`touchWatchedKey`). Neither is a
+  write the master makes to such a key without a `DEL` before it, as one
+  inside a transaction whose time still had the key alive does. A flush and a
+  `SWAPDB` now take each watch as Redis's `touchAllWatchedKeysInDb` does. A
+  key that was alive when watched and has expired since is still a change
+  when a flush removes it, and the `EXEC` fails. Before, the flush took the
+  expired key for absent and the `EXEC` ran. A `SWAPDB` that puts an expired
+  key where the watched key was absent is no change, and the `EXEC` runs.
+  Before, the `EXEC` found the key expired and failed. 1.2.1 and earlier are
+  affected.
+
 - **A transaction runs at one time, as in Redis (#659).** `EXEC` read the
   clock again for each queued command, so a key or hash field whose
   deadline fell while the transaction ran was found by its first commands

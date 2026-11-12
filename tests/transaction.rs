@@ -820,11 +820,11 @@ fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
     }
 }
 
-/// For `SWAPDB`, a key whose time is up is not there, as for a flush: a
-/// watch on one that had expired, swapped for none, holds, as does a watch
-/// on a key that is in neither database but for an expired one. A key that
-/// was there and is swapped for an expired one is gone: its watch fails
-/// (#556). Active expiry is off, so that the keys stay where they are.
+/// For `SWAPDB`: a watch on a key that had expired when it was watched,
+/// swapped for none, holds, as does a watch on a key that is in neither
+/// database but for an expired one. A key that was there and is swapped for
+/// an expired one is modified: its watch fails (#556). Active expiry is off,
+/// so that the keys stay where they are.
 #[test]
 fn test_swapdb_takes_an_expired_key_as_absent() {
     let port = free_port();
@@ -862,6 +862,59 @@ fn test_swapdb_takes_an_expired_key_as_absent() {
     assert_eq!(held.0.as_array().len(), 1);
     assert_eq!(held.1.as_array().len(), 1);
     assert!(held.2.is_nil(), "{:?}", held.2);
+}
+
+/// A flush and a `SWAPDB` take each watch by whether its key had run out of
+/// time when it was watched, as Redis 8.10's `touchAllWatchedKeysInDb` does
+/// (#666). A key that was alive when watched and expired after is still
+/// there until something deletes it, and the flush that deletes it is a
+/// change: the `EXEC` fails (it ran: the flush took the key for absent, and
+/// at `EXEC` there was no expired key left to see). A key that had expired
+/// when it was watched is no change. A `SWAPDB` that puts an expired key
+/// where the watched one was absent marks the watch expired, and the `EXEC`
+/// runs (it failed: the key was found expired at `EXEC`). Active expiry is
+/// off, so that the keys stay where they are.
+#[test]
+fn test_a_flush_or_swapdb_takes_each_watch_by_when_its_key_expired() {
+    let port = free_port();
+    start_server(port);
+    let mut other = Conn::connect(port);
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).is_ok());
+    let watch = |db: &str, key: &str| {
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["SELECT", db]).is_ok());
+        assert!(c.cmds(&["WATCH", key]).is_ok());
+        c
+    };
+    let exec = |c: &mut Conn| {
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        c.cmds(&["EXEC"])
+    };
+
+    assert!(other.cmds(&["SELECT", "4"]).is_ok());
+    assert!(other.cmds(&["SET", "later", "v", "PX", "200"]).is_ok());
+    let mut expired_later = watch("4", "later");
+    assert!(other.cmds(&["SET", "before", "v", "PX", "1"]).is_ok());
+    thread::sleep(Duration::from_millis(400));
+    let mut expired_before = watch("4", "before");
+    assert!(other.cmds(&["FLUSHDB"]).is_ok());
+
+    assert!(other.cmds(&["SELECT", "5"]).is_ok());
+    assert!(other.cmds(&["SET", "x", "v", "PX", "1"]).is_ok());
+    thread::sleep(Duration::from_millis(20));
+    let mut swapped_in = watch("6", "x");
+    assert!(other.cmds(&["SWAPDB", "5", "6"]).is_ok());
+
+    let replies = (
+        exec(&mut expired_later),
+        exec(&mut expired_before),
+        exec(&mut swapped_in),
+    );
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).is_ok());
+    assert!(replies.0.is_nil(), "{:?}", replies.0);
+    assert_eq!(replies.1.as_array().len(), 1, "{:?}", replies.1);
+    assert_eq!(replies.2.as_array().len(), 1, "{:?}", replies.2);
 }
 
 /// A pop that takes nothing changes nothing, and a watch on its key holds,
