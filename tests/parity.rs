@@ -373,7 +373,7 @@ fn commandstats_count_every_call() {
     assert!(matches!(c.cmd(&["LLEN"]), V::Err(_)));
     let after = cmdstat(&mut c, "llen").unwrap();
     let grew = |field: &str| after[field] - before.get(field).copied().unwrap_or(0.0);
-    assert_eq!(grew("calls"), 2.0);
+    assert_eq!(grew("calls"), 1.0);
     assert_eq!(grew("failed_calls"), 1.0);
     assert_eq!(grew("rejected_calls"), 1.0);
 

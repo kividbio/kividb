@@ -9,6 +9,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A watch on a key that had already expired when it was watched holds
+  when the key is then deleted, on a replica too (#666).** A replica keeps
+  such a key until its master's `DEL` arrives, and that `DEL` made the
+  watching client's `EXEC` fail. Redis runs it: the key had already run out
+  of time, so its deletion is no change (`touchWatchedKey`). Neither is a
+  write the master makes to such a key without a `DEL` before it, as one
+  inside a transaction whose time still had the key alive does. A flush and a
+  `SWAPDB` now take each watch as Redis's `touchAllWatchedKeysInDb` does. A
+  key that was alive when watched and has expired since is still a change
+  when a flush removes it, and the `EXEC` fails. Before, the flush took the
+  expired key for absent and the `EXEC` ran. A `SWAPDB` that puts an expired
+  key where the watched key was absent is no change, and the `EXEC` runs.
+  Before, the `EXEC` found the key expired and failed. 1.2.1 and earlier are
+  affected.
+
 - **`XADD *` IDs and stream delivery and idle times use the command's
   time inside a transaction or a script, as in Redis (#667).** They read
   the clock for each command, so inside an `EXEC` (or a script), where
@@ -50,6 +65,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deadline, hidden from reads, until the master's `DEL` or its next writes
   arrive, as Redis does (`checkAlreadyExpired` is false on a replica). 1.2.1
   and earlier are affected.
+- **`INFO commandstats` no longer counts a rejected call in `calls` and
+  `usec`, matching Redis (#664).**
 
 - **A document that any command writes over or deletes leaves its search
   indexes (#619).** A hash or JSON document replaced by a string, a list, a
@@ -72,6 +89,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `_`, and `flags` is a set of simple strings, as in Redis. They were RESP2
   arrays with `$-1`, which redis-py's RESP3 parser refused. RESP2 replies
   are unchanged.
+
+## [1.2.2] - 2026-11-13
+
+See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).
+
+### Fixed
+
+- A multi-key write over a key past its TTL (`MSET`, `MSETNX`,
+  `JSON.MSET`, or a `MULTI`/`EXEC` of plain `SET`s after `WATCH`) could
+  make the server stop answering, until a restart, when a search index
+  existed and was being changed at the same time. The write now lets go
+  of all of its keys before it deletes the expired ones. Servers without
+  a search index were not affected, and neither was 1.1.
 
 ## [1.2.1] - 2026-11-12
 

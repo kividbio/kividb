@@ -1041,6 +1041,45 @@ fn expired_keys_reach_the_replica_as_deletions() {
     });
 }
 
+/// A key a replica watched once its time had run out, and which its master
+/// then writes without a `DEL` before it: the master's transaction runs at
+/// a time the key was alive (#662), so it writes over the key. The watch
+/// holds and the `EXEC` runs, as in Redis 8.10, where `touchWatchedKey`
+/// leaves a watch on a key that had expired when it was watched as it is
+/// while the key is there (#666). See tests/exec_clock.rs for the `DEL`.
+#[test]
+fn a_replica_watch_on_an_expired_key_holds_when_its_master_writes_it_without_a_del() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    assert_eq!(m.cmd(&["SET", "k", "old", "PX", "300"]).s(), "OK");
+    wait_caught_up(&mut m, &mut r);
+
+    let mut writer = master.conn();
+    let exec = std::thread::spawn(move || {
+        assert_eq!(writer.cmd(&["MULTI"]).s(), "OK");
+        assert_eq!(writer.cmd(&["DEBUG", "SLEEP", "0.8"]).s(), "QUEUED");
+        assert_eq!(writer.cmd(&["SET", "k", "new"]).s(), "QUEUED");
+        writer.cmd(&["EXEC"])
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    // Past its time on the replica, which still has it.
+    assert_eq!(r.cmd(&["WATCH", "k"]).s(), "OK");
+    assert_eq!(r.cmd(&["PTTL", "k"]).i(), -2);
+    let ran = exec.join().unwrap();
+    assert_eq!(ran.arr().len(), 2, "{ran:?}");
+    wait_caught_up(&mut m, &mut r);
+    assert_eq!(replica.conn().cmd(&["GET", "k"]).s(), "new");
+
+    assert_eq!(r.cmd(&["MULTI"]).s(), "OK");
+    assert_eq!(r.cmd(&["GET", "k"]).s(), "QUEUED");
+    assert_eq!(r.cmd(&["EXEC"]), V::Arr(vec![V::Str("new".into())]));
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
+}
+
 /// Writes from many clients to keys that expire as they are written: the
 /// replica holds what the master holds, key by key, and no acknowledged
 /// write is lost on either. The replica used to expire keys by its own

@@ -308,11 +308,26 @@ impl TxState {
 /// A key that had already run out when it was watched is skipped, as Redis
 /// skips it: on a replica it stays until its master's `DEL` comes. Nothing is
 /// deleted here.
-pub fn watched_key_expired(store: &crate::store::Store, tx: &TxState) -> bool {
+///
+/// A key not past its time when it was watched may be marked so since: a
+/// `SWAPDB` that put an expired key where it was absent marks it, as Redis's
+/// `touchAllWatchedKeysInDb` does. The registry (`watches`, the client's
+/// `flag`) is asked, only for a key found past its time. The marks the
+/// registry clears are of keys that have gone, which are not past their
+/// time here.
+pub fn watched_key_expired(
+    store: &crate::store::Store,
+    tx: &TxState,
+    watches: &dyn crate::watch::WatchNotifier,
+    flag: &Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
     tx.watched_keys
         .iter()
         .zip(&tx.watched_expired)
-        .any(|((db, key), &was)| !was && crate::commands::helpers::is_expired(store, *db, key))
+        .any(|((db, key), &was)| {
+            !was && crate::commands::helpers::is_expired(store, *db, key)
+                && !watches.marked_expired(*db, key, flag)
+        })
 }
 
 /// Where a refused `EXEC` is shown to MONITOR: see [`reject`].

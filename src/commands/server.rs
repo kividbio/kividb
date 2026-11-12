@@ -2081,18 +2081,18 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
 
 /// Before a flush of `db` (`None`: of every database): the watched keys
 /// that are about to go are modified by it. One that was not there is not —
-/// it is as absent after the flush as it was before.
+/// it is as absent after the flush as it was before. One whose time had run
+/// out when it was watched is not either; one whose time ran out after is
+/// (Redis's `touchAllWatchedKeysInDb`, with nothing to replace the keys).
 fn touch_watched_keys(ctx: &Ctx, db: Option<usize>) {
     if !ctx.watch_registry.has_watchers() {
         return;
     }
-    ctx.watch_registry.notify_existing(db, &|db, key| {
-        if crate::commands::helpers::is_expired(ctx.store, db, key) {
-            return false;
-        }
-        ctx.store.get(db).is_some_and(|shards| {
-            crate::read_lock!(crate::store::get_shard(shards, key)).contains_key(key)
-        })
+    ctx.watch_registry.notify_replaced(db, &|db, key| {
+        (
+            crate::watch::presence(ctx.store, db, key),
+            crate::watch::Presence::Absent,
+        )
     });
 }
 

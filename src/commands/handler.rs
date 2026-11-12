@@ -1972,10 +1972,11 @@ fn popped_nothing(name: &str, result: &[u8]) -> bool {
 /// databases are dirty, if the key is in either of them — its value changed
 /// or it appeared or went. A key in neither, and every key of another
 /// database, is unchanged; a database swapped with itself changes nothing
-/// (Redis's `touchAllWatchedKeysInDb`). A key whose time is up is in
-/// neither, as for a flush (`touch_watched_keys`): a watch on one that had
-/// expired, swapped for none or for another expired one, holds, as Redis
-/// keeps it by `wk->expired`.
+/// (Redis's `touchAllWatchedKeysInDb`). A watch on a key that had expired
+/// when it was watched, swapped for none or for another expired one, holds,
+/// as Redis keeps it by `wk->expired`; one on a key that was not there,
+/// swapped for an expired one, is marked expired
+/// ([`crate::watch::WatchNotifier::notify_replaced`]).
 fn touch_swapped_watches(ctx: &Ctx) {
     let db = |i: usize| {
         ctx.cmd
@@ -1989,15 +1990,13 @@ fn touch_swapped_watches(ctx: &Ctx) {
     if db1 == db2 {
         return;
     }
-    let present = |db: usize, key: &[u8]| {
-        ctx.store.get(db).is_some_and(|shards| {
-            crate::read_lock!(crate::store::get_shard(shards, key)).contains_key(key)
-        }) && !crate::commands::helpers::is_expired(ctx.store, db, key)
-    };
+    // The swap has been made: what a watched key of `watched` was is now in
+    // `other`, and what it is now is in `watched`.
+    let presence = |db: usize, key: &[u8]| crate::watch::presence(ctx.store, db, key);
     for (watched, other) in [(db1, db2), (db2, db1)] {
         ctx.watch_registry
-            .notify_existing(Some(watched), &|_, key| {
-                present(watched, key) || present(other, key)
+            .notify_replaced(Some(watched), &|_, key| {
+                (presence(other, key), presence(watched, key))
             });
     }
 }
