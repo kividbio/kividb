@@ -66,6 +66,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the other queries did, and leaves out one deleted or written over while
   it ran.
 
+- **`FUNCTION LIST` and `FUNCTION STATS` follow the client's protocol**
+  (#476). To a RESP3 client each library, each function and the stats are
+  maps, a function without a description and an idle `running_script` are
+  `_`, and `flags` is a set of simple strings, as in Redis. They were RESP2
+  arrays with `$-1`, which redis-py's RESP3 parser refused. RESP2 replies
+  are unchanged.
+
 ## [1.2.1] - 2026-11-12
 
 See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before upgrading.

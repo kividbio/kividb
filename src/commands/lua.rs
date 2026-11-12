@@ -6,8 +6,8 @@ use crate::commands::helpers::glob_match;
 use crate::replication;
 use crate::resp::write::{
     resp_array, resp_bignum_resp3, resp_bool_resp3, resp_bulk, resp_bulk_str, resp_double_bulk,
-    resp_double_resp3, resp_error, resp_integer, resp_map, resp_null_bulk, resp_null_for,
-    resp_set_resp3, resp_simple, resp_verbatim_resp3,
+    resp_double_resp3, resp_error, resp_integer, resp_map, resp_map_for, resp_null_for,
+    resp_set_for, resp_set_resp3, resp_simple, resp_verbatim_resp3,
 };
 use crate::snapshot::{crc64_digest, redis_function_dump_sources};
 use mlua::prelude::*;
@@ -4904,7 +4904,12 @@ fn function_delete(ctx: &mut Ctx) -> Vec<u8> {
     resp_error("ERR Library not found")
 }
 
+/// `FUNCTION LIST`, shaped for the client's protocol (#476). Under RESP3 as
+/// Redis shapes it: each library and each function is a map, a missing
+/// description is `_` and `flags` is a set of simple strings. Under RESP2 as
+/// it was: flat arrays, `$-1` and each flag a bulk string.
 fn function_list(ctx: &mut Ctx) -> Vec<u8> {
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
     let mut with_code = false;
     let mut lib_filter: Option<String> = None;
     let mut args = ctx.cmd.iter().skip(2);
@@ -4938,18 +4943,32 @@ fn function_list(ctx: &mut Ctx) -> Vec<u8> {
             let registered = lib.registered.iter().find(|f| f.name == *fname);
             let description = registered
                 .and_then(|f| f.description.as_deref())
-                .map_or_else(resp_null_bulk, resp_bulk_str);
+                .map_or_else(|| resp_null_for(resp), resp_bulk_str);
             let flags = registered
-                .map(|f| f.flags.iter().map(|flag| resp_bulk_str(flag)).collect())
+                .map(|f| {
+                    f.flags
+                        .iter()
+                        .map(|flag| {
+                            if resp >= 3 {
+                                resp_simple(flag)
+                            } else {
+                                resp_bulk_str(flag)
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            fn_entries.push(resp_array(vec![
-                resp_bulk_str("name"),
-                resp_bulk_str(fname),
-                resp_bulk_str("description"),
-                description,
-                resp_bulk_str("flags"),
-                resp_array(flags),
-            ]));
+            fn_entries.push(resp_map_for(
+                resp,
+                vec![
+                    resp_bulk_str("name"),
+                    resp_bulk_str(fname),
+                    resp_bulk_str("description"),
+                    description,
+                    resp_bulk_str("flags"),
+                    resp_set_for(resp, flags),
+                ],
+            ));
         }
 
         let mut parts: Vec<Vec<u8>> = vec![
@@ -4964,7 +4983,7 @@ fn function_list(ctx: &mut Ctx) -> Vec<u8> {
             parts.push(resp_bulk_str("library_code"));
             parts.push(resp_bulk(lib.body.as_bytes()));
         }
-        rows.push(resp_array(parts));
+        rows.push(resp_map_for(resp, parts));
     }
 
     resp_array(rows)
@@ -5053,7 +5072,8 @@ fn lua_vms_renew_for_admin_and<R>(
     Ok((old, done))
 }
 
-fn function_stats() -> Vec<u8> {
+fn function_stats(ctx: &Ctx) -> Vec<u8> {
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
     let store = function_store().read();
     let lib_count = store.len() as i64;
     let fn_count: i64 = store.values().map(|l| l.functions.len() as i64).sum();
@@ -5064,32 +5084,66 @@ fn function_stats() -> Vec<u8> {
         Some((name, command)) if LUA_SCRIPT_BUSY_OTHERS.load(Ordering::Acquire) => {
             let duration = crate::replication::unix_ms()
                 .saturating_sub(LUA_SCRIPT_STARTED_MS.load(Ordering::Relaxed));
-            resp_array(vec![
+            Some((name, command, duration as i64))
+        }
+        _ => None,
+    };
+    function_stats_reply(
+        resp,
+        lib_count,
+        fn_count,
+        running
+            .as_ref()
+            .map(|(name, command, ms)| (name.as_str(), command.as_slice(), *ms)),
+    )
+}
+
+/// `FUNCTION STATS`' reply, shaped for `resp` as Redis shapes it (#476):
+/// maps under RESP3, flat arrays under RESP2, and a null `running_script`
+/// when nothing runs.
+fn function_stats_reply(
+    resp: u8,
+    lib_count: i64,
+    fn_count: i64,
+    running: Option<(&str, &[Vec<u8>], i64)>,
+) -> Vec<u8> {
+    let running = match running {
+        Some((name, command, duration_ms)) => resp_map_for(
+            resp,
+            vec![
                 resp_bulk_str("name"),
-                resp_bulk_str(&name),
+                resp_bulk_str(name),
                 resp_bulk_str("command"),
                 resp_array(command.iter().map(|arg| resp_bulk(arg)).collect()),
                 resp_bulk_str("duration_ms"),
-                resp_integer(duration as i64),
-            ])
-        }
-        _ => resp_null_bulk(),
+                resp_integer(duration_ms),
+            ],
+        ),
+        None => resp_null_for(resp),
     };
-    resp_array(vec![
-        resp_bulk_str("running_script"),
-        running,
-        resp_bulk_str("engines"),
-        // A map from engine to its counts, as a flat array.
-        resp_array(vec![
-            resp_bulk_str("LUA"),
-            resp_array(vec![
-                resp_bulk_str("libraries_count"),
-                resp_integer(lib_count),
-                resp_bulk_str("functions_count"),
-                resp_integer(fn_count),
-            ]),
-        ]),
-    ])
+    resp_map_for(
+        resp,
+        vec![
+            resp_bulk_str("running_script"),
+            running,
+            resp_bulk_str("engines"),
+            resp_map_for(
+                resp,
+                vec![
+                    resp_bulk_str("LUA"),
+                    resp_map_for(
+                        resp,
+                        vec![
+                            resp_bulk_str("libraries_count"),
+                            resp_integer(lib_count),
+                            resp_bulk_str("functions_count"),
+                            resp_integer(fn_count),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
 }
 
 /// Binary blob written by [`function_dump_payload`] / read by [`decode_function_dump_payload`].
@@ -5490,7 +5544,7 @@ fn redis_function_dispatch(ctx: &mut Ctx) -> Vec<u8> {
         "DELETE" => function_delete(ctx),
         "LIST" => function_list(ctx),
         "FLUSH" => function_flush(ctx),
-        "STATS" => function_stats(),
+        "STATS" => function_stats(ctx),
         "DUMP" => function_dump(),
         "RESTORE" => function_restore(ctx),
         "HELP" => crate::commands::server::help(
@@ -5708,6 +5762,34 @@ mod lua_busy_allow_tests {
         assert!(
             named,
             "the function's name was taken out by a refused flush"
+        );
+    }
+}
+
+#[cfg(test)]
+mod function_stats_reply_tests {
+    use super::function_stats_reply;
+
+    /// Redis 8.10's bytes for a function that has run for 502 ms.
+    #[test]
+    fn a_running_function_is_a_map_under_resp3_and_an_array_under_resp2() {
+        let command = [b"FCALL".to_vec(), b"spin".to_vec(), b"0".to_vec()];
+        let running = Some(("spin", &command[..], 502));
+        assert_eq!(
+            function_stats_reply(2, 1, 3, running),
+            b"*4\r\n$14\r\nrunning_script\r\n*6\r\n$4\r\nname\r\n$4\r\nspin\r\n\
+              $7\r\ncommand\r\n*3\r\n$5\r\nFCALL\r\n$4\r\nspin\r\n$1\r\n0\r\n\
+              $11\r\nduration_ms\r\n:502\r\n$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n\
+              *4\r\n$15\r\nlibraries_count\r\n:1\r\n$15\r\nfunctions_count\r\n:3\r\n"
+                .to_vec()
+        );
+        assert_eq!(
+            function_stats_reply(3, 1, 3, running),
+            b"%2\r\n$14\r\nrunning_script\r\n%3\r\n$4\r\nname\r\n$4\r\nspin\r\n\
+              $7\r\ncommand\r\n*3\r\n$5\r\nFCALL\r\n$4\r\nspin\r\n$1\r\n0\r\n\
+              $11\r\nduration_ms\r\n:502\r\n$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n\
+              %2\r\n$15\r\nlibraries_count\r\n:1\r\n$15\r\nfunctions_count\r\n:3\r\n"
+                .to_vec()
         );
     }
 }
