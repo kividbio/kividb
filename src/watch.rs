@@ -178,6 +178,47 @@ impl WatchRegistryInner {
         }
     }
 
+    /// [`WatchNotifier::notify`] of a key with a watch marked expired: the
+    /// rare case, out of the way of the common one. Whether the key is gone
+    /// decides: the store is looked at with the registry let go of, since a
+    /// writer holding a shard may be waiting for the registry
+    /// (`notify_written`).
+    #[cold]
+    #[inline(never)]
+    fn notify_marked(&self, db: usize, key: &[u8], id: &(usize, Key)) {
+        let gone = self.gone(db, key);
+        // A write that finds the key there, past its time, without its
+        // being expired first: a replica applying its master's stream,
+        // which keeps such keys for the master's `DEL` (#666). Anywhere else
+        // the write went over the expired key without expiring it (a plain
+        // delete and insert, as `GEOSEARCHSTORE` makes, or a write between
+        // a sweep taking the key and the sweep saying so): Redis would have
+        // expired it first, clearing the mark, and the write would then have
+        // broken the watch. It is broken.
+        let replica_stream = crate::expiry::held();
+        let map = self.inner.read();
+        for watch in map.get(id).into_iter().flatten() {
+            if watch.was_expired() {
+                if gone {
+                    // "Deleted keys are not flagged as expired."
+                    watch.expired.store(false, Ordering::Release);
+                    continue;
+                }
+                if replica_stream {
+                    // Still there: the replica's master wrote the key
+                    // without a `DEL` first (inside a transaction or a
+                    // script whose time still had it alive). Redis leaves
+                    // the watch as it is, and the `EXEC` runs. Redis also
+                    // stops looking (`break`), which leaves every later
+                    // watch on the key unbroken, even one set on the key
+                    // while it was alive; those are still broken here.
+                    continue;
+                }
+            }
+            watch.break_it();
+        }
+    }
+
     /// Whether `key` is gone from the store. Without a store, it is taken
     /// to be there.
     fn gone(&self, db: usize, key: &[u8]) -> bool {
@@ -237,28 +278,7 @@ impl WatchNotifier for WatchRegistryInner {
                 return;
             }
         }
-        // A watch on a key that had expired when it was watched: whether the
-        // key is gone decides. The store is looked at with the registry let
-        // go of: a writer holding a shard may be waiting for the registry
-        // (`notify_written`).
-        let gone = self.gone(db, key);
-        let map = self.inner.read();
-        for watch in map.get(&id).into_iter().flatten() {
-            if watch.was_expired() {
-                if gone {
-                    // "Deleted keys are not flagged as expired."
-                    watch.expired.store(false, Ordering::Release);
-                }
-                // Still there: the replica's master wrote the key without a
-                // `DEL` first (inside a transaction or a script whose time
-                // still had it alive). Redis leaves the watch as it is, and
-                // the `EXEC` runs. Redis also stops looking (`break`), which
-                // leaves every later watch on the key unbroken, even one set
-                // on the key while it was alive; those are still broken here.
-                continue;
-            }
-            watch.break_it();
-        }
+        self.notify_marked(db, key, &id);
     }
 
     #[inline]
@@ -496,24 +516,40 @@ mod tests {
         assert!(absent.load(Ordering::Acquire));
     }
 
-    /// Redis's `touchWatchedKey`: a write to a key that had expired when it
-    /// was watched, and is still there (without a store to look at, a key is
-    /// taken to be there), leaves that watch as it is; the key's going
-    /// clears its mark; a write after that breaks it. A watch on a key that
-    /// was alive is broken by either.
+    /// Redis's `touchWatchedKey`: a write from a replica's master to a key
+    /// that had expired when it was watched, and is still there (without a
+    /// store to look at, a key is taken to be there), leaves that watch as
+    /// it is; the key's going clears its mark; a write after that breaks it.
+    /// A watch on a key that was alive is broken by either.
     #[test]
     fn a_watch_on_an_expired_key_holds_until_the_key_is_gone_and_written_again() {
         let reg = WatchRegistryInner::new();
         let (live, was) = (flag(false), flag(false));
         reg.watch(0, b"k", Arc::clone(&live), false);
         reg.watch(0, b"k", Arc::clone(&was), true);
-        reg.notify(0, b"k");
+        {
+            let _stream = crate::expiry::hold();
+            reg.notify(0, b"k");
+        }
         assert!(live.load(Ordering::Acquire));
         assert!(!was.load(Ordering::Acquire));
         assert!(reg.marked_expired(0, b"k", &was));
         reg.notify_gone(0, b"k");
         assert!(!was.load(Ordering::Acquire));
         assert!(!reg.marked_expired(0, b"k", &was));
+        reg.notify(0, b"k");
+        assert!(was.load(Ordering::Acquire));
+    }
+
+    /// Anywhere but a replica applying its master's stream, a write that
+    /// finds a key marked expired still there wrote over it without
+    /// expiring it first (a plain delete and insert): Redis would have
+    /// expired it, then the write would have broken the watch. It breaks.
+    #[test]
+    fn a_write_over_a_marked_key_not_expired_first_breaks_the_watch() {
+        let reg = WatchRegistryInner::new();
+        let was = flag(false);
+        reg.watch(0, b"k", Arc::clone(&was), true);
         reg.notify(0, b"k");
         assert!(was.load(Ordering::Acquire));
     }

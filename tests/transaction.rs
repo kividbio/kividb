@@ -917,6 +917,75 @@ fn test_a_flush_or_swapdb_takes_each_watch_by_when_its_key_expired() {
     assert_eq!(replies.2.as_array().len(), 1, "{:?}", replies.2);
 }
 
+/// A watch a `SWAPDB` marked expired (its key was absent and an expired one
+/// came in) is broken by a write that stores over the expired key, as in
+/// Redis, where the write expires the key first (no change) and then
+/// writes it (a change). `GEOSEARCHSTORE` and the `STORE` forms of
+/// `GEORADIUS` delete and insert their destination without expiring it
+/// first: the watch held and the `EXEC` ran (review of #672).
+#[test]
+fn test_a_store_over_an_expired_key_a_swapdb_brought_fails_the_watch() {
+    let port = free_port();
+    start_server(port);
+    let mut other = Conn::connect(port);
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).is_ok());
+    let stores: [&[&str]; 4] = [
+        &[
+            "GEOSEARCHSTORE",
+            "KEY",
+            "g",
+            "FROMLONLAT",
+            "0",
+            "0",
+            "BYRADIUS",
+            "10",
+            "km",
+        ],
+        &[
+            "GEOSEARCHSTORE",
+            "KEY",
+            "g",
+            "FROMLONLAT",
+            "0",
+            "0",
+            "BYRADIUS",
+            "10",
+            "km",
+            "STOREDIST",
+        ],
+        &["GEORADIUS", "g", "0", "0", "10", "km", "STORE", "KEY"],
+        &["GEORADIUSBYMEMBER", "g", "m", "10", "km", "STORE", "KEY"],
+    ];
+    let mut replies = Vec::new();
+    for (i, store) in stores.iter().enumerate() {
+        let key = format!("geo{i}");
+        let db = (1 + i).to_string();
+        let mut c = Conn::connect(port);
+        assert!(c.cmds(&["SELECT", "15"]).is_ok());
+        assert!(other.cmds(&["SELECT", &db]).is_ok());
+        assert!(other.cmds(&["SET", &key, "v", "PX", "30"]).is_ok());
+        thread::sleep(Duration::from_millis(60));
+        assert!(c.cmds(&["WATCH", &key]).is_ok());
+        // `c` watches `key` in database 15, absent; the swap brings the
+        // expired one in, and marks the watch.
+        assert!(other.cmds(&["SWAPDB", &db, "15"]).is_ok());
+        assert!(other.cmds(&["SELECT", "15"]).is_ok());
+        assert!(other.cmds(&["GEOADD", "g", "0", "0", "m"]).as_int() >= 0);
+        let args: Vec<&str> = store
+            .iter()
+            .map(|a| if *a == "KEY" { key.as_str() } else { a })
+            .collect();
+        assert_eq!(other.cmds(&args).as_int(), 1, "{args:?}");
+        assert!(c.cmds(&["MULTI"]).is_ok());
+        assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+        replies.push((args.join(" "), c.cmds(&["EXEC"])));
+    }
+    assert!(other.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).is_ok());
+    for (store, reply) in replies {
+        assert!(reply.is_nil(), "{store}: {reply:?}");
+    }
+}
+
 /// A pop that takes nothing changes nothing, and a watch on its key holds,
 /// as in Redis: a `BLPOP` that times out, an `LPOP` of a missing key, and a
 /// `BLPOP` in a transaction that finds nothing (#558).
