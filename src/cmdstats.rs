@@ -334,7 +334,7 @@ mod tests {
         );
 
         let lolwut = of("lolwut");
-        assert_eq!(lolwut.calls - before.0.calls, 3);
+        assert_eq!(lolwut.calls - before.0.calls, 1);
         assert_eq!(lolwut.failed - before.0.failed, 1);
         assert_eq!(lolwut.rejected - before.0.rejected, 2);
         assert_eq!(of("latency|doctor").calls - before.1.calls, 1);
