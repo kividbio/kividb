@@ -72,6 +72,14 @@ pub(super) struct WriteShards<'a> {
     held: Vec<(usize, store::ShardWrite<'a>)>,
 }
 
+impl Drop for WriteShards<'_> {
+    /// Every shard is let go of before anything a write left is announced
+    /// ([`store::unlock_together`]).
+    fn drop(&mut self) {
+        store::unlock_together(self.held.drain(..).map(|(_, shard)| shard));
+    }
+}
+
 impl<'a> WriteShards<'a> {
     /// Every shard of `keys`, held at once, and never waited for while
     /// another is held.
@@ -418,23 +426,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             } else {
                 map.set_str_expiring(key, cmd[2], expiry.map(unix_ms))
             };
+            // A document written over has left the indexes that held it by
+            // the time the shard is let go of here (`ShardMap::put`).
             drop(map);
-            // A document written over leaves the indexes that hold it. What
-            // was there is what the write replaced: a plain SET does not look
-            // the key up first. (Written over in place, it was a string.)
-            let was_document = matches!(
-                &replaced,
-                store::Written::Replaced(old)
-                    if matches!(old.value(), ValueRef::Hash(_) | ValueRef::HashEx(_) | ValueRef::Json(_))
-            );
             // The value that was there is let go of with the shard unlocked:
             // its count is in memory nothing has touched lately, and freeing
             // it is the allocator's time, neither of them the shard's to wait
             // for.
             drop(replaced);
-            if was_document {
-                crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-            }
 
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "set", key);
             if !keepttl && expiry.is_some() {
@@ -1325,7 +1324,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             && !applying_stream(ctx) =>
                     {
                         delete_key(ctx.store, db, key);
-                        crate::vector::maybe_unindex(ctx.index_store, db, key);
                         notify(ctx.pubsub, db, KS_GENERIC, "del", key);
                     }
                     Some(at) => {
@@ -1685,7 +1683,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let removed = map.remove(key);
             drop(map);
             drop(removed);
-            crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
             Some(resp_integer(1))
         }
 

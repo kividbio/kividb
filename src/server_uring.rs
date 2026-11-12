@@ -2065,8 +2065,10 @@ pub async fn handle_client(
                                     watch_registry.as_ref().notify(selected_db, key.as_bytes());
                                 }
                                 // A plain SET takes the key's time to live away, in
-                                // the same step as it writes the value.
-                                drop(guards);
+                                // the same step as it writes the value. Every
+                                // shard is let go of before what a SET wrote over
+                                // is announced (`store::unlock_together`).
+                                store::unlock_together(guards.into_iter().map(|(_, guard)| guard));
 
                                 let count = sets.len();
                                 let mut exec_out = format!("*{count}\r\n").into_bytes();

@@ -472,7 +472,7 @@ pub fn field_option_owner(word: &str) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexOn {
     Hash,
     Json,
@@ -892,6 +892,29 @@ impl IndexDef {
 /// The search indexes of a store, and their aliases, by name.
 pub type IndexStore = Arc<Indexes>;
 
+/// How many stores of this process may have an index: those whose
+/// [`Indexes::none`] is false. What the store asks, with a shard held,
+/// before it notes a document that left ([`documents_left`]): with no index
+/// anywhere there is nothing to take it out of, and a write pays nothing.
+/// Raised with `any`, before anything is added: a write that finds none has
+/// the shard before the walk of a new index reads it, and the walk finds
+/// what the write left there.
+static STORES_INDEXED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether no store has an index ([`STORES_INDEXED`]).
+#[inline]
+pub(crate) fn none_anywhere() -> bool {
+    STORES_INDEXED.load(Acquire) == 0
+}
+
+/// `any` becomes true, counted in [`STORES_INDEXED`]. With `map` held to
+/// change.
+fn raise(any: &AtomicBool) {
+    if !any.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        STORES_INDEXED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// [`IndexStore`]: the indexes behind their lock, and whether there may be
 /// any, which a write can ask without the lock ([`Indexes::none`]).
 ///
@@ -948,7 +971,7 @@ impl Indexes {
     /// The indexes, to change.
     pub fn write(&self) -> IndexesWriteGuard<'_> {
         let map = self.map.write();
-        self.any.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        raise(&self.any.0);
         IndexesWriteGuard {
             map,
             any: &self.any.0,
@@ -981,7 +1004,7 @@ impl Indexes {
         if first && (crate::tag_locks::beside_others() || crate::write_order::holds_stripes()) {
             return Err(FIRST_INDEX_BESIDE_OTHERS);
         }
-        self.any.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        raise(&self.any.0);
         if first {
             self.raising.fetch_add(1, Relaxed);
             drop(map);
@@ -1033,7 +1056,17 @@ impl Drop for IndexesWriteGuard<'_> {
     fn drop(&mut self) {
         // Before the lock is let go of (`map` is dropped after this).
         let any = !self.map.is_empty() || self.raising.load(Relaxed) > 0;
-        self.any.store(any, Release);
+        if self.any.swap(any, std::sync::atomic::Ordering::SeqCst) && !any {
+            STORES_INDEXED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Indexes {
+    fn drop(&mut self) {
+        if *self.any.0.get_mut() {
+            STORES_INDEXED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -2523,6 +2556,51 @@ pub fn unindex_expired_in(id: usize, db: usize, key: &(impl AsRef<[u8]> + ?Sized
         .map(|(_, index_store)| Arc::clone(index_store));
     if let Some(index_store) = index_store {
         maybe_unindex(&index_store, db, key);
+    }
+}
+
+/// The store took the documents under `keys` of database `db` of the store
+/// at address `id` ([`store_id`]) out, or put values of another kind over
+/// them, whatever commands did so: each leaves every index that covers it.
+/// But the indexes of the kind of document the key holds now (`holds`),
+/// which the write that put it there brings up to date.
+///
+/// Called once the shard is let go of, by the write still holding its keys'
+/// order: every command that writes a document holds that whole, and so
+/// waits for this.
+pub fn documents_left<'a>(
+    id: usize,
+    db: usize,
+    keys: impl Iterator<Item = &'a [u8]>,
+    holds: impl Fn(&[u8]) -> Option<IndexOn>,
+) {
+    let index_store = INDEX_STORES
+        .read()
+        .iter()
+        .find(|(other, _)| *other == id)
+        .map(|(_, index_store)| Arc::clone(index_store));
+    let Some(index_store) = index_store else {
+        return;
+    };
+    if indexing_deferred() || index_store.none() {
+        return;
+    }
+    // Each key's shard is read before the indexes' lock is taken, never
+    // under it: a writer of the indexes waiting for this to let go of them
+    // would otherwise wait for whoever holds that shard too.
+    let keys: Vec<(&[u8], Option<IndexOn>)> = keys.map(|key| (key, holds(key))).collect();
+    let indexes = index_store.read();
+    for (key, now) in keys {
+        for (name, def) in indexes.iter() {
+            if now.as_ref() == Some(&def.on)
+                || is_alias(name, def)
+                || def.db_index != db
+                || !def.covers(key)
+            {
+                continue;
+            }
+            unindex_from(def, &crate::key_bytes::text_of(key));
+        }
     }
 }
 

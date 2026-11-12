@@ -144,7 +144,6 @@ pub(crate) fn apply_expire(
     if deletes {
         let removed = delete_key(ctx.store, *ctx.selected_db, key);
         if removed {
-            crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
             crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
         }
         return resp_integer(if removed { 1 } else { 0 });
@@ -951,7 +950,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     if delete_key_if_expired(ctx.store, *ctx.selected_db, key) {
-                        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                         crate::vector::maybe_request_compaction(
                             ctx.index_store,
                             ctx.compaction_tx,
@@ -967,8 +965,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 } else {
                     delete_key(ctx.store, *ctx.selected_db, key)
                 };
+                // A document that was deleted left its indexes when the
+                // shard was let go of (`ShardMap::remove`).
                 if deleted {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,

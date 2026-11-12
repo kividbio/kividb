@@ -168,6 +168,11 @@ fn free_port() -> u16 {
 impl Server {
     /// The AOF off (the default) and no replica: nothing observes the writes.
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// [`Server::start`], with `more` arguments after its own.
+    fn start_with(more: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let log = std::fs::File::create(dir.join("server.log")).unwrap();
@@ -181,6 +186,7 @@ impl Server {
                 "--configfile",
                 "kividb.conf",
             ])
+            .args(more)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
@@ -962,4 +968,110 @@ fn ft_create_beside_hset_indexes_each_hash_as_it_now_is() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+/// `MSET` holds every shard of its keys at once. A document it writes over
+/// leaves its indexes once the shards are let go of, and that takes the
+/// indexes' lock and reads the key's shard. Done while `MSET` still held its
+/// other shards, with something waiting to write the indexes
+/// (`FT.ALIASUPDATE` here), each waited for what another held and the server
+/// stopped answering, `PING` too.
+#[test]
+fn mset_over_documents_beside_index_writes_keeps_the_server_answering() {
+    const KEYS: u64 = 4000;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    const RUN_FOR: Duration = Duration::from_secs(12);
+    let server = Server::start_with(&["--threads", "8"]);
+    let mut one = server.conn();
+    let create = "FT.CREATE idx ON HASH PREFIX 1 d: SCHEMA t TEXT n NUMERIC";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert_eq!(one.cmd(&create), V::Str("OK".into()));
+    let documents: Vec<Vec<String>> = (0..KEYS)
+        .map(|i| args(&["HSET", &format!("d:{i}"), "t", "hello", "n", "1"]))
+        .collect();
+    for batch in documents.chunks(500) {
+        one.pipeline(batch);
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    // Each client sends `batch(next)` at once and reads a line a command,
+    // until told to stop or the server is gone.
+    let client = |seed: u64, batch: fn(&mut dyn FnMut() -> String) -> Vec<Vec<String>>| {
+        let (mut conn, done) = (server.conn(), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut state = seed;
+            let mut key = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                format!("d:{}", (state >> 33) % KEYS)
+            };
+            while !done.load(SeqCst) {
+                let batch = batch(&mut key);
+                let mut buf = Vec::new();
+                for command in &batch {
+                    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+                    Conn::encode(&mut buf, &command);
+                }
+                if conn.writer.write_all(&buf).is_err() {
+                    return;
+                }
+                for _ in &batch {
+                    let mut line = String::new();
+                    if !matches!(conn.reader.read_line(&mut line), Ok(n) if n > 0) {
+                        return;
+                    }
+                }
+            }
+        })
+    };
+    let mut clients = Vec::new();
+    for seed in 0..24 {
+        clients.push(client(seed, |key| {
+            (0..8)
+                .map(|_| {
+                    let mut mset = vec!["MSET".to_string()];
+                    for _ in 0..10 {
+                        mset.extend([key(), "x".to_string()]);
+                    }
+                    mset
+                })
+                .collect()
+        }));
+        clients.push(client(100 + seed, |key| {
+            (0..8)
+                .map(|_| args(&["HSET", &key(), "t", "hello", "n", "1"]))
+                .collect()
+        }));
+        clients.push(client(200 + seed, |key| {
+            (0..8)
+                .map(|_| args(&["HINCRBY", &key(), "n", "1"]))
+                .collect()
+        }));
+    }
+    for seed in 0..8 {
+        clients.push(client(300 + seed, |_| {
+            vec![args(&["FT.ALIASUPDATE", "a", "idx"])]
+        }));
+    }
+
+    let mut ping = server.conn();
+    ping.reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let until = Instant::now() + RUN_FOR;
+    let mut answered = true;
+    while answered && Instant::now() < until {
+        let mut line = String::new();
+        answered = ping.writer.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+            && matches!(ping.reader.read_line(&mut line), Ok(n) if n > 0)
+            && line.starts_with("+PONG");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    done.store(true, SeqCst);
+    assert!(answered, "the server stopped answering PING");
+    for client in clients {
+        client.join().unwrap();
+    }
 }

@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A document that any command writes over or deletes leaves its search
+  indexes (#619).** A hash or JSON document replaced by a string, a list, a
+  set or a sorted set was taken out of its indexes only by the commands
+  that said so themselves (`SET`, `DEL`, `RENAME`, ...). After `SETEX`,
+  `PSETEX`, `MSET`, `MSETEX`, `BITOP`, `SORT ... STORE`, `SUNIONSTORE`,
+  `SINTERSTORE`, `SDIFFSTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`,
+  `ZRANGESTORE`, `GEOSEARCHSTORE` or `GEORADIUS ... STORE` over a document,
+  a KNN query went on returning the key, though it no longer held a
+  document. The store now notes a document that leaves its key, whatever
+  command took it, and the indexes drop it once the shard is unlocked. A
+  write that replaces or removes no document pays one comparison for it.
+  A plain KNN query (`*=>[KNN k ...]`) now looks at each key it found, as
+  the other queries did, and leaves out one deleted or written over while
+  it ran.
+
 ## [1.2.1] - 2026-11-12
 
 See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before upgrading.

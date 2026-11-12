@@ -125,7 +125,7 @@ impl Drop for ShardWrite<'_> {
         if self.lock.keys.load(Ordering::Relaxed) != keys {
             self.lock.keys.store(keys, Ordering::Release);
         }
-        if self.map.wrote_over_expired() {
+        if self.map.has_to_announce() {
             return self.unlock_and_announce();
         }
         // SAFETY: dropped once, here; `map` is not used after.
@@ -134,19 +134,36 @@ impl Drop for ShardWrite<'_> {
 }
 
 impl ShardWrite<'_> {
-    /// Let go of the shard, then expire the keys past their time that
-    /// writes under the lock put new values over: their events, watches,
-    /// caches and indexes, and their `DEL` propagated, all before the
-    /// write's own (`expiry::written_over`).
+    /// Let go of the shard, then say what the writes under the lock left
+    /// to be said ([`ShardLock::announce`]).
     #[cold]
     #[inline(never)]
     fn unlock_and_announce(&mut self) {
-        let keys = self.map.take_written_over();
+        let left = self.map.take_left();
         // SAFETY: dropped once, here, from `drop`; `map` is not used after.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
-        if let Some(&(store, db)) = self.lock.place.get() {
-            crate::expiry::written_over(store, db, &keys);
+        self.lock.announce(&left);
+    }
+}
+
+/// Let go of every shard of `held`, then say what the writes under their
+/// locks left to be said ([`ShardLock::announce`]): how a writer that holds
+/// several shards at once lets go of them.
+///
+/// Dropped one by one, the first shard let go of announced while the others
+/// were still held. Announcing takes the indexes' lock and reads the key's
+/// shard, so a writer of several shards waited for the indexes with a shard
+/// held, another announcer held the indexes and waited for that shard, and
+/// with something waiting to write the indexes between them neither moved.
+pub fn unlock_together<'a>(held: impl IntoIterator<Item = ShardWrite<'a>>) {
+    let mut left = Vec::new();
+    for mut shard in held {
+        if shard.map.has_to_announce() {
+            left.push((shard.lock, shard.map.take_left()));
         }
+    }
+    for (lock, left) in left {
+        lock.announce(&left);
     }
 }
 
@@ -163,6 +180,37 @@ impl ShardLock {
     #[inline(always)]
     pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, ShardMap> {
         self.map.read()
+    }
+
+    /// What writes under this shard's lock left to be said, said with no
+    /// shard held: the keys past their time that they put new values over
+    /// are expired, with their events, watches, caches and indexes, and
+    /// their `DEL` propagated, all before the write's own
+    /// (`expiry::written_over`); and the documents they took out or wrote
+    /// over leave their indexes (`vector::documents_left`).
+    #[cold]
+    #[inline(never)]
+    fn announce(&self, left: &[(shard_map::ToSay, Key)]) {
+        let Some(&(store, db)) = self.place.get() else {
+            return;
+        };
+        let of = |what: shard_map::ToSay| {
+            left.iter()
+                .filter(move |(said, _)| *said == what)
+                .map(|(_, key)| key)
+        };
+        if of(shard_map::ToSay::PastItsTime).next().is_some() {
+            let keys: Vec<Key> = of(shard_map::ToSay::PastItsTime).cloned().collect();
+            crate::expiry::written_over(store, db, &keys);
+        }
+        if of(shard_map::ToSay::Document).next().is_some() {
+            // By what each key holds now: a command that took a document
+            // out and put it back under the lock lost nothing.
+            let documents = of(shard_map::ToSay::Document).map(|key| key.as_bytes());
+            crate::vector::documents_left(store, db, documents, |key| {
+                self.map.read().document_at(key)
+            });
+        }
     }
 
     /// [`ShardLock::write`], if nobody holds the shard now; `None` at once

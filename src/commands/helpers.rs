@@ -624,7 +624,8 @@ fn expire_batch(
         crate::stats::EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
-        crate::vector::maybe_unindex(index_store, db, key);
+        // Out of its indexes when the shard was let go of
+        // (`ShardMap::remove`).
         if marks {
             crate::vector::unmark_leaving(id, db, key);
         }
@@ -1067,10 +1068,10 @@ pub fn delete_key_if_expired(store: &Store, db: usize, key: &(impl AsRef<[u8]> +
         crate::stats::record_expired();
         crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
-        // Out of its indexes too: it used to stay in the graph, and be
-        // found by a KNN query, until something else deleted it.
-        if let Some(indexes) = &indexes {
-            crate::vector::maybe_unindex(indexes, db, key);
+        // Out of its indexes too, when the shard was let go of
+        // (`ShardMap::remove`): it used to stay in the graph, and be found
+        // by a KNN query, until something else deleted it.
+        if indexes.is_some() {
             crate::vector::unmark_leaving(id, db, key);
         }
     }
