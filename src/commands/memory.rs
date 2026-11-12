@@ -193,15 +193,10 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let step = (len / sample_n).max(1);
                 let total: usize = inner
                     .entries
-                    .values()
+                    .iter()
                     .step_by(step)
                     .take(sample_n)
-                    .map(|e| {
-                        e.fields
-                            .iter()
-                            .map(|(k, v)| k.len() + v.len())
-                            .sum::<usize>()
-                    })
+                    .map(|(_, e)| e.fields().map(|(k, v)| k.len() + v.len()).sum::<usize>())
                     .sum();
                 total / sample_n.max(1)
             };

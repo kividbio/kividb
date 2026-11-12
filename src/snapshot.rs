@@ -404,9 +404,9 @@ fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
 fn write_stream_entries(w: &mut impl Write, inner: &StreamInner) -> io::Result<()> {
     w.write_all(&(inner.entries.len() as u32).to_le_bytes())?;
     for (id, entry) in inner.entries.iter() {
-        write_stream_id(w, id)?;
-        w.write_all(&(entry.fields.len() as u32).to_le_bytes())?;
-        for (field, val) in entry.fields.iter() {
+        write_stream_id(w, &id)?;
+        w.write_all(&(entry.field_count() as u32).to_le_bytes())?;
+        for (field, val) in entry.fields() {
             write_bytes(w, field)?;
             write_bytes(w, val)?;
         }
@@ -513,7 +513,7 @@ fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
             let v = read_bytes(r)?;
             fields.push((Arc::from(f.as_slice()), Arc::from(v.as_slice())));
         }
-        stream.entries.insert(id, StreamEntry { fields });
+        stream.entries.insert_loaded(id, StreamEntry { fields });
     }
     stream.last_id = read_stream_id(r)?;
     Ok(stream)
@@ -3898,7 +3898,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
                 seen_live += 1;
                 stream
                     .entries
-                    .insert(crate::types::StreamId { ms, seq }, StreamEntry { fields });
+                    .insert_loaded(crate::types::StreamId { ms, seq }, StreamEntry { fields });
             }
         }
         if (seen_live, seen_deleted) != (live, deleted) {
@@ -4038,7 +4038,7 @@ fn estimated_entries_read(stream: &crate::types::StreamInner, id: &crate::types:
     if length == 0 || key(id) == last {
         return added;
     }
-    let first = stream.entries.keys().next().map(key).unwrap();
+    let first = stream.entries.first_id().as_ref().map(key).unwrap();
     match key(id).cmp(&first) {
         std::cmp::Ordering::Less => added - length,
         std::cmp::Ordering::Equal => added - length + 1,
