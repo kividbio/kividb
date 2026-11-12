@@ -1524,20 +1524,49 @@ fn function_list_follows_the_clients_protocol() {
     c2.raw(&["FUNCTION", "DELETE", "fnlist_476"]);
 }
 
-/// The counts are left out: other tests load libraries into the same store.
+/// Neither the counts nor what `running_script` holds are pinned: the
+/// function store and the Lua VM are the test process's, and other tests
+/// load libraries and run functions in it meanwhile (#431's `f431_s3` was
+/// once running here). `running_script` is the protocol's null or its map;
+/// the running map's bytes are `function_stats_reply`'s unit test.
 #[cfg(feature = "lua")]
 #[test]
 fn function_stats_follows_the_clients_protocol() {
     let port = free_port();
     start_server(port);
     let (mut c2, mut c3) = lua_conns(port);
-    let stats2 = c2.raw(&["FUNCTION", "STATS"]);
-    let want2: &[u8] =
-        b"*4\r\n$14\r\nrunning_script\r\n$-1\r\n$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n\
-                         *4\r\n$15\r\nlibraries_count\r\n:";
-    assert!(stats2.starts_with(want2), "RESP2: {}", s(&stats2));
-    let stats3 = c3.raw(&["FUNCTION", "STATS"]);
-    let want3: &[u8] = b"%2\r\n$14\r\nrunning_script\r\n_\r\n$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n\
-                         %2\r\n$15\r\nlibraries_count\r\n:";
-    assert!(stats3.starts_with(want3), "RESP3: {}", s(&stats3));
+    let cases: [(&mut RawConn, &str, &[u8], &[u8], &[u8], &[u8]); 2] = [
+        (
+            &mut c2,
+            "RESP2",
+            b"*4\r\n$14\r\nrunning_script\r\n",
+            b"$-1\r\n",
+            b"*6\r\n",
+            b"$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n$15\r\nlibraries_count\r\n:",
+        ),
+        (
+            &mut c3,
+            "RESP3",
+            b"%2\r\n$14\r\nrunning_script\r\n",
+            b"_\r\n",
+            b"%3\r\n",
+            b"$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n%2\r\n$15\r\nlibraries_count\r\n:",
+        ),
+    ];
+    for (c, protocol, head, idle, running, engines) in cases {
+        let stats = c.raw(&["FUNCTION", "STATS"]);
+        let rest = stats
+            .strip_prefix(head)
+            .unwrap_or_else(|| panic!("{protocol}: {}", s(&stats)));
+        assert!(
+            rest.starts_with(idle) || rest.starts_with(running),
+            "{protocol} running_script: {}",
+            s(&stats)
+        );
+        assert!(
+            stats.windows(engines.len()).any(|w| w == engines),
+            "{protocol} engines: {}",
+            s(&stats)
+        );
+    }
 }
