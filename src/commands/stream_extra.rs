@@ -1034,16 +1034,7 @@ mod tests {
             entries_read: last,
             pel: pending
                 .iter()
-                .map(|ms| {
-                    (
-                        id(*ms),
-                        PelEntry {
-                            consumer: "c".into(),
-                            delivered_at: 1,
-                            delivery_count: 1,
-                        },
-                    )
-                })
+                .map(|ms| (id(*ms), PelEntry::new("c".into(), 1, 1)))
                 .collect(),
             consumers: Default::default(),
             active: Default::default(),
