@@ -1,6 +1,6 @@
 # KiviDB 1.2.1: release checks on the final code
 
-Every check and benchmark rerun on the code 1.2.1 ships, 2026-11-12. The build under test was made from a tree whose files are those of commit `76f06dee` apart from the version string (the suite READMEs call it `35a413c0`, the local commit it was cut from), built the way `release.yml` builds a release (`amazonlinux:2023`, rustc 1.99.1, fat LTO, default features unless a suite says otherwise). Each suite compares it with the 1.2.0 release binaries, checked against `SHA256SUMS.txt`, and with its own earlier 1.2.1 run where there is one.
+Every check and benchmark rerun on the code 1.2.1 ships, 2026-11-12. The build under test was made from a tree whose code is that of commit `de43b81e` apart from the version string (the suite READMEs call it `35a413c0`, the local commit it was cut from), built the way `release.yml` builds a release (`amazonlinux:2023`, rustc 1.99.1, fat LTO, default features unless a suite says otherwise). Each suite compares it with the 1.2.0 release binaries, checked against `SHA256SUMS.txt`, and with its own earlier 1.2.1 run where there is one.
 
 **Result: everything passes, nothing regressed, no new bugs.**
 
