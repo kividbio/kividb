@@ -54,6 +54,9 @@ impl StreamId {
     }
 }
 
+mod stream_entries;
+pub use stream_entries::{EntryRef, StreamEntries};
+
 pub type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
 /// A single entry in a stream.
 #[derive(Debug, Clone)]
@@ -159,7 +162,7 @@ impl StreamIdmp {
 #[derive(Debug, Clone)]
 pub struct StreamInner {
     /// All entries ordered by ID
-    pub entries: BTreeMap<StreamId, StreamEntry>,
+    pub entries: StreamEntries,
     /// The last generated ID — used for auto-ID generation
     pub last_id: StreamId,
     /// The max deleted ID — used by XSETID
@@ -200,7 +203,7 @@ pub struct NodeFill {
 impl StreamInner {
     pub fn new() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: StreamEntries::new(),
             last_id: StreamId::min(),
             max_deleted_id: StreamId::min(),
             entries_added: 0,

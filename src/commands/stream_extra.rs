@@ -439,7 +439,7 @@ pub(super) fn delete_entry(stream: &mut StreamInner, id: &StreamId, refs: TrimRe
     if refs == TrimRefs::Acked && !acked_by_all_groups(stream, id) {
         return false;
     }
-    if stream.entries.remove(id).is_some() && *id > stream.max_deleted_id {
+    if stream.entries.remove(id) && *id > stream.max_deleted_id {
         stream.max_deleted_id = id.clone();
     }
     if refs == TrimRefs::DelRef {
@@ -466,7 +466,7 @@ fn trim_walk(stream: &mut StreamInner, to: &TrimTo, refs: TrimRefs, limit: u64) 
     let mut kept: Option<StreamId> = None;
     while limit == 0 || (removed as u64) < limit {
         let next = match &kept {
-            None => stream.entries.keys().next(),
+            None => stream.entries.first_id(),
             Some(after) => stream
                 .entries
                 .range((Excluded(after), Unbounded))
@@ -478,12 +478,11 @@ fn trim_walk(stream: &mut StreamInner, to: &TrimTo, refs: TrimRefs, limit: u64) 
         };
         let over = match to {
             TrimTo::MaxLen(max) => stream.entries.len() as u64 > *max,
-            TrimTo::MinId(min) => id < min,
+            TrimTo::MinId(min) => id < *min,
         };
         if !over {
             break;
         }
-        let id = id.clone();
         if refs == TrimRefs::Acked && !acked_by_all_groups(stream, &id) {
             kept = Some(id);
             continue;
@@ -654,9 +653,9 @@ pub(super) fn trim_stream_approx(
             TrimTo::MaxLen(max) => len - node >= *max,
             TrimTo::MinId(min) => stream
                 .entries
-                .keys()
+                .iter()
                 .nth(node as usize - 1)
-                .is_some_and(|last| last < min),
+                .is_some_and(|(last, _)| last < *min),
         };
         if !whole {
             break;
@@ -712,7 +711,7 @@ pub(super) fn exact_trim_args(
                 {
                     parts[i + 2] = first.to_string().into_bytes();
                 }
-            } else if let Some(first) = stream.entries.keys().next() {
+            } else if let Some(first) = stream.entries.first_id() {
                 parts[i + 2] = first.to_string().into_bytes();
             }
             i += 3;
@@ -792,12 +791,7 @@ impl Shape {
         Shape {
             len: stream.entries.len() as u64,
             entries_added: stream.entries_added,
-            first: stream
-                .entries
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(StreamId::min),
+            first: stream.entries.first_id().unwrap_or_else(StreamId::min),
             last_id: stream.last_id.clone(),
             max_deleted: stream.max_deleted_id.clone(),
         }
@@ -920,7 +914,8 @@ mod tests {
     fn stream_with(n: u64) -> StreamInner {
         let mut s = StreamInner::new();
         for ms in 1..=n {
-            s.entries.insert(id(ms), StreamEntry { fields: Vec::new() });
+            s.entries
+                .push_tail(id(ms), StreamEntry { fields: Vec::new() });
             s.last_id = id(ms);
         }
         s
@@ -1082,7 +1077,7 @@ mod tests {
         let mut s = stream_with(5);
         s.groups.insert("g".into(), group(4, &[3]));
         assert_eq!(trim_stream(&mut s, &TrimTo::MaxLen(0), TrimRefs::Acked), 3);
-        let left: Vec<_> = s.entries.keys().cloned().collect();
+        let left: Vec<_> = s.entries.iter().map(|(id, _)| id).collect();
         assert_eq!(left, vec![id(3), id(5)]);
 
         // The same with `~`, and with a MINID: the trim goes past 3.
@@ -1101,7 +1096,7 @@ mod tests {
             trim_stream_approx(&mut s, &to, TrimRefs::Acked, Approx { limit: 2, node: 2 }),
             2
         );
-        let left: Vec<_> = s.entries.keys().cloned().collect();
+        let left: Vec<_> = s.entries.iter().map(|(id, _)| id).collect();
         assert_eq!(left, vec![id(3), id(4), id(5)]);
         // Propagated as a MINID that removes the same: 4, the first left
         // below 6 that the group is done with.
@@ -1167,7 +1162,7 @@ mod tests {
             for _ in 0..n {
                 s.entries_added += 1;
                 s.entries
-                    .insert(id(s.entries_added), StreamEntry { fields: Vec::new() });
+                    .push_tail(id(s.entries_added), StreamEntry { fields: Vec::new() });
             }
         };
         add(&mut s, 101);
@@ -1196,7 +1191,7 @@ mod tests {
             trim_stream_approx(&mut s, &to, TrimRefs::KeepRef, approx(0)),
             10
         );
-        assert_eq!(s.entries.keys().next(), Some(&id(51)));
+        assert_eq!(s.entries.first_id(), Some(id(51)));
         // A limit smaller than the node: nothing.
         let to = TrimTo::MaxLen(0);
         assert_eq!(

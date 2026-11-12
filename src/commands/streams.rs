@@ -12,7 +12,9 @@ use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin}
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{ConsumerGroup, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner};
+use crate::types::{
+    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner,
+};
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
 use parking_lot::RwLock;
@@ -157,7 +159,7 @@ fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR no such key"),
     };
     let mut inner = stream.write();
-    if !inner.entries.contains_key(&id) {
+    if !inner.entries.contains(&id) {
         return resp_error("ERR No such message in stream");
     }
     let recorded = inner
@@ -282,11 +284,10 @@ fn id_interval(start: &str, end: &str) -> Result<Option<(StreamId, StreamId)>, V
 
 /// Format a stream entry as the nested RESP array Redis uses:
 /// ["id", ["field", "value", "field", "value", ...]]
-fn format_entry(id: &StreamId, entry: &StreamEntry) -> Vec<u8> {
+fn format_entry(id: &StreamId, entry: EntryRef<'_>) -> Vec<u8> {
     let field_values: Vec<Vec<u8>> = entry
-        .fields
-        .iter()
-        .flat_map(|(f, v)| vec![resp_bulk(f.as_ref()), resp_bulk(v.as_ref())])
+        .fields()
+        .flat_map(|(f, v)| vec![resp_bulk(f), resp_bulk(v)])
         .collect();
     resp_array(vec![
         resp_bulk_str(&id.to_string()),
@@ -636,7 +637,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
     stream_extra::record_append(&mut inner, &fields);
     inner
         .entries
-        .insert(entry_id.clone(), StreamEntry { fields });
+        .push_tail(entry_id.clone(), StreamEntry { fields });
     inner.last_id = entry_id.clone();
     inner.entries_added += 1;
 
@@ -753,7 +754,7 @@ pub fn xrange(ctx: &mut Ctx) -> Vec<u8> {
                 .entries
                 .range(lo..=hi)
                 .take(count)
-                .map(|(id, entry)| format_entry(id, entry))
+                .map(|(id, entry)| format_entry(&id, entry))
                 .collect();
             resp_array(items)
         }
@@ -805,13 +806,11 @@ pub fn xrevrange(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_array(vec![]),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();
-            // BTreeMap::range gives ascending; rev() flips it
             let items: Vec<Vec<u8>> = inner
                 .entries
-                .range(lo..=hi)
-                .rev()
+                .range_rev(lo..=hi)
                 .take(count)
-                .map(|(id, entry)| format_entry(id, entry))
+                .map(|(id, entry)| format_entry(&id, entry))
                 .collect();
             resp_array(items)
         }
@@ -857,7 +856,7 @@ fn read_streams(
         let mut entries: Vec<Vec<u8>> = Vec::new();
         let newer = (Bound::Excluded(after_id.clone()), Bound::Unbounded);
         for (id, entry) in inner.entries.range(newer).take(count) {
-            let item = format_entry(id, entry);
+            let item = format_entry(&id, entry);
             if !budget.admit(item.len()) {
                 break;
             }
@@ -981,8 +980,8 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
                     if *id_str == "$" {
                         inner.last_id.clone()
                     } else {
-                        match inner.entries.keys().next_back() {
-                            Some(last) => id_before(last),
+                        match inner.entries.last_id() {
+                            Some(last) => id_before(&last),
                             None => inner.last_id.clone(),
                         }
                     }
@@ -1079,7 +1078,7 @@ pub fn xdel(ctx: &mut Ctx) -> Vec<u8> {
             for id_bytes in &cmd[2..] {
                 let id_str = std::str::from_utf8(id_bytes).unwrap_or("");
                 if let Some(id) = StreamId::parse(id_str)
-                    && inner.entries.remove(&id).is_some()
+                    && inner.entries.remove(&id)
                 {
                     removed += 1;
                     if id > inner.max_deleted_id {
@@ -1255,8 +1254,8 @@ pub fn xsetid(ctx: &mut Ctx) -> Vec<u8> {
             "ERR The ID specified in XSETID is smaller than current max_deleted_entry_id",
         );
     }
-    if let Some(top) = inner.entries.keys().next_back() {
-        if new_last_id < *top {
+    if let Some(top) = inner.entries.last_id() {
+        if new_last_id < top {
             return resp_error(
                 "ERR The ID specified in XSETID is smaller than the target stream top item",
             );
@@ -1625,14 +1624,13 @@ struct GroupRead<'a> {
 /// how long ago it was last delivered and how many times it had been.
 fn format_claimed_entry(
     id: &StreamId,
-    entry: &StreamEntry,
+    entry: EntryRef<'_>,
     idle_ms: u64,
     deliveries: u64,
 ) -> Vec<u8> {
     let field_values: Vec<Vec<u8>> = entry
-        .fields
-        .iter()
-        .flat_map(|(f, v)| vec![resp_bulk(f.as_ref()), resp_bulk(v.as_ref())])
+        .fields()
+        .flat_map(|(f, v)| vec![resp_bulk(f), resp_bulk(v)])
         .collect();
     resp_array(vec![
         resp_bulk_str(&id.to_string()),
@@ -2108,9 +2106,9 @@ fn run_xreadgroup_delivery(
                 // can parse the reply uniformly; a new entry has never been
                 // delivered, hence 0 and 0.
                 let item = if spec.claim_min_idle.is_some() {
-                    format_claimed_entry(id, entry, 0, 0)
+                    format_claimed_entry(&id, entry, 0, 0)
                 } else {
-                    format_entry(id, entry)
+                    format_entry(&id, entry)
                 };
                 // Checked before the entry is delivered: one that does not
                 // fit is neither sent nor added to the pending list.
@@ -2126,9 +2124,9 @@ fn run_xreadgroup_delivery(
                             delivery_count: 1,
                         },
                     );
-                    effect(claim_effect(key, spec.group, spec.consumer, id, now, 1));
+                    effect(claim_effect(key, spec.group, spec.consumer, &id, now, 1));
                 }
-                shape.deliver(g, id);
+                shape.deliver(g, &id);
                 delivered += 1;
                 items.push(item);
             }
@@ -2532,7 +2530,7 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
 
             let mut claimed: Vec<Vec<u8>> = Vec::new();
             for id in &ids {
-                let exists = entries.contains_key(id);
+                let exists = entries.contains(id);
                 match g.pel.get(id) {
                     // Pending, but the entry itself is gone: drop the
                     // reference rather than hand out nothing.
@@ -2836,13 +2834,13 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
                 .entries
                 .iter()
                 .next()
-                .map(|(id, e)| format_entry(id, e))
+                .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
             let last_entry = inner
                 .entries
-                .iter()
-                .next_back()
-                .map(|(id, e)| format_entry(id, e))
+                .range_rev(..)
+                .next()
+                .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
 
             let (idmp_duration, idmp_maxsize) =
@@ -2904,12 +2902,7 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
 
 /// The ID of the stream's first entry; `0-0` if it has none.
 fn first_entry_id(stream: &StreamInner) -> StreamId {
-    stream
-        .entries
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(StreamId::min)
+    stream.entries.first_id().unwrap_or_else(StreamId::min)
 }
 
 /// A group's `entries-read` and `lag`, as `XINFO` shows them: nil where
@@ -2958,7 +2951,7 @@ fn xinfo_stream_full(
         .entries
         .iter()
         .take(count)
-        .map(|(id, e)| format_entry(id, e))
+        .map(|(id, e)| format_entry(&id, e))
         .collect();
     let groups: Vec<Vec<u8>> = groups_in_order(inner)
         .into_iter()
@@ -3262,7 +3255,7 @@ pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
     let replies = ids
         .iter()
         .map(|id| {
-            if !inner.entries.contains_key(id) {
+            if !inner.entries.contains(id) {
                 // DELREF still clears references left behind by an entry
                 // that was deleted some other way.
                 if refs == TrimRefs::DelRef {
@@ -3503,7 +3496,7 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
         // Trim immediately if the current length already exceeds the new limit.
         if let Some(max) = inner.max_entries {
             while inner.entries.len() as u64 > max {
-                if let Some((id, _)) = inner.entries.pop_first()
+                if let Some(id) = inner.entries.pop_first()
                     && id > inner.max_deleted_id
                 {
                     inner.max_deleted_id = id;
@@ -3661,9 +3654,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
             // FORCE needs to know which IDs exist in the stream; take that set
             // before borrowing `groups` mutably.
             let existing_ids: Vec<bool> = if force {
-                ids.iter()
-                    .map(|id| inner.entries.contains_key(id))
-                    .collect()
+                ids.iter().map(|id| inner.entries.contains(id)).collect()
             } else {
                 Vec::new()
             };

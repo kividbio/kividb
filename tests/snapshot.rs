@@ -391,7 +391,7 @@ fn kdb_sorted_set_score_order_preserved() {
 fn kdb_stream_basic() {
     let mut stream = StreamInner::new();
     stream.last_id = StreamId::new(1000, 5);
-    stream.entries.insert(
+    stream.entries.push_tail(
         StreamId::new(1000, 1),
         StreamEntry {
             fields: vec![
@@ -406,7 +406,7 @@ fn kdb_stream_basic() {
             ],
         },
     );
-    stream.entries.insert(
+    stream.entries.push_tail(
         StreamId::new(1000, 2),
         StreamEntry {
             fields: vec![(Arc::from(b"name".as_slice()), Arc::from(b"bob".as_slice()))],
@@ -420,14 +420,24 @@ fn kdb_stream_basic() {
             assert_eq!(inner.entries.len(), 2);
             assert_eq!(inner.last_id, StreamId::new(1000, 5));
 
-            let e1 = inner.entries.get(&StreamId::new(1000, 1)).unwrap();
-            assert_eq!(e1.fields[0].0.as_ref(), b"name");
-            assert_eq!(e1.fields[0].1.as_ref(), b"alice");
-            assert_eq!(e1.fields[1].0.as_ref(), b"action");
-            assert_eq!(e1.fields[1].1.as_ref(), b"login");
+            let e1: Vec<_> = inner
+                .entries
+                .get(&StreamId::new(1000, 1))
+                .unwrap()
+                .fields()
+                .collect();
+            assert_eq!(e1[0].0, b"name");
+            assert_eq!(e1[0].1, b"alice");
+            assert_eq!(e1[1].0, b"action");
+            assert_eq!(e1[1].1, b"login");
 
-            let e2 = inner.entries.get(&StreamId::new(1000, 2)).unwrap();
-            assert_eq!(e2.fields[0].1.as_ref(), b"bob");
+            let e2: Vec<_> = inner
+                .entries
+                .get(&StreamId::new(1000, 2))
+                .unwrap()
+                .fields()
+                .collect();
+            assert_eq!(e2[0].1, b"bob");
         }
         _ => panic!("wrong type"),
     }
@@ -435,11 +445,11 @@ fn kdb_stream_basic() {
 
 #[test]
 fn kdb_stream_entry_order() {
-    // BTreeMap orders by StreamId — verify entries come back in ID order
+    // Entries added out of order come back in ID order
     let mut stream = StreamInner::new();
     stream.last_id = StreamId::new(9999, 0);
     for seq in [5u64, 1, 3, 2, 4] {
-        stream.entries.insert(
+        stream.entries.insert_loaded(
             StreamId::new(1000, seq),
             StreamEntry {
                 fields: vec![(
@@ -457,8 +467,8 @@ fn kdb_stream_entry_order() {
     match v {
         KiviDBValue::Stream(s) => {
             let inner = s.read();
-            let seqs: Vec<u64> = inner.entries.keys().map(|id| id.seq).collect();
-            assert_eq!(seqs, vec![1, 2, 3, 4, 5]); // BTreeMap order
+            let seqs: Vec<u64> = inner.entries.iter().map(|(id, _)| id.seq).collect();
+            assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
         }
         _ => panic!("wrong type"),
     }
@@ -473,13 +483,13 @@ fn kdb_stream_consumer_groups_and_meta() {
     stream.max_deleted_id = StreamId::new(900, 1);
     stream.entries_added = 7;
     stream.max_entries = Some(100);
-    stream.entries.insert(
+    stream.entries.push_tail(
         StreamId::new(1000, 1),
         StreamEntry {
             fields: vec![(Arc::from(b"f".as_slice()), Arc::from(b"v0".as_slice()))],
         },
     );
-    stream.entries.insert(
+    stream.entries.push_tail(
         StreamId::new(1000, 2),
         StreamEntry {
             fields: vec![(Arc::from(b"f".as_slice()), Arc::from(b"v1".as_slice()))],
@@ -916,7 +926,7 @@ fn kdb_all_types_together() {
 
     let mut stream = StreamInner::new();
     stream.last_id = StreamId::new(1, 0);
-    stream.entries.insert(
+    stream.entries.push_tail(
         StreamId::new(1, 0),
         StreamEntry {
             fields: vec![(Arc::from(b"k".as_slice()), Arc::from(b"v".as_slice()))],
@@ -1690,7 +1700,7 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
     };
     let st = st.read();
     assert_eq!(st.entries.len(), 2);
-    let first = st.entries.keys().next().unwrap();
+    let first = st.entries.first_id().unwrap();
     assert_eq!((first.ms, first.seq), (1, 1));
     let group = &st.groups[&b"g"[..]];
     assert_eq!(group.pel.len(), 1);
