@@ -1710,16 +1710,22 @@ pub async fn handle_client(
                         b"-ERR wrong number of arguments for 'watch' command\r\n".to_vec()
                     } else {
                         for key in &cmd[1..] {
-                            // A key that has already expired is watched as
-                            // the absent key it is: its removal, when it
-                            // comes, is not a change.
+                            // A key that has already expired is deleted, on
+                            // a master, and watched as the absent key it is.
+                            // A replica keeps it until its master's `DEL`
+                            // comes: it is watched as expired (Redis's
+                            // `watchedKey.expired`), and that `DEL` is no
+                            // change (#666).
                             let expired =
-                                commands::helpers::lazy_expire_key(&store, selected_db, key);
+                                commands::helpers::lazy_expire_key(&store, selected_db, key)
+                                    && crate::watch::presence(&store, selected_db, key)
+                                        == crate::watch::Presence::Expired;
                             tx.watch_key(selected_db, key, expired);
                             watch_registry.as_ref().watch(
                                 selected_db,
                                 key,
                                 Arc::clone(&dirty_flag),
+                                expired,
                             );
                         }
                         b"+OK\r\n".to_vec()
@@ -1919,7 +1925,12 @@ pub async fn handle_client(
                         // the same time): checked here as well as above, for
                         // a deadline that fell while this waited for its
                         // gates, and for a replica, where nothing removes it.
-                        if commands::transaction::watched_key_expired(&store, &tx) {
+                        if commands::transaction::watched_key_expired(
+                            &store,
+                            &tx,
+                            watch_registry.as_ref(),
+                            &dirty_flag,
+                        ) {
                             dirty_flag.store(true, std::sync::atomic::Ordering::Release);
                         }
                         // And to replicas and the AOF as one: its writes in the
@@ -2075,10 +2086,13 @@ pub async fn handle_client(
                                     // after `drop(guards)` below would reopen the exact race this
                                     // path exists to close: another fast-apply EXEC could acquire
                                     // the now-free lock and check `dirty_flag` before this notify
-                                    // sets it, observe clean, and overwrite this write. notify()
-                                    // only touches the (separate) watch-registry lock, so calling
-                                    // it here cannot deadlock against the shard lock we're holding.
-                                    watch_registry.as_ref().notify(selected_db, key.as_bytes());
+                                    // sets it, observe clean, and overwrite this write.
+                                    // notify_written() only touches the (separate) watch-registry
+                                    // lock, never the store, so calling it here cannot deadlock
+                                    // against the shard lock we're holding.
+                                    watch_registry
+                                        .as_ref()
+                                        .notify_written(selected_db, key.as_bytes());
                                 }
                                 // A plain SET takes the key's time to live away, in
                                 // the same step as it writes the value. Every
