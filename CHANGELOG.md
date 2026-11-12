@@ -7,6 +7,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-12
+
+See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before upgrading.
+
 ### Added
 
 - **Data moves in from Valkey 9.** KiviDB reads Valkey 9.0's and 9.1's
