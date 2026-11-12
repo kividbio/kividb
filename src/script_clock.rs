@@ -1,5 +1,7 @@
-//! Logical clock frozen for the duration of a Lua script / FCALL (Redis `execution unit`).
-//! TTL math and `TIME` use the snapshot taken when script execution starts.
+//! Logical clock frozen for the duration of an execution unit, as Redis's
+//! `commandTimeSnapshot`: a Lua script, an `FCALL`, or a transaction's
+//! `EXEC` (#659). TTL math, the expiry of keys and hash fields, and `TIME`
+//! use the snapshot taken when the unit starts. See [`freeze`].
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,6 +48,42 @@ pub fn exit_script_execution() {
             FROZEN_MS.with(|f| f.set(0));
         }
     });
+}
+
+/// The clock held at one time on this thread for as long as the guard
+/// lives: what a script, a function and a transaction's `EXEC` run under.
+/// Every key and hash field in the unit is there, or gone, for all of its
+/// commands at once, as in Redis, where `call()` takes `cmd_time_snapshot`
+/// at the outermost level only (`enterExecutionUnit`) and every expiry
+/// check, TTL reply and `TIME` reads it.
+///
+/// Before #659 only scripts froze the clock, and an `EXEC` read it for each
+/// queued command: a key or field whose deadline fell inside the
+/// transaction was found by its first commands and not by its later ones.
+///
+/// Units nest: one entered inside another (a script run by `EXEC`) keeps
+/// the outer one's time. The guard is not `Send`: the time is this
+/// thread's, so it cannot be held across an `.await` that could move the
+/// task to another thread.
+#[must_use = "the clock is frozen only while the guard lives"]
+#[inline]
+pub fn freeze() -> Frozen {
+    enter_script_execution();
+    Frozen {
+        _this_thread: std::marker::PhantomData,
+    }
+}
+
+/// See [`freeze`].
+pub struct Frozen {
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for Frozen {
+    #[inline]
+    fn drop(&mut self) {
+        exit_script_execution();
+    }
 }
 
 /// Monotonic “now” for TTL (`Instant` comparisons). Frozen during scripts.
@@ -179,6 +217,26 @@ mod wall_ms_tests {
         exit_script_execution();
         assert_eq!(wall_ms_now(), frozen);
         exit_script_execution();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(wall_ms_now() > frozen);
+    }
+
+    #[test]
+    fn a_frozen_unit_keeps_one_time_and_a_nested_one_keeps_the_outer_time() {
+        let outer = freeze();
+        let frozen = wall_ms_now();
+        let time = time_command_wall_tuple();
+        std::thread::sleep(Duration::from_millis(5));
+        {
+            // A script run by an `EXEC`: the transaction's time.
+            let _inner = freeze();
+            std::thread::sleep(Duration::from_millis(2));
+            assert_eq!(wall_ms_now(), frozen);
+        }
+        assert_eq!(wall_ms_now(), frozen);
+        assert_eq!(ttl_wall_ms_now() as u64, frozen);
+        assert_eq!(time_command_wall_tuple(), time);
+        drop(outer);
         std::thread::sleep(Duration::from_millis(2));
         assert!(wall_ms_now() > frozen);
     }

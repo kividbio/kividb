@@ -9,6 +9,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A transaction runs at one time, as in Redis (#659).** `EXEC` read the
+  clock again for each queued command, so a key or hash field whose
+  deadline fell while the transaction ran was found by its first commands
+  and not by its later ones: `EXISTS` said 1 and then 0, `HGETALL` showed a
+  field that `HEXISTS` then said was gone, on a master and on a replica, and
+  an `INCR` late in the transaction started the key again from nothing.
+  `EXEC` now takes one time when it starts, as Redis's
+  `commandTimeSnapshot` does, and every expiry decision in it uses that
+  time: reads, deletion of what is due, `TTL`/`PTTL`/`EXPIRETIME` and the
+  hash field equivalents, times to live given as `EX`/`PX`, and `TIME`
+  (which, as in Redis 8.10, no longer moves inside a transaction). A
+  script run by `EXEC` keeps the transaction's time, as scripts already
+  kept their own. A watched key whose time runs out before `EXEC` starts
+  makes the transaction fail, judged by that same time, now on a replica
+  too.
+
 - **A replica no longer deletes a key when its master's `PEXPIREAT`
   arrives after that moment has passed (#665).** It deleted the key, while
   the master still had it, and the master's next writes to the key made a

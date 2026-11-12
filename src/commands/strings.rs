@@ -2126,9 +2126,10 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
     let as_bytes = |s: &[u8]| s.to_vec();
 
     // A TTL already past: the key goes, and is propagated as DEL, or UNLINK
-    // with `lazyfree-lazy-expire` (Redis 8.10).
+    // with `lazyfree-lazy-expire` (Redis 8.10). Past by the command's time,
+    // as Redis's `checkAlreadyExpired`: a script's or an `EXEC`'s (#659).
     if let Some(at) = new_expiry
-        && at <= SystemTime::now()
+        && at <= crate::script_clock::wall_system_time_now()
     {
         if existed {
             let removed = map.remove(key.as_slice());

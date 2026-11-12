@@ -252,6 +252,10 @@ pub struct TxState {
     pub queue: Vec<Vec<Vec<u8>>>,
     /// Keys being watched — if any are modified, EXEC returns nil
     pub watched_keys: Vec<(usize, crate::store::Key)>, // (db_index, key)
+    /// For each of `watched_keys`, in the same order, whether it had already
+    /// run out of time when it was watched: its time running out is then no
+    /// change (Redis's `watchedKey.expired`). See [`watched_key_expired`].
+    pub watched_expired: Vec<bool>,
     /// Set to true if a watched key was modified before EXEC
     pub dirty: bool,
     /// A command was refused when it was queued: EXEC answers -EXECABORT and
@@ -265,6 +269,7 @@ impl TxState {
             active: false,
             queue: Vec::new(),
             watched_keys: Vec::new(),
+            watched_expired: Vec::new(),
             dirty: false,
             aborted: false,
         }
@@ -273,10 +278,41 @@ impl TxState {
     pub fn reset(&mut self) {
         self.active = false;
         self.queue.clear();
-        self.watched_keys.clear();
+        self.unwatch_keys();
         self.dirty = false;
         self.aborted = false;
     }
+
+    /// Watch `key` in `db`; `expired`: whether its time had already run out.
+    pub fn watch_key(&mut self, db: usize, key: &[u8], expired: bool) {
+        self.watched_keys.push((db, crate::store::Key::new(key)));
+        self.watched_expired.push(expired);
+    }
+
+    /// Forget the watched keys (the registry's watches are the caller's).
+    pub fn unwatch_keys(&mut self) {
+        self.watched_keys.clear();
+        self.watched_expired.clear();
+    }
+}
+
+/// Whether a watched key's time has run out since it was watched, by the
+/// clock as it is now: inside `EXEC`, the transaction's frozen time
+/// (`script_clock::freeze`). Such a key has been modified, whether or not
+/// anything has removed it yet, and the transaction is refused, as Redis's
+/// `execCommand` refuses it (`isWatchedKeyExpired`, which reads the same
+/// `commandTimeSnapshot` the queued commands then read). Read by the time the
+/// commands will run under, a key cannot be alive for the check and gone for
+/// the commands: it is one or the other for both (#659).
+///
+/// A key that had already run out when it was watched is skipped, as Redis
+/// skips it: on a replica it stays until its master's `DEL` comes. Nothing is
+/// deleted here.
+pub fn watched_key_expired(store: &crate::store::Store, tx: &TxState) -> bool {
+    tx.watched_keys
+        .iter()
+        .zip(&tx.watched_expired)
+        .any(|((db, key), &was)| !was && crate::commands::helpers::is_expired(store, *db, key))
 }
 
 /// Where a refused `EXEC` is shown to MONITOR: see [`reject`].
