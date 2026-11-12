@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: runner, namespace: e2e}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: e2e-runner}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin}
+subjects: [{kind: ServiceAccount, name: runner, namespace: e2e}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: runner, namespace: e2e}
+spec:
+  serviceAccountName: runner
+  nodeSelector: {e2e-infra: "true"}
+  containers:
+    - name: r
+      image: python:3.12-slim
+      command: ["sleep", "infinity"]
