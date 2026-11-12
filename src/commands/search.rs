@@ -2312,7 +2312,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                     if gone == 0 || live_ones.len() >= knn.k || had < asked {
                         break;
                     }
-                    more += gone;
+                    more = gone;
                 }
                 live_ones.truncate(knn.k);
                 live_ones
