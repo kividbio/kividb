@@ -24,6 +24,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Before, the `EXEC` found the key expired and failed. 1.2.1 and earlier are
   affected.
 
+- **`XADD *` IDs and stream delivery and idle times use the command's
+  time inside a transaction or a script, as in Redis (#667).** They read
+  the clock for each command, so inside an `EXEC` (or a script), where
+  `TIME` does not move, two `XADD *` got IDs from different milliseconds,
+  and an entry's idle time grew between the transaction's commands. They
+  now use the time the transaction or script began, as Redis's
+  `commandTimeSnapshot()` does. `XADD *` IDs, the delivery times
+  `XREADGROUP`, `XCLAIM` and `XAUTOCLAIM` record, and the idle times that
+  `XPENDING`, `XCLAIM` and `XAUTOCLAIM` judge and report all do. An ID still
+  never goes back: when that time is not past the stream's last ID, the
+  next ID is the last one's next sequence number. Replicas receive explicit
+  IDs, so they never differed from their master.
+
 - **A transaction runs at one time, as in Redis (#659).** `EXEC` read the
   clock again for each queued command, so a key or hash field whose
   deadline fell while the transaction ran was found by its first commands
@@ -52,6 +65,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deadline, hidden from reads, until the master's `DEL` or its next writes
   arrive, as Redis does (`checkAlreadyExpired` is false on a replica). 1.2.1
   and earlier are affected.
+- **`INFO commandstats` no longer counts a rejected call in `calls` and
+  `usec`, matching Redis (#664).**
 
 - **A document that any command writes over or deletes leaves its search
   indexes (#619).** A hash or JSON document replaced by a string, a list, a

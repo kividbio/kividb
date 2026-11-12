@@ -586,6 +586,163 @@ fn a_replica_runs_an_exec_whose_key_had_expired_when_watched_and_then_went() {
     }
 }
 
+/// `TIME`'s reply in milliseconds.
+fn time_ms(time: &Resp) -> u64 {
+    let t = time.array();
+    let secs: u64 = t[0].bulk().parse().unwrap();
+    let micros: u64 = t[1].bulk().parse().unwrap();
+    secs * 1000 + micros / 1000
+}
+
+/// A stream entry ID's two parts.
+fn id_parts(id: &Resp) -> (u64, u64) {
+    let (ms, seq) = id.bulk().split_once('-').unwrap();
+    (ms.parse().unwrap(), seq.parse().unwrap())
+}
+
+/// The idle times in an extended `XPENDING` reply, entry by entry.
+fn idle_times(pending: &Resp) -> Vec<i64> {
+    pending.array().iter().map(|e| e.array()[2].int()).collect()
+}
+
+/// `XADD *` inside an EXEC takes the EXEC's time, as Redis 8.10's
+/// `streamNextID` takes `commandTimeSnapshot()` (#667): both IDs are of the
+/// millisecond `TIME` says, the second with the next sequence number,
+/// however long the EXEC sleeps between them. An entry delivered in the
+/// EXEC is 0 ms idle for the rest of it. An ID never goes back: after an
+/// explicit ID ahead of the clock, `*` is that ID's next sequence number.
+/// The replica gets the same entries.
+#[test]
+fn stream_ids_and_delivery_times_are_the_exec_time() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for io_model in io_models() {
+        let Pair {
+            master: mut m,
+            replica: mut r,
+            _dir,
+        } = pair(&io_model);
+        assert_eq!(
+            m.cmds(&["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"]),
+            ok()
+        );
+        let exec = m.transaction(&[
+            &["TIME"],
+            &["XADD", "s", "*", "f", "1"],
+            &["DEBUG", "SLEEP", "0.2"],
+            &["XADD", "s", "*", "f", "2"],
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &["DEBUG", "SLEEP", "0.2"],
+            &["XPENDING", "s", "g", "-", "+", "10"],
+            &["XADD", "ahead", "99999999999999-5", "f", "1"],
+            &["XADD", "ahead", "*", "f", "2"],
+            &["TIME"],
+        ]);
+        let x = exec.array();
+        assert_eq!(x.len(), 10, "{io_model:?} {x:?}");
+        assert_eq!(x[0], x[9], "{io_model:?} TIME moved inside EXEC");
+        let at = time_ms(&x[0]);
+        assert_eq!(id_parts(&x[1]), (at, 0), "{io_model:?} {x:?}");
+        assert_eq!(id_parts(&x[3]), (at, 1), "{io_model:?} {x:?}");
+        assert_eq!(idle_times(&x[6]), [0, 0], "{io_model:?} {x:?}");
+        assert_eq!(x[8], Resp::Bulk("99999999999999-6".into()), "{io_model:?}");
+
+        caught_up(&mut m);
+        for k in ["s", "ahead"] {
+            let on_master = m.cmds(&["XRANGE", k, "-", "+"]);
+            assert_eq!(
+                r.cmds(&["XRANGE", k, "-", "+"]),
+                on_master,
+                "{k} {io_model:?}"
+            );
+        }
+    }
+}
+
+/// Idle times inside an EXEC are the EXEC's: `XPENDING` gives the same
+/// idle time before and after a sleep in it, `XCLAIM`'s and
+/// `XAUTOCLAIM`'s minimum idle time is judged by it, and an entry they
+/// claim is 0 ms idle for the rest of the EXEC, as Redis 8.10 reads
+/// `commandTimeSnapshot()` for all of them (#667).
+#[test]
+fn idle_times_inside_an_exec_are_the_exec_time() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for io_model in io_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        start_server(port, &io_model, None, dir.path());
+        let mut c = Conn::connect(port);
+        assert_eq!(
+            c.cmds(&["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"]),
+            ok()
+        );
+        let a = c.cmds(&["XADD", "s", "*", "f", "1"]);
+        let b = c.cmds(&["XADD", "s", "*", "f", "2"]);
+        let (a, b) = (a.bulk().to_string(), b.bulk().to_string());
+        c.cmds(&["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"]);
+        thread::sleep(Duration::from_millis(300));
+        let exec = c.transaction(&[
+            &["XPENDING", "s", "g", "-", "+", "10"],
+            &["DEBUG", "SLEEP", "0.2"],
+            &["XPENDING", "s", "g", "-", "+", "10"],
+            &["XCLAIM", "s", "g", "c2", "250", &a, "JUSTID"],
+            &["DEBUG", "SLEEP", "0.2"],
+            &["XPENDING", "s", "g", "-", "+", "10", "c2"],
+            &["XAUTOCLAIM", "s", "g", "c3", "250", "0-0", "JUSTID"],
+            &["DEBUG", "SLEEP", "0.2"],
+            &["XPENDING", "s", "g", "-", "+", "10"],
+        ]);
+        let x = exec.array();
+        assert_eq!(x.len(), 9, "{io_model:?} {x:?}");
+        let before = idle_times(&x[0]);
+        assert!(before.iter().all(|&idle| idle >= 300), "{io_model:?} {x:?}");
+        assert_eq!(
+            idle_times(&x[2]),
+            before,
+            "{io_model:?} idle moved inside EXEC"
+        );
+        assert_eq!(
+            x[3],
+            Resp::Array(vec![Resp::Bulk(a.clone())]),
+            "{io_model:?}"
+        );
+        assert_eq!(idle_times(&x[5]), [0], "{io_model:?} {x:?}");
+        // `a` was claimed in this EXEC, 0 ms ago by its time: only `b` is
+        // 250 ms idle.
+        let claimed = x[6].array();
+        assert_eq!(
+            claimed[1],
+            Resp::Array(vec![Resp::Bulk(b.clone())]),
+            "{io_model:?} {x:?}"
+        );
+        assert_eq!(idle_times(&x[8]), [0, 0], "{io_model:?} {x:?}");
+    }
+}
+
+/// `XADD *` inside a script takes the script's time, as `TIME` does.
+#[cfg(feature = "lua")]
+#[test]
+fn stream_ids_inside_a_script_are_the_script_time() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for io_model in io_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        start_server(port, &io_model, None, dir.path());
+        let mut c = Conn::connect(port);
+        // Busy for a while between the two: a script cannot sleep.
+        let script = "local t = redis.call('TIME') \
+            local a = redis.call('XADD', KEYS[1], '*', 'f', '1') \
+            local n = 0 \
+            while n < 3000000 do n = n + 1 end \
+            local b = redis.call('XADD', KEYS[1], '*', 'f', '2') \
+            return {t[1], t[2], a, b}";
+        let x = c.cmds(&["EVAL", script, "1", "ls"]);
+        let x = x.array();
+        let at = time_ms(&Resp::Array(x[..2].to_vec()));
+        assert_eq!(id_parts(&x[2]), (at, 0), "{io_model:?} {x:?}");
+        assert_eq!(id_parts(&x[3]), (at, 1), "{io_model:?} {x:?}");
+    }
+}
+
 /// A script run by an EXEC runs at the EXEC's time, as in Redis, where a
 /// script inside a transaction is a nested call and reads the same
 /// `commandTimeSnapshot`.
