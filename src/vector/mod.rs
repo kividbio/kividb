@@ -1,3 +1,4 @@
+pub mod doc_keys;
 pub mod filter;
 pub mod postings;
 pub mod score;
@@ -682,6 +683,10 @@ pub struct IndexDef {
     /// (see [`postings`]). For an index with no TAG or NUMERIC field, only
     /// the ids, and only if it has a TEXT field.
     pub postings: postings::SharedPostings,
+    /// Which keys the documents of an index that gives them no ids
+    /// ([`IndexDef::gives_ids`]) are under: how it knows how many it holds
+    /// (see [`doc_keys`]).
+    pub docs: Arc<doc_keys::DocKeys>,
 }
 
 impl IndexDef {
@@ -719,6 +724,31 @@ impl IndexDef {
             FieldType::Text => !f.options.noindex,
             _ => false,
         })
+    }
+
+    /// How many documents the index holds: the ids it has given out, or
+    /// the keys it has kept ([`IndexDef::docs`]). With `served`, those in
+    /// the cluster hash slots it has a bit for
+    /// (`cluster::search::served_slots`).
+    pub fn count_docs(&self, served: Option<&[u64]>) -> usize {
+        if !self.gives_ids() {
+            return match served {
+                None => self.docs.len(),
+                Some(served) => self.docs.len_in(served),
+            };
+        }
+        let postings = self.postings.read();
+        match served {
+            None => postings.len(),
+            Some(served) => postings
+                .live()
+                .iter()
+                .filter(|&id| {
+                    let slot = postings.slot(id) as usize;
+                    served[slot / 64] & (1 << (slot % 64)) != 0
+                })
+                .count(),
+        }
     }
 
     /// Make what the TEXT fields numbered in `changes` of document `doc` hold
@@ -1226,6 +1256,7 @@ impl IndexSchema {
             doc_languages: Arc::new(RwLock::new(AHashMap::new())),
             text: Arc::new(RwLock::new(text::TextIndex::new())),
             postings,
+            docs: Arc::default(),
         }
     }
 }
@@ -1261,7 +1292,8 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
 /// (`FT.ALTER`), and fill them in from the documents it covers — all of its
 /// postings, which is as cheap as only the new ones. With `scan` false
 /// (`SKIPINITIALSCAN`), documents are only given ids, so that `NOT` and `*`
-/// still know every document.
+/// still know every document, and the index how many it holds: with no
+/// field `added`, for an index that gave its documents no ids until now.
 pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaField], scan: bool) {
     def.postings.write().add_fields(added);
     walk_documents(db, def, |key, inner| {
@@ -1458,6 +1490,7 @@ pub fn backfill_from_db_progress(
             def.postings.done(postings);
             doc
         } else {
+            def.docs.add(key);
             postings::NO_DOC
         };
 
@@ -2449,6 +2482,7 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
         let words = def.text_write(changes, restemmed, language);
         def.postings.write_fields(key, fields, whole, words)
     } else {
+        def.docs.add(key);
         postings::NO_DOC
     };
 
@@ -2549,6 +2583,8 @@ fn unindex_from(def: &IndexDef, key: &str) {
     // The words are taken out by the postings, before they give the id back.
     if def.gives_ids() {
         def.postings.remove(key, def.text_removal());
+    } else {
+        def.docs.remove(key);
     }
     def.forget_language(key);
 }

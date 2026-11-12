@@ -464,30 +464,18 @@ fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<V
     out
 }
 
-/// Documents the index covers: hashes, or JSON documents, under its prefixes.
-pub(crate) fn count_docs(
-    db: &Db,
-    def: &IndexDef,
-    cluster: Option<&crate::cluster::ClusterState>,
-) -> usize {
-    // Read before any shard is locked: not the slot table with one held
-    // (see `ClusterState`).
+/// Documents the index holds, as it counts them itself
+/// ([`IndexDef::count_docs`]), not by a walk of its database, which read
+/// every key of it under each shard's lock in turn (#590). In a cluster,
+/// those in the slots this node serves.
+///
+/// A document is counted from when it is indexed until it is unindexed: one
+/// past its time is, until an expiry deletes it, as the walk counted it.
+pub(crate) fn count_docs(def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
+    // Read before the index's own locks are taken: nothing reads the slot
+    // table with one held (see `ClusterState`, #353).
     let served = cluster.map(crate::cluster::search::served_slots);
-    db.iter()
-        .map(|shard| {
-            shard
-                .read()
-                .iter()
-                .filter(|(key, value)| {
-                    crate::vector::is_document(&def.on, *value)
-                        && def.covers(key)
-                        && served
-                            .as_deref()
-                            .is_none_or(|served| crate::cluster::search::in_served(served, key))
-                })
-                .count()
-        })
-        .sum()
+    def.count_docs(served.as_deref())
 }
 
 /// Whether the index covers the document named `key` (a name: see
@@ -511,7 +499,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let resp = ctx.resp;
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
     // The index's own database, whichever the client has selected.
-    let mut num_docs = count_docs(&ctx.store[def.db_index], def, cluster);
+    let mut num_docs = count_docs(def, cluster);
     // In a cluster, the documents of every master.
     if crate::cluster::search::coordinates(ctx) {
         let owned: Vec<Vec<u8>> = ctx.cmd.iter().map(|a| a.to_vec()).collect();

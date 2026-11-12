@@ -6438,3 +6438,153 @@ fn searches_alongside_writes_over_documents_see_what_is_there() {
         assert_eq!(found(&reply), left, "{query}");
     }
 }
+
+/// `FT.INFO`'s `num_docs` of the three indexes of
+/// [`server_with_indexes_over_doc`]: the vectors, the words, the JSON one.
+fn num_docs(c: &mut Conn) -> [i64; 3] {
+    ["vectors", "words", "json"].map(|index| {
+        let info = c.cmds(&["FT.INFO", index]);
+        let info = info.as_array();
+        let at = info
+            .iter()
+            .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+            .unwrap_or_else(|| panic!("no num_docs for {index}: {info:?}"));
+        info[at + 1].as_int()
+    })
+}
+
+/// `num_docs` is read off the documents each index holds, an index of
+/// vectors alone too, not counted by a walk of the database (#590): it
+/// follows every way a document comes under a key of the index or leaves
+/// it.
+#[test]
+fn num_docs_follows_the_documents_of_each_index() {
+    let mut c = server_with_indexes_over_doc();
+    assert_eq!(num_docs(&mut c), [0, 0, 0]);
+    hash_document(&mut c, "doc:1");
+    hash_document(&mut c, "doc:2");
+    json_document(&mut c, "doc:3");
+    hash_document(&mut c, "other:1");
+    let step = |c: &mut Conn, commands: &[&str], docs: [i64; 3]| {
+        for command in commands {
+            let args: Vec<&str> = command.split_whitespace().collect();
+            let reply = c.cmds(&args);
+            assert!(!reply.is_error(), "{command}: {reply:?}");
+        }
+        // An expiry takes its key out a moment after its time.
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while num_docs(c) != docs {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "after {commands:?}: {:?}, not {docs:?}",
+                num_docs(c)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    step(&mut c, &[], [2, 2, 1]);
+    // Written again, and a field at a time: the same document.
+    step(
+        &mut c,
+        &["HSET doc:1 title again", "HDEL doc:1 kind"],
+        [2, 2, 1],
+    );
+    step(&mut c, &["JSON.SET doc:3 $.title \"again\""], [2, 2, 1]);
+    // Written over, and deleted.
+    step(&mut c, &["SET doc:2 x"], [1, 1, 1]);
+    step(&mut c, &["DEL doc:2"], [1, 1, 1]);
+    // Renamed out of the index's keys and back, and over another kind.
+    step(&mut c, &["RENAME doc:1 away:1"], [0, 0, 1]);
+    step(&mut c, &["RENAME away:1 doc:1"], [1, 1, 1]);
+    step(&mut c, &["RENAME other:1 doc:3"], [2, 2, 0]);
+    step(
+        &mut c,
+        &["COPY doc:3 doc:4", "COPY doc:3 other:2"],
+        [3, 3, 0],
+    );
+    // To another database, whose keys the indexes do not cover, and back.
+    step(&mut c, &["MOVE doc:4 1"], [2, 2, 0]);
+    step(&mut c, &["SELECT 1", "MOVE doc:4 0", "SELECT 0"], [3, 3, 0]);
+    // The index of vectors alone is given a field that needs ids: it
+    // goes on counting the documents it had.
+    step(
+        &mut c,
+        &["FT.ALTER vectors SKIPINITIALSCAN SCHEMA ADD title TEXT"],
+        [3, 3, 0],
+    );
+    // A time to live that ends, of the key and of every field of it.
+    step(&mut c, &["PEXPIRE doc:4 1"], [2, 2, 0]);
+    step(
+        &mut c,
+        &["HPEXPIRE doc:3 1 FIELDS 3 vec title kind"],
+        [1, 1, 0],
+    );
+    json_document(&mut c, "doc:5");
+    step(&mut c, &["PEXPIRE doc:5 1"], [1, 1, 0]);
+    json_document(&mut c, "doc:5");
+    step(&mut c, &["JSON.DEL doc:5 $"], [1, 1, 0]);
+    // The databases swapped: the indexes hold what theirs holds now.
+    step(&mut c, &["SWAPDB 0 1"], [0, 0, 0]);
+    hash_document(&mut c, "doc:6");
+    step(&mut c, &["SWAPDB 0 1"], [1, 1, 0]);
+    step(&mut c, &["SWAPDB 0 1"], [1, 1, 0]);
+    // An index made over documents that are there counts them.
+    json_document(&mut c, "doc:7");
+    for index in ["vectors", "json"] {
+        assert!(c.cmds(&["FT.DROPINDEX", index]).is_ok());
+    }
+    step(
+        &mut c,
+        &[
+            "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE json ON JSON PREFIX 1 doc: SCHEMA $.vec AS vec VECTOR FLAT 6 TYPE FLOAT32 \
+             DIM 2 DISTANCE_METRIC L2",
+        ],
+        [1, 1, 1],
+    );
+    // A flush takes the indexes with the documents: made again, they hold
+    // the documents written since.
+    assert!(c.cmds(&["FLUSHDB"]).is_ok());
+    hash_document(&mut c, "doc:8");
+    step(
+        &mut c,
+        &[
+            "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT kind TAG",
+            "FT.CREATE json ON JSON PREFIX 1 doc: SCHEMA $.vec AS vec VECTOR FLAT 6 TYPE FLOAT32 \
+             DIM 2 DISTANCE_METRIC L2",
+        ],
+        [1, 1, 0],
+    );
+    // An index told not to look at the documents that are there counts
+    // those written from then on, as RediSearch does.
+    for (index, schema) in [
+        (
+            "late",
+            "vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC L2",
+        ),
+        ("late-words", "title TEXT"),
+    ] {
+        let create =
+            format!("FT.CREATE {index} ON HASH PREFIX 1 doc: SKIPINITIALSCAN SCHEMA {schema}");
+        let create: Vec<&str> = create.split_whitespace().collect();
+        assert!(c.cmds(&create).is_ok(), "{create:?}");
+    }
+    let late = |c: &mut Conn| {
+        ["late", "late-words"].map(|index| {
+            let info = c.cmds(&["FT.INFO", index]);
+            let info = info.as_array();
+            let at = info
+                .iter()
+                .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+                .unwrap();
+            info[at + 1].as_int()
+        })
+    };
+    assert_eq!(late(&mut c), [0, 0]);
+    hash_document(&mut c, "doc:9");
+    assert_eq!(late(&mut c), [1, 1]);
+    step(&mut c, &[], [2, 2, 0]);
+}

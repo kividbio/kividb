@@ -532,7 +532,15 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             _ => {}
         }
     }
+    let kept_keys = !def.gives_ids();
     def.fields.extend(new_fields);
+    // An index of vectors alone that is given its first TEXT, TAG or
+    // NUMERIC field counts its documents by their ids from here on: each
+    // is given one below, whatever was added and with SKIPINITIALSCAN too.
+    let now_gives_ids = kept_keys && def.gives_ids();
+    if now_gives_ids {
+        def.docs.clear();
+    }
     let altered = def.clone();
 
     // We need to drop the write lock before backfilling — backfill takes
@@ -556,7 +564,7 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             &newly_added_text_fields,
         );
     }
-    if !added_filter_fields.is_empty() {
+    if !added_filter_fields.is_empty() || now_gives_ids {
         crate::vector::backfill_postings(
             &ctx.store[altered.db_index],
             &altered,
@@ -1489,8 +1497,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // What RediSearch divides a word's document count by: every document of
     // the index (`docs.size - 1`), as `FT.INFO`'s `num_docs` counts them.
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
-    let total_docs =
-        crate::commands::search::count_docs(&ctx.store[def.db_index], &def, cluster).max(1) as f64;
+    let total_docs = crate::commands::search::count_docs(&def, cluster).max(1) as f64;
 
     // RediSearch's reply per misspelled word, RESP2:
     //   ["TERM", word, [[score, suggestion], ...]]
