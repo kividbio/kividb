@@ -1161,6 +1161,22 @@ const SOURCE_THEN_DESTINATION: &[&str] = &[
 
 /// What a command does to its `nth` key: (reads it, writes it).
 fn key_access(name: &str, cmd: &[&[u8]], nth: usize) -> (bool, bool) {
+    // Commands that write only with some arguments are not in
+    // `is_write_command`, so they would be taken for pure reads below and the
+    // key they write would pass a read-only (`%R~`) permission. GEORADIUS /
+    // GEORADIUSBYMEMBER read their source key and write the destination of a
+    // STORE / STOREDIST; MIGRATE reads a key and removes it from this node.
+    match name {
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => {
+            return if nth == 0 {
+                (true, false)
+            } else {
+                (false, true)
+            };
+        }
+        "MIGRATE" => return (true, true),
+        _ => {}
+    }
     if !crate::replication::is_write_command(name) {
         return (true, false);
     }

@@ -449,14 +449,15 @@ fn keys_of_several_shards(
     db: usize,
     name: &str,
     cmd: &[&[u8]],
-    cmd0: &[u8],
 ) -> bool {
     // `key_positions` is a long match on the name: the writes that name one
     // key are told apart first.
     if cmd.len() < 3
         || matches!(name, "MSET" | "MSETNX")
         || one_key_write(name)
-        || !replication::is_write_command_bytes(cmd0)
+        // By the arguments: `GEORADIUS ... STORE` writes. (`MIGRATE` skips
+        // the gate before this is asked: `command_gate::skips`.)
+        || !replication::command_mutates_for_replication(name, cmd)
     {
         return false;
     }
@@ -498,7 +499,7 @@ fn takes_the_gate_alone(
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
         // stays small.
-        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd, cmd[0]))
+        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd))
         // A `SORT` that reads fields of hashes it does not name, which may
         // remove one past its time (`generics::sort_reads_hash_fields`).
         // Not `SORT_RO`: it is no write, and takes the order of what it
@@ -719,7 +720,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
 
     if !repl_is_slave
         && check_memory_limit()
-        && replication::is_write_command_bytes(cmd0)
+        && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
         && !crate::eviction::allowed_when_out_of_memory(name2)
         && !skip_mem
     {
@@ -785,27 +786,32 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Counted for `INFO commandstats`, like a command a client sends.
     crate::cmdstats::record(name2, &ctx.cmd, &result, started.elapsed());
 
+    // A command that writes only with some arguments (GEORADIUS ... STORE,
+    // MIGRATE, ...) must count as a write here too, or a key it emptied is
+    // not swept, a client blocked on a key it wrote is not woken, and a
+    // client tracking that key is not told. Judged by the arguments, as the
+    // propagation below judges it (`command_mutates_for_replication`).
+    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
     #[cfg(feature = "lua")]
-    if !result.starts_with(b"-") && replication::is_write_command_bytes(cmd0) {
+    if !result.starts_with(b"-") && inner_write {
         crate::commands::lua::script_note_successful_write();
     }
 
     // A write from a script leaves the same things to be done as one from a
     // client: a key it emptied goes, and clients blocked on a key it wrote
     // are woken.
-    if !result.starts_with(b"-") && replication::is_write_command_bytes(cmd0) {
+    if !result.starts_with(b"-") && inner_write {
         settle_written_keys(ctx, name2);
     }
     // And clients caching a key it wrote are told; a key it read is one its
     // caller has read.
     {
-        let is_write = replication::is_write_command_bytes(cmd0);
         track(
             ctx,
             name2,
             &result,
-            is_write && !result.starts_with(b"-"),
-            is_write,
+            inner_write && !result.starts_with(b"-"),
+            inner_write,
         );
     }
 
@@ -1092,7 +1098,6 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     if let Some(refusal) = crate::commands::arity::check(name, &ctx.cmd) {
         return refusal;
     }
-    let cmd0 = &ctx.cmd[0];
 
     // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
     // Taken before the command is routed, as everything it is checked
@@ -1182,7 +1187,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
         )
         && !crate::command_gate::alone_on_this_thread()
-        && replication::is_data_write(name)
+        && replication::refused_without_replicas(name, &ctx.cmd)
         && ctx.repl_state.lacks_good_replicas()
     {
         return resp_error(replication::NOREPLICAS);
@@ -1260,7 +1265,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         });
     let needs_room = over_limit
         && (loads_functions
-            || (replication::is_write_command_bytes(cmd0)
+            || (replication::command_mutates_for_replication(name, &ctx.cmd)
                 && !crate::eviction::allowed_when_out_of_memory(name)));
 
     // Writes hold the write gate from before they touch the store until their
