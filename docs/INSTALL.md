@@ -1,8 +1,9 @@
 # Installing KiviDB
 
-KiviDB is one binary. This page covers the package repositories for Linux; the
-[README](../README.md#running-kividb) covers Docker images, release tarballs,
-Homebrew and building from source.
+KiviDB is one binary. This page covers the package repositories for Linux,
+Homebrew, Cargo, the Docker images, and the release tarballs and packages on
+GitHub Releases; [BUILDING.md](BUILDING.md) covers building from source, and
+[CONFIGURATION.md](CONFIGURATION.md) running and configuring the server.
 
 - [Debian and Ubuntu (apt)](#debian-and-ubuntu-apt)
 - [Fedora, RHEL and compatibles, Amazon Linux 2023 (dnf)](#fedora-rhel-and-compatibles-amazon-linux-2023-dnf)
@@ -10,6 +11,12 @@ Homebrew and building from source.
 - [Upgrading, pinning and going back](#upgrading-pinning-and-going-back)
 - [Removing](#removing)
 - [The signing key](#the-signing-key)
+- [Homebrew](#homebrew)
+- [Cargo](#cargo)
+- [Docker](#docker)
+- [Release binaries](#release-binaries)
+- [Linux packages from GitHub Releases](#linux-packages-from-github-releases)
+- [Build provenance](#build-provenance)
 - [Maintainers: how the repositories are published](#maintainers-how-the-repositories-are-published)
 - [Maintainers: one-time setup](#maintainers-one-time-setup)
 
@@ -20,10 +27,10 @@ KiviDB 1.2.1. From then on they have every stable release from 1.2.1 on, for
 `amd64`/`x86_64` and `arm64`/`aarch64`. Each release is added when it is
 published, so `apt upgrade` and `dnf upgrade` keep KiviDB current. Until then,
 and for 1.2.0, use the `.deb` and `.rpm` files attached to each GitHub Release
-(see the [README](../README.md#linux-packages)).
+(see [Linux packages from GitHub Releases](#linux-packages-from-github-releases)).
 
 The packages are the default build, without Lua or TLS (see
-[Builds](../README.md#builds)). For `EVAL` or a TLS listener, use the `-lua`,
+[Builds](BUILDING.md#builds)). For `EVAL` or a TLS listener, use the `-lua`,
 `-tls` or `-full` tarball or image.
 
 They need glibc 2.34 or newer: Debian 12, Ubuntu 22.04, RHEL, Rocky Linux and
@@ -173,6 +180,162 @@ The `.deb` and `.rpm` files attached to each GitHub Release carry signed build
 provenance instead (`gh attestation verify <file> --repo kividbio/kividb`).
 The RPMs in the repository are the same builds with the key's signature
 added, so their checksums differ from the release's files.
+
+## Homebrew
+
+On macOS, Homebrew installs the default variant:
+
+```bash
+brew install kividbio/tap/kividb
+```
+
+## Cargo
+
+KiviDB is published on crates.io:
+
+```bash
+cargo install --locked kividb                      # default variant
+cargo install --locked kividb --features lua,tls   # full (or lua, or tls)
+cargo binstall kividb                              # the release's binary
+```
+
+- KiviDB runs on Linux and macOS only.
+- `cargo install` builds from source. `--locked` builds with the dependency
+  versions the release was built and tested with. The release profile uses
+  fat LTO, so the build takes several minutes. Since it compiles on the
+  machine itself, it also works with a glibc older than 2.34.
+- `cargo binstall` downloads the release's own binary of the default variant,
+  for Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon), and compiles
+  only on other targets. The Linux binaries need glibc 2.34 or newer (Debian
+  12, Ubuntu 22.04, RHEL 9, Amazon Linux 2023, or later), and the aarch64 one
+  an ARMv8.1 CPU or newer, for its LSE atomics: Graviton2 and later, Ampere,
+  but not a Raspberry Pi 4. On an older system, use `cargo install`.
+
+## Docker
+
+Images are published to Docker Hub and the GitHub Container Registry, with
+the same tags in both:
+
+```bash
+docker pull kividb/kividb:latest
+# or
+docker pull ghcr.io/kividbio/kividb:latest
+```
+
+`latest`, `1.2` and version tags such as `v1.2.0` are the default variant; `v1.2.0-lua`,
+`v1.2.0-tls` and `v1.2.0-full` are the others. Images are built for `amd64` and `arm64`.
+
+```bash
+docker run -p 6380:6380 kividb/kividb
+```
+
+A container is reached through its network, never from loopback, so the image's default
+command is `--protected-mode no`. **Arguments you pass replace that default**, which turns
+protected mode back on (see [Protected mode](CONFIGURATION.md#protected-mode)). When you
+pass your own flags, set a password (recommended) or add `--protected-mode no` yourself:
+
+```bash
+docker run -p 6380:6380 ghcr.io/kividbio/kividb \
+  --requirepass "change-me" \
+  --databases 8 \
+  --loglevel debug
+```
+
+**With AOF persistence** (mount a volume so data survives restarts; the server runs as UID
+1000 in `/home/kividb`):
+
+```bash
+docker run -p 6380:6380 \
+  -v kividb-data:/home/kividb \
+  ghcr.io/kividbio/kividb --aof --requirepass "change-me"
+```
+
+To keep the data in a host directory instead, create it owned by UID 1000 first
+(`mkdir -p data && sudo chown 1000:1000 data`, then `-v "$(pwd)/data:/home/kividb"`): a
+directory Docker creates for a bind mount belongs to root, and the server stops with
+`Permission denied` when it opens `appendonly.aof`.
+
+With `--aof`, every write is appended to `appendonly.aof`, so a crash loses at most about the
+last second of writes (the fsync interval) rather than everything since the last snapshot.
+On startup the snapshot (`dump.kdb`) is loaded first, and the AOF, which holds the writes
+made since that snapshot, is replayed on top of it; see
+[PERSISTENCE.md](PERSISTENCE.md).
+
+The image is distroless: it has no shell and no `redis-cli`. Connect from another container
+instead, for example `docker run --rm -it --network container:<name> redis redis-cli -p 6380`.
+
+**io_uring in containers:** Docker's default seccomp profile blocks io_uring on recent
+versions, and KiviDB then falls back to Tokio. To allow it on a Linux host, run with
+`--security-opt seccomp=unconfined` (understand what that permits before using it in
+production).
+
+## Release binaries
+
+Release binaries for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel) are published
+on [GitHub Releases](https://github.com/kividbio/kividb/releases). The `latest/download`
+links below always resolve to the newest release; replace `latest/download` with
+`download/v1.2.0` to pin a version.
+
+```bash
+# Linux x86_64
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-x86_64.tar.gz
+tar xzf kividb-linux-x86_64.tar.gz
+./kividb/kividb
+
+# Linux aarch64 (an ARMv8.1 CPU or newer: Graviton2 and later, Ampere; not a Raspberry Pi 4)
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-aarch64.tar.gz
+tar xzf kividb-linux-aarch64.tar.gz
+./kividb/kividb
+
+# macOS, Apple silicon (use kividb-darwin-x86_64.tar.gz on Intel)
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-darwin-aarch64.tar.gz
+tar xzf kividb-darwin-aarch64.tar.gz
+./kividb/kividb
+```
+
+Each tarball unpacks to a `kividb/` directory holding the `kividb` binary, `LICENSE` and
+`NOTICE`.
+
+Each variant other than the default has its name in the file: `kividb-lua-linux-x86_64.tar.gz`,
+`kividb-tls-…`, `kividb-full-…`. The default variant is also packaged for Linux as
+`kividb_amd64.deb` / `kividb_arm64.deb` and `kividb.x86_64.rpm` / `kividb.aarch64.rpm`,
+built with [nfpm](https://github.com/goreleaser/nfpm) from
+[`packaging/nfpm.yaml`](../packaging/nfpm.yaml). A `SHA256SUMS.txt` file lists the checksum
+of every file in a release.
+
+## Linux packages from GitHub Releases
+
+The release page has `.deb` and `.rpm` packages for `amd64` and `arm64`. They
+install the binary, a systemd unit, a `kividb` system user, and a default
+`/etc/kividb/kividb.conf` that listens on loopback only. Installing enables and
+starts the unit, and an upgrade restarts it:
+
+```bash
+sudo apt install ./kividb_amd64.deb     # or: sudo dnf install ./kividb.x86_64.rpm
+redis-cli -p 6380 PING
+```
+
+```bash
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb_amd64.deb && sudo dpkg -i kividb_amd64.deb
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb.x86_64.rpm && sudo dnf install ./kividb.x86_64.rpm
+```
+
+Data (the snapshot, the AOF, `nodes.conf`) lives in `/var/lib/kividb`, and logs
+go to the journal: `journalctl -u kividb`. To accept clients from other
+machines, set a password and change `bind` in `/etc/kividb/kividb.conf`.
+
+## Build provenance
+
+From 1.2.0 on, every file in a release and every image carries signed build provenance: a
+[GitHub artifact attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+that says it was built by this repository's release workflow, from the tagged commit. A
+checksum proves a download arrived whole; the attestation proves who built it. With the
+[GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify kividb-linux-x86_64.tar.gz --repo kividbio/kividb
+gh attestation verify oci://ghcr.io/kividbio/kividb:v1.2.1 --repo kividbio/kividb
+```
 
 ## Maintainers: how the repositories are published
 
