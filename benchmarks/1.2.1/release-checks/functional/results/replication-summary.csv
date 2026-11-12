@@ -1,0 +1,17 @@
+suite,engine,scenario,rep,acked,lost_acked,wrong,wait_acked,wait_acked_lost,unavail_s,recovery_s,base_per_100ms,converge_real_diff,kvdiff_real_diff,digest_equal,digestvalue_equal,extra
+fo,kividb,kill9_promote_rejoin,1,580125,0,0,0,0,0.7,0.82,1042,0,0,y,y,
+fo,kividb,kill9_promote_rejoin,2,588143,0,0,0,0,0.7,0.79,1064,0,0,y,y,
+fo,kividb,kill9_promote_rejoin,3,587637,0,0,0,0,0.7,0.82,1054,0,0,y,y,
+fo,kividb,minrep_kill9_promote_rejoin,1,522545,0,0,0,0,7.2,7.22,1053,0,0,y,y,
+fo,kividb,minrep_kill9_promote_rejoin,2,524770,1,0,0,0,7.2,7.22,1051,0,0,y,y,
+fo,kividb,minrep_kill9_promote_rejoin,3,521199,0,0,0,0,7.2,7.23,1042,0,0,y,y,
+fo,kividb,wait_kill9_promote_rejoin,1,256573,0,0,256090,0,6.8,6.92,512,0,0,y,y,
+fo,kividb,wait_kill9_promote_rejoin,2,255939,0,0,255454,0,6.8,6.92,515,0,0,y,y,
+fo,kividb,wait_kill9_promote_rejoin,3,257347,0,0,256871,0,6.8,6.92,523,0,0,y,y,
+fo,kv120,rolling_upgrade,1,894114,0,0,0,0,0.1,0.29,1051,0,0,y,y,
+fo,kv120,rolling_upgrade,2,895134,0,0,0,0,0.1,21.78,1063,0,0,y,y,
+fo,kv120,rolling_upgrade,3,890614,0,0,0,0,0.1,22.09,1057,0,0,y,y,
+sentinel,kividb,sen_kill9,1,677462,1,0,0,0,6.3,6.41,1058,,0/0,y/y,y/y,new=10.92.1.13:6379 | 10.92.1.12:slave_priority=100 10.92.1.13:slave_priority=100
+sentinel,kividb,sen_kill9,2,685310,0,0,0,0,6.2,6.31,1071,,0/0,y/y,y/y,new=10.92.1.12:6379 | 10.92.1.12:slave_priority=100 10.92.1.13:slave_priority=100
+sentinel,kividb,sen_kill9,3,683122,1,0,0,0,6.3,6.32,1073,,0/0,y/y,y/y,new=10.92.1.12:6379 | 10.92.1.12:slave_priority=100 10.92.1.13:slave_priority=100
+sentinel,kividb,sen_prio0,1,679601,0,0,0,0,6.3,6.32,1062,,0/0,y/y,y/y,new=10.92.1.13:6379 | 10.92.1.12:slave_priority=0 10.92.1.13:slave_priority=100

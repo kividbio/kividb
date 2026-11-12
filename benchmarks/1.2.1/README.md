@@ -17,6 +17,7 @@ Each folder holds its README, harness and raw results. The README gives the hard
 | [final](final/README.md) | the final commit `74071531` against 1.2.0: `GET`/`SET`, a mixed workload, `TS.ADD`, vector KNN, and the hash and field-TTL rows | 4 alternating rounds (2 for the hash rows) |
 | [vector](vector/README.md) | commit `ccba20e2` against the 1.2.0 release binary, Redis 8.10.2 (with and without io-threads) and Dragonfly 2.0.2: the 1.2.0 vector suite on all four datasets (q/s by ef and clients, recall, latency, ingest, memory per vector and after a delete), and whether the published 1.2.0 numbers reproduce | 3 alternating passes per engine |
 | [memory/full](memory/full/README.md) | commit `ccba20e2` against the 1.2.0 release binary, Redis 8.10.3, Valkey 9.1.3 and Dragonfly 2.0.2: bytes per key (warefeats), growth to 50M keys, `BGSAVE` and `BGREWRITEAOF` under 100k writes/s, `maxmemory` during a snapshot (#284), active defrag | 1 round per build (active defrag: 4) |
+| [release-checks](release-checks/README.md) | the code 1.2.1 ships (commit `de43b81e`) against 1.2.0: the functional checks and the Redis Tcl suite, the vector and memory/snapshot suites (with 30M-key snapshot load times), the AWS bare-metal headline, and the operator end to end on AKS | per suite: 3 passes (vector), 3 rounds (memory), 4 rounds (bare metal) |
 
 **On the final commit (`74071531`, [final](final/README.md)):** no row is more than 3% slower than 1.2.0. `HSET` at pipeline 16 is now 7.8% faster (#544 fixed by #569), and writes of hash fields with a TTL are 5-44% faster.
 
