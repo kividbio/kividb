@@ -6346,6 +6346,76 @@ fn nodes_talk_to_each_other_as_masteruser_with_default_limited() {
     assert_eq!(found.array()[0].int(), 3, "{found:?}");
 }
 
+/// `FT.INFO`'s `num_docs` is read off the documents each master's index
+/// holds, those in the slots it serves (#590). Slots that move to another
+/// master take their documents out of one index and into the other, so the
+/// count of every master together stays what it was; and so again when the
+/// slots move back. An index of vectors alone, which kept no list of its
+/// documents.
+#[test]
+fn num_docs_follows_slots_that_move_out_and_back() {
+    const DOCS: i64 = 60;
+    let (nodes, ranges) = form_cluster(3);
+    let owner = |key: &str| {
+        let slot = slot_of(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let create = "FT.CREATE vecs ON HASH PREFIX 1 item: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 \
+                  DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    let r = nodes[0].conn().cmd(&create);
+    assert!(r.is_ok(), "{r:?}");
+    // The half of the first master's slots that moves, and how many of the
+    // documents are in it.
+    let (from, to) = (ranges[0].0, ranges[0].0 + (ranges[0].1 - ranges[0].0) / 2);
+    let mut moving = 0;
+    for i in 0..DOCS {
+        let key = format!("item:{i}");
+        moving += usize::from((from..=to).contains(&slot_of(&key)));
+        let blob: Vec<u8> = [i as f32, 0.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let r = nodes[owner(&key)]
+            .conn()
+            .cmd_bytes(&[b"HSET", key.as_bytes(), b"vec", &blob]);
+        assert!(matches!(r, Resp::Int(1)), "{r:?}");
+    }
+    assert!(moving > 0, "no document in slots {from}-{to}");
+    let num_docs = |node: &Node| {
+        let info = node.conn().cmd(&["FT.INFO", "vecs"]);
+        let at = info
+            .array()
+            .iter()
+            .position(|i| matches!(i, Resp::Bulk(b) if b == b"num_docs"))
+            .unwrap_or_else(|| panic!("no num_docs: {info:?}"));
+        info.array()[at + 1].int()
+    };
+    let everywhere = |when: &str| {
+        // The keys of a slot that left are deleted a moment after it did.
+        wait_until(when, Duration::from_secs(30), || {
+            nodes.iter().all(|node| num_docs(node) == DOCS)
+        });
+    };
+    everywhere("every document counted");
+
+    let (from, to) = (from.to_string(), to.to_string());
+    for (taker, when) in [
+        (1, "every document counted once the slots moved out"),
+        (0, "every document counted once the slots moved back"),
+    ] {
+        let id = nodes[taker]
+            .conn()
+            .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &from, &to])
+            .text();
+        wait_import_completed(&nodes[taker], &id);
+        everywhere(when);
+    }
+}
+
 /// A shard that runs out of time tells the coordinator, which applies
 /// `ON_TIMEOUT`: `fail` is an error, `return` a partial reply. RESP3 puts
 /// the warning on the coordinator's reply; over RESP2 there is none.
