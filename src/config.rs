@@ -675,7 +675,126 @@ impl Default for Config {
     }
 }
 
+#[derive(Debug)]
+pub struct PassthroughDirective {
+    key: String,
+    args: Vec<String>,
+}
+
 impl Config {
+    /// Parse native flags with clap and collect passthrough config directives
+    pub fn parse_cli_from(
+        args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+    ) -> Result<(clap::ArgMatches, Vec<PassthroughDirective>), clap::Error> {
+        use clap::CommandFactory;
+
+        let mut command = Self::command();
+        command.build();
+        let arities: std::collections::HashMap<_, _> = command
+            .get_arguments()
+            .flat_map(|arg| {
+                let arity = arg.get_num_args().unwrap().min_values();
+                arg.get_long()
+                    .into_iter()
+                    .chain(arg.get_all_aliases().into_iter().flatten())
+                    .map(move |name| (name, arity))
+            })
+            .collect();
+        let value_string = |value: &std::ffi::OsStr| {
+            value.to_str().map(str::to_owned).ok_or_else(|| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::InvalidUtf8,
+                    "directive values must be UTF-8",
+                )
+            })
+        };
+        let raw = clap_lex::RawArgs::new(args);
+        let mut cursor = raw.cursor();
+        let mut native = Vec::new();
+        native.extend(raw.next_os(&mut cursor));
+        let mut passthrough_directives = Vec::new();
+        while let Some(option) = raw.next(&mut cursor) {
+            if option.is_escape() {
+                native.push(option.to_value_os());
+                native.extend(raw.remaining(&mut cursor));
+                break;
+            }
+            let Some((Ok(name), inline)) = option.to_long() else {
+                native.push(option.to_value_os());
+                continue;
+            };
+            if let Some(&arity) = arities.get(name) {
+                native.push(option.to_value_os());
+                if inline.is_none() {
+                    native.extend(std::iter::from_fn(|| raw.next_os(&mut cursor)).take(arity));
+                }
+                continue;
+            }
+            let mut values = Vec::new();
+            if let Some(value) = inline {
+                values.push(value_string(value)?);
+            }
+            while let Some(next) = raw.peek(&cursor) {
+                // Redis accepts a first value starting with --, except for bare --save.
+                if next.is_escape()
+                    || next.to_value_os() == "-h"
+                    || next.to_value_os() == "-V"
+                    || (next.is_long() && (!values.is_empty() || name.eq_ignore_ascii_case("save")))
+                {
+                    break;
+                }
+                values.push(value_string(raw.next_os(&mut cursor).unwrap())?);
+            }
+            passthrough_directives.push(PassthroughDirective {
+                key: name.to_ascii_lowercase(),
+                args: values,
+            });
+        }
+        command
+            .try_get_matches_from(native)
+            .map(|matches| (matches, passthrough_directives))
+    }
+
+    /// Apply passthrough CLI directives after the config file. Native CLI flags win,
+    /// as identified by the same `from_cli` predicate used for the file, with a warning.
+    pub fn apply_cli_directives(
+        &mut self,
+        directives: &[PassthroughDirective],
+        from_cli: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<String>, String> {
+        use clap::CommandFactory;
+
+        let command = Self::command();
+        let mut warnings = Vec::new();
+        for directive in directives {
+            let key = &directive.key;
+            let overridden = std::cell::Cell::new(None);
+            let record_override = |field: &str| {
+                let native = from_cli(field);
+                if native {
+                    overridden.set(
+                        command
+                            .get_arguments()
+                            .find(|arg| arg.get_id().as_str() == field)
+                            .and_then(clap::Arg::get_long),
+                    );
+                }
+                native
+            };
+            match self.apply_directive(key, &directive.args, &record_override) {
+                Ok(Some(warning)) => warnings.push(format!("--{key}: {warning}")),
+                Ok(None) => {}
+                Err(error) => return Err(format!("--{key}: {error}")),
+            }
+            if let Some(flag) = overridden.get() {
+                warnings.push(format!(
+                    "Ignoring '--{key}': native flag '--{flag}' takes precedence regardless of argument order"
+                ));
+            }
+        }
+        Ok(warnings)
+    }
+
     pub fn resolve_threads(&self) -> usize {
         if self.threads > 0 {
             return self.threads;
@@ -2028,6 +2147,208 @@ pub enum RewriteError {
     /// rewrite.
     NoConfigFile,
     Io(std::io::Error),
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::FromArgMatches;
+
+    fn load(args: &[&str], file: &str) -> Result<(Config, Vec<String>), String> {
+        let (matches, directives) =
+            Config::parse_cli_from(args.iter().copied()).map_err(|error| error.to_string())?;
+        let mut config = Config::from_arg_matches(&matches).unwrap();
+        let from_cli = |field: &str| {
+            matches.value_source(field) == Some(clap::parser::ValueSource::CommandLine)
+        };
+        let mut warnings = config.apply_config_text(file, &from_cli)?;
+        warnings.extend(config.apply_cli_directives(&directives, &from_cli)?);
+        Ok((config, warnings))
+    }
+
+    #[test]
+    fn redis_directives_mix_with_native_flags() {
+        let (config, warnings) = load(
+            &[
+                "kividb",
+                "--appendonly",
+                "yes",
+                "--save",
+                "60",
+                "1",
+                "--port",
+                "6399",
+                "--appendonly",
+                "no",
+                "--save",
+                "",
+                "--dbfilename",
+                "dump.rdb",
+                "--aof-use-rdb-preamble",
+                "no",
+            ],
+            "",
+        )
+        .unwrap();
+        assert_eq!(config.port, 6399);
+        assert!(!config.aof);
+        assert!(!config.aof_preamble);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("'save' is accepted but has no effect"));
+    }
+
+    #[test]
+    fn empty_and_equals_values_are_not_retokenized() {
+        let (config, warnings) = load(
+            &[
+                "kividb",
+                "--save",
+                "",
+                "--appendonly=yes",
+                "--primaryauth=pa ss#word",
+            ],
+            "",
+        )
+        .unwrap();
+        assert!(config.aof);
+        assert_eq!(config.masterauth, "pa ss#word");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(load(&["kividb", "--save=", "--appendonly=no"], "").is_ok());
+        assert!(load(&["kividb", "--save", "--appendonly=no"], "").is_ok());
+        assert!(load(&["kividb", "--save"], "").is_ok());
+        let (config, _) = load(&["kividb", "--primaryauth", "--opaque-value"], "").unwrap();
+        assert_eq!(config.masterauth, "--opaque-value");
+    }
+
+    #[test]
+    fn native_flags_override_directive_aliases_regardless_of_order() {
+        for args in [
+            ["kividb", "--aof", "--appendonly", "no"],
+            ["kividb", "--appendonly", "no", "--aof"],
+            ["kividb", "--aof", "--appendonly", "yes"],
+        ] {
+            let (config, warnings) = load(&args, "appendonly no").unwrap();
+            assert!(config.aof);
+            assert_eq!(
+                warnings,
+                [
+                    "Ignoring '--appendonly': native flag '--aof' takes precedence regardless of argument order"
+                ]
+            );
+        }
+        let (_, warnings) = load(&["kividb", "--aof"], "appendonly no").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (config, _) = load(
+            &[
+                "kividb",
+                "--slave-priority",
+                "0",
+                "--auto-aof-rewrite-percentage",
+                "25",
+            ],
+            "",
+        )
+        .unwrap();
+        assert_eq!(config.replica_priority, 0);
+        assert_eq!(config.aof_rewrite_percentage, 25);
+        let args = ["kividb", "--port=6399", "--appendonly=no", "--aof"];
+        assert!(load(&args, "appendonly yes").unwrap().0.aof);
+    }
+
+    #[test]
+    fn override_warnings_name_flags_without_exposing_values() {
+        let (config, warnings) = load(
+            &[
+                "kividb",
+                "--masterauth",
+                "native-secret",
+                "--primaryauth",
+                "directive-secret",
+            ],
+            "",
+        )
+        .unwrap();
+        assert_eq!(config.masterauth, "native-secret");
+        assert_eq!(
+            warnings,
+            [
+                "Ignoring '--primaryauth': native flag '--masterauth' takes precedence regardless of argument order"
+            ]
+        );
+        let (_, warnings) = load(
+            &["kividb", "--appendfsync", "always", "--APPENDFSYNC", "no"],
+            "",
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("syncs the append-only file once a second"));
+        assert!(warnings[1].contains("native flag '--appendfsync' takes precedence"));
+    }
+
+    #[test]
+    fn negative_and_multi_value_directives_reach_the_config_handler() {
+        let (config, _) = load(&["kividb", "--slaveof", "localhost", "6379"], "").unwrap();
+        assert_eq!(config.replicaof.unwrap(), ["localhost", "6379"]);
+        let (config, _) = load(
+            &["kividb", "--save", "", "--replicaof", "localhost", "6379"],
+            "",
+        )
+        .unwrap();
+        assert_eq!(config.replicaof.unwrap(), ["localhost", "6379"]);
+        assert!(load(&["kividb", "--port", "--appendonly", "no"], "").is_err());
+        let error = load(&["kividb", "--auto-aof-rewrite-percentage", "-1"], "").unwrap_err();
+        assert!(error.contains("not a number in range"), "{error}");
+    }
+
+    #[test]
+    fn invalid_and_unknown_directives_still_fail() {
+        for (args, expected) in [
+            (
+                vec!["--appendonly", "maybe"],
+                "argument must be 'yes' or 'no'",
+            ),
+            (
+                vec!["--aof", "--appendonly", "maybe"],
+                "argument must be 'yes' or 'no'",
+            ),
+            (vec!["--appendonly", "yes", "no"], "takes one value"),
+            (vec!["--appendonly"], "needs a value"),
+            (
+                vec!["--this-directive-does-not-exist", "42"],
+                "unknown directive",
+            ),
+            (vec!["--daemonize", "yes"], "not supported"),
+        ] {
+            let mut argv = vec!["kividb"];
+            argv.extend(args);
+            let error = load(&argv, "").unwrap_err();
+            assert!(error.contains(expected), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn help_version_and_end_of_options_keep_clap_behavior() {
+        for (flag, kind) in [
+            ("--help", clap::error::ErrorKind::DisplayHelp),
+            ("-h", clap::error::ErrorKind::DisplayHelp),
+            ("--version", clap::error::ErrorKind::DisplayVersion),
+            ("-V", clap::error::ErrorKind::DisplayVersion),
+        ] {
+            let args = ["kividb", "--appendonly", "no", flag];
+            let error = Config::parse_cli_from(args).unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+        for (flag, kind) in [
+            ("-h", clap::error::ErrorKind::DisplayHelp),
+            ("-V", clap::error::ErrorKind::DisplayVersion),
+        ] {
+            let error = Config::parse_cli_from(["kividb", "--primaryauth", flag]).unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+        let (config, _) = load(&["kividb", "--primaryauth=-h"], "").unwrap();
+        assert_eq!(config.masterauth, "-h");
+        assert!(load(&["kividb", "--", "--appendonly", "yes"], "").is_err());
+    }
 }
 
 #[cfg(test)]

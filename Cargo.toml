@@ -80,6 +80,7 @@ ahash = "0.8"
 indexmap = "2"
 socket2 = { version = "0.5", features = ["all"] }
 clap = { version = "4", features = ["derive"] }
+clap_lex = "1"
 libc = "0.2.183"
 rand = "0.8"
 # `float_roundtrip`: a number is read as the double nearest to it. Without

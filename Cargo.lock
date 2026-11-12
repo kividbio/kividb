@@ -425,6 +425,7 @@ dependencies = [
  "bitflags 2.11.0",
  "boxcar",
  "clap",
+ "clap_lex",
  "either",
  "hashbrown",
  "indexmap",

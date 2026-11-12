@@ -404,8 +404,12 @@ gh attestation verify oci://ghcr.io/kividbio/kividb:v1.2.0 --repo kividbio/kivid
 KiviDB is configured with command-line flags, or with a Redis-style configuration file
 (one directive per line, such as `port 6380` or `appendonly yes`). The file is read from
 `/etc/kividb/kividb.conf` if it exists; `--configfile <path>` names another one. A flag given
-on the command line wins over the same setting in the file. Run `kividb --help` for the full
-list.
+on the command line wins over the same setting in the file. Additional config directives
+are accepted as `--<directive> <value...>`. Native flags take precedence over additional
+directives regardless of argument order; for example, `--aof` wins over `--appendonly no`,
+with a warning naming both options. `-h` and `-V` retain their help and version meanings;
+use `--<directive>=-h` or `--<directive>=-V` to pass either as a directive value.
+Run `kividb --help` for the native flags.
 
 | Flag | Default | Description |
 |------|---------|-------------|
