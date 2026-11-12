@@ -1053,11 +1053,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without an empty key are written as before. A snapshot that 1.2.0 wrote
   with the empty key, as `dump.kdb`, an AOF checkpoint or preamble, or a
   1.2.0 master's full sync, now loads: the key is looked for where 1.2.0
-  put it. In the last database that is certain; before it, an image that
-  does not load is read again (at most 32 times) with the key in each
-  place it could be, and one that none of these readings loads is
-  refused as before. An image that goes on past its databases with bytes
-  that are not a section is refused, rather than loaded without them.
+  put it. In the last database that is certain. Before it, an image that
+  does not load as 1.2.1 writes it is read again, a bounded number of
+  times, with the key in each place it could be. One that none of these
+  readings loads is refused as before; so is one that more than one of
+  them loads, or that could not be read every way it can be, with an
+  error that says so and what to do: restore the data from another copy
+  (an AOF, a replica or a backup), or for a full sync, upgrade the master
+  to 1.2.1. An image that goes on past its databases with bytes that are
+  not a section is refused, rather than loaded without them.
   Empty hash fields, set and sorted set members and list elements were
   never affected (#441).
 
