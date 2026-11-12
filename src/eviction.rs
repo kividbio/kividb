@@ -488,6 +488,8 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "RENAME"
             | "RENAMENX"
             | "MOVE"
+            // Takes keys away; Redis flags it a write, but not `denyoom`.
+            | "MIGRATE"
             | "SWAPDB"
             | "LPOP"
             | "RPOP"
