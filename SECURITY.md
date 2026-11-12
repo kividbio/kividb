@@ -60,7 +60,7 @@ report it as above.
 
 KiviDB, like Redis, is meant to run on a trusted network. In particular:
 
-- keep [protected mode](README.md#protected-mode) on, or set a password (`--requirepass` or
+- keep [protected mode](docs/CONFIGURATION.md#protected-mode) on, or set a password (`--requirepass` or
   ACL users) before accepting clients from other machines;
 - do not expose the server port, or the cluster bus port (`<port> + 10000`), to the internet;
 - use a TLS build (`tls` or `full`) with `--tls-port` when traffic crosses an untrusted
