@@ -72,6 +72,14 @@ pub(super) struct WriteShards<'a> {
     held: Vec<(usize, store::ShardWrite<'a>)>,
 }
 
+impl Drop for WriteShards<'_> {
+    /// Every shard is let go of before anything a write left is announced
+    /// ([`store::unlock_together`]).
+    fn drop(&mut self) {
+        store::unlock_together(self.held.drain(..).map(|(_, shard)| shard));
+    }
+}
+
 impl<'a> WriteShards<'a> {
     /// Every shard of `keys`, held at once, and never waited for while
     /// another is held.

@@ -7,6 +7,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-13
+
+See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).
+
+### Fixed
+
+- A multi-key write over a key past its TTL could hang the server when a
+  search index existed: an `MSET`, `MSETNX`, `JSON.MSET` or `MULTI`/`EXEC`
+  of plain `SET`s that wrote over such a key, at the same moment as a
+  change to an index (`FT.CREATE`, `FT.ALTER`, `FT.DROPINDEX`, an
+  `FT.ALIAS*` command or a vector index compacting itself) and a write to
+  an indexed hash (`HINCRBY`, `HDEL` and the like, or a hash field
+  expiring), could leave every client, `PING` included, without an answer
+  until a restart. The write now lets go of all of its keys before it
+  deletes the expired ones.
+
 ## [1.2.1] - 2026-11-12
 
 See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before upgrading.
