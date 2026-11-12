@@ -334,7 +334,7 @@ checksum proves a download arrived whole; the attestation proves who built it. W
 
 ```bash
 gh attestation verify kividb-linux-x86_64.tar.gz --repo kividbio/kividb
-gh attestation verify oci://ghcr.io/kividbio/kividb:v1.2.0 --repo kividbio/kividb
+gh attestation verify oci://ghcr.io/kividbio/kividb:v1.2.1 --repo kividbio/kividb
 ```
 
 ## Maintainers: how the repositories are published
