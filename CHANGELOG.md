@@ -13,15 +13,12 @@ See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).
 
 ### Fixed
 
-- A multi-key write over a key past its TTL could hang the server when a
-  search index existed: an `MSET`, `MSETNX`, `JSON.MSET` or `MULTI`/`EXEC`
-  of plain `SET`s that wrote over such a key, at the same moment as a
-  change to an index (`FT.CREATE`, `FT.ALTER`, `FT.DROPINDEX`, an
-  `FT.ALIAS*` command or a vector index compacting itself) and a write to
-  an indexed hash (`HINCRBY`, `HDEL` and the like, or a hash field
-  expiring), could leave every client, `PING` included, without an answer
-  until a restart. The write now lets go of all of its keys before it
-  deletes the expired ones.
+- A multi-key write over a key past its TTL (`MSET`, `MSETNX`,
+  `JSON.MSET`, or a `MULTI`/`EXEC` of plain `SET`s after `WATCH`) could
+  make the server stop answering, until a restart, when a search index
+  existed and was being changed at the same time. The write now lets go
+  of all of its keys before it deletes the expired ones. Servers without
+  a search index were not affected, and neither was 1.1.
 
 ## [1.2.1] - 2026-11-12
 
