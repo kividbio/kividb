@@ -9,6 +9,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica no longer deletes a key when its master's `PEXPIREAT`
+  arrives after that moment has passed (#665).** It deleted the key, while
+  the master still had it, and the master's next writes to the key made a
+  different key on the replica that never went away: after `PEXPIRE k 100`,
+  `INCR k` and `PERSIST k`, the master had `6` and the replica `1`. This
+  happened whenever the replica lagged by more than the time to live, and
+  whenever the master set it inside a script that ran longer than that.
+  `EXPIRE`, `PEXPIRE` and `GETEX … PX` all reach a replica as `PEXPIREAT`,
+  so all three were affected. The replica now keeps the key with its past
+  deadline, hidden from reads, until the master's `DEL` or its next writes
+  arrive, as Redis does (`checkAlreadyExpired` is false on a replica). 1.2.1
+  and earlier are affected.
+
 - **A document that any command writes over or deletes leaves its search
   indexes (#619).** A hash or JSON document replaced by a string, a list, a
   set or a sorted set was taken out of its indexes only by the commands

@@ -124,6 +124,16 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
 /// that followed made a new key of what came after, with no time to live,
 /// for good. Set, the key keeps its deadline, the writes go into it, and
 /// expiry takes it out once the load is done, with its `DEL` logged.
+///
+/// The same on a replica applying its master's stream (`applying_stream`),
+/// as Redis's `checkAlreadyExpired` is false there (`server.masterhost`):
+/// the master's `PEXPIREAT k t` arrives with `t` past whenever the replica
+/// lags, or the master set the time to live inside a transaction or script
+/// that ran longer than it. Deleted here, the key was gone on the replica
+/// while the master still had it, and the master's next writes to it
+/// (`INCR`, `PERSIST`) made a different key on the replica, for good
+/// (#665). Set, the replica keeps the key, hidden from reads past its
+/// time, until the master's `DEL` or its next writes say what it is.
 pub(crate) fn apply_expire(
     ctx: &Ctx,
     key: &[u8],
@@ -131,7 +141,7 @@ pub(crate) fn apply_expire(
     deletes: bool,
     flags: &ExpireModifierFlags,
 ) -> Vec<u8> {
-    let deletes = deletes && !crate::expiry::replaying();
+    let deletes = deletes && !crate::commands::helpers::applying_stream(ctx);
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     if !read_lock!(shard).contains_key(key) {
