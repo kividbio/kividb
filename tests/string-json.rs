@@ -2983,7 +2983,7 @@ fn a_snapshot_keeps_json_numbers_exactly() {
     assert_exact("snapshot", &doubles, &got);
 }
 
-// ── JSON nesting-depth and array-index bounds (security) ──
+// ── JSON nesting depth and array index bounds ──
 // Repeated JSON writes at ever-deeper paths once built a document far deeper
 // than any single parse (serde_json caps a parse at 128 levels). A later
 // recursive walk over it — JSON.GET/DUMP/SAVE serialisation, Drop, merge —
