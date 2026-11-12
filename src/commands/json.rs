@@ -52,6 +52,74 @@ impl LegacyMiss {
     }
 }
 
+/// The deepest a stored document may nest, as RedisJSON's `MAX_DEPTH`. A
+/// write that would grow a document past it is refused: the recursive walks
+/// over a document (serialising for `JSON.GET`/`DUMP`/`SAVE`, dropping it,
+/// merging) would otherwise overflow the thread stack and abort the whole
+/// server on a document nested far enough.
+pub(crate) const MAX_DEPTH: usize = 128;
+const RECURSION_LIMIT: &str = "ERR recursion limit exceeded";
+
+/// The deepest nesting in `value`: a scalar is 0, an array or object (empty or
+/// not) is 1 plus the deepest of its children — RedisJSON's
+/// `calculate_value_depth`. The recursion is bounded to [`MAX_DEPTH`] levels, so
+/// it stays shallow and allocation-free on the common shallow values and cannot
+/// itself overflow the stack on a value nested further: a value at the bound
+/// counts as [`MAX_DEPTH`], which is enough for the callers, who only compare
+/// against it. Every caller measures a freshly parsed or freshly decoded value,
+/// whose own depth is already bounded by the parser.
+pub(crate) fn value_depth(value: &Value) -> usize {
+    fn go(value: &Value, budget: usize) -> usize {
+        match value {
+            Value::Array(items) => {
+                if budget == 0 {
+                    return 1;
+                }
+                1 + items.iter().map(|v| go(v, budget - 1)).max().unwrap_or(0)
+            }
+            Value::Object(members) => {
+                if budget == 0 {
+                    return 1;
+                }
+                1 + members
+                    .values()
+                    .map(|v| go(v, budget - 1))
+                    .max()
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+    go(value, MAX_DEPTH)
+}
+
+/// Whether placing a value of depth `value_depth` at a location `at_depth`
+/// steps from the root would nest past [`MAX_DEPTH`]. Matches RedisJSON, which
+/// refuses once the total reaches the limit.
+fn too_deep(at_depth: usize, value_depth: usize) -> bool {
+    at_depth + value_depth >= MAX_DEPTH
+}
+
+/// The error reply for a path whose array targets cannot take an element of
+/// depth `added` without nesting past [`MAX_DEPTH`], or `None` when they can.
+/// An element appended to or inserted in an array sits one level below it.
+fn append_too_deep(query: &Query, root: &Value, added: usize) -> Option<Vec<u8>> {
+    let locations = query.locations(root);
+    let targets = if query.is_legacy() {
+        &locations[..locations.len().min(1)]
+    } else {
+        &locations[..]
+    };
+    for location in targets {
+        if matches!(json_path::get(root, location), Some(Value::Array(_)))
+            && too_deep(location.len() + 1, added)
+        {
+            return Some(resp_error(RECURSION_LIMIT));
+        }
+    }
+    None
+}
+
 fn arg<'a>(cmd: &[&'a [u8]], index: usize) -> Option<&'a str> {
     cmd.get(index).and_then(|bytes| parse_utf8(bytes))
 }
@@ -249,9 +317,13 @@ fn set_in(
     if !query.selects() {
         return Err(resp_error(NOT_A_SELECTION));
     }
+    let depth = value_depth(value);
     if query.is_root() {
         if nx {
             return Ok(false);
+        }
+        if too_deep(0, depth) {
+            return Err(resp_error(RECURSION_LIMIT));
         }
         *root = value.clone();
         return Ok(true);
@@ -260,6 +332,12 @@ fn set_in(
     if !locations.is_empty() {
         if nx {
             return Ok(false);
+        }
+        if locations
+            .iter()
+            .any(|location| too_deep(location.len(), depth))
+        {
+            return Err(resp_error(RECURSION_LIMIT));
         }
         for location in locations.iter().rev() {
             if let Some(node) = json_path::get_mut(root, location) {
@@ -274,6 +352,12 @@ fn set_in(
     // Nothing there yet: a new member of an object that is.
     match query.new_member(root) {
         Some((parents, name)) => {
+            if parents
+                .iter()
+                .any(|parent| too_deep(parent.len() + 1, depth))
+            {
+                return Err(resp_error(RECURSION_LIMIT));
+            }
             for parent in &parents {
                 if let Some(Value::Object(members)) = json_path::get_mut(root, parent) {
                     members.insert(name.clone(), value.clone());
@@ -312,17 +396,37 @@ fn set_key(
 
 /// Whether [`set_in`], with neither NX nor XX, fails on `root`: the error it
 /// would fail with, found without changing anything.
-fn check_set_in(root: &Value, query: &Query) -> Result<(), Vec<u8>> {
+fn check_set_in(root: &Value, query: &Query, value: &Value) -> Result<(), Vec<u8>> {
     if !query.selects() {
         return Err(resp_error(NOT_A_SELECTION));
     }
-    if query.is_root() || !query.locations(root).is_empty() {
-        return Ok(());
+    let depth = value_depth(value);
+    let deep = || Err(resp_error(RECURSION_LIMIT));
+    if query.is_root() {
+        return if too_deep(0, depth) { deep() } else { Ok(()) };
     }
-    if query.is_legacy() && query.new_member(root).is_none() {
-        return Err(resp_error("ERR path does not exist"));
+    let locations = query.locations(root);
+    if !locations.is_empty() {
+        return if locations
+            .iter()
+            .any(|location| too_deep(location.len(), depth))
+        {
+            deep()
+        } else {
+            Ok(())
+        };
     }
-    Ok(())
+    match query.new_member(root) {
+        Some((parents, _))
+            if parents
+                .iter()
+                .any(|parent| too_deep(parent.len() + 1, depth)) =>
+        {
+            deep()
+        }
+        None if query.is_legacy() => Err(resp_error("ERR path does not exist")),
+        _ => Ok(()),
+    }
 }
 
 /// One `JSON.MSET` triple on `doc`: a key's document, or `None` for a key
@@ -376,7 +480,7 @@ fn mset(ctx: &Ctx, writes: &[(&[u8], Query, Value)]) -> Result<(), Vec<u8>> {
             set_doc(doc, query, value)?;
         } else {
             match map.get(*key) {
-                Some(ValueRef::Json(tree)) => check_set_in(&tree.read(), query)?,
+                Some(ValueRef::Json(tree)) => check_set_in(&tree.read(), query, value)?,
                 Some(_) => return Err(resp_error(WRONGTYPE)),
                 None if !query.is_root() => return Err(resp_error(NEW_AT_ROOT)),
                 None => {}
@@ -1057,6 +1161,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             write_doc(ctx, key, resp_null_bulk(), |root| {
+                let added = values.iter().map(value_depth).max().unwrap_or(0);
+                if let Some(e) = append_too_deep(&query, root, added) {
+                    return e;
+                }
                 each_node(resp, &query, root, |node| match node {
                     Value::Array(items) => {
                         items.extend(values.iter().cloned());
@@ -1086,6 +1194,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             write_doc(ctx, key, resp_null_bulk(), |root| {
+                let added = values.iter().map(value_depth).max().unwrap_or(0);
+                if let Some(e) = append_too_deep(&query, root, added) {
+                    return e;
+                }
                 each_node(resp, &query, root, |node| match node {
                     Value::Array(items) => {
                         let len = items.len() as i64;
@@ -1281,11 +1393,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     return Some(resp_simple("OK"));
                 }
             }
+            let patch_depth = value_depth(&patch);
             write_doc(ctx, key, resp_error("ERR key does not exist"), |root| {
                 let locations = query.locations(root);
                 if locations.is_empty() {
                     return match query.new_member(root) {
                         Some((parents, name)) => {
+                            if !patch.is_null()
+                                && parents
+                                    .iter()
+                                    .any(|parent| too_deep(parent.len() + 1, patch_depth))
+                            {
+                                return resp_error(RECURSION_LIMIT);
+                            }
                             for parent in &parents {
                                 if let Some(Value::Object(members)) =
                                     json_path::get_mut(root, parent)
@@ -1300,6 +1420,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                         None => resp_error("ERR path does not exist"),
                     };
+                }
+                if !patch.is_null() {
+                    for location in &locations {
+                        let existing = json_path::get(root, location).map(value_depth).unwrap_or(0);
+                        if too_deep(location.len(), existing.max(patch_depth)) {
+                            return resp_error(RECURSION_LIMIT);
+                        }
+                    }
                 }
                 for location in locations.iter().rev() {
                     if patch.is_null() {
@@ -1432,7 +1560,7 @@ mod tests {
                 };
                 let mut root = before.clone();
                 let set = set_in(&mut root, &query, &value, false, false);
-                let checked = check_set_in(&before, &query);
+                let checked = check_set_in(&before, &query, &value);
                 assert_eq!(
                     checked.is_err(),
                     set.is_err(),
@@ -1449,6 +1577,26 @@ mod tests {
             }
         }
         assert!(compared > 100, "only {compared} cases ran");
+
+        // At the nesting limit: replacing the deepest leaf, or adding a
+        // member to the deepest object, with a nested value is refused by
+        // both, with the same error, and changes nothing.
+        let deep_arrays = format!("{}0{}", "[".repeat(127), "]".repeat(127));
+        let deep_objects = format!("{}{{}}{}", "{\"a\":".repeat(126), "}".repeat(126));
+        let cases = [
+            (deep_arrays, format!("${}", "[0]".repeat(127))),
+            (deep_objects, format!("${}.new", ".a".repeat(126))),
+        ];
+        for (doc, path) in cases {
+            let before: Value = serde_json::from_str(&doc).unwrap();
+            let query = Query::parse(&path).unwrap();
+            let mut root = before.clone();
+            let set = set_in(&mut root, &query, &value, false, false);
+            let checked = check_set_in(&before, &query, &value);
+            assert!(set.is_err(), "set_in at the limit must fail");
+            assert_eq!(checked.err(), set.err(), "the same error");
+            assert_eq!(root, before, "a refused set changes nothing");
+        }
     }
 
     #[test]

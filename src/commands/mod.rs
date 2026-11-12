@@ -22,7 +22,7 @@ pub mod helpers;
 pub(crate) mod hotkeys;
 mod hybrid;
 pub(crate) mod hyperloglog;
-mod json;
+pub(crate) mod json;
 pub(crate) mod json_fpha;
 pub(crate) mod json_path;
 mod key_spec_table;

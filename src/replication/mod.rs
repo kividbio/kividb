@@ -1537,7 +1537,8 @@ pub fn load_dump(
     let (loaded, reader) = crate::snapshot::load_snapshot_with(|| {
         let file = std::fs::File::open(path)?;
         Ok(std::io::BufReader::new(FingerprintReader::new(file)))
-    })?;
+    })
+    .map_err(|e| crate::snapshot::refusal_of_file(e, path))?;
     // What the buffer holds beyond what was parsed has been fingerprinted.
     let fingerprint = reader.into_inner().finish()?;
     Ok((loaded, fingerprint))
@@ -1871,24 +1872,6 @@ pub fn is_write_command_bytes(cmd0: &[u8]) -> bool {
     }
     let name = std::str::from_utf8(&buf[..cmd0.len()]).unwrap_or("");
     is_write_command(name)
-}
-
-/// Whether `name` (upper case) changes the dataset, as Redis's `write` flag
-/// has it: [`is_write_command`] but `SELECT`. `SELECT` is propagated, so that
-/// a replica and the AOF follow the switch of database, but it writes
-/// nothing. So the checks that refuse or hold a write let it through, as
-/// Redis does: `min-replicas-to-write`, `CLIENT PAUSE WRITE` and the ACL's
-/// `write` category (#411, #392). (`maxmemory` has a list of its own,
-/// `eviction::allowed_when_out_of_memory`.)
-#[inline]
-pub fn is_data_write(name: &str) -> bool {
-    name != "SELECT" && is_write_command(name)
-}
-
-/// [`is_data_write`] of a command name as the client sent it.
-#[inline]
-pub fn is_data_write_bytes(cmd0: &[u8]) -> bool {
-    !cmd0.eq_ignore_ascii_case(b"SELECT") && is_write_command_bytes(cmd0)
 }
 
 fn generate_repl_id() -> String {
@@ -4494,9 +4477,15 @@ fn script_may_write(name: &str, cmd: &[&[u8]]) -> bool {
 
 /// `GEORADIUS` / `GEORADIUSBYMEMBER` are reads unless they carry `STORE` or
 /// `STOREDIST`, which write the result set to another key.
-fn georadius_stores(cmd: &[&[u8]]) -> bool {
+fn georadius_stores(name: &str, cmd: &[&[u8]]) -> bool {
+    // The STORE / STOREDIST options follow the fixed arguments
+    // (`key lon lat radius unit`, or `key member radius unit` for
+    // GEORADIUSBYMEMBER). Scanning from there, not from argument 1, keeps a
+    // member or key literally named "store" from being taken for the option,
+    // using the same fixed-argument count as `keyspec::geo_radius_keys`.
+    let options = if name == "GEORADIUSBYMEMBER" { 5 } else { 6 };
     cmd.iter()
-        .skip(1)
+        .skip(options)
         .any(|a| a.eq_ignore_ascii_case(b"STORE") || a.eq_ignore_ascii_case(b"STOREDIST"))
 }
 
@@ -4517,7 +4506,7 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
         "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => false,
         // Writes replicate as inner `redis.call` commands, not as `EVAL` / `EVALSHA` / `FCALL`.
         "EVAL" | "EVALSHA" | "FCALL" => false,
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(name, cmd),
         "PFDEBUG" => pfdebug_mutates(cmd),
         // Propagated as the `DEL` of whatever it moved away; see
         // `script_feed::commands_for_propagation`.
@@ -4546,6 +4535,16 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
     }
 }
 
+/// Whether `min-replicas-to-write` refuses a command: one that changes the
+/// dataset, judged by its arguments ([`command_mutates_for_replication`]),
+/// as Redis judges it by its `write` flag. Not `SELECT` (#411) or `SCRIPT`:
+/// both are propagated, but neither is flagged a write in Redis, which runs
+/// them without good replicas.
+#[inline]
+pub fn refused_without_replicas(name: &str, cmd: &[&[u8]]) -> bool {
+    !matches!(name, "SELECT" | "SCRIPT") && command_mutates_for_replication(name, cmd)
+}
+
 /// Write commands blocked inside an `EVAL_RO` / `EVALSHA_RO` script (`redis.call`).
 #[inline]
 pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bool {
@@ -4555,7 +4554,7 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
         // `PFCOUNT`, possibly to its key: not what a script that has said it
         // writes nothing may do.
         "PUBLISH" | "SPUBLISH" | "PFCOUNT" => true,
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(name, cmd),
         "PFDEBUG" => pfdebug_mutates(cmd),
         "MIGRATE" => true,
         "HIMPORT" => crate::commands::hash_import::is_write(cmd),
@@ -5172,6 +5171,20 @@ mod replication_invariants_tests {
         assert!(super::command_mutates_for_replication(
             "GEORADIUSBYMEMBER",
             &storedist
+        ));
+        // A member or key literally named "store" is not the STORE option:
+        // the scan starts after the fixed arguments.
+        let member_named_store: Vec<&[u8]> =
+            vec![b"GEORADIUSBYMEMBER", b"k", b"store", b"1", b"km"];
+        assert!(!super::command_mutates_for_replication(
+            "GEORADIUSBYMEMBER",
+            &member_named_store
+        ));
+        // A replica refuses it all the same, as Redis does: GEORADIUS and
+        // GEORADIUSBYMEMBER are write commands, `_RO` are the reads.
+        assert!(super::is_denied_on_readonly_replica(
+            "GEORADIUSBYMEMBER",
+            &member_named_store
         ));
     }
 

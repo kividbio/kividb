@@ -895,12 +895,32 @@ pub fn acks_wait() -> bool {
 /// Whether a command may write a record its reply should wait for: a write,
 /// or a script or a transaction that may make some.
 #[inline]
-pub fn may_log(name: &[u8]) -> bool {
-    crate::replication::is_write_command_bytes(name)
-        || name.eq_ignore_ascii_case(b"EVAL")
-        || name.eq_ignore_ascii_case(b"EVALSHA")
-        || name.eq_ignore_ascii_case(b"FCALL")
-        || name.eq_ignore_ascii_case(b"EXEC")
+pub fn may_log(cmd: &[&[u8]]) -> bool {
+    let Some(&cmd0) = cmd.first() else {
+        return false;
+    };
+    // A write by name, the most of them, is told by its name alone.
+    if crate::replication::is_write_command_bytes(cmd0) {
+        return true;
+    }
+    // The rest, told apart by length first: most commands are none of them.
+    let is = |name: &str| cmd0.eq_ignore_ascii_case(name.as_bytes());
+    // Writes only with some arguments (`GEORADIUS ... STORE`, `MIGRATE`,
+    // `FUNCTION LOAD`): judged by them, so the reply waits for the record
+    // like any other write's.
+    let by_arguments =
+        |name: &str| is(name) && crate::replication::command_mutates_for_replication(name, cmd);
+    // EVAL, EVALSHA, FCALL and EXEC may write from what they run.
+    match cmd0.len() {
+        4 => is("EVAL") || is("EXEC"),
+        5 => is("FCALL"),
+        6 => by_arguments("SCRIPT"),
+        7 => is("EVALSHA") || by_arguments("MIGRATE"),
+        8 => by_arguments("FUNCTION"),
+        9 => by_arguments("GEORADIUS"),
+        17 => by_arguments("GEORADIUSBYMEMBER"),
+        _ => false,
+    }
 }
 
 /// How long a reply to a write waits for its records to reach the file
@@ -3038,7 +3058,8 @@ pub fn replay_aof(
     };
 
     if let Some(image) = image {
-        let loaded = crate::snapshot::load_snapshot_bytes(image)?;
+        let loaded = crate::snapshot::load_snapshot_bytes(image)
+            .map_err(|e| crate::snapshot::refusal_of_file(e, "the AOF's preamble"))?;
         let crate::snapshot::LoadedSnapshot {
             dbs,
             index_schemas,
@@ -4974,5 +4995,48 @@ mod past_deadline_replay_tests {
         ]);
         assert_eq!(expires(&store, "h"), None);
         assert_eq!(hash_fields(&store, "h"), ["f1"]);
+    }
+}
+
+#[cfg(test)]
+mod may_log_tests {
+    use super::may_log;
+
+    fn logs(cmd: &[&str]) -> bool {
+        let cmd: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+        may_log(&cmd)
+    }
+
+    /// A reply waits for the AOF for a write by name, a script or a
+    /// transaction, and a write by argument only with the arguments that
+    /// write; never for a read.
+    #[test]
+    fn writes_are_told_by_name_or_by_their_arguments() {
+        for write in [
+            &["SET", "k", "v"][..],
+            &["incr", "k"],
+            &["eval", "return 1", "0"],
+            &["EVALSHA", "x", "0"],
+            &["fcall", "f", "0"],
+            &["EXEC"],
+            &["GEORADIUS", "k", "15", "37", "200", "km", "STORE", "d"],
+            &["georadiusbymember", "k", "m", "200", "km", "storedist", "d"],
+            &["MIGRATE", "h", "1", "k", "0", "100"],
+            &["SCRIPT", "LOAD", "return 1"],
+            &["FUNCTION", "FLUSH"],
+        ] {
+            assert!(logs(write), "{write:?}");
+        }
+        for read in [
+            &["GET", "k"][..],
+            &["PING"],
+            &["GEORADIUS", "k", "15", "37", "200", "km"],
+            &["GEORADIUSBYMEMBER", "k", "store", "200", "km"],
+            &["FUNCTION", "LIST"],
+            &["SCRIPT", "EXISTS", "x"],
+            &["EVAL_RO", "return 1", "0"],
+        ] {
+            assert!(!logs(read), "{read:?}");
+        }
     }
 }

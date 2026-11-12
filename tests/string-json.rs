@@ -2983,6 +2983,150 @@ fn a_snapshot_keeps_json_numbers_exactly() {
     assert_exact("snapshot", &doubles, &got);
 }
 
+// ── JSON nesting-depth and array-index bounds (security) ──
+// Repeated JSON writes at ever-deeper paths once built a document far deeper
+// than any single parse (serde_json caps a parse at 128 levels). A later
+// recursive walk over it — JSON.GET/DUMP/SAVE serialisation, Drop, merge —
+// overflowed the thread stack and aborted the whole server. Writes now refuse
+// to grow a document past RedisJSON's depth limit, and the two load paths
+// reject an array index that would overflow `len()`.
+
+/// A document nested at the deepest level still allowed: `n` arrays, innermost
+/// holding `0`.
+fn nested_arrays(n: usize) -> String {
+    format!("{}0{}", "[".repeat(n), "]".repeat(n))
+}
+
+#[test]
+fn json_set_refuses_building_past_the_depth_limit() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    // 127 nested arrays is the deepest a write may create.
+    assert!(c.cmds(&["JSON.SET", "k", "$", &nested_arrays(127)]).is_ok());
+    // Grafting one more level onto the deepest leaf is refused, not a crash.
+    let path = format!("${}", "[0]".repeat(127));
+    let r = c.cmd(&[b"JSON.SET", b"k", path.as_bytes(), b"[0]"]);
+    assert!(r.is_error(), "expected an error, got {:?}", r);
+    assert!(
+        r.error_str().contains("recursion limit exceeded"),
+        "unexpected error: {}",
+        r.error_str()
+    );
+    // The server is alive and the document is still readable (serialisable).
+    assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+    assert!(!c.cmds(&["JSON.GET", "k"]).is_nil());
+}
+
+#[test]
+fn json_arrappend_refuses_growing_past_the_depth_limit() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    // 127 nested arrays, the innermost empty.
+    let deep = format!("{}{}", "[".repeat(127), "]".repeat(127));
+    assert!(c.cmds(&["JSON.SET", "k", "$", &deep]).is_ok());
+    // The innermost array sits at depth 127; appending a nested value would
+    // put that value at depth 128.
+    let path = format!("${}", "[0]".repeat(126));
+    let r = c.cmd(&[b"JSON.ARRAPPEND", b"k", path.as_bytes(), b"[0]"]);
+    assert!(r.is_error(), "expected an error, got {:?}", r);
+    assert!(r.error_str().contains("recursion limit exceeded"));
+    // Appending a scalar at the limit is still fine (it does not deepen).
+    assert!(
+        !c.cmd(&[b"JSON.ARRAPPEND", b"k", path.as_bytes(), b"1"])
+            .is_error()
+    );
+    assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+}
+
+#[test]
+fn json_merge_refuses_growing_past_the_depth_limit() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    // 127 nested objects, keyed "a".
+    let deep = format!("{}0{}", "{\"a\":".repeat(127), "}".repeat(127));
+    assert!(c.cmds(&["JSON.SET", "k", "$", &deep]).is_ok());
+    // Merge a 2-deep patch into the object at depth 126 -> would reach 128.
+    let path = format!("${}", ".a".repeat(126));
+    let r = c.cmd(&[b"JSON.MERGE", b"k", path.as_bytes(), br#"{"a":{"b":0}}"#]);
+    assert!(r.is_error(), "expected an error, got {:?}", r);
+    assert!(r.error_str().contains("recursion limit exceeded"));
+    assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+}
+
+#[test]
+fn json_mset_refuses_growing_past_the_depth_limit_and_writes_nothing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmds(&["JSON.SET", "k", "$", &nested_arrays(127)]).is_ok());
+    let path = format!("${}", "[0]".repeat(127));
+    // One triple on another key, then one past the limit: neither is written.
+    let r = c.cmds(&["JSON.MSET", "other", "$", "1", "k", &path, "[0]"]);
+    assert!(r.is_error(), "expected an error, got {:?}", r);
+    assert!(r.error_str().contains("recursion limit exceeded"));
+    assert_eq!(c.cmds(&["EXISTS", "other"]).as_int(), 0);
+    // The same key twice (worked out on a staged copy) is refused too.
+    let deep = nested_arrays(127);
+    let r = c.cmds(&["JSON.MSET", "k", "$", &deep, "k", &path, "[0]"]);
+    assert!(r.is_error(), "expected an error, got {:?}", r);
+    assert!(r.error_str().contains("recursion limit exceeded"));
+    assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+}
+
+/// A KiviDB `DUMP` payload for an array holding one element at `idx`.
+fn array_dump(idx: u64) -> Vec<u8> {
+    let mut body = vec![11u8]; // TAG_ARRAY
+    body.extend_from_slice(&1u32.to_le_bytes()); // one element
+    body.extend_from_slice(&idx.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes()); // value length
+    body.push(b'x');
+    body.extend_from_slice(&0u64.to_le_bytes()); // next_insert
+    body.extend_from_slice(&0u64.to_le_bytes()); // ring size
+    let crc = kividb::snapshot::crc64_digest(&body);
+    body.extend_from_slice(&[0x0a, 0x00]); // DUMP_VERSION
+    body.extend_from_slice(&crc.to_le_bytes());
+    body
+}
+
+#[test]
+fn restore_rejects_an_array_index_out_of_range() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    // A valid array round-trips: len() is the highest index + 1.
+    assert!(c.cmd(&[b"RESTORE", b"good", b"0", &array_dump(5)]).is_ok());
+    assert_eq!(c.cmds(&["ARLEN", "good"]).as_int(), 6);
+    // u64::MAX would overflow len() (idx + 1 == 0); refused.
+    let r = c.cmd(&[b"RESTORE", b"bad", b"0", &array_dump(u64::MAX)]);
+    assert!(r.is_error(), "expected an error, got {:?}", r);
+    assert_eq!(c.cmds(&["EXISTS", "bad"]).as_int(), 0);
+    // The highest index there is, ARRAY_MAX_INDEX (2^64 - 2), is kept.
+    let r = c.cmd(&[b"RESTORE", b"top", b"0", &array_dump(u64::MAX - 1)]);
+    assert!(r.is_ok(), "expected OK, got {:?}", r);
+    assert_eq!(c.cmds(&["ARCOUNT", "top"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+}
+
+#[test]
+fn json_moderately_deep_documents_round_trip() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmds(&["JSON.SET", "k", "$", &nested_arrays(100)]).is_ok());
+    let dump = match c.cmds(&["DUMP", "k"]) {
+        RespValue::Bulk(b) => b,
+        other => panic!("DUMP: {:?}", other),
+    };
+    assert!(c.cmd(&[b"RESTORE", b"k2", b"0", &dump]).is_ok());
+    assert_eq!(
+        c.cmds(&["JSON.GET", "k"]).as_str(),
+        c.cmds(&["JSON.GET", "k2"]).as_str()
+    );
+}
+
 // ── JSON.MSET is all or nothing (#551) ──────────────────────────────────────
 //
 // A triple that fails fails the whole command, and the triples before it

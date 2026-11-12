@@ -1594,7 +1594,9 @@ fn write_index_schema(w: &mut impl Write, def: &crate::vector::IndexDef) -> io::
 }
 
 pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
-    load_snapshot_with(|| File::open(path).map(BufReader::new)).map(|(loaded, _)| loaded)
+    load_snapshot_with(|| File::open(path).map(BufReader::new))
+        .map(|(loaded, _)| loaded)
+        .map_err(|e| refusal_of_file(e, path))
 }
 
 /// Read a KDB image from anything byte-shaped.
@@ -1607,6 +1609,12 @@ pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
 /// database before its last one is not read (see [`read_retrying`]). The
 /// server reads its images with [`load_snapshot`], [`load_snapshot_bytes`]
 /// and [`load_snapshot_with`].
+///
+/// What reads it is `RESTORE`, whose payload is an image of one database:
+/// read once, it reads one way only. In the last database, the only one, the
+/// byte after a 0 tells 1.2.0's empty key from the database's end: what
+/// follows the end is the end of the image or a section, which opens with
+/// `KIVI`, never with a type tag.
 pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
     read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
 }
@@ -1643,8 +1651,23 @@ pub fn verify_snapshot(image: &[u8]) -> io::Result<usize> {
     read_retrying(|| Ok(image), false, server_databases()).map(|(_, keys, _)| keys)
 }
 
-/// Readings [`read_retrying`] makes of one image at most.
+/// Readings [`read_retrying`] makes of one image at least (see
+/// [`readings_for`]).
 const READINGS: usize = 32;
+
+/// Readings [`read_retrying`] makes of one image at most, whatever the
+/// server's databases; and the most database ends [`read_image`] notes.
+const MAX_READINGS: usize = 1024;
+
+/// Readings [`read_retrying`] makes of one image at most, for a server of
+/// `databases` databases: [`READINGS`] and two for each database, for an
+/// image whose every database can have its end read again (#441) to be read
+/// every way it can be. Never more than [`MAX_READINGS`].
+fn readings_for(databases: usize) -> usize {
+    READINGS
+        .saturating_add(databases.saturating_mul(2))
+        .min(MAX_READINGS)
+}
 
 /// Read the image `open` opens with [`read_image`], and if that fails, again
 /// with the empty key as 1.2.0 wrote it in a database before the last.
@@ -1656,102 +1679,312 @@ const READINGS: usize = 32;
 /// type tag. So the image is read as written by 1.2.1 first, and only if that
 /// fails, again with such an end read as the empty key, earliest first. A
 /// wrong guess reads what follows as a value, which as a rule fails soon
-/// after (a length misread can have up to 4 GiB read before it does). 1.2.0
-/// wrote at most one empty key per database.
+/// after. 1.2.0 wrote at most one empty key per database.
 ///
 /// The image is opened again for each reading, and read no more than
-/// [`READINGS`] times. A reading that fails other than on what it read (the
-/// disk, the network) ends it. If none loads the image, the first reading's
-/// error is returned.
+/// [`readings_for`] the server's databases times. A reading that fails other
+/// than on what it read (the disk, the network) ends it. If none loads the
+/// image, the first reading's error is returned.
+///
+/// Every such reading is made, a reading that loads the image read again
+/// with one more such end too, and none of them keeps what it reads, nor
+/// holds a value's bytes (see [`read_image`]). Two readings never read the
+/// same keys: the one that takes a database's end for the empty key has an
+/// entry more in that database than the other. So if two load the image, it
+/// is refused (see [`ReadsMoreThanOneWay`]), as it is if they could not all
+/// be made: the readings run out, or one fails on the disk. Only once one
+/// reading alone loads it is it read again, that once, to keep what it
+/// reads: no more memory is taken than one reading of it takes.
+///
+/// An image that the first reading loads, as every image 1.2.1 writes, is
+/// read once.
 fn read_retrying<R: Read>(
-    mut open: impl FnMut() -> io::Result<R>,
+    open: impl FnMut() -> io::Result<R>,
     keep: bool,
     databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
-    let mut first_error: Option<io::Error> = None;
-    // Readings still to make, latest pushed first: each a reading that
-    // failed, with one database more read as holding the empty key. Never
+    read_retrying_within(open, keep, databases, readings_for(databases))
+}
+
+/// [`read_retrying`], with no more than `most` readings.
+fn read_retrying_within<R: Read>(
+    mut open: impl FnMut() -> io::Result<R>,
+    keep: bool,
+    databases: usize,
+    most: usize,
+) -> io::Result<(LoadedSnapshot, usize, R)> {
+    let mut reader = open()?;
+    let mut ends = Vec::new();
+    let first_error = match read_image(&mut reader, keep, &[], &mut ends, databases) {
+        Ok((loaded, keys)) => return Ok((loaded, keys, reader)),
+        // Read whole, and refused for its databases (#482).
+        Err(e) if is_past_databases(&e) => return Err(e),
+        Err(e) if !is_layout(&e) => return Err(e),
+        Err(e) => e,
+    };
+    // Readings still to make, latest pushed first: each a reading made
+    // before, with one database more read as holding the empty key. Never
     // more than the readings left.
-    let mut plans: Vec<Vec<usize>> = vec![Vec::new()];
-    let mut readings = 0;
+    let mut plans: Vec<Vec<usize>> = Vec::new();
+    // Whether a reading there was no room for was left out.
+    let mut left_out = !push_plans(&mut plans, &[], &ends, most - 1);
+    let mut readings = 1;
+    // The reading that loads the image, if one does: the databases it reads
+    // the empty key in, and its refusal for a key or an index in a database
+    // past the server's (#482), if it is refused for that.
+    let mut loads: Option<(Vec<usize>, Option<io::Error>)> = None;
     while let Some(plan) = plans.pop() {
-        if readings == READINGS {
+        if readings == most {
+            left_out = true;
             break;
         }
         readings += 1;
         let mut reader = match open() {
             Ok(reader) => reader,
-            Err(e) => return Err(first_error.unwrap_or(e)),
+            Err(e) if loads.is_some() => return Err(not_all_read(e)),
+            Err(_) => return Err(first_error),
         };
         let mut ends = Vec::new();
-        match read_image(&mut reader, keep, &plan, &mut ends, databases) {
-            Ok((loaded, keys)) => {
-                if !plan.is_empty() {
-                    log_warn!(
-                        "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) \
-                         {plan:?}, where 1.2.0 ends a database (#441): read as the empty key"
-                    );
+        let past = match read_image(&mut reader, false, &plan, &mut ends, databases) {
+            Ok(_) => None,
+            // Read whole: it loads but for its databases.
+            Err(e) if is_past_databases(&e) => Some(e),
+            Err(e) if !is_layout(&e) => {
+                if loads.is_some() {
+                    return Err(not_all_read(e));
                 }
-                return Ok((loaded, keys, reader));
-            }
-            // Read whole, and refused for its databases (#482): this
-            // reading's error, whichever reading it is.
-            Err(e) if is_past_databases(&e) => return Err(e),
-            Err(e) => {
-                let layout = matches!(
-                    e.kind(),
-                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                log_warn!(
+                    "snapshot: reading it again failed ({e}); what the first reading found is \
+                     returned"
                 );
-                if first_error.is_none() {
-                    if !layout {
-                        return Err(e);
-                    }
-                    first_error = Some(e);
-                    push_plans(&mut plans, &plan, &ends, READINGS - readings);
-                    continue;
-                }
-                if !layout {
-                    log_warn!(
-                        "snapshot: reading it again failed ({e}); what the first reading \
-                         found is returned"
-                    );
-                    break;
-                }
-                let room = READINGS.saturating_sub(readings + plans.len());
-                push_plans(&mut plans, &plan, &ends, room);
+                break;
             }
+            Err(_) => {
+                let room = most.saturating_sub(readings + plans.len());
+                left_out |= !push_plans(&mut plans, &plan, &ends, room);
+                continue;
+            }
+        };
+        if let Some((first, _)) = &loads {
+            return Err(reads_more_than_one_way_error(first, &plan));
         }
+        loads = Some((plan.clone(), past));
+        let room = most.saturating_sub(readings + plans.len());
+        left_out |= !push_plans(&mut plans, &plan, &ends, room);
     }
-    if readings > 1 {
-        log_warn!(
-            "snapshot could not be read as KiviDB writes it, nor in {} more reading(s) with \
-             the empty key where 1.2.0 could have written it (#441){}",
-            readings - 1,
-            if readings == READINGS {
-                ", the most it is read"
-            } else {
-                ""
-            }
-        );
+    let Some((plan, past)) = loads else {
+        if readings > 1 {
+            log_warn!(
+                "snapshot could not be read as KiviDB writes it, nor in {} more reading(s) with \
+                 the empty key where 1.2.0 could have written it (#441){}",
+                readings - 1,
+                if readings == most {
+                    ", the most it is read"
+                } else {
+                    ""
+                }
+            );
+        }
+        return Err(first_error);
+    };
+    if left_out {
+        return Err(not_all_read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it can be read more ways than the {most} readings made of an image"),
+        )));
     }
-    Err(first_error.unwrap_or_else(|| io::Error::other("snapshot could not be read")))
+    if let Some(past) = past {
+        return Err(past);
+    }
+    // The one reading that loads it, made again to keep what it reads.
+    let mut reader = open()?;
+    let (loaded, keys) = read_image(&mut reader, keep, &plan, &mut Vec::new(), databases)?;
+    log_warn!(
+        "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) {plan:?}, \
+         where 1.2.0 ends a database (#441): read as the empty key, the one reading of {} that \
+         loads it",
+        readings
+    );
+    Ok((loaded, keys, reader))
 }
 
-/// [`read_retrying`]'s next readings after one with `plan` failed: `plan` and
-/// one of the databases in `ends` after the last in it, the earliest `room`
-/// of them, pushed so that the earliest is read first.
-fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room: usize) {
+/// Whether a reading failed on what it read, not on the disk or the network.
+fn is_layout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// [`read_retrying`]'s next readings after one with `plan`: `plan` and one of
+/// the databases in `ends` after the last in it, the earliest `room` of them,
+/// pushed so that the earliest is read first. Whether every one was pushed.
+fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room: usize) -> bool {
     let after = plan.last().map_or(0, |&db| db + 1);
-    let next: Vec<usize> = ends
-        .iter()
-        .copied()
-        .filter(|&db| db >= after)
-        .take(room)
-        .collect();
-    for db in next.into_iter().rev() {
+    let all: Vec<usize> = ends.iter().copied().filter(|&db| db >= after).collect();
+    // `read_image` notes no more than MAX_READINGS ends: there can be more.
+    let whole = all.len() <= room && ends.len() < MAX_READINGS;
+    for &db in all.iter().take(room).rev() {
         let mut more = plan.to_vec();
         more.push(db);
         plans.push(more);
+    }
+    whole
+}
+
+/// The refusal of an image that two readings of [`read_retrying`]'s load,
+/// or that it could not read every way it can be read: loading one reading
+/// of it could load keys under other names, or other values, than were
+/// saved.
+#[derive(Debug)]
+struct ReadsMoreThanOneWay(String);
+
+impl std::fmt::Display for ReadsMoreThanOneWay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReadsMoreThanOneWay {}
+
+/// Whether `e` is the refusal of an image that reads more than one way.
+pub fn reads_more_than_one_way(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ReadsMoreThanOneWay>())
+}
+
+/// `e`, the refusal of the image in the file `what` as one that reads more
+/// than one way, with the file named and what to do about it. Any other
+/// error as it is.
+pub fn refusal_of_file(e: io::Error, what: &str) -> io::Error {
+    if !reads_more_than_one_way(&e) {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        ReadsMoreThanOneWay(format!(
+            "{what}: {e}. It is not loaded: restore the data from another copy (an AOF, a \
+             replica or a backup)"
+        )),
+    )
+}
+
+/// `e`, the refusal of a full-sync payload as one that reads more than one
+/// way, with what to do about it: the master wrote it with 1.2.0's empty
+/// key. Any other error as it is.
+pub fn refusal_of_payload(e: io::Error) -> io::Error {
+    if !reads_more_than_one_way(&e) {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        ReadsMoreThanOneWay(format!(
+            "{e}. It is not loaded: upgrade the master to KiviDB 1.2.1, or if it runs 1.2.1, \
+             have it save again (SAVE), and let the replica sync again"
+        )),
+    )
+}
+
+/// The refusal of an image that the readings `first` and `other` (the
+/// databases each reads 1.2.0's empty key in) both load.
+fn reads_more_than_one_way_error(first: &[usize], other: &[usize]) -> io::Error {
+    let why = format!(
+        "the snapshot can be read more than one way, with different keys: as written by KiviDB \
+         1.2.0 with the empty key (#441) in database(s) {first:?}, or in database(s) {other:?}"
+    );
+    log_error!("{why}; it is not loaded");
+    io::Error::new(io::ErrorKind::InvalidData, ReadsMoreThanOneWay(why))
+}
+
+/// The refusal of an image that one reading loads, when the other readings
+/// it can be read in could not all be made, for `e`.
+fn not_all_read(e: io::Error) -> io::Error {
+    let why = format!(
+        "the snapshot was written by KiviDB 1.2.0 with the empty key (#441), and one reading of \
+         it loads, but not every other reading of it could be made to rule out that another \
+         loads too ({e})"
+    );
+    log_error!("{why}; it is not loaded");
+    io::Error::new(e.kind(), ReadsMoreThanOneWay(why))
+}
+
+/// Pass over `len` bytes of `r`, holding none of them.
+fn skip_exactly(r: &mut impl Read, len: usize) -> io::Result<()> {
+    let passed = io::copy(&mut Read::take(&mut *r, len as u64), &mut io::sink())?;
+    if passed != len as u64 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
+/// [`read_bytes`], passed over.
+fn skip_bytes(r: &mut impl Read) -> io::Result<()> {
+    let len = read_u32_le(r)? as usize;
+    skip_exactly(r, len)
+}
+
+/// [`read_bytes`] passed over, and whether the bytes were UTF-8.
+fn skip_text(r: &mut impl Read) -> io::Result<bool> {
+    let mut left = read_u32_le(r)? as usize;
+    let mut buf = [0u8; 8192];
+    // The bytes of a character cut at the end of the last piece.
+    let mut carried = 0;
+    while left > 0 {
+        let take = (buf.len() - carried).min(left);
+        r.read_exact(&mut buf[carried..carried + take])?;
+        left -= take;
+        let filled = carried + take;
+        carried = 0;
+        if let Err(e) = std::str::from_utf8(&buf[..filled]) {
+            if e.error_len().is_some() {
+                skip_exactly(r, left)?;
+                return Ok(false);
+            }
+            buf.copy_within(e.valid_up_to()..filled, 0);
+            carried = filled - e.valid_up_to();
+        }
+    }
+    Ok(carried == 0)
+}
+
+/// Whether [`skip_value`] passes over a value of type `tag`.
+fn skipped(tag: u8) -> bool {
+    matches!(
+        tag,
+        TAG_STRING | TAG_LIST | TAG_HASH | TAG_SET | TAG_SORTEDSET | TAG_JSON
+    )
+}
+
+/// Pass over a value of type `tag` (see [`skipped`]), refusing what its
+/// reading refuses, holding none of it.
+fn skip_value(r: &mut impl Read, tag: u8) -> io::Result<()> {
+    match tag {
+        TAG_STRING | TAG_JSON => skip_bytes(r),
+        TAG_LIST | TAG_SET => {
+            for _ in 0..read_u32_le(r)? {
+                skip_bytes(r)?;
+            }
+            Ok(())
+        }
+        TAG_HASH => {
+            for _ in 0..read_u32_le(r)? {
+                if !skip_text(r)? {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bad hash field"));
+                }
+                skip_bytes(r)?;
+            }
+            Ok(())
+        }
+        TAG_SORTEDSET => {
+            for _ in 0..read_u32_le(r)? {
+                skip_bytes(r)?;
+                if zset_score(f64::from_le_bytes(read_u64_le(r)?.to_le_bytes())).is_none() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, NAN_SCORE));
+                }
+            }
+            Ok(())
+        }
+        _ => unreachable!("no value of type {tag} is passed over"),
     }
 }
 
@@ -1771,6 +2004,12 @@ fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room:
 /// holds only sections 1.2.0 knows: it does not pass over a section it does
 /// not know, as other readings do. No reading passes over a section that is
 /// cut short or cannot be used.
+///
+/// With `keep` unset, the bytes of keys, of strings, lists, hashes, sets,
+/// sorted sets and JSON documents, of the expiries' keys and of the function
+/// libraries are passed over, not read into memory, with what reading them
+/// refuses refused all the same (see [`skip_value`]): a reading of a 1.2.0
+/// image that misread a length does not take memory for it.
 fn read_image(
     r: impl Read,
     keep: bool,
@@ -1874,7 +2113,7 @@ fn read_image(
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
                         Err(e) => return Err(e),
                         Ok(()) => {
-                            if is_tag(next[0]) && ends.len() < READINGS {
+                            if is_tag(next[0]) && ends.len() < MAX_READINGS {
                                 ends.push(db);
                             }
                             next_byte = Some(next[0]);
@@ -1893,7 +2132,12 @@ fn read_image(
                 klen as usize
             };
 
-            let kbuf = read_exactly(&mut r, klen)?;
+            let kbuf = if keep {
+                read_exactly(&mut r, klen)?
+            } else {
+                skip_exactly(&mut r, klen)?;
+                Vec::new()
+            };
             // Any bytes: a key need not be text.
             let key = Key::from(kbuf);
 
@@ -1905,6 +2149,11 @@ fn read_image(
             }
 
             let value = match tag[0] {
+                // Not kept: passed over.
+                tag if !keep && skipped(tag) => {
+                    skip_value(&mut r, tag)?;
+                    KiviDBValue::String(SharedBytes::from(&b""[..]))
+                }
                 TAG_STRING => {
                     let bytes = read_bytes(&mut r)?;
                     KiviDBValue::String(SharedBytes::from(bytes.as_slice()))
@@ -1973,6 +2222,13 @@ fn read_image(
                     let json_bytes = read_bytes(&mut r)?;
                     let val: serde_json::Value =
                         serde_json::from_slice(&json_bytes).unwrap_or(serde_json::Value::Null);
+                    if crate::commands::json::value_depth(&val) >= crate::commands::json::MAX_DEPTH
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "JSON document nested too deeply",
+                        ));
+                    }
                     KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(val)))
                 }
                 TAG_TIMESERIES | TAG_TIMESERIES_V2 | TAG_TIMESERIES_V3 => {
@@ -2151,6 +2407,12 @@ fn read_image(
                         let mut idx_buf = [0u8; 8];
                         r.read_exact(&mut idx_buf)?;
                         let idx = u64::from_le_bytes(idx_buf);
+                        if idx > crate::types::ARRAY_MAX_INDEX {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "array index out of range",
+                            ));
+                        }
                         let val = read_bytes(&mut r)?;
                         arr.set(idx, Arc::from(val.as_slice()));
                     }
@@ -2232,7 +2494,7 @@ fn read_image(
         } else if &magic == KDB_HNSW_MAGIC {
             hnsw_graphs = usable_section("HNSW graph", read_hnsw_graphs(&mut r))?;
         } else if &magic == KDB_EXPIRY_MAGIC {
-            whole_section("expiry", read_expiry_section(&mut r, &mut expiries))?;
+            whole_section("expiry", read_expiry_section(&mut r, &mut expiries, keep))?;
         } else if &magic == KDB_ALIAS_MAGIC {
             let aliases = usable_section("index alias", read_alias_section(&mut r))?;
             for (alias, index) in aliases {
@@ -2261,7 +2523,12 @@ fn read_image(
         } else if &magic == KDB_FUNCTIONS_MAGIC {
             // Not best-effort: a node that comes back without its libraries
             // fails every FCALL.
-            functions = Some(whole_section("functions", read_bytes(&mut r))?);
+            let libraries = if keep {
+                read_bytes(&mut r)
+            } else {
+                skip_bytes(&mut r).map(|()| Vec::new())
+            };
+            functions = Some(whole_section("functions", libraries)?);
         } else if &magic == KDB_LANGUAGE_MAGIC {
             whole_section(
                 "language",
@@ -2331,15 +2598,21 @@ fn read_image(
     ))
 }
 
-/// Body of the expiry section; the magic has already been consumed.
+/// Body of the expiry section; the magic has already been consumed. With
+/// `keep` unset nothing of it is kept, and its keys are passed over.
 ///
 /// Unlike the index sections this is not best-effort: a torn expiry section
 /// would silently make some keys permanent, so it fails the load instead.
-fn read_expiry_section(r: &mut impl Read, expiries: &mut ExpiryMaps) -> io::Result<()> {
+fn read_expiry_section(r: &mut impl Read, expiries: &mut ExpiryMaps, keep: bool) -> io::Result<()> {
     let db_count = read_u32_le(r)? as usize;
     for db_idx in 0..db_count {
         let count = read_u32_le(r)? as usize;
         for _ in 0..count {
+            if !keep {
+                skip_bytes(r)?;
+                read_u64_le(r)?;
+                continue;
+            }
             let key = Key::from(read_bytes(r)?);
             let at_ms = read_u64_le(r)?;
             if let Some(map) = expiries.get_mut(db_idx) {
@@ -3867,6 +4140,9 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
     } else {
         serde_json::from_slice(document).map_err(|e| rdb_invalid(format!("RedisJSON: {e}")))?
     };
+    if crate::commands::json::value_depth(&json) >= crate::commands::json::MAX_DEPTH {
+        return Err(rdb_invalid("RedisJSON document nested too deeply"));
+    }
     Ok(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(json))))
 }
 
@@ -5172,6 +5448,9 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             for _ in 0..count {
                 let idx = u64::from_le_bytes(payload.get(pos..pos + 8)?.try_into().ok()?);
                 pos += 8;
+                if idx > crate::types::ARRAY_MAX_INDEX {
+                    return None;
+                }
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
                 arr.set(idx, Arc::from(bytes));
                 pos = next;
@@ -5238,6 +5517,9 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let (bytes, _) = read_bytes_slice(payload, 0)?;
             let s = std::str::from_utf8(bytes).ok()?;
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            if crate::commands::json::value_depth(&v) >= crate::commands::json::MAX_DEPTH {
+                return None;
+            }
             Some(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(v))))
         }
         TAG_STREAM | TAG_STREAM_V2 | TAG_STREAM_V3 => {
@@ -7125,16 +7407,22 @@ mod empty_key_tests {
         // One-byte keys: every end could be one.
         let (loaded, opened) = readings(&damaged(16, "k"));
         assert!(loaded.is_err());
-        assert!((2..=READINGS).contains(&opened), "{opened} readings");
-        // However many databases, no more than READINGS readings, nor plans.
+        assert!(
+            (2..=readings_for(server_databases())).contains(&opened),
+            "{opened} readings"
+        );
+        // However many databases, no more readings than are made, nor plans.
         let (loaded, opened) = readings(&damaged(100_000, "k"));
         assert!(loaded.is_err());
-        assert!(opened <= READINGS, "{opened} readings");
+        assert!(
+            opened <= readings_for(server_databases()),
+            "{opened} readings"
+        );
     }
 
     /// An image cut short inside a section is a fault of its layout, so it
     /// is read again where 1.2.0 could have put the empty key, no more than
-    /// [`READINGS`] times, and refused with the first reading's error, which
+    /// [`readings_for`] times, and refused with the first reading's error, which
     /// says where it is cut (#474).
     #[test]
     fn an_image_cut_inside_a_section_is_read_again_a_bounded_number_of_times() {
@@ -7161,7 +7449,7 @@ mod empty_key_tests {
                 let (loaded, opened) = readings(&image);
                 let err = loaded.err().unwrap_or_else(|| panic!("{section} loaded"));
                 assert!(
-                    (2..=READINGS).contains(&opened),
+                    (2..=readings_for(server_databases())).contains(&opened),
                     "{section}: {opened} readings"
                 );
                 assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{section}");
@@ -7302,5 +7590,363 @@ mod empty_key_tests {
                 whole.len()
             );
         }
+    }
+}
+
+/// An image that 1.2.0's empty key lets be read more than one way (#441).
+#[cfg(test)]
+pub(crate) mod readings_tests {
+    use super::*;
+
+    const ZERO: [u8; 4] = [0; 4];
+
+    fn header(dbs: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, dbs).unwrap();
+        out
+    }
+
+    fn get_string(map: &HashMap<Key, KiviDBValue>, key: &[u8]) -> Vec<u8> {
+        match map.get(key) {
+            Some(KiviDBValue::String(bytes)) => bytes.as_ref().to_vec(),
+            _ => panic!("{key:?} is not a string"),
+        }
+    }
+
+    /// Three databases, of which the reading as 1.2.1 writes fails, and two
+    /// readings with 1.2.0's empty key load, with different keys:
+    ///
+    /// - in database 0: the empty key, `"x"`; in database 1, `k`, a string
+    ///   of 255 bytes;
+    /// - in database 1: a key of 257 bytes, `""`, and the empty key, `""`.
+    ///
+    /// The second reading takes database 0's first 4 bytes for its end, and
+    /// what the first reads as the empty key's value, database 0's end and
+    /// `k` for the bytes of a key.
+    pub(crate) fn two_ways() -> Vec<u8> {
+        let mut out = header(3);
+        // Database 0: its end, or the empty key: a string, of one byte.
+        out.extend(ZERO);
+        out.push(TAG_STRING);
+        // Its length (1), or with the tag before it, the length of a key of
+        // 257 bytes, which starts with the length's last byte.
+        out.extend([1, 0, 0, 0]);
+        let key_from = out.len() - 1;
+        out.push(b'x');
+        // Database 0's end, then `k` in database 1, a string of 255 bytes
+        // that runs to database 1's end.
+        out.extend(ZERO);
+        out.extend(1u32.to_le_bytes());
+        out.push(b'k');
+        out.push(TAG_STRING);
+        out.extend(255u32.to_le_bytes());
+        let value_from = out.len();
+        out.resize(key_from + 257, b'v');
+        // The long key's value, `""`; then database 1's end, or the empty
+        // key, `""`; then its end.
+        out.push(TAG_STRING);
+        out.extend(ZERO);
+        out.extend(ZERO);
+        out.push(TAG_STRING);
+        out.extend(ZERO);
+        assert_eq!(out.len() - value_from, 255);
+        out.extend(ZERO);
+        // Database 2, empty.
+        out.extend(ZERO);
+        out
+    }
+
+    /// Whether `err` refuses an image that reads more than one way, saying
+    /// so; its text.
+    fn refused(err: io::Error) -> String {
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        let text = err.to_string();
+        assert!(text.contains("can be read more than one way"), "{text}");
+        assert!(text.contains("database(s) [0]"), "{text}");
+        assert!(text.contains("database(s) [1]"), "{text}");
+        text
+    }
+
+    /// The image reads two ways, and loading it would load either: it is
+    /// refused, saying so, wherever it is loaded or verified, before any
+    /// reading that keeps what it reads.
+    #[test]
+    fn an_image_that_two_readings_load_differently_is_refused() {
+        let image = two_ways();
+        // The image as built: the reading as 1.2.1 writes fails, and both
+        // readings with the empty key load it, differently.
+        assert!(read_image(image.as_slice(), true, &[], &mut Vec::new(), 16).is_err());
+        let (first, _) = read_image(image.as_slice(), true, &[0], &mut Vec::new(), 16).unwrap();
+        assert_eq!(get_string(&first.dbs[0], b""), b"x");
+        // `k` runs to database 1's end, which is followed by database 2's.
+        let k_end = image.len() - 8;
+        assert_eq!(get_string(&first.dbs[1], b"k"), &image[k_end - 255..k_end]);
+        let (second, _) = read_image(image.as_slice(), true, &[1], &mut Vec::new(), 16).unwrap();
+        assert!(second.dbs[0].is_empty());
+        assert_eq!(second.dbs[1].len(), 2);
+        assert_eq!(get_string(&second.dbs[1], b""), b"");
+
+        refused(load_snapshot_bytes(&image).err().expect("loaded"));
+        refused(verify_snapshot(&image).expect_err("verified"));
+        // Three readings, none of which keeps anything: no dataset, whole
+        // or in part, is made of an image that is refused.
+        let mut opened = 0;
+        refused(
+            load_snapshot_with(|| {
+                opened += 1;
+                Ok(image.as_slice())
+            })
+            .err()
+            .expect("loaded"),
+        );
+        assert_eq!(opened, 3);
+        // As before: one reading, which fails.
+        assert!(load_snapshot_from(image.as_slice()).is_err());
+    }
+
+    /// Loaded from a file, the refusal names it and says what to do; from a
+    /// master, it says what to do about the master.
+    #[test]
+    fn the_refusal_names_the_file_and_what_to_do() {
+        let image = two_ways();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        std::fs::write(&path, &image).unwrap();
+        let path = path.to_str().unwrap();
+        // At startup.
+        let text = refused(crate::replication::load_dump(path).err().expect("loaded"));
+        assert!(text.starts_with(path), "{text}");
+        assert!(
+            text.contains("restore the data from another copy"),
+            "{text}"
+        );
+        // `preload-file` and an AOF's base.
+        let text = refused(load_snapshot(path).err().expect("loaded"));
+        assert!(text.starts_with(path), "{text}");
+        // A full sync.
+        let text = refused(refusal_of_payload(
+            load_snapshot_bytes(&image).err().expect("loaded"),
+        ));
+        assert!(text.contains("upgrade the master"), "{text}");
+        assert!(!text.contains("another copy"), "{text}");
+    }
+
+    /// A reading that loads is not taken for the only one if the others
+    /// cannot all be made: the image cannot be opened again, or a reading
+    /// fails on the disk.
+    #[test]
+    fn an_image_not_read_every_way_it_can_be_is_refused() {
+        let image = two_ways();
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            if opened > 2 {
+                return Err(io::Error::other("cannot open it again"));
+            }
+            Ok(image.as_slice())
+        })
+        .err()
+        .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert!(err.to_string().contains("cannot open it again"), "{err}");
+
+        struct Failing<'a>(&'a [u8]);
+        impl Read for Failing<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.len() < 20 {
+                    return Err(io::Error::other("the disk failed"));
+                }
+                self.0.read(buf)
+            }
+        }
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            Ok(if opened > 2 {
+                Box::new(Failing(&image)) as Box<dyn Read + '_>
+            } else {
+                Box::new(image.as_slice())
+            })
+        })
+        .err()
+        .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert!(err.to_string().contains("the disk failed"), "{err}");
+    }
+
+    /// A 1.2.0 image of `dbs` databases: the empty key, `"e0"`, in database
+    /// 0, and in each of the first `used`, `k<db>`, `v<db>`, whose length's
+    /// first byte is a tag.
+    fn image_1_2_0(dbs: u32, used: u32) -> Vec<u8> {
+        let mut image = header(dbs);
+        image.extend(ZERO);
+        let e0 = KiviDBValue::String(SharedBytes::from(&b"e0"[..]));
+        write_kdb_value(&mut image, e0.view()).unwrap();
+        for db in 0..dbs {
+            if db < used {
+                let value = KiviDBValue::String(SharedBytes::from(format!("v{db}").as_bytes()));
+                write_kdb_entry(&mut image, format!("k{db}").as_str(), value.view()).unwrap();
+            }
+            image.extend(ZERO);
+        }
+        image
+    }
+
+    fn check_1_2_0(loaded: &LoadedSnapshot, used: u32) {
+        assert_eq!(get_string(&loaded.dbs[0], b""), b"e0");
+        for db in 0..used {
+            assert_eq!(
+                get_string(&loaded.dbs[db as usize], format!("k{db}").as_bytes()),
+                format!("v{db}").into_bytes()
+            );
+        }
+    }
+
+    /// Once the reading with the empty key in database 0 loads the image, it
+    /// is read again with the ends of the databases after it taken for the
+    /// empty key too. Those readings fail, and it loads, from the one more
+    /// reading that keeps what it reads.
+    #[test]
+    fn a_1_2_0_image_whose_other_readings_fail_loads() {
+        let image = image_1_2_0(4, 4);
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        // As written, then with the empty key in database 0, and in 0 and 1,
+        // and 0 and 2; then again, kept.
+        assert_eq!(opened, 5);
+        check_1_2_0(&loaded, 4);
+        assert_eq!(verify_snapshot(&image).unwrap(), 5);
+    }
+
+    /// With `databases 64` and 40 of them holding keys, the reading that
+    /// loads the image has 39 more to be made after it: more than the
+    /// [`READINGS`] made of an image of 16. The readings made are as many
+    /// as the databases call for, and the image loads.
+    #[test]
+    fn a_1_2_0_image_of_many_databases_loads() {
+        let image = image_1_2_0(64, 40);
+        let (loaded, keys, _) = read_retrying(|| Ok(image.as_slice()), true, 64).unwrap();
+        assert_eq!(keys, 41);
+        check_1_2_0(&loaded, 40);
+        // With READINGS alone, they could not all be made: refused.
+        let err = read_retrying_within(|| Ok(image.as_slice()), true, 64, READINGS)
+            .err()
+            .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+    }
+
+    /// An image whose readings run out once one loads it, with others still
+    /// to be made, is refused, not loaded on that one; with room for them,
+    /// it loads.
+    #[test]
+    fn an_image_whose_readings_run_out_is_refused() {
+        let image = image_1_2_0(4, 4);
+        let err = read_retrying_within(|| Ok(image.as_slice()), true, 16, 3)
+            .err()
+            .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("not every other reading"), "{text}");
+        assert!(text.contains("more ways than the 3 readings"), "{text}");
+        assert!(verify_snapshot(&image).is_ok());
+        let (loaded, _, _) = read_retrying_within(|| Ok(image.as_slice()), true, 16, 5).unwrap();
+        check_1_2_0(&loaded, 4);
+    }
+
+    /// A reading that would load the image but for a key in a database past
+    /// the server's (#482) is a reading that loads it: with another that
+    /// loads it, the image reads more than one way.
+    #[test]
+    fn a_reading_refused_for_its_databases_still_loads_the_image() {
+        let image = two_ways();
+        // Reading [1] has keys in database 1.
+        let err = read_retrying(|| Ok(image.as_slice()), true, 1)
+            .err()
+            .expect("loaded");
+        refused(err);
+    }
+
+    /// The readings that are to be made but there is no room for are noted,
+    /// so that a reading that loads is not taken for the only one.
+    #[test]
+    fn readings_left_out_are_noted() {
+        let mut plans = Vec::new();
+        assert!(push_plans(&mut plans, &[], &[0, 2], 2));
+        assert_eq!(plans, vec![vec![2], vec![0]]);
+        let mut plans = Vec::new();
+        assert!(!push_plans(&mut plans, &[], &[0, 2, 3], 2));
+        assert_eq!(plans, vec![vec![2], vec![0]]);
+        let mut plans = Vec::new();
+        assert!(push_plans(&mut plans, &[2], &[0, 2, 3], 1));
+        assert_eq!(plans, vec![vec![2, 3]]);
+        let ends: Vec<usize> = (0..MAX_READINGS).collect();
+        assert!(!push_plans(&mut Vec::new(), &[], &ends, MAX_READINGS));
+        assert_eq!(readings_for(16), 64);
+        assert_eq!(readings_for(usize::MAX), MAX_READINGS);
+    }
+
+    /// Passing over a value refuses what reading it refuses: a hash field
+    /// that is not UTF-8, cut anywhere in a character or not; a sorted set
+    /// score that is not a number; a value cut short.
+    #[test]
+    fn passing_over_a_value_refuses_what_reading_it_does() {
+        let field = |bytes: &[u8]| {
+            let mut out = Vec::new();
+            write_bytes(&mut out, bytes).unwrap();
+            out
+        };
+        let mut long = "€".repeat(5000).into_bytes();
+        assert!(skip_text(&mut field(&long).as_slice()).unwrap());
+        long.push(0xC3);
+        assert!(!skip_text(&mut field(&long).as_slice()).unwrap());
+        long.pop();
+        long[4097] = 0xFF;
+        assert!(!skip_text(&mut field(&long).as_slice()).unwrap());
+
+        let mut hash = 1u32.to_le_bytes().to_vec();
+        hash.extend(field(&[0xFF]));
+        hash.extend(field(b"v"));
+        assert!(skip_value(&mut hash.as_slice(), TAG_HASH).is_err());
+        let mut zset = 1u32.to_le_bytes().to_vec();
+        zset.extend(field(b"m"));
+        zset.extend(f64::NAN.to_le_bytes());
+        assert!(skip_value(&mut zset.as_slice(), TAG_SORTEDSET).is_err());
+        let cut = field(b"value");
+        assert!(skip_value(&mut &cut[..cut.len() - 1], TAG_STRING).is_err());
+    }
+
+    /// An image as 1.2.1 writes it, the empty key in every database and
+    /// first keys whose length begins with a tag, is read once, as before.
+    #[test]
+    fn an_image_as_1_2_1_writes_it_is_read_once() {
+        let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+        let dbs: Vec<HashMap<String, KiviDBValue>> = (0..16)
+            .map(|db| {
+                HashMap::from([
+                    (String::new(), string(&format!("e{db}"))),
+                    ("k".to_string(), string("v")),
+                ])
+            })
+            .collect();
+        let mut image = Vec::new();
+        write_kdb_image(&mut image, &dbs, None).unwrap();
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        assert_eq!(opened, 1);
+        for (db, map) in loaded.dbs.iter().enumerate() {
+            assert_eq!(get_string(map, b""), format!("e{db}").into_bytes());
+            assert_eq!(get_string(map, b"k"), b"v");
+        }
+        assert_eq!(verify_snapshot(&image).unwrap(), 32);
+        assert_eq!(load_snapshot_bytes(&image).unwrap().dbs.len(), 16);
     }
 }
