@@ -4,11 +4,12 @@
 //! use the snapshot taken when the unit starts. See [`freeze`].
 
 use std::cell::RefCell;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 thread_local! {
-    #[allow(clippy::type_complexity)]
-    static SCRIPT_STATE: RefCell<(u32, Option<(Instant, u64, u32)>)> =
+    /// How deep this thread is in execution units, and the frozen time
+    /// (Unix seconds and microseconds) while it is in one.
+    static SCRIPT_STATE: RefCell<(u32, Option<(u64, u32)>)> =
         const { RefCell::new((0, None)) };
     /// The script's frozen time in milliseconds, as [`ttl_wall_ms_now`]
     /// gives it; 0 outside a script. What [`wall_ms_now`] reads, without
@@ -26,7 +27,7 @@ pub fn enter_script_execution() {
             let wall = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
-            st.1 = Some((Instant::now(), wall.as_secs(), wall.subsec_micros()));
+            st.1 = Some((wall.as_secs(), wall.subsec_micros()));
             let ms = wall
                 .as_secs()
                 .saturating_mul(1000)
@@ -86,33 +87,12 @@ impl Drop for Frozen {
     }
 }
 
-/// Monotonic “now” for TTL (`Instant` comparisons). Frozen during scripts.
-#[allow(dead_code)]
-#[inline]
-pub fn ttl_clock_now() -> Instant {
-    SCRIPT_STATE.with(|s| s.borrow().1.map(|(a, _, _)| a).unwrap_or_else(Instant::now))
-}
-
-/// Wall-clock seconds (UNIX) for `EXAT`-style math. Frozen during scripts.
-#[allow(dead_code)]
-#[inline]
-pub fn ttl_wall_secs_now() -> u64 {
-    SCRIPT_STATE.with(|s| {
-        s.borrow().1.map(|(_, sec, _)| sec).unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
-    })
-}
-
 /// Milliseconds since UNIX epoch; frozen during scripts.
 #[allow(dead_code)]
 #[inline]
 pub fn ttl_wall_ms_now() -> u128 {
     SCRIPT_STATE.with(|s| {
-        if let Some((_, sec, us)) = s.borrow().1 {
+        if let Some((sec, us)) = s.borrow().1 {
             return sec as u128 * 1000 + (us / 1000) as u128;
         }
         SystemTime::now()
@@ -184,7 +164,7 @@ pub fn wall_system_time_now() -> SystemTime {
 #[inline]
 pub fn time_command_wall_tuple() -> (u64, u32) {
     SCRIPT_STATE.with(|s| {
-        if let Some((_, sec, us)) = s.borrow().1 {
+        if let Some((sec, us)) = s.borrow().1 {
             return (sec, us);
         }
         let d = SystemTime::now()

@@ -569,3 +569,51 @@ fn a_script_inside_exec_keeps_the_exec_time() {
         });
     }
 }
+
+/// A time to live set inside an EXEC that runs longer than it (#665): the
+/// master works it out from the EXEC's time, keeps the key for the rest of
+/// the EXEC, and sends `PEXPIREAT` with a moment that has passed by the time
+/// the replica gets it. The replica keeps the key too, as Redis's does, and
+/// the `INCR` and `PERSIST` after it leave both with `6`. A replica that
+/// deleted the key on that `PEXPIREAT` was left with `1`, for good.
+#[test]
+fn a_ttl_set_inside_a_long_exec_reaches_the_replica_as_it_ran() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for io_model in io_models() {
+        let Pair {
+            master: mut m,
+            replica: mut r,
+            _dir,
+        } = pair(&io_model);
+        let exec = m.transaction(&[
+            &["DEBUG", "SLEEP", "0.5"],
+            &["SET", "pe", "5"],
+            &["PEXPIRE", "pe", "100"],
+            &["INCR", "pe"],
+            &["PERSIST", "pe"],
+            &["SET", "gx", "5"],
+            &["GETEX", "gx", "PX", "100"],
+            &["INCR", "gx"],
+            &["PERSIST", "gx"],
+        ]);
+        let x = exec.array();
+        assert_eq!(x.len(), 9, "{io_model:?} {x:?}");
+        assert_eq!(x[2], Resp::Int(1), "{io_model:?} {x:?}");
+        assert_eq!(x[3], Resp::Int(6), "{io_model:?} {x:?}");
+        assert_eq!(x[4], Resp::Int(1), "{io_model:?} {x:?}");
+        assert_eq!(x[6], Resp::Bulk("5".into()), "{io_model:?} {x:?}");
+        assert_eq!(x[7], Resp::Int(6), "{io_model:?} {x:?}");
+        assert_eq!(x[8], Resp::Int(1), "{io_model:?} {x:?}");
+        caught_up(&mut m);
+        for (who, c) in [("master", &mut m), ("replica", &mut r)] {
+            for k in ["pe", "gx"] {
+                assert_eq!(
+                    c.cmds(&["GET", k]),
+                    Resp::Bulk("6".into()),
+                    "{who} {k} {io_model:?}"
+                );
+                assert_eq!(c.cmds(&["PTTL", k]).int(), -1, "{who} {k} {io_model:?}");
+            }
+        }
+    }
+}
