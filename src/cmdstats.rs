@@ -124,6 +124,11 @@ pub fn record(name: &str, cmd: &[&[u8]], reply: &[u8], elapsed: std::time::Durat
     let failed = reply.first() == Some(&b'-');
     let rejected = failed && was_rejected(reply);
     let count = |counters: &Counters| {
+        if rejected {
+            counters.rejected.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         // Read and written back, not added to in one step: this thread is
         // the only one that counts here, and the one step is what costs.
         // (A reset from another thread that lands between the two is undone
@@ -140,9 +145,7 @@ pub fn record(name: &str, cmd: &[&[u8]], reply: &[u8], elapsed: std::time::Durat
         let bucket = (64 - usec.leading_zeros() as usize).min(BUCKETS - 1);
         let bucket = &counters.buckets[bucket];
         bucket.store(bucket.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-        if rejected {
-            counters.rejected.fetch_add(1, Ordering::Relaxed);
-        } else if failed {
+        if failed {
             counters.failed.fetch_add(1, Ordering::Relaxed);
         }
     };
