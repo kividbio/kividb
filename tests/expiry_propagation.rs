@@ -1825,21 +1825,26 @@ fn a_replica_of_a_master_that_sends_deletions_waits_for_them() {
     }
 }
 
-/// A replica applying its master's live stream is not changed by what the
-/// AOF replay does with a deadline that has passed (`expiry::replay`): a
-/// `PEXPIREAT` that reaches it after its moment still deletes the key, as
-/// it always has, and the write after it makes the key again. A master sends
-/// such a `PEXPIREAT` only when the link lags (it sends a `DEL` for a
-/// deadline that has come), and its `DEL` follows; this pins the replica's
-/// behaviour, which the fix leaves as it was.
+/// A replica applying its master's live stream keeps a key whose
+/// `PEXPIREAT` reaches it after its moment, as Redis does
+/// (`checkAlreadyExpired` is false on a replica): the key is hidden from
+/// reads past its time, and the master's `DEL`, or its next writes to the
+/// key, say what it is (#665). The replica deleted it: the `HSET` after it
+/// made a new key `{f1}` with no time to live, and a `PERSIST` (which the
+/// master answered 1, and so sent) found nothing to take a time from, where
+/// the master had `{f0, f1}`.
 #[test]
-fn a_replica_applies_a_pexpireat_whose_moment_has_come_as_before() {
+fn a_replica_keeps_a_key_whose_pexpireat_comes_after_its_moment() {
     let past = (unix_ms_now() - 10_000).to_string();
     let commands: Vec<Vec<String>> = vec![
         vec!["SELECT".into(), "0".into()],
         ["HSET", "h", "f0", "v0"].map(String::from).to_vec(),
-        vec!["PEXPIREAT".into(), "h".into(), past],
+        vec!["PEXPIREAT".into(), "h".into(), past.clone()],
         ["HSET", "h", "f1", "v1"].map(String::from).to_vec(),
+        ["HSET", "p", "f0", "v0"].map(String::from).to_vec(),
+        vec!["PEXPIREAT".into(), "p".into(), past],
+        ["HSET", "p", "f1", "v1"].map(String::from).to_vec(),
+        ["PERSIST", "p"].map(String::from).to_vec(),
         ["SET", "done", "1"].map(String::from).to_vec(),
     ];
     let master = StandIn::start(info_of("1.2.0", 100, true), empty_payload(), commands);
@@ -1849,9 +1854,59 @@ fn a_replica_applies_a_pexpireat_whose_moment_has_come_as_before() {
     wait_until("the stream to be applied", 30, || {
         r.cmd(&["EXISTS", "done"]) == V::Int(1)
     });
-    assert_eq!(r.cmd(&["HKEYS", "h"]), V::Arr(vec![V::Str("f1".into())]));
-    assert_eq!(r.cmd(&["PTTL", "h"]).i(), -1);
-    assert_eq!(r.cmd(&["DBSIZE"]).i(), 2);
+    // Kept with its time, which has passed: hidden, and left for the DEL.
+    assert_eq!(r.cmd(&["HKEYS", "h"]), V::Arr(vec![]));
+    assert_eq!(r.cmd(&["PTTL", "h"]).i(), -2);
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 3);
+    // Kept, written to, and its time taken away: what the master has.
+    assert_eq!(
+        r.cmd(&["HKEYS", "p"]),
+        V::Arr(vec![V::Str("f0".into()), V::Str("f1".into())])
+    );
+    assert_eq!(r.cmd(&["PTTL", "p"]).i(), -1);
+    assert_eq!(r.info("stats", "expired_keys"), "0");
+}
+
+/// A replica that lags past a time to live its master set, then wrote over
+/// and took away (#665): `PEXPIRE`, `INCR`, `PERSIST` on the master while the
+/// replica is stopped (SIGSTOP). The `PEXPIREAT` the master sent reaches the
+/// replica after its moment. The replica deleted the key, and the `INCR`
+/// after it made `1` where the master has `6`, for good. The same for
+/// `GETEX … PX` and `EXPIRE`.
+#[cfg(unix)]
+#[test]
+fn a_replica_that_lags_past_a_ttl_keeps_the_key_as_the_master_does() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    for k in ["pexpire", "getex", "expire"] {
+        assert_eq!(m.cmd(&["SET", k, "5"]).s(), "OK");
+    }
+    wait_caught_up(&mut m, &mut r);
+
+    replica.signal(libc::SIGSTOP);
+    assert_eq!(m.cmd(&["PEXPIRE", "pexpire", "100"]).i(), 1);
+    assert_eq!(m.cmd(&["GETEX", "getex", "PX", "100"]).s(), "5");
+    assert_eq!(m.cmd(&["EXPIRE", "expire", "1"]).i(), 1);
+    for k in ["pexpire", "getex", "expire"] {
+        assert_eq!(m.cmd(&["INCR", k]).i(), 6);
+        assert_eq!(m.cmd(&["PERSIST", k]).i(), 1);
+    }
+    // Past every deadline above before the replica reads its stream.
+    std::thread::sleep(Duration::from_millis(1500));
+    replica.signal(libc::SIGCONT);
+
+    wait_caught_up(&mut m, &mut r);
+    for k in ["pexpire", "getex", "expire"] {
+        for (who, c) in [("master", &mut m), ("replica", &mut r)] {
+            assert_eq!(c.cmd(&["GET", k]), V::Str("6".into()), "{who} {k}");
+            assert_eq!(c.cmd(&["PTTL", k]).i(), -1, "{who} {k}");
+        }
+    }
+    assert_same(&mut m, &mut r);
+    drop(master);
 }
 
 /// A replica holding keys that expired under a master that never deleted
