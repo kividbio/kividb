@@ -1826,6 +1826,89 @@ fn a_checkpoint_stopped_between_its_number_and_its_dump_loses_nothing() {
     }
 }
 
+/// The names in `dir` of the files a dump is written to before it is put in
+/// place, `dump.kdb.<pid>.<n>.tmp`.
+fn temp_dumps(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.strip_prefix("dump.kdb.")
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(pid, n)| {
+                    [pid, n]
+                        .iter()
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                })
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// A checkpoint cut short (a kill -9, the OOM killer, a liveness probe)
+/// leaves the file its dump was being written to, as big as the dump, which
+/// nothing ever reads. The next start, once it holds the data directory,
+/// removes those, whichever process wrote them -- in a container every start
+/// has the same pid -- and says so. Each crash used to leave one more, until
+/// the volume was full (#545). Files named otherwise are left alone.
+#[test]
+fn a_start_removes_the_dumps_of_checkpoints_cut_short() {
+    for &io in io_models() {
+        for (save, started) in [
+            ("BGSAVE", "Background saving started"),
+            ("BGREWRITEAOF", STARTED),
+        ] {
+            let mut server = Server::start(io, "dump-installing");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "k", "1"]).ok());
+            durable(&mut c);
+            assert_eq!(c.cmd(&[save]).s(), started, "{io}, {save}");
+            assert!(server.reached("dump-installing.1", LONG), "{io}, {save}");
+            let cut_short = temp_dumps(&server.dir);
+            assert_eq!(cut_short.len(), 1, "{io}, {save}: {cut_short:?}");
+            // As a start with the same pid would have left it.
+            std::fs::write(server.dir.join("dump.kdb.1.0.tmp"), b"cut short").unwrap();
+            let others = [
+                "dump.kdb.1.tmp",
+                "dump.kdb.x.0.tmp",
+                "dump.kdb.1.0.tmp.bak",
+                "old.dump.kdb.1.0.tmp",
+            ];
+            for name in others {
+                std::fs::write(server.dir.join(name), b"not a dump of ours").unwrap();
+            }
+            drop(c);
+            server.kill();
+
+            server.failpoints.clear();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{io}, {save}");
+            assert_eq!(
+                temp_dumps(&server.dir),
+                Vec::<String>::new(),
+                "{io}, {save}"
+            );
+            for name in others {
+                assert!(
+                    server.dir.join(name).exists(),
+                    "{io}, {save}: {name} removed"
+                );
+            }
+            let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+            for name in [cut_short[0].as_str(), "dump.kdb.1.0.tmp"] {
+                assert!(
+                    log.lines()
+                        .any(|line| line.contains("Removed") && line.contains(name)),
+                    "{io}, {save}: no line says {name} was removed"
+                );
+            }
+        }
+    }
+}
+
 /// A save with the AOF off beside an old log and a log, both holding
 /// records the dataset has: a checkpoint was stopped part-way, the next start
 /// replayed both, and the AOF was then turned off and the dataset saved.

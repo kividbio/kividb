@@ -389,7 +389,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     // One engine to a data directory, before anything in it is read.
-    lock_data_dir();
+    if lock_data_dir() {
+        // Before this process saves anything: the saves that left a dump
+        // there were another process's.
+        aof::remove_cut_short_dumps();
+    }
     // io_uring's workers hold open files of their own, kept from clients.
     #[cfg(target_os = "linux")]
     let uring = match config.io_model {
@@ -455,8 +459,9 @@ const DATA_DIR_LOCK: &str = "kividb.lock";
 /// is an exclusive `flock` (`LockFileEx` on Windows) held until the process
 /// exits, when the system releases it however the process ends. The other
 /// process is usually on its way out, so this waits for it rather than
-/// giving up.
-fn lock_data_dir() {
+/// giving up. Whether the lock is held: a start that could not take it goes
+/// on without it.
+fn lock_data_dir() -> bool {
     static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
     let file = match std::fs::OpenOptions::new()
         .create(true)
@@ -470,7 +475,7 @@ fn lock_data_dir() {
                 "Can't open {DATA_DIR_LOCK} in the data directory ({e}): starting without the \
                  lock that keeps a second process out of it"
             );
-            return;
+            return false;
         }
     };
     let waiting_since = Instant::now();
@@ -497,7 +502,7 @@ fn lock_data_dir() {
                     "Can't lock {DATA_DIR_LOCK} ({e}): starting without the lock that keeps a \
                      second process out of the data directory"
                 );
-                return;
+                return false;
             }
         }
     }
@@ -508,6 +513,7 @@ fn lock_data_dir() {
         );
     }
     let _ = HELD.set(file);
+    true
 }
 
 /// Walk keys to populate TEXT / inverted / FLAT data and HNSW graphs. A graph
