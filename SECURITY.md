@@ -50,9 +50,8 @@ with one OpenPGP key. Its fingerprint is published here and in
 [docs/INSTALL.md](docs/INSTALL.md#the-signing-key), in this repository, so that the key
 the site serves can be checked against a copy that the site does not serve:
 
-<!-- PLACEHOLDER: replace the line below with the key's fingerprint when the key is
-     created, here and in docs/INSTALL.md. -->
-**Fingerprint: not published yet.** It is published here once the key exists.
+**Fingerprint:** `6492 17DE 0F7F D7DB 3D7B  AC3A E21D 8F6E DDE5 F489`
+(`KiviDB Packages <packages@kividb.io>`, RSA 4096, created 2026-11-12).
 
 If the key a repository offers has any other fingerprint, do not install from it, and
 report it as above.

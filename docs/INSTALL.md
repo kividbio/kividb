@@ -157,9 +157,8 @@ fingerprint is published here and in [SECURITY.md](../SECURITY.md#package-signin
 in this repository, so that you can check the key against a copy that the site
 serving it does not control:
 
-<!-- PLACEHOLDER: replace the line below with the key's fingerprint when the key is
-     created, here and in SECURITY.md. -->
-**Fingerprint: not published yet.** It is published here once the key exists.
+**Fingerprint:** `6492 17DE 0F7F D7DB 3D7B  AC3A E21D 8F6E DDE5 F489`
+(`KiviDB Packages <packages@kividb.io>`, RSA 4096, created 2026-11-12).
 
 To see the fingerprint of the key you downloaded:
 
