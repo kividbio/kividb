@@ -1332,7 +1332,7 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     return;
                 }
-                if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
+                if let Some(fields) = crate::vector::query_doc_fields(&def.on, &def.fields, value) {
                     let json = fields.json();
                     consider(key, &fields, json);
                 }
@@ -1342,6 +1342,26 @@ pub(crate) fn filter_each(
     // A scan that reached the end is whole, however long it took: only one
     // that stopped early has timed out.
     timed_out
+}
+
+/// Whether a query is not to see `field` of the document at `key`: a hash
+/// field past its deadline and not removed yet, as [`with_doc`] leaves it
+/// out. A vector index holds such a field's vector until the removal
+/// reindexes the hash, so a nearest-neighbour search asks this of its hits.
+/// The shard is let go before the hash is read, as in `with_doc`.
+pub(crate) fn field_hidden(db: &Db, key: &str, field: &str) -> bool {
+    if !crate::field_expiry::any_watched() {
+        return false;
+    }
+    let key = crate::key_bytes::bytes_of(key);
+    let value = crate::store::get_shard(db, &*key)
+        .read()
+        .get(&*key)
+        .map(ValueRef::to_value);
+    let Some(KiviDBValue::HashEx(hash)) = value else {
+        return false;
+    };
+    hash.read().hides(field, crate::types::field_now())
 }
 
 /// Run `f` on the document at `key`, if there is one of the kind the index
@@ -1367,7 +1387,10 @@ pub(crate) fn with_doc<R>(
     };
     match (&def.on, &value) {
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
-        (IndexOn::Hash, KiviDBValue::HashEx(hash)) => Some(f(&hash.read().fields, None)),
+        (IndexOn::Hash, KiviDBValue::HashEx(hash)) => {
+            let hash = hash.read();
+            Some(f(&hash.shown(crate::types::field_now()), None))
+        }
         (IndexOn::Json, KiviDBValue::Json(doc)) => {
             let doc = doc.read();
             Some(f(
@@ -2252,21 +2275,21 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .get(&knn.field)
                 .ok_or_else(|| "The vector field has no index".to_string())?;
             let nearest = if matches!(filter, Filter::MatchAll) && args.inkeys.is_none() {
-                match live {
+                let ef = knn.ef_runtime.unwrap_or(match &field.field_type {
+                    FieldType::Vector {
+                        algo: VectorAlgo::Hnsw { ef_runtime, .. },
+                        ..
+                    } => *ef_runtime,
+                    _ => knn.k * 2,
+                });
+                crate::commands::vector::nearest_shown(db, &knn.field, knn.k, |k| match live {
                     LiveIndex::Flat(index) => {
-                        crate::vector::knn_flat(index, &knn.vector, knn.k, metric)
+                        crate::vector::knn_flat(index, &knn.vector, k, metric)
                     }
                     LiveIndex::Hnsw(graph) => {
-                        let ef = knn.ef_runtime.unwrap_or(match &field.field_type {
-                            FieldType::Vector {
-                                algo: VectorAlgo::Hnsw { ef_runtime, .. },
-                                ..
-                            } => *ef_runtime,
-                            _ => knn.k * 2,
-                        });
-                        crate::vector::knn_hnsw(graph, &knn.vector, knn.k, ef, metric)
+                        crate::vector::knn_hnsw(graph, &knn.vector, k, ef, metric)
                     }
-                }
+                })
             } else if let Some((nearest, cut)) = crate::commands::vector::knn_planned(
                 ctx,
                 &def,
@@ -2292,7 +2315,13 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                     &filter,
                     args.inkeys.as_ref(),
                     deadline,
-                    |key, _, _| scorer.offer(key),
+                    // Measured only if the query sees the vector field: a
+                    // hash's past its deadline is left out of `fields`.
+                    |key, fields, json| {
+                        if json.is_some() || fields.get(knn.field.as_str()).is_some() {
+                            scorer.offer(key);
+                        }
+                    },
                 );
                 scorer.nearest()
             };

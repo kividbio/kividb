@@ -972,6 +972,29 @@ impl HashInner {
             .collect()
     }
 
+    /// The fields a reader is shown at `now`: those due left out, unless
+    /// this thread keeps them (`field_expiry::policy` is `Keep`). Nothing is
+    /// removed, and the fields are copied only when one is due.
+    #[inline]
+    pub fn shown(&self, now: FieldDeadline) -> std::borrow::Cow<'_, HashFields> {
+        if self.has_due(now) && !crate::field_expiry::due_fields_kept() {
+            std::borrow::Cow::Owned(self.live_fields(now))
+        } else {
+            std::borrow::Cow::Borrowed(&self.fields)
+        }
+    }
+
+    /// Whether [`Self::shown`] leaves `field` out at `now`.
+    #[inline]
+    pub fn hides(&self, field: &str, now: FieldDeadline) -> bool {
+        self.has_due(now)
+            && !crate::field_expiry::due_fields_kept()
+            && self
+                .expiries
+                .get(field)
+                .is_some_and(|at| field_due(*at, now))
+    }
+
     /// Remove a field's value AND its expiry entry. Returns the removed
     /// value if the field existed.
     pub fn evict_field(&mut self, field: &str) -> Option<std::sync::Arc<[u8]>> {

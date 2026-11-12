@@ -145,6 +145,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Search no longer finds a hash field past its deadline.** A field whose
+  TTL had ended but that was not removed yet (between field-expiry sweeps,
+  on a replica waiting for the master's `HDEL`, or with expiry paused) was
+  hidden from `HGET` but still matched, returned and loaded by `FT.SEARCH`,
+  `FT.AGGREGATE` and `FT.HYBRID`, and its vector still ranked in `KNN`
+  queries. These commands now leave it out, as `HGET` does; removing it is
+  still the master's, which sends the `HDEL`. Score statistics, `FT.INFO`
+  counts and `FT.TAGVALS` still include it until it is removed.
+
 - **`CLIENT PAUSE ... WRITE` no longer replies while a write is still on
   its way (#629).** A switchover (the kividb-operator's, and any that works
   the same way) pauses writes on the master, reads `master_repl_offset`,

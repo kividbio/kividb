@@ -229,7 +229,7 @@ pub enum Policy {
 /// [`Policy`] of this thread, for `store`. Only asked once a field is due.
 #[cold]
 pub fn policy(store: &Store) -> Policy {
-    if crate::expiry::fields_held() || crate::expiry::replaying() {
+    if due_fields_kept() {
         return Policy::Keep;
     }
     match crate::expiry::of(store) {
@@ -237,6 +237,13 @@ pub fn policy(store: &Store) -> Policy {
         _ if crate::pause::expiry_deferred() || crate::expiry::loading() => Policy::Hide,
         _ => Policy::Expire,
     }
+}
+
+/// Whether [`policy`] is `Keep` on this thread. It depends on the thread
+/// alone, so a reader with no store at hand (an index query) can ask it.
+#[inline]
+pub fn due_fields_kept() -> bool {
+    crate::expiry::fields_held() || crate::expiry::replaying()
 }
 
 /// What [`expire_due`] did.

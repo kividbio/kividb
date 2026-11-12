@@ -793,7 +793,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if not_served(key) {
                 return;
             }
-            let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {
+            let Some(inner) = crate::vector::query_doc_fields(&def.on, &def.fields, value) else {
                 return;
             };
             // The filter on the raw fields, before anything is turned into
@@ -824,7 +824,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         };
         let candidates = rows
             .iter()
-            .filter_map(|row| row.get("__key").map(String::as_str));
+            .filter_map(|row| row.get("__key").map(String::as_str))
+            .filter(|key| !crate::commands::search::field_hidden(db_ref, key, &knn.field));
         let (nearest, cut) = knn_filtered(live, &knn.vector, knn.k, metric, candidates, deadline);
         timed_out |= cut;
         let rank: ahash::AHashMap<String, (usize, f32)> = nearest
@@ -1564,6 +1565,31 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 // ── Helpers for filtered search ──────────────────────────────────────────────
 
+/// The nearest `k` an index search finds, less the documents whose `field`
+/// a query is not to see ([`crate::commands::search::field_hidden`]).
+/// `search(n)` is the nearest `n`; while hits were left out and the search
+/// found all it was asked for, it is asked for more.
+pub(crate) fn nearest_shown(
+    db: &crate::store::Db,
+    field: &str,
+    k: usize,
+    mut search: impl FnMut(usize) -> Vec<crate::vector::KnnResult>,
+) -> Vec<crate::vector::KnnResult> {
+    let mut want = k;
+    loop {
+        let mut found = search(want);
+        let all = found.len() >= want;
+        let before = found.len();
+        found.retain(|hit| !crate::commands::search::field_hidden(db, &hit.key, field));
+        let hidden = before - found.len();
+        if hidden == 0 || found.len() >= k || !all {
+            found.truncate(k);
+            return found;
+        }
+        want = want.saturating_add(hidden.max(want));
+    }
+}
+
 /// The nearest `k` of the documents offered to it, measured as they come:
 /// what a filtered KNN keeps while the filter runs.
 ///
@@ -1770,8 +1796,22 @@ pub(crate) fn knn_planned(
                     .is_some_and(|v| crate::vector::is_document(&def.on, v))
             })
             .collect();
-        if gone.is_empty() || cut {
+        // A hit whose vector the query is not to see is left out of this
+        // query's plan, not out of the index.
+        let hidden: Vec<String> = nearest
+            .iter()
+            .filter(|r| crate::commands::search::field_hidden(db, &r.key, &knn.field))
+            .map(|r| r.key.clone())
+            .collect();
+        if (gone.is_empty() && hidden.is_empty()) || cut {
+            let mut nearest = nearest;
+            nearest.retain(|r| !hidden.contains(&r.key));
             return Some((nearest, cut));
+        }
+        for key in &hidden {
+            if let Some(id) = def.postings.peek().id(key) {
+                plan.ids.unset(id);
+            }
         }
         for key in gone {
             if let Some(id) = def.postings.peek().id(key) {
