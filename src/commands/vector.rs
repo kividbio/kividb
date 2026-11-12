@@ -1502,6 +1502,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // RediSearch's reply per misspelled word, RESP2:
     //   ["TERM", word, [[score, suggestion], ...]]
     // and RESP3: {"results": {word: [{suggestion: score}, ...], ...}}.
+    // `TERM` and `results` are simple strings there, and so here.
     // A suggestion's score is the share of the index's documents that hold
     // it (`spell_check.c`), best first, written as Redis writes a double; a
     // word only in an INCLUDE dictionary scores 0.
@@ -1556,7 +1557,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
             out.push(resp_array(suggestions));
         } else {
             out.push(resp_array(vec![
-                resp_bulk_str("TERM"),
+                resp_simple("TERM"),
                 resp_bulk_str(&token_clean),
                 resp_array(suggestions),
             ]));
@@ -1564,7 +1565,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     if resp3 {
-        return Some(resp_map(vec![resp_bulk_str("results"), resp_map(out)]));
+        return Some(resp_map(vec![resp_simple("results"), resp_map(out)]));
     }
     Some(resp_array(out))
 }

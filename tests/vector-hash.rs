@@ -2369,8 +2369,12 @@ fn test_ft_spellcheck_finds_suggestions() {
     assert!(!arr.is_empty(), "should have spell-check results");
 
     // Each entry: ["TERM", term, [[score, suggestion], ...]]
+    // `TERM` is a simple string, as RediSearch sends it (#590).
     let entry = arr[0].as_array();
-    assert_eq!(entry[0].as_str(), "TERM");
+    assert!(
+        matches!(&entry[0], RespValue::SimpleStr(term) if term == "TERM"),
+        "{entry:?}"
+    );
     assert_eq!(entry[1].as_str(), "helo");
     let suggestions = entry[2].as_array();
     assert!(
