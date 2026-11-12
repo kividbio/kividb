@@ -820,6 +820,78 @@ fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
     }
 }
 
+/// `SINTERSTORE` of an empty intersection into a destination that is not
+/// there writes nothing and deletes nothing, and a watch on it holds, as in
+/// Redis: an `EXEC` fails only when a watched key was really modified
+/// (#674). A destination that is there is emptied and fails its watch, one
+/// given a result is written and fails its watch — and `SDIFFSTORE`, which
+/// #674 does not name, is left as it was.
+#[test]
+fn test_sinterstore_that_writes_nothing_fails_no_watch() {
+    let port = free_port();
+    start_server(port);
+    let mut setup = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(setup.cmds(&["SADD", "si:s1", "a"]).as_int(), 1);
+    assert_eq!(setup.cmds(&["SADD", "si:s2", "b"]).as_int(), 1);
+    assert_eq!(setup.cmds(&["SADD", "si:s3", "a"]).as_int(), 1);
+    assert_eq!(setup.cmds(&["SADD", "si:here", "z"]).as_int(), 1);
+
+    // The intersection of s1 and s2 is empty, and the destination is not
+    // there: nothing is written and nothing is deleted, and the watch
+    // holds.
+    assert!(c.cmds(&["WATCH", "si:none"]).is_ok());
+    assert_eq!(
+        other
+            .cmds(&["SINTERSTORE", "si:none", "si:s1", "si:s2"])
+            .as_int(),
+        0
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+    let held = c.cmds(&["EXEC"]);
+    assert_eq!(held.as_array().len(), 1, "empty into absent: {held:?}");
+
+    // A destination that is there is emptied: the watch on it fails.
+    assert!(c.cmds(&["WATCH", "si:here"]).is_ok());
+    assert_eq!(
+        other
+            .cmds(&["SINTERSTORE", "si:here", "si:s1", "si:s2"])
+            .as_int(),
+        0
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert!(c.cmds(&["EXEC"]).is_nil(), "the emptied destination");
+
+    // A non-empty intersection writes the destination: its watch fails.
+    assert!(c.cmds(&["WATCH", "si:new"]).is_ok());
+    assert_eq!(
+        other
+            .cmds(&["SINTERSTORE", "si:new", "si:s1", "si:s3"])
+            .as_int(),
+        1
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert!(c.cmds(&["EXEC"]).is_nil(), "the written destination");
+
+    // `SDIFFSTORE` is not among the commands #674 names: an empty result
+    // into a destination that is not there still fails a watch on it, as
+    // it did before.
+    assert!(c.cmds(&["WATCH", "sd:none"]).is_ok());
+    assert_eq!(
+        other
+            .cmds(&["SDIFFSTORE", "sd:none", "si:s1", "si:s3"])
+            .as_int(),
+        0
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert!(c.cmds(&["EXEC"]).is_nil(), "SDIFFSTORE left as it was");
+}
+
 /// For `SWAPDB`, a key whose time is up is not there, as for a flush: a
 /// watch on one that had expired, swapped for none, holds, as does a watch
 /// on a key that is in neither database but for an expired one. A key that
@@ -862,6 +934,71 @@ fn test_swapdb_takes_an_expired_key_as_absent() {
     assert_eq!(held.0.as_array().len(), 1);
     assert_eq!(held.1.as_array().len(), 1);
     assert!(held.2.is_nil(), "{:?}", held.2);
+}
+
+/// `GETEX` and `GETDEL` of a key that is not there — including one a
+/// `SWAPDB` brought in already expired — write nothing and delete nothing,
+/// and a watch on it holds, as in Redis (#674). A write to a watched key
+/// still fails it.
+#[test]
+fn test_getex_and_getdel_that_change_nothing_fail_no_watch() {
+    let port = free_port();
+    start_server(port);
+    let mut setup = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    let mut c = Conn::connect(port);
+    assert!(setup.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).is_ok());
+
+    // A key that was never there.
+    assert!(c.cmds(&["WATCH", "gx:none"]).is_ok());
+    assert!(other.cmds(&["GETEX", "gx:none"]).is_nil());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+    let held = c.cmds(&["EXEC"]);
+    assert_eq!(held.as_array().len(), 1, "GETEX of a missing key: {held:?}");
+
+    assert!(c.cmds(&["WATCH", "gd:none"]).is_ok());
+    assert!(other.cmds(&["GETDEL", "gd:none"]).is_nil());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+    let held = c.cmds(&["EXEC"]);
+    assert_eq!(
+        held.as_array().len(),
+        1,
+        "GETDEL of a missing key: {held:?}"
+    );
+
+    // The keys' time is up in the other database; the swap brings them
+    // into this one, and `GETEX` / `GETDEL` find them already gone, as
+    // Redis does.
+    assert!(other.cmds(&["SELECT", "3"]).is_ok());
+    assert!(other.cmds(&["SET", "gx:old", "v", "PX", "1"]).is_ok());
+    assert!(other.cmds(&["SET", "gd:old", "v", "PX", "1"]).is_ok());
+    assert!(c.cmds(&["SELECT", "2"]).is_ok());
+    assert!(c.cmds(&["WATCH", "gx:old"]).is_ok());
+    assert!(c.cmds(&["WATCH", "gd:old"]).is_ok());
+    thread::sleep(Duration::from_millis(20));
+    assert!(other.cmds(&["SWAPDB", "2", "3"]).is_ok());
+    assert!(other.cmds(&["SELECT", "2"]).is_ok());
+    assert!(other.cmds(&["GETEX", "gx:old"]).is_nil());
+    assert!(other.cmds(&["GETDEL", "gd:old"]).is_nil());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+    let held = c.cmds(&["EXEC"]);
+    assert_eq!(
+        held.as_array().len(),
+        1,
+        "GETEX/GETDEL of an expired key: {held:?}"
+    );
+
+    // A write to a watched key still fails it.
+    assert!(c.cmds(&["WATCH", "gx:old"]).is_ok());
+    assert!(other.cmds(&["SET", "gx:old", "v"]).is_ok());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    c.cmds(&["PING"]);
+    assert!(c.cmds(&["EXEC"]).is_nil());
+
+    assert!(setup.cmds(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).is_ok());
 }
 
 /// A pop that takes nothing changes nothing, and a watch on its key holds,

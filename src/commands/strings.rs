@@ -708,7 +708,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
+                // The key's time is up: nil as for one that was never
+                // there. Nothing was written or deleted, so the watch on
+                // it holds (#674).
+                delete_key_if_expired_keeping_watches(ctx.store, *ctx.selected_db, key);
+                crate::watch::unchanged(*ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -735,6 +739,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 store::Removal::Absent => {
                     crate::stats::record_miss();
+                    // Nothing there to take: nothing was deleted, so a
+                    // watch on the key holds (#674).
+                    crate::watch::unchanged(*ctx.selected_db, key);
                     Some(resp_null_bulk())
                 }
             }
@@ -1273,7 +1280,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 j += 1;
             }
             if is_expired(ctx.store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
+                // The key's time is up: nil as for one that was never
+                // there. Nothing was written or deleted, so the watch on
+                // it holds (#674).
+                delete_key_if_expired_keeping_watches(ctx.store, *ctx.selected_db, key);
+                crate::watch::unchanged(*ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
 
@@ -1338,7 +1349,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             match val {
                 Some(v) => Some(resp_bulk(&v)),
-                None => Some(resp_null_bulk()),
+                None => {
+                    // Not there: nothing was written, so a watch on the
+                    // key holds (#674).
+                    crate::watch::unchanged(*ctx.selected_db, key);
+                    Some(resp_null_bulk())
+                }
             }
         }
 
