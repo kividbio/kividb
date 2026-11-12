@@ -50,6 +50,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deadline, hidden from reads, until the master's `DEL` or its next writes
   arrive, as Redis does (`checkAlreadyExpired` is false on a replica). 1.2.1
   and earlier are affected.
+- **`INFO commandstats` no longer counts a rejected call in `calls` and
+  `usec`, matching Redis (#664).**
 
 - **A document that any command writes over or deletes leaves its search
   indexes (#619).** A hash or JSON document replaced by a string, a list, a
