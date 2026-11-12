@@ -2006,6 +2006,9 @@ pub enum DocFields<'a> {
     Hash(parking_lot::RwLockReadGuard<'a, Fields>),
     /// A hash some of whose fields have a TTL.
     HashEx(parking_lot::RwLockReadGuard<'a, crate::types::HashInner>),
+    /// What a query is shown of a hash with fields past their deadline and
+    /// not removed yet ([`query_doc_fields`]).
+    Shown(Fields),
     Json {
         fields: Fields,
         doc: parking_lot::RwLockReadGuard<'a, serde_json::Value>,
@@ -2028,6 +2031,7 @@ impl std::ops::Deref for DocFields<'_> {
         match self {
             DocFields::Hash(fields) => fields,
             DocFields::HashEx(hash) => &hash.fields,
+            DocFields::Shown(fields) => fields,
             DocFields::Json { fields, .. } => fields,
         }
     }
@@ -2065,6 +2069,28 @@ pub fn doc_fields<'a>(
             })
         }
         _ => None,
+    }
+}
+
+/// [`doc_fields`] as a query reads them: a hash's fields past their
+/// deadline left out (`HashInner::shown`), as HGET leaves them out. Only for
+/// what a query matches and shows. What writes an index reads every stored
+/// field with [`doc_fields`]: the index follows the stored hash, and the
+/// field's removal reindexes it.
+pub fn query_doc_fields<'a>(
+    on: &IndexOn,
+    schema: &[SchemaField],
+    value: crate::store::ValueRef<'a>,
+) -> Option<DocFields<'a>> {
+    match doc_fields(on, schema, value)? {
+        DocFields::HashEx(hash) => {
+            let shown = match hash.shown(crate::types::field_now()) {
+                std::borrow::Cow::Owned(fields) => Some(fields),
+                std::borrow::Cow::Borrowed(_) => None,
+            };
+            Some(shown.map_or(DocFields::HashEx(hash), DocFields::Shown))
+        }
+        doc => Some(doc),
     }
 }
 
