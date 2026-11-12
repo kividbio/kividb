@@ -1053,19 +1053,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without an empty key are written as before. A snapshot that 1.2.0 wrote
   with the empty key, as `dump.kdb`, an AOF checkpoint or preamble, or a
   1.2.0 master's full sync, now loads: the key is looked for where 1.2.0
-  put it. In the last database that is certain. Before it, 1.2.0's empty
-  key and a database's end can read alike, so every snapshot that 1.2.1
-  writes (`dump.kdb`, an AOF checkpoint or preamble, a full sync) now
-  opens with a marker entry, which 1.2.0 and 1.1 ignore: a marked image
-  is read once, as 1.2.1 writes it. An image without the marker is read
-  again, a bounded number of times, with the key in each place 1.2.0
-  could have put it: one that none of these readings loads is refused as
-  before, and so is one that more than one of them loads, or that could
-  not be read every way it can be, with an error that says so and what
-  to do: restore the data from another copy (an AOF, a replica or a
-  backup), or for a full sync, upgrade the master to 1.2.1. An image
-  that goes on past its databases with bytes that are not a section is
-  refused, rather than loaded without them.
+  put it. In the last database that is certain. Before it, an image that
+  does not load as 1.2.1 writes it is read again, a bounded number of
+  times, with the key in each place it could be. One that none of these
+  readings loads is refused as before; so is one that more than one of
+  them loads, or that could not be read every way it can be, with an
+  error that says so and what to do: restore the data from another copy
+  (an AOF, a replica or a backup), or for a full sync, upgrade the master
+  to 1.2.1. An image that goes on past its databases with bytes that are
+  not a section is refused, rather than loaded without them.
   Empty hash fields, set and sorted set members and list elements were
   never affected (#441).
 
@@ -1076,8 +1072,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the full sync of a 1.2.1 master that holds the empty key, keeps its own
   data, and asks again every second, each time a full sync for the master
   to make: upgrade replicas before their master. A 1.2.1 replica of a
-  1.2.0 master loads its full sync. The marker that opens a 1.2.1
-  snapshot is read by 1.2.0 and 1.1 as an empty hash, and dropped.
+  1.2.0 master loads its full sync.
 
 - **`CONFIG REWRITE` no longer writes a config file the server was not
   started from.** A server started without one, because its `--configfile`
