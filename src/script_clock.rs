@@ -1,12 +1,15 @@
-//! Logical clock frozen for the duration of a Lua script / FCALL (Redis `execution unit`).
-//! TTL math and `TIME` use the snapshot taken when script execution starts.
+//! Logical clock frozen for the duration of an execution unit, as Redis's
+//! `commandTimeSnapshot`: a Lua script, an `FCALL`, or a transaction's
+//! `EXEC` (#659). TTL math, the expiry of keys and hash fields, and `TIME`
+//! use the snapshot taken when the unit starts. See [`freeze`].
 
 use std::cell::RefCell;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 thread_local! {
-    #[allow(clippy::type_complexity)]
-    static SCRIPT_STATE: RefCell<(u32, Option<(Instant, u64, u32)>)> =
+    /// How deep this thread is in execution units, and the frozen time
+    /// (Unix seconds and microseconds) while it is in one.
+    static SCRIPT_STATE: RefCell<(u32, Option<(u64, u32)>)> =
         const { RefCell::new((0, None)) };
     /// The script's frozen time in milliseconds, as [`ttl_wall_ms_now`]
     /// gives it; 0 outside a script. What [`wall_ms_now`] reads, without
@@ -24,7 +27,7 @@ pub fn enter_script_execution() {
             let wall = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
-            st.1 = Some((Instant::now(), wall.as_secs(), wall.subsec_micros()));
+            st.1 = Some((wall.as_secs(), wall.subsec_micros()));
             let ms = wall
                 .as_secs()
                 .saturating_mul(1000)
@@ -48,25 +51,40 @@ pub fn exit_script_execution() {
     });
 }
 
-/// Monotonic “now” for TTL (`Instant` comparisons). Frozen during scripts.
-#[allow(dead_code)]
+/// The clock held at one time on this thread for as long as the guard
+/// lives: what a script, a function and a transaction's `EXEC` run under.
+/// Every key and hash field in the unit is there, or gone, for all of its
+/// commands at once, as in Redis, where `call()` takes `cmd_time_snapshot`
+/// at the outermost level only (`enterExecutionUnit`) and every expiry
+/// check, TTL reply and `TIME` reads it.
+///
+/// Before #659 only scripts froze the clock, and an `EXEC` read it for each
+/// queued command: a key or field whose deadline fell inside the
+/// transaction was found by its first commands and not by its later ones.
+///
+/// Units nest: one entered inside another (a script run by `EXEC`) keeps
+/// the outer one's time. The guard is not `Send`: the time is this
+/// thread's, so it cannot be held across an `.await` that could move the
+/// task to another thread.
+#[must_use = "the clock is frozen only while the guard lives"]
 #[inline]
-pub fn ttl_clock_now() -> Instant {
-    SCRIPT_STATE.with(|s| s.borrow().1.map(|(a, _, _)| a).unwrap_or_else(Instant::now))
+pub fn freeze() -> Frozen {
+    enter_script_execution();
+    Frozen {
+        _this_thread: std::marker::PhantomData,
+    }
 }
 
-/// Wall-clock seconds (UNIX) for `EXAT`-style math. Frozen during scripts.
-#[allow(dead_code)]
-#[inline]
-pub fn ttl_wall_secs_now() -> u64 {
-    SCRIPT_STATE.with(|s| {
-        s.borrow().1.map(|(_, sec, _)| sec).unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
-    })
+/// See [`freeze`].
+pub struct Frozen {
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for Frozen {
+    #[inline]
+    fn drop(&mut self) {
+        exit_script_execution();
+    }
 }
 
 /// Milliseconds since UNIX epoch; frozen during scripts.
@@ -74,7 +92,7 @@ pub fn ttl_wall_secs_now() -> u64 {
 #[inline]
 pub fn ttl_wall_ms_now() -> u128 {
     SCRIPT_STATE.with(|s| {
-        if let Some((_, sec, us)) = s.borrow().1 {
+        if let Some((sec, us)) = s.borrow().1 {
             return sec as u128 * 1000 + (us / 1000) as u128;
         }
         SystemTime::now()
@@ -146,7 +164,7 @@ pub fn wall_system_time_now() -> SystemTime {
 #[inline]
 pub fn time_command_wall_tuple() -> (u64, u32) {
     SCRIPT_STATE.with(|s| {
-        if let Some((_, sec, us)) = s.borrow().1 {
+        if let Some((sec, us)) = s.borrow().1 {
             return (sec, us);
         }
         let d = SystemTime::now()
@@ -179,6 +197,26 @@ mod wall_ms_tests {
         exit_script_execution();
         assert_eq!(wall_ms_now(), frozen);
         exit_script_execution();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(wall_ms_now() > frozen);
+    }
+
+    #[test]
+    fn a_frozen_unit_keeps_one_time_and_a_nested_one_keeps_the_outer_time() {
+        let outer = freeze();
+        let frozen = wall_ms_now();
+        let time = time_command_wall_tuple();
+        std::thread::sleep(Duration::from_millis(5));
+        {
+            // A script run by an `EXEC`: the transaction's time.
+            let _inner = freeze();
+            std::thread::sleep(Duration::from_millis(2));
+            assert_eq!(wall_ms_now(), frozen);
+        }
+        assert_eq!(wall_ms_now(), frozen);
+        assert_eq!(ttl_wall_ms_now() as u64, frozen);
+        assert_eq!(time_command_wall_tuple(), time);
+        drop(outer);
         std::thread::sleep(Duration::from_millis(2));
         assert!(wall_ms_now() > frozen);
     }

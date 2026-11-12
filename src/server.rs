@@ -1524,9 +1524,9 @@ where
                             // A key that has already expired is watched as
                             // the absent key it is: its removal, when it
                             // comes, is not a change.
-                            commands::helpers::lazy_expire_key(&store, selected_db, key);
-                            tx.watched_keys
-                                .push((selected_db, crate::store::Key::new(key)));
+                            let expired =
+                                commands::helpers::lazy_expire_key(&store, selected_db, key);
+                            tx.watch_key(selected_db, key, expired);
                             watch_registry.as_ref().watch(
                                 selected_db,
                                 key,
@@ -1547,7 +1547,7 @@ where
                             .map(|_| Arc::clone(&dirty_flag))
                             .collect::<Vec<_>>(),
                     );
-                    tx.watched_keys.clear();
+                    tx.unwatch_keys();
                     dirty_flag.store(false, std::sync::atomic::Ordering::Release);
                     b"+OK\r\n".to_vec()
                 }
@@ -1716,6 +1716,22 @@ where
                         {
                             redispatch = true;
                             continue;
+                        }
+                        // One time for the whole transaction, as Redis's
+                        // `commandTimeSnapshot` (#659): a key or hash field
+                        // whose deadline falls while it runs is there for
+                        // every command in it, or gone for every one. Taken
+                        // alone, so nothing else runs between this moment and
+                        // its last command, and no sweep removes a key from
+                        // under it (the sweeps take the command gate).
+                        let _clock = crate::script_clock::freeze();
+                        // A watched key whose time has run out by then has
+                        // been modified (Redis's `isWatchedKeyExpired`, by
+                        // the same time): checked here as well as above, for
+                        // a deadline that fell while this waited for its
+                        // gates, and for a replica, where nothing removes it.
+                        if commands::transaction::watched_key_expired(&store, &tx) {
+                            dirty_flag.store(true, std::sync::atomic::Ordering::Release);
                         }
                         // And to replicas and the AOF as one: its writes in the
                         // stream between a `MULTI` and an `EXEC`, its records

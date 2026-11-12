@@ -4436,14 +4436,7 @@ fn eval_script(
         );
     }
 
-    crate::script_clock::enter_script_execution();
-    struct ScriptClockGuard;
-    impl Drop for ScriptClockGuard {
-        fn drop(&mut self) {
-            crate::script_clock::exit_script_execution();
-        }
-    }
-    let _script_clock_guard = ScriptClockGuard;
+    let _script_clock_guard = crate::script_clock::freeze();
 
     let slot = first_key_slot(ctx, keys.first().copied());
     SCRIPT_EVAL.with(|c| {
@@ -4558,14 +4551,7 @@ fn eval_function_call(
     let ctx = unsafe { &mut *ctx_ptr };
     let saved_db = *ctx.selected_db;
 
-    crate::script_clock::enter_script_execution();
-    struct ScriptClockGuard;
-    impl Drop for ScriptClockGuard {
-        fn drop(&mut self) {
-            crate::script_clock::exit_script_execution();
-        }
-    }
-    let _script_clock_guard = ScriptClockGuard;
+    let _script_clock_guard = crate::script_clock::freeze();
 
     let slot = first_key_slot(ctx, keys.first().map(|k| k.as_slice()));
     SCRIPT_EVAL.with(|c| {
