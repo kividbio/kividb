@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-13
+
+See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).
+
+### Fixed
+
+- A multi-key write over a key past its TTL (`MSET`, `MSETNX`,
+  `JSON.MSET`, or a `MULTI`/`EXEC` of plain `SET`s after `WATCH`) could
+  make the server stop answering, until a restart, when a search index
+  existed and was being changed at the same time. The write now lets go
+  of all of its keys before it deletes the expired ones. Servers without
+  a search index were not affected, and neither was 1.1.
+
 ## [1.2.1] - 2026-11-12
 
 See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before upgrading.

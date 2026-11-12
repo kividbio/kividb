@@ -168,10 +168,18 @@ fn free_port() -> u16 {
 impl Server {
     /// The AOF off (the default) and no replica: nothing observes the writes.
     fn start() -> Self {
+        Self::start_with(&[], None)
+    }
+
+    /// [`Server::start`], with `more` arguments after its own, and on
+    /// Linux, given `cpus`, kept to the first `cpus` CPUs (so with the
+    /// shards and threads of a machine that size).
+    fn start_with(more: &[&str], cpus: Option<usize>) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let log = std::fs::File::create(dir.join("server.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kividb"));
+        command
             .current_dir(&dir)
             .args([
                 "--port",
@@ -181,11 +189,14 @@ impl Server {
                 "--configfile",
                 "kividb.conf",
             ])
+            .args(more)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("could not start kividb");
+            .stderr(log);
+        if let Some(cpus) = cpus {
+            on_first_cpus(&mut command, cpus);
+        }
+        let child = command.spawn().expect("could not start kividb");
         let server = Server { port, child, dir };
         assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
         server
@@ -195,6 +206,28 @@ impl Server {
         Conn::connect(self.port)
     }
 }
+
+/// Start `command` on the first `cpus` CPUs only. If they cannot be had
+/// (a cpuset without them), it starts on whatever it would have.
+#[cfg(target_os = "linux")]
+fn on_first_cpus(command: &mut Command, cpus: usize) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: between fork and exec the closure makes no allocation and
+    // calls only `sched_setaffinity`, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for cpu in 0..cpus {
+                libc::CPU_SET(cpu, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn on_first_cpus(_: &mut Command, _: usize) {}
 
 impl Drop for Server {
     fn drop(&mut self) {
@@ -962,4 +995,136 @@ fn ft_create_beside_hset_indexes_each_hash_as_it_now_is() {
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+/// `MSET` holds every shard of its keys at once. A key past its time that it
+/// writes over is expired once the shards are let go of, and that takes the
+/// indexes' lock and, for a document, reads the key's shard. Done while
+/// `MSET` still held its other shards, with something waiting to write the
+/// indexes (`FT.ALIASUPDATE` here) and something reading them that wanted
+/// one of those shards (`HINCRBY` on an indexed hash), each waited for what
+/// another held and the server stopped answering, `PING` too.
+///
+/// On a few CPUs, so with few shards: the more keys of an `MSET` share a
+/// shard with somebody else's, the sooner it happened.
+fn multi_key_writes_over_keys_past_their_time_keep_answering(io_model: &[&str]) {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    const KEYS: u64 = 4000;
+    const RUN_FOR: Duration = Duration::from_secs(15);
+    let mut more = vec!["--threads", "8"];
+    more.extend_from_slice(io_model);
+    let server = Server::start_with(&more, Some(4));
+    let mut one = server.conn();
+    let create = "FT.CREATE idx ON HASH PREFIX 1 d: SCHEMA t TEXT n NUMERIC";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert_eq!(one.cmd(&create), V::Str("OK".into()));
+    assert_eq!(one.cmd(&["FT.ALIASADD", "a", "idx"]), V::Str("OK".into()));
+    let documents: Vec<Vec<String>> = (0..KEYS)
+        .map(|i| args(&["HSET", &format!("d:{i}"), "t", "hello", "n", "1"]))
+        .collect();
+    for batch in documents.chunks(500) {
+        one.pipeline(batch);
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    // Each client sends `batch(next)` at once and reads a line a command,
+    // until told to stop or the server is gone.
+    let client = |seed: u64, batch: fn(&mut dyn FnMut() -> String) -> Vec<Vec<String>>| {
+        let (mut conn, done) = (server.conn(), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut state = seed;
+            let mut key = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                format!("d:{}", (state >> 33) % KEYS)
+            };
+            while !done.load(SeqCst) {
+                let batch = batch(&mut key);
+                let mut buf = Vec::new();
+                for command in &batch {
+                    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+                    Conn::encode(&mut buf, &command);
+                }
+                if conn.writer.write_all(&buf).is_err() {
+                    return;
+                }
+                for _ in &batch {
+                    let mut line = String::new();
+                    if !matches!(conn.reader.read_line(&mut line), Ok(n) if n > 0) {
+                        return;
+                    }
+                }
+            }
+        })
+    };
+    let mut clients = Vec::new();
+    for seed in 0..16 {
+        clients.push(client(seed, |key| {
+            (0..8)
+                .map(|_| {
+                    let mut mset = vec!["MSET".to_string()];
+                    for _ in 0..10 {
+                        mset.extend([key(), "x".to_string()]);
+                    }
+                    mset
+                })
+                .collect()
+        }));
+        // Keys past their time for the `MSET`s to write over.
+        clients.push(client(100 + seed, |key| {
+            (0..8).map(|_| args(&["PEXPIRE", &key(), "1"])).collect()
+        }));
+        clients.push(client(200 + seed, |key| {
+            (0..8)
+                .map(|_| args(&["HSET", &key(), "t", "hello", "n", "1"]))
+                .collect()
+        }));
+        clients.push(client(300 + seed, |key| {
+            (0..4)
+                .flat_map(|_| {
+                    [
+                        args(&["HINCRBY", &key(), "n", "1"]),
+                        args(&["HDEL", &key(), "nosuch"]),
+                    ]
+                })
+                .collect()
+        }));
+    }
+    for seed in 0..8 {
+        clients.push(client(400 + seed, |_| {
+            vec![args(&["FT.ALIASUPDATE", "a", "idx"])]
+        }));
+    }
+
+    let mut ping = server.conn();
+    ping.reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let until = Instant::now() + RUN_FOR;
+    let mut answered = true;
+    while answered && Instant::now() < until {
+        let mut line = String::new();
+        answered = ping.writer.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+            && matches!(ping.reader.read_line(&mut line), Ok(n) if n > 0)
+            && line.starts_with("+PONG");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    done.store(true, SeqCst);
+    assert!(answered, "the server stopped answering PING");
+    for client in clients {
+        client.join().unwrap();
+    }
+}
+
+/// On the default I/O model (io_uring on Linux).
+#[test]
+fn multi_key_writes_over_keys_past_their_time_keep_the_server_answering() {
+    multi_key_writes_over_keys_past_their_time_keep_answering(&[]);
+}
+
+#[test]
+fn multi_key_writes_over_keys_past_their_time_keep_the_server_answering_on_tokio() {
+    multi_key_writes_over_keys_past_their_time_keep_answering(&["--io-model", "tokio"]);
 }

@@ -144,9 +144,29 @@ impl ShardWrite<'_> {
         let keys = self.map.take_written_over();
         // SAFETY: dropped once, here, from `drop`; `map` is not used after.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
-        if let Some(&(store, db)) = self.lock.place.get() {
-            crate::expiry::written_over(store, db, &keys);
+        self.lock.announce(&keys);
+    }
+}
+
+/// Let go of every shard of `held`, then expire the keys past their time
+/// that the writes under their locks put new values over
+/// ([`ShardLock::announce`]): how a writer that holds several shards at
+/// once lets go of them.
+///
+/// Dropped one by one, the first shard let go of announced while the others
+/// were still held. Announcing takes the indexes' lock and reads the key's
+/// shard, so a writer of several shards waited for the indexes with a shard
+/// held, another announcer held the indexes and waited for that shard, and
+/// with something waiting to write the indexes between them neither moved.
+pub fn unlock_together<'a>(held: impl IntoIterator<Item = ShardWrite<'a>>) {
+    let mut left = Vec::new();
+    for mut shard in held {
+        if shard.map.wrote_over_expired() {
+            left.push((shard.lock, shard.map.take_written_over()));
         }
+    }
+    for (lock, keys) in left {
+        lock.announce(&keys);
     }
 }
 
@@ -163,6 +183,18 @@ impl ShardLock {
     #[inline(always)]
     pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, ShardMap> {
         self.map.read()
+    }
+
+    /// Expire `keys`, past their time and written over under this shard's
+    /// lock, with no shard held: their events, watches, caches and indexes,
+    /// and their `DEL` propagated, all before the write's own
+    /// (`expiry::written_over`).
+    #[cold]
+    #[inline(never)]
+    fn announce(&self, keys: &[Key]) {
+        if let Some(&(store, db)) = self.place.get() {
+            crate::expiry::written_over(store, db, keys);
+        }
     }
 
     /// [`ShardLock::write`], if nobody holds the shard now; `None` at once
