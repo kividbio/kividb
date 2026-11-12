@@ -102,6 +102,12 @@ pub(super) fn read_dragonfly_value(
             let text = rdb_read_string(r)?;
             let json = serde_json::from_slice(&text)
                 .map_err(|e| rdb_invalid(format!("Dragonfly JSON{}: {e}", named())))?;
+            if crate::commands::json::value_depth(&json) >= crate::commands::json::MAX_DEPTH {
+                return Err(rdb_invalid(format!(
+                    "Dragonfly JSON{} nested too deeply",
+                    named()
+                )));
+            }
             Ok(Some(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(
                 json,
             )))))
