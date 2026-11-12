@@ -21,7 +21,6 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── RESP3 shaping for XREAD / XREADGROUP ─────────────────────────────────────
 //
@@ -181,11 +180,19 @@ fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
     resp_simple("OK")
 }
 
+/// The command's time in milliseconds, as Redis's `commandTimeSnapshot()`,
+/// which `t_stream.c` reads for `XADD *` IDs (`streamNextID`), delivery
+/// times, idle times and consumers' seen and active times. Inside a script,
+/// a function or an `EXEC` it is the time the unit began
+/// (`script_clock::freeze`), as `TIME` is: two `XADD *` in one `EXEC` get
+/// IDs of the same millisecond, the second with the next sequence number,
+/// and an entry delivered in it is 0 ms idle for the rest of it. It read the
+/// clock for each command (#667). An ID still never goes back: when the time
+/// is not past the stream's last ID, the next one is that ID's next
+/// sequence number (`xadd`).
+#[inline]
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::script_clock::wall_ms_now()
 }
 
 fn get_or_create_stream(ctx: &mut Ctx, key: &[u8]) -> Result<Arc<RwLock<StreamInner>>, Vec<u8>> {

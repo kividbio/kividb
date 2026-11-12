@@ -9,6 +9,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`XADD *` IDs and stream delivery and idle times use the command's
+  time inside a transaction or a script, as in Redis (#667).** They read
+  the clock for each command, so inside an `EXEC` (or a script), where
+  `TIME` does not move, two `XADD *` got IDs from different milliseconds,
+  and an entry's idle time grew between the transaction's commands. They
+  now use the time the transaction or script began, as Redis's
+  `commandTimeSnapshot()` does. `XADD *` IDs, the delivery times
+  `XREADGROUP`, `XCLAIM` and `XAUTOCLAIM` record, and the idle times that
+  `XPENDING`, `XCLAIM` and `XAUTOCLAIM` judge and report all do. An ID still
+  never goes back: when that time is not past the stream's last ID, the
+  next ID is the last one's next sequence number. Replicas receive explicit
+  IDs, so they never differed from their master.
+
 - **A transaction runs at one time, as in Redis (#659).** `EXEC` read the
   clock again for each queued command, so a key or hash field whose
   deadline fell while the transaction ran was found by its first commands
