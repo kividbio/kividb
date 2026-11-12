@@ -1398,7 +1398,12 @@ pub(crate) fn with_doc<R>(
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
         (IndexOn::Hash, KiviDBValue::HashEx(hash)) => {
             let hash = hash.read();
-            Some(f(&hash.shown(crate::types::field_now()), None))
+            let shown = hash.shown(crate::types::field_now());
+            // Every field due: no document, as HGETALL shows it empty.
+            if shown.is_empty() {
+                return None;
+            }
+            Some(f(&shown, None))
         }
         (IndexOn::Json, KiviDBValue::Json(doc)) => {
             let doc = doc.read();

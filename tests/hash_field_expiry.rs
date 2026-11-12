@@ -980,6 +980,120 @@ fn ft_queries_leave_a_due_field_for_the_master_to_remove() {
     });
 }
 
+/// Twenty documents, `d:0` every field due and `d:1` only `n`.
+fn twenty_docs_one_wholly_due(m: &mut Conn) {
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    ft_create(m, DOCS);
+    for i in 0..20 {
+        m.cmd(&["HSET", &format!("d:{i}"), "n", "1", "t", "a", "o", "1"]);
+    }
+    m.cmd(&["HPEXPIRE", "d:0", "50", "FIELDS", "3", "n", "t", "o"]);
+    m.cmd(&["HPEXPIRE", "d:1", "50", "FIELDS", "1", "n"]);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// The keys `query` finds: FT.SEARCH's total and keys, with and without
+/// content, FT.AGGREGATE's keys, and its count.
+fn found_by(c: &mut Conn, query: &str) -> (i64, Vec<String>, Vec<String>, Vec<String>, String) {
+    let bare = c.cmd(&["FT.SEARCH", "idx", query, "NOCONTENT", "LIMIT", "0", "100"]);
+    let bare_keys = bare.arr()[1..].iter().map(|k| k.s().to_string()).collect();
+    let full = c.cmd(&["FT.SEARCH", "idx", query, "LIMIT", "0", "100"]);
+    let full_keys = full.arr()[1..]
+        .iter()
+        .step_by(2)
+        .map(|k| k.s().to_string())
+        .collect();
+    let rows = c.cmd(&[
+        "FT.AGGREGATE",
+        "idx",
+        query,
+        "LOAD",
+        "1",
+        "@__key",
+        "LIMIT",
+        "0",
+        "100",
+    ]);
+    let agg_keys = rows.arr()[1..]
+        .iter()
+        .filter_map(|row| {
+            row.arr()
+                .chunks(2)
+                .find(|kv| kv[0].s() == "__key")
+                .map(|kv| kv[1].s().to_string())
+        })
+        .collect();
+    let count = c.cmd(&[
+        "FT.AGGREGATE",
+        "idx",
+        query,
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "c",
+    ]);
+    let count = count.arr()[1].arr()[1].s().to_string();
+    (bare.arr()[0].i(), bare_keys, full_keys, agg_keys, count)
+}
+
+fn assert_wholly_due_left_out(c: &mut Conn, what: &str) {
+    let d0 = "d:0".to_string();
+    for query in ["*", "@o:[0 5]"] {
+        let (total, bare, full, agg, count) = found_by(c, query);
+        assert_eq!(total, 19, "{what} {query}: FT.SEARCH total");
+        assert_eq!(count, "19", "{what} {query}: FT.AGGREGATE count");
+        for keys in [&bare, &full, &agg] {
+            assert_eq!(keys.len(), 19, "{what} {query}: {keys:?}");
+            assert!(!keys.contains(&d0), "{what} {query}: d:0 in {keys:?}");
+            assert!(
+                keys.contains(&"d:1".to_string()),
+                "{what} {query}: partly due d:1"
+            );
+        }
+    }
+    // d:1: its live `t` still matches, its due `n` does not.
+    let (_, tagged, ..) = found_by(c, "@t:{a}");
+    assert!(
+        tagged.contains(&"d:1".to_string()) && !tagged.contains(&d0),
+        "{what}: {tagged:?}"
+    );
+    let (_, numbered, ..) = found_by(c, "@n:[0 5]");
+    assert_eq!(numbered.len(), 18, "{what}: {numbered:?}");
+    assert!(
+        !numbered.contains(&"d:1".to_string()) && !numbered.contains(&d0),
+        "{what}"
+    );
+}
+
+/// A hash whose fields are all due is no document, as HGETALL shows it as
+/// empty: `*` neither finds nor counts it. One with a field still live is.
+#[test]
+fn ft_queries_leave_out_a_hash_whose_fields_are_all_due() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    twenty_docs_one_wholly_due(&mut m);
+    assert_wholly_due_left_out(&mut m, "postings");
+    assert_eq!(m.cmd(&["FT.DEBUG", "POSTINGS", "idx", "OFF"]).s(), "OK");
+    assert_wholly_due_left_out(&mut m, "scan");
+    assert_eq!(m.cmd(&["DBSIZE"]).i(), 20, "a query removed a key");
+    assert_eq!(m.cmd(&["HGETALL", "d:0"]).arr().len(), 0);
+    assert_wholly_due_left_out(&mut m, "after HGETALL");
+}
+
+#[test]
+fn ft_queries_on_a_replica_leave_out_a_hash_whose_fields_are_all_due() {
+    let master = Server::start(&[]);
+    let (replica, _proxy) = replica_behind(&master, Duration::ZERO);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    twenty_docs_one_wholly_due(&mut m);
+    wait_caught_up(&mut m, &mut r);
+    assert_wholly_due_left_out(&mut r, "replica");
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 20, "the replica removed a key");
+}
+
 /// With the sweep running: just past the deadline and after the sweep.
 #[test]
 fn ft_search_does_not_match_a_due_field_on_a_master_with_expiry_running() {

@@ -14,9 +14,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on a replica waiting for the master's `HDEL`, or with expiry paused) was
   hidden from `HGET` but still matched, returned and loaded by `FT.SEARCH`,
   `FT.AGGREGATE` and `FT.HYBRID`, and its vector still ranked in `KNN`
-  queries. These commands now leave it out, as `HGET` does; removing it is
-  still the master's, which sends the `HDEL`. Score statistics, `FT.INFO`
-  counts and `FT.TAGVALS` still include it until it is removed.
+  queries. These commands now leave it out, as `HGET` does, and
+  `FT.SEARCH` and `FT.AGGREGATE` leave out a hash whose fields are all
+  past their deadline; removing it is still the master's, which sends the
+  `HDEL`. Score statistics, `FT.INFO` counts and `FT.TAGVALS` still include
+  it until it is removed.
 
 - **A transaction runs at one time, as in Redis (#659).** `EXEC` read the
   clock again for each queued command, so a key or hash field whose

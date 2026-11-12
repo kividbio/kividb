@@ -2085,6 +2085,9 @@ pub fn query_doc_fields<'a>(
     match doc_fields(on, schema, value)? {
         DocFields::HashEx(hash) => {
             let shown = match hash.shown(crate::types::field_now()) {
+                // Every field due: no document, as HGETALL shows it empty.
+                // A hash emptied by removal is no key at all.
+                std::borrow::Cow::Owned(fields) if fields.is_empty() => return None,
                 std::borrow::Cow::Owned(fields) => Some(fields),
                 std::borrow::Cow::Borrowed(_) => None,
             };
