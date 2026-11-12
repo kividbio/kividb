@@ -2585,9 +2585,12 @@ pub fn documents_left<'a>(
     if indexing_deferred() || index_store.none() {
         return;
     }
+    // Each key's shard is read before the indexes' lock is taken, never
+    // under it: a writer of the indexes waiting for this to let go of them
+    // would otherwise wait for whoever holds that shard too.
+    let keys: Vec<(&[u8], Option<IndexOn>)> = keys.map(|key| (key, holds(key))).collect();
     let indexes = index_store.read();
-    for key in keys {
-        let now = holds(key);
+    for (key, now) in keys {
         for (name, def) in indexes.iter() {
             if now.as_ref() == Some(&def.on)
                 || is_alias(name, def)
