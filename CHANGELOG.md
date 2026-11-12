@@ -20,6 +20,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   document. The store now notes a document that leaves its key, whatever
   command took it, and the indexes drop it once the shard is unlocked. A
   write that replaces or removes no document pays one comparison for it.
+  A plain KNN query (`*=>[KNN k ...]`) now looks at each key it found, as
+  the other queries did, and leaves out one deleted or written over while
+  it ran.
 
 ## [1.2.1] - 2026-11-12
 
