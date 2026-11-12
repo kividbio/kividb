@@ -311,6 +311,13 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
             "Valkey {label}"
         );
         assert_eq!(g1.pel.len(), 2, "Valkey {label}: 1-1 (alice) and 4-1 (bob)");
+        // Each consumer's own entries, as the loader handed them out.
+        let own =
+            |c: &[u8]| -> Vec<String> { g1.pel.ids_of(c, ..).map(|id| id.to_string()).collect() };
+        assert_eq!(own(b"alice"), ["1-1"], "Valkey {label}");
+        assert_eq!(own(b"bob"), ["4-1"], "Valkey {label}");
+        assert_eq!(g1.pel.count_of(b"carol"), 0, "Valkey {label}");
+        assert_eq!(g1.pel.count_of(b""), 0, "Valkey {label}: none left unowned");
         assert!(st.groups.contains_key(&b"g2"[..]), "Valkey {label}");
         let KiviDBValue::Stream(big) = &db["stream:big"] else {
             panic!("Valkey {label}: stream:big is not a stream");

@@ -485,14 +485,10 @@ fn kdb_stream_consumer_groups_and_meta() {
             fields: vec![(Arc::from(b"f".as_slice()), Arc::from(b"v1".as_slice()))],
         },
     );
-    let mut pel = std::collections::BTreeMap::new();
+    let mut pel = kividb::types::Pel::new();
     pel.insert(
         StreamId::new(1000, 1),
-        PelEntry {
-            consumer: "c1".into(),
-            delivered_at: 1_700_000_000_000,
-            delivery_count: 2,
-        },
+        PelEntry::new("c1".into(), 1_700_000_000_000, 2),
     );
     let mut consumers = AHashMap::new();
     consumers.insert("c1".into(), 1_700_000_000_100);
@@ -522,7 +518,7 @@ fn kdb_stream_consumer_groups_and_meta() {
             assert_eq!(g.entries_read, 1);
             assert_eq!(g.pel.len(), 1);
             let pel = g.pel.get(&StreamId::new(1000, 1)).unwrap();
-            assert_eq!(pel.consumer, "c1");
+            assert_eq!(pel.consumer(), "c1");
             assert_eq!(pel.delivery_count, 2);
             assert_eq!(g.consumers.get(&b"c1"[..]), Some(&1_700_000_000_100));
         }
@@ -1694,7 +1690,7 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
     assert_eq!((first.ms, first.seq), (1, 1));
     let group = &st.groups[&b"g"[..]];
     assert_eq!(group.pel.len(), 1);
-    assert_eq!(group.pel.values().next().unwrap().consumer, "alice");
+    assert_eq!(group.pel.values().next().unwrap().consumer(), "alice");
     assert!(group.consumers.contains_key(&b"alice"[..]));
 
     let KiviDBValue::Stream(st2) = &db["st2"] else {
