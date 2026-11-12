@@ -52,11 +52,11 @@ sudo dnf install -y kividb
 ```bash
 brew install kividbio/tap/kividb                  # macOS (Homebrew)
 cargo install --locked kividb                     # Linux and macOS, from crates.io
-docker run -d -p 6380:6380 -v kividb-data:/home/kividb kividb/kividb:v1.2.1
+docker run -d -p 6380:6380 -v kividb-data:/home/kividb kividb/kividb:v1.2.2
 ```
 
 Docker images are on Docker Hub and the GitHub Container Registry (`ghcr.io/kividbio/kividb`),
-tagged `v1.2.1`, `1.2` and `latest`; they are distroless (no shell). The data lives in
+tagged `v1.2.2`, `1.2` and `latest`; they are distroless (no shell). The data lives in
 `/home/kividb`: without a volume there, it is lost when the container is removed or recreated.
 
 The apt and dnf repositories are signed with the key
