@@ -1973,6 +1973,13 @@ fn read_image(
                     let json_bytes = read_bytes(&mut r)?;
                     let val: serde_json::Value =
                         serde_json::from_slice(&json_bytes).unwrap_or(serde_json::Value::Null);
+                    if crate::commands::json::value_depth(&val) >= crate::commands::json::MAX_DEPTH
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "JSON document nested too deeply",
+                        ));
+                    }
                     KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(val)))
                 }
                 TAG_TIMESERIES | TAG_TIMESERIES_V2 | TAG_TIMESERIES_V3 => {
@@ -2151,6 +2158,12 @@ fn read_image(
                         let mut idx_buf = [0u8; 8];
                         r.read_exact(&mut idx_buf)?;
                         let idx = u64::from_le_bytes(idx_buf);
+                        if idx > crate::types::ARRAY_MAX_INDEX {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "array index out of range",
+                            ));
+                        }
                         let val = read_bytes(&mut r)?;
                         arr.set(idx, Arc::from(val.as_slice()));
                     }
@@ -3867,6 +3880,9 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
     } else {
         serde_json::from_slice(document).map_err(|e| rdb_invalid(format!("RedisJSON: {e}")))?
     };
+    if crate::commands::json::value_depth(&json) >= crate::commands::json::MAX_DEPTH {
+        return Err(rdb_invalid("RedisJSON document nested too deeply"));
+    }
     Ok(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(json))))
 }
 
@@ -5172,6 +5188,9 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             for _ in 0..count {
                 let idx = u64::from_le_bytes(payload.get(pos..pos + 8)?.try_into().ok()?);
                 pos += 8;
+                if idx > crate::types::ARRAY_MAX_INDEX {
+                    return None;
+                }
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
                 arr.set(idx, Arc::from(bytes));
                 pos = next;
@@ -5238,6 +5257,9 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let (bytes, _) = read_bytes_slice(payload, 0)?;
             let s = std::str::from_utf8(bytes).ok()?;
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            if crate::commands::json::value_depth(&v) >= crate::commands::json::MAX_DEPTH {
+                return None;
+            }
             Some(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(v))))
         }
         TAG_STREAM | TAG_STREAM_V2 | TAG_STREAM_V3 => {
