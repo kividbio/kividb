@@ -2082,9 +2082,9 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
     // Kept for the next call only with every reply read whole, and nothing
-    // left unread on it.
-    let keep = |conn: crate::cluster::migrate_conns::Conn, reusable: bool| {
-        if reusable && conn.reader.buffer().is_empty() {
+    // left unread on it, in its buffer or, with TLS, in rustls's.
+    let keep = |mut conn: crate::cluster::migrate_conns::Conn, reusable: bool| {
+        if reusable && conn.drained() {
             crate::cluster::migrate_conns::put(conn_key.clone(), conn);
         }
     };

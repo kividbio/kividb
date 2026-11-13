@@ -93,12 +93,22 @@ impl Conn {
         let _ = self.socket.set_write_timeout(Some(timeout));
     }
 
+    /// Whether nothing is left on this connection to be read: not in its
+    /// buffer, nor, with TLS, in rustls's own (see
+    /// [`crate::node_tls::ReadWrite::holds_unread`]). Anything there would be
+    /// read as the next call's replies, each one place late, and a refused
+    /// `RESTORE` taken for one that went through. Only such a connection is
+    /// kept, and reused.
+    pub(crate) fn drained(&mut self) -> bool {
+        self.reader.buffer().is_empty() && !self.reader.get_mut().holds_unread()
+    }
+
     /// Whether the target still has this connection open, and nothing is
     /// waiting on it. Looked at without blocking, and without reading: an
     /// end of stream, a reset, or bytes nobody asked for (they would be read
     /// as the next call's replies) all mean it is not to be used.
-    fn open(&self) -> bool {
-        if !self.reader.buffer().is_empty() || self.socket.set_nonblocking(true).is_err() {
+    fn open(&mut self) -> bool {
+        if !self.drained() || self.socket.set_nonblocking(true).is_err() {
             return false;
         }
         let mut byte = [0u8; 1];
@@ -154,7 +164,8 @@ pub(crate) fn take(key: &Key) -> Option<Conn> {
     };
     // Closed outside the lock.
     drop(gone);
-    conn.filter(Conn::open)
+    let mut conn = conn?;
+    conn.open().then_some(conn)
 }
 
 /// Keep `conn` for the next call to `key`. It must be ready for one: every
@@ -180,9 +191,10 @@ pub(crate) fn put(key: Key, mut conn: Conn) {
 
 /// Close, every second, the connections idle for [`IDLE`], as long as any
 /// are kept: so that a target is not held a connection to for good after a
-/// resharding. The thread ends once none are kept, and [`put`] starts
-/// another. (`SWEEPING` is cleared with the lock held, and only when none
-/// are kept; `put` looks at it after keeping one.)
+/// resharding. The thread ends once none have been kept for [`IDLE`] (a
+/// resharding takes its connection out for each call, and puts it back), and
+/// [`put`] starts another. (`SWEEPING` is cleared with the lock held, and
+/// only when none are kept; `put` looks at it after keeping one.)
 fn sweep_in_the_background() {
     use std::sync::atomic::Ordering;
     if SWEEPING.swap(true, Ordering::AcqRel) {
@@ -191,12 +203,16 @@ fn sweep_in_the_background() {
     let started = std::thread::Builder::new()
         .name("migrate-conns".into())
         .spawn(|| {
+            let mut empty_since: Option<Instant> = None;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let gone = {
                     let mut kept = kept();
-                    let gone = expired(&mut kept, Instant::now());
-                    if kept.is_empty() {
+                    let now = Instant::now();
+                    let gone = expired(&mut kept, now);
+                    if !kept.is_empty() {
+                        empty_since = None;
+                    } else if now.duration_since(*empty_since.get_or_insert(now)) >= IDLE {
                         SWEEPING.store(false, Ordering::Release);
                         drop(kept);
                         drop(gone);
@@ -263,7 +279,11 @@ mod tests {
         // Idle too long: closed, not given out.
         let mut conn = connect(port);
         let _accepted = target.accept().unwrap();
-        conn.last_used = Instant::now() - IDLE;
+        // Not on a machine up for less than that.
+        let Some(long_ago) = Instant::now().checked_sub(IDLE) else {
+            return;
+        };
+        conn.last_used = long_ago;
         kept().push((key.clone(), conn));
         assert!(take(&key).is_none());
         assert_eq!(kept_to("127.0.0.1", port), 0);

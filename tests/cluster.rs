@@ -5730,6 +5730,35 @@ fn a_cluster_runs_over_tls_between_its_nodes() {
             .is_some_and(|t| task_field(t, "state").text() == "completed")
     });
 
+    // MIGRATE over TLS, one key per call, keeps one connection to the
+    // destination (#726), and every key arrives.
+    let tag = key_in(200..=5460, "mig");
+    let slot = slot_of(&tag).to_string();
+    let r = d.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &nodes[0].id()]);
+    assert!(r.is_ok(), "{r:?}");
+    let row = nodes[1].my_row();
+    let tls_port = row[1].split('@').next().unwrap().rsplit(':').next().unwrap();
+    let received = |c: &mut Conn| {
+        let info = c.cmd(&["INFO", "stats"]).text();
+        info.lines()
+            .find_map(|l| l.strip_prefix("total_connections_received:"))
+            .unwrap()
+            .trim()
+            .parse::<i64>()
+            .unwrap()
+    };
+    let before = received(&mut d);
+    let mut s = nodes[0].conn();
+    for i in 0..20 {
+        let key = format!("{{{tag}}}:{i}");
+        assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+        let r = s.cmd(&["MIGRATE", "127.0.0.1", tls_port, &key, "0", "5000"]);
+        assert!(r.is_ok(), "MIGRATE over TLS: {r:?}");
+    }
+    let opened = received(&mut d) - before;
+    assert!(opened <= 3, "{opened} connections for 20 MIGRATEs over TLS");
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 20);
+
     // A node on a plain bus is not let in.
     let plain = Node::start(&[]);
     assert!(
