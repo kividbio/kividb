@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`SCRIPT LOAD` and `SCRIPT FLUSH` during a slot handoff or a manual
+  failover are answered at once, instead of stalling every connection of
+  their worker thread until the handoff ended (#528).** The pause does not
+  hold them, as in Redis, and they then waited the handoff out inside the
+  write gate in a blocking sleep loop. They change only the script cache
+  and are kept out of the replication stream while writes are paused, so
+  they now run straight away.
+
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
