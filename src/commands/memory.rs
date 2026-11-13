@@ -256,7 +256,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let watched = if expiring == 0 {
                 0
             } else {
-                crate::field_expiry::watch_entry_size(key.len())
+                crate::field_expiry::watch_entry_size(key)
             };
             entry()
                 + layout::arc_of::<RwLock<HashInner>>()
