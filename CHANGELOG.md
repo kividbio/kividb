@@ -9,6 +9,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`SELECT` and `SCRIPT LOAD` no longer count as writes where Redis does
+  not count them, and a script on a cluster node cannot select another
+  database (#424, #428, #527).** A read-only script may now `SELECT`, a
+  script that has only selected a database can be killed, and a `SELECT`
+  or `SCRIPT LOAD` no longer costs a node that was demoted its partial
+  resync. A read-only replica runs `SCRIPT LOAD` and `SCRIPT FLUSH`, so
+  clients can load their scripts there before `EVALSHA`. While writes are
+  paused, nothing is evicted, as in Redis: eviction's deletes moved a
+  paused master's replication offset. And `redis.call('SELECT', 3)` on a
+  cluster node is refused as a client's `SELECT` is.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

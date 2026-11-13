@@ -2355,3 +2355,103 @@ fn the_empty_key_in_an_aof_preamble_loads() {
     assert_eq!(c.cmd(&["GET", "k"]).s(), "1");
     assert_eq!(c.cmd(&["GET", "tail"]).s(), "2");
 }
+
+/// A `SELECT` changes no data: a script that has only selected a database
+/// can still be killed, as in Redis (#424). Its `SELECT` used to count as a
+/// write, and `SCRIPT KILL` was answered UNKILLABLE.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_has_only_selected_a_database_can_be_killed() {
+    let server = Server::start(&[]);
+    let port = server.port;
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "lua-time-limit", "200"]).ok());
+
+    let runner = std::thread::spawn(move || {
+        let mut r = Conn::connect(port);
+        r.cmd(&["EVAL", "redis.call('SELECT', 1) while true do end", "0"])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = c.cmd(&["PING"]);
+        if reply.is_err() && reply.s().starts_with("BUSY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script never got busy: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reply = c.cmd(&["SCRIPT", "KILL"]);
+    assert!(reply.ok(), "{reply:?}");
+    assert!(runner.join().unwrap().is_err());
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+}
+
+/// What a script may do with `SELECT`, as Redis 8.10.2 lets it: a read-only
+/// script may select another database (#424), and on a cluster node no
+/// script may select one other than 0, as no client may (#428).
+#[cfg(feature = "lua")]
+#[test]
+fn scripts_select_databases_as_redis_lets_them() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert!(c.cmd(&["SET", "x", "one"]).ok());
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    let read = "redis.call('SELECT', 1) return redis.call('GET', 'x')";
+    assert_eq!(c.cmd(&["EVAL_RO", read, "0"]).s(), "one");
+    let no_writes = format!("#!lua flags=no-writes\n{read}");
+    assert_eq!(c.cmd(&["EVAL", &no_writes, "0"]).s(), "one");
+
+    let node = Server::start(&["--cluster-enabled", "yes"]);
+    let mut n = node.conn();
+    let reply = n.cmd(&["EVAL", "return redis.call('SELECT', 3)", "0"]);
+    assert!(
+        reply.is_err()
+            && reply
+                .s()
+                .starts_with("ERR SELECT is not allowed in cluster mode"),
+        "{reply:?}"
+    );
+    assert!(n.cmd(&["EVAL", "return redis.call('SELECT', 0)", "0"]).ok());
+}
+
+/// A read-only replica loads and flushes scripts, as Redis does: its script
+/// cache is its own, and a client loads a script there before it runs it by
+/// its SHA (#527). What changes data is still refused.
+#[cfg(feature = "lua")]
+#[test]
+fn a_read_only_replica_loads_and_flushes_scripts() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !r
+        .cmd(&["INFO", "replication"])
+        .s()
+        .contains("master_link_status:up")
+    {
+        assert!(Instant::now() < deadline, "the replica never linked up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let sha = r.cmd(&["SCRIPT", "LOAD", "return 1"]).s().to_string();
+    assert_eq!(sha.len(), 40, "{sha}");
+    assert_eq!(r.cmd(&["EVALSHA", &sha, "0"]).i(), 1);
+    assert!(r.cmd(&["SCRIPT", "FLUSH"]).ok());
+    let reply = r.cmd(&["EVALSHA", &sha, "0"]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("NOSCRIPT"),
+        "{reply:?}"
+    );
+    for refused in [&["FUNCTION", "FLUSH"][..], &["SET", "k", "v"]] {
+        let reply = r.cmd(refused);
+        assert!(
+            reply.is_err() && reply.s().starts_with("READONLY"),
+            "{refused:?}: {reply:?}"
+        );
+    }
+}

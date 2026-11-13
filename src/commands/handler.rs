@@ -637,6 +637,16 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         name_owned2.as_str()
     };
 
+    // A cluster node has one keyspace, for a script as for a client: as in
+    // Redis, the `SELECT` command itself refuses (#428).
+    if name2 == "SELECT"
+        && ctx.cluster.enabled
+        && !ctx.apply_replication
+        && ctx.cmd.get(1).is_some_and(|db| *db != &b"0"[..])
+    {
+        return resp_error("ERR SELECT is not allowed in cluster mode");
+    }
+
     // A script running under its tag's lock keeps to its tag (`tag_locks`).
     if crate::tag_locks::in_script() {
         let outside = if crate::tag_locks::sees_the_whole_keyspace(name2) {
@@ -792,8 +802,13 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // client tracking that key is not told. Judged by the arguments, as the
     // propagation below judges it (`command_mutates_for_replication`).
     let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
+    // A `SELECT` is propagated, but writes nothing: a script that has only
+    // selected a database can still be killed (#424).
     #[cfg(feature = "lua")]
-    if !result.starts_with(b"-") && inner_write {
+    if !result.starts_with(b"-")
+        && inner_write
+        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
+    {
         crate::commands::lua::script_note_successful_write();
     }
 
@@ -1257,7 +1272,15 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // Over the limit, room is made before any command runs — a read too,
     // as in Redis: memory is over the limit whoever notices. A command that
     // may add to it is refused if no room could be made.
-    let over_limit = !repl_is_slave && !ctx.apply_replication && check_memory_limit();
+    //
+    // Not while writes are paused (`CLIENT PAUSE`, a failover, a slot
+    // handoff): the dataset stands still then, as in Redis, where eviction
+    // waits like expiry (`PAUSE_ACTION_EVICT`). Its `DEL`s moved the
+    // replication offset a paused master had reported (#424).
+    let over_limit = !repl_is_slave
+        && !ctx.apply_replication
+        && check_memory_limit()
+        && !crate::pause::expiry_deferred();
     // A library of functions is memory too, though not in the keyspace.
     let loads_functions = name == "FUNCTION"
         && ctx.cmd.get(1).is_some_and(|sub| {
@@ -2538,9 +2561,10 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
     if is_mutating_ok_write {
         settle_written_keys(ctx, name);
         // A write of this node's own — not one its master sent — means its
-        // dataset is no longer a position in that master's stream.
+        // dataset is no longer a position in that master's stream. Not a
+        // `SELECT` or a `SCRIPT LOAD`, which change no data (#424).
         if !ctx.apply_replication {
-            ctx.repl_state.note_local_write();
+            ctx.repl_state.note_local_write_of(name);
         }
     }
 
