@@ -2524,7 +2524,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 // A JSON document is returned whole, under `$`.
                 (None, Some(doc)) => {
                     let mut out = extras();
-                    out.push(("$".to_string(), serde_json::to_vec(doc).unwrap_or_default()));
+                    out.push(("$".to_string(), crate::commands::json::json_bytes(doc)));
                     out
                 }
                 (None, None) => {

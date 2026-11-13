@@ -85,6 +85,8 @@ rand = "0.8"
 # `float_roundtrip`: a number is read as the double nearest to it. Without
 # it, one that needs 17 digits was often read as its neighbour (#445).
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+# Already one of serde_json's: named for writing JSON with our own formatter.
+serde = "1"
 ordered-float = "4"
 sha2 = "0.10"
 lzf = "0.3"

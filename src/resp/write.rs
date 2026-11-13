@@ -134,20 +134,14 @@ pub fn resp_bulk_str(s: &str) -> Vec<u8> {
     resp_bulk(s.as_bytes())
 }
 
-/// Shortest human-readable double string — matches Redis `d2string` / `addReplyDouble` better
-/// than `{:.17}`, which amplifies binary noise (e.g. `3.141` → a 19-char tail and wrong `$` length).
-fn format_redis_double(d: f64) -> String {
-    if !d.is_finite() {
-        return format!("{d}");
+/// A double as Redis writes one in a reply (`addReplyDouble`): the shortest
+/// digits that read back as it, laid out as a score is (`format_score`):
+/// `-0`, `10000000000000000`, `1.5e-7`, `1e+300`, not 301 digits (#472).
+pub fn format_redis_double(d: f64) -> String {
+    if d.is_nan() {
+        return "nan".to_string();
     }
-    let mut s = format!("{d}");
-    if s == "-0" {
-        return "0".to_string();
-    }
-    if s.contains('.') {
-        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-    }
-    s
+    crate::commands::helpers::format_score(d)
 }
 
 /// RESP2 encoding for a Lua `{ double = x }` reply (Redis `addReplyDouble` when `client->resp != 3`).
