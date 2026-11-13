@@ -820,6 +820,12 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             w.write_all(&inner.next_insert.to_le_bytes())?;
             w.write_all(&inner.ring_size.unwrap_or(0).to_le_bytes())?;
         }
+
+        // The probabilistic types: their tag, then `sketch::write_kdb`.
+        ValueRef::Sketch(arc) => {
+            w.write_all(&[crate::sketch::TAG_SKETCH])?;
+            crate::sketch::write_kdb(w, &arc.read())?;
+        }
     }
     Ok(())
 }
@@ -2437,6 +2443,9 @@ fn read_image(
                     arr.ring_size = if ring == 0 { None } else { Some(ring) };
                     KiviDBValue::Array(Arc::new(parking_lot::RwLock::new(arr)))
                 }
+                crate::sketch::TAG_SKETCH => KiviDBValue::Sketch(Arc::new(
+                    parking_lot::RwLock::new(crate::sketch::read_kdb(&mut r)?),
+                )),
                 unknown => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -3032,7 +3041,7 @@ fn rdb_read_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
     }
 }
 
-fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
+pub(crate) fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let (len, is_encoded) = rdb_read_length(r)?;
 
     if is_encoded {
@@ -3844,7 +3853,7 @@ fn rdb_invalid(what: impl std::fmt::Display) -> io::Error {
 }
 
 /// A length as an RDB writes one, not an integer encoding.
-fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
+pub(crate) fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
     match rdb_read_length(r)? {
         (n, false) => Ok(n),
         (_, true) => Err(rdb_invalid("an encoded integer where a length belongs")),
@@ -4206,6 +4215,12 @@ fn module_type_name(id: u64) -> (String, u64) {
 /// are refused.
 fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
     let (name, encoding_version) = module_type_name(rdb_read_plain_length(r)?);
+    // The probabilistic types (Bloom filters, ...).
+    if let Some(sketch) = crate::sketch::redis_module::read(&name, encoding_version, r)? {
+        return Ok(KiviDBValue::Sketch(Arc::new(parking_lot::RwLock::new(
+            sketch,
+        ))));
+    }
     if name != "ReJSON-RL" {
         return Err(rdb_extensions::unrepresentable(format!(
             "values of module type {name} are not supported"
@@ -4885,8 +4900,14 @@ pub struct FrozenDataset {
 
 /// What one thread of the capture took: a hold on each string's entry
 /// (its key, bytes and time to live, which do not change while held),
-/// everything else laid out, and the times to live of everything else.
-type FrozenPart = (Vec<store::EntryRef>, Vec<u8>, Vec<(Key, u64)>);
+/// everything else laid out but the probabilistic values, copies of those
+/// (see [`FrozenDb::sketches`]), and the times to live of everything else.
+type FrozenPart = (
+    Vec<store::EntryRef>,
+    Vec<u8>,
+    Vec<(Key, crate::sketch::Sketch)>,
+    Vec<(Key, u64)>,
+);
 
 #[derive(Default)]
 struct FrozenDb {
@@ -4894,6 +4915,11 @@ struct FrozenDb {
     strings: Vec<Vec<store::EntryRef>>,
     /// Complete KDB entries for every non-string key, likewise.
     encoded: Vec<Vec<u8>>,
+    /// The probabilistic values, as copies that share their bytes with the
+    /// store's (`sketch::bloom::LayerBytes`): taken in no time while writes
+    /// are held, and laid out once they go on again. A write meanwhile
+    /// copies the layer it writes to, not the capture.
+    sketches: Vec<Vec<(Key, crate::sketch::Sketch)>>,
     /// The non-string keys with a time to live, and when it ends (Unix
     /// milliseconds), likewise.
     timed: Vec<Vec<(Key, u64)>>,
@@ -4959,6 +4985,7 @@ fn freeze(
                     scope.spawn(move || {
                         let mut strings = Vec::new();
                         let mut encoded = Vec::new();
+                        let mut sketches = Vec::new();
                         let mut timed = Vec::new();
                         for shard in run {
                             let map = read_lock!(shard);
@@ -4969,6 +4996,13 @@ fn freeze(
                                     // the key, nor of the bytes, nor of
                                     // its time to live.
                                     ValueRef::String(_) => strings.push(entry.hold()),
+                                    ValueRef::Sketch(sketch) => {
+                                        let copy = sketch.read().clone();
+                                        sketches.push((Key::from(entry.key()), copy));
+                                        if let Some(at) = entry.expires() {
+                                            timed.push((Key::from(entry.key()), at));
+                                        }
+                                    }
                                     other => {
                                         write_kdb_entry(&mut encoded, entry.key(), other)?;
                                         if let Some(at) = entry.expires() {
@@ -4978,7 +5012,7 @@ fn freeze(
                                 }
                             }
                         }
-                        Ok((strings, encoded, timed))
+                        Ok((strings, encoded, sketches, timed))
                     })
                 })
                 .collect();
@@ -4992,9 +5026,10 @@ fn freeze(
         });
         let mut frozen = FrozenDb::default();
         for part in parts {
-            let (strings, encoded, timed) = part?;
+            let (strings, encoded, sketches, timed) = part?;
             frozen.strings.push(strings);
             frozen.encoded.push(encoded);
+            frozen.sketches.push(sketches);
             frozen.timed.push(timed);
         }
         dbs.push(frozen);
@@ -5064,9 +5099,24 @@ impl FrozenDataset {
             .flat_map(|db| db.encoded.iter())
             .map(Vec::len)
             .sum();
-        let mut out = Vec::with_capacity(
-            16 + strings_bytes + encoded_bytes + self.index_section.len() + 4 * self.dbs.len(),
-        );
+        let sketch_bytes: u64 = self
+            .dbs
+            .iter()
+            .flat_map(|db| db.sketches.iter().flatten())
+            .map(|(key, sketch)| 4 + key.len() as u64 + 1 + sketch.kdb_len())
+            .sum();
+        // Asked for, not assumed: the image of a large dataset may not be
+        // had, and then the full sync or backup fails, not the process.
+        let want = (16 + strings_bytes + encoded_bytes + self.index_section.len())
+            .saturating_add(4 * self.dbs.len())
+            .saturating_add(usize::try_from(sketch_bytes).unwrap_or(usize::MAX));
+        let mut out = Vec::new();
+        out.try_reserve_exact(want).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("not enough memory for a snapshot image of {want} bytes"),
+            )
+        })?;
         let mut not_counted = crate::memory_use::NotCounted::new(out.capacity());
         let before = out.capacity();
         self.write_to(&mut out)?;
@@ -5111,6 +5161,15 @@ impl FrozenDataset {
             timed_strings.push(timed);
             for encoded in &db.encoded {
                 out.write_all(encoded)?;
+            }
+            // Each copy goes as soon as it is written, as each string's
+            // hold does.
+            for part in std::mem::take(&mut db.sketches) {
+                for (key, sketch) in part {
+                    write_key(out, key.as_bytes())?;
+                    out.write_all(&[crate::sketch::TAG_SKETCH])?;
+                    crate::sketch::write_kdb(out, &sketch)?;
+                }
             }
             write_kdb_db_end(out)?;
         }
@@ -5221,6 +5280,14 @@ const DUMP_IMAGE_KEY: &str = "v";
 /// so every type can be dumped, restored and migrated. `RESTORE` tells the two
 /// forms apart by the image's magic.
 pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
+    // The probabilistic types are dumped as Redis dumps them, so that Redis
+    // can restore them too; `RESTORE` here reads both.
+    // A copy (its layers shared, so no bytes are copied), and no guard held
+    // while the payload is laid out and its CRC taken.
+    if let KiviDBValue::Sketch(sketch) = value {
+        let copy = sketch.read().clone();
+        return crate::sketch::redis_module::dump_payload(&copy);
+    }
     // A time series goes without its links to other series, its compaction
     // rules and the series it is a compaction of, as RedisTimeSeries leaves
     // them out of a `DUMP`: they name keys, which the payload may be
@@ -5449,6 +5516,13 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "DUMP not supported for TimeSeries and VectorSet keys",
+            ));
+        }
+        // `dump_payload` writes these itself, in Redis's format.
+        KiviDBValue::Sketch(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "probabilistic values have no compact encoding",
             ));
         }
         KiviDBValue::Array(arc) => {

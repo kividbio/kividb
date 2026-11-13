@@ -939,6 +939,7 @@ fn module_list_names_the_built_in_families_in_both_protocols() {
         ("ReJSON", 81000),
         ("timeseries", 81001),
         ("vectorset", 1),
+        ("bf", 81001),
     ];
     let expected = |header: &str| {
         let mut out = format!("*{}\r\n", modules.len());
