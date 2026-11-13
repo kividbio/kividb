@@ -87,7 +87,7 @@ fn stream_digest(h: &mut Xxh3, stream: &crate::types::StreamInner) {
         g.update(&(group.pel.len() as u64).to_le_bytes());
         for (id, pending) in group.pel.iter() {
             id_digest(&mut g, id);
-            bytes_digest(&mut g, pending.consumer.as_bytes());
+            bytes_digest(&mut g, pending.consumer().as_bytes());
             g.update(&pending.delivered_at.to_le_bytes());
             g.update(&pending.delivery_count.to_le_bytes());
         }
@@ -400,7 +400,7 @@ mod tests {
     /// entries, groups, pending entries and consumer names are part of it.
     #[test]
     fn a_streams_digest_leaves_out_its_consumers_times_and_its_order() {
-        use crate::types::{ConsumerGroup, PelEntry, StreamId, StreamInner};
+        use crate::types::{ConsumerGroup, StreamId, StreamInner};
         use std::sync::Arc;
         let store = crate::store::new_store(1);
         let make = |names: &[&str], seen: u64, delivered: u64| {
@@ -426,11 +426,9 @@ mod tests {
                 }
                 g.pel.insert(
                     StreamId::new(1, 0),
-                    PelEntry {
-                        consumer: format!("c-{}", names[0]).as_str().into(),
-                        delivered_at: delivered,
-                        delivery_count: 1,
-                    },
+                    format!("c-{}", names[0]).as_bytes(),
+                    delivered,
+                    1,
                 );
                 s.groups.insert((*name).into(), g);
             }

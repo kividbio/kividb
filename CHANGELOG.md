@@ -70,6 +70,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Consumer-group commands about one consumer no longer walk the whole
+  pending list (#637).** `XINFO CONSUMERS` counted each consumer's pending
+  entries by reading every pending entry of the group, once per consumer,
+  and the `XPENDING` summary, `XPENDING` for one consumer and `XREADGROUP`
+  of a consumer's own history each read the whole list too: with 200,000
+  entries pending across 50 consumers, `XINFO CONSUMERS` took 82 ms and
+  stalled every other client on its thread meanwhile. A group now also keeps
+  each consumer's pending IDs, so these answer from that consumer's entries
+  alone, in well under a millisecond. The index is rebuilt as a group is
+  loaded, so the snapshot format is unchanged, and it adds about 5 bytes per
+  pending entry. `XPENDING` for a consumer whose name is not UTF-8 now lists
+  only that consumer's entries; it used to list everyone's.
+
 - **`redis-cli --cluster reshard` no longer walks every key of a node for
   each batch it moves (#294).** `CLUSTER GETKEYSINSLOT`, `COUNTKEYSINSLOT`
   and the empty-slot check of `CLUSTER SETSLOT` looked at every key of the

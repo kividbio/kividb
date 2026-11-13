@@ -54,21 +54,15 @@ impl StreamId {
     }
 }
 
+mod pel;
 mod stream_entries;
+pub use pel::{Pel, PelEntry};
 pub use stream_entries::{EntryRef, LoadedEntries, StreamEntries};
 
 pub type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
 
 /// The name of a consumer group or of a consumer: any bytes, as in Redis.
 pub type StreamName = crate::key_bytes::KeyBytes;
-
-/// Pending Entry List entry — tracks unacknowledged messages per consumer.
-#[derive(Debug, Clone)]
-pub struct PelEntry {
-    pub consumer: StreamName,
-    pub delivered_at: u64, // unix ms
-    pub delivery_count: u64,
-}
 
 /// A consumer group.
 #[derive(Debug, Clone)]
@@ -79,8 +73,8 @@ pub struct ConsumerGroup {
     /// How many of the entries ever added to the stream this group has been
     /// delivered — or [`ConsumerGroup::NO_COUNT`] when that is not known.
     pub entries_read: u64,
-    /// Pending Entry List: id → PelEntry
-    pub pel: BTreeMap<StreamId, PelEntry>,
+    /// Pending Entry List, by ID and by consumer.
+    pub pel: Pel,
     /// Consumers: name → last-seen ms
     pub consumers: AHashMap<StreamName, u64>,
     /// Consumers that have been handed entries: name → when they last were,

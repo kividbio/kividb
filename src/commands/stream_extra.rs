@@ -902,7 +902,7 @@ pub(super) fn setid_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PelEntry;
+    use crate::types::Pel;
     const NO_FIELDS: &[(&[u8], &[u8])] = &[];
 
     const DEFAULTS: (u64, u64) = (100, 100);
@@ -1026,19 +1026,13 @@ mod tests {
             name: "g".into(),
             last_id: id(last),
             entries_read: last,
-            pel: pending
-                .iter()
-                .map(|ms| {
-                    (
-                        id(*ms),
-                        PelEntry {
-                            consumer: "c".into(),
-                            delivered_at: 1,
-                            delivery_count: 1,
-                        },
-                    )
-                })
-                .collect(),
+            pel: {
+                let mut pel = Pel::new();
+                for ms in pending {
+                    pel.insert(id(*ms), b"c", 1, 1);
+                }
+                pel
+            },
             consumers: Default::default(),
             active: Default::default(),
         }
