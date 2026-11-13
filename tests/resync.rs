@@ -2828,3 +2828,52 @@ fn a_role_change_and_back_loses_no_element() {
         );
     }
 }
+
+/// With `--io-model tokio`, a `SAVE` blocks its own client and no other:
+/// another client is answered while it runs. It ran on a runtime worker
+/// without handing its place over, and with one worker nothing else was
+/// read until it was done (#605).
+///
+/// (`CONFIG SET maxmemory` below what is in use goes off the runtime the
+/// same way, but it cannot be watched from another client: every command
+/// sent while memory use is over the limit evicts keys itself first, as in
+/// Redis.)
+#[test]
+fn save_leaves_other_clients_answered() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(&dir)
+        .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+        .args(["--io-model", "tokio", "--threads", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    assert_eq!(other.cmd(&["PING"]).s(), "PONG");
+    assert!(c.cmd(&["DEBUG", "POPULATE", "1500000", "k", "32"]).ok());
+
+    // Sent, not waited for; then the other client's PING, timed.
+    let sent = Instant::now();
+    c.writer.write_all(b"*1\r\n$4\r\nSAVE\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let pinging = Instant::now();
+    assert_eq!(other.cmd(&["PING"]).s(), "PONG");
+    let ping = pinging.elapsed();
+    let reply = c.read();
+    let took = sent.elapsed();
+    assert!(reply.ok(), "SAVE: {reply:?}");
+    assert!(
+        took > Duration::from_millis(300),
+        "SAVE took {took:?}: too little to tell"
+    );
+    assert!(
+        ping < took / 2,
+        "a PING waited {ping:?} for SAVE ({took:?})"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}

@@ -9,6 +9,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`SAVE` and a `CONFIG SET maxmemory` below what is in use no longer
+  stall every other client on the tokio I/O model (#605).** Both ran their
+  long work on a runtime worker without handing its place over, which
+  could leave the sockets unpolled, so no client was accepted or read until
+  they were done. They now run off the runtime, as `CONFIG SET appendonly
+  yes` and `MIGRATE` do. `SAVE` still blocks its own client, as in Redis.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

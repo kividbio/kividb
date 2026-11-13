@@ -408,9 +408,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     // A limit below what is in use is enforced
                     // now, not at the next write.
                     if v != 0 {
-                        // Each key ordered against the writes to it (#271).
-                        let _evicting = crate::write_gate::enter();
-                        crate::eviction::make_room(ctx, v, !ctx.apply_replication);
+                        // Off the runtime, as `SAVE` (#605): it may evict a
+                        // great many keys.
+                        crate::cluster::migration::off_the_runtime(|| {
+                            // Each key ordered against the writes to it (#271).
+                            let _evicting = crate::write_gate::enter();
+                            crate::eviction::make_room(ctx, v, !ctx.apply_replication);
+                        });
                     }
                     Some(resp_simple("OK"))
                 }
@@ -4013,8 +4017,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
     match name {
         "SAVE" => {
-            let result =
-                crate::replication::save_dataset(ctx.store, ctx.index_store, ctx.repl_state);
+            // It blocks its own client, as in Redis, and no other: with
+            // `--io-model tokio` the worker it runs on hands its place over
+            // first, or no client is accepted or read until it is done
+            // (#605, as `CONFIG SET appendonly yes` does).
+            let result = crate::cluster::migration::off_the_runtime(|| {
+                crate::replication::save_dataset(ctx.store, ctx.index_store, ctx.repl_state)
+            });
             match result {
                 Ok(_) => {
                     crate::stats::reset_rdb_changes();
