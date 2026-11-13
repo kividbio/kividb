@@ -42,8 +42,21 @@
 //! checked before it is used ([`BloomChain::from_shapes`]): a filter must
 //! never be able to divide by zero, loop without end under its shard's
 //! lock, or ask for memory it was not made with.
+//!
+//! Size limits, checked before anything is allocated, whether a filter is
+//! made, grows or is loaded: its bytes in all (`bloom-max-filter-bytes`), its
+//! layers ([`MAX_LAYERS`]) and the hashes of an item in all its layers
+//! ([`MAX_TOTAL_HASHES`]). Redis has none of these; no filter that grows
+//! as Redis grows one reaches the last two.
+//!
+//! A layer's bytes are shared between copies of the filter (a snapshot
+//! being written, `COPY`, `DUMP`) until one of them is written to, which
+//! then copies that layer: see [`LayerBytes`].
 
 use std::io;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::murmur::murmur64a;
 
@@ -79,20 +92,46 @@ pub const FLAG_WIDE_HASH: u32 = 4;
 pub const FLAG_FIXED: u32 = 8;
 const KNOWN_FLAGS: u32 = FLAG_EXACT_SIZE | FLAG_WIDE_HASH | FLAG_FIXED;
 
+/// The error of a write that could not have memory for its filter.
+pub const NO_MEMORY: &str = "ERR could not allocate memory for the filter";
+
 /// The most bytes one `BF.SCANDUMP` chunk carries.
 pub const CHUNK_MAX: u64 = 16 * 1024 * 1024;
 
 /// The most one layer may take: 4 GiB, a filter of some 3.5 billion items
 /// at 1%. A larger one is refused with an error, whether it is asked for
 /// (`BF.RESERVE`, growth) or described by what is loaded; it is never
-/// allocated.
+/// allocated. (`bloom-max-filter-bytes`, for the whole filter, is lower
+/// unless it is raised.)
 pub const MAX_LAYER_BYTES: u64 = 1 << 32;
 
-/// The most layers a loaded filter may have, from a `BF.LOADCHUNK` header,
-/// a snapshot or an RDB value. A filter that grows stops far below it: its
-/// error rate halves with each layer, and the hashes it takes reach
-/// [`MAX_HASHES`] after about 1,075 layers.
-pub const MAX_LAYERS: usize = 1 << 16;
+/// The most layers a filter may have, made or loaded (a `BF.LOADCHUNK`
+/// header, a snapshot, an RDB value). A filter that grows stops below it:
+/// its error rate halves with each layer, and reaches the smallest double
+/// after at most about 1,075 layers.
+pub const MAX_LAYERS: usize = 2048;
+
+/// The most hashes an item may take in all of a filter's layers together:
+/// what a lookup costs, under its shard's lock. A filter that grows stays
+/// below it (some 580,000 at most, from a capacity of 1, `EXPANSION 1` and
+/// an error rate of 0.25; see the tests).
+pub const MAX_TOTAL_HASHES: u64 = 600_000;
+
+/// `bloom-max-filter-bytes` unless set: the most bytes one filter may take.
+pub const DEFAULT_MAX_FILTER_BYTES: u64 = 512 << 20;
+/// The highest `bloom-max-filter-bytes` may be set to: 1 TiB.
+pub const MAX_MAX_FILTER_BYTES: u64 = 1 << 40;
+
+static MAX_FILTER_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_FILTER_BYTES);
+
+/// `bloom-max-filter-bytes`.
+pub fn max_filter_bytes() -> u64 {
+    MAX_FILTER_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn set_max_filter_bytes(bytes: u64) {
+    MAX_FILTER_BYTES.store(bytes, Ordering::Relaxed);
+}
 
 /// The header chunk's fixed part and each layer's part.
 const HEADER_FIXED: usize = 20;
@@ -103,9 +142,85 @@ const HEADER_LAYER: usize = 53;
 pub enum BloomError {
     /// A filter that does not grow is at capacity.
     Full,
-    /// The layer would be larger than [`MAX_LAYER_BYTES`], than the memory
-    /// left under `maxmemory`, or than the system would allocate.
+    /// A filter that grows cannot: its next layer's error rate is too small
+    /// to make a layer of (Redis's `problem inserting into filter`).
+    CannotGrow,
+    /// The filter would be over a size limit: a layer over
+    /// [`MAX_LAYER_BYTES`], the whole over `bloom-max-filter-bytes`, more than
+    /// [`MAX_LAYERS`] layers or [`MAX_TOTAL_HASHES`] hashes.
     TooLarge,
+    /// There is no room for it under `maxmemory`.
+    NoRoom,
+    /// The system would not allocate it.
+    NoMemory,
+}
+
+/// What a filter may come to, as it is made or grows.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// The most bytes the whole filter may take (`bloom-max-filter-bytes`).
+    pub max_bytes: u64,
+    /// Whether what is allocated must fit under `maxmemory`: for a command
+    /// from a client (which has evicted what it could first), not for one
+    /// applied from a master or replayed from the AOF, nor for a load.
+    pub under_maxmemory: bool,
+}
+
+impl Limits {
+    /// The limits as set, under `maxmemory` or not.
+    pub fn current(under_maxmemory: bool) -> Limits {
+        Limits {
+            max_bytes: max_filter_bytes(),
+            under_maxmemory,
+        }
+    }
+}
+
+/// A layer's bytes. Copies of a filter share them, so that copying one —
+/// for a snapshot, `COPY` or `DUMP` — takes no time and no memory; the
+/// first write to a shared layer copies it then ([`LayerBytes::make_mut`]),
+/// with an allocation that may fail rather than abort.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerBytes(Arc<Box<[u8]>>);
+
+impl LayerBytes {
+    pub fn new(bytes: Box<[u8]>) -> LayerBytes {
+        LayerBytes(Arc::new(bytes))
+    }
+
+    /// The bytes to write to: this filter's own, copied first if another
+    /// copy shares them. `NoMemory` if the copy cannot be had.
+    pub fn make_mut(&mut self) -> Result<&mut [u8], BloomError> {
+        if Arc::get_mut(&mut self.0).is_none() {
+            let copy = copy_of(&self.0)?;
+            self.0 = Arc::new(copy);
+        }
+        Ok(Arc::get_mut(&mut self.0).expect("the bytes are this copy's alone"))
+    }
+}
+
+impl Deref for LayerBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// `bytes` copied into an allocation that is asked for, not assumed.
+fn copy_of(bytes: &[u8]) -> Result<Box<[u8]>, BloomError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| BloomError::NoMemory)?;
+    out.extend_from_slice(bytes);
+    Ok(out.into_boxed_slice())
+}
+
+/// What a filter has already: its bytes and its hashes, all layers'.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Used {
+    pub bytes: u64,
+    pub hashes: u64,
 }
 
 /// One layer of a chain: a plain Bloom filter.
@@ -123,7 +238,7 @@ pub struct Layer {
     pub reserved: u8,
     /// The number of bits: always `data.len() · 8`, and never 0.
     pub bits: u64,
-    pub data: Box<[u8]>,
+    pub data: LayerBytes,
 }
 
 impl Layer {
@@ -139,15 +254,25 @@ impl Layer {
         (bits_per_item, bytes, hashes)
     }
 
-    /// An empty layer for `capacity` items at `error`. `Full` if such a
-    /// layer would have no bits (an error rate near 1 and a capacity near
-    /// 0, which nothing this module makes can come to).
-    pub fn new(capacity: u64, error: f64) -> Result<Layer, BloomError> {
+    /// An empty layer for `capacity` items at `error`, in a filter that
+    /// has `used` already. `CannotGrow` if there can be no such layer (no
+    /// bits, or more hashes than [`MAX_HASHES`]: an error rate too small);
+    /// then the limits, in that order, before anything is allocated.
+    pub fn new(capacity: u64, error: f64, limits: Limits, used: Used) -> Result<Layer, BloomError> {
         let (bits_per_item, bytes, hashes) = Self::shape(capacity, error);
         if bytes == 0 || hashes == 0 || hashes > MAX_HASHES {
-            return Err(BloomError::Full);
+            return Err(BloomError::CannotGrow);
         }
-        let data = zeroed(bytes, true)?;
+        if bytes > MAX_LAYER_BYTES
+            || used.bytes.saturating_add(bytes) > limits.max_bytes
+            || used.hashes.saturating_add(u64::from(hashes)) > MAX_TOTAL_HASHES
+        {
+            return Err(BloomError::TooLarge);
+        }
+        if limits.under_maxmemory && !super::room_for(bytes) {
+            return Err(BloomError::NoRoom);
+        }
+        let data = LayerBytes::new(zeroed(bytes)?);
         Ok(Layer {
             capacity,
             size: 0,
@@ -175,27 +300,26 @@ impl Layer {
         })
     }
 
-    /// Set the item's bits.
+    /// Set the item's bits: `NoMemory` if they are shared with a copy and
+    /// a copy of its own cannot be had.
     #[inline]
-    pub fn set(&mut self, a: u64, b: u64) {
-        for i in 0..u64::from(self.hashes) {
-            let (at, mask) = self.bit(a, b, i);
-            self.data[at] |= mask;
+    pub fn set(&mut self, a: u64, b: u64) -> Result<(), BloomError> {
+        let (bits, hashes) = (self.bits, self.hashes);
+        let data = self.data.make_mut()?;
+        for i in 0..u64::from(hashes) {
+            let x = a.wrapping_add(i.wrapping_mul(b)) % bits;
+            data[(x >> 3) as usize] |= 1u8 << (x & 7);
         }
+        Ok(())
     }
 }
 
 /// `bytes` zeroed bytes, or why not. The allocation is asked for, not
 /// assumed: if the system refuses it, so does this, and the command gets
-/// an error rather than the process an abort. `under_maxmemory` checks the
-/// room left under `maxmemory` first: what a command makes is checked, what
-/// is loaded is not (it is in memory already, or the dataset it belongs to
-/// was taken on as a whole).
-fn zeroed(bytes: u64, under_maxmemory: bool) -> Result<Box<[u8]>, BloomError> {
+/// an error rather than the process an abort. The limits are the caller's
+/// to check first.
+fn zeroed(bytes: u64) -> Result<Box<[u8]>, BloomError> {
     if bytes == 0 || bytes > MAX_LAYER_BYTES {
-        return Err(BloomError::TooLarge);
-    }
-    if under_maxmemory && !super::room_for(bytes) {
         return Err(BloomError::TooLarge);
     }
     let layout =
@@ -206,7 +330,7 @@ fn zeroed(bytes: u64, under_maxmemory: bool) -> Result<Box<[u8]>, BloomError> {
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
         if ptr.is_null() {
-            return Err(BloomError::TooLarge);
+            return Err(BloomError::NoMemory);
         }
         Ok(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
             ptr,
@@ -249,20 +373,107 @@ pub enum ShapeError {
     /// The parts do not make a filter, or one laid out as Redis lays them
     /// out since RedisBloom 2.
     Bad,
-    /// A layer is larger than [`MAX_LAYER_BYTES`], or could not be had.
+    /// It is over a size limit (see [`BloomError::TooLarge`]).
     TooLarge,
+    /// There is no room for its layers under `maxmemory`.
+    NoRoom,
+    /// The system would not allocate its layers.
+    NoMemory,
+}
+
+impl From<BloomError> for ShapeError {
+    fn from(e: BloomError) -> ShapeError {
+        match e {
+            BloomError::NoRoom => ShapeError::NoRoom,
+            BloomError::NoMemory => ShapeError::NoMemory,
+            BloomError::Full | BloomError::CannotGrow | BloomError::TooLarge => {
+                ShapeError::TooLarge
+            }
+        }
+    }
+}
+
+/// The error rate of a chain's first layer, and whether it scales.
+fn first_layer(params: &Params) -> (f64, bool) {
+    let nonscaling = params.nonscaling || params.expansion == 0;
+    let error = params.error.min(MAX_ERROR);
+    (if nonscaling { error } else { error * 0.5 }, nonscaling)
+}
+
+/// The bytes of the layers a chain grows by to take `items` more, at most,
+/// its newest layer having `left` room and being for `capacity` items at
+/// `error`; 0 for a chain that does not grow. Saturates past `u64`.
+fn growth_bytes(
+    mut left: u64,
+    mut capacity: u64,
+    mut error: f64,
+    expansion: u32,
+    items: u64,
+) -> u64 {
+    if expansion == 0 {
+        return 0;
+    }
+    let mut needed = 0u64;
+    let mut items = items;
+    let mut layers = 0;
+    while items > left && layers < MAX_LAYERS {
+        items -= left;
+        capacity = capacity.saturating_mul(u64::from(expansion));
+        error *= 0.5;
+        needed = needed.saturating_add(Layer::shape(capacity, error).1);
+        left = capacity;
+        layers += 1;
+    }
+    needed
 }
 
 impl BloomChain {
+    /// The bytes a chain made with `params` allocates to take `items`
+    /// items: its first layer, and the ones it would grow by.
+    pub fn bytes_to_make(params: &Params, items: u64) -> u64 {
+        let (error, nonscaling) = first_layer(params);
+        let first = Layer::shape(params.capacity, error).1;
+        let expansion = if nonscaling { 0 } else { params.expansion };
+        first.saturating_add(growth_bytes(
+            params.capacity,
+            params.capacity,
+            error,
+            expansion,
+            items,
+        ))
+    }
+
+    /// The bytes the chain would allocate to take `items` more, if none of
+    /// them is there yet.
+    pub fn bytes_to_add(&self, items: u64) -> u64 {
+        let last = self.layers.last().expect("a chain has a layer");
+        let expansion = if self.nonscaling() { 0 } else { self.expansion };
+        growth_bytes(
+            last.capacity.saturating_sub(last.size),
+            last.capacity,
+            last.error,
+            expansion,
+            items,
+        )
+    }
+
+    /// What its layers have: bytes and hashes.
+    pub fn used(&self) -> Used {
+        self.layers.iter().fold(Used::default(), |u, l| Used {
+            bytes: u.bytes.saturating_add(l.data.len() as u64),
+            hashes: u.hashes.saturating_add(u64::from(l.hashes)),
+        })
+    }
+
     /// A new chain, with its first layer.
-    pub fn new(params: Params) -> Result<BloomChain, BloomError> {
-        let nonscaling = params.nonscaling || params.expansion == 0;
-        let error = params.error.min(MAX_ERROR);
-        let first_error = if nonscaling { error } else { error * 0.5 };
-        let layer = Layer::new(params.capacity, first_error).map_err(|e| match e {
-            BloomError::Full => BloomError::TooLarge,
-            other => other,
-        })?;
+    pub fn new(params: Params, limits: Limits) -> Result<BloomChain, BloomError> {
+        let (first_error, nonscaling) = first_layer(&params);
+        let layer = Layer::new(params.capacity, first_error, limits, Used::default()).map_err(
+            |e| match e {
+                BloomError::CannotGrow => BloomError::TooLarge,
+                other => other,
+            },
+        )?;
         let mut flags = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
         if nonscaling {
             flags |= FLAG_FIXED;
@@ -290,7 +501,7 @@ impl BloomChain {
 
     /// Add `item`: `Ok(true)` if it was not there, `Ok(false)` if it may
     /// have been.
-    pub fn add(&mut self, item: &[u8]) -> Result<bool, BloomError> {
+    pub fn add(&mut self, item: &[u8], limits: Limits) -> Result<bool, BloomError> {
         let (a, b) = hash(item);
         if self.layers.iter().rev().any(|layer| layer.contains(a, b)) {
             return Ok(false);
@@ -300,15 +511,18 @@ impl BloomChain {
             if self.nonscaling() || self.expansion == 0 {
                 return Err(BloomError::Full);
             }
+            if self.layers.len() >= MAX_LAYERS {
+                return Err(BloomError::TooLarge);
+            }
             let capacity = last
                 .capacity
                 .checked_mul(u64::from(self.expansion))
                 .ok_or(BloomError::TooLarge)?;
-            let layer = Layer::new(capacity, last.error * 0.5)?;
+            let layer = Layer::new(capacity, last.error * 0.5, limits, self.used())?;
             self.layers.push(layer);
         }
         let last = self.layers.last_mut().expect("a chain has a layer");
-        last.set(a, b);
+        last.set(a, b)?;
         last.size = last.size.saturating_add(1);
         self.items = self.items.saturating_add(1);
         Ok(true)
@@ -383,9 +597,24 @@ impl BloomChain {
         out
     }
 
-    /// A chain from a header chunk, its layers zeroed (and checked against
-    /// `maxmemory`: `BF.LOADCHUNK` is a command that makes a filter).
-    pub fn from_header(raw: &[u8]) -> Result<BloomChain, ShapeError> {
+    /// The bytes the layers of a header chunk take, if it is long enough
+    /// to say (saturating): what `BF.LOADCHUNK` of it would allocate.
+    pub fn header_bytes(raw: &[u8]) -> u64 {
+        if raw.len() < HEADER_FIXED {
+            return 0;
+        }
+        let count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+        (0..count)
+            .map_while(|i| {
+                let at = HEADER_FIXED + HEADER_LAYER * i;
+                raw.get(at..at + 8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// A chain from a header chunk, its layers zeroed, within `limits`.
+    pub fn from_header(raw: &[u8], limits: Limits) -> Result<BloomChain, ShapeError> {
         if raw.len() < HEADER_FIXED {
             return Err(ShapeError::Bad);
         }
@@ -418,26 +647,29 @@ impl BloomChain {
                 }
             })
             .collect();
-        Self::from_shapes(items, flags, expansion, shapes, None)
+        Self::from_shapes(items, flags, expansion, shapes, None, limits)
     }
 
     /// A chain from what a header, a snapshot or a Redis RDB value says.
     /// With `data`, the layers are those bytes, already read (one per
-    /// layer, each as long as its layer): nothing more is allocated, and
-    /// `maxmemory` is not consulted. Without it they are zeroed.
+    /// layer, each as long as its layer): nothing more is allocated. Without
+    /// it they are zeroed, once the whole has been checked against
+    /// `limits`.
     ///
     /// Each layer must be one Redis would make: at least one item of
     /// capacity, an error rate in (0, 1), bits per item positive and
     /// finite, `ceil(H · bits per item)` hashes (at most [`MAX_HASHES`]),
     /// bits that are its bytes times 8 and not 0, and a reserved byte of 0;
     /// the items must add up to the chain's, and the flags must be those of
-    /// a filter of RedisBloom 2 or later and no others.
+    /// a filter of RedisBloom 2 or later and no others. The whole must be
+    /// within the size limits.
     pub fn from_shapes(
         items: u64,
         flags: u32,
         expansion: u32,
         shapes: Vec<LayerShape>,
         data: Option<Vec<Vec<u8>>>,
+        limits: Limits,
     ) -> Result<BloomChain, ShapeError> {
         let layout = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
         if flags & !KNOWN_FLAGS != 0
@@ -451,6 +683,7 @@ impl BloomChain {
             return Err(ShapeError::Bad);
         }
         let mut sum = 0u64;
+        let mut used = Used::default();
         for s in &shapes {
             let finite = s.bits_per_item.is_finite() && s.bits_per_item > 0.0;
             let ok = finite
@@ -469,10 +702,18 @@ impl BloomChain {
             if s.bytes > MAX_LAYER_BYTES {
                 return Err(ShapeError::TooLarge);
             }
+            used.bytes = used.bytes.saturating_add(s.bytes);
+            used.hashes = used.hashes.saturating_add(u64::from(s.hashes));
             sum = sum.checked_add(s.size).ok_or(ShapeError::Bad)?;
         }
         if sum != items {
             return Err(ShapeError::Bad);
+        }
+        if used.bytes > limits.max_bytes || used.hashes > MAX_TOTAL_HASHES {
+            return Err(ShapeError::TooLarge);
+        }
+        if data.is_none() && limits.under_maxmemory && !super::room_for(used.bytes) {
+            return Err(ShapeError::NoRoom);
         }
         let mut datas = data.map(Vec::into_iter);
         let mut layers = Vec::with_capacity(shapes.len());
@@ -480,8 +721,9 @@ impl BloomChain {
             let bytes = match datas.as_mut().and_then(Iterator::next) {
                 Some(given) if given.len() as u64 == s.bytes => given.into_boxed_slice(),
                 Some(_) => return Err(ShapeError::Bad),
-                None => zeroed(s.bytes, true).map_err(|_| ShapeError::TooLarge)?,
+                None => zeroed(s.bytes)?,
             };
+            let bytes = LayerBytes::new(bytes);
             layers.push(Layer {
                 capacity: s.capacity,
                 size: s.size,
@@ -543,7 +785,8 @@ impl BloomChain {
                     return Err("ERR invalid chunk - Too big for current filter");
                 }
                 let from = (offset - start) as usize;
-                l.data[from..from + data.len()].copy_from_slice(data);
+                let bytes = l.data.make_mut().map_err(|_| NO_MEMORY)?;
+                bytes[from..from + data.len()].copy_from_slice(data);
                 return Ok(());
             }
             start = end;
@@ -622,9 +865,38 @@ pub fn write_kdb(w: &mut impl io::Write, chain: &BloomChain) -> io::Result<()> {
     Ok(())
 }
 
+/// The bytes [`write_kdb`] writes for `chain`.
+pub fn kdb_len(chain: &BloomChain) -> u64 {
+    20 + chain
+        .layers
+        .iter()
+        .map(|l| 53 + l.data.len() as u64)
+        .sum::<u64>()
+}
+
+/// Why a filter being read is refused for its size: what to do about it.
+pub(crate) fn over_limits(used: Used) -> Option<String> {
+    let max = max_filter_bytes();
+    if used.bytes > max {
+        Some(format!(
+            "a Bloom filter of more than {} bytes is over bloom-max-filter-bytes ({max}); \
+             raise it to load the filter",
+            used.bytes
+        ))
+    } else if used.hashes > MAX_TOTAL_HASHES {
+        Some(format!(
+            "a Bloom filter whose layers have more than {MAX_TOTAL_HASHES} hashes in all is \
+             not supported"
+        ))
+    } else {
+        None
+    }
+}
+
 /// A chain [`write_kdb`] wrote: its layers are the bytes read, with no
 /// second allocation and no `maxmemory` check (a snapshot, or a replica's
-/// full sync, is taken whole).
+/// full sync, is taken whole). The size limits are checked as each layer
+/// is reached, before its bytes are read.
 pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
     let items = super::read_u64(r)?;
     let flags = super::read_u32(r)?;
@@ -635,6 +907,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
     }
     let mut shapes = Vec::with_capacity(count.min(1024));
     let mut datas = Vec::with_capacity(count.min(1024));
+    let mut used = Used::default();
     for _ in 0..count {
         let capacity = super::read_u64(r)?;
         let size = super::read_u64(r)?;
@@ -647,6 +920,11 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
         let bytes = super::read_u64(r)?;
         if bytes > MAX_LAYER_BYTES {
             return Err(super::invalid("Bloom filter layer too large"));
+        }
+        used.bytes = used.bytes.saturating_add(bytes);
+        used.hashes = used.hashes.saturating_add(u64::from(hashes));
+        if let Some(why) = over_limits(used) {
+            return Err(super::invalid(&why));
         }
         let data = super::read_vec(r, bytes as usize)?;
         shapes.push(LayerShape {
@@ -661,9 +939,12 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
         });
         datas.push(data);
     }
-    BloomChain::from_shapes(items, flags, expansion, shapes, Some(datas)).map_err(|e| match e {
-        ShapeError::TooLarge => super::invalid("Bloom filter layer too large"),
-        ShapeError::Bad => super::invalid("bad Bloom filter"),
+    let limits = Limits::current(false);
+    BloomChain::from_shapes(items, flags, expansion, shapes, Some(datas), limits).map_err(|e| {
+        match e {
+            ShapeError::Bad => super::invalid("bad Bloom filter"),
+            _ => super::invalid("Bloom filter too large"),
+        }
     })
 }
 
@@ -676,6 +957,18 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// No limit but the hard ones, and no `maxmemory`.
+    fn lim() -> Limits {
+        Limits {
+            max_bytes: MAX_MAX_FILTER_BYTES,
+            under_maxmemory: false,
+        }
+    }
+
+    fn new_chain(p: Params) -> Result<BloomChain, BloomError> {
+        BloomChain::new(p, lim())
     }
 
     fn params(capacity: u64, error: f64, expansion: u32, nonscaling: bool) -> Params {
@@ -701,8 +994,8 @@ mod tests {
                 [120, 278, 291, 436, 521, 679, 837],
             ),
         ] {
-            let mut chain = BloomChain::new(params(100, 0.01, 2, true)).unwrap();
-            assert!(chain.add(item).unwrap());
+            let mut chain = new_chain(params(100, 0.01, 2, true)).unwrap();
+            assert!(chain.add(item, lim()).unwrap());
             let layer = &chain.layers[0];
             assert_eq!((layer.bits, layer.hashes), (960, 7));
             let got: Vec<u64> = (0..layer.bits)
@@ -747,9 +1040,9 @@ mod tests {
             ),
         ];
         for (prefix, p, header, n, crc) in cases {
-            let mut chain = BloomChain::new(p).unwrap();
+            let mut chain = new_chain(p).unwrap();
             for i in 0..n {
-                chain.add(format!("{prefix}{i}").as_bytes()).unwrap();
+                chain.add(format!("{prefix}{i}").as_bytes(), lim()).unwrap();
             }
             assert_eq!(chain.header(), hex(header), "{prefix}: header");
             let data: Vec<u8> = chain
@@ -759,7 +1052,7 @@ mod tests {
                 .collect();
             assert_eq!(crate::snapshot::redis_crc64(&data), crc, "{prefix}: data");
             // And back from the header and chunks.
-            let mut copy = BloomChain::from_header(&chain.header()).unwrap();
+            let mut copy = BloomChain::from_header(&chain.header(), lim()).unwrap();
             let mut iter = 1;
             loop {
                 let (next, bytes) = chain.scandump(iter);
@@ -792,7 +1085,7 @@ mod tests {
             (100, 0.999999, true, 40, 3),
             (1, 1e-300, false, 184, 998),
         ] {
-            let chain = BloomChain::new(params(capacity, error, 2, nonscaling)).unwrap();
+            let chain = new_chain(params(capacity, error, 2, nonscaling)).unwrap();
             let l = &chain.layers[0];
             assert_eq!(
                 (l.data.len(), l.hashes),
@@ -804,11 +1097,11 @@ mod tests {
 
     #[test]
     fn nonscaling_fills_up() {
-        let mut chain = BloomChain::new(params(10, 0.01, 0, false)).unwrap();
+        let mut chain = new_chain(params(10, 0.01, 0, false)).unwrap();
         assert!(chain.nonscaling());
         let mut added = 0;
         for i in 0..100 {
-            match chain.add(format!("x{i}").as_bytes()) {
+            match chain.add(format!("x{i}").as_bytes(), lim()) {
                 Ok(true) => added += 1,
                 Ok(false) => {}
                 Err(BloomError::Full) => break,
@@ -821,8 +1114,8 @@ mod tests {
 
     #[test]
     fn scandump_edges() {
-        let mut chain = BloomChain::new(params(10, 0.1, 2, true)).unwrap();
-        chain.add(b"a").unwrap();
+        let mut chain = new_chain(params(10, 0.1, 2, true)).unwrap();
+        chain.add(b"a", lim()).unwrap();
         assert_eq!(chain.scandump(1).0, 9);
         assert_eq!(chain.scandump(2), (9, chain.layers[0].data[1..].to_vec()));
         assert_eq!(chain.scandump(9), (0, vec![]));
@@ -842,20 +1135,23 @@ mod tests {
 
     #[test]
     fn bad_headers() {
-        let chain = BloomChain::new(params(5, 0.1, 2, false)).unwrap();
+        let chain = new_chain(params(5, 0.1, 2, false)).unwrap();
         let header = chain.header();
-        assert!(BloomChain::from_header(&header).is_ok());
+        assert!(BloomChain::from_header(&header, lim()).is_ok());
         let bad = Err(ShapeError::Bad);
-        assert_eq!(BloomChain::from_header(&header[..header.len() - 1]), bad);
+        assert_eq!(
+            BloomChain::from_header(&header[..header.len() - 1], lim()),
+            bad
+        );
         let mut items = header.clone();
         items[0] = 9;
-        assert_eq!(BloomChain::from_header(&items), bad);
+        assert_eq!(BloomChain::from_header(&items, lim()), bad);
         let mut old = header.clone();
         old[12] = 0;
-        assert_eq!(BloomChain::from_header(&old), bad);
+        assert_eq!(BloomChain::from_header(&old, lim()), bad);
         let mut hashes = header.clone();
         hashes[20 + 40] = 0;
-        assert_eq!(BloomChain::from_header(&hashes), bad);
+        assert_eq!(BloomChain::from_header(&hashes, lim()), bad);
     }
 
     #[test]
@@ -876,9 +1172,9 @@ mod tests {
 
     #[test]
     fn kdb_round_trip() {
-        let mut chain = BloomChain::new(params(5, 0.1, 2, false)).unwrap();
+        let mut chain = new_chain(params(5, 0.1, 2, false)).unwrap();
         for i in 0..20 {
-            chain.add(format!("{i}").as_bytes()).unwrap();
+            chain.add(format!("{i}").as_bytes(), lim()).unwrap();
         }
         let mut out = Vec::new();
         write_kdb(&mut out, &chain).unwrap();
@@ -922,7 +1218,7 @@ mod tests {
         let header = |bytes, bits, error, per_item, hashes, capacity| {
             one_layer_header(0, flags, bytes, bits, error, per_item, hashes, capacity)
         };
-        assert!(BloomChain::from_header(&header(8, 64, 0.1, per_item, hashes, 10)).is_ok());
+        assert!(BloomChain::from_header(&header(8, 64, 0.1, per_item, hashes, 10), lim()).is_ok());
         let bad = Err(ShapeError::Bad);
         for (what, raw) in [
             ("capacity 0", header(8, 64, 0.1, per_item, hashes, 0)),
@@ -963,15 +1259,18 @@ mod tests {
                 one_layer_header(0, FLAG_EXACT_SIZE, 8, 64, 0.1, per_item, hashes, 10),
             ),
         ] {
-            assert_eq!(BloomChain::from_header(&raw), bad, "{what}");
+            assert_eq!(BloomChain::from_header(&raw, lim()), bad, "{what}");
         }
         // A 64 GiB layer is refused without being allocated.
         let huge = header(1 << 36, 1 << 39, 0.1, per_item, hashes, 10);
-        assert_eq!(BloomChain::from_header(&huge), Err(ShapeError::TooLarge));
+        assert_eq!(
+            BloomChain::from_header(&huge, lim()),
+            Err(ShapeError::TooLarge)
+        );
         // A header that claims 2^32 - 1 layers is not read past its end.
         let mut many = header(8, 64, 0.1, per_item, hashes, 10);
         many[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(BloomChain::from_header(&many), bad);
+        assert_eq!(BloomChain::from_header(&many, lim()), bad);
     }
 
     /// At most [`MAX_LAYERS`] layers, whichever way a filter is loaded.
@@ -990,10 +1289,10 @@ mod tests {
             reserved: 0,
         };
         let at_cap = vec![shape; MAX_LAYERS];
-        assert!(BloomChain::from_shapes(0, flags, 2, at_cap, None).is_ok());
+        assert!(BloomChain::from_shapes(0, flags, 2, at_cap, None, lim()).is_ok());
         let over = vec![shape; MAX_LAYERS + 1];
         assert_eq!(
-            BloomChain::from_shapes(0, flags, 2, over, None),
+            BloomChain::from_shapes(0, flags, 2, over, None, lim()),
             Err(ShapeError::Bad)
         );
         // A header of MAX_LAYERS + 1 well-formed layers.
@@ -1003,7 +1302,7 @@ mod tests {
         for _ in 0..=MAX_LAYERS {
             raw.extend_from_slice(&one[HEADER_FIXED..]);
         }
-        assert_eq!(BloomChain::from_header(&raw), Err(ShapeError::Bad));
+        assert_eq!(BloomChain::from_header(&raw, lim()), Err(ShapeError::Bad));
         // A snapshot record that claims MAX_LAYERS + 1 layers is refused
         // before any layer is read.
         let mut kdb = Vec::new();
@@ -1021,9 +1320,9 @@ mod tests {
     /// Loaded bytes are the layers: not copied, and not zeroed again.
     #[test]
     fn loaded_layers_are_the_bytes_read() {
-        let mut chain = BloomChain::new(params(5, 0.1, 2, false)).unwrap();
+        let mut chain = new_chain(params(5, 0.1, 2, false)).unwrap();
         for i in 0..20 {
-            chain.add(format!("{i}").as_bytes()).unwrap();
+            chain.add(format!("{i}").as_bytes(), lim()).unwrap();
         }
         let shapes: Vec<LayerShape> = chain
             .layers
@@ -1043,21 +1342,22 @@ mod tests {
         let pointers: Vec<*const u8> = datas.iter().map(|d| d.as_ptr()).collect();
         let (items, flags, expansion) = (chain.items, chain.flags, chain.expansion);
         let loaded =
-            BloomChain::from_shapes(items, flags, expansion, shapes.clone(), Some(datas)).unwrap();
+            BloomChain::from_shapes(items, flags, expansion, shapes.clone(), Some(datas), lim())
+                .unwrap();
         assert_eq!(loaded, chain);
         let kept: Vec<*const u8> = loaded.layers.iter().map(|l| l.data.as_ptr()).collect();
         assert_eq!(kept, pointers);
         // A layer of the wrong length is refused.
         let short = vec![vec![0u8; 1]; shapes.len()];
         assert_eq!(
-            BloomChain::from_shapes(items, flags, expansion, shapes, Some(short)),
+            BloomChain::from_shapes(items, flags, expansion, shapes, Some(short), lim()),
             Err(ShapeError::Bad)
         );
     }
 
     #[test]
     fn load_chunk_iterators_out_of_range() {
-        let mut chain = BloomChain::new(params(10, 0.1, 2, true)).unwrap();
+        let mut chain = new_chain(params(10, 0.1, 2, true)).unwrap();
         for iter in [0, -1, i64::MIN] {
             for data in [&b""[..], b"x"] {
                 assert_eq!(
@@ -1080,24 +1380,186 @@ mod tests {
     #[test]
     fn too_large_is_an_error() {
         assert_eq!(
-            BloomChain::new(params(1 << 30, 1e-30, 2, false)),
+            new_chain(params(1 << 30, 1e-30, 2, false)),
             Err(BloomError::TooLarge)
         );
-        assert_eq!(
-            zeroed(MAX_LAYER_BYTES + 1, false),
-            Err(BloomError::TooLarge)
-        );
-        assert_eq!(zeroed(0, false), Err(BloomError::TooLarge));
+        assert_eq!(zeroed(MAX_LAYER_BYTES + 1), Err(BloomError::TooLarge));
+        assert_eq!(zeroed(0), Err(BloomError::TooLarge));
     }
 
     /// Capacities that add up past u64 are reported, not wrapped.
     #[test]
     fn sums_saturate() {
-        let mut chain = BloomChain::new(params(10, 0.1, 2, false)).unwrap();
+        let mut chain = new_chain(params(10, 0.1, 2, false)).unwrap();
         let mut second = chain.layers[0].clone();
         second.capacity = u64::MAX;
         chain.layers[0].capacity = u64::MAX;
         chain.layers.push(second);
         assert_eq!(chain.capacity(), u64::MAX);
+    }
+
+    /// A layer of hashes [`MAX_HASHES`]: capacity 1 at the smallest error
+    /// rate, 200 bytes.
+    fn widest_shape() -> LayerShape {
+        let error = 5e-324;
+        let (bits_per_item, bytes, hashes) = Layer::shape(1, error);
+        assert_eq!((bytes, hashes), (200, MAX_HASHES));
+        LayerShape {
+            bytes,
+            bits: bytes * 8,
+            size: 0,
+            error,
+            bits_per_item,
+            hashes,
+            capacity: 1,
+            reserved: 0,
+        }
+    }
+
+    /// The most layers and hashes a filter can grow to, as Redis grows it:
+    /// below the limits, which so refuse nothing Redis makes.
+    #[test]
+    fn growth_stays_under_the_limits() {
+        let (mut layers, mut hashes) = (0usize, 0u64);
+        let mut error = MAX_ERROR * 0.5;
+        loop {
+            let (_, bytes, h) = Layer::shape(1, error);
+            if bytes == 0 || h == 0 || h > MAX_HASHES {
+                break;
+            }
+            layers += 1;
+            hashes += u64::from(h);
+            error *= 0.5;
+        }
+        assert!(layers > 1000 && layers < MAX_LAYERS, "{layers} layers");
+        assert!(
+            hashes > 500_000 && hashes < MAX_TOTAL_HASHES,
+            "{hashes} hashes"
+        );
+    }
+
+    /// As in Redis 8.10: `BF.RESERVE g 1e-300 1 EXPANSION 1` takes 91
+    /// items in 78 layers, and the 92nd cannot be put in (`problem
+    /// inserting into filter`), not `non scaling filter is full`.
+    #[test]
+    fn a_filter_that_cannot_grow_says_so() {
+        let mut chain = new_chain(params(1, 1e-300, 1, false)).unwrap();
+        let mut added = 0;
+        let err = loop {
+            match chain.add(format!("item{}", added + 1).as_bytes(), lim()) {
+                Ok(_) => added += 1,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(
+            (err, added, chain.layers.len()),
+            (BloomError::CannotGrow, 91, 78)
+        );
+    }
+
+    /// The limits, checked before anything is allocated, whichever way a
+    /// filter is made.
+    #[test]
+    fn size_limits() {
+        let small = Limits {
+            max_bytes: 1000,
+            under_maxmemory: false,
+        };
+        // Made: 11,984 bytes for 10,000 items at 1%.
+        assert_eq!(
+            BloomChain::new(params(10_000, 0.01, 2, false), small),
+            Err(BloomError::TooLarge)
+        );
+        // Grown: 144 bytes, then 312, then 696, which is over.
+        let mut chain = BloomChain::new(params(100, 0.01, 2, false), small).unwrap();
+        let mut refused = None;
+        for i in 0..1000 {
+            if let Err(e) = chain.add(format!("{i}").as_bytes(), small) {
+                refused = Some(e);
+                break;
+            }
+        }
+        assert_eq!(refused, Some(BloomError::TooLarge));
+        assert!(chain.used().bytes <= 1000);
+        // Loaded: a header of layers over the limit in all, though each is
+        // under it.
+        let mut shapes = vec![widest_shape(); 6];
+        let flags = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
+        assert_eq!(
+            BloomChain::from_shapes(0, flags, 1, shapes.clone(), None, small).unwrap_err(),
+            ShapeError::TooLarge
+        );
+        shapes.truncate(5);
+        assert!(BloomChain::from_shapes(0, flags, 1, shapes, None, small).is_ok());
+        // Hashes: 559 layers of 1075 are over MAX_TOTAL_HASHES.
+        let wide = vec![widest_shape(); 559];
+        assert_eq!(
+            BloomChain::from_shapes(0, flags, 1, wide.clone(), None, lim()).unwrap_err(),
+            ShapeError::TooLarge
+        );
+        assert!(BloomChain::from_shapes(0, flags, 1, wide[..558].to_vec(), None, lim()).is_ok());
+        // A snapshot record of them is refused before its layers are read.
+        let mut kdb = Vec::new();
+        kdb.extend(0u64.to_le_bytes());
+        kdb.extend(flags.to_le_bytes());
+        kdb.extend(1u32.to_le_bytes());
+        kdb.extend(559u32.to_le_bytes());
+        let s = widest_shape();
+        for _ in 0..559 {
+            kdb.extend(s.capacity.to_le_bytes());
+            kdb.extend(0u64.to_le_bytes());
+            kdb.extend(s.error.to_le_bytes());
+            kdb.extend(s.bits_per_item.to_le_bytes());
+            kdb.extend(s.hashes.to_le_bytes());
+            kdb.push(0);
+            kdb.extend(s.bits.to_le_bytes());
+            kdb.extend(s.bytes.to_le_bytes());
+            kdb.extend(vec![0u8; s.bytes as usize]);
+        }
+        let mut r = &kdb[..];
+        let err = read_kdb(&mut r).unwrap_err();
+        assert!(err.to_string().contains("hashes in all"), "{err}");
+    }
+
+    /// What a command would allocate, reckoned before it runs.
+    #[test]
+    fn bytes_reckoned_before() {
+        let p = params(100, 0.01, 2, false);
+        // 144 bytes for the first layer, at 0.5%; 101 items need a second,
+        // of 200 at 0.25%: 312 bytes.
+        assert_eq!(BloomChain::bytes_to_make(&p, 1), 144);
+        assert_eq!(BloomChain::bytes_to_make(&p, 101), 456);
+        let mut chain = new_chain(p).unwrap();
+        assert_eq!(chain.bytes_to_add(100), 0);
+        assert_eq!(chain.bytes_to_add(101), 312);
+        let mut i = 0;
+        while chain.layers[0].size < 100 {
+            chain.add(format!("{i}").as_bytes(), lim()).unwrap();
+            i += 1;
+        }
+        assert_eq!(chain.layers.len(), 1);
+        assert_eq!(chain.bytes_to_add(1), 312);
+        let fixed = new_chain(params(100, 0.01, 2, true)).unwrap();
+        assert_eq!(fixed.bytes_to_add(1000), 0);
+        assert_eq!(BloomChain::header_bytes(&chain.header()), 144);
+        assert_eq!(BloomChain::header_bytes(b"short"), 0);
+    }
+
+    /// A copy shares its layers' bytes until one of the two is written to;
+    /// then the one written to has its own, and the other is as it was.
+    #[test]
+    fn copies_share_layers_until_written() {
+        let mut chain = new_chain(params(100, 0.01, 2, false)).unwrap();
+        chain.add(b"a", lim()).unwrap();
+        let copy = chain.clone();
+        assert_eq!(chain.layers[0].data.as_ptr(), copy.layers[0].data.as_ptr());
+        chain.add(b"b", lim()).unwrap();
+        assert_ne!(chain.layers[0].data.as_ptr(), copy.layers[0].data.as_ptr());
+        assert!(chain.contains(b"b") && !copy.contains(b"b"));
+        assert!(copy.contains(b"a"));
+        // Written to again, the bytes are its own already: not copied.
+        let at = chain.layers[0].data.as_ptr();
+        chain.add(b"c", lim()).unwrap();
+        assert_eq!(chain.layers[0].data.as_ptr(), at);
     }
 }

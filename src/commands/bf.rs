@@ -14,23 +14,33 @@
 //! * A filter a command makes for want of one (`BF.ADD`, `BF.MADD`,
 //!   `BF.INSERT` on a missing key) is made with the `bf-*` settings. It is
 //!   sent to replicas and the AOF as a `BF.INSERT` naming them, so that a
-//!   replica, or a replay, with other settings makes the same filter.
+//!   replica, or a replay, with other settings makes the same filter. A
+//!   `BF.RESERVE` without `EXPANSION` is sent with the one it took from
+//!   `bf-expansion-factor` (one that does not scale, which may not name
+//!   one, as the `BF.LOADCHUNK` of its header).
 //! * A write that found the key, or a filter in its way, invalidates a
 //!   `WATCH` on it even when it fails, as Redis's do (see [`take_touched`]).
+//!
+//! Beyond Redis: a filter is held to size limits (`bloom-max-filter-bytes`
+//! and those of `sketch::bloom`), and a command from a client that would
+//! allocate more than `maxmemory` leaves room for evicts first, under the
+//! policy, and is refused with `OOM` only if that is not enough. A command
+//! from a master or the AOF is not held to `maxmemory`, so that a replica
+//! or a replay never drops what the master took.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::parse_utf8;
 use crate::resp::write::{
     resp_array, resp_bool_resp3, resp_bulk, resp_bulk_str, resp_error, resp_integer, resp_map_for,
     resp_null_for, resp_simple,
 };
 use crate::sketch::Sketch;
 use crate::sketch::bloom::{
-    BloomChain, BloomError, MAX_CAPACITY, MAX_ERROR, MAX_EXPANSION, Params, ShapeError,
+    BloomChain, BloomError, Limits, MAX_CAPACITY, MAX_ERROR, MAX_EXPANSION, MAX_MAX_FILTER_BYTES,
+    NO_MEMORY, Params, ShapeError,
 };
 use crate::store::{self, Key, ValueRef};
 use crate::types::KiviDBValue;
@@ -39,7 +49,11 @@ use crate::{read_lock, write_lock};
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 const NOT_FOUND: &str = "ERR not found";
 const FULL: &str = "ERR non scaling filter is full";
+/// A filter that grows and cannot: Redis's words.
+const CANNOT_GROW: &str = "ERR problem inserting into filter";
 const BAD_DATA: &str = "ERR received bad data";
+const TOO_LARGE: &str = "ERR filter is too large";
+const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
 // ── Settings ─────────────────────────────────────────────────────────────
 
@@ -56,6 +70,8 @@ fn default_error() -> f64 {
 
 /// `CONFIG SET` of a `bf-*` setting, with Redis's checks and messages.
 /// An error rate above 0.25 is kept as 0.25, as Redis keeps it.
+/// `bloom-max-filter-bytes` is KiviDB's: a size, with units as `maxmemory`
+/// takes them.
 pub(crate) fn config_set(param: &str, value: &str) -> Vec<u8> {
     let failed = |why: String| {
         resp_error(&format!(
@@ -95,6 +111,16 @@ pub(crate) fn config_set(param: &str, value: &str) -> Vec<u8> {
                 }
             }
         }
+        "bloom-max-filter-bytes" => match crate::config::parse_memory(param, value) {
+            Err(_) => invalid(),
+            Ok(v) if !(1..=MAX_MAX_FILTER_BYTES).contains(&v) => failed(format!(
+                "Value for `{param}` must be in the range [1, {MAX_MAX_FILTER_BYTES}]"
+            )),
+            Ok(v) => {
+                crate::sketch::bloom::set_max_filter_bytes(v);
+                resp_simple("OK")
+            }
+        },
         _ => resp_error("ERR Unknown option"),
     }
 }
@@ -111,6 +137,10 @@ pub(crate) fn config_rows() -> Vec<(&'static str, String)> {
             EXPANSION.load(Ordering::Relaxed).to_string(),
         ),
         ("bf-error-rate", format!("{}", default_error())),
+        (
+            "bloom-max-filter-bytes",
+            crate::sketch::bloom::max_filter_bytes().to_string(),
+        ),
     ]
 }
 
@@ -153,9 +183,9 @@ fn begin_write() {
     TOUCHED.set(false);
 }
 
-/// What `BF.ADD`, `BF.MADD` or `BF.INSERT` (`cmd`) is sent to replicas and
-/// the AOF as: itself, or, if it made its filter, a `BF.INSERT` that names
-/// how the filter was made.
+/// What `BF.ADD`, `BF.MADD`, `BF.INSERT` or `BF.RESERVE` (`cmd`) is sent to
+/// replicas and the AOF as: itself, or, if it made its filter with a
+/// setting of this node's, a command that names what it took.
 pub(crate) fn propagation(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     match MADE.with_borrow_mut(Option::take) {
         Some(parts) => vec![parts],
@@ -170,10 +200,10 @@ pub(crate) fn take_touched() -> bool {
     TOUCHED.replace(false)
 }
 
-fn insert_form(key: &str, p: &Params, items: &[&[u8]]) -> Vec<Vec<u8>> {
+fn insert_form(key: &[u8], p: &Params, items: &[&[u8]]) -> Vec<Vec<u8>> {
     let mut parts: Vec<Vec<u8>> = vec![
         b"BF.INSERT".to_vec(),
-        key.as_bytes().to_vec(),
+        key.to_vec(),
         b"CAPACITY".to_vec(),
         p.capacity.to_string().into_bytes(),
         b"ERROR".to_vec(),
@@ -263,18 +293,57 @@ fn wrong_args(name: &str) -> Vec<u8> {
     ))
 }
 
-fn too_large() -> Vec<u8> {
-    if crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) != 0 {
-        resp_error("OOM command not allowed when used memory > 'maxmemory'.")
-    } else {
-        resp_error("ERR filter is too large")
-    }
+fn add_error(e: BloomError) -> Vec<u8> {
+    resp_error(match e {
+        BloomError::Full => FULL,
+        BloomError::CannotGrow => CANNOT_GROW,
+        BloomError::TooLarge => TOO_LARGE,
+        BloomError::NoRoom => OOM,
+        BloomError::NoMemory => NO_MEMORY,
+    })
 }
 
-fn add_error(e: BloomError) -> Vec<u8> {
-    match e {
-        BloomError::Full => resp_error(FULL),
-        BloomError::TooLarge => too_large(),
+fn shape_error(e: ShapeError) -> Vec<u8> {
+    resp_error(match e {
+        ShapeError::Bad => BAD_DATA,
+        ShapeError::TooLarge => TOO_LARGE,
+        ShapeError::NoRoom => OOM,
+        ShapeError::NoMemory => NO_MEMORY,
+    })
+}
+
+/// The limits of a write, and room for it under `maxmemory`: for a command
+/// from a client, when there is a limit and what it would allocate
+/// (`bytes`, asked only then) does not fit, keys are evicted first as the
+/// policy allows, as Redis evicts before a command; `OOM` if that is not
+/// enough. Before any lock is taken, as eviction takes them. A command
+/// from a master or the AOF is not held to `maxmemory`, nor is a replica,
+/// as no write on one is.
+fn limits(ctx: &mut Ctx, bytes: impl FnOnce(&Ctx) -> u64) -> Result<Limits, Vec<u8>> {
+    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
+    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
+    if from_client && limit != 0 {
+        let bytes = bytes(ctx);
+        if !crate::sketch::room_for(bytes) {
+            let made = limit
+                .checked_sub(bytes)
+                .is_some_and(|room| crate::eviction::make_room(ctx, room as usize, true));
+            if !made {
+                return Err(resp_error(OOM));
+            }
+        }
+    }
+    Ok(Limits::current(from_client))
+}
+
+/// What adding `items` to the filter at `key` would allocate at most: its
+/// growth, or, if there is none, the filter `make` would make.
+fn bytes_to_add(ctx: &Ctx, key: &[u8], make: Option<&Params>, items: usize) -> u64 {
+    let items = items as u64;
+    match with_filter(ctx, key, |chain| chain.bytes_to_add(items)) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => make.map_or(0, |p| BloomChain::bytes_to_make(p, items)),
+        Err(()) => 0,
     }
 }
 
@@ -328,14 +397,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     Some(reply)
 }
 
-/// The key of `cmd`, or the reply that it is not one.
-fn key_of<'a>(cmd: &[&'a [u8]]) -> Result<&'a str, Vec<u8>> {
-    parse_utf8(cmd[1]).ok_or_else(|| resp_error("ERR key must be valid UTF-8"))
-}
-
 /// The filter at `key` for reading: `Ok(None)` if there is no key,
 /// `Err(())` if it holds another type.
-fn with_filter<T>(ctx: &Ctx, key: &str, f: impl FnOnce(&BloomChain) -> T) -> Result<Option<T>, ()> {
+fn with_filter<T>(
+    ctx: &Ctx,
+    key: &[u8],
+    f: impl FnOnce(&BloomChain) -> T,
+) -> Result<Option<T>, ()> {
     if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return Ok(None);
     }
@@ -357,8 +425,9 @@ fn with_filter<T>(ctx: &Ctx, key: &str, f: impl FnOnce(&BloomChain) -> T) -> Res
 /// gives `missing`. The flag is whether it was made.
 fn with_filter_mut<T>(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     make: Option<Params>,
+    limits: Limits,
     missing: impl FnOnce() -> Vec<u8>,
     f: impl FnOnce(&mut BloomChain, bool) -> T,
 ) -> Result<T, Vec<u8>> {
@@ -375,7 +444,7 @@ fn with_filter_mut<T>(
             let Some(params) = make else {
                 return Err(missing());
             };
-            let chain = BloomChain::new(params).map_err(|_| too_large())?;
+            let chain = BloomChain::new(params, limits).map_err(add_error)?;
             let sketch = Arc::new(parking_lot::RwLock::new(Sketch::Bloom(chain)));
             map.insert(Key::from(key), KiviDBValue::Sketch(Arc::clone(&sketch)));
             (sketch, true)
@@ -395,7 +464,7 @@ fn with_filter_mut<T>(
 /// `BF.RESERVE key error_rate capacity [EXPANSION expansion] [NONSCALING]`
 fn reserve(ctx: &mut Ctx) -> Vec<u8> {
     begin_write();
-    let cmd = &ctx.cmd;
+    let cmd = ctx.cmd.clone();
     if cmd.len() < 4 {
         return wrong_args("BF.RESERVE");
     }
@@ -408,10 +477,7 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
     let expansion_at = opts
         .iter()
         .position(|a| a.eq_ignore_ascii_case(b"EXPANSION"));
-    let key = match key_of(cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = cmd[1];
     let Some(error) = parse_double(cmd[2]) else {
         return resp_error("ERR bad error rate");
     };
@@ -448,6 +514,10 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
         expansion,
         nonscaling,
     };
+    let limits = match limits(ctx, |_| BloomChain::bytes_to_make(&params, 0)) {
+        Ok(limits) => limits,
+        Err(e) => return e,
+    };
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let mut map = write_lock!(shard);
@@ -457,15 +527,39 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
         Some(_) => return resp_error(WRONGTYPE),
         None => {}
     }
-    match BloomChain::new(params) {
+    match BloomChain::new(params, limits) {
         Ok(chain) => {
+            // The expansion came from `bf-expansion-factor`: sent with it, so
+            // that a replica or a replay with another makes the same filter.
+            if expansion_at.is_none() {
+                let made = if nonscaling {
+                    // `NONSCALING` may not name an expansion, and the filter
+                    // keeps one all the same: its header says it.
+                    vec![
+                        b"BF.LOADCHUNK".to_vec(),
+                        key.to_vec(),
+                        b"1".to_vec(),
+                        chain.header(),
+                    ]
+                } else {
+                    vec![
+                        b"BF.RESERVE".to_vec(),
+                        key.to_vec(),
+                        cmd[2].to_vec(),
+                        cmd[3].to_vec(),
+                        b"EXPANSION".to_vec(),
+                        expansion.to_string().into_bytes(),
+                    ]
+                };
+                MADE.with_borrow_mut(|m| *m = Some(made));
+            }
             map.insert(
                 Key::from(key),
                 KiviDBValue::Sketch(Arc::new(parking_lot::RwLock::new(Sketch::Bloom(chain)))),
             );
             resp_simple("OK")
         }
-        Err(_) => too_large(),
+        Err(e) => add_error(e),
     }
 }
 
@@ -475,15 +569,16 @@ fn add(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 3 {
         return wrong_args("BF.ADD");
     }
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = ctx.cmd[1];
     let item = ctx.cmd[2];
     let params = default_params();
     let resp = resp(ctx);
-    let result = with_filter_mut(ctx, key, Some(params), Vec::new, |chain, made| {
-        (chain.add(item), made)
+    let limits = match limits(ctx, |ctx| bytes_to_add(ctx, key, Some(&params), 1)) {
+        Ok(limits) => limits,
+        Err(e) => return e,
+    };
+    let result = with_filter_mut(ctx, key, Some(params), limits, Vec::new, |chain, made| {
+        (chain.add(item, limits), made)
     });
     match result {
         Err(e) => e,
@@ -499,10 +594,10 @@ fn add(ctx: &mut Ctx) -> Vec<u8> {
 
 /// Add each of `items`, stopping at one the filter cannot take: the
 /// replies, the last of them that one's error.
-fn add_each(chain: &mut BloomChain, items: &[&[u8]], resp: u8) -> Vec<Vec<u8>> {
+fn add_each(chain: &mut BloomChain, items: &[&[u8]], resp: u8, limits: Limits) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        match chain.add(item) {
+        match chain.add(item, limits) {
             Ok(added) => out.push(boolean(resp, added)),
             Err(e) => {
                 out.push(add_error(e));
@@ -519,15 +614,19 @@ fn madd(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 3 {
         return wrong_args("BF.MADD");
     }
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
-    let items = &ctx.cmd[2..];
+    let key = ctx.cmd[1];
+    let items: Vec<&[u8]> = ctx.cmd[2..].to_vec();
+    let items = &items[..];
     let params = default_params();
     let resp = resp(ctx);
-    match with_filter_mut(ctx, key, Some(params), Vec::new, |chain, made| {
-        (add_each(chain, items, resp), made)
+    let limits = match limits(ctx, |ctx| {
+        bytes_to_add(ctx, key, Some(&params), items.len())
+    }) {
+        Ok(limits) => limits,
+        Err(e) => return e,
+    };
+    match with_filter_mut(ctx, key, Some(params), limits, Vec::new, |chain, made| {
+        (add_each(chain, items, resp, limits), made)
     }) {
         Err(e) => e,
         Ok((replies, made)) => {
@@ -543,7 +642,7 @@ fn madd(ctx: &mut Ctx) -> Vec<u8> {
 /// [NOCREATE] [NONSCALING] ITEMS item [item ...]`
 fn insert(ctx: &mut Ctx) -> Vec<u8> {
     begin_write();
-    let cmd = &ctx.cmd;
+    let cmd = ctx.cmd.clone();
     if cmd.len() < 4 {
         return wrong_args("BF.INSERT");
     }
@@ -600,18 +699,22 @@ fn insert(ctx: &mut Ctx) -> Vec<u8> {
         Some(items) if !items.is_empty() => items,
         _ => return wrong_args("BF.INSERT"),
     };
-    let key = match key_of(cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = cmd[1];
     let make = (!nocreate).then_some(params);
     let resp = resp(ctx);
+    let limits = match limits(ctx, |ctx| {
+        bytes_to_add(ctx, key, make.as_ref(), items.len())
+    }) {
+        Ok(limits) => limits,
+        Err(e) => return e,
+    };
     match with_filter_mut(
         ctx,
         key,
         make,
+        limits,
         || resp_error(NOT_FOUND),
-        |chain, made| (add_each(chain, items, resp), made),
+        |chain, made| (add_each(chain, items, resp, limits), made),
     ) {
         Err(e) => e,
         Ok((replies, made)) => {
@@ -629,10 +732,7 @@ fn exists(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 3 {
         return wrong_args("BF.EXISTS");
     }
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = ctx.cmd[1];
     let item = ctx.cmd[2];
     let found = matches!(
         with_filter(ctx, key, |chain| chain.contains(item)),
@@ -646,10 +746,7 @@ fn mexists(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() < 3 {
         return wrong_args("BF.MEXISTS");
     }
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = ctx.cmd[1];
     let items = &ctx.cmd[2..];
     let resp = resp(ctx);
     let found = match with_filter(ctx, key, |chain| {
@@ -669,10 +766,7 @@ fn info(ctx: &mut Ctx) -> Vec<u8> {
     if !(2..=3).contains(&ctx.cmd.len()) {
         return wrong_args("BF.INFO");
     }
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = ctx.cmd[1];
     let resp = resp(ctx);
     let fields = match with_filter(ctx, key, |chain| {
         let expansion = if chain.nonscaling() {
@@ -725,10 +819,7 @@ fn card(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 2 {
         return wrong_args("BF.CARD");
     }
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = ctx.cmd[1];
     match with_filter(ctx, key, |chain| chain.items) {
         Ok(Some(n)) => count(n),
         Ok(None) => resp_integer(0),
@@ -744,10 +835,7 @@ fn scandump(ctx: &mut Ctx) -> Vec<u8> {
     let Some(iter) = parse_ll(ctx.cmd[2]) else {
         return resp_error("Second argument must be numeric");
     };
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = ctx.cmd[1];
     match with_filter(ctx, key, |chain| chain.scandump(iter)) {
         Ok(Some((next, bytes))) => resp_array(vec![resp_integer(next), resp_bulk(&bytes)]),
         Ok(None) => resp_error(NOT_FOUND),
@@ -765,11 +853,19 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
     let Some(iter) = parse_ll(ctx.cmd[2]) else {
         return resp_error("ERR Second argument must be numeric");
     };
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
+    let key = ctx.cmd[1];
+    let data = ctx.cmd[3];
+    // A header makes a filter: what its layers take, under `maxmemory`.
+    let limits = match limits(ctx, |_| {
+        if iter == 1 {
+            BloomChain::header_bytes(data)
+        } else {
+            0
+        }
+    }) {
+        Ok(limits) => limits,
         Err(e) => return e,
     };
-    let data = ctx.cmd[3];
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
@@ -783,9 +879,8 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
         if existing.is_some() {
             return resp_error(BAD_DATA);
         }
-        return match BloomChain::from_header(data) {
-            Err(ShapeError::Bad) => resp_error(BAD_DATA),
-            Err(ShapeError::TooLarge) => too_large(),
+        return match BloomChain::from_header(data, limits) {
+            Err(e) => shape_error(e),
             Ok(chain) => {
                 map.insert(
                     Key::from(key),
@@ -815,10 +910,7 @@ fn debug(ctx: &mut Ctx) -> Vec<u8> {
     if ctx.cmd.len() != 2 {
         return wrong_args("BF.DEBUG");
     }
-    let key = match key_of(&ctx.cmd) {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let key = ctx.cmd[1];
     match with_filter(ctx, key, |chain| chain.debug_lines()) {
         Ok(Some(lines)) => resp_array(lines.iter().map(|l| resp_bulk_str(l)).collect()),
         Ok(None) => resp_error(NOT_FOUND),
@@ -874,7 +966,7 @@ mod tests {
             expansion: 2,
             nonscaling: false,
         };
-        let form = insert_form("k", &p, &[b"a", b"b"]);
+        let form = insert_form(b"k", &p, &[b"a", b"b"]);
         let words: Vec<&[u8]> = form.iter().map(Vec::as_slice).collect();
         assert_eq!(
             words,

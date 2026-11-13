@@ -1167,9 +1167,10 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
                 Some(config_set_array(&param, value))
             }
-            "bf-error-rate" | "bf-initial-size" | "bf-expansion-factor" => {
-                Some(crate::commands::bf::config_set(&param, value))
-            }
+            "bf-error-rate"
+            | "bf-initial-size"
+            | "bf-expansion-factor"
+            | "bloom-max-filter-bytes" => Some(crate::commands::bf::config_set(&param, value)),
             "stream-node-max-entries" => match value.parse::<i64>() {
                 Ok(v) if v >= 0 => {
                     crate::commands::stream_extra::NODE_MAX_ENTRIES

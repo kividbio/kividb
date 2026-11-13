@@ -50,18 +50,30 @@ impl Sketch {
         }
     }
 
-    /// How much work freeing it is, in `lazyfree`'s terms: one allocation
-    /// per layer.
+    /// How much work freeing it is, in `lazyfree`'s terms: one for each
+    /// layer and each 64 KiB of its bytes, so that a large filter is freed
+    /// in the background (over 64, some 4 MiB) whatever its layers.
     pub fn free_effort(&self) -> u64 {
         match self {
-            Sketch::Bloom(chain) => chain.layers.len() as u64,
+            Sketch::Bloom(chain) => {
+                (chain.layers.len() as u64).saturating_add(chain.data_bytes() >> 16)
+            }
+        }
+    }
+
+    /// The bytes [`write_kdb`] writes for it.
+    pub fn kdb_len(&self) -> u64 {
+        2 + match self {
+            Sketch::Bloom(chain) => bloom::kdb_len(chain),
         }
     }
 }
 
 /// Whether `bytes` more fit under `maxmemory` (always, without one),
 /// reckoned as eviction reckons it: what is counted against the limit.
-/// Asked by the commands that make a filter, never while loading one.
+/// Asked by the commands from clients that make or grow a filter, once
+/// they have evicted what they could; never while loading one, nor for a
+/// command from a master or the AOF.
 pub fn room_for(bytes: u64) -> bool {
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
     limit == 0 || (crate::memory_use::counted() as u64).saturating_add(bytes) <= limit as u64
@@ -109,15 +121,60 @@ pub(crate) fn read_u64(r: &mut impl io::Read) -> io::Result<u64> {
 }
 
 /// `len` bytes, read a megabyte at a time so that a corrupt length does
-/// not allocate more than the stream holds.
+/// not allocate more than the stream holds. The memory is asked for, not
+/// assumed: if it cannot be had, this is an error, not an abort.
 pub(crate) fn read_vec(r: &mut impl io::Read, len: usize) -> io::Result<Vec<u8>> {
     const STEP: usize = 1 << 20;
-    let mut out = Vec::with_capacity(len.min(STEP));
+    let mut out = Vec::new();
     while out.len() < len {
         let start = out.len();
         let n = (len - start).min(STEP);
+        // Doubling, as `Vec` grows, but up to `len` and no further.
+        let want = (start + n).max(out.capacity().saturating_mul(2)).min(len);
+        if want > out.capacity() {
+            out.try_reserve_exact(want - start).map_err(|_| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "no memory for a filter")
+            })?;
+        }
         out.resize(start + n, 0);
         r.read_exact(&mut out[start..])?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom::{BloomChain, Limits, Params};
+
+    fn one_layer(capacity: u64) -> Sketch {
+        let params = Params {
+            capacity,
+            error: 0.01,
+            expansion: 2,
+            nonscaling: true,
+        };
+        let limits = Limits {
+            max_bytes: bloom::MAX_MAX_FILTER_BYTES,
+            under_maxmemory: false,
+        };
+        Sketch::Bloom(BloomChain::new(params, limits).unwrap())
+    }
+
+    /// One layer of 12 MB is freed in the background, as many small
+    /// ones are; a small filter is not.
+    #[test]
+    fn free_effort_goes_by_bytes() {
+        let lazily = crate::lazyfree::THRESHOLD;
+        assert!(one_layer(10_000_000).free_effort() > lazily);
+        assert!(one_layer(100).free_effort() <= lazily);
+    }
+
+    #[test]
+    fn kdb_len_is_what_is_written() {
+        let sketch = one_layer(1000);
+        let mut out = Vec::new();
+        write_kdb(&mut out, &sketch).unwrap();
+        assert_eq!(out.len() as u64, sketch.kdb_len());
+    }
 }

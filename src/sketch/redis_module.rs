@@ -12,7 +12,9 @@
 use std::io::{self, Read};
 
 use super::Sketch;
-use super::bloom::{BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, ShapeError};
+use super::bloom::{
+    BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, Limits, ShapeError, Used,
+};
 
 /// The module type of Bloom filters, and the encoding version written.
 pub const BLOOM_TYPE: &str = "MBbloom--";
@@ -100,10 +102,27 @@ fn write_bloom(w: &mut Writer, chain: &BloomChain) {
     }
 }
 
+/// The most bytes [`dump_payload`] writes for `sketch`: each field at its
+/// longest, and the layers' bytes.
+fn dump_len(sketch: &Sketch) -> u64 {
+    match sketch {
+        Sketch::Bloom(chain) => {
+            let layers = chain.layers.len() as u64;
+            // Type, module ID, four fields, the end, version and CRC: under
+            // 64. Each layer: eight fields of at most 10 bytes, its bytes.
+            64 + layers * 80 + chain.data_bytes()
+        }
+    }
+}
+
 /// `sketch` as a Redis `DUMP` payload: the module value, the RDB version
-/// and Redis's CRC64 over both.
-pub fn dump_payload(sketch: &Sketch) -> Vec<u8> {
-    let mut w = Writer { out: Vec::new() };
+/// and Redis's CRC64 over both. Its memory is asked for at once, not
+/// assumed: if it cannot be had, this is an error, not an abort.
+pub fn dump_payload(sketch: &Sketch) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let len = usize::try_from(dump_len(sketch)).map_err(|_| no_memory())?;
+    out.try_reserve_exact(len).map_err(|_| no_memory())?;
+    let mut w = Writer { out };
     w.out.push(RDB_TYPE_MODULE_2);
     match sketch {
         Sketch::Bloom(chain) => {
@@ -116,7 +135,19 @@ pub fn dump_payload(sketch: &Sketch) -> Vec<u8> {
     out.extend_from_slice(&DUMP_RDB_VERSION.to_le_bytes());
     let crc = crate::snapshot::redis_crc64(&out);
     out.extend_from_slice(&crc.to_le_bytes());
-    out
+    debug_assert!(
+        out.len() <= len,
+        "dump_len reckons {len}, wrote {}",
+        out.len()
+    );
+    Ok(out)
+}
+
+fn no_memory() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        "not enough memory to serialize the filter",
+    )
 }
 
 // ── Reading ─────────────────────────────────────────────────────────────
@@ -174,8 +205,10 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     if count == 0 || count > super::bloom::MAX_LAYERS as u64 {
         return Err(r.bad("bad number of layers"));
     }
-    let mut shapes = Vec::with_capacity(count as usize);
-    let mut datas = Vec::with_capacity(count as usize);
+    // Not what the payload says: a small payload can say anything.
+    let mut shapes = Vec::with_capacity((count as usize).min(1024));
+    let mut datas = Vec::with_capacity((count as usize).min(1024));
+    let mut used = Used::default();
     for _ in 0..count {
         let capacity = r.uint()?;
         let error = r.double()?;
@@ -183,6 +216,13 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         let bits_per_item = r.double()?;
         let bits = r.uint()?;
         let reserved = r.uint()?;
+        // The size limits, before the layer's bytes are read: they are as
+        // many as its bits over 8, or it is refused below.
+        used.bytes = used.bytes.saturating_add(bits / 8);
+        used.hashes = used.hashes.saturating_add(u64::from(hashes));
+        if let Some(why) = super::bloom::over_limits(used) {
+            return Err(r.bad(&why));
+        }
         let data = r.string()?;
         let size = r.uint()?;
         shapes.push(LayerShape {
@@ -201,13 +241,14 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     // The layers are the strings read: nothing more is allocated, and
     // `maxmemory` is not consulted (a file or a full sync is taken whole).
     let wide = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
-    match BloomChain::from_shapes(items, flags, expansion, shapes, Some(datas)) {
+    let limits = Limits::current(false);
+    match BloomChain::from_shapes(items, flags, expansion, shapes, Some(datas), limits) {
         Ok(chain) => Ok(chain),
-        Err(ShapeError::TooLarge) => Err(r.bad("a layer is too large to load")),
         Err(ShapeError::Bad) if flags & wide != wide => Err(r.bad(
             "a filter made before RedisBloom 2.0 (32-bit hashes) is not supported; recreate it",
         )),
         Err(ShapeError::Bad) => Err(r.bad("the layers do not fit together")),
+        Err(_) => Err(r.bad("a layer is too large to load")),
     }
 }
 
@@ -269,18 +310,22 @@ mod tests {
             panic!("not a Bloom filter");
         };
         assert!(r.is_empty());
-        let mut ours = BloomChain::new(Params {
-            capacity: 50,
-            error: 0.05,
-            expansion: 3,
-            nonscaling: false,
-        })
+        let limits = Limits::current(false);
+        let mut ours = BloomChain::new(
+            Params {
+                capacity: 50,
+                error: 0.05,
+                expansion: 3,
+                nonscaling: false,
+            },
+            limits,
+        )
         .unwrap();
         for item in [b"a", b"b", b"c"] {
-            ours.add(item).unwrap();
+            ours.add(item, limits).unwrap();
         }
         assert_eq!(read, ours);
-        let written = dump_payload(&Sketch::Bloom(ours));
+        let written = dump_payload(&Sketch::Bloom(ours)).unwrap();
         assert_eq!(written[..written.len() - 10], payload[..payload.len() - 10]);
         // Version 9, and the CRC Redis checks.
         let trailer = &written[written.len() - 10..];

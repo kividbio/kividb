@@ -189,6 +189,26 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
             h.update(b"x");
             stream_digest(h, &stream.read());
         }
+        // A probabilistic value as a snapshot lays it out, fed to the hash as
+        // it is written rather than gathered first: a filter can be large.
+        // From a copy that shares its bytes, so that no guard is held.
+        ValueRef::Sketch(sketch) => {
+            struct Feed<'h>(&'h mut Xxh3);
+            impl std::io::Write for Feed<'_> {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.update(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let copy = sketch.read().clone();
+            h.update(b"o");
+            h.update(&0u32.to_le_bytes());
+            h.update(&[crate::sketch::TAG_SKETCH]);
+            let _ = crate::sketch::write_kdb(&mut Feed(h), &copy);
+        }
         // The rest as they are laid out in a snapshot. Where that depends on
         // a node's own order, the fingerprints differ and the replica is
         // sent everything: never wrong, only slower.

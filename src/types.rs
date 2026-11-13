@@ -1424,6 +1424,10 @@ impl KiviDBValue {
                 })))
             }
             KiviDBValue::Array(array) => KiviDBValue::Array(fresh(array)),
+            // A filter of its own whose layers share their bytes with the
+            // original's until either is written to, which then copies the
+            // layer it writes, with memory asked for, not assumed: a copy of
+            // a large filter costs nothing here, and cannot abort.
             KiviDBValue::Sketch(sketch) => KiviDBValue::Sketch(fresh(sketch)),
         }
     }

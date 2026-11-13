@@ -219,6 +219,13 @@ fn replies_are_redis_8_10_byte_for_byte() {
     let golden: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/redis-8.10-bloom-replies.json")).unwrap();
     let port = start(config());
+    // The captures make filters of up to 1.5 GB, which Redis has no limit
+    // for; KiviDB's is raised for them (see `limits`).
+    let mut setup = Conn::connect(port);
+    assert_eq!(
+        setup.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "4gb"]),
+        b"+OK\r\n"
+    );
     let mut failures = Vec::new();
     let mut compared = 0;
     for sequence in golden["sequences"].as_array().unwrap() {
@@ -268,6 +275,7 @@ fn replies_are_redis_8_10_byte_for_byte() {
             }
         }
     }
+    setup.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "512mb"]);
     assert!(compared > 400, "{compared} replies compared");
     assert!(
         failures.is_empty(),
@@ -569,7 +577,15 @@ fn snapshots_keep_filters() {
 #[test]
 fn the_aof_and_replicas_get_the_filter_the_master_made() {
     let (dir, replica_dir) = (tmp_dir("aof"), tmp_dir("replica"));
-    let keys = ["p:scaling", "p:fixed", "p:auto", "p:insert", "p:madd"];
+    let keys = [
+        "p:scaling",
+        "p:fixed",
+        "p:auto",
+        "p:insert",
+        "p:madd",
+        "p:reserved",
+        "p:reserved-fixed",
+    ];
     let on_master: Vec<_> = {
         let master = Child::start(&dir, &["--aof"]);
         let replica = Child::start(
@@ -582,12 +598,35 @@ fn the_aof_and_replicas_get_the_filter_the_master_made() {
             String::from_utf8_lossy(&r.cmd(&["INFO", "replication"]))
                 .contains("master_link_status:up")
         });
+        // The master's own setting, not the replica's nor the replay's:
+        // what it took from it is sent with the commands.
+        assert_eq!(
+            m.cmd(&["CONFIG", "SET", "bf-expansion-factor", "5"]),
+            b"+OK\r\n"
+        );
         some_filters(&mut m);
         m.cmd(&["BF.INSERT", "p:insert", "ERROR", "0.2", "ITEMS", "a", "b"]);
         m.cmd(&["BF.MADD", "p:madd", "a", "b"]);
+        // Without EXPANSION, scaling and not; grown past its first layer.
+        assert_eq!(
+            m.cmd(&["BF.RESERVE", "p:reserved", "0.01", "10"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            m.cmd(&["BF.RESERVE", "p:reserved-fixed", "0.01", "10", "NONSCALING"]),
+            b"+OK\r\n"
+        );
+        let items: Vec<String> = (0..60).map(|i| format!("r{i}")).collect();
+        let mut args = vec!["BF.MADD", "p:reserved"];
+        args.extend(items.iter().map(String::as_str));
+        m.cmd(&args);
+        assert_eq!(
+            m.cmd(&["BF.INFO", "p:reserved", "EXPANSION"]),
+            b"*1\r\n:5\r\n"
+        );
         let on_master: Vec<_> = keys.iter().map(|k| scandump(&mut m, k)).collect();
         wait_until("the replica to have every filter", || {
-            r.cmd(&["EXISTS", "p:madd"]) == b":1\r\n"
+            r.cmd(&["BF.CARD", "p:reserved"]) == m.cmd(&["BF.CARD", "p:reserved"])
         });
         let on_replica: Vec<_> = keys.iter().map(|k| scandump(&mut r, k)).collect();
         assert_eq!(on_replica, on_master);
@@ -605,12 +644,24 @@ fn the_aof_and_replicas_get_the_filter_the_master_made() {
     let text = String::from_utf8_lossy(&aof);
     assert!(
         text.contains(
-            "BF.INSERT\r\n$6\r\np:auto\r\n$8\r\nCAPACITY\r\n$3\r\n100\r\n$5\r\nERROR\r\n$4\r\n0.01\r\n$9\r\nEXPANSION\r\n$1\r\n2\r\n$5\r\nITEMS\r\n$1\r\ny"
+            "BF.INSERT\r\n$6\r\np:auto\r\n$8\r\nCAPACITY\r\n$3\r\n100\r\n$5\r\nERROR\r\n$4\r\n0.01\r\n$9\r\nEXPANSION\r\n$1\r\n5\r\n$5\r\nITEMS\r\n$1\r\ny"
         ),
         "{text}"
     );
     assert!(
         text.contains("$10\r\nBF.RESERVE\r\n$9\r\np:scaling"),
+        "{text}"
+    );
+    // A BF.RESERVE without EXPANSION, with the one it took; one that does
+    // not scale, as its header.
+    assert!(
+        text.contains(
+            "$10\r\nBF.RESERVE\r\n$10\r\np:reserved\r\n$4\r\n0.01\r\n$2\r\n10\r\n$9\r\nEXPANSION\r\n$1\r\n5\r\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("$12\r\nBF.LOADCHUNK\r\n$16\r\np:reserved-fixed\r\n$1\r\n1\r\n"),
         "{text}"
     );
     // And a replay rebuilds every filter.
@@ -621,6 +672,91 @@ fn the_aof_and_replicas_get_the_filter_the_master_made() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
+/// `maxmemory` holds back a client, not a master or the AOF: a replica with
+/// less room, or a replay under a lower limit, keeps every filter the
+/// master took. A client's command evicts first, under an evicting policy,
+/// as Redis evicts before a command, and gets `OOM` only under
+/// `noeviction`.
+#[test]
+fn maxmemory_holds_clients_not_replication() {
+    let (dir, replica_dir) = (tmp_dir("oom-aof"), tmp_dir("oom-replica"));
+    {
+        let master = Child::start(&dir, &["--aof"]);
+        let replica = Child::start(
+            &replica_dir,
+            &["--replicaof", "127.0.0.1", &master.port.to_string()],
+        );
+        let mut m = master.conn();
+        let mut r = replica.conn();
+        wait_until("the replica to sync", || {
+            String::from_utf8_lossy(&r.cmd(&["INFO", "replication"]))
+                .contains("master_link_status:up")
+        });
+        assert_eq!(r.cmd(&["CONFIG", "SET", "maxmemory", "1"]), b"+OK\r\n");
+        // 1.2 MB, which the replica has no room for under its limit.
+        assert_eq!(m.cmd(&["BF.RESERVE", "big", "0.01", "1000000"]), b"+OK\r\n");
+        assert_eq!(m.cmd(&["BF.ADD", "big", "x"]), b":1\r\n");
+        assert_eq!(m.cmd(&["BF.ADD", "auto", "y"]), b":1\r\n");
+        wait_until("the replica to have the filters", || {
+            r.cmd(&["BF.EXISTS", "auto", "y"]) == b":1\r\n"
+        });
+        assert_eq!(r.cmd(&["BF.EXISTS", "big", "x"]), b":1\r\n");
+        assert_eq!(scandump(&mut r, "big"), scandump(&mut m, "big"));
+    }
+    // Replayed under a limit far below what the filter takes.
+    {
+        let server = Child::start(&dir, &["--aof", "--maxmemory", "1mb"]);
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["BF.EXISTS", "big", "x"]), b":1\r\n");
+        assert_eq!(c.cmd(&["BF.EXISTS", "auto", "y"]), b":1\r\n");
+        // A client is held to it.
+        assert_eq!(
+            c.cmd(&["BF.RESERVE", "more", "0.01", "1000000"]),
+            b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        assert_eq!(c.cmd(&["EXISTS", "more"]), b":0\r\n");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+
+    // Under allkeys-lru, room is made for a filter by evicting.
+    let dir = tmp_dir("oom-evict");
+    let server = Child::start(&dir, &["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let used: u64 = String::from_utf8_lossy(&c.cmd(&["INFO", "memory"]))
+        .lines()
+        .find_map(|l| l.strip_prefix("used_memory:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let limit = (used + 3_000_000).to_string();
+    assert_eq!(c.cmd(&["CONFIG", "SET", "maxmemory", &limit]), b"+OK\r\n");
+    let value = "v".repeat(10_000);
+    for i in 0..200 {
+        assert_eq!(c.cmd(&["SET", &format!("s{i}"), &value]), b"+OK\r\n");
+    }
+    assert_eq!(c.cmd(&["BF.RESERVE", "big", "0.01", "1000000"]), b"+OK\r\n");
+    let evicted = String::from_utf8_lossy(&c.cmd(&["INFO", "stats"]))
+        .lines()
+        .find_map(|l| l.strip_prefix("evicted_keys:"))
+        .map(|n| n.trim().to_string())
+        .unwrap();
+    assert_ne!(evicted, "0", "room was made by evicting");
+    // Under noeviction, refused.
+    assert_eq!(
+        c.cmd(&["CONFIG", "SET", "maxmemory-policy", "noeviction"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        c.cmd(&["BF.RESERVE", "big2", "0.01", "1000000"]),
+        b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+    );
+    assert_eq!(c.cmd(&["EXISTS", "big2"]), b":0\r\n");
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── Generic behaviour ────────────────────────────────────────────────────
@@ -670,6 +806,15 @@ fn copy_rename_move_and_expire() {
     c.cmd(&["BF.ADD", "c2", "only-in-the-copy"]);
     assert_eq!(c.cmd(&["BF.EXISTS", "c", "only-in-the-copy"]), b":0\r\n");
     assert_eq!(c.cmd(&["BF.EXISTS", "c2", "a"]), b":1\r\n");
+    // And the other way: the original written after the copy.
+    assert_eq!(c.cmd(&["COPY", "c", "c4"]), b":1\r\n");
+    c.cmd(&["BF.ADD", "c", "only-in-the-original"]);
+    assert_eq!(
+        c.cmd(&["BF.EXISTS", "c4", "only-in-the-original"]),
+        b":0\r\n"
+    );
+    assert_eq!(c.cmd(&["BF.CARD", "c4"]), b":2\r\n");
+    c.cmd(&["DEL", "c4"]);
     assert_eq!(c.cmd(&["RENAME", "c2", "c3"]), b"+OK\r\n");
     assert_eq!(c.cmd(&["BF.CARD", "c3"]), b":3\r\n");
     assert_eq!(c.cmd(&["MOVE", "c3", "5"]), b":1\r\n");
@@ -683,6 +828,25 @@ fn copy_rename_move_and_expire() {
     let usage = String::from_utf8(c.cmd(&["MEMORY", "USAGE", "c"])).unwrap();
     let usage: usize = usage.trim_start_matches(':').trim_end().parse().unwrap();
     assert!((240..1000).contains(&usage), "MEMORY USAGE {usage}");
+}
+
+/// Keys are bytes, as every other command's are.
+#[test]
+fn keys_are_bytes() {
+    let _serial = serial();
+    let port = start(config());
+    let mut c = Conn::connect(port);
+    let key: &[u8] = b"\xff\x00bin";
+    assert_eq!(c.raw(&[b"BF.ADD", key, b"x"]), b":1\r\n");
+    assert_eq!(c.raw(&[b"BF.EXISTS", key, b"x"]), b":1\r\n");
+    assert_eq!(c.raw(&[b"BF.RESERVE", b"\xfe", b"0.01", b"10"]), b"+OK\r\n");
+    assert_eq!(
+        c.raw(&[b"BF.MADD", b"\xfe", b"a", b"b"]),
+        b"*2\r\n:1\r\n:1\r\n"
+    );
+    assert_eq!(c.raw(&[b"BF.CARD", b"\xfe"]), b":2\r\n");
+    assert_eq!(c.raw(&[b"TYPE", key]), b"+MBbloom--\r\n");
+    c.raw(&[b"DEL", key, b"\xfe"]);
 }
 
 #[test]
@@ -728,8 +892,10 @@ fn bf_settings() {
     }
 }
 
-/// Redis sends no keyspace event for any `BF.*` command; neither does
-/// KiviDB. The generic commands still send theirs.
+/// Redis 8.10.2 sends no keyspace event for any `BF.*` command, even with
+/// `KEA` (checked with a capture); neither does KiviDB. The generic commands
+/// still send theirs, and `n` announces a key a `BF.*` command made, as
+/// Redis announces it.
 #[test]
 fn no_keyspace_events() {
     let _serial = serial();
@@ -748,12 +914,150 @@ fn no_keyspace_events() {
     }
     c.cmd(&["DEL", "e"]);
     let event = sub.read();
-    c.cmd(&["CONFIG", "SET", "notify-keyspace-events", ""]);
     assert!(
         shown(&event).contains("__keyevent@0__:del"),
         "the first event is DEL's: {}",
         shown(&event)
     );
+    c.cmd(&["CONFIG", "SET", "notify-keyspace-events", "En"]);
+    c.cmd(&["BF.ADD", "e", "x"]);
+    c.cmd(&["BF.ADD", "e", "y"]);
+    c.cmd(&["SET", "after", "1"]);
+    let event = sub.read();
+    assert!(
+        shown(&event).contains("__keyevent@0__:new") && shown(&event).ends_with("$1\\r\\ne\\r\\n"),
+        "a new filter: {}",
+        shown(&event)
+    );
+    let event = sub.read();
+    assert!(
+        shown(&event).contains("__keyevent@0__:new") && shown(&event).contains("after"),
+        "nothing for the second BF.ADD: {}",
+        shown(&event)
+    );
+    c.cmd(&["CONFIG", "SET", "notify-keyspace-events", ""]);
+    c.cmd(&["DEL", "e", "e2", "after"]);
+}
+
+// ── Limits ───────────────────────────────────────────────────────────────
+
+/// A `BF.SCANDUMP` header of `layers` layers of capacity 1 at the smallest
+/// error rate: 200 bytes and 1075 hashes each.
+fn widest_header(layers: u32) -> Vec<u8> {
+    let error = 5e-324f64;
+    let per_item = -error.ln() / 0.480453013918201;
+    let mut h = Vec::new();
+    h.extend(0u64.to_le_bytes()); // items
+    h.extend(layers.to_le_bytes());
+    h.extend(5u32.to_le_bytes()); // flags
+    h.extend(1u32.to_le_bytes()); // expansion
+    for _ in 0..layers {
+        h.extend(200u64.to_le_bytes());
+        h.extend(1600u64.to_le_bytes());
+        h.extend(0u64.to_le_bytes());
+        h.extend(error.to_le_bytes());
+        h.extend(per_item.to_le_bytes());
+        h.extend(1075u32.to_le_bytes());
+        h.extend(1u64.to_le_bytes());
+        h.push(0);
+    }
+    h
+}
+
+/// The size limits, whichever way a filter is made: `BF.RESERVE`,
+/// `BF.INSERT` (and its growth), `BF.LOADCHUNK` and `RESTORE`. Nothing
+/// over them is made, and the server goes on.
+#[test]
+fn limits() {
+    let _serial = serial();
+    let port = start(config());
+    let mut c = Conn::connect(port);
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "bloom-max-filter-bytes"]),
+        b"*2\r\n$22\r\nbloom-max-filter-bytes\r\n$9\r\n536870912\r\n"
+    );
+    // A filter of 6 KB, dumped while it is allowed.
+    assert_eq!(c.cmd(&["BF.RESERVE", "dumped", "0.01", "5000"]), b"+OK\r\n");
+    let dumped = c.cmd(&["DUMP", "dumped"]);
+    let payload =
+        dumped[dumped.iter().position(|&b| b == b'\n').unwrap() + 1..dumped.len() - 2].to_vec();
+    for bad in ["0", "-1", "2tb", "lots"] {
+        assert!(
+            c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", bad])
+                .starts_with(b"-ERR CONFIG SET failed"),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "4kb"]),
+        b"+OK\r\n"
+    );
+    let too_large = b"-ERR filter is too large\r\n";
+    // RESERVE and INSERT.
+    assert_eq!(c.cmd(&["BF.RESERVE", "l", "0.01", "5000"]), too_large);
+    assert_eq!(
+        c.cmd(&["BF.INSERT", "l", "CAPACITY", "5000", "ITEMS", "a"]),
+        too_large
+    );
+    assert_eq!(c.cmd(&["EXISTS", "l"]), b":0\r\n");
+    // Growth: 144, 312, 696 and 1,536 bytes fit in 4 KiB, and the fifth
+    // layer does not: the reply ends with the item that would need it.
+    assert_eq!(c.cmd(&["BF.RESERVE", "g", "0.01", "100"]), b"+OK\r\n");
+    let items: Vec<String> = (0..2000).map(|i| format!("g{i}")).collect();
+    let mut args = vec!["BF.INSERT", "g", "ITEMS"];
+    args.extend(items.iter().map(String::as_str));
+    let reply = c.cmd(&args);
+    assert!(
+        reply.ends_with(too_large),
+        "{}",
+        shown(&reply[reply.len() - 60..])
+    );
+    assert_eq!(c.cmd(&["BF.INFO", "g", "FILTERS"]), b"*1\r\n:4\r\n");
+    // LOADCHUNK: a header over the limit, in bytes; over the hashes all
+    // layers may have; over the layers a filter may have.
+    for (what, raw, want) in [
+        ("bytes", widest_header(21), &too_large[..]),
+        ("hashes", widest_header(559), too_large),
+        ("layers", widest_header(2049), b"-ERR received bad data\r\n"),
+    ] {
+        if what != "bytes" {
+            c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "512mb"]);
+        }
+        assert_eq!(
+            shown(&c.raw(&[b"BF.LOADCHUNK", b"h", b"1", &raw])),
+            shown(want),
+            "{what}"
+        );
+        assert_eq!(c.cmd(&["EXISTS", "h"]), b":0\r\n", "{what}");
+    }
+    assert_eq!(
+        c.raw(&[b"BF.LOADCHUNK", b"h", b"1", &widest_header(558)]),
+        b"+OK\r\n"
+    );
+    // RESTORE of a filter over the limit.
+    c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "4kb"]);
+    let restored = c.raw(&[b"RESTORE", b"r", b"0", &payload]);
+    assert!(restored.starts_with(b"-"), "{}", shown(&restored));
+    assert_eq!(c.cmd(&["EXISTS", "r"]), b":0\r\n");
+    c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "512mb"]);
+    assert_eq!(c.raw(&[b"RESTORE", b"r", b"0", &payload]), b"+OK\r\n");
+    // A filter that grows and cannot says so, as Redis does.
+    assert_eq!(
+        c.cmd(&["BF.RESERVE", "u", "1e-300", "1", "EXPANSION", "1"]),
+        b"+OK\r\n"
+    );
+    let items: Vec<String> = (1..=92).map(|i| format!("item{i}")).collect();
+    let mut args = vec!["BF.MADD", "u"];
+    args.extend(items.iter().map(String::as_str));
+    let reply = c.cmd(&args);
+    assert!(
+        reply.ends_with(b"-ERR problem inserting into filter\r\n"),
+        "{}",
+        shown(&reply)
+    );
+    assert_eq!(c.cmd(&["BF.INFO", "u", "FILTERS"]), b"*1\r\n:78\r\n");
+    assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
+    c.cmd(&["FLUSHALL"]);
 }
 
 // ── Hostile input ────────────────────────────────────────────────────────
