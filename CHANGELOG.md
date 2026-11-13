@@ -23,6 +23,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A write of several keys that share a store shard is no longer seen
+  half done.** A `DEL` of several keys, `RENAME`, `SMOVE`, `COPY` and the
+  other writes of more than one key work on their keys one at a time, and
+  were made one step for other clients only when their keys were in
+  different shards (#159). When all the keys fell in one shard, a client
+  reading them at the same moment could find some deleted and others not,
+  or a renamed key in neither place. Every write of more than one key is
+  now one step.
+
 - **A script that waits for `TIME` to move ends (#676).** `TIME` in a
   script returned the script's start for as long as it ran, so a loop
   waiting for it to change ran until `SCRIPT KILL`. As in Redis, `TIME`

@@ -7252,3 +7252,68 @@ fn peers_learn_an_announce_address_changed_at_runtime() {
     );
     wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
 }
+
+/// A write of several keys of one hash tag is one step, as it is in Redis:
+/// a reader never finds some of a `DEL`'s keys gone and others not, nor a
+/// `RENAME`'s source gone and its destination not there yet (#159). A
+/// cluster client's multi-key writes are all of this kind, and a write of
+/// keys that share a store shard takes the command gate alone as one of
+/// keys of several shards does.
+#[test]
+fn readers_never_see_a_write_of_one_hash_tag_half_done() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let (nodes, _) = form_cluster(1);
+    let port = nodes[0].port;
+    let keys: Vec<String> = (0..200).map(|i| format!("{{t}}d{i}")).collect();
+    let (from, to) = ("{t}from", "{t}to");
+    let mut w = nodes[0].conn();
+    assert!(w.cmd(&["SET", from, "x"]).is_ok());
+    let stop = Arc::new(AtomicBool::new(false));
+    let torn = Arc::new(AtomicU64::new(0));
+    // Several readers, and many rounds: the window is a few microseconds.
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (stop, torn, keys) = (Arc::clone(&stop), Arc::clone(&torn), keys.clone());
+            std::thread::spawn(move || {
+                let mut r = Conn::connect(port);
+                let mut args = vec!["MGET"];
+                args.extend(keys.iter().map(String::as_str));
+                while !stop.load(Ordering::Relaxed) {
+                    let got = r.cmd(&args);
+                    let present = got.array().iter().filter(|v| **v != Resp::Nil).count();
+                    if present != 0 && present != keys.len() {
+                        torn.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let renamed = r.cmd(&["MGET", from, to]);
+                    if renamed.array().iter().all(|v| *v == Resp::Nil) {
+                        torn.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for _ in 0..1500 {
+        let mut mset = vec!["MSET"];
+        for k in &keys {
+            mset.push(k);
+            mset.push("v");
+        }
+        assert!(w.cmd(&mset).is_ok());
+        let mut del = vec!["DEL"];
+        del.extend(keys.iter().map(String::as_str));
+        assert_eq!(w.cmd(&del).int(), keys.len() as i64);
+        assert!(w.cmd(&["RENAME", from, to]).is_ok());
+        assert!(w.cmd(&["RENAME", to, from]).is_ok());
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(
+        torn.load(Ordering::Relaxed),
+        0,
+        "a reader saw a write half done"
+    );
+}
