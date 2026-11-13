@@ -1094,6 +1094,7 @@ async fn run_replication_session(
                 {
                     let _cut = crate::write_gate::cut();
                     let empty = store::new_store(config.databases);
+                    touch_watches_of_replaced(store, &empty);
                     store::swap_kv_with_staging(store, &empty);
                     crate::aof::log_superseded();
                     index_store.write().clear();
@@ -1132,6 +1133,7 @@ async fn run_replication_session(
             // Stop the world for the swap, the same way a checkpoint does, so a
             // local AOF record cannot straddle it.
             let _cut = crate::write_gate::cut();
+            touch_watches_of_replaced(store, &staged.store);
             store::swap_kv_with_staging(store, &staged.store);
             // The open log is of the dataset this replaced (#350).
             crate::aof::log_superseded();
@@ -1796,6 +1798,27 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
         keys,
         keys_with_ttl,
     })
+}
+
+/// Before the dataset `store` holds is replaced by `incoming` (a full sync):
+/// a watch on a key that is in either is broken, as a flush or a `SWAPDB`
+/// breaks it, and one on a key in neither holds (Redis touches every watched
+/// key when a replica loads its master's data, `touchAllWatchedKeysInDb`).
+/// The watches stayed: a client that had watched a key on the replica ran
+/// its `EXEC` over a dataset that had been replaced under it (#673). Called
+/// with the write gate cut, so nothing writes to either meanwhile.
+fn touch_watches_of_replaced(store: &Store, incoming: &Store) {
+    use crate::watch::WatchNotifier;
+    let watches = crate::watch::ForStore(store);
+    if !watches.has_watchers() {
+        return;
+    }
+    watches.notify_replaced(None, &|db, key| {
+        (
+            crate::watch::presence(store, db, key),
+            crate::watch::presence(incoming, db, key),
+        )
+    });
 }
 
 fn count_keys(store: &Store) -> usize {
