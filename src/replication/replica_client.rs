@@ -1071,11 +1071,20 @@ async fn run_replication_session(
             if local_keys > 0 && is_kdb && repl_state.flush_before_load.load(Ordering::Relaxed) {
                 Some(
                     crate::snapshot::verify_snapshot(rdb_bytes.as_slice()).map_err(|e| {
+                        // Read whole and refused for its databases (#482),
+                        // or for keys outside database 0 of a cluster node
+                        // (#484): the same master sends the same again.
+                        let refused = crate::snapshot::is_past_databases(&e);
                         let e = crate::snapshot::refusal_of_payload(e);
-                        SessionError::Link(format!(
+                        let what = format!(
                             "full-sync payload is not a valid KDB image ({e}); the local dataset \
                          is untouched"
-                        ))
+                        );
+                        if refused {
+                            SessionError::Unfollowable(what)
+                        } else {
+                            SessionError::Link(what)
+                        }
                     })?,
                 )
             } else {
@@ -1761,8 +1770,14 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
         let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
+            let refused = crate::snapshot::is_past_databases(&e);
             let e = crate::snapshot::refusal_of_payload(e);
-            SessionError::Link(format!("full-sync payload is not a valid KDB image: {e}"))
+            let what = format!("full-sync payload is not a valid KDB image: {e}");
+            if refused {
+                SessionError::Unfollowable(what)
+            } else {
+                SessionError::Link(what)
+            }
         })?;
         (
             loaded.dbs,

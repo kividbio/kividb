@@ -528,6 +528,75 @@ fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -
 
 // ── Formation and routing ─────────────────────────────────────────────────────
 
+/// A cluster node serves database 0 alone. Started on a dataset with keys
+/// in another, from a snapshot or from its AOF, it refuses to start, as
+/// Redis does. It used to load them where no client could reach them, and
+/// slot accounting and migration never saw them (#484).
+#[test]
+fn a_cluster_node_refuses_to_start_with_keys_outside_database_0() {
+    for aof in [false, true] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let persistence: &[&str] = if aof {
+            &["--aof", "--appendfsync", "always"]
+        } else {
+            &[]
+        };
+        let port = cluster_port();
+        let mut plain = Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(&dir)
+            .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+            .args(persistence)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut c = Conn::connect(port);
+        assert!(c.cmd(&["SET", "in0", "v"]).is_ok());
+        assert!(c.cmd(&["SELECT", "1"]).is_ok());
+        assert!(c.cmd(&["SET", "in1", "v"]).is_ok());
+        if !aof {
+            assert!(c.cmd(&["SAVE"]).is_ok());
+        }
+        drop(c);
+        let _ = plain.kill();
+        let _ = plain.wait();
+
+        let log = dir.join("cluster.log");
+        let mut node = Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(&dir)
+            .args(["--bind", "127.0.0.1", "--port", &cluster_port().to_string()])
+            .args(["--cluster-enabled", "yes"])
+            .args(persistence)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = node.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = node.kill();
+                let _ = node.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "aof {aof}: the cluster node started on keys in database 1:\n{log}"
+        );
+        assert!(
+            log.contains("can't have keys in a DB different than DB 0 when in Cluster mode"),
+            "aof {aof}: {log}"
+        );
+    }
+}
+
 #[test]
 fn cluster_forms_and_routes_by_slot() {
     let (nodes, ranges) = form_cluster(3);

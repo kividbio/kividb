@@ -9,6 +9,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A cluster node refuses to start with keys outside database 0 (#484).**
+  It loaded them from a snapshot, an RDB file or its AOF into databases no
+  client can reach in cluster mode, where slot accounting and migration
+  never saw them. As in Redis, it now exits with `can't have keys in a DB
+  different than DB 0 when in Cluster mode`, and a cluster replica refuses
+  such a full sync before it touches its own dataset.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
