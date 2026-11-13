@@ -9,6 +9,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An `FT.SEARCH` right after a document left its index scores with the
+  index as it is now, whichever path answers it (#421).** A document's
+  removal is queued when a query holds the index's postings, and applied by
+  the next query that reads them, which also takes the document's words out
+  of the `TEXT` index. The scoring read the `TEXT` statistics (the number
+  of documents, their average length, each word's document frequency)
+  before applying it: a query answered by reading every match scored with
+  the document still counted, while its own count, and a query answered
+  from the postings' page, left it out. The queue is now applied first.
+
 - **`SCRIPT LOAD` and `SCRIPT FLUSH` during a slot handoff or a manual
   failover are answered at once, instead of stalling every connection of
   their worker thread until the handoff ended (#528).** The pause does not
