@@ -1116,9 +1116,14 @@ impl StreamEntries {
                 idx += 1;
                 count += 1;
             }
-            for j in (count.max(1) - 1) / SEGMENT..ANCHORS {
+            for (j, &anchor) in b
+                .anchors
+                .iter()
+                .enumerate()
+                .skip((count.max(1) - 1) / SEGMENT)
+            {
                 if (j + 1) * SEGMENT >= count {
-                    assert_eq!(b.anchors[j], 0, "stale anchor");
+                    assert_eq!(anchor, 0, "stale anchor");
                 }
             }
             if let Some(next) = self.blocks.get(bi + 1) {
