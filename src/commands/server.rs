@@ -329,28 +329,47 @@ const NO_LUA: &str = concat!(
 
 /// `FUNCTION` in a build without Lua. `FUNCTION FLUSH` drops the libraries
 /// it kept from the data it loaded (`snapshot::flush_kept_functions`), so
-/// they can be got rid of here too; every other subcommand is refused. A
-/// refused one from the master leaves the kept libraries behind the
-/// master's, and says so once: a replica without Lua keeps those of its last
+/// they can be got rid of here too, from a client, the master or the AOF;
+/// every other subcommand is refused. One refused from the master or the
+/// AOF leaves this server with other libraries than the master had, so it
+/// is logged, once for each: a replica without Lua keeps those of its last
 /// full sync.
 #[cfg(not(feature = "lua"))]
 fn function_without_lua(ctx: &Ctx) -> Vec<u8> {
+    use std::sync::atomic::AtomicBool;
     let sub = ctx.cmd.get(1).copied().unwrap_or_default();
-    let mode_ok = match ctx.cmd.len() {
-        2 => true,
-        3 => ctx.cmd[2].eq_ignore_ascii_case(b"SYNC") || ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC"),
-        _ => false,
-    };
-    if sub.eq_ignore_ascii_case(b"FLUSH") && mode_ok {
+    if sub.eq_ignore_ascii_case(b"FLUSH") {
+        // As Redis answers these.
+        match ctx.cmd.len() {
+            2 => {}
+            3 if ctx.cmd[2].eq_ignore_ascii_case(b"SYNC")
+                || ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC") => {}
+            3 => return resp_error("ERR FUNCTION FLUSH only supports SYNC|ASYNC option"),
+            _ => {
+                return resp_error(
+                    "ERR unknown subcommand or wrong number of arguments for 'flush'. Try \
+                     FUNCTION HELP.",
+                );
+            }
+        }
         crate::snapshot::flush_kept_functions();
         return resp_simple("OK");
     }
-    if ctx.apply_replication && crate::snapshot::holds_kept_functions() {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if ctx.apply_replication {
+        static FROM_MASTER: AtomicBool = AtomicBool::new(false);
+        static FROM_AOF: AtomicBool = AtomicBool::new(false);
+        // The AOF is replayed with the dataset counted as loading; the
+        // master's stream is applied once it is loaded.
+        let (source, warned) = if crate::expiry::loading() {
+            ("the AOF", &FROM_AOF)
+        } else {
+            ("the master", &FROM_MASTER)
+        };
+        if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
             log_warn!(
-                "the master sent FUNCTION {}, which this build without Lua cannot run: the \
-                 function libraries it keeps are those of its last full sync, not the master's",
+                "FUNCTION {} from {source} was refused: this build has no Lua, so its function \
+                 libraries are not those the master has (those of the data it loaded, if any). \
+                 Run the lua or full build on replicas of a master that uses them",
                 String::from_utf8_lossy(sub).to_ascii_uppercase()
             );
         }

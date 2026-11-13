@@ -1128,8 +1128,9 @@ impl KeptFunctions {
 }
 
 /// Whether a build without Lua holds function libraries it cannot run
-/// ([`KEPT_FUNCTIONS`]).
+/// ([`KEPT_FUNCTIONS`]). Unused by the binary; the tests read it.
 #[cfg(not(feature = "lua"))]
+#[allow(dead_code)]
 pub fn holds_kept_functions() -> bool {
     KEPT_FUNCTIONS.get().is_some()
 }

@@ -66,8 +66,8 @@ env:
   SITE_REPO: kividbio/packages
   BASE_URL: https://packages.kividb.io
   # Versions kept per architecture: KEEP of `kividb` (four packages of about
-  # 6.6 MB a release) and KEEP_FULL of `kividb-full` (four of about 7.4 MB,
-  # from 1.3.0). 16 and 8 keep the site near 660 MB, under the job's 900 MB
+  # 5.9 MB a release, xz) and KEEP_FULL of `kividb-full` (four of about
+  # 6.7 MB, from 1.3.0). 16 and 8 keep the site near 600 MB, under the job's 900 MB
   # limit (build-repos.sh) with room for the packages to grow, inside GitHub
   # Pages' 1 GB.
   KEEP: "16"

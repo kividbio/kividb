@@ -151,7 +151,7 @@ jobs:
   # the other and back, and upgrade, in clean Debian 12, Ubuntu 24.04, Rocky
   # Linux 9 and Amazon Linux 2023 containers running systemd, with this
   # release's x86_64 binaries (packaging/test/swap-test.sh). `publish` waits
-  # for it. About ten minutes, once per release.
+  # for it. About 15 to 20 minutes, once per release.
   package-test:
     needs: [linux-amd64]
     runs-on: ubuntu-24.04
@@ -658,12 +658,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/kividb.rb
           if [ -f Formula/kividb-full.rb ]; then git add Formula/kividb-full.rb; fi
+          # What this run wrote: kividb-full only when its tarballs exist.
+          what=kividb
+          if git diff --cached --quiet -- Formula/kividb-full.rb; then :; else what="kividb and kividb-full"; fi
           # A re-run after the formulas were already pushed has nothing to add.
           if git diff --cached --quiet; then
             echo "The tap already has kividb ${{ steps.extract.outputs.version }}."
             exit 0
           fi
-          git commit -m "chore: update kividb and kividb-full to ${{ steps.extract.outputs.version }}"
+          git commit -m "chore: update ${what} to ${{ steps.extract.outputs.version }}"
           git push
 
   # ── apt and dnf repositories — stable releases only ─────────────────────

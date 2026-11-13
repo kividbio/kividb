@@ -10,8 +10,8 @@
 # named anything. The packages already in SITE are kept, so users can pin or
 # go back to an older version, except that only the newest $KEEP versions of
 # kividb and $KEEP_FULL of kividb-full are kept, per architecture (GitHub
-# Pages sites are meant to stay under 1 GB; a release adds about 26 MB of
-# kividb and 30 MB of kividb-full).
+# Pages sites are meant to stay under 1 GB; a release adds about 24 MB of
+# kividb and 27 MB of kividb-full, compressed with xz).
 #
 # Environment:
 #   GPG_KEY   fingerprint of the signing key, already in gpg's keyring, usable

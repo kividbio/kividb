@@ -226,9 +226,10 @@ server is running normally, or start `kividb-full` once more first.
 On the default build, `FUNCTION FLUSH` drops the libraries it keeps (and
 replicates like any write): use it to be rid of them for good. Every other
 `FUNCTION` subcommand is refused. A replica on the default build keeps the
-libraries of its last full sync from its master; the `FUNCTION` commands its
-master runs after that are refused on it and logged, so run replicas on the
-same build as their master.
+libraries of its last full sync from its master. After that, a `FUNCTION
+FLUSH` from its master is applied, and the other `FUNCTION` commands (`LOAD`,
+`DELETE`, `RESTORE`) are refused, with one warning in its log: its libraries
+are then not its master's. Run replicas on the same build as their master.
 
 ### Removing
 
@@ -519,11 +520,11 @@ find the indexes they were told about: apt's indexes are also served by their
 digest (`by-hash`), and the dnf metadata files are named by theirs. In both,
 the previous generation is kept beside the new one and older ones are removed.
 
-**Size.** A release adds about 56 MB: four `kividb` packages of about 6.6 MB
-and four `kividb-full` packages of about 7.4 MB. GitHub Pages sites are
-limited to 1 GB, and the job fails above 900 MB; keeping 16 releases of
-`kividb` (about 420 MB) and 8 of `kividb-full` (about 240 MB), the site is
-about 660 MB. If more packages are added per release (`-lua` or `-tls`
+**Size.** The packages are compressed with xz. A release adds about 50 MB:
+four `kividb` packages of about 5.9 MB and four `kividb-full` packages of
+about 6.7 MB. GitHub Pages sites are limited to 1 GB, and the job fails
+above 900 MB; keeping 16 releases of `kividb` (about 380 MB) and 8 of
+`kividb-full` (about 215 MB), the site is about 600 MB. If more packages are added per release (`-lua` or `-tls`
 packages), or they grow, lower `KEEP` or `KEEP_FULL` in the workflow.
 
 **Before publishing.** The release workflow's `package-test` job builds both
@@ -531,7 +532,12 @@ packages from the release's x86_64 binaries and runs
 `packaging/test/swap-test.sh`: in Debian 12, Ubuntu 24.04, Rocky Linux 9 and
 Amazon Linux 2023 containers running systemd, it installs `kividb`, swaps to
 `kividb-full` and back, and upgrades each, checking the config, the data,
-the service and the stored functions at each step. `publish` waits for it.
+the service and the stored functions at each step. It also starts from the
+released `kividb` 1.2.2 packages (`packaging/test/from-1.2.sh`: a swap and
+an upgrade, with the unit running and with it stopped and disabled), and
+checks the release's own `.deb` and `.rpm` files: their Provides,
+Conflicts, Replaces and (none) Obsoletes, and an install and a swap of them
+in Debian 12 and Rocky Linux 9. `publish` and `source-tag` wait for it.
 It runs anywhere with Docker:
 `bash packaging/test/swap-test.sh <default kividb> <full kividb>`, with
 binaries built on glibc 2.34 (in `amazonlinux:2023`).

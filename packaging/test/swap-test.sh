@@ -181,7 +181,7 @@ if sh packaging/homebrew/formula.sh full 9.8.7 kividbio/kividb "" "$b" >/dev/nul
     echo "formula.sh took an empty checksum" >&2
     exit 1
 fi
-docker run --rm -v "$PWD/$work:/w:ro" ruby:3.3-slim sh -c 'ruby -c /w/formula-default.rb && ruby -c /w/formula-full.rb'
+retry docker run --rm -v "$PWD/$work:/w:ro" ruby:3.3-slim sh -c 'ruby -c /w/formula-default.rb && ruby -c /w/formula-full.rb'
 echo "ok: the Homebrew formulas render, with the release's urls and checksums"
 
 # ── The distributions ────────────────────────────────────────────────────
