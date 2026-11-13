@@ -23,6 +23,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and are kept out of the replication stream while writes are paused, so
   they now run straight away.
 
+- **`DEBUG DIGEST-VALUE` of a hash with field TTLs, and of a stream, stays
+  the same across a restart and an AOF replay (#519, #505).** Both were
+  digested as laid out in a snapshot, which writes field deadlines, groups,
+  consumers and producers in the order of tables whose order differs from
+  process to process, and a stream's layout also holds its consumers' last
+  seen times, which an AOF replay sets to its own clock. A hash's fields
+  are now summed with their deadlines as a plain hash's are, and a stream
+  is digested from its entries, groups, pending entries, consumer names and
+  idempotent IDs, without its consumers' times or when each idempotent ID
+  was recorded. The dataset fingerprint a restarted master
+  compares with its replicas uses the same digest, so those replicas are no
+  longer sent a full sync they did not need.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
