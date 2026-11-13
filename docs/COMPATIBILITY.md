@@ -153,9 +153,9 @@ other files:
   vector sets, Cuckoo filters, Count-min sketches, Top-K, t-digests) is
   refused.
 - Bloom filters: `COPY` copies one, which Redis refuses. A filter made before
-  RedisBloom 2.0 (32-bit hashes) is not loaded. A layer larger than 4 GiB,
-  or than what is left under `maxmemory`, is refused where Redis would try
-  to allocate it; so is one the system will not allocate. What a header, a
+  RedisBloom 2.0 (32-bit hashes) is not loaded. A filter has size limits
+  Redis does not have: `bloom-max-filter-bytes` (512 MiB unless raised) and
+  2048 layers, whether it is made, grows or is loaded. What a header, a
   snapshot, an RDB file or a `DUMP` payload says about a filter is checked
   before it is used: one Redis could not have made is refused. Their `DUMP` payloads carry RDB version 9, so every Redis
   since 6.0 can `RESTORE` them.

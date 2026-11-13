@@ -755,17 +755,24 @@ Redis master, `RESTORE`/`MIGRATE`, `BF.LOADCHUNK`) answers as it did there, and
 
 Settings (`CONFIG SET`, the config file): `bf-error-rate` (0.01),
 `bf-initial-size` (100) and `bf-expansion-factor` (2) are what `BF.ADD`,
-`BF.MADD` and `BF.INSERT` make a missing filter with. Such a filter is sent to
-replicas and the AOF as a `BF.INSERT` naming them, so a replica or a replay with
-other settings makes the same filter.
+`BF.MADD` and `BF.INSERT` make a missing filter with, and `bf-expansion-factor`
+what `BF.RESERVE` takes without `EXPANSION`. Such a filter is sent to replicas
+and the AOF naming what it took, so a replica or a replay with other settings
+makes the same filter. `bloom-max-filter-bytes` (512 MiB; KiviDB's own, with
+units as `maxmemory` takes them) is the most one filter may take.
 
 ### Differences from Redis
 
 - `COPY` copies a filter; Redis refuses it.
-- A filter made before RedisBloom 2.0 (32-bit hashes) is not loaded, and a
-  layer larger than 4 GiB, or than what is left under `maxmemory`, or than the
-  system will allocate, is refused (`ERR filter is too large`, or `OOM ...`)
-  where Redis would try to allocate it.
+- A filter made before RedisBloom 2.0 (32-bit hashes) is not loaded.
+- Size limits: a filter over `bloom-max-filter-bytes` (512 MiB unless raised)
+  or 2048 layers is not made, grown or loaded (`ERR filter is too large`);
+  Redis has no such limit. Nor is one the system will not allocate.
+- Under `maxmemory`, a client's command that would allocate more than is left
+  evicts first under the policy, and is refused with `OOM ...` only if that is
+  not enough. A command from a master or the AOF is not refused.
+- A scaling filter that cannot grow any more (its error rate too small for
+  another layer) answers `ERR problem inserting into filter`, as Redis does.
 - `BF.LOADCHUNK`, `RESTORE` and the loaders check what they are given: a
   layer Redis could not have made (no capacity, a hash count that does not
   follow from its bits per item, flags of no known layout) is refused.

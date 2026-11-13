@@ -5,10 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.3.0] - Unreleased
-
-Kept apart from the 1.2.1 changes under [Unreleased] below: these ship in
-1.3.0.
+## [Unreleased]
 
 ### Upgrading
 
@@ -23,7 +20,8 @@ Kept apart from the 1.2.1 changes under [Unreleased] below: these ship in
 ### Added
 
 - **Bloom filters (`BF.*`), as Redis 8 has them built in (part of #453).**
-  `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.INSERT`, `BF.EXISTS`, `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`, `BF.LOADCHUNK` and
+  `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.INSERT`, `BF.EXISTS`,
+  `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`, `BF.LOADCHUNK` and
   `BF.DEBUG`, and the `bf-error-rate`, `bf-initial-size` and
   `bf-expansion-factor` settings. Replies and errors are Redis 8.10's, byte
   for byte, in RESP2 and RESP3, quirks included (`BF.EXISTS` answers 0 for
@@ -32,20 +30,22 @@ Kept apart from the 1.2.1 changes under [Unreleased] below: these ship in
   moved from Redis answer as they did there: RDB files and full syncs from
   Redis 8 and Redis Stack 6.2 to 7.4, `RESTORE` and `MIGRATE` of Redis's
   `DUMP` payloads, and `BF.SCANDUMP` chunks. `DUMP` writes Redis's format,
-  which every Redis since 6.0 restores. A filter a command made for want of
-  one goes to replicas and the AOF as a `BF.INSERT` naming how it was made,
-  so a replica with other settings makes the same filter. `COPY` copies a
-  filter (Redis refuses), and, as in Redis, no `BF.*` command sends a
-  keyspace event. `MODULE LIST` reports Redis 8's `bf` module, and `ACL`
-  has the `@bloom` category. Snapshots keep filters under a new record
-  (tag 40), so a snapshot with a Bloom filter in it cannot be read by an
-  earlier release (see Upgrading). What a header, a snapshot, an RDB file
-  or a `DUMP` payload says about a filter is checked before it is used, and
-  a layer is at most 4 GiB: larger ones, and allocations the system
-  refuses, are errors, never an abort. Cuckoo filters, Count-min sketches,
-  Top-K and t-digests follow.
-
-## [Unreleased]
+  which every Redis since 6.0 restores. A command that made its filter with
+  a setting of this node's (`BF.ADD` on a missing key, `BF.RESERVE`
+  without `EXPANSION`) goes to replicas and the AOF naming what it took,
+  so a replica or a replay with other settings makes the same filter.
+  `maxmemory` holds back clients, not a master or the AOF: a client's
+  command that would not fit evicts first under the policy, and gets `OOM`
+  only if that is not enough. `COPY` copies a filter (Redis refuses); a
+  copy, a snapshot and a `DUMP` share the filter's bytes until it is next
+  written. As in Redis 8.10, no `BF.*` command sends a keyspace event but
+  `new` for a key it made. `MODULE LIST` reports Redis 8's `bf` module,
+  and `ACL` has the `@bloom` category. Snapshots keep filters under a new
+  record (tag 40), so a snapshot with a Bloom filter in it cannot be read
+  by an earlier release (see Upgrading). Unlike Redis, a filter has size
+  limits: `bloom-max-filter-bytes`, a new setting, is 512 MiB by default;
+  raise it for larger filters. Cuckoo filters, Count-min sketches, Top-K
+  and t-digests follow.
 
 ### Changed
 
@@ -419,6 +419,7 @@ See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before 
   binary is built against. On an older system (Debian 11, Ubuntu 20.04,
   RHEL 8, Amazon Linux 2) the package manager now refuses them, rather than
   installing a server that cannot start.
+
 ### Changed
 
 - **`HELLO` reports the Redis release KiviDB follows: `server: redis`,
