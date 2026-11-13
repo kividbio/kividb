@@ -12,7 +12,9 @@ use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin}
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamId, StreamInner};
+use crate::types::{
+    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntries, StreamId, StreamInner,
+};
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
 use parking_lot::RwLock;
@@ -510,13 +512,17 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         if (cmd.len() - i) < 2 || !(cmd.len() - i).is_multiple_of(2) {
             return resp_error("ERR wrong number of arguments: field-value pairs required");
         }
-        type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
-        let fields: FieldsType = cmd[i..]
+        // Borrowed from the command's arguments, which outlive `ctx`'s
+        // borrows below: the stream copies the bytes it keeps.
+        let fields: Vec<(&[u8], &[u8])> = cmd[i..]
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|chunk| (Arc::from(chunk[0]), Arc::from(chunk[1])))
+            .map(|&[field, value]| (field, value))
             .collect();
+        if !StreamEntries::fits(&fields) {
+            return resp_error("ERR Elements are too large to be stored");
+        }
 
         // Owned (producer, idempotent ID): the borrow of `ctx.cmd` ends here.
         let idmp: Option<(Vec<u8>, Arc<[u8]>)> =

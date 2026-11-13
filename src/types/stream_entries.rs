@@ -134,6 +134,7 @@ struct Block {
 }
 
 // The anchors fill what would be padding.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Block>() == 56);
 
 /// Where a scan of a block is: the entry at `off`, the `idx`th of the block,
@@ -163,6 +164,17 @@ impl Decoded {
     }
 }
 
+/// The bytes `fields`' names take at the head of a block, or `None` past
+/// `u32::MAX`, where a block's `hdr` can no longer say where they end.
+fn names_len<K: AsRef<[u8]>, V>(fields: &[(K, V)]) -> Option<u32> {
+    let mut len = vlen(fields.len() as u64) as u64;
+    for (k, _) in fields {
+        let k = k.as_ref().len() as u64;
+        len = len.checked_add(vlen(k) as u64 + k)?;
+    }
+    u32::try_from(len).ok()
+}
+
 fn entry_len<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     same: bool,
     (dms, seq): (u64, u64),
@@ -182,15 +194,12 @@ fn entry_len<K: AsRef<[u8]>, V: AsRef<[u8]>>(
 }
 
 impl Block {
-    /// A block of the one entry `id`, its field names the block's.
+    /// A block of the one entry `id`, its field names the block's. Every
+    /// entry is checked with [`StreamEntries::fits`] before it gets here.
     fn start<K: AsRef<[u8]>, V: AsRef<[u8]>>(id: &StreamId, fields: &[(K, V)]) -> Block {
-        let hdr = vlen(fields.len() as u64)
-            + fields
-                .iter()
-                .map(|(k, _)| str_len(k.as_ref()))
-                .sum::<usize>();
+        let hdr = names_len(fields).expect("an entry's field names fit in a block");
         let size = entry_len(true, (0, 0), fields);
-        let mut buf = Vec::with_capacity(hdr + size);
+        let mut buf = Vec::with_capacity(hdr as usize + size);
         put(&mut buf, fields.len() as u64);
         for (k, _) in fields {
             put_str(&mut buf, k.as_ref());
@@ -198,7 +207,7 @@ impl Block {
         let mut block = Block {
             key: id.clone(),
             buf,
-            hdr: hdr as u32,
+            hdr,
             dead: 0,
             count: 0,
             live: 0,
@@ -334,6 +343,40 @@ impl Block {
             n,
             body,
             end: p,
+        }
+    }
+
+    /// Move `c` past the entries whose IDs `before` holds for, up to the
+    /// first it does not or the block's end. Only an entry's flags and ID
+    /// are read; its fields are passed over by their lengths.
+    fn skip_while(&self, c: &mut Cursor, names: usize, before: impl Fn(&StreamId) -> bool) {
+        let b = &self.buf;
+        while !self.at_end(c) {
+            let mut p = c.off;
+            let flags = b[p];
+            p += 1;
+            let dms = get(b, &mut p);
+            let seq = get(b, &mut p);
+            let base = if c.idx.is_multiple_of(SEGMENT) {
+                &self.key
+            } else {
+                &c.prev
+            };
+            let id = undelta(base, dms, seq);
+            if !before(&id) {
+                return;
+            }
+            let strings = if flags & SAME_NAMES != 0 {
+                names
+            } else {
+                2 * get(b, &mut p) as usize
+            };
+            for _ in 0..strings {
+                skip_str(b, &mut p);
+            }
+            c.off = p;
+            c.idx += 1;
+            c.prev = id;
         }
     }
 
@@ -638,6 +681,13 @@ impl StreamEntries {
         self.len == 0
     }
 
+    /// Whether an entry of `fields` can be stored: its field names, encoded,
+    /// come to no more than `u32::MAX` bytes. [`StreamEntries::push_tail`]
+    /// and [`LoadedEntries::insert`] take only entries that fit.
+    pub fn fits<K: AsRef<[u8]>, V>(fields: &[(K, V)]) -> bool {
+        names_len(fields).is_some()
+    }
+
     pub fn contains(&self, id: &StreamId) -> bool {
         self.locate(id).is_some()
     }
@@ -699,7 +749,13 @@ impl StreamEntries {
         let lo = range.start_bound().cloned();
         let hi = range.end_bound().cloned();
         let (bi, c) = match bound_id(&lo).map(|x| (x, self.floor(x))) {
-            Some((x, Some(bi))) => (bi, self.seek(bi, x)),
+            Some((x, Some(bi))) => {
+                let b = &self.blocks[bi];
+                let (names, _) = b.names();
+                let mut c = self.seek(bi, x);
+                b.skip_while(&mut c, names, |id| below(&lo, id));
+                (bi, c)
+            }
             _ if self.blocks.is_empty() => (0, Cursor::start()),
             _ => (0, self.begin(0)),
         };
@@ -833,17 +889,14 @@ impl StreamEntries {
         let b = &self.blocks[bi];
         let (names, _) = b.names();
         let mut c = self.seek(bi, id);
-        while !b.at_end(&c) {
-            let off = c.off;
-            let d = b.decode(&mut c, names);
-            if d.id == *id {
-                return d.live().then_some((bi, d, off));
-            }
-            if d.id > *id {
-                return None;
-            }
+        // IDs only increase through a block, deleted entries included.
+        b.skip_while(&mut c, names, |x| x < id);
+        if b.at_end(&c) {
+            return None;
         }
-        None
+        let off = c.off;
+        let d = b.decode(&mut c, names);
+        (d.id == *id && d.live()).then_some((bi, d, off))
     }
 
     fn append<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, id: StreamId, fields: &[(K, V)]) {
@@ -969,12 +1022,14 @@ impl StreamEntries {
         let b = &mut self.blocks[bi];
         b.buf[off] |= DELETED;
         b.live -= 1;
-        b.dead += (d.end - off) as u32;
         self.len -= 1;
         if b.live == 0 {
             self.drop_block(bi);
             return;
         }
+        // The block holds another entry, so it is at most MAX_BYTES: only
+        // an entry alone in its block is larger.
+        b.dead += u32::try_from(d.end - off).expect("an entry beside another is small");
         if bi == 0 {
             self.skip_head();
         }
@@ -1031,7 +1086,8 @@ impl StreamEntries {
                 c = at;
                 break;
             }
-            b.dead -= (d.end - at.off) as u32;
+            // Deleted, in a block with a live entry: small (see `kill`).
+            b.dead -= u32::try_from(d.end - at.off).expect("an entry beside another is small");
             moved = true;
         }
         if moved {
@@ -1654,6 +1710,9 @@ mod tests {
         assert_eq!(s.last_id(), all.last().cloned());
         for _ in 0..20 {
             let (a, b) = (some_id(r, model), some_id(r, model));
+            // Absent and deleted IDs too, which a lookup passes over.
+            assert_eq!(s.contains(&a), model.contains_key(&a), "{a:?}");
+            assert_eq!(s.get(&b).map(fields_of).as_ref(), model.get(&b), "{b:?}");
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             let bounds = [
                 (Included(lo.clone()), Included(hi.clone())),
@@ -1809,6 +1868,42 @@ mod tests {
         let s = l.finish();
         assert_eq!(s.len(), 200_000);
         assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn field_names_past_u32_max_do_not_fit() {
+        // One 1 MiB buffer named 4096 times, the last name cut so the names
+        // come to exactly u32::MAX encoded bytes.
+        let big = vec![b'n'; 1 << 20];
+        let whole = str_len(&big);
+        let last = u32::MAX as usize - vlen(4096) - 4095 * whole - vlen(1 << 20);
+        let names = |last: usize| -> Vec<(&[u8], &[u8])> {
+            let mut f = vec![(&big[..], &b""[..]); 4095];
+            f.push((&big[..last], b""));
+            f
+        };
+        assert_eq!(names_len(&names(last)), Some(u32::MAX));
+        assert!(StreamEntries::fits(&names(last)));
+        assert_eq!(names_len(&names(last + 1)), None);
+        assert!(!StreamEntries::fits(&names(last + 1)));
+        assert!(!StreamEntries::fits(&vec![(&big[..], &b""[..]); 4097]));
+        assert!(StreamEntries::fits(&fv(b"v")));
+        assert!(StreamEntries::fits::<&[u8], &[u8]>(&[]));
+    }
+
+    #[test]
+    fn deleting_a_lone_entry_larger_than_a_block_drops_its_block() {
+        let mut s = StreamEntries::new();
+        s.push_tail(id(1, 0), &fv(b"a"));
+        s.push_tail(id(2, 0), &fv(&vec![7u8; 100_000]));
+        s.push_tail(id(3, 0), &fv(b"c"));
+        s.audit();
+        assert!(s.remove(&id(2, 0)));
+        s.audit();
+        assert_eq!(ids(s.iter()), [id(1, 0), id(3, 0)]);
+        assert!(s.remove(&id(1, 0)));
+        s.audit();
+        assert_eq!(ids(s.iter()), [id(3, 0)]);
     }
 
     #[test]

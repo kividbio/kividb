@@ -513,6 +513,12 @@ fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
             let v = read_bytes(r)?;
             fields.push((f, v));
         }
+        if !crate::types::StreamEntries::fits(&fields) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream entry's field names are too large",
+            ));
+        }
         entries.insert(id, &fields);
     }
     stream.entries = entries.finish();
@@ -3896,6 +3902,9 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
                 seen_deleted += 1;
             } else {
                 seen_live += 1;
+                if !crate::types::StreamEntries::fits(&fields) {
+                    return Err(rdb_invalid("stream entry's field names are too large"));
+                }
                 entries.insert(crate::types::StreamId { ms, seq }, &fields);
             }
         }

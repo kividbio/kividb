@@ -11,7 +11,7 @@ use crate::types::{ConsumerGroup, IdmpRecord, NodeFill, StreamId, StreamInner};
 use std::sync::Arc;
 
 /// One field of a stream entry and its value.
-type Field = (Arc<[u8]>, Arc<[u8]>);
+type Field<'a> = (&'a [u8], &'a [u8]);
 
 // ── Idempotent production ────────────────────────────────────────────────────
 
@@ -518,7 +518,7 @@ pub(crate) static NODE_MAX_BYTES: std::sync::atomic::AtomicI64 =
 /// have: it opens a new node if the newest is full by
 /// `stream-node-max-entries` or would pass `stream-node-max-bytes`. Called
 /// before the entry is inserted and `entries_added` counts it.
-pub(crate) fn record_append(stream: &mut StreamInner, fields: &crate::types::FieldsType) {
+pub(crate) fn record_append(stream: &mut StreamInner, fields: &[Field]) {
     use std::hash::{Hash, Hasher};
     let max_entries = Approx::new(None).node;
     let max_bytes = NODE_MAX_BYTES
@@ -961,10 +961,10 @@ mod tests {
 
     #[test]
     fn content_ids_distinguish_messages_but_not_their_order() {
-        let f = |pairs: &[(&str, &str)]| -> Vec<Field> {
+        let f = |pairs: &[(&'static str, &'static str)]| -> Vec<Field<'static>> {
             pairs
                 .iter()
-                .map(|(a, b)| (Arc::from(a.as_bytes()), Arc::from(b.as_bytes())))
+                .map(|(a, b)| (a.as_bytes(), b.as_bytes()))
                 .collect()
         };
         let auto = IdmpArg::Auto { producer: b"p" };
