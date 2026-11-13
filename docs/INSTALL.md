@@ -226,7 +226,7 @@ docker pull ghcr.io/kividbio/kividb:latest
 `v1.2.0-tls` and `v1.2.0-full` are the others. Images are built for `amd64` and `arm64`.
 
 ```bash
-docker run -d -p 6380:6380  -v kividb-data:/data kividb/kividb
+docker run -d -p 6380:6380 -v kividb-data:/home/kividb kividb/kividb
 ```
 
 The `-v kividb-data:/home/kividb` flag mounts a named volume where KiviDB keeps its data (`/home/kividb`, the image's working directory), so it survives the container being removed and recreated. Without it, the data is lost with the container.
