@@ -55,16 +55,9 @@ impl StreamId {
 }
 
 mod stream_entries;
-pub use stream_entries::{EntryRef, StreamEntries};
+pub use stream_entries::{EntryRef, LoadedEntries, StreamEntries};
 
 pub type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
-/// A single entry in a stream.
-#[derive(Debug, Clone)]
-pub struct StreamEntry {
-    /// Field-value pairs in insertion order.
-    /// Vec<(field, value)> preserves order, which Redis guarantees.
-    pub fields: FieldsType,
-}
 
 /// The name of a consumer group or of a consumer: any bytes, as in Redis.
 pub type StreamName = crate::key_bytes::KeyBytes;

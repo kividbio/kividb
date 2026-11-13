@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`MEMORY USAGE` of a stream is what its entries take, and reads
+  differently (#683).** Stream entries are now packed into blocks, and
+  `MEMORY USAGE` counts those blocks exactly instead of estimating from a
+  sample of entries. The old estimate counted only the bytes of fields and
+  values, far below what the entries took. The new figure follows the
+  memory the entries really use, so it changes for every stream: a stream
+  of small entries (`f`=`v`) reports about three times what 1.2.1 reported,
+  though the memory it uses falls by more than 90%. Anything that alerts on
+  or graphs this number will see it move. `SAMPLES` no longer changes the
+  figure for a stream, and a stream's consumer groups and their pending
+  entries are still not counted.
+
 ### Fixed
 
 - **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
