@@ -2051,7 +2051,15 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
     // `vector::walk_documents` (#275). The walk used to index the fields as
     // it found them, and a write to the key meanwhile, which indexed what it
     // wrote, could be overwritten in the index by the walk's older copy.
+    //
+    // An index that gives its documents no ids counts each one the walk
+    // meets: made with `SKIPINITIALSCAN`, it has not met them before, and
+    // a search of the new field finds them from here on.
+    let keeps_keys = !def.gives_ids();
     crate::vector::walk_documents(&ctx.store[def.db_index], &def, |key, inner| {
+        if keeps_keys {
+            def.docs.add(key);
+        }
         for w in &work {
             let raw_bytes = match inner.get(&w.name) {
                 Some(b) => b,

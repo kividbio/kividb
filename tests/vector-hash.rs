@@ -6591,4 +6591,11 @@ fn num_docs_follows_the_documents_of_each_index() {
     hash_document(&mut c, "doc:9");
     assert_eq!(late(&mut c), [1, 1]);
     step(&mut c, &[], [2, 2, 0]);
+    // A vector field added walks the documents, and the index counts each
+    // one it meets.
+    let alter = "FT.ALTER late SCHEMA ADD other VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+                 DISTANCE_METRIC L2";
+    let alter: Vec<&str> = alter.split_whitespace().collect();
+    assert!(c.cmds(&alter).is_ok(), "{alter:?}");
+    assert_eq!(late(&mut c), [2, 1]);
 }
