@@ -1117,11 +1117,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "RANDOMKEY" => {
-            // A key picked at random: from a shard picked at random, and,
-            // if that one is empty, from the ones after it. A key whose
-            // time has run out is not a key: it is removed, and another
-            // picked, for as long as it takes, as in Redis (#566): each
-            // pick that removes one leaves one fewer to pick.
+            // A key picked at random: from a shard picked at random in
+            // proportion to its keys, so that every key is as likely as any
+            // other (in cluster mode one busy hash tag fills one shard, and
+            // picked evenly its keys came up far less often than the rest,
+            // #294), and, if that one is empty by now, from the ones after
+            // it. A key whose time has run out is not a key: it is removed,
+            // and another picked, for as long as it takes, as in Redis
+            // (#566): each pick that removes one leaves one fewer to pick.
             //
             // An expired key that stays (on a replica, while writes are
             // paused, or while loading) could be picked again and again:
@@ -1141,7 +1144,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             let mut kept_expired = 0;
             loop {
-                let start = rand::random::<usize>() % shards.max(1);
+                let mut weights = Vec::with_capacity(shards);
+                crate::store::shard_weights(&ctx.store[db], false, &mut weights);
+                let start = crate::store::pick_weighted(&weights, rand::random::<usize>())
+                    .unwrap_or_else(|| rand::random::<usize>() % shards.max(1));
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
                     map.random_entry(rand::random::<usize>)

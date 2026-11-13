@@ -7372,6 +7372,268 @@ fn peers_learn_an_announce_address_changed_at_runtime() {
     wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
 }
 
+// ── Keys of a slot (#294) ────────────────────────────────────────────────────
+
+/// The slot of `key` as a cluster sees it: of its hash tag, if it has one.
+fn tagged_slot_of(key: &str) -> u16 {
+    let tag = key.find('{').and_then(|open| {
+        let rest = &key[open + 1..];
+        rest.find('}')
+            .filter(|&len| len > 0)
+            .map(|len| &rest[..len])
+    });
+    slot_of(tag.unwrap_or(key))
+}
+
+/// Every key the node is expected to hold, by slot.
+type KeysBySlot = std::collections::BTreeMap<u16, std::collections::BTreeSet<String>>;
+
+/// Writes keys of every kind on `c`, some of them under hash tags (a slot
+/// with many keys), some with a time to live, and returns them by slot.
+/// `DEBUG POPULATE` writes `key:0` to `key:{populate - 1}`.
+fn fill_slots(c: &mut Conn, populate: usize) -> KeysBySlot {
+    let mut keys: Vec<String> = (0..populate).map(|i| format!("key:{i}")).collect();
+    assert!(c.cmd(&["DEBUG", "POPULATE", &populate.to_string()]).is_ok());
+    let mut writes: Vec<Vec<String>> = Vec::new();
+    for i in 0..300 {
+        let key = format!("{{busy}}:{i}");
+        writes.push(vec![
+            "SET".into(),
+            key.clone(),
+            "v".into(),
+            "EX".into(),
+            "100000".into(),
+        ]);
+        keys.push(key);
+    }
+    for i in 0..200 {
+        let (h, l, z, s) = (
+            format!("h:{i}"),
+            format!("{{list}}:{i}"),
+            format!("z:{i}"),
+            format!("s:{{{i}}}"),
+        );
+        writes.push(vec!["HSET".into(), h.clone(), "f".into(), "v".into()]);
+        writes.push(vec!["RPUSH".into(), l.clone(), "a".into(), "b".into()]);
+        writes.push(vec!["ZADD".into(), z.clone(), "1".into(), "m".into()]);
+        writes.push(vec!["SADD".into(), s.clone(), "m".into()]);
+        keys.extend([h, l, z, s]);
+    }
+    for chunk in writes.chunks(500) {
+        let chunk: Vec<Vec<&str>> = chunk
+            .iter()
+            .map(|w| w.iter().map(String::as_str).collect())
+            .collect();
+        for reply in c.pipeline(&chunk) {
+            assert!(reply.err().is_none(), "{reply:?}");
+        }
+    }
+    let mut by_slot = KeysBySlot::new();
+    for key in keys {
+        by_slot.entry(tagged_slot_of(&key)).or_default().insert(key);
+    }
+    by_slot
+}
+
+/// `commands` sent in pipelines of a thousand, their replies in order.
+fn pipelined(c: &mut Conn, commands: &[Vec<String>]) -> Vec<Resp> {
+    let mut replies = Vec::with_capacity(commands.len());
+    for chunk in commands.chunks(1000) {
+        let chunk: Vec<Vec<&str>> = chunk
+            .iter()
+            .map(|args| args.iter().map(String::as_str).collect())
+            .collect();
+        replies.extend(c.pipeline(&chunk));
+    }
+    replies
+}
+
+/// `COUNTKEYSINSLOT` and `GETKEYSINSLOT` give exactly the keys of `want` for
+/// every slot, every key is found by a read, and there are no others.
+fn assert_slots_hold(c: &mut Conn, want: &KeysBySlot, what: &str) {
+    let total: usize = want.values().map(|k| k.len()).sum();
+    assert_eq!(c.cmd(&["DBSIZE"]).int(), total as i64, "{what}: DBSIZE");
+    let counts = pipelined(
+        c,
+        &(0..16384u16)
+            .map(|s| vec!["CLUSTER".into(), "COUNTKEYSINSLOT".into(), s.to_string()])
+            .collect::<Vec<_>>(),
+    );
+    for (slot, count) in counts.iter().enumerate() {
+        let expected = want.get(&(slot as u16)).map_or(0, |k| k.len());
+        assert_eq!(
+            count.int(),
+            expected as i64,
+            "{what}: COUNTKEYSINSLOT {slot}"
+        );
+    }
+    let lists = pipelined(
+        c,
+        &want
+            .keys()
+            .map(|s| {
+                vec![
+                    "CLUSTER".into(),
+                    "GETKEYSINSLOT".into(),
+                    s.to_string(),
+                    "100000".into(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
+    for ((slot, keys), got) in want.iter().zip(&lists) {
+        let got: std::collections::BTreeSet<String> = got.array().iter().map(Resp::text).collect();
+        assert_eq!(&got, keys, "{what}: GETKEYSINSLOT {slot}");
+    }
+    // Found by key, too: each where a read looks for it.
+    let all: Vec<&String> = want.values().flatten().collect();
+    let found = pipelined(
+        c,
+        &all.iter()
+            .map(|k| vec!["EXISTS".into(), k.to_string()])
+            .collect::<Vec<_>>(),
+    );
+    for (key, found) in all.iter().zip(&found) {
+        assert_eq!(found.int(), 1, "{what}: EXISTS {key}");
+    }
+}
+
+/// `CLUSTER COUNTKEYSINSLOT` and `GETKEYSINSLOT` look at the one store
+/// shard that holds a slot's keys, not at every key of the node (#294:
+/// `redis-cli --cluster reshard` asks for each batch of keys it moves, and
+/// on a node of millions of keys each call took a third of a second). For
+/// that a cluster node places each key in the shard of its slot. This holds
+/// the counts and lists to every key, for keys written, deleted, loaded
+/// from a snapshot (the node's own, and one written by a server not in
+/// cluster mode), from the AOF, and sent to a replica in a full sync.
+#[test]
+fn keys_in_slot_are_found_wherever_they_came_from() {
+    let (mut nodes, _) = form_cluster(1);
+    // A cluster node places keys by slot: what the rest of this checks.
+    let log = nodes[0].log();
+    assert!(log.contains("Keys placed by : cluster slot"), "{log}");
+    let mut want = {
+        let mut c = nodes[0].conn();
+        let mut want = fill_slots(&mut c, 20_000);
+        assert_slots_hold(&mut c, &want, "written");
+
+        // Deleted: from the counts and the lists as well.
+        for i in (0..20_000).step_by(7) {
+            let key = format!("key:{i}");
+            assert_eq!(c.cmd(&["DEL", &key]).int(), 1);
+            let slot = tagged_slot_of(&key);
+            let keys = want.get_mut(&slot).unwrap();
+            keys.remove(&key);
+            if keys.is_empty() {
+                want.remove(&slot);
+            }
+        }
+        assert_slots_hold(&mut c, &want, "after deletes");
+        assert!(c.cmd(&["SAVE"]).is_ok());
+        want
+    };
+
+    // The node's own snapshot.
+    nodes[0].restart();
+    wait_cluster_ok(&[&nodes[0]], 1);
+    assert_slots_hold(&mut nodes[0].conn(), &want, "loaded from the snapshot");
+
+    // A replica's full sync.
+    let replica = add_replica(&nodes, &nodes[0]);
+    let mut r = replica.conn();
+    assert!(r.cmd(&["READONLY"]).is_ok());
+    wait_until(
+        "the replica to have every key",
+        Duration::from_secs(20),
+        || r.cmd(&["DBSIZE"]).int() == nodes[0].conn().cmd(&["DBSIZE"]).int(),
+    );
+    assert_slots_hold(&mut r, &want, "on the replica");
+    drop(r);
+    drop(replica);
+
+    // The AOF: the snapshot it starts from, and the writes in it after.
+    {
+        let mut c = nodes[0].conn();
+        assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).is_ok());
+        assert!(c.cmd(&["CONFIG", "REWRITE"]).is_ok());
+        // Done once a rewrite has finished: this process had none before
+        // (`aof_last_rewrite_time_ms:-1`), so `aof_rewrite_in_progress:0`
+        // alone could be read before the one asked for had begun.
+        wait_until("the AOF's first rewrite", Duration::from_secs(20), || {
+            let info = c.cmd(&["INFO", "persistence"]).text();
+            info.contains("aof_rewrite_in_progress:0")
+                && !info.contains("aof_last_rewrite_time_ms:-1")
+                && info.contains("aof_last_bgrewrite_status:ok")
+        });
+        let writes: Vec<Vec<String>> = (0..2000)
+            .map(|i| vec!["SET".into(), format!("aof:{i}"), "v".into()])
+            .chain(
+                (0..20_000)
+                    .step_by(11)
+                    .map(|i| vec!["DEL".into(), format!("key:{i}")]),
+            )
+            .collect();
+        for reply in pipelined(&mut c, &writes) {
+            assert!(reply.err().is_none(), "{reply:?}");
+        }
+        for i in 0..2000 {
+            let key = format!("aof:{i}");
+            want.entry(tagged_slot_of(&key)).or_default().insert(key);
+        }
+        for i in (0..20_000).step_by(11) {
+            let key = format!("key:{i}");
+            let slot = tagged_slot_of(&key);
+            if let Some(keys) = want.get_mut(&slot) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    want.remove(&slot);
+                }
+            }
+        }
+        // Long enough for the AOF to have them on disk (fsync every second).
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    nodes[0].restart();
+    // The replica, gone, is still in its table.
+    wait_until("the node to be up", Duration::from_secs(30), || {
+        nodes[0].cluster_info("cluster_state") == "ok"
+    });
+    assert_slots_hold(&mut nodes[0].conn(), &want, "loaded from the AOF");
+}
+
+/// A snapshot written by a server not in cluster mode, where keys are
+/// placed by another hash, is loaded by a cluster node into the shards of
+/// their slots (#294).
+#[test]
+fn a_standalone_snapshot_loads_into_the_shards_of_its_slots() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = cluster_port();
+    let mut plain = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(&dir)
+        .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let want = {
+        let mut c = Conn::connect(port);
+        let want = fill_slots(&mut c, 20_000);
+        assert!(c.cmd(&["SAVE"]).is_ok());
+        want
+    };
+    let _ = plain.kill();
+    let _ = plain.wait();
+
+    let mut node = Node::start(&[]);
+    node.kill();
+    std::fs::copy(dir.join("dump.kdb"), node.dir.join("dump.kdb")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    node.spawn();
+    let (nodes, _) = form_cluster_of(vec![node]);
+    assert_slots_hold(&mut nodes[0].conn(), &want, "a standalone snapshot");
+}
+
 /// A write of several keys of one hash tag is one step, as it is in Redis:
 /// a reader never finds some of a `DEL`'s keys gone and others not, nor a
 /// `RENAME`'s source gone and its destination not there yet (#159). A
@@ -7435,4 +7697,30 @@ fn readers_never_see_a_write_of_one_hash_tag_half_done() {
         0,
         "a reader saw a write half done"
     );
+}
+
+/// `RANDOMKEY` picks every key as often as any other, however its keys fill
+/// the store's shards: on a cluster node, where keys are placed by slot,
+/// the keys of one hash tag fill one shard, and picking a shard evenly gave
+/// them 3% of the picks for half of the keys (#294).
+#[test]
+fn randomkey_is_even_over_a_busy_hash_tag() {
+    let (nodes, _) = form_cluster(1);
+    let mut c = nodes[0].conn();
+    let writes: Vec<Vec<String>> = (0..2_000)
+        .flat_map(|i| {
+            [
+                vec!["SET".into(), format!("{{a}}k{i}"), "v".into()],
+                vec!["SET".into(), format!("k{i}"), "v".into()],
+            ]
+        })
+        .collect();
+    for reply in pipelined(&mut c, &writes) {
+        assert!(reply.is_ok(), "{reply:?}");
+    }
+    let picks = pipelined(&mut c, &vec![vec!["RANDOMKEY".to_string()]; 4_000]);
+    let tagged = picks.iter().filter(|k| k.text().starts_with("{a}")).count();
+    // Half; about 0.008 either way.
+    let share = tagged as f64 / picks.len() as f64;
+    assert!((0.44..0.56).contains(&share), "tagged share {share}");
 }

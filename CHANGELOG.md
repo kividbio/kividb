@@ -70,6 +70,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`redis-cli --cluster reshard` no longer walks every key of a node for
+  each batch it moves (#294).** `CLUSTER GETKEYSINSLOT`, `COUNTKEYSINSLOT`
+  and the empty-slot check of `CLUSTER SETSLOT` looked at every key of the
+  node to find one slot's, so on a node of millions of keys each call took
+  hundreds of milliseconds and resharding moved a few slots a minute. A
+  cluster node now keeps each key in the store shard of its slot, and these
+  commands look at that shard alone. Servers not in cluster mode place keys
+  as before, and pay nothing for it. Eviction and `RANDOMKEY` now pick a
+  shard in proportion to its keys, so the keys of one busy hash tag, all in
+  one shard, are as likely to be evicted or returned as any others. Writes
+  to the keys of one hash tag on a cluster node now share one shard lock,
+  as all writes in Redis share one thread.
+
 - **A write of several keys that share a store shard is no longer seen
   half done.** A `DEL` of several keys, `RENAME`, `SMOVE`, `COPY` and the
   other writes of more than one key work on their keys one at a time, and
@@ -78,6 +91,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reading them at the same moment could find some deleted and others not,
   or a renamed key in neither place. Every write of more than one key is
   now one step.
+
 
 - **Searches in a cluster no longer use up the coordinator's ports
   (#723).** `FT.SEARCH` and `FT.AGGREGATE` opened a new connection to every
