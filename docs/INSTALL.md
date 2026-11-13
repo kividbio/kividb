@@ -226,8 +226,10 @@ docker pull ghcr.io/kividbio/kividb:latest
 `v1.2.0-tls` and `v1.2.0-full` are the others. Images are built for `amd64` and `arm64`.
 
 ```bash
-docker run -p 6380:6380 kividb/kividb
+docker run -d -p 6380:6380 -v kividb-data:/home/kividb kividb/kividb
 ```
+
+The `-v kividb-data:/home/kividb` flag mounts a named volume where KiviDB keeps its data (`/home/kividb`, the image's working directory), so it survives the container being removed and recreated. Without it, the data is lost with the container.
 
 A container is reached through its network, never from loopback, so the image's default
 command is `--protected-mode no`. **Arguments you pass replace that default**, which turns
