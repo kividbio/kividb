@@ -35,6 +35,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   close, as any long-lived client does, and searches fail with the login
   error once they are replaced.
 
+- **`DEBUG SLEEP` returns Redis's errors for non-numeric and wrong-arity arguments (#657).**
+  A non-numeric argument (`DEBUG SLEEP abc`) was reported as a wrong number
+  of arguments, and arity errors used KiviDB's own wording. A non-numeric
+  argument now answers `ERR value is not a valid float`, and wrong argument
+  counts answer `ERR unknown subcommand or wrong number of arguments for
+  '<subcommand>'. Try DEBUG HELP.`, matching Redis and the other `DEBUG`
+  subcommands.
 - **A script that waits for `TIME` to move ends (#676).** `TIME` in a
   script returned the script's start for as long as it ran, so a loop
   waiting for it to change ran until `SCRIPT KILL`. As in Redis, `TIME`
