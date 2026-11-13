@@ -37,7 +37,10 @@ impl PelEntry {
     }
 }
 
-/// The IDs one consumer owns.
+/// The IDs one consumer owns. Kept when it comes to own none, so a consumer
+/// that is handed one entry at a time and acknowledges it does not make
+/// and drop its slot each time; dropped by [`Pel::remove_consumer`] and
+/// with the group.
 #[derive(Debug, Clone)]
 struct Owned {
     name: Arc<StreamName>,
@@ -48,31 +51,68 @@ struct Owned {
 #[derive(Debug, Clone, Default)]
 pub struct Pel {
     entries: BTreeMap<StreamId, PelEntry>,
-    /// Consumer name → the IDs it owns. A consumer with none has no entry.
+    /// Consumer name → the IDs it owns.
     owners: Owners,
 }
 
-type Owners = AHashMap<StreamName, Owned>;
-
-/// `consumer`'s index entry, made if it has none. One lookup: a consumer
-/// name is short, and copying it is cheaper than looking it up twice.
-fn owner_mut<'a>(owners: &'a mut Owners, consumer: &[u8]) -> &'a mut Owned {
-    owners
-        .entry(StreamName::from(consumer))
-        .or_insert_with_key(|name| Owned {
-            name: Arc::new(name.clone()),
-            ids: BTreeSet::new(),
-        })
+/// The consumers' slots, by name. A table of its own rather than a map
+/// keyed by name: the name is in the slot already, and a lookup by a
+/// borrowed name that finds nothing inserts without a second lookup.
+#[derive(Debug, Clone, Default)]
+struct Owners {
+    table: hashbrown::HashTable<Owned>,
+    hasher: ahash::RandomState,
 }
 
-/// Takes `id` out of `consumer`'s index, and the consumer out of the index
-/// once it owns nothing.
+impl Owners {
+    fn get(&self, consumer: &[u8]) -> Option<&Owned> {
+        let hash = self.hasher.hash_one(consumer);
+        self.table
+            .find(hash, |owned| owned.name.as_bytes() == consumer)
+    }
+
+    fn get_mut(&mut self, consumer: &[u8]) -> Option<&mut Owned> {
+        let hash = self.hasher.hash_one(consumer);
+        self.table
+            .find_mut(hash, |owned| owned.name.as_bytes() == consumer)
+    }
+
+    /// `consumer`'s slot, made if it has none: one lookup, and the name is
+    /// copied only into a new slot.
+    fn slot(&mut self, consumer: &[u8]) -> &mut Owned {
+        let hasher = &self.hasher;
+        let hash = hasher.hash_one(consumer);
+        self.table
+            .entry(
+                hash,
+                |owned| owned.name.as_bytes() == consumer,
+                |owned| hasher.hash_one(owned.name.as_bytes()),
+            )
+            .or_insert_with(|| Owned {
+                name: Arc::new(StreamName::from(consumer)),
+                ids: BTreeSet::new(),
+            })
+            .into_mut()
+    }
+
+    fn remove(&mut self, consumer: &[u8]) -> Option<Owned> {
+        let hash = self.hasher.hash_one(consumer);
+        let found = self
+            .table
+            .find_entry(hash, |owned| owned.name.as_bytes() == consumer);
+        found.ok().map(|slot| slot.remove().0)
+    }
+}
+
+/// `consumer`'s index entry, made if it has none.
+fn owner_mut<'a>(owners: &'a mut Owners, consumer: &[u8]) -> &'a mut Owned {
+    owners.slot(consumer)
+}
+
+/// Takes `id` out of `consumer`'s index. The slot stays, even empty.
 fn unlink(owners: &mut Owners, consumer: &[u8], id: &StreamId) {
     if let Some(owned) = owners.get_mut(consumer) {
         owned.ids.remove(id);
-        if owned.ids.is_empty() {
-            owners.remove(consumer);
-        }
     }
 }
 
@@ -215,9 +255,10 @@ impl Pel {
             .owners
             .get(consumer)
             .map(|owned| owned.ids.range(range));
-        ids.into_iter().flatten().map(|id| {
-            let entry = self.entries.get(id).expect("indexed entry is pending");
-            (id, entry)
+        ids.into_iter().flatten().filter_map(|id| {
+            let entry = self.entries.get(id);
+            debug_assert!(entry.is_some(), "{id}: indexed but not pending");
+            Some((id, entry?))
         })
     }
 
@@ -225,13 +266,15 @@ impl Pel {
     /// unnamed one, if listed, holds the entries `XNACK` released.
     pub fn owners(&self) -> impl Iterator<Item = (&StreamName, usize)> {
         self.owners
+            .table
             .iter()
-            .map(|(name, owned)| (name, owned.ids.len()))
+            .filter(|owned| !owned.ids.is_empty())
+            .map(|owned| (&*owned.name, owned.ids.len()))
     }
 
     /// Checks the index against a scan of the whole list: every entry is
-    /// in its owner's set, every set holds only entries the consumer owns,
-    /// and no set is empty. For tests and `DEBUG`; it walks everything.
+    /// in its owner's set, and every set holds only entries the consumer
+    /// owns (a set may be empty). For tests; it walks everything.
     pub fn check(&self) -> Result<(), String> {
         let mut counts: AHashMap<&[u8], usize> = AHashMap::new();
         for (id, entry) in &self.entries {
@@ -246,17 +289,22 @@ impl Pel {
                 _ => return Err(format!("{id}: not in its consumer's index")),
             }
         }
-        for (name, owned) in &self.owners {
-            if owned.ids.is_empty() {
-                return Err(format!("{name:?}: empty index entry"));
-            }
-            if counts.get(name.as_bytes()).copied() != Some(owned.ids.len()) {
+        let mut slots = 0;
+        for owned in self.owners.table.iter() {
+            let name = &owned.name;
+            let listed = counts.get(name.as_bytes()).copied().unwrap_or(0);
+            if listed != owned.ids.len() {
                 return Err(format!(
-                    "{name:?}: index holds {} entries, the list {}",
+                    "{name:?}: index holds {} entries, the list {listed}",
                     owned.ids.len(),
-                    counts.get(name.as_bytes()).copied().unwrap_or(0)
                 ));
             }
+            if listed > 0 {
+                slots += 1;
+            }
+        }
+        if slots != counts.len() {
+            return Err("a consumer that owns entries has no slot".into());
         }
         Ok(())
     }
@@ -299,6 +347,7 @@ mod tests {
         assert_eq!(pel.assign(&id(1), b"c").unwrap().delivered_at, 10);
         assert_eq!(pel.consumer_len(b"a"), 0);
         assert_eq!(pel.owners().count(), 2, "a owns nothing, so is not listed");
+        pel.check().unwrap();
         assert!(pel.assign(&id(9), b"c").is_none());
         assert_eq!(pel.remove(&id(3)).unwrap().consumer(), "b");
         assert!(pel.remove(&id(3)).is_none());

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -138,6 +138,42 @@ impl Conn {
     }
 }
 
+/// Whether nothing has `port`. It is asked with a socket that is bound and
+/// never listens. One that listened, as this used to, could be given a
+/// connection: a server another test is starting holds, between its fork and
+/// its exec, a copy of every socket this process has open, and a client that
+/// dialled the port in that moment was connected to the copy and then reset
+/// ("Connection reset by peer", at the first command of a test).
+fn port_is_free(port: u16) -> bool {
+    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
+        return false;
+    };
+    // As the server's own socket, so that a copy of this one, while it
+    // lasts, does not keep the server from the port.
+    #[cfg(unix)]
+    let _ = probe.set_reuse_address(true);
+    probe
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .is_ok()
+}
+
+/// A port nothing is listening on — and not one the system hands out to
+/// outgoing connections. A client that starts dialling before its server is
+/// listening can otherwise be given, as its own end, the very port it is
+/// dialling: it is then connected to itself and reads back what it writes.
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let from = (std::process::id() as u16).wrapping_mul(31);
+        let port = 10_000 + from.wrapping_add(step) % 20_000;
+        if port_is_free(port) {
+            return port;
+        }
+    }
+}
+
 /// A server process of its own, so it can be stopped and started again on
 /// the same directory.
 struct Server {
@@ -150,11 +186,7 @@ impl Server {
     /// alongside takes it first.
     fn start(dir: &Path, extra: &[&str]) -> Server {
         for _ in 0..5 {
-            let port = TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
+            let port = free_port();
             let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
                 .current_dir(dir)
                 .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
@@ -346,13 +378,17 @@ fn some_id(c: &mut Conn, r: &mut Rng, key: &str, group: &str, top: u64) -> Strin
 }
 
 /// One random change of the pending list, through any command that adds,
-/// moves or removes a pending entry.
-fn random_change(c: &mut Conn, r: &mut Rng, top: &mut u64) {
+/// moves or removes a pending entry. Without `history`, no history reads:
+/// a history read of an entry still pending but deleted from the stream
+/// reaches replicas and the AOF as an `XCLAIM`, which drops the entry there
+/// and not on the primary. Redis 8.10.2 does the same, so a copy is
+/// compared only after changes that leave no such difference.
+fn random_change(c: &mut Conn, r: &mut Rng, top: &mut u64, history: bool) {
     let consumer = CONSUMERS[r.below(CONSUMERS.len() as u64) as usize];
     let group = if r.below(4) == 0 { "h" } else { "g" };
     let policy = ["KEEPREF", "DELREF", "ACKED"][r.below(3) as usize];
     let count = (1 + r.below(20)).to_string();
-    match r.below(16) {
+    match r.below(17) {
         0 | 1 => {
             let mut args = vec!["XREADGROUP", "GROUP", group, consumer, "COUNT", &count];
             if r.below(4) == 0 {
@@ -361,7 +397,7 @@ fn random_change(c: &mut Conn, r: &mut Rng, top: &mut u64) {
             args.extend(["STREAMS", "s", ">"]);
             c.ok(&args);
         }
-        2 => {
+        2 if history => {
             // A consumer's own history, from the start or from an ID.
             let from = if r.below(2) == 0 {
                 "0".to_string()
@@ -458,6 +494,24 @@ fn random_change(c: &mut Conn, r: &mut Rng, top: &mut u64) {
                 c.ok(&["XGROUP", "CREATE", "s", "h", "0"]);
             }
         }
+        15 => {
+            // CLAIM: idle entries of any consumer move to this one before
+            // new entries are read.
+            let idle = r.below(3).to_string();
+            c.ok(&[
+                "XREADGROUP",
+                "GROUP",
+                group,
+                consumer,
+                "COUNT",
+                &count,
+                "CLAIM",
+                &idle,
+                "STREAMS",
+                "s",
+                ">",
+            ]);
+        }
         _ => {
             let n = 1 + r.below(5);
             add_entries(c, "s", *top + 1, n);
@@ -477,7 +531,7 @@ fn every_change_of_the_pending_list_keeps_each_consumers_share_in_step() {
     c.ok(&["XGROUP", "CREATE", "s", "h", "0"]);
     let mut r = Rng(0x2545_F491_4F6C_DD1D);
     for _ in 0..1500 {
-        random_change(&mut c, &mut r, &mut top);
+        random_change(&mut c, &mut r, &mut top, true);
         view(&mut c, "s", "g");
         view(&mut c, "s", "h");
     }
@@ -548,7 +602,7 @@ fn the_index_comes_back_from_every_copy_of_a_group() {
     let mut top = 400;
     c.ok(&["XGROUP", "CREATE", "s", "h", "0"]);
     for _ in 0..300 {
-        random_change(&mut c, &mut r, &mut top);
+        random_change(&mut c, &mut r, &mut top, false);
     }
     let want = view(&mut c, "s", "g");
     let want_h = view(&mut c, "s", "h");
