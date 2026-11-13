@@ -1069,6 +1069,16 @@ fn write_every_type(c: &mut Conn) {
         b"\xff\x00f",
     ]));
     ok(c.cmd(&[b"XADD", b"s\xff", b"1-1", b"f", b"v"]));
+    ok(c.cmd(&[
+        b"XADD",
+        b"s\xff",
+        b"IDMP",
+        b"p\xfe",
+        b"i\xff\x00",
+        b"*",
+        b"f",
+        b"w",
+    ]));
     ok(c.cmd(&[b"XGROUP", b"CREATE", b"s\xff", b"g\xff", b"0"]));
     ok(c.cmd(&[
         b"XREADGROUP",
@@ -1179,19 +1189,14 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
         b"OK"
     );
     write_every_type(&mut a);
-    // A stream's digest changes across an AOF replay whatever its names
-    // (its consumers' times are those of the replay; text names do the
-    // same): compare the stream by its names (the last row), not its digest.
-    let aof_view = |rows: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
-        rows.into_iter()
-            .filter(|row| !row.starts_with(b"s\xff stream"))
-            .collect()
-    };
-    let want = aof_view(dataset(&mut a));
+    // The stream's digest too: its consumers' times and when its
+    // idempotent IDs were recorded, which the replay sets to its own clock,
+    // are not part of it (#505).
+    let want = dataset(&mut a);
     drop(a);
     aof.restart();
     let mut a = aof.conn();
-    assert_eq!(aof_view(dataset(&mut a)), want, "after replaying the AOF");
+    assert_eq!(dataset(&mut a), want, "after replaying the AOF");
     assert!(!matches!(a.cmd(&[b"BGREWRITEAOF"]), V::Err(_)));
     eventually(30, "the AOF rewrite", || {
         a.info("persistence", "aof_rewrite_in_progress") == "0"
@@ -1200,9 +1205,5 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
     drop(a);
     aof.restart();
     let mut a = aof.conn();
-    assert_eq!(
-        aof_view(dataset(&mut a)),
-        want,
-        "after loading the rewritten AOF"
-    );
+    assert_eq!(dataset(&mut a), want, "after loading the rewritten AOF");
 }
