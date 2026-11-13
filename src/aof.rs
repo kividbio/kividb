@@ -3560,9 +3560,10 @@ pub fn recover_local(
                     repl_state,
                     dump_loaded,
                 );
-                if recovery.index_names.is_empty() {
-                    recovery.index_names = names;
-                }
+                // Every index there is now, not the snapshot's alone: one
+                // created since the dump is in the log, and its documents
+                // are indexed by the walk after this as well.
+                recovery.index_names = names;
                 // Delta writes are not in the snapshot's HNSW graph: the
                 // backfill after this brings it up to date with the keys.
                 if dump_loaded {
@@ -3706,7 +3707,7 @@ fn preload(
         }
         // An index created during the backup window is in the replayed
         // commands, not in the base snapshot.
-        index_names = index_store.read().keys().cloned().collect();
+        index_names = crate::vector::index_names(index_store);
     }
     Ok(index_names)
 }
@@ -3814,7 +3815,7 @@ pub fn recover_from_aof(
         Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be loaded: {e}")),
     }
 
-    index_store.read().keys().cloned().collect()
+    crate::vector::index_names(index_store)
 }
 
 // ── Test hooks ───────────────────────────────────────────────────────────────

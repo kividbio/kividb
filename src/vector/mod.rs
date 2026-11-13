@@ -1121,6 +1121,16 @@ pub fn is_alias(key: &str, def: &IndexDef) -> bool {
     key != def.name
 }
 
+/// The names of the indexes, without their aliases.
+pub fn index_names(index_store: &IndexStore) -> Vec<String> {
+    index_store
+        .read()
+        .iter()
+        .filter(|(name, def)| !is_alias(name, def))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// The index `name` refers to — itself, or the index it is an alias of.
 pub fn resolve_index_name(store: &AHashMap<String, IndexDef>, name: &str) -> Option<String> {
     let def = store.get(name)?;
@@ -1324,11 +1334,21 @@ pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaF
 /// The keys of a shard are listed first, under its read lock, and each is
 /// looked up again: a write to the key takes its order before its shard's
 /// lock, so the walk cannot hold the shard while it waits for an order.
+///
+/// Nothing is walked while a replay defers indexing ([`DEFER_INDEXING`]):
+/// the walk after the replay indexes every document as the keys are then.
+/// A walk in the replay (of an `FT.CREATE`, `FT.ALTER` or `SWAPDB` in the
+/// log) indexed the documents of that moment, and the replay skips taking
+/// out the ones a later command of the log deleted: the index went on
+/// counting them (#590).
 pub fn walk_documents(
     db: &crate::store::Db,
     def: &IndexDef,
     mut visit: impl FnMut(&str, DocFields<'_>),
 ) {
+    if indexing_deferred() {
+        return;
+    }
     for shard in db.iter() {
         // The keys themselves, for their order and for reading them; the
         // visit is given the document's name (`key_bytes::text_of`).
