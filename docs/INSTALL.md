@@ -261,8 +261,54 @@ On startup the snapshot (`dump.kdb`) is loaded first, and the AOF, which holds t
 made since that snapshot, is replayed on top of it; see
 [PERSISTENCE.md](PERSISTENCE.md).
 
-The image is distroless: it has no shell and no `redis-cli`. Connect from another container
-instead, for example `docker run --rm -it --network container:<name> redis redis-cli -p 6380`.
+### Compose
+
+```yaml
+services:
+  kividb:
+    image: kividb/kividb:v1.2.2
+    command: ["--aof", "--requirepass", "${KIVIDB_PASSWORD:?set KIVIDB_PASSWORD}"]
+    environment:
+      # Turns off the startup update check: the image tag is what you upgrade.
+      KIVIDB_NO_UPDATE_CHECK: "1"
+    ports:
+      - "6380:6380"
+    volumes:
+      - kividb-data:/home/kividb
+volumes:
+  kividb-data:
+```
+
+### The update check in containers
+
+Each time it starts, KiviDB makes one HTTPS request to GitHub to see whether a newer
+release is out, and prints a line if one is ([what is sent](UPDATE_CHECK.md)). In a
+container that is every start, and an air-gapped host can't reach GitHub anyway (the check
+gives up quietly after a few seconds). Where the image tag decides the version, as in
+Compose files, platform templates and Kubernetes, turn it off with
+`KIVIDB_NO_UPDATE_CHECK=1` in the environment, or `--update-check no` among the arguments.
+It is already off when `CI` is set, and in the apt and dnf packages.
+
+### Debugging a container without a shell
+
+The image is distroless: it has the `kividb` binary and nothing else, so there is no shell,
+no `redis-cli` and no `ps` inside. That's on purpose: the tools in a full base image kept
+showing up in vulnerability scans, and KiviDB uses none of them. Debug from outside instead:
+
+- **Logs** go to standard output: `docker logs <name>`, `kubectl logs <pod>`.
+- **Run commands** from a client in another container on the same network:
+  `docker run --rm -it --network container:<name> redis redis-cli -p 6380`, then `INFO`,
+  `SLOWLOG GET`, `LATENCY LATEST`, `CLIENT LIST`, `MEMORY DOCTOR`.
+- **On Kubernetes**, attach a debug container to the pod:
+  `kubectl debug -it <pod> --image=redis --target=<container> -- redis-cli -p 6380`.
+  With `--target`, the debug container also sees KiviDB's process, for `top` or `strace`
+  from an image that has them.
+- **Look at the data files** through the volume, from another container:
+  `docker run --rm -v kividb-data:/data busybox ls -l /data`, or copy one out with
+  `docker cp <name>:/home/kividb/dump.kdb .`.
+- **Health checks** can't run `redis-cli` in the container. `["CMD", "kividb", "--version"]`
+  only proves the binary runs. Use a TCP check on the port instead (Kubernetes
+  `tcpSocket`), or have the check run `redis-cli ping` from another container.
 
 **io_uring in containers:** Docker's default seccomp profile blocks io_uring on recent
 versions, and KiviDB then falls back to Tokio. To allow it on a Linux host, run with
