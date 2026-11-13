@@ -103,7 +103,11 @@ What the RDB reader takes from Redis:
   and `BF.SCANDUMP` chunks taken on Redis can be loaded with `BF.LOADCHUNK`.
   The `bf-*` settings carry over in the config file. Loading is not held
   to `bloom-max-filter-bytes`; `BF.LOADCHUNK` of a filter over 512 MiB
-  needs it raised first (Redis has no such limit).
+  needs it raised first (Redis has no such limit). A filter Redis grew past
+  KiviDB's size limits for clients (65,536 hashes in all its layers, as a
+  filter with `EXPANSION 1` and a small capacity can reach) loads from an
+  RDB file, a full sync or `RESTORE`, and answers; KiviDB's commands add
+  to its layers but do not grow it further.
 - **Other module data** (time series, vector sets, Cuckoo filters,
   Count-min sketches, Top-K, t-digests) is refused, and so is the whole
   file: KiviDB won't load part of a snapshot. Move those keys with `MIGRATE`

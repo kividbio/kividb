@@ -154,10 +154,7 @@ mod tests {
             expansion: 2,
             nonscaling: true,
         };
-        let limits = Limits {
-            max_bytes: bloom::MAX_MAX_FILTER_BYTES,
-            under_maxmemory: false,
-        };
+        let limits = Limits::structural();
         Sketch::Bloom(BloomChain::new(params, limits).unwrap())
     }
 

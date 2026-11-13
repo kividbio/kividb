@@ -47,7 +47,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and holds a client's commands; raise it for larger filters. Replication,
   the AOF and loads (snapshots, full syncs, RDB files, `RESTORE`) are held
   only to fixed size limits, so a replica or a restart with a lower setting
-  keeps every filter the master took. `BF.MADD`, `BF.INSERT` and
+  keeps every filter the master took, and a filter Redis grew past the
+  size limits for clients still loads. `BF.MADD`, `BF.INSERT` and
   `BF.MEXISTS` have a per-command limit: a command that reaches it stops,
   and its reply ends with an error for the item it stopped at (send fewer
   items per command). Cuckoo filters, Count-min sketches, Top-K and

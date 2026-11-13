@@ -940,6 +940,101 @@ fn bloom_max_filter_bytes_holds_clients_not_replication() {
     let _ = std::fs::remove_dir_all(&replica_dir);
 }
 
+/// A filter Redis grew to more hashes in all than a client's command may
+/// grow one to (Redis 8.10.2: `BF.RESERVE wide 1e-300 1 EXPANSION 1`, then
+/// `BF.MADD wide item1 ... item80`: 68 layers, 70,142 hashes) loads from
+/// an RDB file and from `RESTORE`, reaches a replica, and survives a
+/// snapshot. A client's command answers from it and adds to its layers,
+/// but does not grow it.
+#[test]
+fn filters_redis_grew_past_the_client_limit_load() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let rdb = fixtures.join("redis-8.10-bloom-wide.rdb");
+    let payload = std::fs::read(fixtures.join("redis-8.10-bloom-wide.dump")).unwrap();
+    let (dir, replica_dir) = (tmp_dir("wide"), tmp_dir("wide-replica"));
+    let preload = format!("rdb:{}", rdb.display());
+    let items: Vec<String> = (1..=80).map(|i| format!("item{i}")).collect();
+    let all_found = {
+        let mut want = b"*80\r\n".to_vec();
+        for _ in 0..80 {
+            want.extend_from_slice(b":1\r\n");
+        }
+        want
+    };
+    let on_master = {
+        let master = Child::start(&dir, &["--preload-file", &preload]);
+        let mut m = master.conn();
+        assert_eq!(m.cmd(&["BF.INFO", "wide", "FILTERS"]), b"*1\r\n:68\r\n");
+        assert_eq!(m.cmd(&["BF.CARD", "wide"]), b":68\r\n");
+        let mut args = vec!["BF.MEXISTS", "wide"];
+        args.extend(items.iter().map(String::as_str));
+        assert_eq!(shown(&m.cmd(&args)), shown(&all_found));
+        // RESTORE of Redis's DUMP of it.
+        assert_eq!(
+            m.raw(&[b"RESTORE", b"restored", b"0", &payload]),
+            b"+OK\r\n"
+        );
+        assert_eq!(scandump(&mut m, "restored"), scandump(&mut m, "wide"));
+        // A replica takes both.
+        let replica = Child::start(
+            &replica_dir,
+            &["--replicaof", "127.0.0.1", &master.port.to_string()],
+        );
+        let mut r = replica.conn();
+        wait_until("the replica to sync", || {
+            String::from_utf8_lossy(&r.cmd(&["INFO", "replication"]))
+                .contains("master_link_status:up")
+        });
+        wait_until("the replica to have the filters", || {
+            r.cmd(&["BF.CARD", "restored"]) == b":68\r\n"
+        });
+        // A client's command: answered, an item there already is no add,
+        // and a new item, which needs another layer, is refused.
+        // (Layers of 1,472 bits and 998 hashes take some items as there
+        // already, in Redis as here: one that is not is looked for.)
+        assert_eq!(m.cmd(&["BF.ADD", "wide", "item1"]), b":0\r\n");
+        let absent = (0..1000)
+            .map(|i| format!("absent{i}"))
+            .find(|item| m.cmd(&["BF.EXISTS", "wide", item]) == b":0\r\n")
+            .expect("an item the filter does not have");
+        assert_eq!(
+            m.cmd(&["BF.ADD", "wide", &absent]),
+            b"-ERR filter is too large\r\n"
+        );
+        assert_eq!(
+            m.cmd(&["BF.INSERT", "wide", "ITEMS", "item2", &absent]),
+            b"*2\r\n:0\r\n-ERR filter is too large\r\n"
+        );
+        assert_eq!(m.cmd(&["BF.INFO", "wide", "FILTERS"]), b"*1\r\n:68\r\n");
+        m.cmd(&["SET", "last", "1"]);
+        wait_until("the replica to catch up", || {
+            r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
+        });
+        let on_master: Vec<_> = ["wide", "restored"]
+            .iter()
+            .map(|k| scandump(&mut m, k))
+            .collect();
+        let on_replica: Vec<_> = ["wide", "restored"]
+            .iter()
+            .map(|k| scandump(&mut r, k))
+            .collect();
+        assert_eq!(on_replica, on_master);
+        assert_eq!(m.cmd(&["SAVE"]), b"+OK\r\n");
+        on_master
+    };
+    // KiviDB's own snapshot of them loads.
+    let server = Child::start(&dir, &[]);
+    let mut c = server.conn();
+    let after: Vec<_> = ["wide", "restored"]
+        .iter()
+        .map(|k| scandump(&mut c, k))
+        .collect();
+    assert_eq!(after, on_master);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
 // ── Generic behaviour ────────────────────────────────────────────────────
 
 /// As in Redis: a write to the key invalidates a `WATCH` on it even when it

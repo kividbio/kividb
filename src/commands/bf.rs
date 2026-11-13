@@ -48,7 +48,7 @@ use crate::resp::write::{
 use crate::sketch::Sketch;
 use crate::sketch::bloom::{
     BloomChain, BloomError, Limits, MAX_CAPACITY, MAX_ERROR, MAX_EXPANSION, MAX_MAX_FILTER_BYTES,
-    NO_MEMORY, Params, Probes, ShapeError,
+    NO_MEMORY, Params, Probes, ShapeError, hash,
 };
 use crate::store::{self, Key, ValueRef};
 use crate::types::KiviDBValue;
@@ -647,8 +647,13 @@ fn add(ctx: &mut Ctx) -> Vec<u8> {
         Ok(limits) => limits,
         Err(e) => return e,
     };
+    // Hashed before the shard's lock is taken.
+    let hashed = hash(item);
     let result = with_filter_mut(ctx, key, Some(params), limits, Vec::new, |chain, made| {
-        (chain.add(item, limits), made)
+        (
+            chain.add_hashed(hashed, limits, &mut Probes::unlimited()),
+            made,
+        )
     });
     match result {
         Err(e) => e,
@@ -670,20 +675,26 @@ struct Added {
     header: Option<Vec<u8>>,
 }
 
-/// Add each of `items`, stopping at one the filter cannot take, or at the
-/// per-command limit (`probes`): the replies, the last of them that one's
-/// error. Nothing of the item it stopped at is written.
+/// The items' hashes, taken before the shard's lock is.
+fn hash_all(items: &[&[u8]]) -> Vec<(u64, u64)> {
+    items.iter().map(|item| hash(item)).collect()
+}
+
+/// Add each of the items hashed to `hashed`, stopping at one the filter
+/// cannot take, or at the per-command limit (`probes`): the replies, the
+/// last of them that one's error. Nothing of the item it stopped at is
+/// written.
 fn add_each(
     chain: &mut BloomChain,
-    items: &[&[u8]],
+    hashed: &[(u64, u64)],
     resp: u8,
     limits: Limits,
     mut probes: Probes,
 ) -> Added {
-    let mut replies = Vec::with_capacity(items.len());
+    let mut replies = Vec::with_capacity(hashed.len());
     let mut done = 0;
-    for item in items {
-        match chain.add_within(item, limits, &mut probes) {
+    for &h in hashed {
+        match chain.add_hashed(h, limits, &mut probes) {
             Ok(added) => {
                 replies.push(boolean(resp, added));
                 done += 1;
@@ -719,8 +730,9 @@ fn madd(ctx: &mut Ctx) -> Vec<u8> {
     let probes = probes(ctx);
     let cmd = &ctx.cmd;
     let items = &cmd[2..];
+    let hashed = hash_all(items);
     match with_filter_mut(ctx, key, Some(params), limits, Vec::new, |chain, made| {
-        (add_each(chain, items, resp, limits, probes), made)
+        (add_each(chain, &hashed, resp, limits, probes), made)
     }) {
         Err(e) => e,
         Ok((added, made)) => {
@@ -804,13 +816,14 @@ fn insert(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return e,
     };
     let probes = probes(ctx);
+    let hashed = hash_all(items);
     match with_filter_mut(
         ctx,
         key,
         make,
         limits,
         || resp_error(NOT_FOUND),
-        |chain, made| (add_each(chain, items, resp, limits, probes), made),
+        |chain, made| (add_each(chain, &hashed, resp, limits, probes), made),
     ) {
         Err(e) => e,
         Ok((added, made)) => {
@@ -831,8 +844,11 @@ fn exists(ctx: &mut Ctx) -> Vec<u8> {
     }
     let key = ctx.cmd[1];
     let item = ctx.cmd[2];
+    let hashed = hash(item);
     let found = matches!(
-        with_filter(ctx, key, |chain| chain.contains(item)),
+        with_filter(ctx, key, |chain| chain
+            .contains_hashed(hashed, &mut Probes::unlimited())
+            == Ok(true)),
         Ok(Some(true))
     );
     boolean(resp(ctx), found)
@@ -846,12 +862,13 @@ fn mexists(ctx: &mut Ctx) -> Vec<u8> {
     let key = ctx.cmd[1];
     let items = &ctx.cmd[2..];
     let resp = resp(ctx);
+    let hashed = hash_all(items);
     let replies = match with_filter(ctx, key, |chain| {
         // A read: held to the per-command limit wherever it comes from.
         let mut probes = Probes::budgeted();
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            match chain.contains_within(item, &mut probes) {
+        let mut out = Vec::with_capacity(hashed.len());
+        for &h in &hashed {
+            match chain.contains_hashed(h, &mut probes) {
                 Ok(found) => out.push(boolean(resp, found)),
                 Err(e) => {
                     out.push(add_error(e));

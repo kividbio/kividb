@@ -45,13 +45,14 @@
 //!
 //! Size limits, checked before anything is allocated, whether a filter is
 //! made, grows or is loaded: its bytes in all, its layers ([`MAX_LAYERS`])
-//! and the hashes of an item in all its layers ([`MAX_TOTAL_HASHES`]). Redis
-//! has none of these. A command from a client is held to
-//! `bloom-max-filter-bytes` ([`Limits::client`]); a command from a master
-//! or the AOF, and a filter loaded (a snapshot, a full sync, an RDB file,
-//! `RESTORE`), only to the fixed limits ([`Limits::structural`]), so that a
-//! replica or a restart with a lower setting keeps every filter the master
-//! took.
+//! and the hashes of an item in all its layers. Redis has none of these. A
+//! command from a client is held to `bloom-max-filter-bytes` and to
+//! [`MAX_CLIENT_HASHES`] ([`Limits::client`]); a command from a master or
+//! the AOF, and a filter loaded (a snapshot, a full sync, an RDB file,
+//! `RESTORE`), only to the fixed limits, [`MAX_TOTAL_HASHES`] among them
+//! ([`Limits::structural`]). So a replica or a restart with a lower setting
+//! keeps every filter the master took, and a filter Redis made with more
+//! hashes than a client may grow one to still loads.
 //!
 //! A command of many items is held to [`PROBE_BUDGET`] as well: see
 //! [`Probes`].
@@ -118,12 +119,20 @@ pub const MAX_LAYER_BYTES: u64 = 1 << 32;
 /// after at most about 1,075 layers.
 pub const MAX_LAYERS: usize = 2048;
 
-/// The most hashes an item may take in all of a filter's layers together:
-/// what one lookup costs at most, under its shard's lock. A filter that
-/// grows stops at it with `filter is too large`: after some 350 layers from
-/// the default error rate, which no filter grown from a sensible capacity
-/// reaches (see the tests).
-pub const MAX_TOTAL_HASHES: u64 = 65_536;
+/// The most hashes an item may take in all of a filter's layers together,
+/// for a filter a client's command makes or grows: what one lookup costs at
+/// most, under its shard's lock. A filter that grows stops at it with
+/// `filter is too large`: after some 350 layers from the default error
+/// rate, which no filter grown from a sensible capacity reaches (see the
+/// tests). Lookups and adds in the layers a filter has go on.
+pub const MAX_CLIENT_HASHES: u64 = 65_536;
+
+/// The most hashes in all of a filter's layers that is loaded or applied
+/// from a master or the AOF: above what Redis can grow a filter to (some
+/// 580,000, from a capacity of 1, `EXPANSION 1` and an error rate of 0.25),
+/// so that no filter moved from Redis, nor any a master took, is refused.
+/// One lookup in such a filter takes some 8 ms at worst.
+pub const MAX_TOTAL_HASHES: u64 = 600_000;
 
 /// The most bits one command may look at, or set, in all (`BF.MADD`,
 /// `BF.MEXISTS`, `BF.INSERT`): a command of many items stops at the item
@@ -133,9 +142,9 @@ pub const MAX_TOTAL_HASHES: u64 = 65_536;
 /// is not there costs a few per layer, not every hash.
 ///
 /// What a bit costs at worst was measured (`probe_cost` below) on a filter
-/// of every bit set, as many hashes as there may be, and 504 MiB in 354
-/// layers, every bit of every layer looked at: 14.5 ns on an Azure
-/// D4s_v5, so 250,000 bits take some 3.6 ms under the shard's lock. A
+/// of every bit set, [`MAX_CLIENT_HASHES`] hashes, and 504 MiB in 354
+/// layers, every bit of every layer looked at: 14 ns on an Azure D4s_v5,
+/// so 250,000 bits take some 3.5 ms under the shard's lock. A
 /// filter of ten layers grown from the defaults takes some 20 bits for a
 /// lookup of an item not there and 37 for an add: some 12,000 lookups, or
 /// 6,700 adds, in one command.
@@ -171,7 +180,7 @@ pub enum BloomError {
     CannotGrow,
     /// The filter would be over a size limit: a layer over
     /// [`MAX_LAYER_BYTES`], the whole over [`Limits::max_bytes`], more than
-    /// [`MAX_LAYERS`] layers or [`MAX_TOTAL_HASHES`] hashes.
+    /// [`MAX_LAYERS`] layers or [`Limits::max_hashes`] hashes.
     TooLarge,
     /// There is no room for it under `maxmemory`.
     NoRoom,
@@ -186,6 +195,8 @@ pub enum BloomError {
 pub struct Limits {
     /// The most bytes the whole filter may take.
     pub max_bytes: u64,
+    /// The most hashes all its layers may have.
+    pub max_hashes: u64,
     /// Whether what is allocated must fit under `maxmemory`: for a command
     /// from a client (which has evicted what it could first), not for one
     /// applied from a master or replayed from the AOF, nor for a load.
@@ -193,10 +204,12 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// A command from a client: `bloom-max-filter-bytes`, under `maxmemory`.
+    /// A command from a client: `bloom-max-filter-bytes` and
+    /// [`MAX_CLIENT_HASHES`], under `maxmemory`.
     pub fn client() -> Limits {
         Limits {
             max_bytes: max_filter_bytes(),
+            max_hashes: MAX_CLIENT_HASHES,
             under_maxmemory: true,
         }
     }
@@ -205,10 +218,12 @@ impl Limits {
     /// alone ([`MAX_MAX_FILTER_BYTES`], [`MAX_LAYER_BYTES`], [`MAX_LAYERS`],
     /// [`MAX_TOTAL_HASHES`]), and not `maxmemory`. Never this node's
     /// `bloom-max-filter-bytes`: a replica, or a restart, with a lower one
-    /// must keep what the master took under a higher one.
+    /// must keep what the master took under a higher one. Every limit here
+    /// is at or above the client's, so nothing a master took is refused.
     pub fn structural() -> Limits {
         Limits {
             max_bytes: MAX_MAX_FILTER_BYTES,
+            max_hashes: MAX_TOTAL_HASHES,
             under_maxmemory: false,
         }
     }
@@ -353,7 +368,7 @@ impl Layer {
         }
         if bytes > MAX_LAYER_BYTES
             || used.bytes.saturating_add(bytes) > limits.max_bytes
-            || used.hashes.saturating_add(u64::from(hashes)) > MAX_TOTAL_HASHES
+            || used.hashes.saturating_add(u64::from(hashes)) > limits.max_hashes
         {
             return Err(BloomError::TooLarge);
         }
@@ -640,10 +655,20 @@ impl BloomChain {
     /// `probes`; `OverBudget`, with nothing looked at, if it could take
     /// `probes` past its budget.
     pub fn contains_within(&self, item: &[u8], probes: &mut Probes) -> Result<bool, BloomError> {
+        self.contains_hashed(hash(item), probes)
+    }
+
+    /// [`contains_within`](Self::contains_within) of an item already
+    /// hashed ([`hash`]), so that it can be hashed before the shard's lock
+    /// is taken.
+    pub fn contains_hashed(
+        &self,
+        (a, b): (u64, u64),
+        probes: &mut Probes,
+    ) -> Result<bool, BloomError> {
         if !probes.allows(self.worst_lookup()) {
             return Err(BloomError::OverBudget);
         }
-        let (a, b) = hash(item);
         Ok(self.lookup(a, b, probes))
     }
 
@@ -673,11 +698,22 @@ impl BloomChain {
         limits: Limits,
         probes: &mut Probes,
     ) -> Result<bool, BloomError> {
+        self.add_hashed(hash(item), limits, probes)
+    }
+
+    /// [`add_within`](Self::add_within) of an item already hashed
+    /// ([`hash`]), so that it can be hashed before the shard's lock is
+    /// taken.
+    pub fn add_hashed(
+        &mut self,
+        (a, b): (u64, u64),
+        limits: Limits,
+        probes: &mut Probes,
+    ) -> Result<bool, BloomError> {
         // A lookup, then the bits of the newest layer, or of one more.
         if !probes.allows(self.worst_lookup().saturating_add(u64::from(MAX_HASHES))) {
             return Err(BloomError::OverBudget);
         }
-        let (a, b) = hash(item);
         if self.lookup(a, b, probes) {
             return Ok(false);
         }
@@ -885,7 +921,7 @@ impl BloomChain {
         if sum != items {
             return Err(ShapeError::Bad);
         }
-        if used.bytes > limits.max_bytes || used.hashes > MAX_TOTAL_HASHES {
+        if used.bytes > limits.max_bytes || used.hashes > limits.max_hashes {
             return Err(ShapeError::TooLarge);
         }
         if data.is_none() && limits.under_maxmemory && !super::room_for(used.bytes) {
@@ -1139,9 +1175,15 @@ mod tests {
 
     /// No limit but the hard ones, and no `maxmemory`.
     fn lim() -> Limits {
+        Limits::structural()
+    }
+
+    /// What a client's command is held to, but `bloom-max-filter-bytes`
+    /// and `maxmemory`.
+    fn client() -> Limits {
         Limits {
-            max_bytes: MAX_MAX_FILTER_BYTES,
-            under_maxmemory: false,
+            max_hashes: MAX_CLIENT_HASHES,
+            ..Limits::structural()
         }
     }
 
@@ -1595,13 +1637,13 @@ mod tests {
     }
 
     /// The layers a filter grows by before its hashes in all pass
-    /// [`MAX_TOTAL_HASHES`], from a first layer at `error`.
+    /// [`MAX_CLIENT_HASHES`], from a first layer at `error`.
     fn layers_to_hash_limit(error: f64) -> usize {
         let (mut layers, mut hashes) = (0usize, 0u64);
         let mut error = error;
         loop {
             let (_, _, h) = Layer::shape(1, error);
-            if hashes + u64::from(h) > MAX_TOTAL_HASHES {
+            if hashes + u64::from(h) > MAX_CLIENT_HASHES {
                 return layers;
             }
             layers += 1;
@@ -1628,11 +1670,30 @@ mod tests {
         assert!(layers < 30, "{layers}");
     }
 
-    /// A filter that grows and would pass the hash limit is refused with
-    /// `TooLarge`, and keeps what it had.
+    /// A client's command that would grow a filter past
+    /// [`MAX_CLIENT_HASHES`] is refused with `TooLarge`, and the filter
+    /// keeps what it had: its items are found, and an item that is there
+    /// already is still an add. From a master, the AOF or a load, the same
+    /// filter grows as Redis grows it: as in Redis 8.10.2, `BF.RESERVE g
+    /// 1e-300 1 EXPANSION 1` takes 91 items in 78 layers, and the 92nd
+    /// cannot be put in (`problem inserting into filter`).
     #[test]
-    fn growth_stops_at_the_hash_limit() {
+    fn growth_stops_at_the_client_hash_limit() {
         // From 1e-300, 998 hashes a layer and more: the limit comes first.
+        let mut chain = BloomChain::new(params(1, 1e-300, 1, false), client()).unwrap();
+        let mut added = 0;
+        let err = loop {
+            match chain.add(format!("item{}", added + 1).as_bytes(), client()) {
+                Ok(_) => added += 1,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, BloomError::TooLarge);
+        assert!(chain.used().hashes <= MAX_CLIENT_HASHES);
+        assert_eq!(chain.layers.len(), layers_to_hash_limit(0.5e-300));
+        assert!(chain.contains(b"item1"));
+        assert_eq!(chain.add(b"item1", client()), Ok(false));
+        // Structural limits: as Redis.
         let mut chain = new_chain(params(1, 1e-300, 1, false)).unwrap();
         let mut added = 0;
         let err = loop {
@@ -1641,9 +1702,50 @@ mod tests {
                 Err(e) => break e,
             }
         };
-        assert_eq!(err, BloomError::TooLarge);
-        assert!(chain.used().hashes <= MAX_TOTAL_HASHES);
-        assert_eq!(chain.layers.len(), layers_to_hash_limit(0.5e-300));
+        assert_eq!(
+            (err, added, chain.layers.len()),
+            (BloomError::CannotGrow, 91, 78)
+        );
+        let hashes = chain.used().hashes;
+        assert!(hashes > MAX_CLIENT_HASHES && hashes <= MAX_TOTAL_HASHES);
+        // Such a filter, loaded, takes no more layers from a client, but
+        // answers, and takes items into the layers it has.
+        // (At 1e-300 a layer of 1,472 bits and 998 hashes takes some items
+        // as there already, as Redis's does: they are looked for first.)
+        let absent = |chain: &BloomChain| {
+            (0..)
+                .map(|i| format!("absent{i}"))
+                .find(|item| !chain.contains(item.as_bytes()))
+                .unwrap()
+        };
+        let mut wide = BloomChain::new(params(1, 1e-300, 1, false), lim()).unwrap();
+        let mut n = 0;
+        while wide.used().hashes <= MAX_CLIENT_HASHES {
+            wide.add(format!("w{n}").as_bytes(), lim()).unwrap();
+            n += 1;
+        }
+        assert!(wide.contains(b"w0"));
+        assert_eq!(wide.add(b"w0", client()), Ok(false));
+        let item = absent(&wide);
+        assert_eq!(
+            wide.add(item.as_bytes(), client()),
+            Err(BloomError::TooLarge)
+        );
+        // Its newest layer has room: a client's add goes into it.
+        let mut roomy = BloomChain::new(params(5, 1e-300, 1, false), lim()).unwrap();
+        let mut n = 0;
+        loop {
+            let last = roomy.layers.last().unwrap();
+            if roomy.used().hashes > MAX_CLIENT_HASHES && last.size < last.capacity {
+                break;
+            }
+            roomy.add(format!("r{n}").as_bytes(), lim()).unwrap();
+            n += 1;
+        }
+        let layers = roomy.layers.len();
+        let item = absent(&roomy);
+        assert_eq!(roomy.add(item.as_bytes(), client()), Ok(true));
+        assert_eq!(roomy.layers.len(), layers);
     }
 
     /// As in Redis 8.10.2: `BF.RESERVE g 1e-305 1 EXPANSION 1` takes 69
@@ -1762,60 +1864,65 @@ mod tests {
     #[ignore]
     fn probe_cost() {
         use std::time::Instant;
-        // The worst: every bit set, as many hashes as may be, and 512 MiB
-        // (the default `bloom-max-filter-bytes`) spread over the layers, so
-        // that each bit looked at is a cache miss.
+        // The worst: every bit set, as many hashes as may be, and some 500
+        // MiB spread over the layers, so that each bit looked at is a cache
+        // miss: as many as a client may grow a filter to, and as many as
+        // may be loaded.
         let flags = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
-        let mut shapes = Vec::new();
-        let (mut hashes, mut error) = (0u64, 0.005f64);
-        let capacity = 45_000u64;
-        loop {
-            let (bits_per_item, bytes, h) = Layer::shape(capacity, error);
-            if hashes + u64::from(h) > MAX_TOTAL_HASHES {
-                break;
+        for (max_hashes, capacity) in [(MAX_CLIENT_HASHES, 45_000u64), (MAX_TOTAL_HASHES, 5_000)] {
+            let mut shapes = Vec::new();
+            let (mut hashes, mut error) = (0u64, 0.005f64);
+            loop {
+                let (bits_per_item, bytes, h) = Layer::shape(capacity, error);
+                if h > MAX_HASHES || hashes + u64::from(h) > max_hashes {
+                    break;
+                }
+                hashes += u64::from(h);
+                shapes.push(LayerShape {
+                    bytes,
+                    bits: bytes * 8,
+                    size: 0,
+                    error,
+                    bits_per_item,
+                    hashes: h,
+                    capacity,
+                    reserved: 0,
+                });
+                error *= 0.5;
             }
-            hashes += u64::from(h);
-            shapes.push(LayerShape {
-                bytes,
-                bits: bytes * 8,
-                size: 0,
-                error,
-                bits_per_item,
-                hashes: h,
-                capacity,
-                reserved: 0,
-            });
-            error *= 0.5;
-        }
-        let mut chain = BloomChain::from_shapes(0, flags, 1, shapes, None, lim()).unwrap();
-        for l in &mut chain.layers {
-            l.data.make_mut().unwrap().fill(0xff);
-        }
-        let used = chain.used();
-        // An item whose bits are set in every layer but the last of them
-        // has every bit of every layer looked at: here, every layer of the
-        // saturated filter is looked at whole, as for that item.
-        let mut probes = Probes::unlimited();
-        let mut found = 0;
-        let start = Instant::now();
-        for i in 0..200 {
-            let (a, b) = hash(format!("w{i}").as_bytes());
-            for layer in chain.layers.iter().rev() {
-                let (hit, bits) = layer.probe(a, b);
-                probes.charge(bits);
-                found += usize::from(hit);
+            let mut chain = BloomChain::from_shapes(0, flags, 1, shapes, None, lim()).unwrap();
+            for l in &mut chain.layers {
+                l.data.make_mut().unwrap().fill(0xff);
             }
+            let used = chain.used();
+            // An item whose bits are set in every layer but the last of
+            // them has every bit of every layer looked at: here, every
+            // layer of the saturated filter is looked at whole, as for it.
+            let mut probes = Probes::unlimited();
+            let mut found = 0;
+            let items = 50;
+            let start = Instant::now();
+            for i in 0..items {
+                let (a, b) = hash(format!("w{i}").as_bytes());
+                for layer in chain.layers.iter().rev() {
+                    let (hit, bits) = layer.probe(a, b);
+                    probes.charge(bits);
+                    found += usize::from(hit);
+                }
+            }
+            let took = start.elapsed();
+            let ns = took.as_nanos() as f64 / probes.spent() as f64;
+            assert_eq!(found, items * chain.layers.len());
+            println!(
+                "worst: {} layers, {} MiB, {} hashes an item: {ns:.1} ns a bit, {:.2} ms an item, {:.2} ms for {} bits",
+                chain.layers.len(),
+                used.bytes >> 20,
+                used.hashes,
+                took.as_secs_f64() * 1e3 / items as f64,
+                ns * PROBE_BUDGET as f64 / 1e6,
+                PROBE_BUDGET
+            );
         }
-        let ns = start.elapsed().as_nanos() as f64 / probes.spent() as f64;
-        assert_eq!(found, 200 * chain.layers.len());
-        println!(
-            "worst: {} layers, {} MiB, {} hashes an item: {ns:.1} ns a bit, {:.2} ms for {} bits",
-            chain.layers.len(),
-            used.bytes >> 20,
-            used.hashes,
-            ns * PROBE_BUDGET as f64 / 1e6,
-            PROBE_BUDGET
-        );
         // As used: ten layers from the defaults, 100,000 items; a thousand
         // lookups and a thousand adds of items not there.
         let mut chain = new_chain(params(100, 0.01, 2, false)).unwrap();
@@ -1875,7 +1982,7 @@ mod tests {
     fn size_limits() {
         let small = Limits {
             max_bytes: 1000,
-            under_maxmemory: false,
+            ..client()
         };
         // Made: 11,984 bytes for 10,000 items at 1%.
         assert_eq!(
@@ -1903,21 +2010,31 @@ mod tests {
         );
         shapes.truncate(5);
         assert!(BloomChain::from_shapes(0, flags, 1, shapes, None, small).is_ok());
-        // Hashes: 61 layers of 1075 are over MAX_TOTAL_HASHES.
+        // Hashes: 61 layers of 1075 are over MAX_CLIENT_HASHES, which a
+        // client's BF.LOADCHUNK is held to; a load is not.
         let wide = vec![widest_shape(); 61];
+        assert_eq!(
+            BloomChain::from_shapes(0, flags, 1, wide.clone(), None, client()).unwrap_err(),
+            ShapeError::TooLarge
+        );
+        assert!(BloomChain::from_shapes(0, flags, 1, wide[..60].to_vec(), None, client()).is_ok());
+        assert!(BloomChain::from_shapes(0, flags, 1, wide, None, lim()).is_ok());
+        // 559 layers of 1075 are over MAX_TOTAL_HASHES, which every load is
+        // held to.
+        let wide = vec![widest_shape(); 559];
         assert_eq!(
             BloomChain::from_shapes(0, flags, 1, wide.clone(), None, lim()).unwrap_err(),
             ShapeError::TooLarge
         );
-        assert!(BloomChain::from_shapes(0, flags, 1, wide[..60].to_vec(), None, lim()).is_ok());
+        assert!(BloomChain::from_shapes(0, flags, 1, wide[..558].to_vec(), None, lim()).is_ok());
         // A snapshot record of them is refused before its layers are read.
         let mut kdb = Vec::new();
         kdb.extend(0u64.to_le_bytes());
         kdb.extend(flags.to_le_bytes());
         kdb.extend(1u32.to_le_bytes());
-        kdb.extend(61u32.to_le_bytes());
+        kdb.extend(559u32.to_le_bytes());
         let s = widest_shape();
-        for _ in 0..61 {
+        for _ in 0..559 {
             kdb.extend(s.capacity.to_le_bytes());
             kdb.extend(0u64.to_le_bytes());
             kdb.extend(s.error.to_le_bytes());
