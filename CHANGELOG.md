@@ -28,8 +28,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   other master for each search and closed it after the reply, so under a
   steady load of searches the node that received them ran out of local
   ports (`Cannot assign requested address`). The connections are now kept
-  open and reused, up to 16 idle ones per master, and are opened again
-  when `masteruser`, `masterauth` or the TLS files change.
+  open and reused, up to 16 idle ones per master or one per command
+  thread if there are more, and are opened again when `masteruser`,
+  `masterauth` or the TLS files change. When a master's own password
+  changes, the connections kept to it stay logged in as before until they
+  close, as any long-lived client does, and searches fail with the login
+  error once they are replaced.
 
 - **A script that waits for `TIME` to move ends (#676).** `TIME` in a
   script returned the script's start for as long as it ran, so a loop

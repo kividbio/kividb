@@ -214,8 +214,9 @@ fn encode(parts: &[&[u8]]) -> Vec<u8> {
 // kept open now, logged in, and reused.
 
 /// How many idle connections to one master, opened as one login, are kept
-/// for the next search. A burst of searches may open more at once; those
-/// beyond this are closed when their search is done.
+/// for the next search, at least: as many as the node has command threads,
+/// if that is more (see [`Pool::size_for`]). A burst of searches may open
+/// more at once; those beyond this are closed when their search is done.
 pub(crate) const POOL_IDLE_MAX: usize = 16;
 
 /// What a kept connection was opened as: to where, logged in as whom, in
@@ -264,22 +265,48 @@ struct Conn {
 
 /// Idle connections to the other masters, by what they were opened as. See
 /// [`ask_once`] for when one is kept and when it is closed.
-#[derive(Default)]
 pub struct Pool {
     idle: parking_lot::Mutex<ahash::AHashMap<PoolKey, Vec<Conn>>>,
+    /// How many idle connections are kept for one key.
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self {
+            idle: Default::default(),
+            most: std::sync::atomic::AtomicUsize::new(POOL_IDLE_MAX),
+        }
+    }
 }
 
 impl Pool {
+    /// Keep as many idle connections to a master as the node has command
+    /// threads, each of which may be searching at once, or
+    /// [`POOL_IDLE_MAX`] if that is more. Fewer, and a burst on a large
+    /// host would open and close the difference every time.
+    pub(crate) fn size_for(&self, threads: usize) {
+        self.most.store(
+            threads.max(POOL_IDLE_MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn most(&self) -> usize {
+        self.most.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn take(&self, key: &PoolKey) -> Option<Conn> {
         self.idle.lock().get_mut(key).and_then(Vec::pop)
     }
 
     /// Keep `conn` for the next search, unless as many are kept already.
     fn put(&self, key: &PoolKey, conn: Conn) {
+        let most = self.most();
         let extra = {
             let mut idle = self.idle.lock();
             let conns = idle.entry(key.clone()).or_default();
-            if conns.len() < POOL_IDLE_MAX {
+            if conns.len() < most {
                 conns.push(conn);
                 None
             } else {
@@ -290,17 +317,11 @@ impl Pool {
         drop(extra);
     }
 
-    /// Close every connection kept as `key`.
-    fn clear(&self, key: &PoolKey) {
-        let gone = self.idle.lock().remove(key);
-        drop(gone);
-    }
-
     /// Close the connections that are not to one of `targets`, or not
     /// logged in as `login` is: to a master forgotten, moved, or no longer
     /// a master, or opened with credentials or TLS files since changed. So
-    /// what is kept never grows past [`POOL_IDLE_MAX`] for each master there
-    /// is now, and each database searched.
+    /// what is kept never grows past [`Pool::size_for`] for each master
+    /// there is now, and each database searched.
     fn keep_only(&self, targets: &[(String, u16)], login: &PoolKey) {
         let mut gone = Vec::new();
         {
@@ -446,10 +467,10 @@ fn ask(
 /// A connection goes back to the pool only once a whole reply has been
 /// read off it, which leaves it ready for the next command; one that failed
 /// in any way, timed out, or gave part of a reply is closed. A kept
-/// connection found closed before any of the reply came is given up, with
-/// the others kept to that master the same way, and the command is sent
-/// once more on a new one: searches change nothing, so sending one twice
-/// is harmless. Nothing is sent again after part of a reply.
+/// connection found closed before any of the reply came is given up, and
+/// the command is sent once more on a new one: searches change nothing, so
+/// sending one twice is harmless. Nothing is sent again after part of a
+/// reply.
 fn ask_once(
     pool: &Pool,
     host: &str,
@@ -464,8 +485,8 @@ fn ask_once(
     if let Some(mut conn) = pool.take(&key) {
         match exchange(&mut conn, &command, 0) {
             Ok(reply) => return done(pool, &key, conn, reply),
-            // Most likely, the others kept with it were closed too.
-            Err(Failed::BeforeReply(_)) => pool.clear(&key),
+            // Closed here; sent again below.
+            Err(Failed::BeforeReply(_)) => {}
             Err(Failed::Other(e)) => return Err(e),
         }
     }
@@ -814,6 +835,17 @@ mod tests {
             pool.put(&key, conn);
         }
         assert_eq!(pool.idle(), POOL_IDLE_MAX);
+
+        // As many as the node has command threads, where that is more.
+        pool.size_for(2);
+        assert_eq!(pool.most(), POOL_IDLE_MAX);
+        pool.size_for(30);
+        assert_eq!(pool.most(), 30);
+        for _ in 0..20 {
+            let (conn, _, _) = dial("127.0.0.1", peer.port, &open, 0).unwrap();
+            pool.put(&key, conn);
+        }
+        assert_eq!(pool.idle(), 30);
     }
 
     #[test]

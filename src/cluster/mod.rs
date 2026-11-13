@@ -583,6 +583,7 @@ impl ClusterState {
         state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
         state.set_my_announced_client_port(config.cluster_announce_client_port);
+        state.search_pool.size_for(config.resolve_threads());
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
                 .bus_secret

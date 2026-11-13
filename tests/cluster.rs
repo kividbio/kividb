@@ -6032,7 +6032,8 @@ fn connections_received(node: &Node) -> u64 {
 #[test]
 fn a_coordinator_keeps_its_connections_to_the_other_masters() {
     const SEARCH_NAME: &str = "kividb-cluster-search";
-    // The most kept to one master (`search::POOL_IDLE_MAX`).
+    // The most kept to one master: the node's command threads (`--threads
+    // 2` here), or `search::POOL_IDLE_MAX` (16) if that is more.
     const KEPT_MAX: u64 = 16;
     let (mut nodes, _) = form_cluster(3);
     let r = nodes[0].conn().cmd(&[
