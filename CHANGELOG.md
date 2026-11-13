@@ -23,6 +23,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A script that waits for `TIME` to move ends (#676).** `TIME` in a
+  script returned the script's start for as long as it ran, so a loop
+  waiting for it to change ran until `SCRIPT KILL`. As in Redis, `TIME`
+  now moves once the script has run past `busy-reply-threshold`. Expiry
+  still holds the script's start, and `EXEC` still holds one time.
+
 - **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
   in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path
   `JSON.NUMINCRBY` replies shaped for RESP3, and whole numbers up to 2^62

@@ -2,6 +2,9 @@
 //! `commandTimeSnapshot`: a Lua script, an `FCALL`, or a transaction's
 //! `EXEC` (#659). TTL math, the expiry of keys and hash fields, and `TIME`
 //! use the snapshot taken when the unit starts. See [`freeze`].
+//!
+//! `TIME` stops holding it once a script runs past `busy-reply-threshold`
+//! (#676). See [`let_time_move`].
 
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,6 +18,9 @@ thread_local! {
     /// gives it; 0 outside a script. What [`wall_ms_now`] reads, without
     /// borrowing `SCRIPT_STATE`.
     static FROZEN_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Whether `TIME` reads the wall clock while the rest stays frozen:
+    /// set by [`let_time_move`] until the outermost unit ends.
+    static TIME_MOVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Used only when `--features lua` (EVAL/FCALL); harmless no-op visibility otherwise.
@@ -47,6 +53,7 @@ pub fn exit_script_execution() {
         if st.0 == 0 {
             st.1 = None;
             FROZEN_MS.with(|f| f.set(0));
+            TIME_MOVES.with(|t| t.set(false));
         }
     });
 }
@@ -160,11 +167,26 @@ pub fn wall_system_time_now() -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(ttl_wall_ms_now() as u64)
 }
 
+/// Lets `TIME` read the wall clock for the rest of this thread's unit,
+/// while expiry stays at the unit's start: a script past
+/// `busy-reply-threshold`. Redis refreshes its cached time there
+/// (`scriptInterrupt` calls `processEventsWhileBlocked`, which calls
+/// `updateCachedTime`), and `TIME` reads that time, but expiry reads
+/// `cmd_time_snapshot`, which stays where the script began. Without it a
+/// script waiting for `TIME` to move never ended.
+#[allow(dead_code)]
+#[inline]
+pub fn let_time_move() {
+    TIME_MOVES.with(|t| t.set(true));
+}
+
 /// `TIME` command: `(seconds, microseconds_within_second)`.
 #[inline]
 pub fn time_command_wall_tuple() -> (u64, u32) {
     SCRIPT_STATE.with(|s| {
-        if let Some((sec, us)) = s.borrow().1 {
+        if let Some((sec, us)) = s.borrow().1
+            && !TIME_MOVES.with(|t| t.get())
+        {
             return (sec, us);
         }
         let d = SystemTime::now()
@@ -219,5 +241,24 @@ mod wall_ms_tests {
         drop(outer);
         std::thread::sleep(Duration::from_millis(2));
         assert!(wall_ms_now() > frozen);
+    }
+
+    #[test]
+    fn time_moves_once_let_while_expiry_stays_until_the_unit_ends() {
+        let unit = freeze();
+        let frozen = wall_ms_now();
+        let time = time_command_wall_tuple();
+        let_time_move();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(time_command_wall_tuple() > time);
+        assert_eq!(wall_ms_now(), frozen);
+        assert_eq!(ttl_wall_ms_now() as u64, frozen);
+        drop(unit);
+
+        // The next unit holds `TIME` again.
+        let _next = freeze();
+        let time = time_command_wall_tuple();
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(time_command_wall_tuple(), time);
     }
 }
