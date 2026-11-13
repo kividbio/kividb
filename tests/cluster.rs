@@ -2670,6 +2670,79 @@ fn command_in_background(port: u16, args: &[&str]) -> std::thread::JoinHandle<Re
     })
 }
 
+/// A `MIGRATE` that passed its connection's pause check before a
+/// `CLIENT PAUSE WRITE` was set, and reached its gate after, is held with
+/// the other writes: its key is neither sent nor deleted, and it is not
+/// answered, until the pause ends. It used to move and delete the key after
+/// the pause had been answered, a write after the offset a switchover reads
+/// (#640).
+#[test]
+fn a_migrate_on_its_way_when_clients_are_paused_is_held() {
+    let env = [("KIVIDB_TEST_PRE_GATE_DELAY_MS", "1500")];
+    let (nodes, ranges) = form_cluster_with_env(2, &env);
+    // Made by `DEBUG POPULATE`, none of whose arguments begins with
+    // `stalled:`: the hook holds up only the first write that has one.
+    let key = "stalled:0".to_string();
+    let slot = slot_of(&key).to_string();
+    let here = usize::from(!(ranges[0].0..=ranges[0].1).contains(&slot_of(&key)));
+    let (src, dst) = (&nodes[here], &nodes[1 - here]);
+    let mut s = src.conn();
+    assert!(s.cmd(&["DEBUG", "POPULATE", "1", "stalled"]).is_ok());
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
+    let reply = dst
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src.id()]);
+    assert!(reply.is_ok(), "SETSLOT IMPORTING: {reply:?}");
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst.id()])
+            .is_ok()
+    );
+
+    let port = dst.port.to_string();
+    let args = ["MIGRATE", "127.0.0.1", &port, &key, "0", "5000"];
+    let mut m = src.conn();
+    let mut raw = format!("*{}\r\n", args.len());
+    for a in args {
+        raw.push_str(&format!("${}\r\n{a}\r\n", a.len()));
+    }
+    m.stream.write_all(raw.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut a = src.conn();
+    assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).is_ok());
+    // Past the end of the hold-up: the MIGRATE has reached its gate. And
+    // past the destination's own hold-up of the first write of the key
+    // (its `RESTORE`), which a MIGRATE that was not held would be through
+    // by now.
+    std::thread::sleep(Duration::from_millis(4000));
+    m.stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    assert!(
+        m.read().is_err(),
+        "the MIGRATE was answered while writes were paused"
+    );
+    m.stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(
+        a.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        1,
+        "the MIGRATE deleted its key while writes were paused"
+    );
+    assert_eq!(
+        dst.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        0
+    );
+
+    assert!(a.cmd(&["CLIENT", "UNPAUSE"]).is_ok());
+    assert!(m.read().unwrap().is_ok(), "MIGRATE after the pause");
+    assert_eq!(a.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    assert_eq!(
+        dst.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        1
+    );
+}
+
 /// A write to a key while `MIGRATE` has it on the wire is not lost (#274),
 /// and does not make the `MIGRATE` fail either (#295): it waits until the
 /// key has moved, and is then sent on with `-ASK`, as in Redis, where
