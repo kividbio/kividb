@@ -650,7 +650,11 @@ fn move_swapdb_and_copy_to_another_database_are_refused_in_cluster_mode() {
     ] {
         refused(&mut c, args, "ERR MOVE is not allowed in cluster mode");
     }
-    for args in [&["SWAPDB", "0", "1"][..], &["SWAPDB", "0", "0"], &["SWAPDB", "x", "1"]] {
+    for args in [
+        &["SWAPDB", "0", "1"][..],
+        &["SWAPDB", "0", "0"],
+        &["SWAPDB", "x", "1"],
+    ] {
         refused(&mut c, args, "ERR SWAPDB is not allowed in cluster mode");
     }
     for args in [
@@ -745,7 +749,10 @@ fn a_cluster_replica_refuses_a_full_sync_with_keys_outside_database_0() {
         why.contains("Move them into database 0 on the master"),
         "the refusal does not say what to do: {why}"
     );
-    assert_ne!(replica.repl_info("master_link_status").as_deref(), Some("up"));
+    assert_ne!(
+        replica.repl_info("master_link_status").as_deref(),
+        Some("up")
+    );
     // Its own keys are untouched, and none of the master's came in.
     assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3), "{}", replica.log());
 }

@@ -3113,20 +3113,22 @@ pub const CLUSTER_KEYS_OUTSIDE_DB0: &str =
 
 /// How a node that refused to start for [`CLUSTER_KEYS_OUTSIDE_DB0`] is
 /// brought back with its keys, which it left on disk.
-pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_START: &str =
-    "The data on disk is kept. To recover it: start this node once without \
-     cluster-enabled, in the same directory and with the same persistence settings; in each \
-     database other than 0, move its keys into database 0 (SELECT n, then MOVE key 0) or \
-     delete them (FLUSHDB); then SAVE, or BGREWRITEAOF if the AOF is on, stop it, and start \
-     it as a cluster node again";
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_START: &str = concat!(
+    "The data on disk is kept. To recover it: start this node once without ",
+    "cluster-enabled, in the same directory and with the same persistence settings; in each ",
+    "database other than 0, move its keys into database 0 (SELECT n, then MOVE key 0) or ",
+    "delete them (FLUSHDB); then SAVE, or BGREWRITEAOF if the AOF is on, stop it, and start ",
+    "it as a cluster node again",
+);
 
 /// What a cluster replica that refused a full sync for
 /// [`CLUSTER_KEYS_OUTSIDE_DB0`] asks of its master's operator.
-pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_SYNC: &str =
-    "the master holds keys outside database 0, which a cluster node cannot serve (an older \
-     KiviDB let MOVE, SWAPDB and COPY ... DB put them there). Move them into database 0 on \
-     the master, or delete them: restarted once without cluster-enabled, it can reach them \
-     (SELECT n, then MOVE key 0, or FLUSHDB). This replica syncs again on its next try";
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_SYNC: &str = concat!(
+    "the master holds keys outside database 0, which a cluster node cannot serve (an older ",
+    "KiviDB let MOVE, SWAPDB and COPY ... DB put them there). Move them into database 0 on ",
+    "the master, or delete them: restarted once without cluster-enabled, it can reach them ",
+    "(SELECT n, then MOVE key 0, or FLUSHDB). This replica syncs again on its next try",
+);
 
 /// The largest number of databases the refusal of a snapshot advises
 /// starting with. A database number past it is more likely a damaged file
