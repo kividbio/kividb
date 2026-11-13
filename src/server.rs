@@ -2046,7 +2046,6 @@ where
                                             &args,
                                             &mut resp_version,
                                             &repl_state,
-                                            cluster_state.enabled,
                                         )
                                     } else {
                                         commands::transaction::connection_reply_in_exec(
@@ -2224,12 +2223,7 @@ where
                         key_restricted: &mut key_restricted,
                         cmd_restricted: &mut cmd_restricted,
                     }
-                    .hello(
-                        &cmd,
-                        &mut resp_version,
-                        &repl_state,
-                        cluster_state.enabled,
-                    );
+                    .hello(&cmd, &mut resp_version, &repl_state);
                     // Counted here: the commands below are not.
                     crate::cmdstats::record("HELLO", &cmd, &reply, std::time::Duration::ZERO);
                     combined.extend_from_slice(&reply);

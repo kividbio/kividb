@@ -2262,26 +2262,6 @@ fn the_empty_key_can_be_migrated() {
     assert_eq!(reply.s(), "NOKEY");
 }
 
-/// `HELLO` says `mode` `cluster` on a cluster node, as Redis does: clients
-/// read it to know whether to route by slot (#502).
-#[test]
-fn hello_says_which_mode_the_server_is_in() {
-    for (args, mode) in [
-        (&[][..], "standalone"),
-        (&["--cluster-enabled", "yes"][..], "cluster"),
-    ] {
-        let server = Server::start(args);
-        let mut c = server.conn();
-        let hello = c.cmd(&["HELLO", "2"]);
-        let at = hello
-            .arr()
-            .iter()
-            .position(|v| matches!(v, V::Str(s) if s == "mode"))
-            .unwrap_or_else(|| panic!("{hello:?}"));
-        assert_eq!(hello.arr()[at + 1].s(), mode, "{hello:?}");
-    }
-}
-
 /// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
 /// ends a database: `databases` databases, the empty key in `at`, and every
 /// key with a time to live.

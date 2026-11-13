@@ -9,13 +9,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **`HELLO` says `mode` `cluster` on a cluster node, and `MIGRATE` with an
-  empty key argument and no `KEYS` migrates the empty key (#502, #458).**
-  `HELLO` always said `standalone`, and clients read it to decide whether
-  to route by slot; its fallback reply also lacked the `id` and always
-  said protocol 2 and role master. `MIGRATE host port "" db timeout` was a
-  syntax error where Redis migrates the key named `""`, and `KEYS` with
-  nothing after it now answers `NOKEY`, as in Redis.
+- **`MIGRATE` with an empty key argument and no `KEYS` migrates the empty
+  key (#458).** `MIGRATE host port "" db timeout` was a syntax error where
+  Redis migrates the key named `""`, and the key tables named no key for
+  that form, so ACL key checks did not see it. `KEYS` with nothing after
+  it now answers `NOKEY`, as in Redis.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

@@ -115,7 +115,6 @@ impl Login<'_> {
         cmd: &[&[u8]],
         resp_version: &mut u8,
         repl_state: &crate::replication::ReplState,
-        cluster: bool,
     ) -> Vec<u8> {
         let mut protocol: Option<u8> = None;
         let mut next = 1usize;
@@ -184,44 +183,40 @@ impl Login<'_> {
             self.client_registry
                 .update(self.client_id, |info| info.resp = protocol);
         }
-        hello_reply(*resp_version, self.client_id, cluster, &repl_state.role())
-    }
-}
+        let proto_reply = *resp_version as i64;
 
-/// What `HELLO` replies: the server, its versions, the connection's
-/// protocol and id, the mode, the role and the modules. RESP3 clients (e.g.
-/// modern redis-py, whose default changed to protocol 3) expect it as a `%`
-/// map once RESP3 is negotiated; RESP2 has a flat `*` array of pairs.
-///
-/// `mode` is `cluster` on a cluster node, as in Redis: clients read it to
-/// know whether to route by slot (#502).
-pub(crate) fn hello_reply(proto: u8, client_id: u64, cluster: bool, role: &str) -> Vec<u8> {
-    // The Redis release this server follows, as `INFO`'s `redis_version`
-    // says: clients read these two to know what they may use (#451).
-    // KiviDB's own release follows them, as Dragonfly's does, and is
-    // `INFO`'s `kividb_version` too.
-    let kv = vec![
-        resp_bulk_str("server"),
-        resp_bulk_str("redis"),
-        resp_bulk_str("version"),
-        resp_bulk_str(crate::commands::server::REDIS_VERSION),
-        resp_bulk_str("kividb_version"),
-        resp_bulk_str(env!("CARGO_PKG_VERSION")),
-        resp_bulk_str("proto"),
-        resp_integer(i64::from(proto)),
-        resp_bulk_str("id"),
-        resp_integer(client_id as i64),
-        resp_bulk_str("mode"),
-        resp_bulk_str(if cluster { "cluster" } else { "standalone" }),
-        resp_bulk_str("role"),
-        resp_bulk_str(role),
-        resp_bulk_str("modules"),
-        crate::commands::server::module_list_reply(proto),
-    ];
-    if proto == 3 {
-        resp_map(kv)
-    } else {
-        resp_array(kv)
+        // Build the response — RESP3 clients (e.g. modern redis-py, whose
+        // default changed to protocol 3) expect the HELLO reply itself encoded
+        // as a `%` map once RESP3 is negotiated; RESP2 stays a flat `*` array
+        // of pairs.
+        let role = repl_state.role();
+        // The Redis release this server follows, as `INFO`'s `redis_version`
+        // says: clients read these two to know what they may use (#451).
+        // KiviDB's own release follows them, as Dragonfly's does, and is
+        // `INFO`'s `kividb_version` too.
+        let kv = vec![
+            resp_bulk_str("server"),
+            resp_bulk_str("redis"),
+            resp_bulk_str("version"),
+            resp_bulk_str(crate::commands::server::REDIS_VERSION),
+            resp_bulk_str("kividb_version"),
+            resp_bulk_str(env!("CARGO_PKG_VERSION")),
+            resp_bulk_str("proto"),
+            resp_integer(proto_reply),
+            resp_bulk_str("id"),
+            resp_integer(self.client_id as i64),
+            resp_bulk_str("mode"),
+            resp_bulk_str("standalone"),
+            resp_bulk_str("role"),
+            resp_bulk_str(&role),
+            resp_bulk_str("modules"),
+            crate::commands::server::module_list_reply(proto_reply as u8),
+        ];
+        if proto_reply == 3 {
+            resp_map(kv)
+        } else {
+            resp_array(kv)
+        }
     }
 }
 
