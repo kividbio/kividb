@@ -196,6 +196,12 @@ other files:
   node they're sent to.
 - Without `tls-cluster`, traffic between nodes is unencrypted, as in Redis.
 - KiviDB nodes cluster only with KiviDB nodes.
+- `cluster-node-timeout` is read only at startup: `CONFIG SET` refuses a
+  new value, where Redis takes it at runtime. Set it in the config file or
+  with `--cluster-node-timeout` and restart the node. The announce settings
+  (`cluster-announce-ip`, `-port`, `-bus-port`, `-hostname`,
+  `-client-port`) and `cluster-require-full-coverage` can be changed at
+  runtime, as in Redis.
 
 **Performance**
 - Many clients writing to **one key** are slower while something follows the

@@ -47,7 +47,47 @@ Kept apart from the 1.2.1 changes under [Unreleased] below: these ship in
 
 ## [Unreleased]
 
+### Changed
+
+- **`MEMORY USAGE` of a stream is what its entries take, and reads
+  differently (#683).** Stream entries are now packed into blocks, and
+  `MEMORY USAGE` counts those blocks exactly instead of estimating from a
+  sample of entries. The old estimate counted only the bytes of fields and
+  values, far below what the entries took. The new figure follows the
+  memory the entries really use, so it changes for every stream: a stream
+  of small entries (`f`=`v`) reports about three times what 1.2.1 reported,
+  though the memory it uses falls by more than 90%. Anything that alerts on
+  or graphs this number will see it move. `SAMPLES` no longer changes the
+  figure for a stream, and a stream's consumer groups and their pending
+  entries are still not counted.
+
 ### Fixed
+
+- **A server that read `/etc/kividb/kividb.conf` only because it is the
+  default config file refuses `CONFIG REWRITE` (#475).** On a host with the
+  deb or rpm package installed, every server started without `--configfile`
+  read the packaged file, and after Sentinel's `REPLICAOF` and `CONFIG
+  REWRITE` any of them overwrote it with its own `port` and `replicaof`,
+  which the packaged server then loaded on its next restart. Such a server
+  now logs a warning at startup and replies to `CONFIG REWRITE` with an
+  error saying to start it with `--configfile`; the packaged systemd unit
+  now passes `--configfile /etc/kividb/kividb.conf`.
+
+  **Upgrade note:** a server that relies on finding
+  `/etc/kividb/kividb.conf` by default, without `--configfile`, can no
+  longer `CONFIG REWRITE` it; add `--configfile /etc/kividb/kividb.conf` to
+  its command line. The packaged unit already does. A future release will
+  read a config file only when one is named, as Redis does.
+
+- **`CONFIG SET` changes `cluster-announce-ip`, `cluster-announce-port`,
+  `cluster-announce-bus-port` and `cluster-require-full-coverage` at
+  runtime, as Redis does (#391).** They were refused as immutable, so a
+  harness that learns a node's address only once it runs, as
+  testcontainers-style tests do, could not set it. The node's own address
+  follows the new settings and is saved in nodes.conf, peers take it from
+  its next heartbeat, and `CONFIG GET` and `CONFIG REWRITE` give the value
+  set. `cluster-node-timeout` stays fixed at startup, and `CONFIG SET` now
+  says so.
 
 - **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
   in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path

@@ -13,7 +13,7 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::{
-    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner,
+    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntries, StreamId, StreamInner,
 };
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
@@ -519,13 +519,17 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         if (cmd.len() - i) < 2 || !(cmd.len() - i).is_multiple_of(2) {
             return resp_error("ERR wrong number of arguments: field-value pairs required");
         }
-        type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
-        let fields: FieldsType = cmd[i..]
+        // Borrowed from the command's arguments, which outlive `ctx`'s
+        // borrows below: the stream copies the bytes it keeps.
+        let fields: Vec<(&[u8], &[u8])> = cmd[i..]
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|chunk| (Arc::from(chunk[0]), Arc::from(chunk[1])))
+            .map(|&[field, value]| (field, value))
             .collect();
+        if !StreamEntries::fits(&fields) {
+            return resp_error("ERR Elements are too large to be stored");
+        }
 
         // Owned (producer, idempotent ID): the borrow of `ctx.cmd` ends here.
         let idmp: Option<(Vec<u8>, Arc<[u8]>)> =
@@ -642,9 +646,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
 
     let id_str_out = entry_id.to_string();
     stream_extra::record_append(&mut inner, &fields);
-    inner
-        .entries
-        .push_tail(entry_id.clone(), StreamEntry { fields });
+    inner.entries.push_tail(entry_id.clone(), &fields);
     inner.last_id = entry_id.clone();
     inner.entries_added += 1;
 
@@ -2839,14 +2841,12 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
             }
             let first_entry = inner
                 .entries
-                .iter()
-                .next()
+                .first()
                 .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
             let last_entry = inner
                 .entries
-                .range_rev(..)
-                .next()
+                .last()
                 .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
 

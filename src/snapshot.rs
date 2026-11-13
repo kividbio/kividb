@@ -3,8 +3,7 @@ use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::SharedBytes;
 use crate::types::{
-    ConsumerGroup, KiviDBValue, PelEntry, SortedSetInner, StreamEntry, StreamId, StreamInner,
-    TsInner,
+    ConsumerGroup, KiviDBValue, PelEntry, SortedSetInner, StreamId, StreamInner, TsInner,
 };
 use crate::types::{VSetEntry, VectorSetInner};
 use crate::vector::{DistanceMetric, FieldType, IndexOn, IndexSchema, SchemaField, VectorAlgo};
@@ -504,6 +503,7 @@ fn read_stream_idmp(r: &mut impl Read, stream: &mut StreamInner) -> io::Result<(
 fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
     let count = read_u32_le(r)? as usize;
     let mut stream = StreamInner::new();
+    let mut entries = crate::types::LoadedEntries::new();
     for _ in 0..count {
         let id = read_stream_id(r)?;
         let fcount = read_u32_le(r)? as usize;
@@ -511,10 +511,17 @@ fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
         for _ in 0..fcount {
             let f = read_bytes(r)?;
             let v = read_bytes(r)?;
-            fields.push((Arc::from(f.as_slice()), Arc::from(v.as_slice())));
+            fields.push((f, v));
         }
-        stream.entries.insert_loaded(id, StreamEntry { fields });
+        if !crate::types::StreamEntries::fits(&fields) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream entry's field names are too large",
+            ));
+        }
+        entries.insert(id, &fields);
     }
+    stream.entries = entries.finish();
     stream.last_id = read_stream_id(r)?;
     Ok(stream)
 }
@@ -3930,13 +3937,12 @@ impl<'a> LpCursor<'a> {
 /// Type 26 on ends with idempotent production: duration, size, and for each
 /// producer its idempotent IDs and the entries they made, then two counters.
 fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
-    use crate::types::{
-        ConsumerGroup, IdmpRecord, PelEntry, ProducerIdmp, StreamEntry, StreamInner,
-    };
+    use crate::types::{ConsumerGroup, IdmpRecord, PelEntry, ProducerIdmp, StreamInner};
     const DELETED: i64 = 1;
     const SAMEFIELDS: i64 = 2;
 
     let mut stream = StreamInner::new();
+    let mut entries = crate::types::LoadedEntries::new();
     for _ in 0..rdb_read_plain_length(r)? {
         let master = raw_stream_id(&rdb_read_string(r)?)
             .ok_or_else(|| rdb_invalid("stream node key is not a stream ID"))?;
@@ -3944,8 +3950,8 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
         let mut lp = LpCursor(elements.iter());
         let live = lp.count()?;
         let deleted = lp.count()?;
-        let master_fields: Vec<Arc<[u8]>> = (0..lp.count()?)
-            .map(|_| lp.bytes().map(Arc::from))
+        let master_fields: Vec<&[u8]> = (0..lp.count()?)
+            .map(|_| lp.bytes())
             .collect::<io::Result<_>>()?;
         if lp.int()? != 0 {
             return Err(rdb_invalid("stream master entry is not closed by 0"));
@@ -3962,14 +3968,14 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             let (Some(ms), Some(seq)) = (ms, seq) else {
                 return Err(rdb_invalid("stream entry ID out of range"));
             };
-            let fields: crate::types::FieldsType = if flags & SAMEFIELDS != 0 {
+            let fields: Vec<(&[u8], &[u8])> = if flags & SAMEFIELDS != 0 {
                 master_fields
                     .iter()
-                    .map(|field| Ok((Arc::clone(field), Arc::from(lp.bytes()?))))
+                    .map(|&field| Ok((field, lp.bytes()?)))
                     .collect::<io::Result<_>>()?
             } else {
                 (0..lp.count()?)
-                    .map(|_| Ok((Arc::from(lp.bytes()?), Arc::from(lp.bytes()?))))
+                    .map(|_| Ok((lp.bytes()?, lp.bytes()?)))
                     .collect::<io::Result<_>>()?
             };
             lp.int()?; // how many elements the entry took
@@ -3977,9 +3983,10 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
                 seen_deleted += 1;
             } else {
                 seen_live += 1;
-                stream
-                    .entries
-                    .insert_loaded(crate::types::StreamId { ms, seq }, StreamEntry { fields });
+                if !crate::types::StreamEntries::fits(&fields) {
+                    return Err(rdb_invalid("stream entry's field names are too large"));
+                }
+                entries.insert(crate::types::StreamId { ms, seq }, &fields);
             }
         }
         if (seen_live, seen_deleted) != (live, deleted) {
@@ -3988,6 +3995,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             ));
         }
     }
+    stream.entries = entries.finish();
 
     let length = rdb_read_plain_length(r)?;
     stream.last_id = rdb_read_stream_id(r)?;
