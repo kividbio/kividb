@@ -528,6 +528,235 @@ fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -
 
 // ── Formation and routing ─────────────────────────────────────────────────────
 
+/// A cluster node serves database 0 alone. Started on a dataset with keys
+/// in another, from a snapshot or from its AOF, it refuses to start, as
+/// Redis does. It used to load them where no client could reach them, and
+/// slot accounting and migration never saw them (#484). The refusal says
+/// how to recover, and leaves the data on disk as it was: started again
+/// without `cluster-enabled`, the node has every key, in both databases.
+#[test]
+fn a_cluster_node_refuses_to_start_with_keys_outside_database_0() {
+    for aof in [false, true] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let persistence: &[&str] = if aof {
+            &["--aof", "--appendfsync", "always"]
+        } else {
+            &[]
+        };
+        let start_plain = |port: u16| {
+            Command::new(env!("CARGO_BIN_EXE_kividb"))
+                .current_dir(&dir)
+                .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+                .args(persistence)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let port = cluster_port();
+        let mut plain = start_plain(port);
+        let mut c = Conn::connect(port);
+        assert!(c.cmd(&["SET", "in0", "v"]).is_ok());
+        assert!(c.cmd(&["SELECT", "1"]).is_ok());
+        assert!(c.cmd(&["SET", "in1", "v"]).is_ok());
+        if !aof {
+            assert!(c.cmd(&["SAVE"]).is_ok());
+        }
+        drop(c);
+        let _ = plain.kill();
+        let _ = plain.wait();
+
+        let log = dir.join("cluster.log");
+        let mut node = Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(&dir)
+            .args(["--bind", "127.0.0.1", "--port", &cluster_port().to_string()])
+            .args(["--cluster-enabled", "yes"])
+            .args(persistence)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = node.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = node.kill();
+                let _ = node.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "aof {aof}: the cluster node started on keys in database 1:\n{log}"
+        );
+        assert!(
+            log.contains("can't have keys in a DB different than DB 0 when in Cluster mode"),
+            "aof {aof}: {log}"
+        );
+        assert!(
+            log.contains("start this node once without cluster-enabled"),
+            "aof {aof}: the refusal does not say how to recover:\n{log}"
+        );
+
+        // Nothing was lost: without cluster-enabled, every key is back.
+        let port = cluster_port();
+        let mut plain = start_plain(port);
+        let mut c = Conn::connect(port);
+        wait_until(
+            "the plain server to load its data again",
+            Duration::from_secs(30),
+            || c.cmd(&["GET", "in0"]) == Resp::Bulk(b"v".to_vec()),
+        );
+        assert!(c.cmd(&["SELECT", "1"]).is_ok());
+        assert_eq!(
+            c.cmd(&["GET", "in1"]),
+            Resp::Bulk(b"v".to_vec()),
+            "aof {aof}: the key in database 1 was lost"
+        );
+        assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(1), "aof {aof}");
+        assert!(c.cmd(&["SELECT", "0"]).is_ok());
+        assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(1), "aof {aof}");
+        drop(c);
+        let _ = plain.kill();
+        let _ = plain.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A cluster node has database 0 alone, and nothing puts a key in another:
+/// `MOVE` and `SWAPDB` are refused, and `COPY ... DB n` to any database
+/// but 0 is out of range, with Redis 8.10.2's errors. They used to put keys
+/// where no client could reach them, and the node would then refuse to
+/// start (#484).
+#[test]
+fn move_swapdb_and_copy_to_another_database_are_refused_in_cluster_mode() {
+    let (nodes, _) = form_cluster(1);
+    let mut c = nodes[0].conn();
+    assert!(c.cmd(&["SET", "{k}a", "v"]).is_ok());
+    let refused = |c: &mut Conn, args: &[&str], error: &str| {
+        assert_eq!(c.cmd(args), Resp::Error(error.to_string()), "{args:?}");
+    };
+    for args in [
+        &["MOVE", "{k}a", "1"][..],
+        &["MOVE", "{k}a", "0"],
+        &["MOVE", "{k}missing", "1"],
+        &["MOVE", "{k}a", "x"],
+    ] {
+        refused(&mut c, args, "ERR MOVE is not allowed in cluster mode");
+    }
+    for args in [
+        &["SWAPDB", "0", "1"][..],
+        &["SWAPDB", "0", "0"],
+        &["SWAPDB", "x", "1"],
+    ] {
+        refused(&mut c, args, "ERR SWAPDB is not allowed in cluster mode");
+    }
+    for args in [
+        &["COPY", "{k}a", "{k}b", "DB", "1"][..],
+        &["COPY", "{k}a", "{k}b", "DB", "15", "REPLACE"],
+        &["COPY", "{k}a", "{k}b", "DB", "99"],
+        &["COPY", "{k}a", "{k}b", "DB", "-1"],
+        &["COPY", "{k}a", "{k}b", "DB", "1", "BOGUS"],
+    ] {
+        refused(&mut c, args, "ERR DB index is out of range");
+    }
+    // A key's slot is checked first, as in Redis.
+    assert!(
+        c.cmd(&["COPY", "{k}a", "{j}b", "DB", "1"])
+            .err()
+            .is_some_and(|e| e.starts_with("CROSSSLOT")),
+    );
+    // In database 0 it copies.
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}b", "DB", "0"]), Resp::Int(1));
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}c"]), Resp::Int(1));
+    // In a transaction, each is refused as it runs.
+    assert!(c.cmd(&["MULTI"]).is_ok());
+    assert_eq!(c.cmd(&["MOVE", "{k}a", "1"]).text(), "QUEUED");
+    assert_eq!(c.cmd(&["SWAPDB", "0", "1"]).text(), "QUEUED");
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}d", "DB", "1"]).text(), "QUEUED");
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        Resp::Array(vec![
+            Resp::Error("ERR MOVE is not allowed in cluster mode".into()),
+            Resp::Error("ERR SWAPDB is not allowed in cluster mode".into()),
+            Resp::Error("ERR DB index is out of range".into()),
+        ])
+    );
+    // Every key is still in database 0.
+    assert_eq!(c.cmd(&["GET", "{k}a"]), Resp::Bulk(b"v".to_vec()));
+    assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(3));
+}
+
+/// A cluster replica whose master sends a full sync with keys outside
+/// database 0 refuses it before it touches its own dataset, and says why
+/// and what to do. The master here is one that let `MOVE` put a key in
+/// database 1, as KiviDB did before #484 (`KIVIDB_TEST_FAILPOINTS`).
+#[test]
+fn a_cluster_replica_refuses_a_full_sync_with_keys_outside_database_0() {
+    let (nodes, _) = form_cluster_with_env(1, &[("KIVIDB_TEST_FAILPOINTS", "cluster-move")]);
+    let master = &nodes[0];
+    let mut m = master.conn();
+    assert!(m.cmd(&["SET", "{k}kept", "v"]).is_ok());
+    assert!(m.cmd(&["SET", "{k}moved", "v"]).is_ok());
+    assert_eq!(m.cmd(&["MOVE", "{k}moved", "1"]), Resp::Int(1));
+
+    // A node with keys of its own, and no slots, to be the replica: the
+    // refusal must leave its keys where they are.
+    let replica = Node::start(&[]);
+    let mut r = replica.conn();
+    assert!(r.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]).is_ok());
+    wait_cluster_ok(&[&replica], 1);
+    for key in ["{r}1", "{r}2", "{r}3"] {
+        assert!(r.cmd(&["SET", key, "local"]).is_ok());
+    }
+    assert!(r.cmd(&["CLUSTER", "DELSLOTSRANGE", "0", "16383"]).is_ok());
+    assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3));
+
+    let meet = m.cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
+    assert!(meet.is_ok(), "MEET: {meet:?}");
+    let master_id = master.id();
+    wait_until(
+        "replica to learn of its master",
+        Duration::from_secs(15),
+        || {
+            r.cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .any(|l| l.starts_with(&master_id))
+        },
+    );
+    let rep = r.cmd(&["CLUSTER", "REPLICATE", &master_id]);
+    assert!(rep.is_ok(), "REPLICATE: {rep:?}");
+    wait_until(
+        "the replica to refuse the full sync",
+        Duration::from_secs(30),
+        || {
+            replica
+                .repl_info("replica_last_sync_refusal")
+                .is_some_and(|why| {
+                    why.contains("can't have keys in a DB different than DB 0 when in Cluster mode")
+                })
+        },
+    );
+    let why = replica.repl_info("replica_last_sync_refusal").unwrap();
+    assert!(
+        why.contains("Move them into database 0 on the master"),
+        "the refusal does not say what to do: {why}"
+    );
+    assert_ne!(
+        replica.repl_info("master_link_status").as_deref(),
+        Some("up")
+    );
+    // Its own keys are untouched, and none of the master's came in.
+    assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3), "{}", replica.log());
+}
+
 /// `cluster-port` sets the port the bus listens on, from a config file (as
 /// LiteLLM's tests start a node) or the command line, in place of `port` +
 /// 10000; `CONFIG GET` and `CLUSTER NODES` say it. A config file with it

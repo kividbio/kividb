@@ -55,11 +55,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and any change to how the sum is worked out would make versions differ.
   The field keeps its time to live on the replica and after a replay.
 
+- **A cluster node refuses to start with keys outside database 0 (#484).**
+  It loaded them from a snapshot, an RDB file or its AOF into databases no
+  client can reach in cluster mode, where slot accounting and migration
+  never saw them. As in Redis, it now exits with `can't have keys in a DB
+  different than DB 0 when in Cluster mode`, and a cluster replica refuses
+  such a full sync before it touches its own dataset. `MOVE`, `SWAPDB` and
+  `COPY ... DB n` put keys there and are now refused in cluster mode, with
+  Redis's errors. **Upgrade note:** a cluster node that already holds keys
+  outside database 0 will not start after the upgrade; its data on disk is
+  kept. Start it once without `cluster-enabled`, move those keys into
+  database 0 (`SELECT n`, `MOVE key 0`) or `FLUSHDB` them, `SAVE` (or
+  `BGREWRITEAOF` with the AOF on), and start it as a cluster node again.
+
 - **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
   that a short key never took (#497).** The list of hashes whose fields
   expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
   bytes is held inside that copy rather than on the heap. The estimate now adds the key's length only
   for a key that really is on the heap.
+
+- **`CLIENT LIST` and `CLIENT INFO` show `x` for a client inside `MULTI`
+  (#656).** Such a client showed `flags=N`, so a tool looking for clients
+  left in a transaction found none. The flag comes after `P` and before
+  `b`, as in Redis 8.10.
 
 - **`SCRIPT LOAD` and `SCRIPT FLUSH` during a slot handoff or a manual
   failover are answered at once, instead of stalling every connection of

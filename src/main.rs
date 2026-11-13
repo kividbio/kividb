@@ -351,6 +351,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eviction::configure(&config);
     compaction::configure(&config);
     snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
+    snapshot::SNAPSHOT_CLUSTER.store(config.cluster_enabled, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -853,6 +854,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -1709,6 +1711,7 @@ async fn async_main_tokio(
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -2284,4 +2287,26 @@ async fn async_main_tokio(
     unsafe { libc::_exit(0) };
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// A cluster node serves database 0 alone: keys loaded into another, from
+/// the AOF (a snapshot with them is refused as it is read, see
+/// `snapshot::SNAPSHOT_CLUSTER`), are where no client can reach them, and
+/// slot accounting and migration never see them. Redis refuses to start;
+/// so does KiviDB (#484).
+fn refuse_keys_outside_db0(store: &store::Store) {
+    for (db, shards) in store.iter().enumerate().skip(1) {
+        let keys: usize = shards
+            .iter()
+            .map(|shard| crate::read_lock!(shard).len())
+            .sum();
+        if keys > 0 {
+            log_fatal!(
+                "{}: {keys} keys were loaded into database {db}",
+                snapshot::CLUSTER_KEYS_OUTSIDE_DB0
+            );
+            log_fatal!("{}.", snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+            std::process::exit(1);
+        }
+    }
 }

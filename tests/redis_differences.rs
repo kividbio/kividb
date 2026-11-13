@@ -885,6 +885,50 @@ fn client_flags_laddr_and_reset() {
     });
 }
 
+/// A client inside `MULTI` shows as `x` in `CLIENT LIST` and `CLIENT INFO`
+/// (#656).
+#[test]
+fn client_flags_multi() {
+    on_each_loop(&[], |server, io| {
+        let mut observer = server.conn();
+        let mut c = server.conn();
+        assert!(c.cmd(&["CLIENT", "SETNAME", "tx"]).ok());
+        let flags = |observer: &mut Conn| -> String {
+            let list = observer.cmd(&["CLIENT", "LIST"]);
+            let line = list
+                .s()
+                .lines()
+                .find(|line| line.contains(" name=tx "))
+                .unwrap_or_else(|| panic!("no tx client in {list:?}"))
+                .to_string();
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix("flags="))
+                .unwrap_or_else(|| panic!("no flags in {line:?}"))
+                .to_string()
+        };
+        assert_eq!(flags(&mut observer), "N", "{io}");
+
+        assert!(c.cmd(&["MULTI"]).ok());
+        assert_eq!(flags(&mut observer), "x", "{io}");
+        assert_eq!(c.cmd(&["SET", "k", "v"]), V::Simple("QUEUED".into()));
+        assert_eq!(flags(&mut observer), "x", "{io}");
+        assert_eq!(c.cmd(&["EXEC"]).arr().len(), 1, "{io}");
+        assert_eq!(flags(&mut observer), "N", "{io}");
+
+        assert!(c.cmd(&["MULTI"]).ok());
+        assert_eq!(c.cmd(&["CLIENT", "INFO"]), V::Simple("QUEUED".into()));
+        let exec = c.cmd(&["EXEC"]);
+        let info = exec.arr()[0].s();
+        assert!(info.contains(" flags=x "), "{io}: {info}");
+
+        assert!(c.cmd(&["CLIENT", "NO-EVICT", "on"]).ok());
+        assert!(c.cmd(&["MULTI"]).ok());
+        assert_eq!(flags(&mut observer), "xe", "{io}");
+        assert!(c.cmd(&["DISCARD"]).ok());
+        assert_eq!(flags(&mut observer), "e", "{io}");
+    });
+}
+
 /// `CONFIG RESETSTAT` resets statistics; how much has changed since the
 /// last save is not one of them.
 #[test]
