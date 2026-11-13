@@ -1234,6 +1234,42 @@ fn ttls_survive_an_aof_replay_unchanged() {
     assert_eq!(c.cmd(&["HGETALL", "x:hash"]).arr().len(), 8);
 }
 
+/// The duplicates an idempotent `XADD` recognised are counted again when the
+/// AOF is replayed, as in Redis, which propagates the retry (#655).
+#[test]
+fn idmp_duplicates_survive_an_aof_replay() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let added = c.cmd(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+    for _ in 0..2 {
+        assert_eq!(
+            c.cmd(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]),
+            added
+        );
+    }
+    let counters = |c: &mut Conn| {
+        let info = c.cmd(&["XINFO", "STREAM", "s"]);
+        (
+            info.field("length").i(),
+            info.field("iids-added").i(),
+            info.field("iids-duplicates").i(),
+        )
+    };
+    assert_eq!(counters(&mut c), (1, 1, 2));
+    drop(c);
+
+    std::thread::sleep(Duration::from_millis(1500));
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    let mut c = restart_with_aof(&mut server);
+    assert_eq!(counters(&mut c), (1, 1, 2));
+    assert_eq!(
+        c.cmd(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]),
+        added
+    );
+    assert_eq!(counters(&mut c), (1, 1, 3));
+}
+
 // ── A persistence file that cannot be loaded ─────────────────────────────────
 
 /// A `dump.kdb` or an

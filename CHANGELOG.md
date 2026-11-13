@@ -23,6 +23,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`XINFO STREAM`'s `iids-duplicates` survives a restart that replays the
+  AOF, and a replica counts the duplicates too (#655).** A retried
+  `XADD … IDMP` that was recognised as a duplicate was not propagated, so
+  the counter started over from the AOF and stayed at 0 on a replica.
+  Redis propagates the retry as it came, and the replay counts it again;
+  KiviDB now does the same.
+
 - **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
   in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path
   `JSON.NUMINCRBY` replies shaped for RESP3, and whole numbers up to 2^62

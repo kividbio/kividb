@@ -600,15 +600,25 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
     let idmp_defaults = stream_extra::idmp_defaults(ctx.config);
 
     // A retry of a message this producer already delivered: reply with the
-    // entry it produced the first time and add nothing. A replica does not
-    // second-guess its master, which has already made this decision.
+    // entry it produced the first time and add nothing. The retry is
+    // propagated as it came, as Redis does, so a replica or the AOF counts
+    // the duplicate too. An entry the master added arrives with its ID
+    // resolved, so `*` from the master can only be such a retry: one the
+    // other side does not recognise adds nothing rather than an entry of
+    // its own.
     if let Some((producer, iid)) = &idmp
-        && !ctx.apply_replication
-        && !ctx.bypass_cluster_check
-        && let Some(existing) =
-            stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
+        && id_str == "*"
     {
-        return resp_bulk_str(&existing.to_string());
+        match stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults) {
+            Some(existing) => {
+                effect(ctx.cmd.iter().map(|b| b.to_vec()).collect());
+                return resp_bulk_str(&existing.to_string());
+            }
+            None if ctx.apply_replication || ctx.bypass_cluster_check => {
+                return resp_null_bulk();
+            }
+            None => {}
+        }
     }
 
     // The next ID is worked out without ever adding to a sequence number
