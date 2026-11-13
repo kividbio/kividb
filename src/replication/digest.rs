@@ -387,7 +387,8 @@ mod tests {
             let mut s = StreamInner::new();
             for ms in 1..=5u64 {
                 let value = ms.to_string();
-                s.entries.push_tail(StreamId::new(ms, 0), &[(&b"f"[..], value.as_bytes())]);
+                s.entries
+                    .push_tail(StreamId::new(ms, 0), &[(&b"f"[..], value.as_bytes())]);
             }
             s.last_id = StreamId::new(5, 0);
             s.entries_added = 5;
