@@ -1132,6 +1132,34 @@ fn a_replica_that_was_written_to_resyncs_in_full() {
     assert_eq!(m.stat("sync_partial_ok"), 0);
 }
 
+/// A `SELECT` changes no data: a client that selects a database on a
+/// replica leaves it where it is in its master's stream, and a dropped link
+/// is resumed with a partial resync (#424). The `SELECT` counted as a write
+/// of the replica's own, and the replica resynced in full: every client
+/// configured with a database other than 0 did that to it.
+#[test]
+fn a_select_on_a_replica_keeps_its_partial_resync() {
+    let master = Server::start(&[]);
+    let relay = Relay::to(master.port);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+
+    write_batch(&mut m, 0, 20);
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+
+    relay.cut();
+    wait_link_down(&mut r);
+    assert!(r.cmd(&["SELECT", "3"]).ok());
+    assert!(r.cmd(&["SELECT", "0"]).ok());
+    write_batch(&mut m, 1, 20);
+    relay.restore();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert_eq!(m.stat("sync_full"), 1, "{}", replica.log());
+    assert_eq!(m.stat("sync_partial_ok"), 1);
+}
+
 /// `repl-diskless-load`: by default the local dataset is dropped before the
 /// master's is loaded, so a full resync needs memory for one dataset; with
 /// `swapdb` the old one is kept until the new one is in. Either way the
