@@ -258,7 +258,13 @@ impl SortedSetInner {
 
     /// Insert or update a member. Returns true if the member is new.
     /// This is the ONLY place both maps should be written — keeps the invariant.
+    ///
+    /// A score of -0 is kept as 0, as Redis keeps it in the listpack that
+    /// holds a sorted set of up to 128 members: `ZADD z -0 m` then
+    /// `ZSCORE z m` is `0` (#422).
     pub fn insert(&mut self, member: ZMember, score: f64) -> bool {
+        // -0 + 0 is 0; any other score is itself.
+        let score = score + 0.0;
         if let Some(&old_score) = self.members.get(&member) {
             // Member exists — remove old position in the score index first
             self.by_score

@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Sorted-set scores past the range of a double, and hexadecimal ones, are
+  read as Redis 8.10 reads them, and `-0` is stored as 0 (#422).** `ZADD`,
+  `ZINCRBY` and the weights of `ZUNIONSTORE`/`ZINTERSTORE` stored `1e-400`
+  as 0 and refused `2e308`, where Redis refuses the first and takes the
+  second as infinite; a hexadecimal score was rounded digit by digit, and
+  one with a large exponent was refused or read as 0. A new member's
+  `ZINCRBY` of `-0` now replies `-0`, and a score of `-0` is kept as 0, as
+  in Redis's listpack.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
