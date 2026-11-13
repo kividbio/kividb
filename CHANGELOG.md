@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`cluster-port` sets the port the cluster bus listens on (#430).** A
+  config file with it was refused and the server did not start, and the
+  bus always listened on `port` + 10000. It is now read from the config
+  file and the command line (`--cluster-port`), shown by `CONFIG GET`,
+  written by `CONFIG REWRITE` and fixed at startup, as in Redis: 0, the
+  default, is `port` + 10000. A cluster node also logs `Cluster state
+  changed: ok` (or `fail`) when its state changes, as Redis does, for the
+  tests and operators that wait for that line.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

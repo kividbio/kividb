@@ -528,6 +528,85 @@ fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -
 
 // ── Formation and routing ─────────────────────────────────────────────────────
 
+/// `cluster-port` sets the port the bus listens on, from a config file (as
+/// LiteLLM's tests start a node) or the command line, in place of `port` +
+/// 10000; `CONFIG GET` and `CLUSTER NODES` say it. A config file with it
+/// was refused, and the node did not start. And the node says in its log
+/// when the cluster's state changes, as Redis does: a test waits for
+/// `Cluster state changed: ok` (#430).
+#[test]
+fn cluster_port_sets_the_bus_port() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = cluster_port();
+    // A port of its own, not `port` + 10000.
+    let bus = (port + 1..20_000)
+        .find(|p| port_is_free(*p) && *p != port + 10_000)
+        .unwrap();
+    let conf = [
+        "bind 127.0.0.1".to_string(),
+        format!("port {port}"),
+        format!("cluster-port {bus}"),
+        "cluster-enabled yes".to_string(),
+        "cluster-config-file nodes.conf".to_string(),
+        "appendonly no".to_string(),
+    ];
+    std::fs::write(dir.join("kividb.conf"), conf.join("\n")).unwrap();
+    let log = dir.join("node.log");
+    let mut node = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(&dir)
+        .args(["--configfile", "kividb.conf"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while TcpStream::connect(("127.0.0.1", bus)).is_err() {
+        assert!(
+            node.try_wait().unwrap().is_none(),
+            "the node exited:\n{}",
+            read_log()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no bus on {bus}:\n{}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        TcpStream::connect(("127.0.0.1", port + 10_000)).is_err(),
+        "a bus on port + 10000 too"
+    );
+    let mut c = Conn::connect(port);
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "cluster-port"]),
+        Resp::Array(vec![
+            Resp::Bulk(b"cluster-port".to_vec()),
+            Resp::Bulk(bus.to_string().into_bytes()),
+        ])
+    );
+    let nodes = c.cmd(&["CLUSTER", "NODES"]).text();
+    assert!(
+        nodes.contains(&format!(":{port}@{bus}")),
+        "CLUSTER NODES: {nodes}"
+    );
+    assert!(!read_log().contains("Cluster state changed: ok"));
+    assert!(c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_log().contains("Cluster state changed: ok") {
+        assert!(
+            Instant::now() < deadline,
+            "no state change in:\n{}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = node.kill();
+    let _ = node.wait();
+}
+
 #[test]
 fn cluster_forms_and_routes_by_slot() {
     let (nodes, ranges) = form_cluster(3);
