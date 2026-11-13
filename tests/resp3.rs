@@ -1535,25 +1535,14 @@ fn function_stats_follows_the_clients_protocol() {
     let port = free_port();
     start_server(port);
     let (mut c2, mut c3) = lua_conns(port);
-    let cases: [(&mut RawConn, &str, &[u8], &[u8], &[u8], &[u8]); 2] = [
-        (
-            &mut c2,
-            "RESP2",
-            b"*4\r\n$14\r\nrunning_script\r\n",
-            b"$-1\r\n",
-            b"*6\r\n",
-            b"$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n$15\r\nlibraries_count\r\n:",
-        ),
-        (
-            &mut c3,
-            "RESP3",
-            b"%2\r\n$14\r\nrunning_script\r\n",
-            b"_\r\n",
-            b"%3\r\n",
-            b"$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n%2\r\n$15\r\nlibraries_count\r\n:",
-        ),
-    ];
-    for (c, protocol, head, idle, running, engines) in cases {
+    fn check(
+        c: &mut RawConn,
+        protocol: &str,
+        head: &[u8],
+        idle: &[u8],
+        running: &[u8],
+        engines: &[u8],
+    ) {
         let stats = c.raw(&["FUNCTION", "STATS"]);
         let rest = stats
             .strip_prefix(head)
@@ -1569,6 +1558,22 @@ fn function_stats_follows_the_clients_protocol() {
             s(&stats)
         );
     }
+    check(
+        &mut c2,
+        "RESP2",
+        b"*4\r\n$14\r\nrunning_script\r\n",
+        b"$-1\r\n",
+        b"*6\r\n",
+        b"$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n$15\r\nlibraries_count\r\n:",
+    );
+    check(
+        &mut c3,
+        "RESP3",
+        b"%2\r\n$14\r\nrunning_script\r\n",
+        b"_\r\n",
+        b"%3\r\n",
+        b"$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n%2\r\n$15\r\nlibraries_count\r\n:",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
