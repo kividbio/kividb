@@ -2382,6 +2382,27 @@ fn test_ft_spellcheck_finds_suggestions() {
         "should have at least one suggestion"
     );
 
+    // Under RESP3 the reply is a map of `results`, a simple string too
+    // (RediSearch's `RedisModule_ReplyKV_Map(reply, "results")`).
+    let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut reader = BufReader::new(raw.try_clone().unwrap());
+    raw.write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n").unwrap();
+    raw.write_all(b"*3\r\n$13\r\nFT.SPELLCHECK\r\n$3\r\nidx\r\n$4\r\nhelo\r\n")
+        .unwrap();
+    // After what `HELLO` answers: the map, and its one name.
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "+results\r\n" {
+            break;
+        }
+        assert!(lines.len() < 512, "no `+results` in {lines:?}");
+        lines.push(line);
+    }
+    assert_eq!(lines.last().map(String::as_str), Some("%1\r\n"));
+
     // Each suggestion: [score, word]
     let found_hello = suggestions.iter().any(|s| {
         let pair = s.as_array();
