@@ -145,6 +145,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             "cluster-announce-bus-port",
             ctx.config.cluster_announce_bus_port.to_string(),
         ),
+        ("cluster-port", ctx.config.cluster_port.to_string()),
         (
             "cluster-bus-port-protected-mode",
             yes_no(ctx.config.cluster_bus_port_protected_mode),
@@ -841,6 +842,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             | "cluster-announce-ip"
             | "cluster-announce-port"
             | "cluster-announce-bus-port"
+            | "cluster-port"
             | "cluster-bus-port-protected-mode"
             | "cluster-bus-secret"
             | "tls-cluster"
