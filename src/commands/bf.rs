@@ -25,8 +25,16 @@
 //! and those of `sketch::bloom`), and a command from a client that would
 //! allocate more than `maxmemory` leaves room for evicts first, under the
 //! policy, and is refused with `OOM` only if that is not enough. A command
-//! from a master or the AOF is not held to `maxmemory`, so that a replica
-//! or a replay never drops what the master took.
+//! from a master or the AOF is held to neither `maxmemory` nor
+//! `bloom-max-filter-bytes`, only to the fixed limits, so that a replica or
+//! a replay never drops what the master took.
+//!
+//! A command of many items (`BF.MADD`, `BF.INSERT`, `BF.MEXISTS`) is held
+//! to a per-command limit (`sketch::bloom::PROBE_BUDGET`): it stops at the
+//! item that could take it past the limit, and its reply ends with an
+//! error for that item, as it ends at an item a full filter cannot take.
+//! A write that stopped early is sent to replicas and the AOF with the
+//! items it took and no others.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -40,7 +48,7 @@ use crate::resp::write::{
 use crate::sketch::Sketch;
 use crate::sketch::bloom::{
     BloomChain, BloomError, Limits, MAX_CAPACITY, MAX_ERROR, MAX_EXPANSION, MAX_MAX_FILTER_BYTES,
-    NO_MEMORY, Params, ShapeError,
+    NO_MEMORY, Params, Probes, ShapeError,
 };
 use crate::store::{self, Key, ValueRef};
 use crate::types::KiviDBValue;
@@ -54,6 +62,9 @@ const CANNOT_GROW: &str = "ERR problem inserting into filter";
 const BAD_DATA: &str = "ERR received bad data";
 const TOO_LARGE: &str = "ERR filter is too large";
 const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
+/// A command of many items at its per-command limit.
+const OVER_BUDGET: &str =
+    "ERR command reached the per-command limit for Bloom filters; send fewer items per command";
 
 // ── Settings ─────────────────────────────────────────────────────────────
 
@@ -172,8 +183,10 @@ fn default_params() -> Params {
 // ── Propagation and WATCH ────────────────────────────────────────────────
 
 thread_local! {
-    /// The `BF.INSERT` a command that made its filter is to be sent as.
-    static MADE: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) };
+    /// What a command is to be sent as instead of itself: the `BF.INSERT`
+    /// naming how it made its filter, or the items it took when it stopped
+    /// early (none, nothing).
+    static MADE: RefCell<Option<Vec<Vec<Vec<u8>>>>> = const { RefCell::new(None) };
     /// Whether the running write got as far as the key.
     static TOUCHED: Cell<bool> = const { Cell::new(false) };
 }
@@ -184,12 +197,53 @@ fn begin_write() {
 }
 
 /// What `BF.ADD`, `BF.MADD`, `BF.INSERT` or `BF.RESERVE` (`cmd`) is sent to
-/// replicas and the AOF as: itself, or, if it made its filter with a
-/// setting of this node's, a command that names what it took.
+/// replicas and the AOF as: itself; or, if it made its filter with a
+/// setting of this node's, a command that names what it took; or, if it
+/// stopped before its last item, one with the items it took.
 pub(crate) fn propagation(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     match MADE.with_borrow_mut(Option::take) {
-        Some(parts) => vec![parts],
+        Some(cmds) => cmds,
         None => vec![cmd.iter().map(|b| b.to_vec()).collect()],
+    }
+}
+
+fn send_as(cmds: Vec<Vec<Vec<u8>>>) {
+    MADE.with_borrow_mut(|m| *m = Some(cmds));
+}
+
+/// What a `BF.MADD` or `BF.INSERT` (`cmd`, its items the last `items` of
+/// it) that took the first `done` of them is to be sent as, if not as
+/// itself: `made` is the parameters it made the filter with, if it made
+/// it, and `header` the filter's header if it took no item.
+fn sent_items(
+    cmd: &[&[u8]],
+    key: &[u8],
+    items: &[&[u8]],
+    done: usize,
+    made: Option<&Params>,
+    header: Option<Vec<u8>>,
+) -> Option<Vec<Vec<Vec<u8>>>> {
+    match (made, header) {
+        (Some(params), _) if done > 0 => Some(vec![insert_form(key, params, &items[..done])]),
+        // Made, and nothing put in it: the empty filter, as its header.
+        (Some(_), Some(header)) => Some(vec![vec![
+            b"BF.LOADCHUNK".to_vec(),
+            key.to_vec(),
+            b"1".to_vec(),
+            header,
+        ]]),
+        (Some(_), None) => None,
+        (None, _) if done == items.len() => None,
+        (None, _) if done == 0 => Some(Vec::new()),
+        (None, _) => {
+            let head = &cmd[..cmd.len() - items.len()];
+            Some(vec![
+                head.iter()
+                    .chain(&items[..done])
+                    .map(|b| b.to_vec())
+                    .collect(),
+            ])
+        }
     }
 }
 
@@ -300,6 +354,7 @@ fn add_error(e: BloomError) -> Vec<u8> {
         BloomError::TooLarge => TOO_LARGE,
         BloomError::NoRoom => OOM,
         BloomError::NoMemory => NO_MEMORY,
+        BloomError::OverBudget => OVER_BUDGET,
     })
 }
 
@@ -317,8 +372,9 @@ fn shape_error(e: ShapeError) -> Vec<u8> {
 /// (`bytes`, asked only then) does not fit, keys are evicted first as the
 /// policy allows, as Redis evicts before a command; `OOM` if that is not
 /// enough. Before any lock is taken, as eviction takes them. A command
-/// from a master or the AOF is not held to `maxmemory`, nor is a replica,
-/// as no write on one is.
+/// from a master or the AOF is held to neither `maxmemory` nor
+/// `bloom-max-filter-bytes` ([`Limits::structural`]), nor is a replica, as
+/// no write on one is.
 fn limits(ctx: &mut Ctx, bytes: impl FnOnce(&Ctx) -> u64) -> Result<Limits, Vec<u8>> {
     let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
     let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
@@ -333,7 +389,21 @@ fn limits(ctx: &mut Ctx, bytes: impl FnOnce(&Ctx) -> u64) -> Result<Limits, Vec<
             }
         }
     }
-    Ok(Limits::current(from_client))
+    Ok(if from_client {
+        Limits::client()
+    } else {
+        Limits::structural()
+    })
+}
+
+/// The per-command limit of a write of many items: none for one from a
+/// master or the AOF, which must take what the master took.
+fn probes(ctx: &Ctx) -> Probes {
+    if ctx.apply_replication {
+        Probes::unlimited()
+    } else {
+        Probes::budgeted()
+    }
 }
 
 /// What adding `items` to the filter at `key` would allocate at most: its
@@ -551,7 +621,7 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
                         expansion.to_string().into_bytes(),
                     ]
                 };
-                MADE.with_borrow_mut(|m| *m = Some(made));
+                send_as(vec![made]);
             }
             map.insert(
                 Key::from(key),
@@ -585,27 +655,51 @@ fn add(ctx: &mut Ctx) -> Vec<u8> {
         Ok((Err(e), _)) => add_error(e),
         Ok((Ok(added), made)) => {
             if made {
-                MADE.with_borrow_mut(|m| *m = Some(insert_form(key, &params, &[item])));
+                send_as(vec![insert_form(key, &params, &[item])]);
             }
             boolean(resp, added)
         }
     }
 }
 
-/// Add each of `items`, stopping at one the filter cannot take: the
-/// replies, the last of them that one's error.
-fn add_each(chain: &mut BloomChain, items: &[&[u8]], resp: u8, limits: Limits) -> Vec<Vec<u8>> {
-    let mut out = Vec::with_capacity(items.len());
+/// What [`add_each`] did: the replies, how many items it took, and the
+/// filter's header if it took none.
+struct Added {
+    replies: Vec<Vec<u8>>,
+    done: usize,
+    header: Option<Vec<u8>>,
+}
+
+/// Add each of `items`, stopping at one the filter cannot take, or at the
+/// per-command limit (`probes`): the replies, the last of them that one's
+/// error. Nothing of the item it stopped at is written.
+fn add_each(
+    chain: &mut BloomChain,
+    items: &[&[u8]],
+    resp: u8,
+    limits: Limits,
+    mut probes: Probes,
+) -> Added {
+    let mut replies = Vec::with_capacity(items.len());
+    let mut done = 0;
     for item in items {
-        match chain.add(item, limits) {
-            Ok(added) => out.push(boolean(resp, added)),
+        match chain.add_within(item, limits, &mut probes) {
+            Ok(added) => {
+                replies.push(boolean(resp, added));
+                done += 1;
+            }
             Err(e) => {
-                out.push(add_error(e));
+                replies.push(add_error(e));
                 break;
             }
         }
     }
-    out
+    let header = (done == 0).then(|| chain.header());
+    Added {
+        replies,
+        done,
+        header,
+    }
 }
 
 /// `BF.MADD key item [item ...]`
@@ -622,16 +716,19 @@ fn madd(ctx: &mut Ctx) -> Vec<u8> {
         Ok(limits) => limits,
         Err(e) => return e,
     };
-    let items = &ctx.cmd[2..];
+    let probes = probes(ctx);
+    let cmd = &ctx.cmd;
+    let items = &cmd[2..];
     match with_filter_mut(ctx, key, Some(params), limits, Vec::new, |chain, made| {
-        (add_each(chain, items, resp, limits), made)
+        (add_each(chain, items, resp, limits, probes), made)
     }) {
         Err(e) => e,
-        Ok((replies, made)) => {
-            if made {
-                MADE.with_borrow_mut(|m| *m = Some(insert_form(key, &params, items)));
+        Ok((added, made)) => {
+            let made = made.then_some(&params);
+            if let Some(cmds) = sent_items(cmd, key, items, added.done, made, added.header) {
+                send_as(cmds);
             }
-            resp_array(replies)
+            resp_array(added.replies)
         }
     }
 }
@@ -706,20 +803,22 @@ fn insert(ctx: &mut Ctx) -> Vec<u8> {
         Ok(limits) => limits,
         Err(e) => return e,
     };
+    let probes = probes(ctx);
     match with_filter_mut(
         ctx,
         key,
         make,
         limits,
         || resp_error(NOT_FOUND),
-        |chain, made| (add_each(chain, items, resp, limits), made),
+        |chain, made| (add_each(chain, items, resp, limits, probes), made),
     ) {
         Err(e) => e,
-        Ok((replies, made)) => {
-            if made {
-                MADE.with_borrow_mut(|m| *m = Some(insert_form(key, &params, items)));
+        Ok((added, made)) => {
+            let made = made.then_some(&params);
+            if let Some(cmds) = sent_items(&cmd, key, items, added.done, made, added.header) {
+                send_as(cmds);
             }
-            resp_array(replies)
+            resp_array(added.replies)
         }
     }
 }
@@ -747,16 +846,25 @@ fn mexists(ctx: &mut Ctx) -> Vec<u8> {
     let key = ctx.cmd[1];
     let items = &ctx.cmd[2..];
     let resp = resp(ctx);
-    let found = match with_filter(ctx, key, |chain| {
-        items
-            .iter()
-            .map(|item| chain.contains(item))
-            .collect::<Vec<_>>()
+    let replies = match with_filter(ctx, key, |chain| {
+        // A read: held to the per-command limit wherever it comes from.
+        let mut probes = Probes::budgeted();
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match chain.contains_within(item, &mut probes) {
+                Ok(found) => out.push(boolean(resp, found)),
+                Err(e) => {
+                    out.push(add_error(e));
+                    break;
+                }
+            }
+        }
+        out
     }) {
-        Ok(Some(found)) => found,
-        _ => vec![false; items.len()],
+        Ok(Some(replies)) => replies,
+        _ => vec![boolean(resp, false); items.len()],
     };
-    resp_array(found.into_iter().map(|f| boolean(resp, f)).collect())
+    resp_array(replies)
 }
 
 /// `BF.INFO key [CAPACITY | SIZE | FILTERS | ITEMS | EXPANSION]`
@@ -853,12 +961,17 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
     };
     let key = ctx.cmd[1];
     let data = ctx.cmd[3];
-    // A header makes a filter: what its layers take, under `maxmemory`.
-    let limits = match limits(ctx, |_| {
+    // A header makes a filter: what its layers take, under `maxmemory`; a
+    // data chunk, the copy of the layer it lands in if another copy of the
+    // filter shares it.
+    let limits = match limits(ctx, |ctx| {
         if iter == 1 {
             BloomChain::header_bytes(data)
         } else {
-            0
+            with_filter(ctx, key, |chain| chain.chunk_copy_bytes(iter, data.len()))
+                .ok()
+                .flatten()
+                .unwrap_or(0)
         }
     }) {
         Ok(limits) => limits,
@@ -954,6 +1067,60 @@ mod tests {
         for bad in [&b"nan"[..], b" 0.01", b"0.01 ", b"abc", b""] {
             assert_eq!(parse_double(bad), None, "{bad:?}");
         }
+    }
+
+    /// A write that stopped before its last item is sent with the items it
+    /// took and no others; one that took them all, as itself.
+    #[test]
+    fn writes_that_stop_early_are_sent_with_what_they_took() {
+        let p = Params {
+            capacity: 100,
+            error: 0.01,
+            expansion: 2,
+            nonscaling: false,
+        };
+        let cmd: Vec<&[u8]> = vec![b"BF.MADD", b"k", b"a", b"b", b"c"];
+        let items = &cmd[2..];
+        let words = |cmds: Vec<Vec<Vec<u8>>>| -> Vec<Vec<String>> {
+            cmds.into_iter()
+                .map(|c| {
+                    c.into_iter()
+                        .map(|w| String::from_utf8_lossy(&w).into_owned())
+                        .collect()
+                })
+                .collect()
+        };
+        assert_eq!(sent_items(&cmd, b"k", items, 3, None, None), None);
+        assert_eq!(
+            words(sent_items(&cmd, b"k", items, 2, None, None).unwrap()),
+            [["BF.MADD", "k", "a", "b"]]
+        );
+        assert_eq!(
+            sent_items(&cmd, b"k", items, 0, None, Some(vec![])),
+            Some(vec![])
+        );
+        let insert: Vec<&[u8]> = vec![b"BF.INSERT", b"k", b"NOCREATE", b"ITEMS", b"a", b"b"];
+        assert_eq!(
+            words(sent_items(&insert, b"k", &insert[4..], 1, None, None).unwrap()),
+            [["BF.INSERT", "k", "NOCREATE", "ITEMS", "a"]]
+        );
+        // Made: the BF.INSERT that names how, with the items taken.
+        let made = words(sent_items(&cmd, b"k", items, 1, Some(&p), None).unwrap());
+        assert_eq!(made[0][0], "BF.INSERT");
+        assert_eq!(made[0].last().map(String::as_str), Some("a"));
+        let made = words(sent_items(&cmd, b"k", items, 3, Some(&p), None).unwrap());
+        assert_eq!(made[0].len(), 12);
+        // Made, and nothing taken: the empty filter, as its header.
+        let sent = sent_items(&cmd, b"k", items, 0, Some(&p), Some(b"hdr".to_vec())).unwrap();
+        assert_eq!(
+            sent,
+            vec![vec![
+                b"BF.LOADCHUNK".to_vec(),
+                b"k".to_vec(),
+                b"1".to_vec(),
+                b"hdr".to_vec()
+            ]]
+        );
     }
 
     #[test]

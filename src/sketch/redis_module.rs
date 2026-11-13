@@ -13,7 +13,8 @@ use std::io::{self, Read};
 
 use super::Sketch;
 use super::bloom::{
-    BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, Limits, ShapeError, Used,
+    BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, Limits, MAX_LAYER_BYTES, ShapeError,
+    Used,
 };
 
 /// The module type of Bloom filters, and the encoding version written.
@@ -216,14 +217,30 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         let bits_per_item = r.double()?;
         let bits = r.uint()?;
         let reserved = r.uint()?;
-        // The size limits, before the layer's bytes are read: they are as
-        // many as its bits over 8, or it is refused below.
-        used.bytes = used.bytes.saturating_add(bits / 8);
-        used.hashes = used.hashes.saturating_add(u64::from(hashes));
+        // The fixed size limits, before the layer's bytes are read, by what
+        // the layer says it has.
+        let claimed = Used {
+            bytes: used.bytes.saturating_add(bits / 8),
+            hashes: used.hashes.saturating_add(u64::from(hashes)),
+        };
+        if bits / 8 > MAX_LAYER_BYTES {
+            return Err(r.bad("a layer is too large to load"));
+        }
+        if let Some(why) = super::bloom::over_limits(claimed) {
+            return Err(r.bad(&why));
+        }
+        // Then by what was read (a compressed string's length is its own
+        // word, not the layer's): its bits must be its bytes times 8, and
+        // its bytes are what is charged.
+        let data = r.string()?;
+        if (data.len() as u64).checked_mul(8) != Some(bits) {
+            return Err(r.bad("a layer's bytes do not match its bits"));
+        }
+        used.bytes = used.bytes.saturating_add(data.len() as u64);
+        used.hashes = claimed.hashes;
         if let Some(why) = super::bloom::over_limits(used) {
             return Err(r.bad(&why));
         }
-        let data = r.string()?;
         let size = r.uint()?;
         shapes.push(LayerShape {
             bytes: data.len() as u64,
@@ -239,9 +256,10 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     }
     r.end()?;
     // The layers are the strings read: nothing more is allocated, and
-    // `maxmemory` is not consulted (a file or a full sync is taken whole).
+    // neither `maxmemory` nor `bloom-max-filter-bytes` is consulted (a
+    // file, a full sync or a `RESTORE` is taken whole).
     let wide = FLAG_EXACT_SIZE | FLAG_WIDE_HASH;
-    let limits = Limits::current(false);
+    let limits = Limits::structural();
     match BloomChain::from_shapes(items, flags, expansion, shapes, Some(datas), limits) {
         Ok(chain) => Ok(chain),
         Err(ShapeError::Bad) if flags & wide != wide => Err(r.bad(
@@ -285,6 +303,39 @@ mod tests {
             .collect()
     }
 
+    /// A one-layer value of 64 bits whose bytes are `data`.
+    fn one_layer_value(data: &[u8]) -> Vec<u8> {
+        let error = 0.1f64;
+        let per_item = -error.ln() / 0.480453013918201;
+        let mut w = Writer { out: Vec::new() };
+        w.uint(0); // items
+        w.uint(1); // layers
+        w.uint(u64::from(FLAG_EXACT_SIZE | FLAG_WIDE_HASH));
+        w.uint(2); // expansion
+        w.uint(10); // capacity
+        w.double(error);
+        w.uint(4); // hashes
+        w.double(per_item);
+        w.uint(64); // bits
+        w.uint(0); // reserved
+        w.string(data);
+        w.uint(0); // size
+        w.len(OPCODE_EOF);
+        w.out
+    }
+
+    /// A layer's bytes must be its bits over 8 exactly, whatever their
+    /// string says, and are refused as soon as that layer is read.
+    #[test]
+    fn layer_bytes_must_match_bits() {
+        let read = |value: Vec<u8>| super::read(BLOOM_TYPE, 4, &mut &value[..]);
+        assert!(matches!(read(one_layer_value(&[0u8; 8])), Ok(Some(_))));
+        for len in [7, 9, 16, 4096] {
+            let err = read(one_layer_value(&vec![0u8; len])).unwrap_err();
+            assert!(err.to_string().contains("do not match"), "{len}: {err}");
+        }
+    }
+
     #[test]
     fn bloom_module_id() {
         // As Redis 8.10 writes it after the type byte.
@@ -310,7 +361,7 @@ mod tests {
             panic!("not a Bloom filter");
         };
         assert!(r.is_empty());
-        let limits = Limits::current(false);
+        let limits = Limits::structural();
         let mut ours = BloomChain::new(
             Params {
                 capacity: 50,

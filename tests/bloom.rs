@@ -759,6 +759,187 @@ fn maxmemory_holds_clients_not_replication() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The AOF of `dir`, all its files together.
+fn aof_text(dir: &std::path::Path) -> String {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains("appendonly"))
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    let bytes: Vec<u8> = files
+        .iter()
+        .filter_map(|p| {
+            if p.is_dir() {
+                let mut inner: Vec<_> = std::fs::read_dir(p)
+                    .ok()?
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .collect();
+                inner.sort();
+                Some(
+                    inner
+                        .iter()
+                        .filter_map(|f| std::fs::read(f).ok())
+                        .flatten()
+                        .collect(),
+                )
+            } else {
+                std::fs::read(p).ok()
+            }
+        })
+        .flatten()
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// `bloom-max-filter-bytes` holds a client, never a master, the AOF or a
+/// load: a replica with a lower setting takes every filter the master
+/// took under its higher one, in full, and keeps them when it restarts;
+/// the AOF and a snapshot replayed under the lower setting do too. And a
+/// write the master stopped early at its own limit reaches the replica
+/// with the items it took and no others.
+#[test]
+fn bloom_max_filter_bytes_holds_clients_not_replication() {
+    let (dir, replica_dir) = (tmp_dir("limit-master"), tmp_dir("limit-replica"));
+    std::fs::write(
+        replica_dir.join("kividb.conf"),
+        "bloom-max-filter-bytes 4kb\n",
+    )
+    .unwrap();
+    let keys = ["big", "fixed", "grown", "made", "stopped"];
+    let master = Child::start(&dir, &["--aof"]);
+    let mut m = master.conn();
+    let replica_args = [
+        "--aof",
+        "--replicaof",
+        "127.0.0.1",
+        &master.port.to_string(),
+    ]
+    .map(String::from);
+    let replica_args: Vec<&str> = replica_args.iter().map(String::as_str).collect();
+    let synced = |r: &mut Conn| {
+        wait_until("the replica to sync", || {
+            String::from_utf8_lossy(&r.cmd(&["INFO", "replication"]))
+                .contains("master_link_status:up")
+        });
+    };
+    let on_master: Vec<_> = {
+        let replica = Child::start(&replica_dir, &replica_args);
+        let mut r = replica.conn();
+        synced(&mut r);
+        assert_eq!(
+            r.cmd(&["CONFIG", "GET", "bloom-max-filter-bytes"]),
+            b"*2\r\n$22\r\nbloom-max-filter-bytes\r\n$4\r\n4096\r\n"
+        );
+        // Each over the replica's 4 KiB: one layer of 6 KB, made by
+        // BF.RESERVE, by BF.RESERVE NONSCALING (sent as its header) and by
+        // BF.INSERT; and five layers grown to 6 KB in all.
+        assert_eq!(m.cmd(&["BF.RESERVE", "big", "0.01", "5000"]), b"+OK\r\n");
+        assert_eq!(m.cmd(&["BF.ADD", "big", "x"]), b":1\r\n");
+        assert_eq!(
+            m.cmd(&["BF.RESERVE", "fixed", "0.01", "5000", "NONSCALING"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(m.cmd(&["BF.ADD", "fixed", "y"]), b":1\r\n");
+        assert_eq!(
+            m.cmd(&["BF.INSERT", "made", "CAPACITY", "5000", "ITEMS", "a", "b"]),
+            b"*2\r\n:1\r\n:1\r\n"
+        );
+        assert_eq!(m.cmd(&["BF.RESERVE", "grown", "0.01", "100"]), b"+OK\r\n");
+        for batch in 0..3 {
+            let items: Vec<String> = (0..600).map(|i| format!("g{batch}-{i}")).collect();
+            let mut args = vec!["BF.MADD", "grown"];
+            args.extend(items.iter().map(String::as_str));
+            let reply = m.cmd(&args);
+            assert!(!shown(&reply).contains("ERR"), "{}", shown(&reply));
+        }
+        assert_eq!(m.cmd(&["BF.INFO", "grown", "FILTERS"]), b"*1\r\n:5\r\n");
+        // The master at a lower limit of its own: its BF.MADD stops at the
+        // item that would need a fifth layer, and the replica, which is
+        // not held to any setting, takes no more than it did.
+        assert_eq!(
+            m.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "4kb"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(m.cmd(&["BF.RESERVE", "stopped", "0.01", "100"]), b"+OK\r\n");
+        let items: Vec<String> = (0..2000).map(|i| format!("s{i}")).collect();
+        let mut args = vec!["BF.MADD", "stopped"];
+        args.extend(items.iter().map(String::as_str));
+        let reply = m.cmd(&args);
+        assert!(
+            reply.ends_with(b"-ERR filter is too large\r\n"),
+            "{}",
+            shown(&reply[reply.len().saturating_sub(60)..])
+        );
+        assert_eq!(
+            m.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "512mb"]),
+            b"+OK\r\n"
+        );
+        m.cmd(&["SET", "last", "1"]);
+        wait_until("the replica to have every filter", || {
+            r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
+        });
+        let on_master: Vec<_> = keys.iter().map(|k| scandump(&mut m, k)).collect();
+        let on_replica: Vec<_> = keys.iter().map(|k| scandump(&mut r, k)).collect();
+        assert_eq!(on_replica, on_master);
+        assert_eq!(
+            r.cmd(&["BF.CARD", "stopped"]),
+            m.cmd(&["BF.CARD", "stopped"])
+        );
+        on_master
+    };
+    // The master stopped early and sent the items it took, not all 2000.
+    let aof = aof_text(&dir);
+    assert!(
+        !aof.contains("s1999"),
+        "the AOF has items the master did not take"
+    );
+    // The replica restarted, under its lower setting.
+    {
+        let replica = Child::start(&replica_dir, &replica_args);
+        let mut r = replica.conn();
+        synced(&mut r);
+        let after: Vec<_> = keys.iter().map(|k| scandump(&mut r, k)).collect();
+        assert_eq!(after, on_master, "the replica restarted");
+    }
+    // The replica's own AOF, replayed with no master, under it.
+    {
+        let server = Child::start(&replica_dir, &["--aof"]);
+        let mut c = server.conn();
+        let after: Vec<_> = keys.iter().map(|k| scandump(&mut c, k)).collect();
+        assert_eq!(after, on_master, "the replica's AOF replayed");
+    }
+    drop(master);
+    // The master's AOF replayed under the lower setting; then its snapshot.
+    std::fs::write(dir.join("kividb.conf"), "bloom-max-filter-bytes 4kb\n").unwrap();
+    {
+        let server = Child::start(&dir, &["--aof"]);
+        let mut c = server.conn();
+        assert_eq!(
+            c.cmd(&["CONFIG", "GET", "bloom-max-filter-bytes"]),
+            b"*2\r\n$22\r\nbloom-max-filter-bytes\r\n$4\r\n4096\r\n"
+        );
+        let after: Vec<_> = keys.iter().map(|k| scandump(&mut c, k)).collect();
+        assert_eq!(after, on_master, "the master's AOF replayed");
+        assert_eq!(c.cmd(&["SAVE"]), b"+OK\r\n");
+        // A client is still held to it.
+        assert_eq!(
+            c.cmd(&["BF.RESERVE", "more", "0.01", "5000"]),
+            b"-ERR filter is too large\r\n"
+        );
+    }
+    {
+        let server = Child::start(&dir, &[]);
+        let mut c = server.conn();
+        let after: Vec<_> = keys.iter().map(|k| scandump(&mut c, k)).collect();
+        assert_eq!(after, on_master, "the snapshot loaded");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
 // ── Generic behaviour ────────────────────────────────────────────────────
 
 /// As in Redis: a write to the key invalidates a `WATCH` on it even when it
@@ -1017,7 +1198,7 @@ fn limits() {
     // layers may have; over the layers a filter may have.
     for (what, raw, want) in [
         ("bytes", widest_header(21), &too_large[..]),
-        ("hashes", widest_header(559), too_large),
+        ("hashes", widest_header(61), too_large),
         ("layers", widest_header(2049), b"-ERR received bad data\r\n"),
     ] {
         if what != "bytes" {
@@ -1031,22 +1212,34 @@ fn limits() {
         assert_eq!(c.cmd(&["EXISTS", "h"]), b":0\r\n", "{what}");
     }
     assert_eq!(
-        c.raw(&[b"BF.LOADCHUNK", b"h", b"1", &widest_header(558)]),
+        c.raw(&[b"BF.LOADCHUNK", b"h", b"1", &widest_header(60)]),
         b"+OK\r\n"
     );
-    // RESTORE of a filter over the limit.
+    // RESTORE is a load: held to the fixed limits alone, not to the
+    // setting, as a snapshot or a full sync is.
     c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "4kb"]);
-    let restored = c.raw(&[b"RESTORE", b"r", b"0", &payload]);
-    assert!(restored.starts_with(b"-"), "{}", shown(&restored));
-    assert_eq!(c.cmd(&["EXISTS", "r"]), b":0\r\n");
-    c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "512mb"]);
     assert_eq!(c.raw(&[b"RESTORE", b"r", b"0", &payload]), b"+OK\r\n");
-    // A filter that grows and cannot says so, as Redis does.
+    assert_eq!(scandump(&mut c, "r"), scandump(&mut c, "dumped"));
+    c.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "512mb"]);
+    // A filter that grows past the hashes all its layers may have is
+    // refused at the item that would need another layer.
     assert_eq!(
-        c.cmd(&["BF.RESERVE", "u", "1e-300", "1", "EXPANSION", "1"]),
+        c.cmd(&["BF.RESERVE", "t", "1e-300", "1", "EXPANSION", "1"]),
         b"+OK\r\n"
     );
     let items: Vec<String> = (1..=92).map(|i| format!("item{i}")).collect();
+    let mut args = vec!["BF.MADD", "t"];
+    args.extend(items.iter().map(String::as_str));
+    let reply = c.cmd(&args);
+    assert!(reply.ends_with(too_large), "{}", shown(&reply));
+    // A filter that grows and cannot, below that, says so, as Redis does.
+    assert_eq!(
+        c.cmd(&["BF.RESERVE", "u", "1e-305", "1", "EXPANSION", "1"]),
+        b"+OK\r\n"
+    );
+    let items: Vec<String> = (1..=REDIS_1E305_ITEMS + 1)
+        .map(|i| format!("item{i}"))
+        .collect();
     let mut args = vec!["BF.MADD", "u"];
     args.extend(items.iter().map(String::as_str));
     let reply = c.cmd(&args);
@@ -1055,7 +1248,82 @@ fn limits() {
         "{}",
         shown(&reply)
     );
-    assert_eq!(c.cmd(&["BF.INFO", "u", "FILTERS"]), b"*1\r\n:78\r\n");
+    assert_eq!(
+        c.cmd(&["BF.INFO", "u", "FILTERS"]),
+        format!("*1\r\n:{REDIS_1E305_LAYERS}\r\n").into_bytes()
+    );
+    assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
+    c.cmd(&["FLUSHALL"]);
+}
+
+/// What Redis 8.10.2 does with `BF.RESERVE u 1e-305 1 EXPANSION 1` and
+/// `BF.MADD` of `item1`, `item2`, ...: it takes this many items, in this
+/// many layers, and the next is `problem inserting into filter`.
+const REDIS_1E305_ITEMS: usize = 69;
+const REDIS_1E305_LAYERS: usize = 61;
+
+/// A command of many items is held to a per-command limit: a reply that
+/// reaches it ends with an error for the item it stopped at, and the
+/// filter, and the server, go on. Commands of ordinary size are not
+/// touched by it.
+#[test]
+fn per_command_limit() {
+    let _serial = serial();
+    let port = start(config());
+    let mut c = Conn::connect(port);
+    // 60 layers of 1075 hashes, every bit set: an item may take 64,500
+    // bits to look up.
+    assert_eq!(
+        c.raw(&[b"BF.LOADCHUNK", b"wide", b"1", &widest_header(60)]),
+        b"+OK\r\n"
+    );
+    for layer in 0..60u64 {
+        let iter = ((layer + 1) * 200 + 1).to_string();
+        assert_eq!(
+            c.raw(&[b"BF.LOADCHUNK", b"wide", iter.as_bytes(), &[0xff; 200]]),
+            b"+OK\r\n"
+        );
+    }
+    let over = b"-ERR command reached the per-command limit for Bloom filters; send fewer items per command\r\n";
+    let items: Vec<String> = (0..300).map(|i| format!("w{i}")).collect();
+    let mut args = vec!["BF.MEXISTS", "wide"];
+    args.extend(items.iter().map(String::as_str));
+    let reply = c.cmd(&args);
+    assert!(reply.starts_with(b"*174\r\n"), "{}", shown(&reply[..20]));
+    assert!(reply.ends_with(over), "{}", shown(&reply));
+    for write in ["BF.MADD", "BF.INSERT"] {
+        let mut args = if write == "BF.MADD" {
+            vec!["BF.MADD", "wide"]
+        } else {
+            vec!["BF.INSERT", "wide", "ITEMS"]
+        };
+        args.extend(items.iter().map(String::as_str));
+        let reply = c.cmd(&args);
+        assert!(
+            reply.starts_with(b"*173\r\n"),
+            "{write}: {}",
+            shown(&reply[..20])
+        );
+        assert!(reply.ends_with(over), "{write}: {}", shown(&reply));
+    }
+    // One item at a time is always taken.
+    assert_eq!(c.cmd(&["BF.EXISTS", "wide", "w299"]), b":1\r\n");
+    assert_eq!(c.cmd(&["BF.ADD", "wide", "w299"]), b":0\r\n");
+    // Ordinary filters and commands: a filter of ten layers, a thousand
+    // items a command.
+    assert_eq!(c.cmd(&["BF.RESERVE", "n", "0.01", "100"]), b"+OK\r\n");
+    for batch in 0..101 {
+        let items: Vec<String> = (0..1000).map(|i| format!("n{batch}-{i}")).collect();
+        let mut args = vec!["BF.MADD", "n"];
+        args.extend(items.iter().map(String::as_str));
+        let reply = c.cmd(&args);
+        assert!(!shown(&reply).contains("ERR"), "{batch}: {}", shown(&reply));
+        let mut args = vec!["BF.MEXISTS", "n"];
+        args.extend(items.iter().map(String::as_str));
+        let reply = c.cmd(&args);
+        assert!(!shown(&reply).contains("ERR"), "{batch}: {}", shown(&reply));
+    }
+    assert_eq!(c.cmd(&["BF.INFO", "n", "FILTERS"]), b"*1\r\n:10\r\n");
     assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
     c.cmd(&["FLUSHALL"]);
 }

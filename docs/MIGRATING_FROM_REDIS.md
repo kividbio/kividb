@@ -101,8 +101,9 @@ What the RDB reader takes from Redis:
   RedisBloom 2.4 and later (tested with RDB files of Redis Stack 6.2, 7.2
   and 7.4, and Redis 8.10). So do `RESTORE` and `MIGRATE` of them,
   and `BF.SCANDUMP` chunks taken on Redis can be loaded with `BF.LOADCHUNK`.
-  The `bf-*` settings carry over in the config file. A filter over 512 MiB
-  needs `bloom-max-filter-bytes` raised first (Redis has no such limit).
+  The `bf-*` settings carry over in the config file. Loading is not held
+  to `bloom-max-filter-bytes`; `BF.LOADCHUNK` of a filter over 512 MiB
+  needs it raised first (Redis has no such limit).
 - **Other module data** (time series, vector sets, Cuckoo filters,
   Count-min sketches, Top-K, t-digests) is refused, and so is the whole
   file: KiviDB won't load part of a snapshot. Move those keys with `MIGRATE`

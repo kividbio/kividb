@@ -759,15 +759,25 @@ Settings (`CONFIG SET`, the config file): `bf-error-rate` (0.01),
 what `BF.RESERVE` takes without `EXPANSION`. Such a filter is sent to replicas
 and the AOF naming what it took, so a replica or a replay with other settings
 makes the same filter. `bloom-max-filter-bytes` (512 MiB; KiviDB's own, with
-units as `maxmemory` takes them) is the most one filter may take.
+units as `maxmemory` takes them) is the most one filter a client's commands
+make or grow may take; replication, the AOF and loads are not held to it.
 
 ### Differences from Redis
 
 - `COPY` copies a filter; Redis refuses it.
 - A filter made before RedisBloom 2.0 (32-bit hashes) is not loaded.
-- Size limits: a filter over `bloom-max-filter-bytes` (512 MiB unless raised)
-  or 2048 layers is not made, grown or loaded (`ERR filter is too large`);
-  Redis has no such limit. Nor is one the system will not allocate.
+- Size limits: a client's command does not make or grow a filter over
+  `bloom-max-filter-bytes` (512 MiB unless raised); no filter of more than
+  2048 layers, or 65,536 hashes in all its layers, is made, grown or loaded
+  (`ERR filter is too large`). Redis has no such limit. Nor is one the system
+  will not allocate. Replication, the AOF, snapshots, RDB files and
+  `RESTORE` are held only to the fixed limits, so a replica or a restart
+  with a lower `bloom-max-filter-bytes` keeps every filter.
+- Per-command limit: `BF.MADD`, `BF.INSERT` and `BF.MEXISTS` stop at the item
+  that would take the command past it, and the reply ends with `ERR command
+  reached the per-command limit for Bloom filters; send fewer items per
+  command` for that item. A write sends replicas and the AOF only the items
+  it took. Commands of ordinary size are not affected.
 - Under `maxmemory`, a client's command that would allocate more than is left
   evicts first under the policy, and is refused with `OOM ...` only if that is
   not enough. A command from a master or the AOF is not refused.

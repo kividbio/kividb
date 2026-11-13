@@ -43,9 +43,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `ACL` has the `@bloom` category. Snapshots keep filters under a new
   record (tag 40), so a snapshot with a Bloom filter in it cannot be read
   by an earlier release (see Upgrading). Unlike Redis, a filter has size
-  limits: `bloom-max-filter-bytes`, a new setting, is 512 MiB by default;
-  raise it for larger filters. Cuckoo filters, Count-min sketches, Top-K
-  and t-digests follow.
+  limits: `bloom-max-filter-bytes`, a new setting, is 512 MiB by default
+  and holds a client's commands; raise it for larger filters. Replication,
+  the AOF and loads (snapshots, full syncs, RDB files, `RESTORE`) are held
+  only to fixed size limits, so a replica or a restart with a lower setting
+  keeps every filter the master took. `BF.MADD`, `BF.INSERT` and
+  `BF.MEXISTS` have a per-command limit: a command that reaches it stops,
+  and its reply ends with an error for the item it stopped at (send fewer
+  items per command). Cuckoo filters, Count-min sketches, Top-K and
+  t-digests follow.
 
 ### Changed
 

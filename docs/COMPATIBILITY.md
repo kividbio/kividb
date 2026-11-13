@@ -154,8 +154,11 @@ other files:
   refused.
 - Bloom filters: `COPY` copies one, which Redis refuses. A filter made before
   RedisBloom 2.0 (32-bit hashes) is not loaded. A filter has size limits
-  Redis does not have: `bloom-max-filter-bytes` (512 MiB unless raised) and
-  2048 layers, whether it is made, grows or is loaded. What a header, a
+  Redis does not have: `bloom-max-filter-bytes` (512 MiB unless raised) for
+  a client's commands, and fixed ones (2048 layers, 65,536 hashes in all its
+  layers) whether it is made, grows or is loaded. Replication, the AOF and
+  loads are not held to `bloom-max-filter-bytes`. `BF.MADD`, `BF.INSERT`
+  and `BF.MEXISTS` have a per-command limit. What a header, a
   snapshot, an RDB file or a `DUMP` payload says about a filter is checked
   before it is used: one Redis could not have made is refused. Their `DUMP` payloads carry RDB version 9, so every Redis
   since 6.0 can `RESTORE` them.
