@@ -1619,9 +1619,14 @@ pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
     read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
 }
 
-/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]).
+/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]):
+/// database 0 alone on a cluster node ([`SNAPSHOT_CLUSTER`]).
 fn server_databases() -> usize {
-    SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
+    if SNAPSHOT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// [`load_snapshot_from`] for an image in memory, read again as
@@ -3092,6 +3097,39 @@ fn too_long() -> io::Error {
 pub static SNAPSHOT_DATABASES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(16);
 
+/// The server is a cluster node, set as it starts: a snapshot may have keys
+/// in database 0 only, the one database a cluster serves (`SELECT` is
+/// refused there). Keys in the others were loaded where no client could
+/// reach them, and slot accounting and migration never saw them (#484).
+/// Redis refuses to start with them; so does KiviDB, and a replica refuses
+/// such a full sync before it touches its dataset.
+pub static SNAPSHOT_CLUSTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What refuses a dataset with keys outside database 0 on a cluster node,
+/// as Redis words it.
+pub const CLUSTER_KEYS_OUTSIDE_DB0: &str =
+    "can't have keys in a DB different than DB 0 when in Cluster mode";
+
+/// How a node that refused to start for [`CLUSTER_KEYS_OUTSIDE_DB0`] is
+/// brought back with its keys, which it left on disk.
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_START: &str = concat!(
+    "The data on disk is kept. To recover it: start this node once without ",
+    "cluster-enabled, in the same directory and with the same persistence settings; in each ",
+    "database other than 0, move its keys into database 0 (SELECT n, then MOVE key 0) or ",
+    "delete them (FLUSHDB); then SAVE, or BGREWRITEAOF if the AOF is on, stop it, and start ",
+    "it as a cluster node again",
+);
+
+/// What a cluster replica that refused a full sync for
+/// [`CLUSTER_KEYS_OUTSIDE_DB0`] asks of its master's operator.
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_SYNC: &str = concat!(
+    "the master holds keys outside database 0, which a cluster node cannot serve (an older ",
+    "KiviDB let MOVE, SWAPDB and COPY ... DB put them there). Move them into database 0 on ",
+    "the master, or delete them: restarted once without cluster-enabled, it can reach them ",
+    "(SELECT n, then MOVE key 0, or FLUSHDB). This replica syncs again on its next try",
+);
+
 /// The largest number of databases the refusal of a snapshot advises
 /// starting with. A database number past it is more likely a damaged file
 /// than a server to configure.
@@ -3102,6 +3140,9 @@ const DATABASES_ADVISED_MAX: u64 = 1 << 16;
 fn database_of_snapshot(db: u64, databases: usize, what: &str) -> Result<usize, String> {
     match usize::try_from(db) {
         Ok(index) if index < databases => Ok(index),
+        _ if SNAPSHOT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) => Err(format!(
+            "{CLUSTER_KEYS_OUTSIDE_DB0}: the file has {what} in database {db}"
+        )),
         _ if db < DATABASES_ADVISED_MAX => Err(format!(
             "the file has {what} in database {db}, and this server has {databases} databases: \
              start it with databases {} or more",
@@ -3128,7 +3169,7 @@ impl std::fmt::Display for PastDatabases {
 
 impl std::error::Error for PastDatabases {}
 
-fn is_past_databases(e: &io::Error) -> bool {
+pub(crate) fn is_past_databases(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<PastDatabases>())
 }
 
@@ -3251,7 +3292,7 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xFE => {
                 // Database selector
                 let (db_num, _) = rdb_read_length(&mut r)?;
-                let databases = SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
+                let databases = server_databases();
                 current_db =
                     database_of_snapshot(db_num, databases, "keys").map_err(rdb_invalid)?;
                 if current_db >= result.len() {

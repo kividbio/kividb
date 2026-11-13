@@ -1071,11 +1071,12 @@ async fn run_replication_session(
             if local_keys > 0 && is_kdb && repl_state.flush_before_load.load(Ordering::Relaxed) {
                 Some(
                     crate::snapshot::verify_snapshot(rdb_bytes.as_slice()).map_err(|e| {
-                        let e = crate::snapshot::refusal_of_payload(e);
-                        SessionError::Link(format!(
-                            "full-sync payload is not a valid KDB image ({e}); the local dataset \
-                         is untouched"
-                        ))
+                        payload_refusal(e, |e| {
+                            format!(
+                                "full-sync payload is not a valid KDB image ({e}); the local \
+                                 dataset is untouched"
+                            )
+                        })
                     })?,
                 )
             } else {
@@ -1746,6 +1747,30 @@ struct StagedSync {
     keys_with_ttl: usize,
 }
 
+/// The refusal of a KDB full-sync payload, for `e`. One read whole and
+/// refused for its databases (#482), or for keys outside database 0 of a
+/// cluster node (#484), is [`SessionError::Unfollowable`]: the same master
+/// sends the same again. Anything else is a broken link. `what` words it.
+fn payload_refusal(
+    e: std::io::Error,
+    what: impl FnOnce(&std::io::Error) -> String,
+) -> SessionError {
+    let refused = crate::snapshot::is_past_databases(&e);
+    let e = crate::snapshot::refusal_of_payload(e);
+    if !refused {
+        return SessionError::Link(what(&e));
+    }
+    if e.to_string()
+        .contains(crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0)
+    {
+        return SessionError::Unfollowable(format!(
+            "full-sync payload refused ({e}); the local dataset is untouched. {}",
+            crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_SYNC
+        ));
+    }
+    SessionError::Unfollowable(what(&e))
+}
+
 /// Parse a full-sync payload into fresh staging stores.
 ///
 /// The master sends a native KDB image (`KIVIDB01`); a Redis master sends an
@@ -1763,8 +1788,9 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
         let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
-            let e = crate::snapshot::refusal_of_payload(e);
-            SessionError::Link(format!("full-sync payload is not a valid KDB image: {e}"))
+            payload_refusal(e, |e| {
+                format!("full-sync payload is not a valid KDB image: {e}")
+            })
         })?;
         (
             loaded.dbs,
