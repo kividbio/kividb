@@ -767,9 +767,12 @@ fn a_cluster_replica_refuses_a_full_sync_with_keys_outside_database_0() {
 fn cluster_port_sets_the_bus_port() {
     let dir = tempfile::tempdir().unwrap().keep();
     let port = cluster_port();
-    // A port of its own, not `port` + 10000.
-    let bus = (port + 1..20_000)
-        .find(|p| port_is_free(*p) && *p != port + 10_000)
+    // A port of its own, not `port` + 10000, and outside 10000-29999, where
+    // the other tests' nodes and their buses are: `port + 1` was often the
+    // next node's port, which then could not start. Below Linux's ephemeral
+    // range (32768 and up), so no client's own port can take it.
+    let bus = (30_000 + port % 2_000..32_768)
+        .find(|p| port_is_free(*p))
         .unwrap();
     let conf = [
         "bind 127.0.0.1".to_string(),
