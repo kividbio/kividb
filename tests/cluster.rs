@@ -5737,7 +5737,13 @@ fn a_cluster_runs_over_tls_between_its_nodes() {
     let r = d.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &nodes[0].id()]);
     assert!(r.is_ok(), "{r:?}");
     let row = nodes[1].my_row();
-    let tls_port = row[1].split('@').next().unwrap().rsplit(':').next().unwrap();
+    let tls_port = row[1]
+        .split('@')
+        .next()
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap();
     let received = |c: &mut Conn| {
         let info = c.cmd(&["INFO", "stats"]).text();
         info.lines()
