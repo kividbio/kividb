@@ -20,6 +20,7 @@
 
 pub mod bus;
 pub mod ddl;
+pub(crate) mod migrate_conns;
 pub mod migration;
 pub mod node;
 pub mod persist;

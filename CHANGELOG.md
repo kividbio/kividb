@@ -93,6 +93,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now one step.
 
 
+- **`MIGRATE` no longer opens a new connection for every call (#726).**
+  It dialled its target each time and closed the connection after the
+  replies, so a resharding, which sends one `MIGRATE` per batch of keys,
+  left a socket in TIME_WAIT on the source node for every batch. As in
+  Redis, the connection is now kept for 10 seconds and reused by the next
+  `MIGRATE` to the same target with the same `AUTH`/`AUTH2` and TLS setup,
+  at most 16 kept in all; it is closed on any error or timeout, and nothing
+  is ever sent on it twice.
+
 - **Searches in a cluster no longer use up the coordinator's ports
   (#723).** `FT.SEARCH` and `FT.AGGREGATE` opened a new connection to every
   other master for each search and closed it after the reply, so under a
