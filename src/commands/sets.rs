@@ -615,7 +615,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             let len = result.len() as i64;
+            // An empty difference into a destination that is not there
+            // writes nothing and deletes nothing: Redis fails no watch on
+            // it, and so must we, as for an empty `SINTERSTORE` (#674). A
+            // destination that is there goes, and fails its watch either
+            // way.
+            let absent = len == 0
+                && ctx.watch_registry.has_watchers()
+                && read_lock!(store::get_shard(&ctx.store[*ctx.selected_db], &dst_key))
+                    .get(dst_key.as_slice())
+                    .is_none();
             store_set(ctx, &dst_key, result);
+            if absent {
+                crate::watch::unchanged(*ctx.selected_db, &dst_key);
+            }
             crate::stats::record_hit();
             notify(ctx.pubsub, *ctx.selected_db, KS_SET, "sdiffstore", &dst_key);
             Some(resp_integer(len))
@@ -651,7 +664,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             let len = result.len() as i64;
+            // An empty intersection into a destination that is not there
+            // writes nothing and deletes nothing: Redis fails no watch on
+            // it, and so must we (#674). A destination that is there goes,
+            // and fails its watch either way.
+            let absent = len == 0
+                && ctx.watch_registry.has_watchers()
+                && read_lock!(store::get_shard(&ctx.store[*ctx.selected_db], &dst_key))
+                    .get(dst_key.as_slice())
+                    .is_none();
             store_set(ctx, &dst_key, result);
+            if absent {
+                crate::watch::unchanged(*ctx.selected_db, &dst_key);
+            }
             crate::stats::record_hit();
             notify(
                 ctx.pubsub,
@@ -730,7 +755,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             let len = result.len() as i64;
+            // An empty union into a destination that is not there writes
+            // nothing and deletes nothing: Redis fails no watch on it, and
+            // so must we, as for an empty `SINTERSTORE` (#674). A
+            // destination that is there goes, and fails its watch either
+            // way.
+            let absent = len == 0
+                && ctx.watch_registry.has_watchers()
+                && read_lock!(store::get_shard(&ctx.store[*ctx.selected_db], &dst_key))
+                    .get(dst_key.as_slice())
+                    .is_none();
             store_set(ctx, &dst_key, result);
+            if absent {
+                crate::watch::unchanged(*ctx.selected_db, &dst_key);
+            }
             crate::stats::record_hit();
             notify(
                 ctx.pubsub,
