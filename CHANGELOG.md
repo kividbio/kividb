@@ -23,6 +23,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A server that read `/etc/kividb/kividb.conf` only because it is the
+  default config file refuses `CONFIG REWRITE` (#475).** On a host with the
+  deb or rpm package installed, every server started without `--configfile`
+  read the packaged file, and after Sentinel's `REPLICAOF` and `CONFIG
+  REWRITE` any of them overwrote it with its own `port` and `replicaof`,
+  which the packaged server then loaded on its next restart. Such a server
+  now logs a warning at startup and replies to `CONFIG REWRITE` with an
+  error saying to start it with `--configfile`; the packaged systemd unit
+  now passes `--configfile /etc/kividb/kividb.conf`.
+
+  **Upgrade note:** a server that relies on finding
+  `/etc/kividb/kividb.conf` by default, without `--configfile`, can no
+  longer `CONFIG REWRITE` it; add `--configfile /etc/kividb/kividb.conf` to
+  its command line. The packaged unit already does. A future release will
+  read a config file only when one is named, as Redis does.
+
+- **`CONFIG SET` changes `cluster-announce-ip`, `cluster-announce-port`,
+  `cluster-announce-bus-port` and `cluster-require-full-coverage` at
+  runtime, as Redis does (#391).** They were refused as immutable, so a
+  harness that learns a node's address only once it runs, as
+  testcontainers-style tests do, could not set it. The node's own address
+  follows the new settings and is saved in nodes.conf, peers take it from
+  its next heartbeat, and `CONFIG GET` and `CONFIG REWRITE` give the value
+  set. `cluster-node-timeout` stays fixed at startup, and `CONFIG SET` now
+  says so.
+
 - **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
   in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path
   `JSON.NUMINCRBY` replies shaped for RESP3, and whole numbers up to 2^62
