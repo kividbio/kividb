@@ -9,6 +9,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CONFIG SET` changes `cluster-announce-ip`, `cluster-announce-port`,
+  `cluster-announce-bus-port` and `cluster-require-full-coverage` at
+  runtime, as Redis does (#391).** They were refused as immutable, so a
+  harness that learns a node's address only once it runs, as
+  testcontainers-style tests do, could not set it. The node's own address
+  follows the new settings and is saved in nodes.conf, peers take it from
+  its next heartbeat, and `CONFIG GET` and `CONFIG REWRITE` give the value
+  set. `cluster-node-timeout` stays fixed at startup, and `CONFIG SET` now
+  says so.
+
 - **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
   in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path
   `JSON.NUMINCRBY` replies shaped for RESP3, and whole numbers up to 2^62
