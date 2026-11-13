@@ -1100,6 +1100,11 @@ pub fn format_score(score: f64) -> String {
     if let Some(whole) = whole_score(score) {
         return whole.to_string();
     }
+    // Redis writes every whole number up to 2^62 as an integer, all its
+    // digits: `100000000` and `10000000000000000`, not `1e+8` and `1e+16`.
+    if score != 0.0 && score.abs() <= 4_611_686_018_427_387_904.0 && score.fract() == 0.0 {
+        return (score as i64).to_string();
+    }
     if score == f64::INFINITY {
         return "inf".to_string();
     }
@@ -1172,6 +1177,19 @@ mod score_format_tests {
             (-1.7976931348623157e308, "-1.7976931348623157e+308"),
             (f64::INFINITY, "inf"),
             (f64::NEG_INFINITY, "-inf"),
+            // Whole numbers up to 2^62 are written as integers. What Redis
+            // 8.10.2 replies to ZSCORE for each (#472).
+            (-0.0, "-0"),
+            (100_000_000.0, "100000000"),
+            (1e16, "10000000000000000"),
+            (1e18, "1000000000000000000"),
+            (-1e18, "-1000000000000000000"),
+            (4_611_686_018_427_387_904.0, "4611686018427387904"),
+            (18_446_744_073_709_551_616.0, "18446744073709552000"),
+            (123_456_789.123_456_78, "1.2345678912345678e+8"),
+            (1.5e-7, "1.5e-7"),
+            (0.000_001, "0.000001"),
+            (1e300, "1e+300"),
         ] {
             assert_eq!(format_score(score), text, "{score:e}");
         }
@@ -1456,8 +1474,8 @@ mod whole_score_tests {
             (1.0, "1"),
             (99_999_999.0, "99999999"),
             (-99_999_999.0, "-99999999"),
-            // Past eight digits it is the long way round, as it always was.
-            (100_000_000.0, "1e+8"),
+            // Past eight digits it is the long way round, to the same digits.
+            (100_000_000.0, "100000000"),
             (10_000_000.0, "10000000"),
             (123_456_789.0, "123456789"),
             (0.0, "0"),

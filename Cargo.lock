@@ -443,6 +443,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-webpki",
+ "serde",
  "serde_json",
  "sha1",
  "sha2",

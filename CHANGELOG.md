@@ -9,6 +9,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
+  in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path
+  `JSON.NUMINCRBY` replies shaped for RESP3, and whole numbers up to 2^62
+  with all their digits (#471, #472, #473).** JSON text had `1e+21` where
+  RedisJSON writes `1e21`, `JSON.RESP` sent a float as the bulk string of
+  its JSON text, and a RESP3 double was never written with an exponent, so
+  `1e300` went out as 301 digits, and `-0` as `0`; a score of `100000000`
+  was `1e+8`. Under RESP3, `JSON.TYPE` replies in an array of one, as
+  RedisJSON does, and `JSON.NUMINCRBY`/`JSON.NUMMULTBY` through a legacy
+  path reply with every match; through a legacy path they now change every
+  number the path matches, as RedisJSON does, not only the first, and their
+  errors for a key or a number that is not there are RedisJSON's.
+
+  **Upgrade note:** a `JSON.NUMINCRBY` or `JSON.NUMMULTBY` through a legacy
+  path (`.a`, `..x`) now changes every number it matches. The command is
+  replicated and logged as sent, so where a legacy path matches more than
+  one number, a replica on an older version changes only the first and
+  ends up with a different document, and an AOF written by an older
+  version, replayed after the upgrade, now changes every match where the
+  older server changed only the first. Upgrade replicas before their
+  master, as always, and run `BGREWRITEAOF` before upgrading if such
+  commands are in the AOF.
+
 - **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
   that a short key never took (#497).** The list of hashes whose fields
   expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
