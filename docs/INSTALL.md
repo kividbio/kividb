@@ -115,7 +115,8 @@ journalctl -u kividb
 To accept clients from other machines, set a password (`requirepass`) and
 change `bind` in `/etc/kividb/kividb.conf`, then `sudo systemctl restart kividb`.
 Without systemd (a container, for example), nothing is started; run
-`kividb` yourself, as the `kividb` user, from `/var/lib/kividb`.
+`kividb --configfile /etc/kividb/kividb.conf` yourself, as the `kividb`
+user, from `/var/lib/kividb`.
 
 ### Upgrading, pinning and going back
 

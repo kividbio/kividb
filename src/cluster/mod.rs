@@ -203,6 +203,23 @@ pub struct LostDataset {
     empty_replicas: parking_lot::Mutex<ahash::AHashSet<(String, u16)>>,
 }
 
+/// This node's announce settings, and what an unset one falls back to.
+#[derive(Default)]
+struct Announce {
+    /// `cluster-announce-ip`; empty: unset.
+    ip: String,
+    /// `cluster-announce-port`; 0: unset.
+    port: u16,
+    /// `cluster-announce-bus-port`; 0: unset.
+    bus_port: u16,
+    /// `bind`, fixed at startup.
+    bind: String,
+    /// The port clients reach this node on, fixed at startup.
+    client_port: u16,
+    /// The bus port this node listens on, fixed at startup.
+    listen_bus_port: u16,
+}
+
 /// The locks below are `parking_lot` locks: a reader queues behind a waiting
 /// writer, so a thread must never take a lock it already holds, read or
 /// write, and a guard must not be kept across an `.await`. Where one thread
@@ -322,6 +339,9 @@ pub struct ClusterState {
     marked_failed: AtomicBool,
     /// `cluster-require-full-coverage`.
     require_full_coverage: AtomicBool,
+    /// `cluster-announce-ip`, `-port` and `-bus-port`, as configured at
+    /// startup or since by `CONFIG SET`. See [`Self::set_announce`].
+    announce: parking_lot::Mutex<Announce>,
     /// `cluster-replica-validity-factor`: how stale a replica's data may be
     /// for it to stand for election, in node timeouts; 0 = always stand.
     replica_validity_factor: AtomicU64,
@@ -398,6 +418,7 @@ impl ClusterState {
             last_failover_began: parking_lot::Mutex::new(None),
             marked_failed: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
+            announce: parking_lot::Mutex::new(Announce::default()),
             replica_validity_factor: AtomicU64::new(10),
             self_ip_is_guess: AtomicBool::new(false),
             bus_secret: std::sync::OnceLock::new(),
@@ -508,7 +529,14 @@ impl ClusterState {
     /// after logging one line.
     pub fn from_config(config: &crate::config::Config) -> std::io::Result<Self> {
         if !config.cluster_enabled {
-            return Ok(Self::new_disabled());
+            // Kept for `CONFIG GET`, `SET` and `REWRITE`, as Redis keeps
+            // them outside cluster mode too.
+            let state = Self::new_disabled();
+            state.configure_announce(config);
+            state
+                .require_full_coverage
+                .store(config.cluster_require_full_coverage, Ordering::Relaxed);
+            return Ok(state);
         }
         if !valid_hostname(&config.cluster_announce_hostname) {
             return Err(std::io::Error::new(
@@ -546,23 +574,7 @@ impl ClusterState {
         // for clients and for the other nodes alike (see `node_tls`); the bus
         // stays where it is. A node with no plaintext port (port 0) has
         // `tls-cluster`: see `Config::validate`.
-        let client_port = if config.tls_cluster || config.port == 0 {
-            config.tls_port
-        } else {
-            config.port
-        };
-        let bus_port = if config.cluster_announce_bus_port != 0 {
-            config.cluster_announce_bus_port
-        } else {
-            config.cluster_bus_port()
-        };
-        state.configure_self_address(
-            &config.bind,
-            client_port,
-            &config.cluster_announce_ip,
-            config.cluster_announce_port,
-            bus_port,
-        );
+        state.configure_announce(config);
         state.set_require_full_coverage(config.cluster_require_full_coverage);
         state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
@@ -770,6 +782,100 @@ impl ClusterState {
             me.client_port = announced_client;
             me.cluster_port = announced_bus;
         }
+    }
+
+    /// Take this node's announce settings from its configuration, and set
+    /// its own address from them.
+    pub fn configure_announce(&self, config: &crate::config::Config) {
+        // With `tls-cluster` the port to reach this node on is its TLS port,
+        // for clients and for the other nodes alike (see `node_tls`); the bus
+        // stays where it is. A node with no plaintext port (port 0) has
+        // `tls-cluster`: see `Config::validate`.
+        let client_port = if config.tls_cluster || config.port == 0 {
+            config.tls_port
+        } else {
+            config.port
+        };
+        let mut announce = self.announce.lock();
+        *announce = Announce {
+            ip: config.cluster_announce_ip.clone(),
+            port: config.cluster_announce_port,
+            bus_port: config.cluster_announce_bus_port,
+            bind: config.bind.clone(),
+            client_port,
+            listen_bus_port: config.cluster_bus_port(),
+        };
+        self.apply_announce(&announce);
+    }
+
+    fn apply_announce(&self, announce: &Announce) {
+        let bus_port = if announce.bus_port != 0 {
+            announce.bus_port
+        } else {
+            announce.listen_bus_port
+        };
+        self.configure_self_address(
+            &announce.bind,
+            announce.client_port,
+            &announce.ip,
+            announce.port,
+            bus_port,
+        );
+    }
+
+    /// `cluster-announce-ip`, `cluster-announce-port` and
+    /// `cluster-announce-bus-port` as they are set now (empty or 0: unset).
+    pub fn announce(&self) -> (String, u16, u16) {
+        let announce = self.announce.lock();
+        (announce.ip.clone(), announce.port, announce.bus_port)
+    }
+
+    /// Change `cluster-announce-ip`, `-port` or `-bus-port` while the node
+    /// runs (`CONFIG SET`), as Redis allows (#391). This node's own address
+    /// follows, and nodes.conf is saved when it changed. Peers take the new
+    /// address from this node's next heartbeat, as they would after a
+    /// restart with the new settings.
+    pub fn set_announce(
+        &self,
+        ip: Option<&str>,
+        port: Option<u16>,
+        bus_port: Option<u16>,
+    ) -> std::io::Result<()> {
+        let address = || {
+            self.nodes
+                .read()
+                .get(&self.myself())
+                .map(|me| (me.ip.clone(), me.client_port, me.cluster_port))
+        };
+        let before = address();
+        {
+            let mut announce = self.announce.lock();
+            if let Some(ip) = ip {
+                announce.ip = ip.to_string();
+            }
+            if let Some(port) = port {
+                announce.port = port;
+            }
+            if let Some(bus_port) = bus_port {
+                announce.bus_port = bus_port;
+            }
+            if self.enabled {
+                self.apply_announce(&announce);
+            }
+        }
+        if self.enabled && address() != before {
+            let (ip, port, bus_port) = self.announce();
+            log_info!(
+                "Cluster: announce settings changed (ip '{ip}', port {port}, bus port {bus_port})"
+            );
+            self.save_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// `cluster-require-full-coverage`.
+    pub fn require_full_coverage(&self) -> bool {
+        self.require_full_coverage.load(Ordering::Relaxed)
     }
 
     /// Set this node's `cluster-announce-hostname` (empty: none). Peers

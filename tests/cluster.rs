@@ -7094,3 +7094,161 @@ fn cluster_searches_give_back_keys_of_any_bytes() {
         assert_eq!(keys, want, "FT.AGGREGATE on port {}", node.port);
     }
 }
+
+/// `CONFIG SET` changes `cluster-announce-ip`, `-port`, `-bus-port` and
+/// `cluster-require-full-coverage` while the node runs, as Redis 8 allows:
+/// testcontainers-style harnesses learn a node's address only once it runs
+/// (#391). `CONFIG GET` and `CONFIG REWRITE` give the value set, the node's
+/// own address follows, and nodes.conf is saved with it.
+/// `cluster-node-timeout` stays fixed at startup, and says so.
+#[test]
+fn announce_settings_and_full_coverage_change_at_runtime() {
+    let node = Node::start(&[]);
+    let mut c = node.conn();
+    let get = |c: &mut Conn, name: &str| c.cmd(&["CONFIG", "GET", name]).array()[1].text();
+    for (name, value) in [
+        ("cluster-announce-ip", "172.17.0.9"),
+        ("cluster-announce-port", "6379"),
+        ("cluster-announce-bus-port", "16379"),
+        ("cluster-require-full-coverage", "no"),
+    ] {
+        let r = c.cmd(&["CONFIG", "SET", name, value]);
+        assert!(r.is_ok(), "CONFIG SET {name} {value}: {r:?}");
+        assert_eq!(get(&mut c, name), value);
+    }
+    assert_eq!(
+        node.my_row()[1].split(',').next().unwrap(),
+        "172.17.0.9:6379@16379"
+    );
+    let saved = std::fs::read_to_string(node.dir.join("nodes.conf")).unwrap();
+    assert!(
+        saved
+            .lines()
+            .any(|l| l.contains("myself") && l.contains("172.17.0.9:6379@16379")),
+        "{saved}"
+    );
+    assert!(c.cmd(&["CONFIG", "REWRITE"]).is_ok());
+    let conf = std::fs::read_to_string(node.dir.join("kividb.conf")).unwrap();
+    for line in [
+        "cluster-announce-ip 172.17.0.9",
+        "cluster-announce-port 6379",
+        "cluster-announce-bus-port 16379",
+        "cluster-require-full-coverage no",
+    ] {
+        assert!(conf.lines().any(|l| l == line), "no '{line}' in:\n{conf}");
+    }
+    // Unset again: an empty address is not left at the one set before.
+    assert!(c.cmd(&["CONFIG", "SET", "cluster-announce-ip", ""]).is_ok());
+    assert_eq!(get(&mut c, "cluster-announce-ip"), "");
+    assert!(c.cmd(&["CONFIG", "REWRITE"]).is_ok());
+    let conf = std::fs::read_to_string(node.dir.join("kividb.conf")).unwrap();
+    assert!(!conf.contains("cluster-announce-ip"), "{conf}");
+
+    // Refused as Redis refuses them.
+    let long = "x".repeat(46);
+    for (name, value, why) in [
+        (
+            "cluster-announce-ip",
+            "a_b",
+            "Hostnames may only contain alphanumeric characters, hyphens or dots",
+        ),
+        (
+            "cluster-announce-ip",
+            long.as_str(),
+            "Hostnames for cluster-announce-ip must be less than 46 characters",
+        ),
+        (
+            "cluster-announce-port",
+            "70000",
+            "argument must be between 0 and 65535 inclusive",
+        ),
+        (
+            "cluster-announce-bus-port",
+            "abc",
+            "argument couldn't be parsed into an integer",
+        ),
+        (
+            "cluster-require-full-coverage",
+            "maybe",
+            "argument must be 'yes' or 'no'",
+        ),
+    ] {
+        let r = c.cmd(&["CONFIG", "SET", name, value]);
+        assert_eq!(
+            r.err(),
+            Some(
+                format!("ERR CONFIG SET failed (possibly related to argument '{name}') - {why}")
+                    .as_str()
+            ),
+            "CONFIG SET {name} {value}"
+        );
+    }
+
+    let timeout = NODE_TIMEOUT_MS.to_string();
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-node-timeout", &timeout])
+            .is_ok()
+    );
+    let r = c.cmd(&["CONFIG", "SET", "cluster-node-timeout", "6000"]);
+    let err = r.err().unwrap_or_else(|| panic!("{r:?}"));
+    assert!(err.contains("only at startup"), "{err}");
+    assert_eq!(get(&mut c, "cluster-node-timeout"), timeout);
+}
+
+/// A node's address changed with `CONFIG SET` reaches its peers from its
+/// own heartbeats, and the cluster goes on with it (#391).
+#[test]
+fn peers_learn_an_announce_address_changed_at_runtime() {
+    let (nodes, _) = form_cluster(3);
+    let id = nodes[1].id();
+    let row_of = |node: &Node| {
+        let text = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+        text.lines()
+            .find(|l| l.starts_with(&id))
+            .unwrap_or_else(|| panic!("no row for {id} in:\n{text}"))
+            .split(' ')
+            .nth(1)
+            .and_then(|address| address.split(',').next())
+            .unwrap()
+            .to_string()
+    };
+    let port = nodes[1].port;
+    let original = format!("127.0.0.1:{port}@{}", port + 10_000);
+    assert_eq!(row_of(&nodes[0]), original);
+
+    // An address nobody listens on: the peers still take it from node 1.
+    let mut c = nodes[1].conn();
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-port", "1"])
+            .is_ok()
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-bus-port", "2"])
+            .is_ok()
+    );
+    wait_until(
+        "the peers to learn node 1's new address",
+        Duration::from_secs(15),
+        || {
+            [&nodes[0], &nodes[2]]
+                .iter()
+                .all(|n| row_of(n) == "127.0.0.1:1@2")
+        },
+    );
+
+    // And back: the cluster is whole again.
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-port", "0"])
+            .is_ok()
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-bus-port", "0"])
+            .is_ok()
+    );
+    wait_until(
+        "the peers to learn node 1's own address again",
+        Duration::from_secs(15),
+        || [&nodes[0], &nodes[2]].iter().all(|n| row_of(n) == original),
+    );
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
+}
