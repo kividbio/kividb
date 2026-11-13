@@ -23,6 +23,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`DEBUG SLEEP` returns Redis's errors for non-numeric and wrong-arity arguments (#657).**
+  A non-numeric argument (`DEBUG SLEEP abc`) was reported as a wrong number
+  of arguments, and arity errors used KiviDB's own wording. A non-numeric
+  argument now answers `ERR value is not a valid float`, and wrong argument
+  counts answer `ERR unknown subcommand or wrong number of arguments for
+  '<subcommand>'. Try DEBUG HELP.`, matching Redis and the other `DEBUG`
+  subcommands.
+
 - **A server that read `/etc/kividb/kividb.conf` only because it is the
   default config file refuses `CONFIG REWRITE` (#475).** On a host with the
   deb or rpm package installed, every server started without `--configfile`
