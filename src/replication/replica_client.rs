@@ -1094,6 +1094,7 @@ async fn run_replication_session(
                 {
                     let _cut = crate::write_gate::cut();
                     let empty = store::new_store(config.databases);
+                    touch_watches_of_replaced(store, &empty);
                     store::swap_kv_with_staging(store, &empty);
                     crate::aof::log_superseded();
                     index_store.write().clear();
@@ -1132,6 +1133,7 @@ async fn run_replication_session(
             // Stop the world for the swap, the same way a checkpoint does, so a
             // local AOF record cannot straddle it.
             let _cut = crate::write_gate::cut();
+            touch_watches_of_replaced(store, &staged.store);
             store::swap_kv_with_staging(store, &staged.store);
             // The open log is of the dataset this replaced (#350).
             crate::aof::log_superseded();
@@ -1777,10 +1779,17 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
                 let what = format!("full-sync payload is not a valid RDB: {e}");
                 // Refused for what it holds (it would be refused again), not
                 // cut short or corrupt: see `SessionError::Unfollowable`.
-                if crate::snapshot::is_unrepresentable(&e) {
-                    SessionError::Unfollowable(what)
-                } else {
-                    SessionError::Link(what)
+                // Its checksum decides where it has one: a wrong one is
+                // damage on the way, whatever the reading made of it; a
+                // right one is what the master holds, whatever refused it
+                // (#483).
+                match crate::snapshot::rdb_payload_checksum(payload) {
+                    Some(false) => SessionError::Link(what),
+                    Some(true) => SessionError::Unfollowable(what),
+                    None if crate::snapshot::is_unrepresentable(&e) => {
+                        SessionError::Unfollowable(what)
+                    }
+                    None => SessionError::Link(what),
                 }
             })?;
         (dbs, expiries, Vec::new(), Vec::new(), functions)
@@ -1796,6 +1805,27 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
         keys,
         keys_with_ttl,
     })
+}
+
+/// Before the dataset `store` holds is replaced by `incoming` (a full sync):
+/// a watch on a key that is in either is broken, as a flush or a `SWAPDB`
+/// breaks it, and one on a key in neither holds (Redis touches every watched
+/// key when a replica loads its master's data, `touchAllWatchedKeysInDb`).
+/// The watches stayed: a client that had watched a key on the replica ran
+/// its `EXEC` over a dataset that had been replaced under it (#673). Called
+/// with the write gate cut, so nothing writes to either meanwhile.
+fn touch_watches_of_replaced(store: &Store, incoming: &Store) {
+    use crate::watch::WatchNotifier;
+    let watches = crate::watch::ForStore(store);
+    if !watches.has_watchers() {
+        return;
+    }
+    watches.notify_replaced(None, &|db, key| {
+        (
+            crate::watch::presence(store, db, key),
+            crate::watch::presence(incoming, db, key),
+        )
+    });
 }
 
 fn count_keys(store: &Store) -> usize {
@@ -2918,6 +2948,50 @@ mod full_sync_guard_tests {
 
         // Not a KDB image and not an RDB either.
         assert!(load_full_sync_payload(b"definitely not a dataset", 16).is_err());
+    }
+
+    /// A Redis payload refused for what it holds is unfollowable: tried
+    /// again later and later, its reason shown, as KeyDB's and Dragonfly's
+    /// are. Before, the refusals of Redis's own content (module values and
+    /// data, opcodes 0xF2/0xF3/0xF6, an unknown type) were link errors,
+    /// retried every second, each a full sync on the master (#483). A wrong
+    /// checksum says the payload was damaged on the way: a link error, as
+    /// before, whatever the reading made of it.
+    #[test]
+    fn a_redis_payload_refused_for_what_it_holds_is_unfollowable() {
+        let with_checksum = |body: &[u8], sum: Option<u64>| {
+            let mut payload = body.to_vec();
+            let sum = sum.unwrap_or_else(|| crate::snapshot::redis_crc64(body));
+            payload.extend_from_slice(&sum.to_le_bytes());
+            payload
+        };
+        let unfollowable = |payload: &[u8]| {
+            matches!(
+                load_full_sync_payload(payload, 16),
+                Err(super::SessionError::Unfollowable(_))
+            )
+        };
+        let link = |payload: &[u8]| {
+            matches!(
+                load_full_sync_payload(payload, 16),
+                Err(super::SessionError::Link(_))
+            )
+        };
+        // A key of RDB type 30, which no Redis writes yet.
+        let mut unknown_type = b"REDIS0012\xfe\x00".to_vec();
+        unknown_type.extend_from_slice(&[30, 1, b'k', 0, 0xff]);
+        // A hash template (opcode 0xF2).
+        let template = b"REDIS0012\xfe\x00\xf2\x00\xff".to_vec();
+        for body in [&unknown_type, &template] {
+            assert!(unfollowable(&with_checksum(body, None)), "{body:?}");
+            // No checksum (`rdbchecksum no`): refused by what it is.
+            assert!(unfollowable(&with_checksum(body, Some(0))), "{body:?}");
+            // A wrong one: damaged on the way.
+            assert!(link(&with_checksum(body, Some(12345))), "{body:?}");
+        }
+        // A payload cut short: no checksum to vouch for it, and nothing
+        // refused for what it is.
+        assert!(link(b"REDIS0012\xfe\x00\x00\x01k"));
     }
 
     /// A 1.2.0 master's payload that reads more than one way (#441) is an

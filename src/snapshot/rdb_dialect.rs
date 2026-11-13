@@ -58,10 +58,12 @@ pub(super) fn from_header(header: &[u8; 9]) -> io::Result<Dialect> {
         .ok_or_else(|| rdb_invalid("a VALKEY header without an RDB version"))?;
     match version {
         VALKEY_RDB_VERSION => Ok(Dialect::Valkey),
-        newer if newer > VALKEY_RDB_VERSION => Err(rdb_invalid(format!(
-            "Valkey RDB version {newer} is newer than the one this server reads \
+        newer if newer > VALKEY_RDB_VERSION => {
+            Err(super::rdb_extensions::unrepresentable(format!(
+                "Valkey RDB version {newer} is newer than the one this server reads \
              ({VALKEY_RDB_VERSION}, Valkey 9.0 and 9.1)"
-        ))),
+            )))
+        }
         // Valkey itself never writes a VALKEY header below 80.
         older => Err(rdb_invalid(format!(
             "a VALKEY header with RDB version {older}, which Valkey does not write"
@@ -102,7 +104,7 @@ pub(super) fn read_value(
             22 => read_valkey_hash_2(r),
             // The types Valkey shares with Redis: up to RDB 11's.
             0..=21 => rdb_read_value(r, type_id),
-            other => Err(rdb_invalid(format!(
+            other => Err(super::rdb_extensions::unrepresentable(format!(
                 "RDB type {other} is not one Valkey 9.0 or 9.1 writes"
             ))),
         },
@@ -116,7 +118,7 @@ pub(super) fn read_value(
 /// with them, or without them.
 pub(super) fn refuse_slot_import(r: &mut impl Read) -> io::Error {
     let what = describe_slot_import(r).unwrap_or_default();
-    rdb_invalid(format!(
+    super::rdb_extensions::unrepresentable(format!(
         "the file holds a Valkey slot migration into this node that was in progress \
          when it was saved{what}: the keys of those slots are not all there. Finish or \
          cancel the migration on the Valkey node, then save the file again"
