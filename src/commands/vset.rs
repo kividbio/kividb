@@ -9,10 +9,8 @@
 // vectors directly at a key — like a sorted set but with N-dim vectors.
 
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::parse_utf8;
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, VSetEntry, VectorSetInner};
 use crate::{read_lock, write_lock};
@@ -45,7 +43,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 /// `asked` names a `DISTANCE` other than the existing set's.
 fn get_or_create_vset(
     ctx: &mut Ctx,
-    key: &str,
+    key: &[u8],
     dim: usize,
     asked: Option<crate::vector::DistanceMetric>,
 ) -> Result<Arc<RwLock<VectorSetInner>>, Vec<u8>> {
@@ -81,7 +79,7 @@ fn get_or_create_vset(
         )),
         None => {
             let vs = Arc::new(RwLock::new(VectorSetInner::with_metric(dim, metric)));
-            map.insert(Key::from(key), KiviDBValue::VectorSet(Arc::clone(&vs)));
+            map.insert(key, KiviDBValue::VectorSet(Arc::clone(&vs)));
             Ok(vs)
         }
     }
@@ -147,10 +145,7 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // Walk arguments to find vector encoding and element name
     let mut i = 2usize;
@@ -237,8 +232,10 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let dim = vec.len();
 
     // Next: element name
-    let element = match cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
-        Some(s) => s.to_string(),
+    // Any bytes, as in Redis: a name that was not UTF-8 was taken for a
+    // missing one.
+    let element = match cmd.get(i) {
+        Some(b) => crate::key_bytes::KeyBytes::from(*b),
         None => {
             return Some(resp_error(
                 "ERR wrong number of arguments for 'vadd' command",
@@ -317,10 +314,7 @@ fn vrem(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -340,10 +334,9 @@ fn vrem(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let mut inner = vs.write();
     let mut removed = 0i64;
+    // Any bytes: a name that was not UTF-8 was passed over.
     for elem_bytes in &cmd[2..] {
-        if let Ok(elem) = std::str::from_utf8(elem_bytes)
-            && inner.entries.remove(elem).is_some()
-        {
+        if inner.entries.remove(*elem_bytes).is_some() {
             removed += 1;
         }
     }
@@ -362,10 +355,7 @@ fn vcard(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vcard' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -391,10 +381,7 @@ fn vdim(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vdim' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -421,19 +408,13 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vemb' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
-    let element = match parse_utf8(cmd[2]) {
-        Some(e) => e,
-        None => return Some(resp_error("ERR element must be valid UTF-8")),
-    };
-    let raw = cmd
-        .get(3)
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.eq_ignore_ascii_case("RAW"))
-        .unwrap_or(false);
+    let key: &[u8] = cmd[1];
+    let element: &[u8] = cmd[2];
+    // As the vector-sets module: RAW, as often as given, and nothing else.
+    if cmd[3..].iter().any(|opt| !opt.eq_ignore_ascii_case(b"RAW")) {
+        return Some(resp_error("ERR invalid option"));
+    }
+    let raw = cmd.len() > 3;
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -481,14 +462,8 @@ fn vismember(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vismember' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
-    let element = match parse_utf8(cmd[2]) {
-        Some(e) => e,
-        None => return Some(resp_error("ERR element must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
+    let element: &[u8] = cmd[2];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -518,14 +493,8 @@ fn vgetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vgetattr' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
-    let element = match parse_utf8(cmd[2]) {
-        Some(e) => e,
-        None => return Some(resp_error("ERR element must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
+    let element: &[u8] = cmd[2];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -556,14 +525,8 @@ fn vsetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vsetattr' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
-    let element = match parse_utf8(cmd[2]) {
-        Some(e) => e.to_string(),
-        None => return Some(resp_error("ERR element must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
+    let element: Vec<u8> = cmd[2].to_vec();
     let attr_str = match std::str::from_utf8(cmd[3]) {
         Ok(s) => s.to_string(),
         Err(_) => return Some(resp_error("ERR attrs must be valid UTF-8")),
@@ -573,25 +536,27 @@ fn vsetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    match map.get(key.as_str()) {
+    match map.get(key.as_slice()) {
         Some(ValueRef::VectorSet(vs)) => {
             let mut inner = vs.write();
-            match inner.entries.get_mut(&element) {
-                None => Some(resp_error("ERR no such element")),
+            // 1 when set, 0 when there is no such element or key, as the
+            // vector-sets module replies (#561).
+            match inner.entries.get_mut(element.as_slice()) {
+                None => Some(resp_integer(0)),
                 Some(entry) => {
                     entry.attrs = if attr_str.is_empty() {
                         None
                     } else {
                         Some(attr_str)
                     };
-                    Some(resp_simple("OK"))
+                    Some(resp_integer(1))
                 }
             }
         }
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
-        None => Some(resp_error("ERR no such key")),
+        None => Some(resp_integer(0)),
     }
 }
 
@@ -607,10 +572,7 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vinfo' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -673,14 +635,8 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vlinks' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
-    let element = match parse_utf8(cmd[2]) {
-        Some(e) => e,
-        None => return Some(resp_error("ERR element must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
+    let element: &[u8] = cmd[2];
     let with_scores = cmd
         .get(3)
         .and_then(|b| std::str::from_utf8(b).ok())
@@ -700,14 +656,14 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
             };
 
             // Brute-force: find 16 nearest neighbours
-            let mut scored: Vec<(f32, &str)> = inner
+            let mut scored: Vec<(f32, &[u8])> = inner
                 .entries
                 .iter()
                 .filter(|(name, _)| *name != element)
                 .map(|(name, entry)| {
                     (
                         crate::vector::distance(&inner.metric, &query_vec, &entry.vector),
-                        name.as_str(),
+                        name.as_bytes(),
                     )
                 })
                 .collect();
@@ -719,7 +675,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let layer_items: Vec<Vec<u8>> = scored
                 .iter()
                 .flat_map(|(score, name)| {
-                    let mut items = vec![resp_bulk_str(name)];
+                    let mut items = vec![resp_bulk(name)];
                     if with_scores {
                         let similarity = similarity(&inner.metric, *score);
                         items.push(resp_bulk_str(&format!("{:.6}", similarity)));
@@ -744,20 +700,21 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
-    if cmd.len() < 2 {
+    if cmd.len() != 2 && cmd.len() != 3 {
         return Some(resp_error(
             "ERR wrong number of arguments for 'vrandmember' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
 
-    let count: Option<i64> = cmd
-        .get(2)
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.parse().ok());
+    let count: Option<i64> = match cmd.get(2) {
+        None => None,
+        Some(arg) => match std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok()) {
+            Some(i64::MIN) => return Some(resp_error("ERR COUNT value is out of range")),
+            Some(n) => Some(n),
+            None => return Some(resp_error("ERR COUNT value is not an integer")),
+        },
+    };
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -766,7 +723,7 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key) {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
-            let names: Vec<&str> = inner.entries.keys().map(|s| s.as_str()).collect();
+            let names: Vec<&[u8]> = inner.entries.keys().map(|s| s.as_bytes()).collect();
 
             if names.is_empty() {
                 return if count.is_some() {
@@ -780,7 +737,7 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 None => {
                     // Return a single random element
                     let idx = rand::random::<usize>() % names.len();
-                    Some(resp_bulk_str(names[idx]))
+                    Some(resp_bulk(names[idx]))
                 }
                 Some(n) => {
                     let n_abs = n.unsigned_abs() as usize;
@@ -794,13 +751,13 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         for i in 0..take {
                             let j = i + rand::random::<usize>() % (names.len() - i);
                             indices.swap(i, j);
-                            result.push(resp_bulk_str(names[indices[i]]));
+                            result.push(resp_bulk(names[indices[i]]));
                         }
                     } else {
                         // Negative: may repeat, return exactly |count| elements
                         for _ in 0..n_abs {
                             let idx = rand::random::<usize>() % names.len();
-                            result.push(resp_bulk_str(names[idx]));
+                            result.push(resp_bulk(names[idx]));
                         }
                     }
                     Some(resp_array(result))
@@ -836,11 +793,11 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // and refuses to unify them. A named fn with `'a` ties input to output
 // explicitly, making the borrow checker happy.
 
-fn parse_lex_bound(s: &str) -> (Option<&str>, bool) {
+fn parse_lex_bound(s: &[u8]) -> (Option<&[u8]>, bool) {
     match s {
-        "-" | "+" => (None, true),
-        s if s.starts_with('[') => (Some(&s[1..]), true),
-        s if s.starts_with('(') => (Some(&s[1..]), false),
+        b"-" | b"+" => (None, true),
+        [b'[', rest @ ..] => (Some(rest), true),
+        [b'(', rest @ ..] => (Some(rest), false),
         s => (Some(s), true), // bare string: treat as inclusive
     }
 }
@@ -852,18 +809,10 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'vrange' command",
         ));
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
-    let start_raw = match std::str::from_utf8(cmd[2]) {
-        Ok(s) => s,
-        Err(_) => return Some(resp_error("ERR start must be valid UTF-8")),
-    };
-    let end_raw = match std::str::from_utf8(cmd[3]) {
-        Ok(s) => s,
-        Err(_) => return Some(resp_error("ERR end must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[1];
+    // Element names are any bytes, and so are the bounds.
+    let start_raw: &[u8] = cmd[2];
+    let end_raw: &[u8] = cmd[3];
     let count: Option<usize> = cmd
         .get(4)
         .and_then(|b| std::str::from_utf8(b).ok())
@@ -879,10 +828,10 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key) {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
-            let mut names: Vec<&str> = inner.entries.keys().map(|s| s.as_str()).collect();
+            let mut names: Vec<&[u8]> = inner.entries.keys().map(|s| s.as_bytes()).collect();
             names.sort_unstable();
 
-            let matches_start = |name: &str| -> bool {
+            let matches_start = |name: &[u8]| -> bool {
                 match start_str {
                     None => true,
                     Some(s) => {
@@ -894,7 +843,7 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     }
                 }
             };
-            let matches_end = |name: &str| -> bool {
+            let matches_end = |name: &[u8]| -> bool {
                 match end_str {
                     None => true,
                     Some(s) => {
@@ -912,9 +861,9 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .filter(|&&name| matches_start(name) && matches_end(name));
 
             let result: Vec<Vec<u8>> = if let Some(n) = count {
-                iter.take(n).map(|name| resp_bulk_str(name)).collect()
+                iter.take(n).map(|name| resp_bulk(name)).collect()
             } else {
-                iter.map(|name| resp_bulk_str(name)).collect()
+                iter.map(|name| resp_bulk(name)).collect()
             };
 
             Some(resp_array(result))
@@ -945,10 +894,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     let encoding = match std::str::from_utf8(cmd[2]) {
         Ok(s) => s.to_ascii_uppercase(),
@@ -959,10 +905,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let (query_vec, mut i) = match encoding.as_str() {
         "ELE" => {
             // The query is identified by an element name stored in the set
-            let elem_name = match std::str::from_utf8(cmd[3]) {
-                Ok(s) => s.to_string(),
-                Err(_) => return Some(resp_error("ERR element name must be valid UTF-8")),
-            };
+            let elem_name: Vec<u8> = cmd[3].to_vec();
             // We'll resolve it after acquiring the lock — placeholder for now
             // We store a sentinel and handle below
             (Err(elem_name), 4usize)
@@ -1052,7 +995,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    let vs = match map.get(key.as_str()) {
+    let vs = match map.get(key.as_slice()) {
         Some(ValueRef::VectorSet(vs)) => Arc::clone(vs),
         Some(_) => {
             return Some(resp_error(
@@ -1068,7 +1011,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Resolve ELE query — look up from the VectorSet
     let query_vec: Vec<f32> = match query_vec {
         Ok(v) => v,
-        Err(elem_name) => match inner.entries.get(&elem_name) {
+        Err(elem_name) => match inner.entries.get(elem_name.as_slice()) {
             Some(e) => e.vector.clone(),
             None => return Some(resp_error("ERR element not found in vector set")),
         },
@@ -1076,7 +1019,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // Brute-force cosine similarity search
     // Using select_nth_unstable: O(n) average, same trick as FT flat search
-    let mut scored: Vec<(f32, &str)> = inner
+    let mut scored: Vec<(f32, &[u8])> = inner
         .entries
         .iter()
         .filter(|(_, entry)| entry.vector.len() == query_vec.len())
@@ -1088,7 +1031,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .map(|(name, entry)| {
             (
                 crate::vector::distance(&inner.metric, &query_vec, &entry.vector),
-                name.as_str(),
+                name.as_bytes(),
             )
         })
         .collect();
@@ -1104,7 +1047,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Flat array with optional interleaved scores/attribs
     let mut out: Vec<Vec<u8>> = Vec::new();
     for (score, name) in &scored {
-        out.push(resp_bulk_str(name));
+        out.push(resp_bulk(name));
         if with_scores {
             out.push(resp_bulk_str(&format!(
                 "{:.6}",

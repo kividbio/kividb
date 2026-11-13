@@ -439,7 +439,7 @@ pub(super) fn delete_entry(stream: &mut StreamInner, id: &StreamId, refs: TrimRe
     if refs == TrimRefs::Acked && !acked_by_all_groups(stream, id) {
         return false;
     }
-    if stream.entries.remove(id).is_some() && *id > stream.max_deleted_id {
+    if stream.entries.remove(id) && *id > stream.max_deleted_id {
         stream.max_deleted_id = id.clone();
     }
     if refs == TrimRefs::DelRef {
@@ -466,7 +466,7 @@ fn trim_walk(stream: &mut StreamInner, to: &TrimTo, refs: TrimRefs, limit: u64) 
     let mut kept: Option<StreamId> = None;
     while limit == 0 || (removed as u64) < limit {
         let next = match &kept {
-            None => stream.entries.keys().next(),
+            None => stream.entries.first_id(),
             Some(after) => stream
                 .entries
                 .range((Excluded(after), Unbounded))
@@ -478,12 +478,11 @@ fn trim_walk(stream: &mut StreamInner, to: &TrimTo, refs: TrimRefs, limit: u64) 
         };
         let over = match to {
             TrimTo::MaxLen(max) => stream.entries.len() as u64 > *max,
-            TrimTo::MinId(min) => id < min,
+            TrimTo::MinId(min) => id < *min,
         };
         if !over {
             break;
         }
-        let id = id.clone();
         if refs == TrimRefs::Acked && !acked_by_all_groups(stream, &id) {
             kept = Some(id);
             continue;
@@ -654,9 +653,9 @@ pub(super) fn trim_stream_approx(
             TrimTo::MaxLen(max) => len - node >= *max,
             TrimTo::MinId(min) => stream
                 .entries
-                .keys()
+                .iter()
                 .nth(node as usize - 1)
-                .is_some_and(|last| last < min),
+                .is_some_and(|(last, _)| last < *min),
         };
         if !whole {
             break;
@@ -712,7 +711,7 @@ pub(super) fn exact_trim_args(
                 {
                     parts[i + 2] = first.to_string().into_bytes();
                 }
-            } else if let Some(first) = stream.entries.keys().next() {
+            } else if let Some(first) = stream.entries.first_id() {
                 parts[i + 2] = first.to_string().into_bytes();
             }
             i += 3;
@@ -735,29 +734,34 @@ pub(super) fn exact_trim_args(
 /// been delivered, so a replica re-running them reaches a different pending
 /// list. Redis propagates this same explicit form.
 pub(super) fn claim_effect(
-    key: &str,
-    group: &str,
-    consumer: &str,
+    key: &[u8],
+    group: &[u8],
+    consumer: &[u8],
     id: &StreamId,
     delivered_at_ms: u64,
     delivery_count: u64,
 ) -> Vec<Vec<u8>> {
+    let (id, at, count) = (
+        id.to_string(),
+        delivered_at_ms.to_string(),
+        delivery_count.to_string(),
+    );
     [
-        "XCLAIM",
+        &b"XCLAIM"[..],
         key,
         group,
         consumer,
-        "0",
-        &id.to_string(),
-        "TIME",
-        &delivered_at_ms.to_string(),
-        "RETRYCOUNT",
-        &delivery_count.to_string(),
-        "FORCE",
-        "JUSTID",
+        b"0",
+        id.as_bytes(),
+        b"TIME",
+        at.as_bytes(),
+        b"RETRYCOUNT",
+        count.as_bytes(),
+        b"FORCE",
+        b"JUSTID",
     ]
     .iter()
-    .map(|s| s.as_bytes().to_vec())
+    .map(|s| s.to_vec())
     .collect()
 }
 
@@ -787,12 +791,7 @@ impl Shape {
         Shape {
             len: stream.entries.len() as u64,
             entries_added: stream.entries_added,
-            first: stream
-                .entries
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(StreamId::min),
+            first: stream.entries.first_id().unwrap_or_else(StreamId::min),
             last_id: stream.last_id.clone(),
             max_deleted: stream.max_deleted_id.clone(),
         }
@@ -881,22 +880,23 @@ pub(super) fn entries_read_arg(entries_read: u64) -> String {
 
 /// The command that moves a group's read position on a replica.
 pub(super) fn setid_effect(
-    key: &str,
-    group: &str,
+    key: &[u8],
+    group: &[u8],
     last_id: &StreamId,
     entries_read: u64,
 ) -> Vec<Vec<u8>> {
+    let (last_id, entries_read) = (last_id.to_string(), entries_read_arg(entries_read));
     [
-        "XGROUP",
-        "SETID",
+        &b"XGROUP"[..],
+        b"SETID",
         key,
         group,
-        &last_id.to_string(),
-        "ENTRIESREAD",
-        &entries_read_arg(entries_read),
+        last_id.as_bytes(),
+        b"ENTRIESREAD",
+        entries_read.as_bytes(),
     ]
     .iter()
-    .map(|s| s.as_bytes().to_vec())
+    .map(|s| s.to_vec())
     .collect()
 }
 
@@ -914,7 +914,8 @@ mod tests {
     fn stream_with(n: u64) -> StreamInner {
         let mut s = StreamInner::new();
         for ms in 1..=n {
-            s.entries.insert(id(ms), StreamEntry { fields: Vec::new() });
+            s.entries
+                .push_tail(id(ms), StreamEntry { fields: Vec::new() });
             s.last_id = id(ms);
         }
         s
@@ -1053,7 +1054,7 @@ mod tests {
             3
         );
         assert_eq!(s.entries.len(), 2);
-        assert_eq!(s.groups["g"].pel.len(), 2);
+        assert_eq!(s.groups[&b"g"[..]].pel.len(), 2);
         // Trimmed, not deleted: the mark `XDEL` leaves is where it was.
         assert_eq!(s.max_deleted_id, StreamId::min());
     }
@@ -1066,7 +1067,7 @@ mod tests {
             trim_stream(&mut s, &TrimTo::MinId(id(4)), TrimRefs::DelRef),
             3
         );
-        let pending: Vec<_> = s.groups["g"].pel.keys().cloned().collect();
+        let pending: Vec<_> = s.groups[&b"g"[..]].pel.keys().cloned().collect();
         assert_eq!(pending, vec![id(4)]);
     }
 
@@ -1076,7 +1077,7 @@ mod tests {
         let mut s = stream_with(5);
         s.groups.insert("g".into(), group(4, &[3]));
         assert_eq!(trim_stream(&mut s, &TrimTo::MaxLen(0), TrimRefs::Acked), 3);
-        let left: Vec<_> = s.entries.keys().cloned().collect();
+        let left: Vec<_> = s.entries.iter().map(|(id, _)| id).collect();
         assert_eq!(left, vec![id(3), id(5)]);
 
         // The same with `~`, and with a MINID: the trim goes past 3.
@@ -1095,7 +1096,7 @@ mod tests {
             trim_stream_approx(&mut s, &to, TrimRefs::Acked, Approx { limit: 2, node: 2 }),
             2
         );
-        let left: Vec<_> = s.entries.keys().cloned().collect();
+        let left: Vec<_> = s.entries.iter().map(|(id, _)| id).collect();
         assert_eq!(left, vec![id(3), id(4), id(5)]);
         // Propagated as a MINID that removes the same: 4, the first left
         // below 6 that the group is done with.
@@ -1161,7 +1162,7 @@ mod tests {
             for _ in 0..n {
                 s.entries_added += 1;
                 s.entries
-                    .insert(id(s.entries_added), StreamEntry { fields: Vec::new() });
+                    .push_tail(id(s.entries_added), StreamEntry { fields: Vec::new() });
             }
         };
         add(&mut s, 101);
@@ -1190,7 +1191,7 @@ mod tests {
             trim_stream_approx(&mut s, &to, TrimRefs::KeepRef, approx(0)),
             10
         );
-        assert_eq!(s.entries.keys().next(), Some(&id(51)));
+        assert_eq!(s.entries.first_id(), Some(id(51)));
         // A limit smaller than the node: nothing.
         let to = TrimTo::MaxLen(0);
         assert_eq!(
@@ -1222,11 +1223,18 @@ mod tests {
                 .join(" ")
         };
         assert_eq!(
-            text(claim_effect("s", "g", "c", &StreamId::new(7, 1), 1234, 3)),
+            text(claim_effect(
+                b"s",
+                b"g",
+                b"c",
+                &StreamId::new(7, 1),
+                1234,
+                3
+            )),
             "XCLAIM s g c 0 7-1 TIME 1234 RETRYCOUNT 3 FORCE JUSTID"
         );
         assert_eq!(
-            text(setid_effect("s", "g", &StreamId::new(7, 1), 9)),
+            text(setid_effect(b"s", b"g", &StreamId::new(7, 1), 9)),
             "XGROUP SETID s g 7-1 ENTRIESREAD 9"
         );
     }

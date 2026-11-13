@@ -40,6 +40,12 @@ pub async fn handle_replica_connection_uring(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
+    // However this ends, the socket is shut down: dropped, the forwarder's and
+    // the ACK reader's operations still hold it open (and a stuck write its
+    // buffer) until they complete, which for a replica that reads nothing is
+    // never. Shut down, they complete at once.
+    let _shutdown = ShutdownOnDrop(Rc::clone(&stream));
+
     // ── 1. The stream queue. Unbounded: bounded queues fill before forwarding runs.
     let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let replica_id = crate::replication::next_replica_id();
@@ -48,7 +54,10 @@ pub async fn handle_replica_connection_uring(
     // decrements it after each successful flush. Lets the hub evict us if we fall
     // far enough behind instead of queueing an unbounded backlog — see
     // `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the connection ends, also before the
+    // forwarder runs, and says so.
+    let replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // ── 2. A replica that only lost its connection is sent what it missed.
     // Failing that, take the cut: register with the hub and serialise the
@@ -111,10 +120,16 @@ pub async fn handle_replica_connection_uring(
         Some(_) => None,
     };
     if let Some(greeting) = greeting {
-        let (res, _) = stream.write_all(greeting.into_bytes()).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            return Err(e.into());
+        match write_unless_let_go(&stream, greeting.into_bytes(), &repl_state, replica_id).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                return Err(e.into());
+            }
+            None => {
+                let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                return Ok(());
+            }
         }
     }
 
@@ -123,7 +138,7 @@ pub async fn handle_replica_connection_uring(
     // Blocks on `recv()` (event-driven) — no polling, no re-issued ops.
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel::<()>();
     let stream_fwd = Rc::clone(&stream);
-    let forward_task = tokio_uring::spawn(async move {
+    let mut forward_task = tokio_uring::spawn(async move {
         if rdb_enqueued_rx.await.is_err() {
             return;
         }
@@ -135,24 +150,37 @@ pub async fn handle_replica_connection_uring(
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
+                return;
+            }
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        pending_bytes
-                            .fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let _ = stream_fwd.write_all(batch).await;
+                        pending_bytes.taken(batch.len(), held);
+                        if !pending_bytes.abandoned() {
+                            let _ = stream_fwd.write_all(batch).await;
+                        }
                         return;
                     }
                 }
             }
-            pending_bytes.fetch_sub(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            pending_bytes.taken(batch.len(), held);
             if stream_fwd.write_all(batch).await.0.is_err() {
                 break;
             }
@@ -165,17 +193,27 @@ pub async fn handle_replica_connection_uring(
             replica.set_state(crate::replication::ReplicaState::SendBulk);
         }
         let header = format!("${}\r\n", sync.payload.len()).into_bytes();
-        let (res, _) = stream.write_all(header).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            drop(rdb_enqueued_tx);
-            return Err(e.into());
-        }
-        let (res, _) = stream.write_all(sync.payload).await;
-        if let Err(e) = res {
-            let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
-            drop(rdb_enqueued_tx);
-            return Err(e.into());
+        for part in [header, sync.payload] {
+            // A replica that stops reading during its full sync is let go of
+            // once its queue passes its limit: the write is given up then,
+            // rather than waited on for good with its queue held (#542).
+            match write_unless_let_go(&stream, part, &repl_state, replica_id).await {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                    drop(rdb_enqueued_tx);
+                    return Err(e.into());
+                }
+                None => {
+                    log_warn!(
+                        "Replication: uring: replica {endpoint} let go of during its full sync"
+                    );
+                    let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
+                    drop(rdb_enqueued_tx);
+                    forward_task.abort();
+                    return Ok(());
+                }
+            }
         }
         log_info!("Replication: uring: sent full RDB; streaming queued writes from hub");
     }
@@ -234,19 +272,51 @@ pub async fn handle_replica_connection_uring(
 
     tokio::select! {
         _ = ack_reader => {}
-        _ = forward_task => {}
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        _ = &mut forward_task => {}
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
         }
     }
 
+    // The forwarder ends with the connection. Left running when the ACK
+    // reader, `repl-timeout` or the hub letting go of the replica ended it,
+    // it kept the socket open and the replica's queue allocated after the
+    // hub had forgotten both.
+    forward_task.abort();
     let _ = hub_tx.send(crate::replication::HubMsg::Deregister(replica_id));
     log_info!("Replication: uring: replica disconnected");
     Ok(())
+}
+
+/// Shuts a replica's socket down when dropped (see
+/// `handle_replica_connection_uring`).
+struct ShutdownOnDrop(Rc<TcpStream>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Write `buf` to a replica, unless it goes silent or the hub lets go of it
+/// first (`None`; see `ReplState::replica_timed_out`).
+async fn write_unless_let_go(
+    stream: &TcpStream,
+    buf: Vec<u8>,
+    repl_state: &crate::replication::ReplState,
+    replica_id: u64,
+) -> Option<std::io::Result<()>> {
+    tokio::select! {
+        (res, _) = stream.write_all(buf) => Some(res),
+        _ = repl_state.replica_timed_out(replica_id) => None,
+    }
 }
 
 #[inline(always)]
@@ -292,7 +362,14 @@ async fn park_blocking_uring(
     client: (&crate::client_registry::ClientRegistry, u64),
     interrupted: &mut crate::commands::blocking::Interrupted,
     watch: &PeerWatch,
+    repl_state: &crate::replication::ReplState,
 ) -> Result<(), Vec<u8>> {
+    // No wait: a write that got past a `CLIENT PAUSE` before it was set
+    // (`blocking::hold_for_pause`). Read again, and held by the pause check.
+    if wait.held_by_pause() {
+        slot.held_by_pause();
+        return Ok(());
+    }
     if slot.in_resume() && !wait.may_repark() {
         // A resumed handler parked again — it forgot its resume check. Reply as
         // if the wait timed out rather than looping forever.
@@ -323,12 +400,27 @@ async fn park_blocking_uring(
         subs.flushed();
     }
 
+    let refused_on_replica = wait.refused_on_replica();
+    let park_epoch = wait.role_epoch();
     let block_state = wait.take_state();
+    #[cfg(debug_assertions)]
+    if let Some(delay) = crate::commands::blocking::test_park_delay() {
+        tokio::time::sleep(delay).await;
+    }
     let (client_registry, client_id) = client;
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = watch.fd;
-    let delivery = {
+    let delivery = if crate::commands::blocking::ended_by_role_change(
+        park_epoch,
+        refused_on_replica,
+        repl_state,
+    ) {
+        // This node became a replica before the client was listed as
+        // blocked, so the sweep that ends blocked clients passed it by.
+        interrupted.role_changed = true;
+        None
+    } else {
         let waiting = wait.wait();
         tokio::pin!(waiting);
         // Whether the client is still there. A read cannot be raced against
@@ -360,6 +452,8 @@ async fn park_blocking_uring(
                     Ok(how) => {
                         interrupted.unblocked_with_error =
                             how == crate::commands::blocking::Unblock::Error;
+                        interrupted.role_changed =
+                            how == crate::commands::blocking::Unblock::RoleChange;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -368,11 +462,24 @@ async fn park_blocking_uring(
         }
     };
     client_registry.set_blocked(client_id, None, false);
+    // Woken, or unblocked otherwise, at the moment this node became a
+    // replica: ended as the sweep ends it.
+    if !interrupted.gone
+        && crate::commands::blocking::ended_by_role_change(
+            park_epoch,
+            refused_on_replica,
+            repl_state,
+        )
+    {
+        interrupted.unblocked_with_error = false;
+        interrupted.role_changed = true;
+    }
     // However it ended, the command is dispatched again: with what it was
     // waiting for, or as if its time had run out — which is also how it
-    // leaves the line it was standing in — or, its client gone, only to
-    // leave that line, taking nothing.
-    if interrupted.gone {
+    // leaves the line it was standing in — or, its client gone or the role
+    // changed, only to leave that line, taking nothing (see
+    // `server::park_blocking`).
+    if interrupted.gone || interrupted.role_changed {
         slot.set_gone(block_state);
     } else {
         slot.set_pending(delivery, block_state);
@@ -620,6 +727,14 @@ fn open_subscriptions(
     subs
 }
 
+/// The address a client connected to: `laddr` in `CLIENT LIST`.
+fn local_address(stream: &TcpStream) -> Option<std::net::SocketAddr> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
+    // SAFETY: `stream` owns `fd` and outlives this borrow of it.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    socket2::SockRef::from(&fd).local_addr().ok()?.as_socket()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
     stream: TcpStream,
@@ -658,7 +773,12 @@ pub async fn handle_client(
     let client_id = crate::client_registry::next_client_id();
     let (mut client_info, mut kill_rx) =
         crate::client_registry::ClientInfo::new(client_id, peer_addr.clone());
-    client_info.laddr = format!("{}:{}", config.bind, config.port);
+    // The socket's own address, as Redis shows it (#566): not the bind
+    // setting, which can be 0.0.0.0.
+    client_info.laddr = local_address(&stream).map_or_else(
+        || format!("{}:{}", config.bind, config.port),
+        |a| a.to_string(),
+    );
     let activity = Arc::clone(&client_info.activity);
     let query_buffer = Arc::clone(&client_info.query_buffer);
     // `CLIENT REPLY`.
@@ -956,6 +1076,10 @@ pub async fn handle_client(
         // Outside the parse loop: a park in one turn hands its delivery to
         // the re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
+        // The next turn dispatches the command of this one again: a parked
+        // command resumed, or a write a pause sent back to be held. It is
+        // the same command: not recorded, settled or begun again.
+        let mut redispatch = false;
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
@@ -1014,23 +1138,29 @@ pub async fn handle_client(
             // For `CLIENT LIST`'s `cmd=` and `db=`, and `tot-cmds`. Not again
             // for a blocked command dispatched once more with what it waited
             // for: it is one command.
-            if !blocking_slot.resuming() {
+            if !redispatch && !blocking_slot.resuming() {
                 activity.record(&cmd, selected_db);
             }
-            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(cmd[0]) {
+            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(&cmd) {
                 aof_wait = true;
             }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
-            reply_gate.settle(&mut out_buf);
-            crate::tracking::after_command(
-                &tracking_table,
-                &client_registry,
-                client_id,
-                &activity,
-                &mut out_buf,
-            );
-            reply_gate.begin(&cmd, &mut out_buf);
+            if std::mem::take(&mut redispatch) {
+                // A `CLIENT REPLY SKIP` before it is for the dispatch that
+                // replies, not used up by the one that did not.
+                reply_gate.again(&out_buf);
+            } else {
+                reply_gate.settle(&mut out_buf);
+                crate::tracking::after_command(
+                    &tracking_table,
+                    &client_registry,
+                    client_id,
+                    &activity,
+                    &mut out_buf,
+                );
+                reply_gate.begin(&cmd, &mut out_buf);
+            }
             // ── ACL changes reach connections that are already open ──────────────
             // One relaxed load per command when nothing has changed.
             if crate::acl::ACL_EPOCH.load(std::sync::atomic::Ordering::Relaxed) != acl_epoch_seen
@@ -1063,7 +1193,7 @@ pub async fn handle_client(
             // `PeerWatch::gone`.
             let _ran = if crate::pause::PAUSE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
                 != 0
-                && !(blocking_slot.resuming() && interrupted.gone)
+                && !(blocking_slot.resuming() && (interrupted.gone || interrupted.role_changed))
             {
                 let gated: std::pin::Pin<
                     Box<dyn std::future::Future<Output = Option<Option<crate::pause::Ran>>> + '_>,
@@ -1164,6 +1294,13 @@ pub async fn handle_client(
                         resp_version,
                     )
                     .await;
+                    // A script that got past a `CLIENT PAUSE` before it was
+                    // set, and did not run (`pause::HELD_IN_GATE`): read
+                    // again, and held by the pause check.
+                    if crate::pause::is_held(&response) {
+                        redispatch = true;
+                        continue;
+                    }
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
                         let client_name = client_registry
                             .get(client_id)
@@ -1226,12 +1363,16 @@ pub async fn handle_client(
                             (&client_registry, client_id),
                             &mut interrupted,
                             &peer_watch,
+                            &repl_state,
                         )
                         .await
                         {
                             // `parse_offset` deliberately not advanced: the same
                             // command is re-dispatched, now carrying the delivery.
-                            Ok(()) => continue,
+                            Ok(()) => {
+                                redispatch = true;
+                                continue;
+                            }
                             Err(reply) => response = reply,
                         }
                     }
@@ -1242,6 +1383,12 @@ pub async fn handle_client(
                     }
                     if interrupted.gone {
                         // It has left the line; there is nobody to reply to.
+                        quit_requested = true;
+                        break;
+                    }
+                    if std::mem::take(&mut interrupted.role_changed) {
+                        // This node became a replica: told so, and closed.
+                        out_buf.extend_from_slice(crate::commands::blocking::ROLE_CHANGED);
                         quit_requested = true;
                         break;
                     }
@@ -1300,11 +1447,15 @@ pub async fn handle_client(
                         (&client_registry, client_id),
                         &mut interrupted,
                         &peer_watch,
+                        &repl_state,
                     )
                     .await
                     {
                         // See the note at the non-slowlog site above.
-                        Ok(()) => continue,
+                        Ok(()) => {
+                            redispatch = true;
+                            continue;
+                        }
                         Err(reply) => response = reply,
                     }
                 }
@@ -1315,6 +1466,12 @@ pub async fn handle_client(
                 }
                 if interrupted.gone {
                     // It has left the line; there is nobody to reply to.
+                    quit_requested = true;
+                    break;
+                }
+                if std::mem::take(&mut interrupted.role_changed) {
+                    // This node became a replica: told so, and closed.
+                    out_buf.extend_from_slice(crate::commands::blocking::ROLE_CHANGED);
                     quit_requested = true;
                     break;
                 }
@@ -1353,22 +1510,8 @@ pub async fn handle_client(
             if authenticated_user.is_none()
                 && !matches!(cmd_name.as_str(), "AUTH" | "QUIT" | "HELLO" | "RESET")
             {
-                // Log unauthenticated access attempt
-                let entry = crate::acl::AclLogEntry {
-                    id: acl_log.next_id(),
-                    reason: "auth".into(),
-                    context: "toplevel".into(),
-                    object: cmd_name.to_lowercase(),
-                    username: "default".into(),
-                    age_seconds: 0.0,
-                    client_info: peer_addr.clone(),
-                    timestamp_created: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    count: 1,
-                };
-                acl_log.push(entry);
+                // As in Redis, nothing goes to the ACL log: no user was
+                // refused anything.
                 out_buf.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
                 parse_offset += consumed;
                 continue;
@@ -1381,14 +1524,41 @@ pub async fn handle_client(
                     .get(username.as_str())
                     .and_then(|user| crate::acl::check_permission(user, &cmd_name, &cmd).err());
                 if let Some(denied) = denied {
-                    acl_log.record(denied.reason(), denied.object(), username, &peer_addr);
+                    // As in Redis, a command there is no such command as, or
+                    // with the wrong number of arguments, is refused for that
+                    // before the user's rules are looked at.
+                    let refusal = if !commands::server::is_command(&cmd_name) {
+                        commands::handler::unknown_command(&cmd)
+                    } else if let Some(wrong) = commands::arity::check(&cmd_name, &cmd) {
+                        wrong
+                    } else if tx.active && commands::transaction::not_allowed_in_multi(&cmd_name) {
+                        crate::resp::write::resp_error(commands::transaction::NOT_IN_MULTI)
+                    } else {
+                        let _context = tx.active.then(|| crate::acl::log_context("multi"));
+                        acl_log.record(
+                            denied.reason(),
+                            denied.object(),
+                            username,
+                            &crate::acl::log_client_info(&client_registry, client_id, &peer_addr),
+                        );
+                        format!("-{}\r\n", denied.message(username)).into_bytes()
+                    };
                     // Refused inside MULTI, it is not queued, and EXEC runs nothing, as
-                    // for a command refused for any other reason (#159).
-                    if tx.active {
-                        tx.aborted = true;
-                    }
-                    out_buf
-                        .extend_from_slice(format!("-{}\r\n", denied.message(username)).as_bytes());
+                    // for a command refused for any other reason (#159). A refused
+                    // EXEC discards the transaction, as in Redis.
+                    let reply = commands::transaction::reject(
+                        &mut tx,
+                        &cmd,
+                        watch_registry.as_ref(),
+                        &dirty_flag,
+                        commands::transaction::Monitored {
+                            registry: &monitor_registry,
+                            db: selected_db,
+                            peer_addr: &peer_addr,
+                        },
+                        refusal,
+                    );
+                    out_buf.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
                 }
@@ -1433,7 +1603,9 @@ pub async fn handle_client(
             // connection stays a client until it asks again; so is one of a
             // master that lost its dataset (`ReplState::psync_offer`).
             // A replica does not take replicas of its own (#144).
-            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && repl_state.is_slave() {
+            // Inside MULTI they are refused, as in Redis (`queue_refusal`), and
+            // the transaction with them: they do not hand the connection over.
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && !tx.active && repl_state.is_slave() {
                 out_buf.extend_from_slice(&crate::resp::write::resp_error(
                     crate::replication::NOT_A_MASTER,
                 ));
@@ -1441,6 +1613,7 @@ pub async fn handle_client(
                 continue;
             }
             if cmd_name == "PSYNC"
+                && !tx.active
                 && let Some(offer) =
                     repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
             {
@@ -1448,7 +1621,7 @@ pub async fn handle_client(
                 parse_offset += consumed;
                 continue;
             }
-            if cmd_name == "PSYNC" || cmd_name == "SYNC" {
+            if (cmd_name == "PSYNC" || cmd_name == "SYNC") && !tx.active {
                 parse_offset += consumed;
                 connection_handoff = Some(ConnectionHandoff::Replica {
                     legacy_sync: cmd_name == "SYNC",
@@ -1456,7 +1629,9 @@ pub async fn handle_client(
                 });
                 break;
             }
-            if cmd_name == "MONITOR" {
+            // Inside MULTI it is queued, as in Redis, and refused when EXEC
+            // runs it (#550).
+            if cmd_name == "MONITOR" && !tx.active {
                 if monitoring.is_none() {
                     monitoring = Some(crate::monitor::Monitoring::start(
                         &monitor_registry,
@@ -1469,11 +1644,39 @@ pub async fn handle_client(
                 continue;
             }
 
+            // A transaction's own commands with the wrong number of
+            // arguments are refused before they do anything, as in Redis;
+            // and, like any command refused inside MULTI, they take the
+            // transaction with them. An EXEC refused so ends it (#550).
+            if matches!(
+                cmd_name.as_str(),
+                "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" | "RESET"
+            ) && let Some(wrong) = commands::arity::check(&cmd_name, &cmd)
+            {
+                let reply = commands::transaction::reject(
+                    &mut tx,
+                    &cmd,
+                    watch_registry.as_ref(),
+                    &dirty_flag,
+                    commands::transaction::Monitored {
+                        registry: &monitor_registry,
+                        db: selected_db,
+                        peer_addr: &peer_addr,
+                    },
+                    wrong,
+                );
+                out_buf.extend_from_slice(&reply);
+                parse_offset += consumed;
+                continue;
+            }
+
             // `MULTI` or `EXEC`, as the client wrote it: for MONITOR, below.
             let transaction_word: Option<Vec<u8>> =
                 matches!(cmd_name.as_str(), "MULTI" | "EXEC").then(|| cmd[0].to_vec());
 
             // ── Transaction + Auth commands ───────────────────────────────
+            // Queued, inside MULTI: counted when EXEC runs them.
+            let queued_here = tx.active && matches!(cmd_name.as_str(), "UNWATCH" | "AUTH");
             let response = match cmd_name.as_str() {
                 "MULTI" => {
                     if tx.active {
@@ -1506,32 +1709,40 @@ pub async fn handle_client(
                     } else if cmd.len() < 2 {
                         b"-ERR wrong number of arguments for 'watch' command\r\n".to_vec()
                     } else {
-                        for key_bytes in &cmd[1..] {
-                            if let Ok(key) = std::str::from_utf8(key_bytes) {
-                                // A key that has already expired is watched
-                                // as the absent key it is: its removal, when
-                                // it comes, is not a change.
-                                commands::helpers::lazy_expire_key(&store, selected_db, key);
-                                tx.watched_keys.push((selected_db, key.to_string()));
-                                watch_registry.as_ref().watch(
-                                    selected_db,
-                                    key,
-                                    Arc::clone(&dirty_flag),
-                                );
-                            }
+                        for key in &cmd[1..] {
+                            // A key that has already expired is deleted, on
+                            // a master, and watched as the absent key it is.
+                            // A replica keeps it until its master's `DEL`
+                            // comes: it is watched as expired (Redis's
+                            // `watchedKey.expired`), and that `DEL` is no
+                            // change (#666).
+                            let expired =
+                                commands::helpers::lazy_expire_key(&store, selected_db, key)
+                                    && crate::watch::presence(&store, selected_db, key)
+                                        == crate::watch::Presence::Expired;
+                            tx.watch_key(selected_db, key, expired);
+                            watch_registry.as_ref().watch(
+                                selected_db,
+                                key,
+                                Arc::clone(&dirty_flag),
+                                expired,
+                            );
                         }
                         b"+OK\r\n".to_vec()
                     }
                 }
 
-                "UNWATCH" => {
+                // Inside MULTI it is queued, as in Redis: run there, it
+                // dropped the watches, and EXEC ran after a watched key
+                // had changed (#550).
+                "UNWATCH" if !tx.active => {
                     watch_registry.as_ref().unwatch_all(
                         &tx.watched_keys
                             .iter()
                             .map(|_| Arc::clone(&dirty_flag))
                             .collect::<Vec<_>>(),
                     );
-                    tx.watched_keys.clear();
+                    tx.unwatch_keys();
                     dirty_flag.store(false, std::sync::atomic::Ordering::Release);
                     b"+OK\r\n".to_vec()
                 }
@@ -1562,7 +1773,10 @@ pub async fn handle_client(
                     }
                     tracking_table.unregister_client(client_id);
                     monitoring = None;
+                    // `HIMPORT` fieldsets are the connection's state (#566).
+                    crate::commands::hash_import::forget_client(client_id);
                     client_registry.update(client_id, |info| {
+                        info.no_evict = false;
                         info.resp = 2;
                         info.name = String::new();
                         info.tracking = false;
@@ -1655,11 +1869,70 @@ pub async fn handle_client(
                         // From the check of the watched keys to the last queued
                         // command, the transaction is alone: no other command —
                         // read or write — runs in between. See `command_gate`.
+                        // A queued WAIT counts the replicas that have what was
+                        // written before this EXEC: each one's target taken after
+                        // a hub barrier, as WAIT takes it outside a transaction.
+                        // Taken here, before the gates: nothing waits inside them.
+                        let wait_targets = if commands::transaction::queues_wait(&tx.queue)
+                            && repl_state
+                                .connected_replicas
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                > 0
+                        {
+                            let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+                            if hub_tx
+                                .send(crate::replication::HubMsg::Barrier(barrier_tx))
+                                .is_ok()
+                            {
+                                let _ = barrier_rx.await;
+                            }
+                            Some(repl_state.wait_targets())
+                        } else {
+                            None
+                        };
+                        // The test hook that holds a write up before its gates
+                        // (`pause::test_stall_before_the_gate`).
+                        #[cfg(debug_assertions)]
+                        for queued in &tx.queue {
+                            let queued: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
+                            crate::pause::test_stall_before_the_gate(&queued);
+                        }
                         let _alone = crate::command_gate::enter_alone();
                         // And as one write: a snapshot, a backup or a full sync cuts
                         // before it or after it, never between two of its commands
                         // (#148). The writes it runs are inside this one.
                         let _whole = crate::write_gate::enter();
+                        // A `CLIENT PAUSE` set since it passed the pause
+                        // check: out of the gates, read again, and held by
+                        // that check, the transaction as it was (#629). See
+                        // `pause::pause_clients`.
+                        if crate::pause::writes_must_check(routed.at())
+                            && crate::pause::exec_held_in_gate(&tx.queue)
+                        {
+                            redispatch = true;
+                            continue;
+                        }
+                        // One time for the whole transaction, as Redis's
+                        // `commandTimeSnapshot` (#659): a key or hash field
+                        // whose deadline falls while it runs is there for
+                        // every command in it, or gone for every one. Taken
+                        // alone, so nothing else runs between this moment and
+                        // its last command, and no sweep removes a key from
+                        // under it (the sweeps take the command gate).
+                        let _clock = crate::script_clock::freeze();
+                        // A watched key whose time has run out by then has
+                        // been modified (Redis's `isWatchedKeyExpired`, by
+                        // the same time): checked here as well as above, for
+                        // a deadline that fell while this waited for its
+                        // gates, and for a replica, where nothing removes it.
+                        if commands::transaction::watched_key_expired(
+                            &store,
+                            &tx,
+                            watch_registry.as_ref(),
+                            &dirty_flag,
+                        ) {
+                            dirty_flag.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         // And to replicas and the AOF as one: its writes in the
                         // stream between a `MULTI` and an `EXEC`, its records
                         // written together (#172). Dropped first, while the
@@ -1813,14 +2086,19 @@ pub async fn handle_client(
                                     // after `drop(guards)` below would reopen the exact race this
                                     // path exists to close: another fast-apply EXEC could acquire
                                     // the now-free lock and check `dirty_flag` before this notify
-                                    // sets it, observe clean, and overwrite this write. notify()
-                                    // only touches the (separate) watch-registry lock, so calling
-                                    // it here cannot deadlock against the shard lock we're holding.
-                                    watch_registry.as_ref().notify(selected_db, key);
+                                    // sets it, observe clean, and overwrite this write.
+                                    // notify_written() only touches the (separate) watch-registry
+                                    // lock, never the store, so calling it here cannot deadlock
+                                    // against the shard lock we're holding.
+                                    watch_registry
+                                        .as_ref()
+                                        .notify_written(selected_db, key.as_bytes());
                                 }
                                 // A plain SET takes the key's time to live away, in
-                                // the same step as it writes the value.
-                                drop(guards);
+                                // the same step as it writes the value. Every
+                                // shard is let go of before what a SET wrote over
+                                // is announced (`store::unlock_together`).
+                                store::unlock_together(guards.into_iter().map(|(_, guard)| guard));
 
                                 let count = sets.len();
                                 let mut exec_out = format!("*{count}\r\n").into_bytes();
@@ -1892,21 +2170,18 @@ pub async fn handle_client(
                             let count = queued.len();
                             let mut exec_out = format!("*{count}\r\n").into_bytes();
 
-                            // Hoist outside the loop — name won't change mid-transaction
-                            let client_name_for_slowlog = client_registry
-                                .get(client_id)
-                                .map(|info| info.name.clone())
-                                .unwrap_or_default();
-
                             // A plain FLUSHALL here is not counted as lazily freed.
                             let _queued = crate::lazyfree::running_queued();
+                            // What the queued commands write to the ACL log is
+                            // in context `multi`, as in Redis.
+                            let _context = crate::acl::log_context("multi");
                             for queued_cmd in queued {
+                                let queued_name = queued_cmd
+                                    .first()
+                                    .map(|name| String::from_utf8_lossy(name).to_ascii_uppercase())
+                                    .unwrap_or_default();
                                 // SUBSCRIBE and its kind, queued: see the tokio loop (#23).
-                                if queued_cmd.first().is_some_and(|name| {
-                                    crate::pubsub::is_subscription_command(
-                                        &String::from_utf8_lossy(name).to_ascii_uppercase(),
-                                    )
-                                }) {
+                                if crate::pubsub::is_subscription_command(&queued_name) {
                                     let args: Vec<&[u8]> =
                                         queued_cmd.iter().map(|b| b.as_slice()).collect();
                                     let subs = subscriptions.get_or_insert_with(|| {
@@ -1922,6 +2197,71 @@ pub async fn handle_client(
                                     if subs.total() == 0 {
                                         subscriptions = None;
                                     }
+                                    continue;
+                                }
+                                // Those the connection loop answers itself outside a
+                                // transaction, answered as Redis's EXEC answers them
+                                // (#550, #499).
+                                if matches!(
+                                    queued_name.as_str(),
+                                    "AUTH" | "HELLO" | "UNWATCH" | "MONITOR" | "WAIT" | "WAITAOF"
+                                ) {
+                                    let args: Vec<&[u8]> =
+                                        queued_cmd.iter().map(|b| b.as_slice()).collect();
+                                    let reply = if queued_name == "AUTH" {
+                                        commands::login::Login {
+                                            acl_store: &acl_store,
+                                            acl_log: &acl_log,
+                                            client_registry: &client_registry,
+                                            client_id,
+                                            peer_addr: &peer_addr,
+                                            user: &mut authenticated_user,
+                                            key_restricted: &mut key_restricted,
+                                            cmd_restricted: &mut cmd_restricted,
+                                        }
+                                        .auth(&args)
+                                    } else if queued_name == "HELLO" {
+                                        commands::login::Login {
+                                            acl_store: &acl_store,
+                                            acl_log: &acl_log,
+                                            client_registry: &client_registry,
+                                            client_id,
+                                            peer_addr: &peer_addr,
+                                            user: &mut authenticated_user,
+                                            key_restricted: &mut key_restricted,
+                                            cmd_restricted: &mut cmd_restricted,
+                                        }
+                                        .hello(
+                                            &args,
+                                            &mut resp_version,
+                                            &repl_state,
+                                        )
+                                    } else {
+                                        commands::transaction::connection_reply_in_exec(
+                                            &queued_name,
+                                            &args,
+                                            &commands::transaction::InExec {
+                                                acl_store: &acl_store,
+                                                acl_log: &acl_log,
+                                                user: authenticated_user
+                                                    .as_deref()
+                                                    .unwrap_or("default"),
+                                                peer_addr: &peer_addr,
+                                                client_registry: &client_registry,
+                                                client_id,
+                                                repl_state: &repl_state,
+                                                wait_targets: wait_targets.as_deref(),
+                                            },
+                                        )
+                                        .unwrap_or_default()
+                                    };
+                                    crate::cmdstats::record(
+                                        &queued_name,
+                                        &args,
+                                        &reply,
+                                        std::time::Duration::ZERO,
+                                    );
+                                    exec_out.extend_from_slice(&reply);
                                     continue;
                                 }
                                 let raw_cmd = queued_cmd.clone();
@@ -2021,7 +2361,12 @@ pub async fn handle_client(
                                         &raw_cmd,
                                         elapsed_us,
                                         &peer_addr,
-                                        client_name_for_slowlog.clone(),
+                                        // The name now: a queued CLIENT SETNAME
+                                        // or HELLO may have changed it.
+                                        client_registry
+                                            .get(client_id)
+                                            .map(|info| info.name.clone())
+                                            .unwrap_or_default(),
                                     );
                                 }
 
@@ -2041,236 +2386,42 @@ pub async fn handle_client(
                     }
                 }
 
-                "AUTH" => {
-                    // AUTH password            — legacy single-password form
-                    // AUTH username password   — Redis 6 ACL multi-user form
-                    //
-                    // We check the acl_store for all cases. The default user's
-                    // password is stored there (seeded from --requirepass at startup).
-                    // nopass users authenticate with any password.
-                    if cmd.len() < 2 {
-                        b"-ERR wrong number of arguments for 'auth' command\r\n".to_vec()
-                    } else if cmd.len() == 2 && crate::acl::default_user_is_open(&acl_store) {
-                        // As Redis: how a client learns that the password it
-                        // was given is not in use. It was answered OK (#135).
-                        crate::acl::AUTH_WITHOUT_PASSWORD.as_bytes().to_vec()
-                    } else {
-                        let (provided_username, provided_password) = if cmd.len() >= 3 {
-                            // AUTH username password
-                            (
-                                std::str::from_utf8(cmd[1]).unwrap_or("").to_string(),
-                                std::str::from_utf8(cmd[2]).unwrap_or("").to_string(),
-                            )
-                        } else {
-                            // AUTH password — legacy form, authenticate as "default"
-                            (
-                                "default".to_string(),
-                                std::str::from_utf8(cmd[1]).unwrap_or("").to_string(),
-                            )
-                        };
-
-                        let matched = crate::acl::authenticate(
-                            &acl_store,
-                            &provided_username,
-                            &provided_password,
-                        );
-
-                        match matched.as_ref() {
-                            Some(user) => {
-                                // Adjust the restricted-client counters before
-                                // overwriting authenticated_user, so we correctly
-                                // handle re-auth (e.g. switching from restricted
-                                // to unrestricted user on the same connection).
-                                crate::acl::track_restriction_counters(
-                                    user,
-                                    &mut key_restricted,
-                                    &mut cmd_restricted,
-                                );
-                                authenticated_user = Some(user.name.clone());
-                                client_registry
-                                    .update(client_id, |info| info.user = user.name.clone());
-                                // Simple string, not a bulk string: real Redis
-                                // replies `+OK` here, and clients that text-match
-                                // a leading `+OK` on control connections read
-                                // `$2\r\nOK\r\n` as a failed AUTH.
-                                crate::resp::write::resp_simple("OK")
-                            }
-                            None => {
-                                let entry = crate::acl::AclLogEntry {
-                                    id: acl_log.next_id(),
-                                    reason: "auth".into(),
-                                    context: "toplevel".into(),
-                                    object: provided_username.clone(),
-                                    username: provided_username.clone(),
-                                    age_seconds: 0.0,
-                                    client_info: peer_addr.clone(),
-                                    timestamp_created: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                        as u64,
-                                    count: 1,
-                                };
-                                acl_log.push(entry);
-                                b"-WRONGPASS invalid username-password pair or user is disabled.\r\n".to_vec()
-                            }
-                        }
-                    }
+                // AUTH and HELLO: inside MULTI they are queued, and run
+                // when EXEC runs the transaction, as in Redis (#550).
+                "AUTH" if !tx.active => commands::login::Login {
+                    acl_store: &acl_store,
+                    acl_log: &acl_log,
+                    client_registry: &client_registry,
+                    client_id,
+                    peer_addr: &peer_addr,
+                    user: &mut authenticated_user,
+                    key_restricted: &mut key_restricted,
+                    cmd_restricted: &mut cmd_restricted,
                 }
+                .auth(&cmd),
 
-                "HELLO" => {
-                    // HELLO [protover [AUTH username password] [SETNAME clientname]]
-
-                    let mut i = 1usize; // index into cmd, past "HELLO"
-
-                    let mut proto_reply: i64 = resp_version as i64;
-
-                    // Optional protocol version
-                    if let Some(ver_bytes) = cmd.get(i) {
-                        let ver = std::str::from_utf8(ver_bytes).unwrap_or("2");
-                        // protover 0 is a special case meaning "RESET to defaults"
-                        if ver != "0" && ver != "1" && ver != "2" && ver != "3" {
-                            out_buf.extend_from_slice(
-                                b"-ERR Protocol version is not an integer or out of range\r\n",
-                            );
-                            parse_offset += consumed;
-                            continue;
-                        }
-                        proto_reply = match ver {
-                            "3" => {
-                                resp_version = 3;
-                                client_registry.update(client_id, |info| info.resp = 3);
-                                3
-                            }
-                            _ => {
-                                resp_version = 2;
-                                client_registry.update(client_id, |info| info.resp = 2);
-                                2
-                            }
-                        };
-                        i += 1;
+                "HELLO" if !tx.active => {
+                    let reply = commands::login::Login {
+                        acl_store: &acl_store,
+                        acl_log: &acl_log,
+                        client_registry: &client_registry,
+                        client_id,
+                        peer_addr: &peer_addr,
+                        user: &mut authenticated_user,
+                        key_restricted: &mut key_restricted,
+                        cmd_restricted: &mut cmd_restricted,
                     }
-
-                    // Optional AUTH username password
-                    if cmd
-                        .get(i)
-                        .and_then(|b| std::str::from_utf8(b).ok())
-                        .map(|s| s.eq_ignore_ascii_case("AUTH"))
-                        .unwrap_or(false)
-                    {
-                        i += 1; // consume "AUTH"
-                        let (provided_username, provided_password) =
-                            match (cmd.get(i), cmd.get(i + 1)) {
-                                (Some(u), Some(p)) => {
-                                    i += 2;
-                                    (
-                                        std::str::from_utf8(u).unwrap_or("default"),
-                                        std::str::from_utf8(p).unwrap_or(""),
-                                    )
-                                }
-                                (Some(p), None) => {
-                                    i += 1;
-                                    ("default", std::str::from_utf8(p).unwrap_or(""))
-                                }
-                                _ => {
-                                    out_buf.extend_from_slice(
-                                        b"-ERR Syntax error in HELLO option 'auth'\r\n",
-                                    );
-                                    parse_offset += consumed;
-                                    continue;
-                                }
-                            };
-
-                        // The user named, and no other. (This used to
-                        // accept `default` as a name for *any* user whose
-                        // password matched.)
-                        let matched = crate::acl::authenticate(
-                            &acl_store,
-                            provided_username,
-                            provided_password,
-                        );
-                        match matched.as_ref() {
-                            Some(user) => {
-                                crate::acl::track_restriction_counters(
-                                    user,
-                                    &mut key_restricted,
-                                    &mut cmd_restricted,
-                                );
-                                authenticated_user = Some(user.name.clone());
-                                client_registry
-                                    .update(client_id, |info| info.user = user.name.clone());
-                            }
-                            None => {
-                                out_buf.extend_from_slice(
-                                    b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
-                                );
-                                parse_offset += consumed;
-                                continue;
-                            }
-                        }
-                    }
-
-                    // HELLO is let through the auth gate so that it can
-                    // carry AUTH; without it, it needs a connection that is
-                    // already authenticated.
-                    if authenticated_user.is_none() {
-                        out_buf.extend_from_slice(
-                            b"-NOAUTH HELLO must be called with the client already \
-                              authenticated, otherwise the HELLO <proto> AUTH <user> <pass> \
-                              option can be used to authenticate the client and select the \
-                              RESP protocol version at the same time\r\n",
-                        );
-                        parse_offset += consumed;
-                        continue;
-                    }
-
-                    // Optional SETNAME clientname
-                    if cmd
-                        .get(i)
-                        .and_then(|b| std::str::from_utf8(b).ok())
-                        .map(|s| s.eq_ignore_ascii_case("SETNAME"))
-                        .unwrap_or(false)
-                    {
-                        i += 1;
-                        if let Some(name_bytes) = cmd.get(i) {
-                            let name = String::from_utf8_lossy(name_bytes).to_string();
-                            client_registry.update(client_id, |info| info.name = name);
-                        }
-                    }
-
-                    // Build the response — RESP3 clients (e.g. modern redis-py, whose default
-                    // changed to protocol 3) expect the HELLO reply itself encoded as a `%`
-                    // map once RESP3 is negotiated; RESP2 stays a flat `*` array of pairs.
-                    use crate::resp::write::{resp_array, resp_bulk_str, resp_integer, resp_map};
-                    let role = repl_state.role();
-                    let kv = vec![
-                        resp_bulk_str("server"),
-                        resp_bulk_str("kividb"),
-                        resp_bulk_str("version"),
-                        resp_bulk_str(env!("CARGO_PKG_VERSION")),
-                        resp_bulk_str("proto"),
-                        resp_integer(proto_reply),
-                        resp_bulk_str("id"),
-                        resp_integer(client_id as i64),
-                        resp_bulk_str("mode"),
-                        resp_bulk_str("standalone"),
-                        resp_bulk_str("role"),
-                        resp_bulk_str(&role),
-                        resp_bulk_str("modules"),
-                        commands::server::module_list_reply(proto_reply as u8),
-                    ];
-                    let response = if proto_reply == 3 {
-                        resp_map(kv)
-                    } else {
-                        resp_array(kv)
-                    };
-                    out_buf.extend_from_slice(&response);
+                    .hello(&cmd, &mut resp_version, &repl_state);
+                    // Counted here: the commands below are not.
+                    crate::cmdstats::record("HELLO", &cmd, &reply, std::time::Duration::ZERO);
+                    out_buf.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
                 }
 
-                // In the slow path match in server.rs, add WAITAOF as a special case:
-                "WAITAOF" => {
+                // WAITAOF and WAIT: inside MULTI they are queued, and EXEC
+                // answers them without waiting, as in Redis (#499).
+                "WAITAOF" if !tx.active => {
                     if cmd.len() < 4 {
                         b"-ERR wrong number of arguments for 'waitaof' command\r\n".to_vec()
                     } else if !aof_enabled
@@ -2307,10 +2458,18 @@ pub async fn handle_client(
                             } else {
                                 timeout_ms
                             });
+                        let role_epoch = crate::commands::blocking::role_changes(&repl_state);
 
                         let waited = unless_gone(
                             async {
                                 loop {
+                                    // Ended, as every blocked client is, when
+                                    // this node becomes a replica (#591).
+                                    if crate::commands::blocking::role_changes(&repl_state)
+                                        != role_epoch
+                                    {
+                                        break crate::commands::blocking::ROLE_CHANGED.to_vec();
+                                    }
                                     let fsynced = crate::aof::AOF_FSYNCED
                                         .load(std::sync::atomic::Ordering::Relaxed);
                                     if fsynced >= target || tokio::time::Instant::now() >= deadline
@@ -2321,13 +2480,20 @@ pub async fn handle_client(
                                             b"*2\r\n:0\r\n:0\r\n".to_vec()
                                         };
                                     }
-                                    tokio::task::yield_now().await;
+                                    // tokio-uring submits queued I/O when the worker
+                                    // parks. A busy yield loop can prevent that.
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                                 }
                             },
                             &peer_watch,
                         )
                         .await;
                         match waited {
+                            Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
+                                out_buf.extend_from_slice(&reply);
+                                quit_requested = true;
+                                break;
+                            }
                             Some(reply) => reply,
                             // The client has gone: there is nobody to answer.
                             None => {
@@ -2338,65 +2504,38 @@ pub async fn handle_client(
                     }
                 }
 
-                "WAIT" => {
-                    if cmd.len() < 3 {
-                        b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec()
-                    } else {
-                        let num_replicas: i64 =
-                            std::str::from_utf8(cmd.get(1).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-
-                        let timeout_ms: u64 =
-                            std::str::from_utf8(cmd.get(2).copied().unwrap_or(b"0"))
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-
-                        let connected = repl_state
-                            .connected_replicas
-                            .load(std::sync::atomic::Ordering::Relaxed);
-
-                        if num_replicas == 0 || connected == 0 {
-                            crate::resp::write::resp_integer(connected).to_vec()
-                        } else {
-                            // See the tokio loop in server.rs: per-replica
-                            // targets, taken after a hub barrier.
-                            let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
-                            if hub_tx
-                                .send(crate::replication::HubMsg::Barrier(barrier_tx))
-                                .is_ok()
-                            {
-                                let _ = barrier_rx.await;
-                            }
-                            let targets = repl_state.wait_targets();
-
-                            let deadline = tokio::time::Instant::now()
-                                + tokio::time::Duration::from_millis(if timeout_ms == 0 {
-                                    u64::MAX
-                                } else {
-                                    timeout_ms
-                                });
-
+                "WAIT" if !tx.active => {
+                    match crate::replication::wait_args(&cmd, repl_state.is_slave()) {
+                        Err(refusal) => refusal,
+                        Ok((wanted, timeout_ms)) => {
+                            // A blocked client while it waits, as in Redis:
+                            // `b` in CLIENT LIST, counted in
+                            // `blocked_clients`, and ended by CLIENT UNBLOCK.
+                            let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+                            let _blocked = (wanted > 0).then(|| {
+                                client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
+                            });
                             let waited = unless_gone(
-                                async {
-                                    loop {
-                                        let acked =
-                                            crate::replication::ReplState::count_reached(&targets);
-                                        if acked >= num_replicas
-                                            || tokio::time::Instant::now() >= deadline
-                                        {
-                                            break crate::resp::write::resp_integer(acked).to_vec();
-                                        }
-                                        tokio::task::yield_now().await; // not tokio::time::sleep
-                                    }
-                                },
+                                crate::replication::wait_for_replicas(
+                                    &repl_state,
+                                    &hub_tx,
+                                    wanted,
+                                    timeout_ms,
+                                    unblock_rx,
+                                ),
                                 &peer_watch,
                             )
                             .await;
                             match waited {
-                                Some(reply) => reply,
+                                Some(end) if end.close => {
+                                    // This master became a replica: told so,
+                                    // and closed, as Redis closes it.
+                                    out_buf.extend_from_slice(&end.reply);
+                                    parse_offset += consumed;
+                                    quit_requested = true;
+                                    break;
+                                }
+                                Some(end) => end.reply,
                                 // The client has gone: there is nobody to answer.
                                 None => {
                                     quit_requested = true;
@@ -2581,7 +2720,8 @@ pub async fn handle_client(
                         (r, cmd_start.elapsed().as_micros() as u64)
                     };
 
-                    if elapsed_us >= slowlog.threshold_us() {
+                    // Not a write a pause sent back: it is timed when it runs.
+                    if elapsed_us >= slowlog.threshold_us() && !crate::pause::is_held(&result) {
                         let client_name = client_registry
                             .get(client_id)
                             .map(|info| info.name.clone())
@@ -2593,6 +2733,29 @@ pub async fn handle_client(
                     result
                 }
             };
+            // A write that got past a `CLIENT PAUSE` before it was set, and
+            // went no further (`pause::HELD_IN_GATE`): read again, and held.
+            if crate::pause::is_held(&response) {
+                redispatch = true;
+                continue;
+            }
+            // The other commands answered here, and not by `execute_command`,
+            // are counted as well (`HELLO` counts itself, as it replies in
+            // several places).
+            if !queued_here
+                && matches!(
+                    cmd_name.as_str(),
+                    "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH"
+                )
+            {
+                // None of them has subcommands, so the name is all `record` needs.
+                crate::cmdstats::record(
+                    &cmd_name,
+                    &[cmd_name.as_bytes()],
+                    &response,
+                    std::time::Duration::ZERO,
+                );
+            }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —
             // each shown as it was run — and then `EXEC`.
             if let Some(word) = &transaction_word {
@@ -2723,6 +2886,10 @@ pub async fn handle_client(
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                // A replica's link from here: `flags=S`, `TYPE replica`, as
+                // Redis lists it (#595). `CLIENT KILL` shuts its socket, as
+                // any client's, which ends the link.
+                client_registry.update(client_id, |info| info.flags = "S".to_string());
                 // Out of the reactor while the descriptor is surely open.
                 drop(peer_watch);
                 handle_replica_connection_uring(

@@ -488,6 +488,8 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "RENAME"
             | "RENAMENX"
             | "MOVE"
+            // Takes keys away; Redis flags it a write, but not `denyoom`.
+            | "MIGRATE"
             | "SWAPDB"
             | "LPOP"
             | "RPOP"
@@ -894,14 +896,15 @@ thread_local! {
 /// Delete `key` to make room, with everything a deletion entails. Returns
 /// about how much memory that gives back (see `store::Taken::footprint`),
 /// or None if the key was gone already.
-fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
+fn evict(ctx: &mut Ctx, db: usize, key: &[u8], ordered: bool) -> Option<usize> {
     // Ordered against other writes to the key, like any write (#271). See
     // `write_order`.
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
-        .then(|| crate::write_order::lock_keys(db, std::iter::once(key.as_bytes())));
+        .then(|| crate::write_order::lock_keys(db, std::iter::once(key)));
 
+    // A document left its indexes when the shard was let go of
+    // (`ShardMap::remove`).
     let given = crate::commands::helpers::delete_key_sized(ctx.store, db, key)?;
-    crate::vector::maybe_unindex(ctx.index_store, db, key);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
     crate::stats::record_rdb_change();
@@ -920,7 +923,7 @@ fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
         // In the key's database, whichever the client has selected.
         let selected = *ctx.selected_db;
         *ctx.selected_db = db;
-        crate::replication::replicate_one_write(ctx, &[b"DEL".to_vec(), key.as_bytes().to_vec()]);
+        crate::replication::replicate_one_write(ctx, &[b"DEL".to_vec(), key.to_vec()]);
         *ctx.selected_db = selected;
     }
     Some(given)
@@ -1029,7 +1032,7 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             continue;
         };
         fresh = false;
-        match evict(ctx, db, crate::store::key_text(&key), ordered) {
+        match evict(ctx, db, &key, ordered) {
             Some(size) => {
                 misses = 0;
                 given = given.saturating_add(size);
@@ -1160,7 +1163,7 @@ mod tests {
         sample_db(shards, volatile, count, rng, |_, _, e| {
             let expires = if volatile { e.expires() } else { None };
             found.push((
-                crate::store::key_text(e.key()).to_owned(),
+                crate::key_bytes::text_of(e.key()).into_owned(),
                 expires,
                 e.access(),
             ))
@@ -1194,7 +1197,7 @@ mod tests {
         for _ in 0..40_000 {
             let n = sample_shard(&map, false, 5, &mut rng, |_, e| {
                 *times
-                    .entry(crate::store::key_text(e.key()).to_owned())
+                    .entry(crate::key_bytes::text_of(e.key()).into_owned())
                     .or_default() += 1;
             });
             assert_eq!(n, 5);
@@ -1240,7 +1243,7 @@ mod tests {
         assert_eq!(ids(&c.top[..c.len]), [7, 2, 5, 3, 8]);
         assert_eq!(
             c.decide()
-                .map(|(db, key)| (db, crate::store::key_text(&key).to_owned())),
+                .map(|(db, key)| (db, crate::key_bytes::text_of(&key).into_owned())),
             Some((3, "k7".to_string()))
         );
         let kept = KEPT_SPOTS.with(|k| k.get());

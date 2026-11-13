@@ -577,6 +577,12 @@ impl Entry {
         }
     }
 
+    /// What the entry's block adds to `memory_use::allocated`: a slab's
+    /// block at its class's size.
+    pub(super) fn block_bytes(self) -> usize {
+        allocated_size(self.size())
+    }
+
     #[inline]
     pub(super) fn holders(self) -> u32 {
         self.header().word.load(Ordering::Acquire) & HOLDERS

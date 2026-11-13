@@ -2,7 +2,7 @@
 
 use crate::commands::*;
 use crate::replication;
-use crate::resp::write::{resp_array, resp_error, resp_integer, resp_null_bulk};
+use crate::resp::write::{resp_array, resp_error, resp_integer};
 use ctx::Ctx;
 use std::sync::atomic::Ordering;
 
@@ -144,7 +144,7 @@ fn replace_watch_begin(ctx: &Ctx, name: &str) -> Option<ReplaceWatch> {
         .into_iter()
         .filter_map(|(db, pos)| {
             let db = db.unwrap_or(*ctx.selected_db);
-            let key = std::str::from_utf8(ctx.cmd[pos]).ok()?;
+            let key = ctx.cmd[pos];
             let held =
                 crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key)).get_ref(key)?;
             Some((db, pos, held))
@@ -169,9 +169,7 @@ fn replace_watch_end(ctx: &Ctx, watch: ReplaceWatch) {
         Vec::new()
     };
     for (db, pos, old) in watch.before {
-        let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
-            continue;
-        };
+        let key = ctx.cmd[pos];
         // Whether the key has another value now, and whether of another type.
         let replaced = {
             let map = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key));
@@ -241,12 +239,15 @@ pub(crate) fn execute_command_from_script(
         return resp_error("ERR This Redis command is not allowed from script");
     }
 
-    // Purely blocking commands — return fixed sentinel values instead of blocking the Lua thread.
-    // Redis's behaviour: BLPOP/BRPOP/… → nil;  WAIT → 0;  WAITAOF → {0 0}.
+    // A script never waits. `BLPOP`, `BZPOPMIN`, `BLMOVE` and the other
+    // blocking pops run as their non-blocking form, as in Redis, where a
+    // script's client is `CLIENT_DENY_BLOCKING`: the element if there is
+    // one, their empty reply if not. The `Ctx` a script runs commands with
+    // has `blocking: None`, which is what makes them so
+    // (`blocking::wait_for_keys`). They used to answer nil here without
+    // running, whatever the key held (#558).
+    // `WAIT` → 0 and `WAITAOF` → {0 0}, as in Redis.
     match name {
-        "BLPOP" | "BRPOP" | "BLMOVE" | "BLMPOP" | "BZPOPMIN" | "BZPOPMAX" | "BZMPOP"
-        | "BRPOPLPUSH" => return resp_null_bulk(),
-
         "WAIT" => return resp_integer(0),
 
         "WAITAOF" => return resp_array(vec![resp_integer(0), resp_integer(0)]),
@@ -365,6 +366,21 @@ fn not_allowed_from_script(name: &str, sub: Option<&[u8]>) -> bool {
     }
 }
 
+/// The `BUSY` reply to a command refused while a script runs: it names
+/// `FUNCTION KILL` while a function runs, as Redis's does (#562).
+fn busy_reply() -> Vec<u8> {
+    #[cfg(feature = "lua")]
+    {
+        crate::commands::lua::busy_reply()
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        resp_error(
+            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+        )
+    }
+}
+
 /// The rest of [`execute_command_from_script`], with the command in `ctx.cmd`.
 /// Why a script on a cluster node may not run `ctx.cmd`, or `None` when it
 /// may: as in Redis, its keys must be ones this node serves, and, unless the
@@ -405,10 +421,8 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
         false,
         || registry.get_readonly(client_id),
         |key| {
-            std::str::from_utf8(key).is_ok_and(|key| {
-                let shard = crate::store::get_shard(&store[db], key);
-                crate::read_lock!(shard).contains_key(key)
-            })
+            let shard = crate::store::get_shard(&store[db], key);
+            crate::read_lock!(shard).contains_key(key)
         },
     );
     match decision {
@@ -436,14 +450,15 @@ fn keys_of_several_shards(
     db: usize,
     name: &str,
     cmd: &[&[u8]],
-    cmd0: &[u8],
 ) -> bool {
     // `key_positions` is a long match on the name: the writes that name one
     // key are told apart first.
     if cmd.len() < 3
         || matches!(name, "MSET" | "MSETNX")
         || one_key_write(name)
-        || !replication::is_write_command_bytes(cmd0)
+        // By the arguments: `GEORADIUS ... STORE` writes. (`MIGRATE` skips
+        // the gate before this is asked: `command_gate::skips`.)
+        || !replication::command_mutates_for_replication(name, cmd)
     {
         return false;
     }
@@ -454,13 +469,11 @@ fn keys_of_several_shards(
     let Some(db) = store.get(db) else {
         return false;
     };
-    let mut shards = keys.iter().map(|pos| {
-        std::str::from_utf8(cmd[pos])
-            .map(|key| crate::store::shard_index(db.len(), key))
-            .ok()
-    });
-    let first = shards.next().flatten();
-    first.is_none() || shards.any(|shard| shard != first)
+    let mut shards = keys
+        .iter()
+        .map(|pos| crate::store::shard_index_of_bytes(db.len(), cmd[pos]));
+    let first = shards.next();
+    first.is_none() || shards.any(|shard| Some(shard) != first)
 }
 
 /// Whether a command takes the command gate alone: the one rule, asked by
@@ -487,7 +500,18 @@ fn takes_the_gate_alone(
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
         // stays small.
-        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd, cmd[0]))
+        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd))
+        // A `SORT` that reads fields of hashes it does not name, which may
+        // remove one past its time (`generics::sort_reads_hash_fields`).
+        // Not `SORT_RO`: it is no write, and takes the order of what it
+        // removes as a read does.
+        || (name == "SORT" && sort_reads_hash_fields(cmd))
+}
+
+/// [`takes_the_gate_alone`]'s question for `SORT`, out of line.
+#[inline(never)]
+fn sort_reads_hash_fields(cmd: &[&[u8]]) -> bool {
+    crate::commands::generics::sort_reads_hash_fields(cmd)
 }
 
 /// The writes of one key, and so of one shard, made most: told apart by
@@ -579,6 +603,26 @@ fn order_of_pairs_shared(ctx: &Ctx) -> crate::write_order::OrderGuard {
     crate::write_order::lock_keys_shared(*ctx.selected_db, ctx.cmd[1..].iter().step_by(2).copied())
 }
 
+/// For a script held to a hash tag: the refusal of a `SORT` or `SORT_RO`
+/// whose `BY` or `GET` pattern can name keys outside the tag
+/// (`generics::sort_pattern_outside`). Asked before the command runs, so
+/// nothing is read, and no field removed, before it is refused.
+#[inline(never)]
+fn sort_pattern_outside_the_tag(name: &str, cmd: &[&[u8]]) -> Option<String> {
+    if !matches!(name, "SORT" | "SORT_RO") {
+        return None;
+    }
+    let pattern =
+        crate::commands::generics::sort_pattern_outside(cmd, crate::tag_locks::script_may_touch)?;
+    Some(format!(
+        "ERR Script attempted to run '{}' with the pattern '{}', which looks at keys it does \
+         not name outside the hash tag '{}' of its KEYS (lua-parallel-scripts)",
+        name.to_ascii_lowercase(),
+        String::from_utf8_lossy(pattern),
+        crate::tag_locks::script_tag_for_message()
+    ))
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -593,6 +637,16 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         name_owned2 = String::from_utf8_lossy(cmd0).to_ascii_uppercase();
         name_owned2.as_str()
     };
+
+    // A cluster node has one keyspace, for a script as for a client: as in
+    // Redis, the `SELECT` command itself refuses (#428).
+    if name2 == "SELECT"
+        && ctx.cluster.enabled
+        && !ctx.apply_replication
+        && ctx.cmd.get(1).is_some_and(|db| *db != &b"0"[..])
+    {
+        return resp_error("ERR SELECT is not allowed in cluster mode");
+    }
 
     // A script running under its tag's lock keeps to its tag (`tag_locks`).
     if crate::tag_locks::in_script() {
@@ -616,6 +670,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
                         crate::tag_locks::script_tag_for_message()
                     )
                 })
+                .or_else(|| sort_pattern_outside_the_tag(name2, &ctx.cmd))
         };
         if let Some(outside) = outside {
             return resp_error(&outside);
@@ -676,7 +731,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
 
     if !repl_is_slave
         && check_memory_limit()
-        && replication::is_write_command_bytes(cmd0)
+        && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
         && !crate::eviction::allowed_when_out_of_memory(name2)
         && !skip_mem
     {
@@ -711,11 +766,12 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
             .get(ctx.authenticated_user)
             .and_then(|user| crate::acl::check_permission(user, name2, ctx.cmd.as_slice()).err());
         if let Some(denied) = denied {
+            let _lua = crate::acl::log_context("lua");
             ctx.acl_log.record(
                 denied.reason(),
                 denied.object(),
                 ctx.authenticated_user,
-                ctx.peer_addr,
+                &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
             );
             let reply = resp_error(&denied.message(ctx.authenticated_user));
             return reply;
@@ -727,33 +783,62 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
 
     // Unknown-command message must match Redis's wording (Tcl tests use glob `*Unknown Redis*`).
     let started = std::time::Instant::now();
+    // A write takes the keys it names that are past their time as gone,
+    // and they go first, as from a client (`expire_named_keys_first`).
+    if replication::command_mutates_for_replication(name2, ctx.cmd.as_slice()) {
+        expire_named_keys_first(ctx, name2, None);
+    }
+    // What the command records of its effects is read below whether or not
+    // the write is observed (`script_feed::effects_begin_if_read`).
+    let script_call = replication::script_feed::ScriptCall::enter();
     let result = dispatch_command_handlers(ctx, name2)
         .unwrap_or_else(|| resp_error("ERR Unknown Redis command called from script"));
+    drop(script_call);
     // Counted for `INFO commandstats`, like a command a client sends.
     crate::cmdstats::record(name2, &ctx.cmd, &result, started.elapsed());
 
+    // A command that writes only with some arguments (GEORADIUS ... STORE,
+    // MIGRATE, ...) must count as a write here too, or a key it emptied is
+    // not swept, a client blocked on a key it wrote is not woken, and a
+    // client tracking that key is not told. Judged by the arguments, as the
+    // propagation below judges it (`command_mutates_for_replication`).
+    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
+    // A `SELECT` is propagated, but writes nothing: a script that has only
+    // selected a database can still be killed (#424).
     #[cfg(feature = "lua")]
-    if !result.starts_with(b"-") && replication::is_write_command_bytes(cmd0) {
+    if !result.starts_with(b"-")
+        && inner_write
+        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
+    {
         crate::commands::lua::script_note_successful_write();
     }
 
     // A write from a script leaves the same things to be done as one from a
     // client: a key it emptied goes, and clients blocked on a key it wrote
     // are woken.
-    if !result.starts_with(b"-") && replication::is_write_command_bytes(cmd0) {
+    if !result.starts_with(b"-") && inner_write {
         settle_written_keys(ctx, name2);
     }
     // And clients caching a key it wrote are told; a key it read is one its
     // caller has read.
     {
-        let is_write = replication::is_write_command_bytes(cmd0);
-        track(ctx, name2, is_write && !result.starts_with(b"-"), is_write);
+        track(
+            ctx,
+            name2,
+            &result,
+            inner_write && !result.starts_with(b"-"),
+            inner_write,
+        );
     }
 
+    // A write that changed nothing — a pop that took nothing, a `PERSIST`
+    // that answered 0 — is not sent, not counted, and a `WATCH` on its keys
+    // holds (`changed_nothing`).
     #[cfg(feature = "lua")]
     if !result.starts_with(b"-")
         && !repl_is_slave
         && !ctx.apply_replication
+        && !propagates_nothing(name2, ctx.cmd.as_slice(), &result)
         && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
     {
         let feeds = replication::script_feed::commands_for_propagation(
@@ -772,9 +857,13 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
             }
             crate::stats::record_rdb_change();
         }
-        // A write made from a script dirties a WATCH like any other write.
-        notify_watchers(ctx, name2);
+        // A write made from a script dirties a WATCH like any other write,
+        // on the keys it changed.
+        notify_watchers(ctx, name2, &result);
     }
+    // What this command said it left unchanged is for this command only:
+    // the next one a script calls may change the same key.
+    crate::watch::clear_unchanged();
 
     rewrite_wrong_arity_error_for_script(result)
 }
@@ -874,6 +963,13 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     // case it has not run yet and is counted when it is resumed.
     let started = std::time::Instant::now();
     let reply = run_command(ctx, name, started);
+    if crate::pause::is_held(&reply) {
+        // Not run: a `CLIENT PAUSE` sent it back to be held, and it is
+        // dispatched again (`blocking::hold_for_pause`). Counted and timed
+        // then.
+        crate::stats::unrecord_command_processed();
+        return reply;
+    }
     let elapsed = started.elapsed();
     // For the connection loop's slow log: see `cmdstats::last_command_us`.
     crate::cmdstats::note_last_command(elapsed);
@@ -1005,11 +1101,7 @@ fn routed_again_in_gate(
         ctx.cluster,
         routed.asking(),
         || registry.get_readonly(client_id),
-        |key| {
-            std::str::from_utf8(key).is_ok_and(|key| {
-                crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key)
-            })
-        },
+        |key| crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key),
     )
     .refusal()
 }
@@ -1022,7 +1114,6 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     if let Some(refusal) = crate::commands::arity::check(name, &ctx.cmd) {
         return refusal;
     }
-    let cmd0 = &ctx.cmd[0];
 
     // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
     // Taken before the command is routed, as everything it is checked
@@ -1062,12 +1153,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             let store_for_check = ctx.store;
             let db = *ctx.selected_db;
             let has_key_locally = |key: &[u8]| -> bool {
-                let key_str = match std::str::from_utf8(key) {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                let shard = crate::store::get_shard(&store_for_check[db], key_str);
-                crate::read_lock!(shard).contains_key(key_str)
+                let shard = crate::store::get_shard(&store_for_check[db], key);
+                crate::read_lock!(shard).contains_key(key)
             };
             let registry = ctx.client_registry;
             let client_id = ctx.client_id;
@@ -1094,9 +1181,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     #[cfg(feature = "lua")]
     if crate::commands::lua::lua_server_busy_for_command(ctx.cmd.as_slice()) {
-        return resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        );
+        return busy_reply();
     }
 
     // Masters skip `is_write_command` entirely here — hot path for standalone read benchmarks.
@@ -1118,7 +1203,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
         )
         && !crate::command_gate::alone_on_this_thread()
-        && replication::is_data_write(name)
+        && replication::refused_without_replicas(name, &ctx.cmd)
         && ctx.repl_state.lacks_good_replicas()
     {
         return resp_error(replication::NOREPLICAS);
@@ -1159,11 +1244,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             .get(ctx.authenticated_user)
             .and_then(|user| crate::acl::check_permission(user, name, ctx.cmd.as_slice()).err());
         if let Some(denied) = denied {
+            // As in Redis, a command there is no such command as is refused
+            // for that, before the user's rules (and the ACL log). The
+            // wrong number of arguments was refused above.
+            if !crate::commands::server::is_command(name) {
+                return unknown_command(&ctx.cmd);
+            }
             ctx.acl_log.record(
                 denied.reason(),
                 denied.object(),
                 ctx.authenticated_user,
-                ctx.peer_addr,
+                &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
             );
             return resp_error(&denied.message(ctx.authenticated_user));
         }
@@ -1182,7 +1273,15 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // Over the limit, room is made before any command runs — a read too,
     // as in Redis: memory is over the limit whoever notices. A command that
     // may add to it is refused if no room could be made.
-    let over_limit = !repl_is_slave && !ctx.apply_replication && check_memory_limit();
+    //
+    // Not while writes are paused (`CLIENT PAUSE`, a failover, a slot
+    // handoff): the dataset stands still then, as in Redis, where eviction
+    // waits like expiry (`PAUSE_ACTION_EVICT`). Its `DEL`s moved the
+    // replication offset a paused master had reported (#424).
+    let over_limit = !repl_is_slave
+        && !ctx.apply_replication
+        && check_memory_limit()
+        && !crate::pause::expiry_deferred();
     // A library of functions is memory too, though not in the keyspace.
     let loads_functions = name == "FUNCTION"
         && ctx.cmd.get(1).is_some_and(|sub| {
@@ -1190,7 +1289,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         });
     let needs_room = over_limit
         && (loads_functions
-            || (replication::is_write_command_bytes(cmd0)
+            || (replication::command_mutates_for_replication(name, &ctx.cmd)
                 && !crate::eviction::allowed_when_out_of_memory(name)));
 
     // Writes hold the write gate from before they touch the store until their
@@ -1288,6 +1387,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // stream, alone for a command that takes it alone
     // (`applied_takes_the_gate_alone`, #373), and EXEC and a script hold it
     // alone for theirs.
+    #[cfg(debug_assertions)]
+    if gated && !crate::write_gate::held_by_this_thread() {
+        crate::pause::test_stall_before_the_gate(ctx.cmd.as_slice());
+    }
     let gates = if crate::command_gate::skips(name, &ctx.cmd) {
         Some((None, None))
     } else if takes_the_gate_alone(
@@ -1303,9 +1406,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
     };
     let Some((_command_gate, _alone)) = gates else {
-        return resp_error(
-            "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-        );
+        return busy_reply();
     };
 
     // A write under a script or an `EXEC` that already holds the gate is part
@@ -1326,9 +1427,37 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // since this write was routed: a whole `MIGRATE` of its key may have run
     // between its routing and the gate. It is routed again, here in the
     // gate, where nothing moves its keys before it is done (#331).
+    //
+    // And a `CLIENT PAUSE` set since it passed the pause check: it would be
+    // applied, and acknowledged, after the pause had been answered and the
+    // master's offset read, and lost by a switchover that promoted a replica
+    // at that offset (#629). It goes back to its connection, out of the
+    // gates, and is held there like any write that comes during the pause
+    // (`pause::pause_clients`). Not a dispatch that resumes a command whose
+    // client has gone, which writes nothing.
     while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
     {
-        let handoff = crate::pause::handoff();
+        // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
+        // cache, not the dataset, and while writes are paused they are kept
+        // out of the replication stream and the AOF
+        // (`replication::held_back`), so a handoff misses nothing of them.
+        // The pause does not hold them (#518), and they used to wait the
+        // handoff out here instead, asleep on their worker thread, with
+        // every other connection of that thread (#528).
+        let handoff = crate::pause::handoff() && name != "SCRIPT";
+        if !handoff
+            && crate::pause::write_held_in_gate(ctx.cmd.as_slice())
+            && !crate::commands::blocking::client_gone(ctx)
+        {
+            drop(_write_gate);
+            // `ASKING` was used up when it was routed; the dispatch that
+            // runs it is routed as this one was.
+            if routed.asking() {
+                ctx.client_registry
+                    .update(ctx.client_id, |info| info.asking = true);
+            }
+            return crate::commands::blocking::hold_for_pause(ctx);
+        }
         if !handoff
             && !(crate::pause::keys_moving()
                 && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))
@@ -1359,10 +1488,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
                 // whether the key is still here.
                 |key| {
                     handoff
-                        || std::str::from_utf8(key).is_ok_and(|key| {
-                            crate::read_lock!(crate::store::get_shard(&store[db], key))
-                                .contains_key(key)
-                        })
+                        || crate::read_lock!(crate::store::get_shard(&store[db], key))
+                            .contains_key(key)
                 },
             );
             if let Some(refusal) = decision.refusal() {
@@ -1421,7 +1548,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         None
     };
 
-    let _write_order = if crate::command_gate::alone_on_this_thread() {
+    // Whether a hash command took its key's order shared, having found no
+    // search index: see `ask_again_for_an_index`.
+    let mut hash_beside_others = false;
+    // The keys it names, if they were looked for here: for
+    // `expire_named_keys_first`, which would look for them again.
+    let mut named: Option<crate::keyspec::Keys> = None;
+    let mut _write_order = if crate::command_gate::alone_on_this_thread() {
         // No other command is running: there is nothing to be ordered
         // against, and the writes made from inside this one take nothing.
         Some(crate::write_order::held_exclusively())
@@ -1433,6 +1566,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // orders (see `write_order::lock_key_shared`). Not while anything
         // reads the write stream: the stream carries the writes to a key in
         // the order they take this lock whole.
+        // `HSET`, `HMSET`, `HSETNX`, `HINCRBY`, `HINCRBYFLOAT`: the only
+        // ones of them that start with an H.
+        hash_beside_others = name.as_bytes()[0] == b'H';
         Some(crate::write_order::lock_key_shared(
             *ctx.selected_db,
             ctx.cmd[1],
@@ -1448,7 +1584,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // write stream, as every other write is.
         Some(order_of_pairs_shared(ctx))
     } else if keys_ordered {
-        let keys = crate::keyspec::key_positions(name, &ctx.cmd);
+        let keys = named.insert(crate::keyspec::key_positions(name, &ctx.cmd));
         let here = *ctx.selected_db;
         match database_written_too(ctx, name) {
             // The key's record is ordered where it goes as well: see
@@ -1465,6 +1601,16 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         None
     };
+    if hash_beside_others && !ctx.index_store.none() {
+        ask_again_for_an_index(ctx, &mut _write_order);
+    }
+    // The keys it names that are past their time go first, their deletions
+    // sent ahead of it (`expire_named_keys_first`, #628). In the gate and
+    // the order of its keys: the deletion falls where it did among the
+    // writes to them.
+    if gated && writes_operation {
+        expire_named_keys_first(ctx, name, named);
+    }
 
     // HOTKEYS: one relaxed load when no session is running.
     let hotkeys_started = hotkeys::active().then(std::time::Instant::now);
@@ -1491,14 +1637,14 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
             & crate::keyspace_events::KS_NEW
             != 0;
-    let exists = |ctx: &Ctx, key: &str| {
+    let exists = |ctx: &Ctx, key: &[u8]| {
         crate::read_lock!(crate::store::get_shard(&ctx.store[*ctx.selected_db], key))
             .contains_key(key)
     };
     let absent: Vec<usize> = if announce_new {
         crate::keyspec::key_positions(name, &ctx.cmd)
             .iter()
-            .filter(|pos| std::str::from_utf8(ctx.cmd[*pos]).is_ok_and(|key| !exists(ctx, key)))
+            .filter(|pos| !exists(ctx, ctx.cmd[*pos]))
             .collect()
     } else {
         Vec::new()
@@ -1513,7 +1659,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     {
         crate::keyspec::key_positions(name, &ctx.cmd)
             .iter()
-            .filter(|pos| std::str::from_utf8(ctx.cmd[*pos]).is_ok_and(|key| !exists(ctx, key)))
+            .filter(|pos| !exists(ctx, ctx.cmd[*pos]))
             .collect()
     } else {
         Vec::new()
@@ -1568,9 +1714,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     }
 
     for pos in absent {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos])
-            && exists(ctx, key)
-        {
+        let key = ctx.cmd[pos];
+        if exists(ctx, key) {
             crate::keyspace_events::notify(
                 ctx.pubsub,
                 *ctx.selected_db,
@@ -1581,15 +1726,13 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         }
     }
     for pos in missed {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-            crate::keyspace_events::notify(
-                ctx.pubsub,
-                *ctx.selected_db,
-                crate::keyspace_events::KS_KEY_MISS,
-                "keymiss",
-                key,
-            );
-        }
+        crate::keyspace_events::notify(
+            ctx.pubsub,
+            *ctx.selected_db,
+            crate::keyspace_events::KS_KEY_MISS,
+            "keymiss",
+            ctx.cmd[pos],
+        );
     }
     // The events of the commands that announce none of their own (#160).
     if writes_operation
@@ -1598,7 +1741,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && !crate::commands::blocking::parked(ctx)
     {
         for event in crate::keyspace_events::command_events(name, &ctx.cmd, &result) {
-            if let Some(Ok(key)) = ctx.cmd.get(event.key).map(|key| std::str::from_utf8(key)) {
+            if let Some(key) = ctx.cmd.get(event.key) {
                 crate::keyspace_events::notify(
                     ctx.pubsub,
                     event.db.unwrap_or(*ctx.selected_db),
@@ -1695,68 +1838,374 @@ fn makes_the_switch(ctx: &Ctx) -> Option<usize> {
 /// Redis does not touch such a key, and a `WATCH` on it holds (#159). Only
 /// replies that cannot mean a change are listed: `ZADD` and `HSET` answer
 /// `0` for updates too.
+///
+/// Nor is such a write propagated, as Redis does not propagate it (#628).
+/// A replica, and a replay of the AOF, never take a key as gone because of
+/// its time: a `PERSIST` that found its key past its time, answered 0 and
+/// left the key for the sweep, took the key's time away on the replica, and
+/// the key lived there with no time to live until the sweep's `UNLINK`
+/// came. A `MOVE` or `COPY` that answered 0 moved the key on the replica,
+/// where the sweep's `DEL` then deleted nothing, and the key stayed in the
+/// other database for good.
 fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
     let nil = result == b"$-1\r\n" || result == b"_\r\n";
     let zero = result == b":0\r\n";
     match name {
-        "SET" => {
-            nil && cmd[3..]
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(b"NX") || a.eq_ignore_ascii_case(b"XX"))
-        }
+        "SET" => nil && !set_wrote_answering_nil(cmd),
+        // `SMOVE`: no source, the member not in it, or moved to where it
+        // is and not there. `LPUSHX` / `RPUSHX`: no list (a push to one
+        // answers its new length, at least 1).
         "SETNX" | "MSETNX" | "HSETNX" | "RENAMENX" | "PERSIST" | "EXPIRE" | "PEXPIRE"
-        | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" => zero,
-        _ => false,
+        | "EXPIREAT" | "PEXPIREAT" | "SADD" | "SREM" | "ZREM" | "HDEL" | "LREM" | "DEL"
+        | "UNLINK" | "COPY" | "MOVE" | "SMOVE" | "LPUSHX" | "RPUSHX" => zero,
+        // No list (0), or no such pivot (-1).
+        "LINSERT" => zero || result == b":-1\r\n",
+        _ => popped_nothing(name, result),
     }
 }
 
-/// Whether a `MOVE` or a `COPY` answered `0`: it moved or copied nothing,
-/// and is not propagated, as Redis does not propagate it. A replica, and a
-/// replay of the AOF, never take a key as gone because of its time: a key
-/// past its time that the master's `MOVE` had found gone, and left where it
-/// was for the sweep, was moved by the replica. The sweep's `DEL` then
-/// deleted nothing there, and the replica kept the key in the other
-/// database for good; and when the key's name was used again, the
-/// replica's `MOVE` of the new key found the old one in its way and left
-/// the new one behind, for good too.
-#[inline]
-fn moved_nothing(name: &str, result: &[u8]) -> bool {
-    matches!(name, "MOVE" | "COPY") && result == b":0\r\n"
+/// Whether a `SET` (`cmd`) that answered nil wrote all the same. Without
+/// `GET` it did not: a `SET` that writes answers `OK`, and nil is a
+/// condition (`NX`, `XX`, `IFEQ`, ...) not met. With `GET` nil is the old
+/// value of a key that was not there, and the `SET` wrote unless its
+/// condition needs the key (`XX`, `IFEQ`, `IFDEQ`): `SET k v NX GET` on a
+/// missing key writes and answers nil. The options are read as `SET` reads
+/// them: the argument of `EX`, `IFEQ`, ... is not an option.
+fn set_wrote_answering_nil(cmd: &[&[u8]]) -> bool {
+    let (mut get, mut needs_the_key) = (false, false);
+    let mut i = 3;
+    while i < cmd.len() {
+        let option = cmd[i];
+        let is = |name: &[u8]| option.eq_ignore_ascii_case(name);
+        if is(b"GET") {
+            get = true;
+        } else if is(b"XX") {
+            needs_the_key = true;
+        } else if is(b"IFEQ") || is(b"IFDEQ") {
+            needs_the_key = true;
+            i += 1;
+        } else if is(b"IFNE")
+            || is(b"IFDNE")
+            || is(b"EX")
+            || is(b"PX")
+            || is(b"EXAT")
+            || is(b"PXAT")
+        {
+            i += 1;
+        }
+        i += 1;
+    }
+    get && !needs_the_key
 }
 
-/// Mark every `WATCH` on a key this write touched as dirty.
+/// Before a write runs on a master whose write stream something reads (the
+/// AOF, a replica, a tap): each key it names that is past its time is
+/// deleted, and its `UNLINK` (or `DEL`) sent, as a read that finds one
+/// deletes it (`helpers::delete_key_if_expired`), and as Redis expires every
+/// key a write looks up (`expireIfNeeded`).
+///
+/// A write takes such a key as gone. One that then wrote over it sent the
+/// deletion first already (`expiry::written_over`), but one that did
+/// nothing, or something that needed no new value, left the key there for
+/// the sweep and was sent as it came (#628): `PERSIST` answered 0 and took
+/// the key's time away on a replica, which still had the key, and `SET … XX`
+/// gave the replica's key a new value with no time to live, where the
+/// master had neither. Until the sweep's `UNLINK` came the replica had a key
+/// the master did not, with no time to live, and a failover in between
+/// brought it back for good. With the key deleted first, the replica
+/// applies the write to what the master did.
+///
+/// Nothing when nothing reads the stream: the key stays for the sweep, or
+/// for the read or write that finds it, as before. Under the write gate and
+/// the order of the command's keys, which the deletion takes again for
+/// nothing (both nest).
+///
+/// Not for a `SET` with no condition, the commonest write: it writes its
+/// key whatever is there, over a key past its time too, and that sends the
+/// deletion first (`expiry::written_over`). Looking first cost every such
+/// `SET` about 200 instructions more (3%, with the AOF on).
+#[inline]
+fn expire_named_keys_first(ctx: &Ctx, name: &str, named: Option<crate::keyspec::Keys>) {
+    if ctx.apply_replication || ctx.repl_state.is_slave() || !replication::write_is_observed(ctx) {
+        return;
+    }
+    if name == "SET" && !set_has_a_condition(&ctx.cmd) {
+        return;
+    }
+    let db = *ctx.selected_db;
+    let named = named.unwrap_or_else(|| crate::keyspec::key_positions(name, &ctx.cmd));
+    for pos in named.iter() {
+        let key = ctx.cmd[pos];
+        if crate::commands::helpers::is_expired(ctx.store, db, key) {
+            crate::commands::helpers::delete_key_if_expired(ctx.store, db, key);
+        }
+    }
+}
+
+/// Whether `SET` `cmd` writes only on a condition: `NX`, `XX`, `IFEQ`,
+/// `IFNE`, `IFDEQ` or `IFDNE`. The argument of an option (`EX 10`, `IFEQ
+/// NX`) is taken as an option too, which only makes a `SET` look first that
+/// need not have.
+fn set_has_a_condition(cmd: &[&[u8]]) -> bool {
+    cmd.iter().skip(3).any(|arg| {
+        arg.eq_ignore_ascii_case(b"NX")
+            || arg.eq_ignore_ascii_case(b"XX")
+            || (arg.len() >= 4 && arg[..2].eq_ignore_ascii_case(b"IF"))
+    })
+}
+
+/// Whether a write's reply (`result`) says it changed nothing
+/// ([`changed_nothing`]), and so is not propagated. A reply that could say
+/// so is short and is a number, a null or an empty array: the common reply,
+/// `+OK` or a value, is passed over without looking at the command.
+#[inline]
+fn propagates_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
+    result.len() <= 5
+        && matches!(result.first(), Some(b':' | b'$' | b'_' | b'*' | b'~'))
+        && changed_nothing(name, cmd, result)
+}
+
+/// Whether a pop answered that it took nothing: a null (a `BLPOP` that
+/// timed out, or found nothing in `MULTI` or a script; an `LPOP` of a
+/// missing key) or an empty array (`ZPOPMIN` of one). Redis neither
+/// propagates such a pop nor counts it as a change, and a `WATCH` on its
+/// keys holds. The reply is looked at first: it is rarely one of these.
+#[inline]
+fn popped_nothing(name: &str, result: &[u8]) -> bool {
+    matches!(
+        result,
+        b"$-1\r\n" | b"*-1\r\n" | b"_\r\n" | b"*0\r\n" | b"~0\r\n"
+    ) && matches!(
+        name,
+        "LPOP"
+            | "RPOP"
+            | "LMPOP"
+            | "LMOVE"
+            | "RPOPLPUSH"
+            | "LMOVEM"
+            | "ZPOPMIN"
+            | "ZPOPMAX"
+            | "ZMPOP"
+            | "SPOP"
+            | "BLPOP"
+            | "BRPOP"
+            | "BLMPOP"
+            | "BLMOVE"
+            | "BRPOPLPUSH"
+            | "BLMOVEM"
+            | "BZPOPMIN"
+            | "BZPOPMAX"
+            | "BZMPOP"
+    )
+}
+
+/// After a `SWAPDB` (`ctx.cmd`): the watches on keys of the two swapped
+/// databases are dirty, if the key is in either of them — its value changed
+/// or it appeared or went. A key in neither, and every key of another
+/// database, is unchanged; a database swapped with itself changes nothing
+/// (Redis's `touchAllWatchedKeysInDb`). A watch on a key that had expired
+/// when it was watched, swapped for none or for another expired one, holds,
+/// as Redis keeps it by `wk->expired`; one on a key that was not there,
+/// swapped for an expired one, is marked expired
+/// ([`crate::watch::WatchNotifier::notify_replaced`]).
+fn touch_swapped_watches(ctx: &Ctx) {
+    let db = |i: usize| {
+        ctx.cmd
+            .get(i)
+            .and_then(|arg| std::str::from_utf8(arg).ok())
+            .and_then(|arg| arg.parse::<usize>().ok())
+    };
+    let (Some(db1), Some(db2)) = (db(1), db(2)) else {
+        return;
+    };
+    if db1 == db2 {
+        return;
+    }
+    // The swap has been made: what a watched key of `watched` was is now in
+    // `other`, and what it is now is in `watched`.
+    let presence = |db: usize, key: &[u8]| crate::watch::presence(ctx.store, db, key);
+    for (watched, other) in [(db1, db2), (db2, db1)] {
+        ctx.watch_registry
+            .notify_replaced(Some(watched), &|_, key| {
+                (presence(other, key), presence(watched, key))
+            });
+    }
+}
+
+/// Mark every `WATCH` on a key this write (`result`, its reply) changed as
+/// dirty: the keys [`for_each_changed_key`] gives.
 ///
 /// It used to notify `cmd[1]` and nothing else. So `MSET a 1 b 2` left a
 /// client watching `b` free to `EXEC`, as did `RENAME a b`, `LMOVE a b …`,
 /// `SUNIONSTORE …` for their other keys — and for a command whose first
 /// argument is not a key (`XGROUP CREATE s …`, `LMPOP 1 k …`) it notified a
-/// "key" named `CREATE` or `1`. A flush did not notify anyone.
-fn notify_watchers(ctx: &Ctx, name: &str) {
+/// "key" named `CREATE` or `1`. A flush did not notify anyone. Then it
+/// notified every key the command named, changed or not (#584).
+fn notify_watchers(ctx: &Ctx, name: &str, result: &[u8]) {
     if !ctx.watch_registry.has_watchers() {
         return;
     }
+    notify_watchers_of_changed_keys(ctx, name, result);
+}
+
+#[cold]
+fn notify_watchers_of_changed_keys(ctx: &Ctx, name: &str, result: &[u8]) {
     let db = *ctx.selected_db;
     match name {
         // The flush has said which watched keys it removed, before it
         // removed them (`touch_watched_keys`).
         "FLUSHDB" | "FLUSHALL" => return,
-        "SWAPDB" => return ctx.watch_registry.notify_db(None),
+        "SWAPDB" => return touch_swapped_watches(ctx),
+        // The key, in this database and in the one it went to, as Redis
+        // signals both.
+        "MOVE" => {
+            if result == b":1\r\n" {
+                ctx.watch_registry.notify(db, ctx.cmd[1]);
+                if let Some(to) = ctx.cmd.get(2).and_then(|to| parse_db(to)) {
+                    ctx.watch_registry.notify(to, ctx.cmd[1]);
+                }
+            }
+            return;
+        }
+        // `COPY … DB n`: the destination is in database `n`.
+        "COPY" => {
+            if let Some(to) = copy_db(&ctx.cmd) {
+                if result == b":1\r\n" {
+                    ctx.watch_registry.notify(to, ctx.cmd[2]);
+                }
+                return;
+            }
+        }
         _ => {}
     }
-    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
-    if keys.is_empty() {
+    let known = for_each_changed_key(ctx, name, result, |key| ctx.watch_registry.notify(db, key));
+    if !known && !changed_nothing(name, &ctx.cmd, result) {
         // Not in the key table: keep the old first-argument guess.
-        if let Some(Ok(key)) = ctx.cmd.get(1).map(|k| std::str::from_utf8(k)) {
+        if let Some(key) = ctx.cmd.get(1) {
             ctx.watch_registry.notify(db, key);
         }
-        return;
     }
-    for pos in keys.iter() {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos])
-            && !crate::watch::is_unchanged(db, key)
-        {
-            ctx.watch_registry.notify(db, key);
+}
+
+fn parse_db(arg: &[u8]) -> Option<usize> {
+    std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// The database of `COPY source destination DB n`, if it names one.
+fn copy_db(cmd: &[&[u8]]) -> Option<usize> {
+    let at = cmd
+        .iter()
+        .skip(3)
+        .position(|arg| arg.eq_ignore_ascii_case(b"DB"))?;
+    parse_db(cmd.get(3 + at + 1)?)
+}
+
+/// Run `changed` on each key of the current database that a successful
+/// write (`result`, its reply) changed: the keys Redis signals as modified
+/// (`signalModifiedKey`), and so those whose `WATCH` fails and whose
+/// tracking clients are told. Not every key a command names:
+///
+/// * a write that changed nothing changes no key ([`changed_nothing`]);
+/// * a key the command said it left as it was ([`crate::watch::unchanged`]:
+///   a `DEL` of a key that is not there, `SMOVE` to a set that has the
+///   member already);
+/// * of a pop from the first of several keys that has something (`BLPOP`,
+///   `BZPOPMIN`, `LMPOP`, ...), only the key it took from, which its reply
+///   names;
+/// * a key the command only reads: the sources of `SUNIONSTORE`, `COPY`,
+///   `BITOP`, `PFMERGE`, `SORT … STORE`, `GEOSEARCHSTORE`, ..., those whose
+///   key spec is `RO`;
+/// * a stream whose consumer groups alone a command changes (`XREADGROUP`,
+///   `XACK`, `XCLAIM`, `XAUTOCLAIM`, `XSETID`, `XGROUP` but a `CREATE …
+///   MKSTREAM`): Redis does not signal it (#588).
+///
+/// Returns false, having done nothing, for a command the key table knows no
+/// keys of. Only called while someone watches a key or tracks keys: the
+/// common write pays nothing for it.
+#[cold]
+fn for_each_changed_key(
+    ctx: &Ctx,
+    name: &str,
+    result: &[u8],
+    mut changed: impl FnMut(&[u8]),
+) -> bool {
+    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
+    let Some(first) = keys.first() else {
+        return false;
+    };
+    if changed_nothing(name, &ctx.cmd, result) || leaves_the_stream_signalled_as_is(name, &ctx.cmd)
+    {
+        return true;
+    }
+    let db = *ctx.selected_db;
+    let mut tell = |key: &[u8]| {
+        if !crate::watch::is_unchanged(db, key) {
+            changed(key);
         }
+    };
+    if keys.iter().nth(1).is_none() {
+        tell(ctx.cmd[first]);
+        return true;
+    }
+    if let Some(popped) = popped_from(name, result)
+        && let Some(pos) = keys.iter().find(|&pos| ctx.cmd[pos] == popped)
+    {
+        tell(ctx.cmd[pos]);
+        return true;
+    }
+    let read_only = read_only_key_positions(&ctx.cmd);
+    for pos in keys.iter() {
+        if !read_only.contains(&pos) {
+            tell(ctx.cmd[pos]);
+        }
+    }
+    true
+}
+
+/// Whether `cmd` is a stream command that Redis does not signal the key of:
+/// it changes a consumer group, or the stream's last ID, and calls no
+/// `signalModifiedKey` (Redis 8.2's `t_stream.c`). `XGROUP CREATE …
+/// MKSTREAM` may make the stream, and is taken as changing it.
+fn leaves_the_stream_signalled_as_is(name: &str, cmd: &[&[u8]]) -> bool {
+    match name {
+        "XREADGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "XSETID" => true,
+        "XGROUP" => {
+            !(cmd
+                .get(1)
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"CREATE"))
+                && cmd.iter().any(|arg| arg.eq_ignore_ascii_case(b"MKSTREAM")))
+        }
+        _ => false,
+    }
+}
+
+/// The key a pop from the first of several keys that has something took
+/// from: the first element of its reply (`*2 $key ...`). `None` for any
+/// other command, or a reply that is not that.
+fn popped_from<'a>(name: &str, result: &'a [u8]) -> Option<&'a [u8]> {
+    if !matches!(
+        name,
+        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" | "LMPOP" | "ZMPOP" | "BLMPOP" | "BZMPOP"
+    ) {
+        return None;
+    }
+    let rest = result.strip_prefix(b"*")?;
+    let rest = &rest[rest.iter().position(|&b| b == b'\n')? + 1..];
+    let rest = rest.strip_prefix(b"$")?;
+    let digits = rest.iter().position(|&b| b == b'\r')?;
+    let len: usize = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+    rest.get(digits + 2..digits + 2 + len)
+}
+
+/// The positions of the keys of `cmd` that its key specs say it only reads.
+fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
+    match crate::commands::key_specs::keys_of(cmd) {
+        Some(Ok(keys)) => keys
+            .into_iter()
+            .filter(|(_, flags)| flags.starts_with("RO"))
+            .map(|(pos, _)| pos)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1802,7 +2251,8 @@ fn notify_failed_bf_write(ctx: &Ctx) {
 ///
 /// The hash commands only while no search index is defined: they bring the
 /// indexes up to date after the shard is let go of, and two of them beside
-/// each other could leave an index with the earlier one's fields.
+/// each other could leave an index with the earlier one's fields. Asked
+/// again once the order is held ([`ask_again_for_an_index`], #570).
 ///
 /// Never a command that removes what it finds (`SREM`, `HDEL`, `LPOP`, ...)
 /// or writes back what it read under an earlier hold of the shard
@@ -1816,11 +2266,32 @@ fn atomic_under_its_shard(ctx: &Ctx, name: &str) -> bool {
     match name {
         "SET" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "LPUSH" | "RPUSH"
         | "SADD" | "ZADD" | "ZINCRBY" | "PFADD" => true,
-        "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => {
-            ctx.index_store.read().is_empty()
-        }
+        // Asked without the indexes' lock (#544): see `vector::Indexes`.
+        "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => ctx.index_store.none(),
         _ => false,
     }
+}
+
+/// A hash command that [`atomic_under_its_shard`] let take its key's order
+/// shared, and that finds a search index now that it holds it: it takes the
+/// order whole instead, before it has touched the store.
+///
+/// It was let because there was no index when it asked, before it held the
+/// order; one may have been added since. The first index is added only once
+/// every write that holds an order is done, and after `none` has become
+/// false (`vector::Indexes::write_to_add`): a write that holds the order
+/// shared and still finds no index is over before that index exists, and
+/// one that finds an index is ordered against its walk, as every other write
+/// of a document is (#570).
+#[cold]
+#[inline(never)]
+fn ask_again_for_an_index(ctx: &Ctx, order: &mut Option<crate::write_order::OrderGuard>) {
+    // Let go of first: the stripe is the one taken next.
+    *order = None;
+    *order = Some(crate::write_order::lock_keys(
+        *ctx.selected_db,
+        std::iter::once(ctx.cmd[1]),
+    ));
 }
 
 /// Commands that can take the last element out of a list, set, sorted set,
@@ -1881,7 +2352,7 @@ fn can_leave_a_key_empty(name: &str) -> bool {
 }
 
 /// Delete `key` if it holds a collection with nothing in it.
-fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
+fn drop_if_empty(ctx: &Ctx, db: usize, key: &[u8]) -> bool {
     let shard = crate::store::get_shard(&ctx.store[db], key);
     if !crate::read_lock!(shard)
         .get(key)
@@ -1898,7 +2369,6 @@ fn drop_if_empty(ctx: &Ctx, db: usize, key: &str) -> bool {
         still_empty && map.remove(key).is_some()
     };
     if removed {
-        crate::vector::maybe_unindex(ctx.index_store, db, key);
         crate::keyspace_events::notify(
             ctx.pubsub,
             db,
@@ -1937,16 +2407,20 @@ fn database_written_too(ctx: &Ctx, name: &str) -> Option<usize> {
 fn reindex_copied(ctx: &Ctx, name: &str) {
     use crate::vector::Write;
     let here = *ctx.selected_db;
-    let text = |i: usize| ctx.cmd.get(i).and_then(|a| std::str::from_utf8(a).ok());
-    let number = |i: usize| text(i).and_then(|s| s.parse::<usize>().ok());
+    let number = |i: usize| {
+        ctx.cmd
+            .get(i)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|s| s.parse::<usize>().ok())
+    };
     if name == "MOVE" {
-        if let (Some(key), Some(to)) = (text(1), number(2)) {
+        if let (Some(key), Some(to)) = (ctx.cmd.get(1), number(2)) {
             crate::vector::reindex_key(ctx.index_store, ctx.store, here, key, Write::Whole);
             crate::vector::reindex_key(ctx.index_store, ctx.store, to, key, Write::Whole);
         }
         return;
     }
-    let Some(key) = text(2) else {
+    let Some(key) = ctx.cmd.get(2) else {
         return;
     };
     let mut to = here;
@@ -2021,31 +2495,32 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
             };
             let db = *ctx.selected_db;
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    crate::field_expiry::track_key(ctx.store, db, key);
-                    if let Some(how) = how {
-                        crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, how);
-                    }
+                let key = ctx.cmd[pos];
+                crate::field_expiry::track_key(ctx.store, db, key);
+                if let Some(how) = how {
+                    crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, how);
                 }
             }
         }
         // These can put it in another database.
         "COPY" | "MOVE" => {
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    for db in 0..ctx.store.len() {
-                        crate::field_expiry::track_key(ctx.store, db, key);
-                    }
+                for db in 0..ctx.store.len() {
+                    crate::field_expiry::track_key(ctx.store, db, ctx.cmd[pos]);
                 }
             }
             reindex_copied(ctx, name);
         }
         "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "HSETNX" | "HGETDEL" => {
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    let db = *ctx.selected_db;
-                    crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, Write::Refresh);
-                }
+                let db = *ctx.selected_db;
+                crate::vector::reindex_key(
+                    ctx.index_store,
+                    ctx.store,
+                    db,
+                    ctx.cmd[pos],
+                    Write::Refresh,
+                );
             }
         }
         "SWAPDB" => {
@@ -2058,14 +2533,12 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
         // and a replay.
         _ if name.starts_with("JSON.") => {
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-                if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                    crate::vector::reindex_json_key(
-                        ctx.index_store,
-                        ctx.store,
-                        *ctx.selected_db,
-                        key,
-                    );
-                }
+                crate::vector::reindex_json_key(
+                    ctx.index_store,
+                    ctx.store,
+                    *ctx.selected_db,
+                    ctx.cmd[pos],
+                );
             }
         }
         _ => {}
@@ -2084,9 +2557,7 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     }
     let db = *ctx.selected_db;
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-        let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
-            continue;
-        };
+        let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {
             continue;
         }
@@ -2112,9 +2583,10 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
     if is_mutating_ok_write {
         settle_written_keys(ctx, name);
         // A write of this node's own — not one its master sent — means its
-        // dataset is no longer a position in that master's stream.
+        // dataset is no longer a position in that master's stream. Not a
+        // `SELECT` or a `SCRIPT LOAD`, which change no data (#424).
         if !ctx.apply_replication {
-            ctx.repl_state.note_local_write();
+            ctx.repl_state.note_local_write_of(name);
         }
     }
 
@@ -2125,7 +2597,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         // `write_is_observed`), but reaching that no-op used to cost a
         // `Vec<Vec<u8>>` clone of every argument here *plus* a full RESP encode
         // inside — allocations on every single write, discarded immediately.
-        if replication::write_is_observed(ctx) && !moved_nothing(name, result) {
+        if replication::write_is_observed(ctx) && !propagates_nothing(name, &ctx.cmd, result) {
             // Propagate the command's *effect*, not the bytes the client sent.
             // `SPOP` and `XADD … *` produce a different result each time they
             // run, so a replica re-executing them diverges (measured: a replica
@@ -2142,13 +2614,15 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
             }
         }
 
-        if !changed_nothing(name, &ctx.cmd, result) {
-            notify_watchers(ctx, name);
-        }
+        notify_watchers(ctx, name, result);
 
         // An XREADGROUP that only re-read pending entries, or found nothing
-        // new, changed nothing Redis counts (#27).
-        if name != "XREADGROUP" || replication::script_feed::effects_changed_data() {
+        // new, changed nothing Redis counts (#27); nor did a pop that took
+        // nothing, nor any write whose reply says it changed nothing
+        // (`changed_nothing`), as from a script.
+        if (name != "XREADGROUP" || replication::script_feed::effects_changed_data())
+            && !propagates_nothing(name, &ctx.cmd, result)
+        {
             crate::stats::record_rdb_change();
         }
     }
@@ -2186,7 +2660,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         replication::propagate_in_order(ctx.repl_state, ctx.hub_tx, payload);
     }
 
-    track(ctx, name, is_mutating_ok_write, writes_operation);
+    track(ctx, name, result, is_mutating_ok_write, writes_operation);
 }
 
 /// Client-side caching: what a command that has just run means for the
@@ -2196,15 +2670,15 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
 ///
 /// One atomic load when no client has tracking on.
 #[inline(always)]
-fn track(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
+fn track(ctx: &Ctx, name: &str, result: &[u8], wrote: bool, is_write: bool) {
     if crate::tracking::TRACKING_CLIENT_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
-    track_for_clients(ctx, name, wrote, is_write);
+    track_for_clients(ctx, name, result, wrote, is_write);
 }
 
 #[cold]
-fn track_for_clients(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
+fn track_for_clients(ctx: &Ctx, name: &str, result: &[u8], wrote: bool, is_write: bool) {
     // A script is tracked by what it calls, one command at a time. `CLIENT`
     // subcommands are not reads of data, and must not use up the one-shot
     // `CLIENT CACHING`.
@@ -2223,11 +2697,11 @@ fn track_for_clients(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
             );
             return;
         }
-        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-            if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-                invalidate_tracked_key(ctx, key, true);
-            }
-        }
+        // The keys it changed, as for `WATCH`: Redis tells both from
+        // `signalModifiedKey` (#584).
+        for_each_changed_key(ctx, name, result, |key| {
+            invalidate_tracked_key(ctx, key, true)
+        });
         return;
     }
     if is_write {
@@ -2256,17 +2730,15 @@ fn track_for_clients(ctx: &Ctx, name: &str, wrote: bool, is_write: bool) {
         return;
     }
     for pos in keys.iter() {
-        if let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) {
-            let dropped = ctx.tracking_table.register(key, ctx.client_id);
-            crate::tracking::tell_dropped(ctx.client_registry, dropped, Some(ctx.client_id));
-        }
+        let dropped = ctx.tracking_table.register(ctx.cmd[pos], ctx.client_id);
+        crate::tracking::tell_dropped(ctx.client_registry, dropped, Some(ctx.client_id));
     }
 }
 
 /// Tell the clients caching `key` that it has changed. `by_client` is false
 /// when no client's command did it — the key was evicted — and then nobody
 /// is spared the message for having asked for NOLOOP.
-pub(crate) fn invalidate_tracked_key(ctx: &Ctx, key: &str, by_client: bool) {
+pub(crate) fn invalidate_tracked_key(ctx: &Ctx, key: &[u8], by_client: bool) {
     if crate::tracking::TRACKING_CLIENT_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
@@ -2591,5 +3063,99 @@ mod replica_loading_gate_tests {
             "applier must not hit LOADING gate, got {}",
             String::from_utf8_lossy(&out)
         );
+    }
+}
+
+#[cfg(test)]
+mod changed_nothing_tests {
+    use super::*;
+
+    fn cmd(args: &[&'static str]) -> Vec<&'static [u8]> {
+        args.iter().map(|&a| a.as_bytes()).collect()
+    }
+
+    /// What a `SET` that answered nil did: with `GET` it wrote unless its
+    /// condition needs the key; an option's argument is not an option.
+    #[test]
+    fn a_set_that_answered_nil_wrote_only_with_get_and_a_condition_a_missing_key_meets() {
+        let wrote = |args: &[&'static str]| set_wrote_answering_nil(&cmd(args));
+        // GET with no condition, or one a missing key meets: written.
+        assert!(wrote(&["SET", "k", "v", "GET"]));
+        assert!(wrote(&["SET", "k", "v", "NX", "GET"]));
+        assert!(wrote(&["SET", "k", "v", "GET", "NX"]));
+        assert!(wrote(&["SET", "k", "v", "IFNE", "x", "GET"]));
+        assert!(wrote(&[
+            "SET",
+            "k",
+            "v",
+            "IFDNE",
+            "0123456789abcdef",
+            "GET"
+        ]));
+        assert!(wrote(&["SET", "k", "v", "EX", "10", "GET"]));
+        // `XX` here is what IFNE compares with, not the option.
+        assert!(wrote(&["SET", "k", "v", "IFNE", "XX", "GET"]));
+        assert!(wrote(&["set", "k", "v", "ifne", "IFEQ", "get"]));
+        // A condition a missing key does not meet: not written.
+        assert!(!wrote(&["SET", "k", "v", "XX", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "IFEQ", "x", "GET"]));
+        assert!(!wrote(&[
+            "SET",
+            "k",
+            "v",
+            "IFDEQ",
+            "0123456789abcdef",
+            "GET"
+        ]));
+        // No GET: nil is a condition not met. `GET` as an argument is not
+        // the option.
+        assert!(!wrote(&["SET", "k", "v", "NX"]));
+        assert!(!wrote(&["SET", "k", "v", "IFNE", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "IFEQ", "GET"]));
+        assert!(!wrote(&["SET", "k", "v", "PX", "100", "XX"]));
+    }
+
+    #[test]
+    fn replies_that_change_nothing() {
+        let nothing = |args: &[&'static str], reply: &[u8]| {
+            let cmd = cmd(args);
+            assert_eq!(
+                changed_nothing(&args[0].to_ascii_uppercase(), &cmd, reply),
+                propagates_nothing(&args[0].to_ascii_uppercase(), &cmd, reply),
+                "{args:?}"
+            );
+            changed_nothing(&args[0].to_ascii_uppercase(), &cmd, reply)
+        };
+        assert!(nothing(&["SMOVE", "a", "b", "m"], b":0\r\n"));
+        assert!(!nothing(&["SMOVE", "a", "b", "m"], b":1\r\n"));
+        assert!(nothing(&["LPUSHX", "l", "x"], b":0\r\n"));
+        assert!(nothing(&["RPUSHX", "l", "x"], b":0\r\n"));
+        assert!(!nothing(&["RPUSHX", "l", "x"], b":1\r\n"));
+        assert!(nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":0\r\n"));
+        assert!(nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":-1\r\n"));
+        assert!(!nothing(&["LINSERT", "l", "BEFORE", "p", "x"], b":3\r\n"));
+        assert!(nothing(&["PERSIST", "k"], b":0\r\n"));
+        assert!(nothing(&["SET", "k", "v", "XX"], b"$-1\r\n"));
+        assert!(nothing(&["SET", "k", "v", "IFEQ", "x"], b"_\r\n"));
+        assert!(!nothing(&["SET", "k", "v", "NX", "GET"], b"$-1\r\n"));
+        assert!(!nothing(&["SET", "k", "v"], b"+OK\r\n"));
+        assert!(nothing(&["LPOP", "l"], b"$-1\r\n"));
+        // A count that is not 0 is a change; an INCR to 0 is one too.
+        assert!(!nothing(&["SADD", "s", "a"], b":1\r\n"));
+        assert!(!nothing(&["INCRBY", "n", "-1"], b":0\r\n"));
+    }
+
+    #[test]
+    fn only_a_set_with_a_condition_looks_for_its_key_first() {
+        let conditional = |args: &[&'static str]| set_has_a_condition(&cmd(args));
+        assert!(!conditional(&["SET", "k", "v"]));
+        assert!(!conditional(&["SET", "k", "v", "EX", "10"]));
+        assert!(!conditional(&["SET", "k", "v", "KEEPTTL", "GET"]));
+        // The value is not an option.
+        assert!(!conditional(&["SET", "k", "NX"]));
+        assert!(conditional(&["SET", "k", "v", "NX"]));
+        assert!(conditional(&["SET", "k", "v", "xx", "PX", "5"]));
+        assert!(conditional(&["SET", "k", "v", "IFEQ", "old"]));
+        assert!(conditional(&["SET", "k", "v", "ifdne", "0123456789abcdef"]));
     }
 }

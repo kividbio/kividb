@@ -141,6 +141,19 @@ impl KeyBytes {
         self.tag() != HEAP
     }
 
+    /// The bytes a [`KeyBytes`] of `bytes` would put on the heap: none when
+    /// [`new`](Self::new) keeps it inline, else the key's length (what
+    /// `MEMORY USAGE` counts for a copy of a key, without making one).
+    #[inline]
+    pub fn heap_bytes_of(bytes: &[u8]) -> usize {
+        let len = bytes.len();
+        if len <= INLINE || (len == SIZE && bytes[SIZE - 1] < HEAP) {
+            0
+        } else {
+            len
+        }
+    }
+
     /// The key as text, if it is UTF-8.
     #[inline]
     pub fn to_str(&self) -> Result<&str, std::str::Utf8Error> {
@@ -354,6 +367,138 @@ pub fn quoted(bytes: &[u8]) -> String {
     out
 }
 
+// ── Keys and names as text ────────────────────────────────────────────────────
+//
+// What keeps a key, or a hash keeps a field, as a `String` (the search
+// indexes' documents, a hash's fields until #437 makes them bytes) keeps it
+// in this form. A hash keeps its fields by name, as `String`s. Redis's field names are
+// bytes: any bytes. So that a hash can hold them all, a name that is not
+// valid UTF-8 is kept in a form that is — each byte that is not part of
+// valid text becomes one character from a block set aside for it (U+F780 –
+// U+F7FF, private use: byte 0x80 is U+F780, 0xFF is U+F7FF) — and is turned
+// back on the way out. Ordinary text is itself, both ways, and costs one
+// scan. Text that happens to use those characters has their bytes put in
+// the same form, so that nothing can be mistaken for something else.
+
+const BYTE_BLOCK: u32 = 0xF700;
+
+fn in_byte_block(c: char) -> bool {
+    (0xF780..=0xF7FF).contains(&(c as u32))
+}
+
+/// The first byte of every character of the block (U+F780 to U+F7FF are
+/// `EF 9E 80` to `EF 9F BF`). Text without this byte has none of them, and
+/// a byte search finds that out without decoding a character: the search
+/// indexes ask it of every key they scan and of every name they read back.
+const BLOCK_LEAD: u8 = 0xEF;
+
+fn push_as_block(out: &mut String, bytes: &[u8]) {
+    for byte in bytes {
+        // 0x80..=0xFF only: bytes below that are text wherever they are.
+        match char::from_u32(BYTE_BLOCK + *byte as u32) {
+            Some(c) if *byte >= 0x80 => out.push(c),
+            _ => out.push(*byte as char),
+        }
+    }
+}
+
+/// The `String` a name of any bytes is kept as.
+pub fn text_of(raw: &[u8]) -> std::borrow::Cow<'_, str> {
+    if let Ok(text) = std::str::from_utf8(raw)
+        && (!raw.contains(&BLOCK_LEAD) || !text.contains(in_byte_block))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let (text, bad) = match std::str::from_utf8(rest) {
+            Ok(text) => (text, 0),
+            Err(e) => {
+                let good = e.valid_up_to();
+                // The bytes of one broken sequence, or everything left.
+                let bad = e.error_len().unwrap_or(rest.len() - good);
+                // Valid up to `good`, by the error's own account.
+                (std::str::from_utf8(&rest[..good]).unwrap_or(""), bad)
+            }
+        };
+        for c in text.chars() {
+            if in_byte_block(c) {
+                let mut utf8 = [0u8; 4];
+                push_as_block(&mut out, c.encode_utf8(&mut utf8).as_bytes());
+            } else {
+                out.push(c);
+            }
+        }
+        let consumed = text.len();
+        push_as_block(&mut out, &rest[consumed..consumed + bad]);
+        rest = &rest[consumed + bad..];
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The bytes a kept name stands for.
+pub fn bytes_of(name: &str) -> std::borrow::Cow<'_, [u8]> {
+    if !name.as_bytes().contains(&BLOCK_LEAD) || !name.contains(in_byte_block) {
+        return std::borrow::Cow::Borrowed(name.as_bytes());
+    }
+    let mut out = Vec::with_capacity(name.len());
+    for c in name.chars() {
+        if in_byte_block(c) {
+            out.push((c as u32 - BYTE_BLOCK) as u8);
+        } else {
+            let mut utf8 = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::{bytes_of as name_to_bytes, text_of as name_from_bytes};
+
+    #[test]
+    fn any_bytes_survive_the_round_trip() {
+        let mut cases: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"plain".to_vec(),
+            "caf\u{e9} \u{1F600}".as_bytes().to_vec(),
+            vec![0xff],
+            vec![0x80, 0x00, 0x7f, 0xfe],
+            b"abc\xc3".to_vec(),                    // a sequence cut short
+            b"\xe2\x82 tail".to_vec(),              // and one cut in the middle
+            "\u{F780}\u{F7FF}".as_bytes().to_vec(), // the block's own characters
+            (0u8..=255).collect(),
+        ];
+        // And a few thousand pseudo-random ones.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for len in 0..2000usize {
+            let bytes: Vec<u8> = (0..len % 37)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state >> 56) as u8
+                })
+                .collect();
+            cases.push(bytes);
+        }
+        let mut seen = std::collections::HashMap::new();
+        for raw in cases {
+            let name = name_from_bytes(&raw).into_owned();
+            assert_eq!(name_to_bytes(&name).as_ref(), raw.as_slice(), "{raw:?}");
+            // Two different inputs never share a name.
+            if let Some(other) = seen.insert(name.clone(), raw.clone()) {
+                assert_eq!(other, raw, "{name:?}");
+            }
+        }
+        // Text is itself.
+        assert!(matches!(
+            name_from_bytes(b"field"),
+            std::borrow::Cow::Borrowed("field")
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +534,8 @@ mod tests {
             let copy = held.clone();
             assert_eq!(copy.as_bytes(), &key[..]);
             assert_eq!(copy.is_inline(), held.is_inline());
+            let heap = if held.is_inline() { 0 } else { key.len() };
+            assert_eq!(KeyBytes::heap_bytes_of(&key), heap, "{key:?}");
             drop(held);
             assert_eq!(copy.as_bytes(), &key[..], "a clone outlives its original");
         }

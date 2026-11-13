@@ -5,6 +5,22 @@
 use kividb::snapshot::load_redis_rdb_from;
 use kividb::types::KiviDBValue;
 
+/// A loaded database keyed by text, for these tests, whose keys all are:
+/// a load gives keys back as bytes (`store::Key`).
+fn texted<V>(
+    map: std::collections::HashMap<kividb::store::Key, V>,
+) -> std::collections::HashMap<String, V> {
+    map.into_iter()
+        .map(|(key, value)| (String::from_utf8(key.to_vec()).unwrap(), value))
+        .collect()
+}
+
+fn texted_all<V>(
+    maps: Vec<std::collections::HashMap<kividb::store::Key, V>>,
+) -> Vec<std::collections::HashMap<String, V>> {
+    maps.into_iter().map(texted).collect()
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -62,8 +78,10 @@ fn refusal(bytes: &[u8]) -> String {
 }
 
 // A hash with field TTLs, as Valkey 9 saves one: the fields keep their TTLs
-// to the millisecond, one without keeps none, and one already past its time
-// is not loaded, as Valkey does not load it (#449).
+// to the millisecond, one without keeps none (#449), and one already past
+// its time is kept as that moment, for field expiry to remove (and a master
+// to send the `HDEL` of): dropped by each reader's clock, a replica's full
+// sync or `RESTORE` went otherwise than its master's (#415).
 #[test]
 fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
     let later = now_ms() + 3_600_000;
@@ -76,35 +94,41 @@ fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
         ],
     );
     let (dbs, _, _) = load_redis_rdb_from(&file(b"VALKEY080", &body)[..]).unwrap();
+    let dbs = texted_all(dbs);
     let KiviDBValue::HashEx(h) = &dbs[0]["h"] else {
         panic!("h is not a hash with field TTLs");
     };
     let h = h.read();
     let mut fields: Vec<&str> = h.fields.keys().map(String::as_str).collect();
     fields.sort_unstable();
-    assert_eq!(fields, ["a", "b"]);
+    assert_eq!(fields, ["a", "b", "gone"]);
     assert_eq!(&h.fields["a"][..], b"1");
-    assert_eq!(h.expiries.len(), 1, "only a has a TTL");
-    let left = h.expiries["a"].saturating_duration_since(std::time::Instant::now());
-    assert!(
-        (3_590..=3_600).contains(&left.as_secs()),
-        "a's TTL is {left:?}"
-    );
+    assert_eq!(h.expiries.len(), 2, "b has no TTL");
+    assert!(h.expiries["gone"] < now_ms(), "gone is due");
+    let left = h.expiries["a"].saturating_sub(now_ms()) / 1_000;
+    assert!((3_590..=3_600).contains(&left), "a's TTL is {left} s");
 }
 
 // Valkey writes a hash all of whose fields have TTLs as type 22 too. When
-// every one has run out, there is no key, as Valkey loads none.
+// every one has run out, the hash is kept with them all due: field expiry
+// takes it out, as it takes out each field (see above).
 #[test]
-fn a_valkey_9_hash_whose_fields_have_all_run_out_is_no_key() {
+fn a_valkey_9_hash_whose_fields_have_all_run_out_is_kept_with_them_due() {
     let past = (now_ms() - 1_000) as i64;
     let mut body = valkey_hash(b"gone", &[(b"a", b"1", past), (b"b", b"2", past)]);
     body.extend([0]);
     body.extend(rdb_str(b"s"));
     body.extend(rdb_str(b"kept"));
     let (dbs, _, _) = load_redis_rdb_from(&file(b"VALKEY080", &body)[..]).unwrap();
+    let dbs = texted_all(dbs);
     let mut keys: Vec<&str> = dbs[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["s"]);
+    assert_eq!(keys, ["gone", "s"]);
+    let KiviDBValue::HashEx(h) = &dbs[0]["gone"] else {
+        panic!("gone is not a hash with field TTLs");
+    };
+    assert!(h.read().has_due(now_ms()));
+    assert!(h.read().live_fields(now_ms()).is_empty());
 }
 
 // What Valkey 9.0 and 9.1 do not write is refused, by what it is: a newer
@@ -144,6 +168,7 @@ fn what_valkey_9_does_not_write_is_refused() {
     // The rest of the string types load under the VALKEY header as under
     // REDIS: it is the same format up to RDB 11's types.
     let (dbs, _, _) = load_redis_rdb_from(&file(b"VALKEY080", &string)[..]).unwrap();
+    let dbs = texted_all(dbs);
     assert!(matches!(&dbs[0]["k"], KiviDBValue::String(v) if &v[..] == b"v"));
 }
 
@@ -190,6 +215,8 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
         assert!(bytes.starts_with(b"VALKEY080"), "Valkey {label}");
         let (dbs, expiries, functions) =
             load_redis_rdb_from(bytes).unwrap_or_else(|e| panic!("Valkey {label}: {e}"));
+        let dbs = texted_all(dbs);
+        let expiries = texted_all(expiries);
         let db = &dbs[0];
         let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -236,21 +263,16 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
         }
         assert!(functions.is_some(), "Valkey {label}: the library was lost");
 
-        // Field TTLs, each to the millisecond: `left` is what is left of
-        // one now, which must match FAR from the wall clock.
+        // Field TTLs, each to the millisecond: kept as the file has them.
         let ttls = |key: &str| -> Vec<(String, u64)> {
             let KiviDBValue::HashEx(h) = &db[key] else {
                 panic!("Valkey {label} {key}: not a hash with field TTLs");
             };
             let h = h.read();
-            let (wall, mono) = (now_ms(), std::time::Instant::now());
             let mut ttls: Vec<(String, u64)> = h
                 .expiries
                 .iter()
-                .map(|(field, at)| {
-                    let left = at.saturating_duration_since(mono).as_millis() as u64;
-                    (field.clone(), wall + left)
-                })
+                .map(|(field, at)| (field.clone(), *at))
                 .collect();
             ttls.sort();
             ttls
@@ -264,8 +286,8 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
             let names: Vec<&str> = got.iter().map(|(f, _)| f.as_str()).collect();
             assert_eq!(names, with_ttl, "Valkey {label} {key}");
             for (field, at) in &got {
-                assert!(
-                    at.abs_diff(FAR) <= 2,
+                assert_eq!(
+                    *at, FAR,
                     "Valkey {label} {key} {field}: expires at {at}, not {FAR}"
                 );
             }
@@ -280,12 +302,16 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
         };
         let st = st.read();
         assert_eq!(st.entries.len(), 4, "Valkey {label}");
-        let g1 = &st.groups["g1"];
-        let mut consumers: Vec<&str> = g1.consumers.keys().map(String::as_str).collect();
+        let g1 = &st.groups[&b"g1"[..]];
+        let mut consumers: Vec<&[u8]> = g1.consumers.keys().map(|c| c.as_bytes()).collect();
         consumers.sort_unstable();
-        assert_eq!(consumers, ["alice", "bob", "carol"], "Valkey {label}");
+        assert_eq!(
+            consumers,
+            [&b"alice"[..], b"bob", b"carol"],
+            "Valkey {label}"
+        );
         assert_eq!(g1.pel.len(), 2, "Valkey {label}: 1-1 (alice) and 4-1 (bob)");
-        assert!(st.groups.contains_key("g2"), "Valkey {label}");
+        assert!(st.groups.contains_key(&b"g2"[..]), "Valkey {label}");
         let KiviDBValue::Stream(big) = &db["stream:big"] else {
             panic!("Valkey {label}: stream:big is not a stream");
         };
@@ -320,6 +346,7 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
 fn an_rdb_file_with_a_valkey_json_document_loads() {
     let (dbs, _, _) =
         load_redis_rdb_from(&include_bytes!("fixtures/valkey-9.0-json.rdb")[..]).unwrap();
+    let dbs = texted_all(dbs);
     let KiviDBValue::Json(doc) = &dbs[0]["json:doc"] else {
         panic!("json:doc is not JSON");
     };

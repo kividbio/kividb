@@ -209,10 +209,10 @@ async function apiKeys() {
   await check("API key policy: a key limited to 2 a minute gets 429 rate_limit_exceeded on the 3rd", async () => {
     await awayFromMinuteEdge();
     for (let i = 0; i < 2; i++) {
-      const ok = await policy.enforceApiKeyPolicy(req(limited.key), "openai/gpt-4o-mini");
+      const ok = await policy.enforceApiKeyPolicy(req(limited.key), "openai/gpt-6-luna");
       assert(ok.rejection === null, `request ${i + 1} rejected: ${ok.rejection?.status}`);
     }
-    const no = await policy.enforceApiKeyPolicy(req(limited.key), "openai/gpt-4o-mini");
+    const no = await policy.enforceApiKeyPolicy(req(limited.key), "openai/gpt-6-luna");
     assert(no.rejection?.status === 429, `3rd: ${no.rejection?.status}`);
     const body = await no.rejection.json();
     assert(body.error?.code === "rate_limit_exceeded", JSON.stringify(body).slice(0, 200));
@@ -273,7 +273,7 @@ async function apiKeys() {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${chatKey.key}` },
         body: JSON.stringify({
-          model: "openai/gpt-4o-mini",
+          model: "openai/gpt-6-luna",
           stream: false,
           messages: [{ role: "user", content: `hello ${n}` }],
         }),

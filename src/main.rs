@@ -335,6 +335,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     crate::protected_mode::set(cfg.protected_mode);
     crate::protected_mode::set_bind_explicit(cfg.bind_explicit);
+    // `appendfsync`, from the command line or the file (#513). The file's
+    // `no` has been warned about as it was read; the command line's is here.
+    if from_cli("appendfsync") && cfg.appendfsync.eq_ignore_ascii_case("no") {
+        log_warn!(
+            "'--appendfsync no' syncs the append-only file once a second, as 'everysec' does"
+        );
+    }
+    let _ = crate::commands::server::config_set_global("appendfsync", &cfg.appendfsync);
     let threads = cfg.resolve_threads();
     let config = Arc::new(cfg);
     RUNTIME_MAXMEMORY.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);
@@ -344,6 +352,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eviction::configure(&config);
     compaction::configure(&config);
     snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
+    snapshot::SNAPSHOT_CLUSTER.store(config.cluster_enabled, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -382,7 +391,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     // One engine to a data directory, before anything in it is read.
-    lock_data_dir();
+    if lock_data_dir() {
+        // Before this process saves anything: the saves that left a dump
+        // there were another process's.
+        aof::remove_cut_short_dumps();
+    }
     // io_uring's workers hold open files of their own, kept from clients.
     #[cfg(target_os = "linux")]
     let uring = match config.io_model {
@@ -448,8 +461,9 @@ const DATA_DIR_LOCK: &str = "kividb.lock";
 /// is an exclusive `flock` (`LockFileEx` on Windows) held until the process
 /// exits, when the system releases it however the process ends. The other
 /// process is usually on its way out, so this waits for it rather than
-/// giving up.
-fn lock_data_dir() {
+/// giving up. Whether the lock is held: a start that could not take it goes
+/// on without it.
+fn lock_data_dir() -> bool {
     static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
     let file = match std::fs::OpenOptions::new()
         .create(true)
@@ -463,7 +477,7 @@ fn lock_data_dir() {
                 "Can't open {DATA_DIR_LOCK} in the data directory ({e}): starting without the \
                  lock that keeps a second process out of it"
             );
-            return;
+            return false;
         }
     };
     let waiting_since = Instant::now();
@@ -490,7 +504,7 @@ fn lock_data_dir() {
                     "Can't lock {DATA_DIR_LOCK} ({e}): starting without the lock that keeps a \
                      second process out of the data directory"
                 );
-                return;
+                return false;
             }
         }
     }
@@ -501,6 +515,7 @@ fn lock_data_dir() {
         );
     }
     let _ = HELD.set(file);
+    true
 }
 
 /// Walk keys to populate TEXT / inverted / FLAT data and HNSW graphs. A graph
@@ -735,6 +750,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let latency = crate::latency::new_latency_tracker();
     let monitor_registry = crate::monitor::new_monitor_registry();
@@ -839,6 +855,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -1630,6 +1647,7 @@ async fn async_main_tokio(
     let client_registry = crate::client_registry::new_client_registry();
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let monitor_registry = crate::monitor::new_monitor_registry();
     let tracking_table = crate::tracking::new_tracking_table();
@@ -1694,6 +1712,7 @@ async fn async_main_tokio(
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -2269,4 +2288,26 @@ async fn async_main_tokio(
     unsafe { libc::_exit(0) };
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// A cluster node serves database 0 alone: keys loaded into another, from
+/// the AOF (a snapshot with them is refused as it is read, see
+/// `snapshot::SNAPSHOT_CLUSTER`), are where no client can reach them, and
+/// slot accounting and migration never see them. Redis refuses to start;
+/// so does KiviDB (#484).
+fn refuse_keys_outside_db0(store: &store::Store) {
+    for (db, shards) in store.iter().enumerate().skip(1) {
+        let keys: usize = shards
+            .iter()
+            .map(|shard| crate::read_lock!(shard).len())
+            .sum();
+        if keys > 0 {
+            log_fatal!(
+                "{}: {keys} keys were loaded into database {db}",
+                snapshot::CLUSTER_KEYS_OUTSIDE_DB0
+            );
+            log_fatal!("{}.", snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+            std::process::exit(1);
+        }
+    }
 }

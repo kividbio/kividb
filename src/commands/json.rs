@@ -3,7 +3,6 @@ use crate::commands::helpers::*;
 use crate::commands::json_path::{self, Location, Query, Step};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
@@ -27,7 +26,99 @@ use std::sync::Arc;
 // move another that is still to be visited.
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const NEW_AT_ROOT: &str = "ERR new objects must be created at the root";
 const NOT_A_SELECTION: &str = "ERR the path must select values, not compute one";
+const PATH_MISSING: &str = "ERR Path does not exist";
+
+/// What a read through a legacy path answers when the path matches nothing
+/// (`missing`), or matches a value the command does not work on
+/// (`wrong_type`): the error RedisJSON 8.10 gives there, or nil for `None`.
+/// Each command has its own, as in RedisJSON.
+#[derive(Clone, Copy)]
+struct LegacyMiss {
+    missing: Option<&'static str>,
+    wrong_type: Option<&'static str>,
+}
+
+/// Nil both ways: `JSON.TYPE`, and a JSONPath, which never asks.
+const LEGACY_NIL: LegacyMiss = LegacyMiss {
+    missing: None,
+    wrong_type: None,
+};
+
+impl LegacyMiss {
+    fn reply(error: Option<&'static str>) -> Vec<u8> {
+        error.map_or_else(resp_null_bulk, resp_error)
+    }
+}
+
+/// The deepest a stored document may nest, as RedisJSON's `MAX_DEPTH`. A
+/// write that would grow a document past it is refused: the recursive walks
+/// over a document (serialising for `JSON.GET`/`DUMP`/`SAVE`, dropping it,
+/// merging) would otherwise overflow the thread stack and abort the whole
+/// server on a document nested far enough.
+pub(crate) const MAX_DEPTH: usize = 128;
+const RECURSION_LIMIT: &str = "ERR recursion limit exceeded";
+
+/// The deepest nesting in `value`: a scalar is 0, an array or object (empty or
+/// not) is 1 plus the deepest of its children — RedisJSON's
+/// `calculate_value_depth`. The recursion is bounded to [`MAX_DEPTH`] levels, so
+/// it stays shallow and allocation-free on the common shallow values and cannot
+/// itself overflow the stack on a value nested further: a value at the bound
+/// counts as [`MAX_DEPTH`], which is enough for the callers, who only compare
+/// against it. Every caller measures a freshly parsed or freshly decoded value,
+/// whose own depth is already bounded by the parser.
+pub(crate) fn value_depth(value: &Value) -> usize {
+    fn go(value: &Value, budget: usize) -> usize {
+        match value {
+            Value::Array(items) => {
+                if budget == 0 {
+                    return 1;
+                }
+                1 + items.iter().map(|v| go(v, budget - 1)).max().unwrap_or(0)
+            }
+            Value::Object(members) => {
+                if budget == 0 {
+                    return 1;
+                }
+                1 + members
+                    .values()
+                    .map(|v| go(v, budget - 1))
+                    .max()
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+    go(value, MAX_DEPTH)
+}
+
+/// Whether placing a value of depth `value_depth` at a location `at_depth`
+/// steps from the root would nest past [`MAX_DEPTH`]. Matches RedisJSON, which
+/// refuses once the total reaches the limit.
+fn too_deep(at_depth: usize, value_depth: usize) -> bool {
+    at_depth + value_depth >= MAX_DEPTH
+}
+
+/// The error reply for a path whose array targets cannot take an element of
+/// depth `added` without nesting past [`MAX_DEPTH`], or `None` when they can.
+/// An element appended to or inserted in an array sits one level below it.
+fn append_too_deep(query: &Query, root: &Value, added: usize) -> Option<Vec<u8>> {
+    let locations = query.locations(root);
+    let targets = if query.is_legacy() {
+        &locations[..locations.len().min(1)]
+    } else {
+        &locations[..]
+    };
+    for location in targets {
+        if matches!(json_path::get(root, location), Some(Value::Array(_)))
+            && too_deep(location.len() + 1, added)
+        {
+            return Some(resp_error(RECURSION_LIMIT));
+        }
+    }
+    None
+}
 
 fn arg<'a>(cmd: &[&'a [u8]], index: usize) -> Option<&'a str> {
     cmd.get(index).and_then(|bytes| parse_utf8(bytes))
@@ -42,8 +133,42 @@ fn parse_json(text: Option<&str>) -> Result<Value, Vec<u8>> {
         .ok_or_else(|| resp_error("ERR invalid JSON value"))
 }
 
-fn json_text(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
+/// JSON as RedisJSON writes it: serde_json's text, with no `+` in an
+/// exponent: `1e21` and `1.8446744073709552e19`, as RedisJSON's serde_json
+/// (with `ryu`) writes them, not `1e+21` (#473).
+struct RedisJsonFormatter;
+
+impl serde_json::ser::Formatter for RedisJsonFormatter {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        let mut text = Vec::with_capacity(32);
+        serde_json::ser::CompactFormatter.write_f64(&mut text, value)?;
+        match memchr::memchr(b'+', &text) {
+            Some(at) => {
+                writer.write_all(&text[..at])?;
+                writer.write_all(&text[at + 1..])
+            }
+            None => writer.write_all(&text),
+        }
+    }
+}
+
+/// `value` as JSON text, as `JSON.GET` returns it.
+pub(crate) fn json_text<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    String::from_utf8(json_bytes(value)).unwrap_or_default()
+}
+
+/// [`json_text`] as bytes.
+pub(crate) fn json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, RedisJsonFormatter);
+    if value.serialize(&mut serializer).is_err() {
+        return Vec::new();
+    }
+    out
 }
 
 fn type_name(value: &Value) -> &'static str {
@@ -59,7 +184,7 @@ fn type_name(value: &Value) -> &'static str {
 }
 
 /// Run `f` on the document at `key`. A key that does not exist is `missing`.
-fn read_doc(ctx: &Ctx, key: &str, missing: Vec<u8>, f: impl FnOnce(&Value) -> Vec<u8>) -> Vec<u8> {
+fn read_doc(ctx: &Ctx, key: &[u8], missing: Vec<u8>, f: impl FnOnce(&Value) -> Vec<u8>) -> Vec<u8> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
@@ -73,7 +198,7 @@ fn read_doc(ctx: &Ctx, key: &str, missing: Vec<u8>, f: impl FnOnce(&Value) -> Ve
 /// [`read_doc`] for a command that changes the document.
 fn write_doc(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     missing: Vec<u8>,
     f: impl FnOnce(&mut Value) -> Vec<u8>,
 ) -> Vec<u8> {
@@ -89,19 +214,21 @@ fn write_doc(
 
 /// The reply of a command that reads: `f` for every value the path matches,
 /// or for the first if the path is a legacy one. `f` is `None` for a value of
-/// the wrong type.
+/// the wrong type. A legacy path that matches nothing, or a value of the
+/// wrong type, answers as `legacy` says.
 fn each_value(
     resp: u8,
     query: &Query,
     root: &Value,
+    legacy: LegacyMiss,
     f: impl Fn(&Value) -> Option<Vec<u8>>,
 ) -> Vec<u8> {
     let values = query.values(root);
     if query.is_legacy() {
-        values
-            .first()
-            .and_then(|value| f(value))
-            .unwrap_or_else(resp_null_bulk)
+        match values.first() {
+            Some(value) => f(value).unwrap_or_else(|| LegacyMiss::reply(legacy.wrong_type)),
+            None => LegacyMiss::reply(legacy.missing),
+        }
     } else {
         resp_array(
             values
@@ -224,9 +351,13 @@ fn set_in(
     if !query.selects() {
         return Err(resp_error(NOT_A_SELECTION));
     }
+    let depth = value_depth(value);
     if query.is_root() {
         if nx {
             return Ok(false);
+        }
+        if too_deep(0, depth) {
+            return Err(resp_error(RECURSION_LIMIT));
         }
         *root = value.clone();
         return Ok(true);
@@ -235,6 +366,12 @@ fn set_in(
     if !locations.is_empty() {
         if nx {
             return Ok(false);
+        }
+        if locations
+            .iter()
+            .any(|location| too_deep(location.len(), depth))
+        {
+            return Err(resp_error(RECURSION_LIMIT));
         }
         for location in locations.iter().rev() {
             if let Some(node) = json_path::get_mut(root, location) {
@@ -249,6 +386,12 @@ fn set_in(
     // Nothing there yet: a new member of an object that is.
     match query.new_member(root) {
         Some((parents, name)) => {
+            if parents
+                .iter()
+                .any(|parent| too_deep(parent.len() + 1, depth))
+            {
+                return Err(resp_error(RECURSION_LIMIT));
+            }
             for parent in &parents {
                 if let Some(Value::Object(members)) = json_path::get_mut(root, parent) {
                     members.insert(name.clone(), value.clone());
@@ -264,7 +407,7 @@ fn set_in(
 /// `JSON.SET` for one key. `Ok(true)` if the value was stored.
 fn set_key(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     query: &Query,
     value: &Value,
     nx: bool,
@@ -276,16 +419,140 @@ fn set_key(
     match map.get(key) {
         Some(ValueRef::Json(tree)) => set_in(&mut tree.write(), query, value, nx, xx),
         Some(_) => Err(resp_error(WRONGTYPE)),
-        None if !query.is_root() => Err(resp_error("ERR new objects must be created at the root")),
+        None if !query.is_root() => Err(resp_error(NEW_AT_ROOT)),
         None if xx => Ok(false),
         None => {
-            map.insert(
-                Key::from(key),
-                KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))),
-            );
+            map.insert(key, KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))));
             Ok(true)
         }
     }
+}
+
+/// Whether [`set_in`], with neither NX nor XX, fails on `root`: the error it
+/// would fail with, found without changing anything.
+fn check_set_in(root: &Value, query: &Query, value: &Value) -> Result<(), Vec<u8>> {
+    if !query.selects() {
+        return Err(resp_error(NOT_A_SELECTION));
+    }
+    let depth = value_depth(value);
+    let deep = || Err(resp_error(RECURSION_LIMIT));
+    if query.is_root() {
+        return if too_deep(0, depth) { deep() } else { Ok(()) };
+    }
+    let locations = query.locations(root);
+    if !locations.is_empty() {
+        return if locations
+            .iter()
+            .any(|location| too_deep(location.len(), depth))
+        {
+            deep()
+        } else {
+            Ok(())
+        };
+    }
+    match query.new_member(root) {
+        Some((parents, _))
+            if parents
+                .iter()
+                .any(|parent| too_deep(parent.len() + 1, depth)) =>
+        {
+            deep()
+        }
+        None if query.is_legacy() => Err(resp_error("ERR path does not exist")),
+        _ => Ok(()),
+    }
+}
+
+/// One `JSON.MSET` triple on `doc`: a key's document, or `None` for a key
+/// that is not there.
+fn set_doc(doc: &mut Option<Value>, query: &Query, value: &Value) -> Result<(), Vec<u8>> {
+    match doc {
+        Some(root) => set_in(root, query, value, false, false).map(drop),
+        None if !query.is_root() => Err(resp_error(NEW_AT_ROOT)),
+        None => {
+            *doc = Some(value.clone());
+            Ok(())
+        }
+    }
+}
+
+/// `JSON.MSET`: every triple is written, or none is (#551).
+///
+/// Every key's shard is held from the first check to the last write, so
+/// nothing changes in between. Each triple is checked against what it will
+/// find when its turn comes, and nothing is written until all of them
+/// pass: an error means nothing changed. It used to write triple by triple
+/// and stop at the first that failed, keeping the ones before; and a reply
+/// that is an error is not sent to replicas or the AOF, so they never got
+/// those writes.
+///
+/// A key named in more than one triple is worked out on a copy of its
+/// document, as an earlier triple changes what a later one finds; only
+/// such a key is copied.
+fn mset(ctx: &Ctx, writes: &[(&[u8], Query, Value)]) -> Result<(), Vec<u8>> {
+    use std::collections::hash_map::Entry;
+    let db = &ctx.store[*ctx.selected_db];
+    let mut shards = super::strings::WriteShards::lock(db, writes.iter().map(|w| w.0));
+    let mut named: ahash::AHashMap<&[u8], usize> = ahash::AHashMap::new();
+    for (key, _, _) in writes {
+        *named.entry(*key).or_default() += 1;
+    }
+    // The documents of keys named more than once, as their triples so far
+    // leave them.
+    let mut staged: ahash::AHashMap<&[u8], Option<Value>> = ahash::AHashMap::new();
+    for (key, query, value) in writes {
+        let map = shards.map(key);
+        if named[key] > 1 {
+            let doc = match staged.entry(*key) {
+                Entry::Occupied(doc) => doc.into_mut(),
+                Entry::Vacant(slot) => slot.insert(match map.get(*key) {
+                    Some(ValueRef::Json(tree)) => Some(tree.read().clone()),
+                    Some(_) => return Err(resp_error(WRONGTYPE)),
+                    None => None,
+                }),
+            };
+            set_doc(doc, query, value)?;
+        } else {
+            match map.get(*key) {
+                Some(ValueRef::Json(tree)) => check_set_in(&tree.read(), query, value)?,
+                Some(_) => return Err(resp_error(WRONGTYPE)),
+                None if !query.is_root() => return Err(resp_error(NEW_AT_ROOT)),
+                None => {}
+            }
+        }
+    }
+    // Everything has passed, under the same locks: nothing below fails.
+    // Were something to, the command still replies OK, and so reaches the
+    // replicas and the AOF, which run it as this did.
+    for (key, query, value) in writes {
+        if named[key] > 1 {
+            continue;
+        }
+        let map = shards.map(key);
+        match map.get(*key) {
+            Some(ValueRef::Json(tree)) => {
+                let set = set_in(&mut tree.write(), query, value, false, false);
+                debug_assert!(set.is_ok(), "JSON.MSET: a checked triple failed");
+            }
+            _ => {
+                map.insert(
+                    *key,
+                    KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))),
+                );
+            }
+        }
+    }
+    for (key, doc) in staged {
+        let Some(doc) = doc else { continue };
+        let map = shards.map(key);
+        match map.get(key) {
+            Some(ValueRef::Json(tree)) => *tree.write() = doc,
+            _ => {
+                map.insert(key, KiviDBValue::Json(Arc::new(RwLock::new(doc))));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove the node at `location`. Removing a member keeps the order of the
@@ -304,13 +571,10 @@ fn remove_at(root: &mut Value, location: &Location) -> bool {
     }
 }
 
-/// Delete the whole key: the value, its TTL and whatever indexed it.
-fn delete_document(ctx: &Ctx, key: &str) -> bool {
-    let removed = delete_key(ctx.store, *ctx.selected_db, key);
-    if removed {
-        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
-    }
-    removed
+/// Delete the whole key: the value and its TTL. It leaves its indexes with
+/// them (`ShardMap::remove`).
+fn delete_document(ctx: &Ctx, key: &[u8]) -> bool {
+    delete_key(ctx.store, *ctx.selected_db, key)
 }
 
 /// RFC 7396 JSON Merge Patch.
@@ -342,29 +606,45 @@ enum NumOp {
     Multiply,
 }
 
-/// `current ⊕ operand`. Integers stay integers while the result fits; a
-/// result that is not a finite number is refused.
-fn arithmetic(current: &Number, operand: &Number, op: NumOp) -> Option<Number> {
-    if let (Some(a), Some(b)) = (current.as_i64(), operand.as_i64()) {
+/// The value of a number that is an integer. `serde_json` holds one above
+/// `i64::MAX` as a `u64`.
+fn integer(number: &Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+/// `current ⊕ operand`, or the error to reply with. Two integers give an
+/// integer, refused if it does not fit an `i64`. Anything else gives a float,
+/// refused if it is not finite.
+fn arithmetic(current: &Number, operand: &Number, op: NumOp) -> Result<Number, &'static str> {
+    const NOT_FINITE: &str = "ERR result is not a finite number";
+    if let (Some(a), Some(b)) = (integer(current), integer(operand)) {
+        // Checked even in an `i128`: two `u64`s can multiply past it.
         let exact = match op {
             NumOp::Add => a.checked_add(b),
             NumOp::Multiply => a.checked_mul(b),
         };
-        if let Some(n) = exact {
-            return Some(n.into());
-        }
+        // Refused, because a float would lose precision. Redis differs for
+        // some integers and array elements, and KiviDB does so on purpose,
+        // see docs/COMPATIBILITY.md (#536).
+        return exact
+            .and_then(|n| i64::try_from(n).ok())
+            .map(Number::from)
+            .ok_or("ERR numeric overflow");
     }
-    let (a, b) = (current.as_f64()?, operand.as_f64()?);
+    let (a, b) = (
+        current.as_f64().ok_or(NOT_FINITE)?,
+        operand.as_f64().ok_or(NOT_FINITE)?,
+    );
     let result = match op {
         NumOp::Add => a + b,
         NumOp::Multiply => a * b,
     };
-    // A whole number that an integer can hold exactly is stored as one, so
-    // `1.5 + 1.5` is `3` and not `3.0`.
-    if result.fract() == 0.0 && result.abs() < 9_007_199_254_740_992.0 {
-        return Some((result as i64).into());
-    }
-    Number::from_f64(result)
+    // A float stays a float even when the result is whole: `1.5 + 1.5` is
+    // `3.0`, as in RedisJSON. Only two integers give an integer, above.
+    Number::from_f64(result).ok_or(NOT_FINITE)
 }
 
 /// `JSON.NUMINCRBY` / `JSON.NUMMULTBY`.
@@ -376,8 +656,9 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
             name.to_ascii_lowercase()
         ));
     }
-    let (Some(key), Some(path)) = (arg(cmd, 1), arg(cmd, 2)) else {
-        return resp_error("ERR key and path must be valid UTF-8");
+    let key: &[u8] = cmd[1];
+    let Some(path) = arg(cmd, 2) else {
+        return resp_error("ERR path must be valid UTF-8");
     };
     let operand = match arg(cmd, 3).and_then(|text| serde_json::from_str::<Value>(text).ok()) {
         Some(Value::Number(n)) => n,
@@ -387,10 +668,13 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
         Ok(query) => query,
         Err(e) => return e,
     };
-    write_doc(ctx, key, resp_null_bulk(), |root| {
+    let missing = resp_error("ERR could not perform this operation on a key that doesn't exist");
+    write_doc(ctx, key, missing, |root| {
         if !query.selects() {
             return resp_error(NOT_A_SELECTION);
         }
+        // A legacy path changes every number it matches too, as in RedisJSON
+        // (`..x` adds to every `x`); only the reply differs (#471).
         let locations = query.locations(root);
         // Work everything out before changing anything, so a result that is
         // out of range fails the command and leaves the document alone.
@@ -398,25 +682,23 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
         for location in &locations {
             match json_path::get(root, location) {
                 Some(Value::Number(current)) => match arithmetic(current, &operand, op) {
-                    Some(next) => results.push(Some(next)),
-                    None => return resp_error("ERR result is not a finite number"),
+                    Ok(next) => results.push(Some(next)),
+                    Err(error) => return resp_error(error),
                 },
                 _ => results.push(None),
             }
-        }
-        if query.is_legacy() {
-            results.truncate(1);
         }
         for (location, result) in locations.iter().zip(&results) {
             if let (Some(node), Some(next)) = (json_path::get_mut(root, location), result) {
                 *node = Value::Number(next.clone());
             }
         }
-        if query.is_legacy() {
-            return match results.first() {
-                Some(Some(next)) => resp_bulk_str(&next.to_string()),
-                Some(None) => resp_error("ERR path is not a number"),
-                None => resp_null_bulk(),
+        // RESP2: the last new value, alone. RESP3: every match, as for a
+        // JSONPath.
+        if query.is_legacy() && resp < 3 {
+            return match results.iter().rev().flatten().next() {
+                Some(next) => resp_bulk_str(&json_text(&Value::Number(next.clone()))),
+                None => resp_error("ERR Path does not exist or does not contains a number"),
             };
         }
         if resp >= 3 {
@@ -446,16 +728,18 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
 // ── JSON.RESP ────────────────────────────────────────────────────────────────
 
 /// A JSON value in RESP: null as nil, booleans as `true`/`false`, integers as
-/// integers, other numbers and strings as bulk strings, an array as `[`
-/// followed by its elements, an object as `{` followed by its members as
-/// alternating names and values.
+/// integers, other numbers as doubles (a RESP3 double, in RESP2 its text:
+/// `1`, `-0`, `1e+21`), strings as bulk strings, an array as `[` followed by
+/// its elements, an object as `{` followed by its members as alternating
+/// names and values.
 fn as_resp(resp: u8, value: &Value) -> Vec<u8> {
     match value {
         Value::Null => resp_null_for(resp),
         Value::Bool(b) => resp_simple(if *b { "true" } else { "false" }),
         Value::Number(n) => match n.as_i64() {
             Some(i) => resp_integer(i),
-            None => resp_bulk_str(&n.to_string()),
+            // A `u64` past `i64::MAX` too, as in RedisJSON.
+            None => resp_double_for(resp, n.as_f64().unwrap_or(0.0)),
         },
         Value::String(s) => resp_bulk_str(s),
         Value::Array(items) => {
@@ -483,6 +767,37 @@ fn clamp_index(index: i64, len: usize) -> usize {
     at.clamp(0, len) as usize
 }
 
+/// The bytes `value` takes in memory: its own node, and what it owns on the
+/// heap, its children included. What `JSON.DEBUG MEMORY` reports, as
+/// RedisJSON reports it of its own representation. An object's members are
+/// counted as an `IndexMap` holds them: the key, the value, the hash and a
+/// slot of the index table each.
+fn value_memory(value: &Value) -> usize {
+    std::mem::size_of::<Value>() + value_heap(value)
+}
+
+fn value_heap(value: &Value) -> usize {
+    const VALUE: usize = std::mem::size_of::<Value>();
+    match value {
+        Value::String(s) => s.capacity(),
+        Value::Array(items) => {
+            items.capacity() * VALUE + items.iter().map(value_heap).sum::<usize>()
+        }
+        Value::Object(members) => members
+            .iter()
+            .map(|(key, member)| {
+                std::mem::size_of::<String>()
+                    + VALUE
+                    + 2 * std::mem::size_of::<usize>()
+                    + 1
+                    + key.capacity()
+                    + value_heap(member)
+            })
+            .sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
 fn not_an_array<T>() -> Result<T, &'static str> {
     Err("ERR path is not an array")
 }
@@ -507,8 +822,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         ))
     };
     // The key, and the path if there is one (the root if not).
-    let key_and_path = |path_at: usize| -> Result<(&str, Query), Vec<u8>> {
-        let key = arg(cmd, 1).ok_or_else(|| resp_error("ERR key must be valid UTF-8"))?;
+    let key_and_path = |path_at: usize| -> Result<(&[u8], Query), Vec<u8>> {
+        let key: &[u8] = cmd[1];
         let path = match cmd.get(path_at) {
             Some(bytes) => {
                 parse_utf8(bytes).ok_or_else(|| resp_error("ERR path must be valid UTF-8"))?
@@ -577,12 +892,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if cmd.len() < 4 || !(cmd.len() - 1).is_multiple_of(3) {
                 return Some(wrong_args());
             }
-            // Every argument is checked before any key is touched.
-            let mut writes: Vec<(&str, Query, Value)> = Vec::new();
+            // Every argument is parsed before any key is looked at.
+            let mut writes: Vec<(&[u8], Query, Value)> = Vec::new();
             for triple in cmd[1..].chunks(3) {
-                let Some(key) = parse_utf8(triple[0]) else {
-                    return Some(resp_error("ERR key must be valid UTF-8"));
-                };
+                let key: &[u8] = triple[0];
                 let query = match parse_utf8(triple[1]).map(parse_path) {
                     Some(Ok(query)) => query,
                     Some(Err(e)) => return Some(e),
@@ -594,12 +907,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 };
                 writes.push((key, query, value));
             }
-            for (key, query, value) in &writes {
-                if let Err(e) = set_key(ctx, key, query, value, false, false) {
-                    return Some(e);
-                }
+            match mset(ctx, &writes) {
+                Ok(()) => resp_simple("OK"),
+                Err(e) => e,
             }
-            resp_simple("OK")
         }
 
         // ── JSON.GET key [INDENT s] [NEWLINE s] [SPACE s] [path ...] ─────────
@@ -609,9 +920,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if cmd.len() < 2 {
                 return Some(wrong_args());
             }
-            let Some(key) = arg(cmd, 1) else {
-                return Some(resp_error("ERR key must be valid UTF-8"));
-            };
+            let key: &[u8] = cmd[1];
             let mut format = Format::default();
             let mut paths: Vec<(&str, Query)> = Vec::new();
             let mut i = 2;
@@ -694,9 +1003,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let replies = cmd[1..cmd.len() - 1]
                 .iter()
                 .map(|key| {
-                    let Some(key) = parse_utf8(key) else {
-                        return resp_null_for(resp);
-                    };
+                    let key: &[u8] = key;
                     let shard = store::get_shard(db, key);
                     let map = read_lock!(shard);
                     let Some(ValueRef::Json(tree)) = map.get(key) else {
@@ -711,7 +1018,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                     } else {
                         let all: Vec<&Value> = values.iter().map(|v| v.as_ref()).collect();
-                        resp_bulk_str(&serde_json::to_string(&all).unwrap_or_default())
+                        resp_bulk_str(&json_text(&all))
                     }
                 })
                 .collect();
@@ -757,11 +1064,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
-            read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| {
+            let reply = read_doc(ctx, key, resp_null_bulk(), |root| {
+                each_value(resp, &query, root, LEGACY_NIL, |value| {
                     Some(resp_bulk_str(type_name(value)))
                 })
-            })
+            });
+            // In RESP3 RedisJSON wraps the reply, whatever the path, in an
+            // array of one: `[number]` for a legacy path, `[[number]]` for a
+            // JSONPath, `[nil]` for a key that is not there (#471).
+            if resp >= 3 && !reply.starts_with(b"-") {
+                resp_array(vec![resp3_normalize_null(reply)])
+            } else {
+                reply
+            }
         }
 
         // ── JSON.STRLEN / JSON.OBJLEN / JSON.ARRLEN key [path] ───────────────
@@ -770,8 +1085,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
+            let legacy = match name {
+                "JSON.STRLEN" => LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: Some("WRONGTYPE wrong type of path value - expected string"),
+                },
+                "JSON.OBJLEN" => LegacyMiss {
+                    missing: None,
+                    wrong_type: Some("WRONGTYPE wrong type of path value - expected object"),
+                },
+                _ => LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: Some("ERR Path does not exist or not an array"),
+                },
+            };
             read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| {
+                each_value(resp, &query, root, legacy, |value| {
                     let len = match (name, value) {
                         ("JSON.STRLEN", Value::String(s)) => s.len(),
                         ("JSON.OBJLEN", Value::Object(members)) => members.len(),
@@ -789,8 +1118,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
+            let legacy = LegacyMiss {
+                missing: None,
+                wrong_type: Some("ERR Path does not exist or not an object"),
+            };
             read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| {
+                each_value(resp, &query, root, legacy, |value| {
                     let members = value.as_object()?;
                     Some(resp_array(
                         members.keys().map(|key| resp_bulk_str(key)).collect(),
@@ -870,6 +1203,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             write_doc(ctx, key, resp_null_bulk(), |root| {
+                let added = values.iter().map(value_depth).max().unwrap_or(0);
+                if let Some(e) = append_too_deep(&query, root, added) {
+                    return e;
+                }
                 each_node(resp, &query, root, |node| match node {
                     Value::Array(items) => {
                         items.extend(values.iter().cloned());
@@ -899,6 +1236,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             write_doc(ctx, key, resp_null_bulk(), |root| {
+                let added = values.iter().map(value_depth).max().unwrap_or(0);
+                if let Some(e) = append_too_deep(&query, root, added) {
+                    return e;
+                }
                 each_node(resp, &query, root, |node| match node {
                     Value::Array(items) => {
                         let len = items.len() as i64;
@@ -992,7 +1333,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             let bound = |at: usize| arg(cmd, at).and_then(|s| s.parse::<i64>().ok());
             let (start, stop) = (bound(4).unwrap_or(0), bound(5).unwrap_or(0));
-            read_doc(ctx, key, resp_null_bulk(), |root| {
+            // A key that does not exist is no path, as in RedisJSON.
+            read_doc(ctx, key, resp_error(PATH_MISSING), |root| {
                 let search = |value: &Value| -> Option<i64> {
                     let items = value.as_array()?;
                     let from = clamp_index(start, items.len());
@@ -1011,16 +1353,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         .map_or(-1, |at| (at + from) as i64);
                     Some(found)
                 };
-                if query.is_legacy() {
-                    return match query.values(root).first() {
-                        Some(value) => match search(value) {
-                            Some(found) => resp_integer(found),
-                            None => resp_error("ERR path is not an array"),
-                        },
-                        None => resp_null_bulk(),
-                    };
-                }
-                each_value(resp, &query, root, |value| search(value).map(resp_integer))
+                let legacy = LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: Some("WRONGTYPE wrong type of path value - expected array"),
+                };
+                each_value(resp, &query, root, legacy, |value| {
+                    search(value).map(resp_integer)
+                })
             })
         }
 
@@ -1096,11 +1435,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     return Some(resp_simple("OK"));
                 }
             }
+            let patch_depth = value_depth(&patch);
             write_doc(ctx, key, resp_error("ERR key does not exist"), |root| {
                 let locations = query.locations(root);
                 if locations.is_empty() {
                     return match query.new_member(root) {
                         Some((parents, name)) => {
+                            if !patch.is_null()
+                                && parents
+                                    .iter()
+                                    .any(|parent| too_deep(parent.len() + 1, patch_depth))
+                            {
+                                return resp_error(RECURSION_LIMIT);
+                            }
                             for parent in &parents {
                                 if let Some(Value::Object(members)) =
                                     json_path::get_mut(root, parent)
@@ -1116,6 +1463,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => resp_error("ERR path does not exist"),
                     };
                 }
+                if !patch.is_null() {
+                    for location in &locations {
+                        let existing = json_path::get(root, location).map(value_depth).unwrap_or(0);
+                        if too_deep(location.len(), existing.max(patch_depth)) {
+                            return resp_error(RECURSION_LIMIT);
+                        }
+                    }
+                }
                 for location in locations.iter().rev() {
                     if patch.is_null() {
                         remove_at(root, location);
@@ -1128,8 +1483,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         // ── JSON.DEBUG MEMORY key [path] ─────────────────────────────────────
-        // The size of the value's JSON text, as an approximation of the
-        // memory it takes.
+        // The bytes the value takes in memory (see `value_memory`). A key
+        // that does not exist is 0, or no values for a JSONPath.
         "JSON.DEBUG" => {
             let sub = arg(cmd, 1).unwrap_or("").to_ascii_uppercase();
             match sub.as_str() {
@@ -1143,16 +1498,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR wrong number of arguments for 'json.debug|memory' command",
                         ));
                     }
-                    let Some(key) = arg(cmd, 2) else {
-                        return Some(resp_error("ERR key must be valid UTF-8"));
-                    };
+                    let key: &[u8] = cmd[2];
                     let query = match parse_path(arg(cmd, 3).unwrap_or(".")) {
                         Ok(query) => query,
                         Err(e) => return Some(e),
                     };
-                    read_doc(ctx, key, resp_null_bulk(), |root| {
-                        each_value(resp, &query, root, |value| {
-                            Some(resp_integer(json_text(value).len() as i64))
+                    let missing = if query.is_legacy() {
+                        resp_integer(0)
+                    } else {
+                        resp_array(Vec::new())
+                    };
+                    let legacy = LegacyMiss {
+                        missing: Some(PATH_MISSING),
+                        wrong_type: None,
+                    };
+                    read_doc(ctx, key, missing, |root| {
+                        each_value(resp, &query, root, legacy, |value| {
+                            Some(resp_integer(value_memory(value) as i64))
                         })
                     })
                 }
@@ -1167,10 +1529,126 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let (key, query) = key_and_path!(2);
             read_doc(ctx, key, resp_null_bulk(), |root| {
-                each_value(resp, &query, root, |value| Some(as_resp(resp, value)))
+                let legacy = LegacyMiss {
+                    missing: Some(PATH_MISSING),
+                    wrong_type: None,
+                };
+                each_value(resp, &query, root, legacy, |value| {
+                    Some(as_resp(resp, value))
+                })
             })
         }
 
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `check_set_in` must fail exactly where `set_in` fails, or `JSON.MSET`
+    /// could pass its checks and then fail half-written (#551). And where
+    /// `set_in` fails, it must have changed nothing.
+    #[test]
+    fn check_set_in_fails_where_set_in_fails() {
+        let docs = [
+            r#"{}"#,
+            r#"{"a":1}"#,
+            r#"{"a":{"b":[1,2,{"c":3}]},"d":"x"}"#,
+            r#"[1,2,3]"#,
+            r#"[{"a":1},{"a":2}]"#,
+            r#""text""#,
+            r#"null"#,
+            r#"5"#,
+        ];
+        let paths = [
+            "$",
+            ".",
+            "$.a",
+            ".a",
+            "a",
+            "$.a.b",
+            ".a.b",
+            "$.x",
+            ".x",
+            "x",
+            "$.x.y",
+            ".x.y",
+            "$.a.b[0]",
+            ".a.b[2].c",
+            ".a.b[9]",
+            "$.a.b[9]",
+            "$..a",
+            "$[*]",
+            "$[0]",
+            "[0]",
+            "[7]",
+            "$[*].a",
+            "$[*].z",
+            "$.d.e",
+            ".d.e",
+            "$..c",
+            "$.a.b[*].c",
+            "$.a.n",
+        ];
+        let value: Value = serde_json::from_str(r#"{"new":true}"#).unwrap();
+        let mut compared = 0;
+        for doc in docs {
+            let before: Value = serde_json::from_str(doc).unwrap();
+            for path in paths {
+                let Ok(query) = Query::parse(path) else {
+                    continue;
+                };
+                let mut root = before.clone();
+                let set = set_in(&mut root, &query, &value, false, false);
+                let checked = check_set_in(&before, &query, &value);
+                assert_eq!(
+                    checked.is_err(),
+                    set.is_err(),
+                    "doc {doc}, path {path}: check {checked:?}, set {set:?}"
+                );
+                if let (Err(a), Err(b)) = (&checked, &set) {
+                    assert_eq!(a, b, "doc {doc}, path {path}: the same error");
+                    assert_eq!(
+                        root, before,
+                        "doc {doc}, path {path}: a failed set changes nothing"
+                    );
+                }
+                compared += 1;
+            }
+        }
+        assert!(compared > 100, "only {compared} cases ran");
+
+        // At the nesting limit: replacing the deepest leaf, or adding a
+        // member to the deepest object, with a nested value is refused by
+        // both, with the same error, and changes nothing.
+        let deep_arrays = format!("{}0{}", "[".repeat(127), "]".repeat(127));
+        let deep_objects = format!("{}{{}}{}", "{\"a\":".repeat(126), "}".repeat(126));
+        let cases = [
+            (deep_arrays, format!("${}", "[0]".repeat(127))),
+            (deep_objects, format!("${}.new", ".a".repeat(126))),
+        ];
+        for (doc, path) in cases {
+            let before: Value = serde_json::from_str(&doc).unwrap();
+            let query = Query::parse(&path).unwrap();
+            let mut root = before.clone();
+            let set = set_in(&mut root, &query, &value, false, false);
+            let checked = check_set_in(&before, &query, &value);
+            assert!(set.is_err(), "set_in at the limit must fail");
+            assert_eq!(checked.err(), set.err(), "the same error");
+            assert_eq!(root, before, "a refused set changes nothing");
+        }
+    }
+
+    #[test]
+    fn set_doc_on_a_missing_key_needs_the_root() {
+        let value: Value = serde_json::from_str(r#"{"x":1}"#).unwrap();
+        let mut doc = None;
+        assert!(set_doc(&mut doc, &Query::parse("$.x").unwrap(), &value).is_err());
+        assert_eq!(doc, None);
+        set_doc(&mut doc, &Query::parse("$").unwrap(), &value).unwrap();
+        set_doc(&mut doc, &Query::parse("$.y").unwrap(), &Value::from(2)).unwrap();
+        assert_eq!(doc, Some(serde_json::json!({"x": 1, "y": 2})));
+    }
 }

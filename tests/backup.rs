@@ -301,7 +301,7 @@ fn keys_on_two_shards() -> (String, String) {
 }
 
 fn counter(snapshot: &kividb::snapshot::LoadedSnapshot, key: &str) -> i64 {
-    match snapshot.dbs[0].get(key) {
+    match snapshot.dbs[0].get(key.as_bytes()) {
         Some(kividb::types::KiviDBValue::String(b)) => {
             std::str::from_utf8(b.as_ref()).unwrap().parse().unwrap()
         }
@@ -755,6 +755,239 @@ fn a_killed_server_keeps_every_acknowledged_write() {
                 "round {round}: {key} kept {kept}, {acked} acknowledged"
             );
         }
+    }
+}
+
+/// `appendfsync always` (#513): a reply to a write is sent only once its
+/// record is synced to disk, whether the setting comes from the
+/// configuration file, the command line or `CONFIG SET`. It was accepted
+/// and the file synced once a second, so a power failure could lose a
+/// second of acknowledged writes. The sync is held at a test failpoint, and
+/// no reply may come while it is held.
+#[test]
+fn appendfsync_always_replies_only_once_the_write_is_synced() {
+    const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    for how in ["file", "command line", "CONFIG SET"] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let port = free_port();
+        let mut extra = vec!["--aof"];
+        match how {
+            "file" => std::fs::write(dir.join("kividb.conf"), "appendfsync always\n").unwrap(),
+            "command line" => extra.extend(["--appendfsync", "always"]),
+            _ => {}
+        }
+        let child = kividb(&dir, port, &extra)
+            .env("KIVIDB_TEST_FAILPOINTS", "aof-fsync-before-reply")
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("could not start kividb");
+        let server = Server { port, dir, child };
+        let mut c = server.conn();
+        if how == "CONFIG SET" {
+            let before = c.cmd(&["CONFIG", "GET", "appendfsync"]);
+            assert_eq!(before.arr()[1].s(), "everysec");
+            assert!(
+                c.cmd(&["CONFIG", "SET", "appendfsync", "sometimes"])
+                    .is_err()
+            );
+            assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+        }
+        let setting = c.cmd(&["CONFIG", "GET", "appendfsync"]);
+        assert_eq!(setting.arr()[1].s(), "always", "{how}");
+
+        let held = server.dir.join("failpoint.aof-fsync-before-reply.1");
+        c.writer.write_all(SET).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !held.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{how}: the write was acknowledged without a sync"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The sync is held: no reply yet.
+        c.writer
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        let early = c.reader.read_line(&mut line);
+        assert!(
+            early.is_err() && line.is_empty(),
+            "{how}: replied {line:?} before its write was synced"
+        );
+        c.writer
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        std::fs::remove_file(&held).unwrap();
+        assert!(c.read().ok(), "{how}");
+
+        // Under `everysec` the reply does not wait for a sync.
+        assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "everysec"]).ok());
+        assert!(c.cmd(&["SET", "k2", "v"]).ok());
+        assert!(
+            !server
+                .dir
+                .join("failpoint.aof-fsync-before-reply.2")
+                .exists(),
+            "{how}: synced for a reply under everysec"
+        );
+    }
+}
+
+/// The test hold of the sync for replies under `appendfsync always` is
+/// reached by that sync only, not by the second's sync, which answers no
+/// reply (#515). The second's sync took it too: when it ran first, with a
+/// write's record in the file, it took the hit a test waited for, and the
+/// write's own sync then waited at the next hit, which the test above never
+/// lets go of. Here the second's sync is held (at `fsync`) with a record
+/// unsynced while the setting turns to `always`, and a write is sent: the
+/// first hold of the reply's sync is the write's, and its reply comes once
+/// that is let go.
+#[test]
+fn the_reply_sync_failpoint_is_the_replys_not_the_seconds_sync() {
+    const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nw\r\n";
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let child = kividb(&dir, port, &["--aof"])
+        .env("KIVIDB_TEST_FAILPOINTS", "fsync,aof-fsync-before-reply")
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir, child };
+    let wait_for = |path: &std::path::Path, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "{what} was never reached");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let mut c = server.conn();
+    // A record written and not yet synced, under `everysec`.
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    // The second's sync, asked for, holds the writer with that record
+    // unsynced.
+    let mut waiter = server.conn();
+    waiter
+        .writer
+        .write_all(b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$1\r\n0\r\n")
+        .unwrap();
+    let fsync = server.dir.join("failpoint.fsync.1");
+    wait_for(&fsync, "the second's sync");
+    // Any later second's sync goes on at once.
+    let done = Arc::new(AtomicBool::new(false));
+    let releaser = {
+        let (dir, done) = (server.dir.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut next = 2;
+            while !done.load(Ordering::Relaxed) {
+                if std::fs::remove_file(dir.join(format!("failpoint.fsync.{next}"))).is_ok() {
+                    next += 1;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    // Now every reply to a write waits for its sync, and one is sent.
+    assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+    c.writer.write_all(SET).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::remove_file(&fsync).unwrap();
+    // The first hold of a reply's sync is the write's.
+    let held = server.dir.join("failpoint.aof-fsync-before-reply.1");
+    wait_for(&held, "the reply's sync");
+    std::fs::remove_file(&held).unwrap();
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = String::new();
+    let replied = c.reader.read_line(&mut line);
+    assert!(
+        replied.is_ok() && line == "+OK\r\n",
+        "no reply once the reply's sync was let go ({replied:?}, {line:?}); held again: {}",
+        server
+            .dir
+            .join("failpoint.aof-fsync-before-reply.2")
+            .exists()
+    );
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "w");
+    done.store(true, Ordering::Relaxed);
+    releaser.join().unwrap();
+}
+
+/// Under `appendfsync always`, a sync of the AOF that fails stops the
+/// server (#514's review). The checkpoint's sync of the old log used to be
+/// logged and passed over, its mark cleared: Linux reports a failed
+/// writeback once to each open file, so the next sync of the log returned
+/// success and answered replies whose writes could be lost. Here the old
+/// log's sync is made to fail while writers keep going: the server exits,
+/// and every write it acknowledged is there after a restart.
+#[test]
+fn appendfsync_always_stops_at_a_failed_sync() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let args = ["--aof", "--appendfsync", "always"];
+    let mut child = kividb(&dir, port, &args)
+        .env("KIVIDB_TEST_FAILPOINTS", "turn-over-sync-fails")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not start kividb");
+    let stderr = child.stderr.take().unwrap();
+    let said = std::thread::spawn(move || {
+        let mut said = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut said);
+        said
+    });
+    let mut server = Server { port, dir, child };
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "before", "1"]).ok());
+
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let key = format!("acked:{w}");
+                let mut acked = 0i64;
+                while let Some(V::Int(n)) = c.try_cmd(&["INCR", &key]) {
+                    acked = n;
+                }
+                (key, acked)
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = c.cmd(&["BGREWRITEAOF"]);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server carried on after a failed sync under appendfsync always"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "{status:?}");
+    let acked: Vec<(String, i64)> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    let said = said.join().unwrap();
+    assert!(said.contains("failed under appendfsync always"), "{said}");
+
+    server.child = kividb(&server.dir, port, &args)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not restart kividb");
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["GET", "before"]).s(), "1");
+    for (key, acked) in acked {
+        let kept: i64 = match c.cmd(&["GET", &key]) {
+            V::Str(n) => n.parse().unwrap(),
+            _ => 0,
+        };
+        assert!(kept >= acked, "{key} kept {kept}, {acked} acknowledged");
     }
 }
 
@@ -1419,7 +1652,8 @@ fn hotkeys_session() {
     // process and sees every command it runs.
     let server = Server::start(&[]);
     let mut c = server.conn();
-    assert!(c.cmd(&["HOTKEYS", "STOP"]).is_err(), "nothing to stop");
+    // Nothing to stop: nil, as in Redis 8.10.
+    assert_eq!(c.cmd(&["HOTKEYS", "STOP"]), V::Nil);
     assert!(c.cmd(&["HOTKEYS", "START"]).is_err(), "METRICS is required");
     assert!(
         c.cmd(&["HOTKEYS", "START", "METRICS", "1", "CPU", "SLOTS", "1", "5"])
@@ -1803,6 +2037,193 @@ fn a_backup_into_the_data_directory_is_refused() {
     );
 }
 
+/// Every file of `dir` and what it holds.
+fn directory(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name, std::fs::read(entry.path()).unwrap_or_default())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether a server started in `dir` with `args` exited with an error within
+/// 30 s (one that starts is stopped), and what it logged.
+fn fails_to_start(dir: &Path, args: &[&str]) -> (bool, String) {
+    let mut child = kividb(dir, free_port(), args)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not run kividb");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let failed = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break !status.success();
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+    (failed, stderr)
+}
+
+/// A preload target that is not a whole snapshot is fatal, and the data
+/// directory is left exactly as it was: the same files, holding the same
+/// bytes (#444).
+///
+/// A Dragonfly snapshot in Dragonfly's own format (a summary with no keys,
+/// and a file for each shard) started the server empty: "preload-file: 0
+/// keys from the base snapshot". Its files are refused by name (`.dfs`),
+/// from every Dragonfly version; renamed, by the fields Dragonfly 1.32 and
+/// later write in them, and a summary from before 1.32 as a Dragonfly file
+/// with no keys. The fixtures are from Dragonfly 2.1, 1.31 and 1.15. A cut
+/// file, one with a byte changed, and a KiviDB snapshot cut short loaded as
+/// far as they went.
+#[test]
+fn a_preload_file_that_is_not_a_whole_snapshot_is_fatal() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture = |name: &str| std::fs::read(fixtures.join(name)).unwrap();
+    let source = Server::start(&[]);
+    let mut c = source.conn();
+    for i in 0..50 {
+        c.cmd(&["SET", &format!("key:{i}"), &"v".repeat(100)]);
+    }
+    assert!(c.cmd(&["SAVE"]).ok());
+    let kdb = std::fs::read(source.dir.join("dump.kdb")).unwrap();
+    let rdb = fixture("redis-8.10.rdb");
+    let mut flipped = rdb.clone();
+    let at = flipped.windows(5).position(|w| w == b"hello").unwrap();
+    flipped[at] = b'j';
+
+    // Each target, and what the refusal says.
+    let targets: Vec<(&str, Vec<u8>, &str)> = vec![
+        // As Dragonfly names them.
+        (
+            "dump-2026-11-06T01:48:42-summary.dfs",
+            fixture("dragonfly-2.1-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:42-0000.dfs",
+            fixture("dragonfly-2.1-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:17-summary.dfs",
+            fixture("dragonfly-1.31-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:17-0000.DFS",
+            fixture("dragonfly-1.31-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:47:48-summary.dfs",
+            fixture("dragonfly-1.15-summary.dfs"),
+            "Dragonfly",
+        ),
+        // Renamed: by what is in them.
+        (
+            "summary-2.1.rdb",
+            fixture("dragonfly-2.1-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "shard-2.1.rdb",
+            fixture("dragonfly-2.1-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "summary-1.31.rdb",
+            fixture("dragonfly-1.31-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "summary-1.15.rdb",
+            fixture("dragonfly-1.15-summary.dfs"),
+            "could not be loaded",
+        ),
+        ("empty", Vec::new(), "could not be loaded"),
+        ("cut.rdb", rdb[..rdb.len() - 8].to_vec(), "checksum"),
+        ("damaged.rdb", flipped, "rdbchecksum no"),
+        (
+            "cut.kdb",
+            kdb[..kdb.len() / 2].to_vec(),
+            "could not be loaded",
+        ),
+        ("header.kdb", kdb[..12].to_vec(), "cut short"),
+    ];
+    // The data directory holds a dump of its own and the lock file a server
+    // makes, all of which must stay as they are.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("dump.rdb"), b"REDIS0011\xFF\0\0\0\0\0\0\0\0").unwrap();
+    std::fs::write(data.join("kividb.lock"), b"").unwrap();
+    let before = directory(&data);
+    for (name, bytes, says) in targets {
+        let file = dir.path().join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let target = format!("rdb:{}", file.display());
+        let (failed, stderr) = fails_to_start(&data, &["--preload-file", &target]);
+        assert!(failed, "{name} must not start: {stderr}");
+        assert!(stderr.contains("could not be loaded"), "{name}: {stderr}");
+        assert!(stderr.contains(says), "{name}: {stderr}");
+        assert!(
+            directory(&data) == before,
+            "{name} changed the data directory"
+        );
+    }
+
+    // A Dragonfly shard's file as `dump.rdb` does not start the server on
+    // that shard's keys either.
+    std::fs::write(data.join("dump.rdb"), fixture("dragonfly-2.1-0000.dfs")).unwrap();
+    let before = directory(&data);
+    let (failed, stderr) = fails_to_start(&data, &[]);
+    assert!(failed, "{stderr}");
+    assert!(stderr.contains("Dragonfly"), "{stderr}");
+    assert!(
+        directory(&data) == before,
+        "dump.rdb changed the data directory"
+    );
+}
+
+/// `rdbchecksum no` skips the check of an RDB file's checksum as it is
+/// loaded, as in Redis, so that a file whose only fault is its checksum can
+/// still be loaded on purpose (#444).
+#[test]
+fn rdbchecksum_no_loads_a_file_whose_checksum_is_wrong() {
+    let mut damaged =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redis-8.10.rdb"))
+            .unwrap();
+    let at = damaged.windows(5).position(|w| w == b"hello").unwrap();
+    damaged[at] = b'j';
+    let dir = tempfile::tempdir().unwrap().keep();
+    let file = dir.join("damaged.rdb");
+    std::fs::write(&file, damaged).unwrap();
+    std::fs::write(dir.join("kividb.conf"), "rdbchecksum no\n").unwrap();
+    let port = free_port();
+    let target = format!("rdb:{}", file.display());
+    let child = kividb(&dir, port, &["--preload-file", &target])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir, child };
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 9);
+    let reply = c.cmd(&["CONFIG", "GET", "rdbchecksum"]);
+    assert_eq!(reply.arr()[1].s(), "no");
+}
+
 // ── The empty key (#441) ─────────────────────────────────────────────────────
 //
 // Redis allows the empty key. In a snapshot it was written with the key
@@ -1909,6 +2330,19 @@ fn the_empty_key_can_be_migrated() {
     assert!(reply.ok(), "MIGRATE: {reply:?}");
     assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
     assert_eq!(to.conn().cmd(&["HGET", "", ""]).s(), "v");
+
+    // Without `KEYS`, the empty key argument is the empty key, as in Redis:
+    // it was a syntax error (#458). `KEYS` and nothing after it moves
+    // nothing.
+    assert!(c.cmd(&["SET", "", "plain"]).ok());
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "REPLACE"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
+    assert_eq!(to.conn().cmd(&["GET", ""]).s(), "plain");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000"]);
+    assert_eq!(reply.s(), "NOKEY");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]);
+    assert_eq!(reply.s(), "NOKEY");
 }
 
 /// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
@@ -2016,4 +2450,104 @@ fn the_empty_key_in_an_aof_preamble_loads() {
     assert_eq!(c.cmd(&["GET", ""]).s(), "x");
     assert_eq!(c.cmd(&["GET", "k"]).s(), "1");
     assert_eq!(c.cmd(&["GET", "tail"]).s(), "2");
+}
+
+/// A `SELECT` changes no data: a script that has only selected a database
+/// can still be killed, as in Redis (#424). Its `SELECT` used to count as a
+/// write, and `SCRIPT KILL` was answered UNKILLABLE.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_has_only_selected_a_database_can_be_killed() {
+    let server = Server::start(&[]);
+    let port = server.port;
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "lua-time-limit", "200"]).ok());
+
+    let runner = std::thread::spawn(move || {
+        let mut r = Conn::connect(port);
+        r.cmd(&["EVAL", "redis.call('SELECT', 1) while true do end", "0"])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = c.cmd(&["PING"]);
+        if reply.is_err() && reply.s().starts_with("BUSY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script never got busy: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reply = c.cmd(&["SCRIPT", "KILL"]);
+    assert!(reply.ok(), "{reply:?}");
+    assert!(runner.join().unwrap().is_err());
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+}
+
+/// What a script may do with `SELECT`, as Redis 8.10.2 lets it: a read-only
+/// script may select another database (#424), and on a cluster node no
+/// script may select one other than 0, as no client may (#428).
+#[cfg(feature = "lua")]
+#[test]
+fn scripts_select_databases_as_redis_lets_them() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert!(c.cmd(&["SET", "x", "one"]).ok());
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    let read = "redis.call('SELECT', 1) return redis.call('GET', 'x')";
+    assert_eq!(c.cmd(&["EVAL_RO", read, "0"]).s(), "one");
+    let no_writes = format!("#!lua flags=no-writes\n{read}");
+    assert_eq!(c.cmd(&["EVAL", &no_writes, "0"]).s(), "one");
+
+    let node = Server::start(&["--cluster-enabled", "yes"]);
+    let mut n = node.conn();
+    let reply = n.cmd(&["EVAL", "return redis.call('SELECT', 3)", "0"]);
+    assert!(
+        reply.is_err()
+            && reply
+                .s()
+                .starts_with("ERR SELECT is not allowed in cluster mode"),
+        "{reply:?}"
+    );
+    assert!(n.cmd(&["EVAL", "return redis.call('SELECT', 0)", "0"]).ok());
+}
+
+/// A read-only replica loads and flushes scripts, as Redis does: its script
+/// cache is its own, and a client loads a script there before it runs it by
+/// its SHA (#527). What changes data is still refused.
+#[cfg(feature = "lua")]
+#[test]
+fn a_read_only_replica_loads_and_flushes_scripts() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !r
+        .cmd(&["INFO", "replication"])
+        .s()
+        .contains("master_link_status:up")
+    {
+        assert!(Instant::now() < deadline, "the replica never linked up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let sha = r.cmd(&["SCRIPT", "LOAD", "return 1"]).s().to_string();
+    assert_eq!(sha.len(), 40, "{sha}");
+    assert_eq!(r.cmd(&["EVALSHA", &sha, "0"]).i(), 1);
+    assert!(r.cmd(&["SCRIPT", "FLUSH"]).ok());
+    let reply = r.cmd(&["EVALSHA", &sha, "0"]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("NOSCRIPT"),
+        "{reply:?}"
+    );
+    for refused in [&["FUNCTION", "FLUSH"][..], &["SET", "k", "v"]] {
+        let reply = r.cmd(refused);
+        assert!(
+            reply.is_err() && reply.s().starts_with("READONLY"),
+            "{refused:?}: {reply:?}"
+        );
+    }
 }

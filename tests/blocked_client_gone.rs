@@ -205,6 +205,14 @@ impl Server {
     }
 
     fn start_with(io: &str, extra: &[&str]) -> Self {
+        Self::start_with_workers(io, 4, extra)
+    }
+
+    fn start_with_workers(io: &str, workers: usize, extra: &[&str]) -> Self {
+        Self::start_with_env(io, workers, extra, &[])
+    }
+
+    fn start_with_env(io: &str, workers: usize, extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
         let log = std::fs::File::create(dir.join("server.log")).unwrap();
@@ -218,11 +226,12 @@ impl Server {
                 "--io-model",
                 io,
                 "--threads",
-                "4",
+                &workers.to_string(),
                 "--configfile",
                 "kividb.conf",
             ])
             .args(extra)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
@@ -643,6 +652,133 @@ fn a_client_that_closes_while_a_pause_holds_it_takes_nothing() {
         }
         assert_eq!(ctl.cmd(&["LLEN", "p:active"]), V::Int(0), "{io}");
         assert!(let_go, "{io}: still listed while the pause held it");
+    }
+}
+
+/// A pipelined write and WAIT must let the replica stream and its ACK make
+/// progress on the same worker. A busy yield loop on io_uring kept that
+/// worker runnable, so its queued socket operations were never submitted.
+#[test]
+fn a_wait_on_one_worker_receives_replica_acknowledgments() {
+    for &io in io_models() {
+        let master = Server::start_with_workers(io, 1, &["--repl-ping-replica-period", "3600"]);
+        let mut writer = master.conn();
+        assert_eq!(writer.cmd(&["SET", "seed", "ready"]), s("OK"));
+        let port = master.port.to_string();
+        let replica = Server::start_with("tokio", &["--replicaof", "127.0.0.1", &port]);
+        let mut reader = replica.conn();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reader.cmd(&["GET", "seed"]) != s("ready") {
+            assert!(Instant::now() < deadline, "{io}: full sync did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // No pause between the write and WAIT: an ACK already received
+        // before WAIT starts would bypass the broken wait loop entirely.
+        for timeout in ["2000", "0"] {
+            for round in 0..4 {
+                let value = format!("{timeout}:{round}");
+                let mut batch = request(&["SET", "wait-progress", &value]);
+                batch.extend(request(&["WAIT", "1", timeout]));
+                writer.writer.write_all(&batch).unwrap();
+                assert_eq!(writer.read(), s("OK"), "{io}");
+                assert_eq!(
+                    writer.read(),
+                    V::Int(1),
+                    "{io}: WAIT timed out instead of letting the replica acknowledge"
+                );
+                assert_eq!(reader.cmd(&["GET", "wait-progress"]), s(&value), "{io}");
+            }
+        }
+        // An unmet replica count still times out with the count reached.
+        assert_eq!(writer.cmd(&["WAIT", "2", "25"]), V::Int(1), "{io}");
+    }
+}
+
+/// While WAITAOF waits for the disk, another client on its worker must
+/// still receive replies. Hold both syncs of a turn-over's old log, the
+/// checkpoint's and the writer's own, so no later write can be reported
+/// fsynced until the test releases them. Holding the checkpoint's alone did
+/// not hold WAITAOF: the writer synced the old log itself, as it should, and
+/// WAITAOF answered 1 whenever the disk beat the test to its check (#529).
+#[test]
+fn a_waitaof_on_one_worker_does_not_stop_other_clients() {
+    for &io in io_models() {
+        let server = Server::start_with_env(
+            io,
+            1,
+            &["--aof"],
+            &[("KIVIDB_TEST_FAILPOINTS", "turn-over-syncing,old-log-synced")],
+        );
+        let mut waiter = server.conn();
+        assert_eq!(waiter.cmd(&["SET", "before", "1"]), s("OK"), "{io}");
+        assert_eq!(
+            waiter.cmd(&["BGREWRITEAOF"]),
+            s("Background append only file rewriting started"),
+            "{io}"
+        );
+        let held = server.dir.join("failpoint.turn-over-syncing.1");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !held.exists() {
+            assert!(Instant::now() < deadline, "{io}: old-log sync was not held");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // This write belongs to the new log, which cannot be fsynced ahead
+        // of the old log. WAITAOF must really wait, however fast the disk.
+        assert_eq!(waiter.cmd(&["SET", "during", "2"]), s("OK"), "{io}");
+        assert_eq!(waiter.cmd(&["CLIENT", "SETNAME", "fsync-waiter"]), s("OK"));
+        let mut ctl = server.conn();
+        ctl.reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        waiter.send(&["WAITAOF", "1", "0", "0"]);
+        // The writer's sync of the old log, WAITAOF's or the second's: held
+        // there, the writer reports nothing synced.
+        let writer_held = server.dir.join("failpoint.old-log-synced.1");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !writer_held.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{io}: the writer's sync of the old log was not held"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Observe entry into WAITAOF before checking PING: checking it
+        // before the waiter runs would miss the starvation. The old yield
+        // loop can already prevent this CLIENT LIST reply from arriving.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let V::Str(clients) = ctl.cmd(&["CLIENT", "LIST"]) else {
+                panic!("{io}: CLIENT LIST is a bulk string");
+            };
+            if clients.lines().any(|line| {
+                line.split_whitespace().any(|v| v == "name=fsync-waiter")
+                    && line.split_whitespace().any(|v| v == "cmd=waitaof")
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{io}: WAITAOF never started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ctl.cmd(&["PING"]), s("PONG"), "{io}: WAITAOF stopped I/O");
+
+        // A reply here would mean the wait finished early, making PING's
+        // success meaningless. peek leaves any reply intact for read().
+        let socket = waiter.reader.get_ref();
+        socket.set_nonblocking(true).unwrap();
+        let reply = socket.peek(&mut [0]);
+        socket.set_nonblocking(false).unwrap();
+        assert!(
+            matches!(reply, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{io}: WAITAOF did not remain pending: {reply:?}"
+        );
+
+        std::fs::remove_file(held).unwrap();
+        std::fs::remove_file(writer_held).unwrap();
+        assert_eq!(waiter.read(), V::Arr(vec![V::Int(1), V::Int(0)]), "{io}");
     }
 }
 

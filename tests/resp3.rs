@@ -1468,3 +1468,262 @@ fn every_way_of_running_a_script_sends_its_false_in_the_clients_protocol() {
         assert_wire!(c.raw(&["EXEC"]), want, "EXEC of scripts");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FUNCTION LIST and FUNCTION STATS (#476, #439)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Under RESP3 the expected bytes are Redis 8.10's: each library, each function
+// and the stats are maps, a missing value is `_` and `flags` is a set of simple
+// strings. Under RESP2 they are as they were: flat arrays, `$-1` and each flag
+// a bulk string (Redis sends a flag as a simple string under both).
+
+#[cfg(feature = "lua")]
+#[test]
+fn function_list_follows_the_clients_protocol() {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    let lib = "#!lua name=fnlist_476\n\
+               redis.register_function('fnlist_476_a', function() return 1 end)\n\
+               redis.register_function{function_name='fnlist_476_b', callback=function() return 2 end, \
+               description='has one', flags={'no-writes', 'allow-stale'}}";
+    assert_wire!(
+        c2.raw(&["FUNCTION", "LOAD", "REPLACE", lib]),
+        b"$10\r\nfnlist_476\r\n",
+        "FUNCTION LOAD"
+    );
+    let list = ["FUNCTION", "LIST", "LIBRARYNAME", "fnlist_476"];
+    assert_wire!(
+        c2.raw(&list),
+        b"*1\r\n*6\r\n$12\r\nlibrary_name\r\n$10\r\nfnlist_476\r\n$6\r\nengine\r\n$3\r\nLUA\r\n\
+          $9\r\nfunctions\r\n*2\r\n\
+          *6\r\n$4\r\nname\r\n$12\r\nfnlist_476_a\r\n$11\r\ndescription\r\n$-1\r\n$5\r\nflags\r\n*0\r\n\
+          *6\r\n$4\r\nname\r\n$12\r\nfnlist_476_b\r\n$11\r\ndescription\r\n$7\r\nhas one\r\n\
+          $5\r\nflags\r\n*2\r\n$9\r\nno-writes\r\n$11\r\nallow-stale\r\n",
+        "RESP2 FUNCTION LIST"
+    );
+    assert_wire!(
+        c3.raw(&list),
+        b"*1\r\n%3\r\n$12\r\nlibrary_name\r\n$10\r\nfnlist_476\r\n$6\r\nengine\r\n$3\r\nLUA\r\n\
+          $9\r\nfunctions\r\n*2\r\n\
+          %3\r\n$4\r\nname\r\n$12\r\nfnlist_476_a\r\n$11\r\ndescription\r\n_\r\n$5\r\nflags\r\n~0\r\n\
+          %3\r\n$4\r\nname\r\n$12\r\nfnlist_476_b\r\n$11\r\ndescription\r\n$7\r\nhas one\r\n\
+          $5\r\nflags\r\n~2\r\n+no-writes\r\n+allow-stale\r\n",
+        "RESP3 FUNCTION LIST"
+    );
+    // WITHCODE adds a fourth pair: the library's map is `%4`.
+    let with_code = c3.raw(&["FUNCTION", "LIST", "WITHCODE", "LIBRARYNAME", "fnlist_476"]);
+    assert!(with_code.starts_with(b"*1\r\n%4\r\n"), "{}", s(&with_code));
+    assert!(
+        with_code
+            .windows(b"$12\r\nlibrary_code\r\n".len())
+            .any(|w| w == b"$12\r\nlibrary_code\r\n"),
+        "{}",
+        s(&with_code)
+    );
+    c2.raw(&["FUNCTION", "DELETE", "fnlist_476"]);
+}
+
+/// Neither the counts nor what `running_script` holds are pinned: the
+/// function store and the Lua VM are the test process's, and other tests
+/// load libraries and run functions in it meanwhile (#431's `f431_s3` was
+/// once running here). `running_script` is the protocol's null or its map;
+/// the running map's bytes are `function_stats_reply`'s unit test.
+#[cfg(feature = "lua")]
+#[test]
+fn function_stats_follows_the_clients_protocol() {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    let cases: [(&mut RawConn, &str, &[u8], &[u8], &[u8], &[u8]); 2] = [
+        (
+            &mut c2,
+            "RESP2",
+            b"*4\r\n$14\r\nrunning_script\r\n",
+            b"$-1\r\n",
+            b"*6\r\n",
+            b"$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n$15\r\nlibraries_count\r\n:",
+        ),
+        (
+            &mut c3,
+            "RESP3",
+            b"%2\r\n$14\r\nrunning_script\r\n",
+            b"_\r\n",
+            b"%3\r\n",
+            b"$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n%2\r\n$15\r\nlibraries_count\r\n:",
+        ),
+    ];
+    for (c, protocol, head, idle, running, engines) in cases {
+        let stats = c.raw(&["FUNCTION", "STATS"]);
+        let rest = stats
+            .strip_prefix(head)
+            .unwrap_or_else(|| panic!("{protocol}: {}", s(&stats)));
+        assert!(
+            rest.starts_with(idle) || rest.starts_with(running),
+            "{protocol} running_script: {}",
+            s(&stats)
+        );
+        assert!(
+            stats.windows(engines.len()).any(|w| w == engines),
+            "{protocol} engines: {}",
+            s(&stats)
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Doubles and JSON replies as Redis 8.10.2 (with RedisJSON 8.10) writes them
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Each command's reply to a RESP2 and a RESP3 client, byte for byte as
+/// Redis 8.10.2 sent it (#471, #472, #473).
+#[test]
+fn doubles_and_json_replies_are_written_as_redis_writes_them() {
+    let port = free_port();
+    start_server(port);
+    let mut c2 = RawConn::connect(port);
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+
+    c2.raw(&[
+        "JSON.SET",
+        "d",
+        "$",
+        r#"{"a":1.0,"b":-0.0,"c":100000.0,"d":123456789.12345678,"e":1e300,"f":1e21,"g":1.5e-7,"i":18446744073709551616,"j":1e16,"n":5}"#,
+    ]);
+    c2.raw(&[
+        "ZADD",
+        "z",
+        "1e16",
+        "a",
+        "100000000",
+        "b",
+        "1e21",
+        "c",
+        "1.5e-7",
+        "d",
+    ]);
+
+    let both: &[(&[&str], &[u8], &[u8])] = &[
+        // JSON text: an exponent has no `+`.
+        (
+            &["JSON.GET", "d"],
+            b"$125\r\n{\"a\":1.0,\"b\":-0.0,\"c\":100000.0,\"d\":123456789.12345678,\"e\":1e300,\"f\":1e21,\"g\":1.5e-7,\"i\":1.8446744073709552e19,\"j\":1e16,\"n\":5}\r\n",
+            b"$125\r\n{\"a\":1.0,\"b\":-0.0,\"c\":100000.0,\"d\":123456789.12345678,\"e\":1e300,\"f\":1e21,\"g\":1.5e-7,\"i\":1.8446744073709552e19,\"j\":1e16,\"n\":5}\r\n",
+        ),
+        (&["JSON.GET", "d", "$.f"], b"$6\r\n[1e21]\r\n", b"$6\r\n[1e21]\r\n"),
+        (
+            &["JSON.MGET", "d", ".i"],
+            b"*1\r\n$21\r\n1.8446744073709552e19\r\n",
+            b"*1\r\n$21\r\n1.8446744073709552e19\r\n",
+        ),
+        // JSON.RESP: a number that is not an integer is a double.
+        (&["JSON.RESP", "d", ".a"], b"$1\r\n1\r\n", b",1\r\n"),
+        (&["JSON.RESP", "d", ".b"], b"$2\r\n-0\r\n", b",-0\r\n"),
+        (&["JSON.RESP", "d", ".c"], b"$6\r\n100000\r\n", b",100000\r\n"),
+        (
+            &["JSON.RESP", "d", ".d"],
+            b"$21\r\n1.2345678912345678e+8\r\n",
+            b",1.2345678912345678e+8\r\n",
+        ),
+        (&["JSON.RESP", "d", ".e"], b"$6\r\n1e+300\r\n", b",1e+300\r\n"),
+        (&["JSON.RESP", "d", ".g"], b"$6\r\n1.5e-7\r\n", b",1.5e-7\r\n"),
+        (
+            &["JSON.RESP", "d", ".i"],
+            b"$20\r\n18446744073709552000\r\n",
+            b",18446744073709552000\r\n",
+        ),
+        (
+            &["JSON.RESP", "d", ".j"],
+            b"$17\r\n10000000000000000\r\n",
+            b",10000000000000000\r\n",
+        ),
+        (&["JSON.RESP", "d", ".n"], b":5\r\n", b":5\r\n"),
+        // JSON.TYPE: in RESP3, always in an array of one.
+        (&["JSON.TYPE", "d"], b"$6\r\nobject\r\n", b"*1\r\n$6\r\nobject\r\n"),
+        (&["JSON.TYPE", "d", ".n"], b"$7\r\ninteger\r\n", b"*1\r\n$7\r\ninteger\r\n"),
+        (
+            &["JSON.TYPE", "d", "$.a"],
+            b"*1\r\n$6\r\nnumber\r\n",
+            b"*1\r\n*1\r\n$6\r\nnumber\r\n",
+        ),
+        (&["JSON.TYPE", "d", "$.nope"], b"*0\r\n", b"*1\r\n*0\r\n"),
+        (&["JSON.TYPE", "d", ".nope"], b"$-1\r\n", b"*1\r\n_\r\n"),
+        (&["JSON.TYPE", "nokey"], b"$-1\r\n", b"*1\r\n_\r\n"),
+        (&["JSON.TYPE", "nokey", "$"], b"$-1\r\n", b"*1\r\n_\r\n"),
+        // Scores: whole numbers up to 2^62 as integers.
+        (
+            &["ZSCORE", "z", "a"],
+            b"$17\r\n10000000000000000\r\n",
+            b",10000000000000000\r\n",
+        ),
+        (&["ZSCORE", "z", "b"], b"$9\r\n100000000\r\n", b",100000000\r\n"),
+        (&["ZSCORE", "z", "c"], b"$5\r\n1e+21\r\n", b",1e+21\r\n"),
+        (&["ZSCORE", "z", "d"], b"$6\r\n1.5e-7\r\n", b",1.5e-7\r\n"),
+        // A key that is not there.
+        (
+            &["JSON.NUMINCRBY", "nokey", ".n", "1"],
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+        ),
+        (
+            &["JSON.NUMINCRBY", "nokey", "$.n", "1"],
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+        ),
+    ];
+    for (args, resp2, resp3) in both {
+        assert_wire!(c2.raw(args), *resp2, format!("RESP2 {args:?}"));
+        assert_wire!(c3.raw(args), *resp3, format!("RESP3 {args:?}"));
+    }
+
+    // A legacy path adds to every number it matches. RESP2 replies with the
+    // last new value, RESP3 with all of them.
+    let doc = r#"{"a":{"x":1},"b":{"x":2.5},"c":{"x":"s"}}"#;
+    let changed = b"$41\r\n{\"a\":{\"x\":2},\"b\":{\"x\":3.5},\"c\":{\"x\":\"s\"}}\r\n";
+    c2.raw(&["JSON.SET", "n2", "$", doc]);
+    assert_wire!(
+        c2.raw(&["JSON.NUMINCRBY", "n2", "..x", "1"]),
+        b"$3\r\n3.5\r\n",
+        "RESP2 legacy NUMINCRBY"
+    );
+    assert_wire!(
+        c2.raw(&["JSON.GET", "n2"]),
+        changed,
+        "after RESP2 NUMINCRBY"
+    );
+    c3.raw(&["JSON.SET", "n3", "$", doc]);
+    assert_wire!(
+        c3.raw(&["JSON.NUMINCRBY", "n3", "..x", "1"]),
+        b"*3\r\n:2\r\n,3.5\r\n_\r\n",
+        "RESP3 legacy NUMINCRBY"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.GET", "n3"]),
+        changed,
+        "after RESP3 NUMINCRBY"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.NUMMULTBY", "n3", ".b.x", "2"]),
+        b"*1\r\n,7\r\n",
+        "RESP3 legacy NUMMULTBY"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.NUMINCRBY", "n3", ".c.x", "1"]),
+        b"*1\r\n_\r\n",
+        "RESP3 legacy NUMINCRBY of a string"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.NUMINCRBY", "n3", ".nope", "1"]),
+        b"*0\r\n",
+        "RESP3 legacy NUMINCRBY of nothing"
+    );
+    for path in [".c.x", ".nope"] {
+        assert_wire!(
+            c2.raw(&["JSON.NUMINCRBY", "n2", path, "1"]),
+            b"-ERR Path does not exist or does not contains a number\r\n",
+            format!("RESP2 legacy NUMINCRBY {path}")
+        );
+    }
+}

@@ -107,7 +107,8 @@ other files:
   runs scripts.
 - `save <points>` has no effect: KiviDB doesn't snapshot on a schedule. Use
   the AOF or `BGSAVE`.
-- `appendfsync` is always `everysec`.
+- `appendfsync no` is taken as `everysec`; `always` and `everysec` do what
+  they do in Redis.
 - The config file is read strictly: an unknown directive stops the server.
 
 **Durability**
@@ -122,12 +123,12 @@ other files:
   does that, for more writes a second.
 
 **Data**
-- Keys, hash fields and set members must be valid UTF-8; Redis and Valkey
-  accept any bytes. A non-UTF-8 key gets `ERR key must be
-  valid UTF-8` (or `ERR must be valid UTF-8`), so an application that uses
-  binary keys, such as Stalwart Mail Server, doesn't work yet
-  ([#437](https://github.com/kividbio/kividb/issues/437)). Values and
-  sorted-set members are binary-safe, as in Redis.
+- Keys, values, hash fields, set and sorted-set members, list elements,
+  stream consumer group and consumer names and vector-set element names are
+  any bytes, as in Redis. What is still text: ACL rules (a key or channel
+  pattern in `ACL SETUSER` that is not UTF-8 is refused,
+  [#437](https://github.com/kividbio/kividb/issues/437)), search index
+  names, prefixes and field names, and time-series label names and values.
 - A HyperLogLog copied from Redis (`DUMP`/`RESTORE`, an RDB, replication)
   loads and counts as it did on Redis. By default KiviDB writes new
   HyperLogLogs in its own format, which Redis refuses (`INVALIDOBJ`), and
@@ -158,14 +159,37 @@ other files:
   snapshot, an RDB file or a `DUMP` payload says about a filter is checked
   before it is used: one Redis could not have made is refused. Their `DUMP` payloads carry RDB version 9, so every Redis
   since 6.0 can `RESTORE` them.
+- Set and sorted-set members can't have their own TTLs. A Dragonfly file
+  with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
+  or sorted-set member, is refused, naming the key. Hash field TTLs from
+  either load. Dragonfly's Bloom, Cuckoo, count-min and top-k keys and its
+  compressed snapshot blocks are refused (save with `--compression_mode=0`).
+- KiviDB can't be a replica of a KeyDB primary in active replication
+  (`active-replica yes`): the link ends at its first `RREPLAY`, saying so.
+  Move that data by RDB file or with `MIGRATE`.
+- `JSON.NUMINCRBY` and `JSON.NUMMULTBY` refuse any integer result that does
+  not fit an `i64` with `ERR numeric overflow`, and change nothing. Redis
+  returns that error too, with three exceptions KiviDB doesn't copy: it
+  stores a `u64` for some array elements (`JSON.NUMINCRBY k $[0] 1` on
+  `[9223372036854775807]` succeeds), it gives a float for some integers
+  above `i64::MAX`, losing precision, and it can leave a multi-match path
+  half done ([#536](https://github.com/kividbio/kividb/issues/536)).
 
 **Server and introspection**
+- `HELLO` and `INFO`'s `redis_version` report the Redis release KiviDB
+  follows (`server: redis`, `version: 8.10.0`), as Dragonfly does, so that
+  clients use what that release has: redis-py's and Jedis's client-side
+  caches need Redis 7.4 or later. KiviDB's own release is `kividb_version`,
+  in `HELLO` and in `INFO`.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set.
 - `client-output-buffer-limit` isn't configurable.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica
   of a KiviDB master older than 1.1.3 expires keys by its own clock (such a
-  master sends no `DEL` for the keys it expires).
+  master sends no `DEL` for the keys it expires). A replica of a 1.2.0
+  master, and a 1.2.0 replica, expire hash fields by their own clock (1.2.0
+  sends no `HDEL` for the fields it expires, and a 1.2.0 replica does not
+  wait for one).
 
 **Cluster**
 - `FT.SPELLCHECK`, `FT.PROFILE`, `FT.HYBRID` and `FT.SYNDUMP` answer from the

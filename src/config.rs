@@ -94,6 +94,12 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub aof: bool,
 
+    /// When the append-only file is synced to disk: `always`, before the
+    /// reply to each write, as in Redis; `everysec`, once a second. `no` is
+    /// taken as `everysec`.
+    #[arg(long, default_value = "everysec")]
+    pub appendfsync: String,
+
     /// Start a rewritten AOF with a KDB image of the dataset, so recovery loads
     /// the bulk at snapshot speed and replays only what came after it.
     /// Disable to emit the plain command log older builds produce.
@@ -247,6 +253,11 @@ pub struct Config {
     /// Maximum number of slowlog entries to keep
     #[arg(long, default_value_t = 128)]
     pub slowlog_max_len: usize,
+
+    /// Maximum number of ACL LOG entries to keep (`acllog-max-len`); 0
+    /// keeps none
+    #[arg(long, default_value_t = 128)]
+    pub acllog_max_len: usize,
 
     /// True iff the server should run as a cluster node.
     /// Activated by `--cluster-enabled yes`. Defaults to false (standalone).
@@ -482,6 +493,11 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_bus_port: u16,
 
+    /// The port the cluster bus listens on (Redis 7's `cluster-port`).
+    /// 0 = `port` + 10000. Fixed at startup.
+    #[arg(long, default_value_t = 0)]
+    pub cluster_port: u16,
+
     /// A secret every node of the cluster shares. A node connecting to
     /// another's bus port must prove it knows it (a challenge and an
     /// HMAC-SHA256 answer; the secret itself is never sent) before anything
@@ -604,6 +620,7 @@ impl Default for Config {
             aclfile: "".into(),
             slowlog_log_slower_than: u64::MAX,
             slowlog_max_len: 128,
+            acllog_max_len: 128,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "/etc/kividb/kividb.conf".into(),
@@ -640,6 +657,7 @@ impl Default for Config {
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
+            cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
@@ -658,6 +676,7 @@ impl Default for Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            appendfsync: "everysec".into(),
         }
     }
 }
@@ -727,6 +746,7 @@ impl Config {
             aclfile: "".to_string(),
             slowlog_log_slower_than: 10_000,
             slowlog_max_len: 128,
+            acllog_max_len: 128,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
@@ -763,6 +783,7 @@ impl Config {
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
+            cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
@@ -781,6 +802,7 @@ impl Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            appendfsync: "everysec".into(),
         }
     }
 
@@ -940,6 +962,15 @@ impl Config {
                 self.hll_write_format
             ));
         }
+        if !matches!(
+            self.appendfsync.to_ascii_lowercase().as_str(),
+            "always" | "everysec" | "no"
+        ) {
+            return Err(format!(
+                "invalid appendfsync '{}' (expected always, everysec or no)",
+                self.appendfsync
+            ));
+        }
 
         if self.cluster_enabled {
             if self.replicaof.is_some() {
@@ -948,7 +979,7 @@ impl Config {
                         .into(),
                 );
             }
-            if self.client_port() > u16::MAX - 10000 {
+            if self.cluster_port == 0 && self.client_port() > u16::MAX - 10000 {
                 return Err(format!(
                     "port {} leaves no room for the cluster bus port (port + 10000)",
                     self.client_port()
@@ -974,8 +1005,12 @@ impl Config {
         Ok(warnings)
     }
 
-    /// The port the cluster bus listens on: 10000 above the client port.
+    /// The port the cluster bus listens on: `cluster-port`, or 10000 above
+    /// the client port (#430).
     pub fn cluster_bus_port(&self) -> u16 {
+        if self.cluster_port != 0 {
+            return self.cluster_port;
+        }
         self.client_port().saturating_add(10000)
     }
 
@@ -1111,6 +1146,7 @@ impl Config {
             us => out.push_str(&format!("slowlog-log-slower-than {us}\n")),
         }
         out.push_str(&format!("slowlog-max-len {}\n", self.slowlog_max_len));
+        out.push_str(&format!("acllog-max-len {}\n", self.acllog_max_len));
         out.push_str(&format!(
             "cluster-enabled {}\n",
             if self.cluster_enabled { "yes" } else { "no" }
@@ -1143,6 +1179,7 @@ impl Config {
         out.push_str(&format!("repl-backlog-ttl {}\n", self.repl_backlog_ttl));
         out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
         out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
+        out.push_str(&format!("appendfsync {}\n", self.appendfsync));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
         out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
         out.push_str(&format!("replica-priority {}\n", self.replica_priority));
@@ -1203,6 +1240,9 @@ impl Config {
                 "cluster-announce-bus-port {}\n",
                 self.cluster_announce_bus_port
             ));
+        }
+        if self.cluster_port != 0 {
+            out.push_str(&format!("cluster-port {}\n", self.cluster_port));
         }
         if !self.cluster_bus_secret.is_empty() {
             out.push_str(&format!("cluster-bus-secret {}\n", self.cluster_bus_secret));
@@ -1507,6 +1547,7 @@ impl Config {
                 )
             }
             "slowlog-max-len" => set!(slowlog_max_len, number(key, one()?)?),
+            "acllog-max-len" => set!(acllog_max_len, number(key, one()?)?),
             "slowlog-entry-max-argc" => set!(slowlog_entry_max_argc, number(key, one()?)?),
             "slowlog-entry-max-string-len" => {
                 set!(slowlog_entry_max_string_len, number(key, one()?)?)
@@ -1549,6 +1590,7 @@ impl Config {
                 set!(cluster_announce_client_port, number(key, one()?)?)
             }
             "cluster-announce-bus-port" => set!(cluster_announce_bus_port, number(key, one()?)?),
+            "cluster-port" => set!(cluster_port, number(key, one()?)?),
             "cluster-bus-secret" => set!(cluster_bus_secret, one()?.to_string()),
             "cluster-bus-port-protected-mode" => {
                 set!(cluster_bus_port_protected_mode, yes_no(key, one()?)?)
@@ -1702,13 +1744,26 @@ impl Config {
                     );
                 }
             }
-            "appendfsync" => match one()? {
-                "everysec" => {}
-                "always" | "no" => {
-                    return no_effect("the append-only file is synced once a second");
+            // When the AOF is synced (#513). It used to be read and warned
+            // about, and the file synced once a second whatever it said.
+            "appendfsync" => {
+                let value = one()?.to_ascii_lowercase();
+                if !matches!(value.as_str(), "always" | "everysec" | "no") {
+                    return Err(format!(
+                        "invalid value '{value}' for 'appendfsync': expected always, everysec \
+                         or no"
+                    ));
                 }
-                other => return Err(format!("invalid value '{other}' for 'appendfsync'")),
-            },
+                let no = value == "no";
+                set!(appendfsync, value);
+                if no {
+                    return Ok(Some(
+                        "'appendfsync no' syncs the append-only file once a second, as \
+                         'everysec' does"
+                            .into(),
+                    ));
+                }
+            }
             "save" => {
                 if args.iter().any(|a| !a.is_empty()) {
                     return no_effect(
@@ -1786,7 +1841,6 @@ impl Config {
             | "lazyfree-lazy-user-del"
             | "no-appendfsync-on-rewrite"
             | "proc-title-template"
-            | "rdbchecksum"
             | "rdbcompression"
             | "repl-disable-tcp-nodelay"
             | "repl-diskless-sync"
@@ -1840,6 +1894,7 @@ impl Config {
                                 | "lazyfree-lazy-expire"
                                 | "latency-tracking"
                                 | "latency-tracking-info-percentiles"
+                                | "rdbchecksum"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")
@@ -2160,8 +2215,8 @@ mod config_file_tests {
         .unwrap();
         // All but maxclients, latency-tracking and latency-monitor-threshold,
         // which the latency monitor and `INFO latencystats` go by (#158,
-        // #232).
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        // #232), and acllog-max-len, which the ACL log goes by.
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].contains("'hash-max-listpack-entries'"),
             "{warnings:?}"
@@ -2280,13 +2335,25 @@ mod config_file_tests {
 
     #[test]
     fn redis_directives_with_no_effect_are_reported_and_not_fatal() {
-        let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync always\n").unwrap();
+        let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync no\n").unwrap();
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings[0].contains("line 1") && warnings[0].contains("'save'"));
         // The values KiviDB already behaves as are not worth a warning.
         let (_, warnings) =
             load("save \"\"\nappendfsync everysec\ndaemonize no\ndbfilename dump.kdb\n").unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// `appendfsync` is read from the file, not warned about and ignored
+    /// (#513).
+    #[test]
+    fn appendfsync_is_read_from_the_file() {
+        let (config, warnings) = load("appendfsync always\n").unwrap();
+        assert_eq!(config.appendfsync, "always");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (config, _) = load("appendfsync EVERYSEC\n").unwrap();
+        assert_eq!(config.appendfsync, "everysec");
+        assert!(load("appendfsync sometimes\n").is_err());
     }
 
     /// Every option the file can set is asked about by the name clap knows

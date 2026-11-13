@@ -1,8 +1,7 @@
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired, parse_utf8};
+use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::types::SharedBytes;
@@ -499,7 +498,7 @@ fn hll_count(registers: &[u8]) -> u64 {
 
 // ── Get blobs ─────────────────────────────────────────────────────────────────
 
-fn delete_expired_key(ctx: &Ctx, key: &str) {
+fn delete_expired_key(ctx: &Ctx, key: &[u8]) {
     if is_expired(ctx.store, *ctx.selected_db, key) {
         delete_key_if_expired(ctx.store, *ctx.selected_db, key);
     }
@@ -526,19 +525,19 @@ fn dense_header(blob: &[u8], encoding: u8, invalidate: bool) -> [u8; HLL_HEADER_
     header
 }
 
-fn save_hll(ctx: &mut Ctx, key: &str, blob: SharedBytes) {
-    let key_owned = key.to_string();
+fn save_hll(ctx: &mut Ctx, key: &[u8], blob: SharedBytes) {
+    let key_owned = key.to_vec();
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
-    map.insert(Key::from(key_owned), KiviDBValue::String(blob));
+    map.insert(key_owned, KiviDBValue::String(blob));
 }
 
-fn save_dense_hll(ctx: &mut Ctx, key: &str, header: [u8; HLL_HEADER_SIZE], registers: &[u8]) {
+fn save_dense_hll(ctx: &mut Ctx, key: &[u8], header: [u8; HLL_HEADER_SIZE], registers: &[u8]) {
     save_hll(ctx, key, SharedBytes::concat(&[&header, registers]));
 }
 
-fn get_hll_blob(ctx: &Ctx, key: &str) -> Result<SharedBytes, Vec<u8>> {
+fn get_hll_blob(ctx: &Ctx, key: &[u8]) -> Result<SharedBytes, Vec<u8>> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
@@ -549,7 +548,7 @@ fn get_hll_blob(ctx: &Ctx, key: &str) -> Result<SharedBytes, Vec<u8>> {
     }
 }
 
-fn get_optional_hll(ctx: &Ctx, key: &str) -> Result<Option<SharedBytes>, Vec<u8>> {
+fn get_optional_hll(ctx: &Ctx, key: &[u8]) -> Result<Option<SharedBytes>, Vec<u8>> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
@@ -564,7 +563,7 @@ fn classify_for_reply(blob: &[u8]) -> Result<HllFormat, Vec<u8>> {
     classify_hll(blob).map_err(hll_error)
 }
 
-fn get_classified_hll(ctx: &Ctx, key: &str) -> Result<(SharedBytes, HllFormat), Vec<u8>> {
+fn get_classified_hll(ctx: &Ctx, key: &[u8]) -> Result<(SharedBytes, HllFormat), Vec<u8>> {
     let blob = get_hll_blob(ctx, key)?;
     let format = classify_for_reply(blob.as_slice())?;
     Ok((blob, format))
@@ -578,10 +577,7 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'pfadd' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     delete_expired_key(ctx, &key);
 
@@ -602,7 +598,7 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
             Some(_) => wrongtype(),
             None => {
                 let empty = make_empty_hll_shared(write_redis);
-                map.insert(Key::from(key.as_str()), KiviDBValue::String(empty));
+                map.insert(key.as_slice(), KiviDBValue::String(empty));
                 resp_integer(1)
             }
         };
@@ -665,7 +661,7 @@ fn cmd_pfadd(ctx: &mut Ctx) -> Vec<u8> {
             Err(e) => return e,
         }
     };
-    let replaced = map.insert(Key::from(key.as_str()), KiviDBValue::String(updated));
+    let replaced = map.insert(key.as_slice(), KiviDBValue::String(updated));
     drop(map);
     // What was there is freed with the shard let go of.
     drop(replaced);
@@ -710,10 +706,7 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     if cmd.len() == 2 {
-        let key = match parse_utf8(cmd[1]) {
-            Some(k) => k,
-            None => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = cmd[1];
 
         if is_expired(ctx.store, *ctx.selected_db, key) {
             expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -776,10 +769,7 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
     let mut legacy_space: Option<bool> = None;
 
     for key_bytes in &cmd[1..] {
-        let key = match parse_utf8(key_bytes) {
-            Some(k) => k,
-            None => continue,
-        };
+        let key: &[u8] = key_bytes;
 
         if is_expired(ctx.store, *ctx.selected_db, key) {
             expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -823,10 +813,7 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'pfmerge' command");
     }
-    let dest_key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR dest key must be valid UTF-8"),
-    };
+    let dest_key: Vec<u8> = cmd[1].to_vec();
 
     delete_expired_key(ctx, &dest_key);
 
@@ -854,11 +841,9 @@ fn cmd_pfmerge(ctx: &mut Ctx) -> Vec<u8> {
         merge_registers(&mut merged, registers.as_slice());
     }
 
+    // Any bytes: a source key that is not text used to be passed over.
     for key_bytes in &cmd[2..] {
-        let key = match parse_utf8(key_bytes) {
-            Some(k) => k,
-            None => continue,
-        };
+        let key: &[u8] = key_bytes;
 
         delete_expired_key(ctx, key);
 
@@ -969,10 +954,7 @@ fn cmd_pfdebug(ctx: &mut Ctx) -> Vec<u8> {
     let subcmd = std::str::from_utf8(cmd[1])
         .unwrap_or("")
         .to_ascii_uppercase();
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[2].to_vec();
 
     if is_expired(ctx.store, *ctx.selected_db, &key) {
         delete_key_if_expired(ctx.store, *ctx.selected_db, &key);

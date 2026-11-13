@@ -66,11 +66,7 @@ fn sets_at(ctx: &Ctx, keys: &[&[u8]]) -> Result<Vec<Option<Set>>, Vec<u8>> {
     let db = *ctx.selected_db;
     let mut out = Vec::with_capacity(keys.len());
     for raw in keys {
-        let Some(key) = parse_utf8(raw) else {
-            // Keys are stored as UTF-8, so no such key exists.
-            out.push(None);
-            continue;
-        };
+        let key: &[u8] = raw;
         let gone = lazy_expire_on_read(ctx.store, db, key);
         let shard = store::get_shard(&ctx.store[db], key);
         match read_lock!(shard).get(key).filter(|_| !gone) {

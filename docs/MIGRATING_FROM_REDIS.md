@@ -54,7 +54,7 @@ The ones that behave differently:
 |---|---|
 | `io-threads` | Accepted, no effect: commands run on every core. `--threads` sets the worker count (default: cores − 2). |
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
-| `appendfsync` | Only `everysec`. `always` and `no` are accepted with a warning. |
+| `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
 | `client-output-buffer-limit` | Not supported: remove it. Pub/Sub subscribers get Redis's default limits. |
 | `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets and Bloom filters (`BF.*`) are built in. |
@@ -106,16 +106,28 @@ What the RDB reader takes from Redis:
   Count-min sketches, Top-K, t-digests) is refused, and so is the whole
   file: KiviDB won't load part of a snapshot. Move those keys with `MIGRATE`
   instead, or recreate them.
+- **Dragonfly and KeyDB.** Their RDB files (Dragonfly: `SAVE RDB`) and
+  `DUMP` payloads load, including hash field TTLs (Dragonfly's `HSETEX` and
+  `FIELDEXPIRE`, KeyDB's `EXPIREMEMBER` on a hash) and Dragonfly's JSON
+  documents. KiviDB can replicate from a KeyDB primary, but not from one
+  in active replication (`active-replica yes`): the link ends at its first
+  `RREPLAY`, saying so; move that data by RDB file or with `MIGRATE`. Set
+  and sorted-set members with their own TTLs
+  (Dragonfly's `SADDEX`, KeyDB's `EXPIREMEMBER` on a set or sorted set) have
+  no equivalent, so the file, or the replication link, is refused with the
+  key named. Save Dragonfly's file with `--compression_mode=0`: its
+  compressed blocks aren't read. Dragonfly's own `.dfs` snapshot format
+  isn't read. KeyDB's `DUMP` leaves member TTLs out, so `RESTORE` and
+  `MIGRATE` from KeyDB can't carry them: move hashes with field TTLs by
+  file or by replication.
 - **HyperLogLogs** load and count as they did on Redis. Set
   `hll-write-format redis` on KiviDB before you switch over: by default it
   writes new HyperLogLogs in its own format, and `PFMERGE` or a multi-key
   `PFCOUNT` refuses to combine those with the ones copied from Redis
   ([PERSISTENCE.md](PERSISTENCE.md)).
-- **Key names must be valid UTF-8**
-  ([#437](https://github.com/kividbio/kividb/issues/437)). Redis keys are
-  binary-safe; a snapshot with a non-UTF-8 key name loads, but clients can't
-  write that name again ([#446](https://github.com/kividbio/kividb/issues/446)).
-  List such keys on the source before you move.
+- **Keys of any bytes** move over and work as on Redis (#437, #446). An
+  ACL rule whose key pattern is not UTF-8 is not taken yet: list such rules
+  on the source before you move.
 
 ## 5. Persistence and durability
 
@@ -125,7 +137,8 @@ What the RDB reader takes from Redis:
 - **With the AOF on, a write is answered once its record is in the file**,
   as in Redis: a `kill -9` or an OOM kill loses no acknowledged write while
   the disk keeps up, and a power failure loses up to a second, as with
-  Redis's `appendfsync everysec`. A reply waits at most 5 s for its record;
+  Redis's `appendfsync everysec` (none with `appendfsync always`, which
+  syncs each write before its reply). Under `everysec`, a reply waits at most 5 s for its record;
   if the disk falls further behind than that, replies go out without their
   writes and `aof_acks_before_write` counts them, so size the AOF's disk for
   the write load. Before 1.2 a write was answered once its record was queued,

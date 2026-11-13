@@ -1,0 +1,523 @@
+"""Charts and tables from parse.py's summary JSON.
+
+Usage: python charts.py <summary.json> <charts dir> <tables.md>
+Every pass is a full pass (searches and a load), so a search point's q/s is
+the median of the three passes' medians (each pass: three repetitions), with
+the passes' min-max as whiskers and spread. Ingest time and memory use every
+pass too (median, min-max). One idea per chart, SVG, white background, the
+suite-wide engine colors.
+
+The two KiviDB builds are set from the environment (the 1.2.1 round's defaults):
+  CAND, CAND_NAME   the build under test  (kividb-121, "KiviDB 1.2.1")
+  BASE, BASE_NAME   the reference build   (kividb-120, "KiviDB 1.2.0")
+  BASE_SHORT        the reference's short name in the regression chart ("1.2.0")
+  BASE_IN_MAIN=1    also draw the reference in the main charts and tables (default 1)
+"""
+import json, os, statistics, sys
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+plt.rcParams.update({
+    "svg.fonttype": "none", "font.family": "DejaVu Sans", "font.size": 10,
+    "axes.facecolor": "white", "figure.facecolor": "white", "savefig.facecolor": "white",
+    "axes.edgecolor": "#444444", "axes.labelcolor": "#222222", "text.color": "#222222",
+    "xtick.color": "#333333", "ytick.color": "#333333",
+    "axes.grid": True, "grid.color": "#e3e3e3", "grid.linewidth": 0.8, "axes.axisbelow": True,
+    "axes.spines.top": False, "axes.spines.right": False,
+})
+
+CAND = os.environ.get("CAND", "kividb-121")
+BASE = os.environ.get("BASE", "kividb-120")
+CAND_NAME = os.environ.get("CAND_NAME", "KiviDB 1.2.1")
+BASE_NAME = os.environ.get("BASE_NAME", "KiviDB 1.2.0")
+BASE_SHORT = os.environ.get("BASE_SHORT", "1.2.0")
+CAND_SHORT = os.environ.get("CAND_SHORT", "1.2.1")
+ENGINES = {
+    # label: (legend name, color, linestyle, marker, hatch)
+    CAND: (CAND_NAME, "#0072B2", "-", "o", None),
+    BASE: (BASE_NAME, "#56B4E9", "-", "s", None),
+    "redis": ("Redis 8.10.2 (workflow flags)", "#D55E00", "-", "^", None),
+    "redis-mt": ("Redis 8.10.2 + io-threads 8", "#D55E00", "--", "v", "///"),
+    "dragonfly": ("Dragonfly 2.0.2", "#CC79A7", "-", "D", None),
+}
+ORDER = [CAND] + ([BASE] if os.environ.get("BASE_IN_MAIN", "1") == "1" else []) + ["redis", "redis-mt", "dragonfly"]
+DS = {
+    "h-and-m-2048-angular-filters": "h-and-m 2048-d, filtered (105K)",
+    "dbpedia-openai-100K-1536-angular": "dbpedia 1536-d (100K)",
+    "glove-25-angular": "glove 25-d (1.18M)",
+    "dbpedia-openai-1M-1536-angular": "dbpedia 1536-d (1M, text-embedding-3-large)",
+}
+# Takeaway lines for the summary charts, set from the final numbers.
+TITLES = json.loads(os.environ.get("CHART_TITLES", "{}"))
+
+SHORT = {"h-and-m-2048-angular-filters": "h-and-m", "dbpedia-openai-100K-1536-angular": "dbpedia-100K",
+         "glove-25-angular": "glove-25", "dbpedia-openai-1M-1536-angular": "dbpedia-1M"}
+
+
+def engines_in(runs, order=ORDER):
+    present = {r["engine"] for r in runs}
+    return [e for e in order if e in present]
+
+
+def legend_out(ax, **kw):
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), frameon=False, **kw)
+
+
+def save(fig, out, name):
+    fig.savefig(os.path.join(out, name), format="svg", bbox_inches="tight")
+    if os.environ.get("PNG_PREVIEW"):  # local preview only, not published
+        fig.savefig(os.path.join(os.environ["PNG_PREVIEW"], name[:-4] + ".png"), dpi=80, bbox_inches="tight")
+    plt.close(fig)
+
+
+def full_runs(runs):
+    return [r for r in runs if r["searches"]]
+
+
+def pick(runs, e, ds):
+    return [r for r in runs if r["engine"] == e and r["dataset"] == ds]
+
+
+def med(v):
+    v = [x for x in v if x is not None]
+    return statistics.median(v) if v else None
+
+
+def search_agg(runs, e, ds):
+    """(ef, parallel) -> the point over every full pass: median of the passes'
+    medians, their min/max, the spread between passes, the largest spread of
+    the three repetitions inside one pass, and the medians of recall and of
+    the per-pass latency percentiles."""
+    pts = {}
+    for r in sorted(pick(full_runs(runs), e, ds), key=lambda r: r["pass"]):
+        for s in r["searches"]:
+            pts.setdefault((s["ef"], s["parallel"]), []).append(s)
+    out = {}
+    for k, ss in pts.items():
+        meds = [s["median_rps"] for s in ss]
+        m = statistics.median(meds)
+        out[k] = {
+            "ef": k[0], "parallel": k[1], "n": len(ss), "median_rps": m, "pass_meds": meds,
+            "lo": min(meds), "hi": max(meds),
+            "spread_pct": 100 * (max(meds) - min(meds)) / m if len(meds) > 1 else None,
+            "rep_spread_pct": max((s["spread_pct"] or 0) for s in ss),
+            "recall": med(s["recall"] for s in ss),
+            "p50_ms": med(s["p50_ms"] for s in ss), "p95_ms": med(s["p95_ms"] for s in ss),
+            "p99_ms": med(s["p99_ms"] for s in ss), "p999_ms": med(s.get("p999_ms") for s in ss),
+            "client_saturated": any(s.get("client_saturated") for s in ss),
+        }
+    return out
+
+
+def ordered_points(agg):
+    return [agg[k] for k in sorted(agg, key=lambda k: (k[1], k[0]))]
+
+
+def lead(vals):
+    """takeaway helper: (engine label, value) with the max value."""
+    vals = [(k, v) for k, v in vals if v]
+    return max(vals, key=lambda kv: kv[1]) if vals else (None, None)
+
+
+def interp(curve, t):
+    """q/s at recall t on a (recall, q/s) curve, linear between measured points."""
+    for (r1, q1), (r2, q2) in zip(curve, curve[1:]):
+        if r1 <= t <= r2:
+            return q1 + (q2 - q1) * (t - r1) / (r2 - r1) if r2 > r1 else max(q1, q2)
+    return None
+
+
+def chart_qps_recall(runs, out, ds):
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    best = []
+    curves = {}
+    par = 100 if ds == "glove-25-angular" else 1
+    for e in engines_in(full_runs(runs)):
+        a = search_agg(runs, e, ds)
+        pts = sorted([(s["recall"], s["median_rps"], s["ef"]) for s in a.values()
+                      if s["parallel"] == par and s["recall"] is not None], key=lambda p: p[2])
+        if not pts:
+            continue
+        name, c, ls, mk, _ = ENGINES[e]
+        ax.plot([p[0] for p in pts], [p[1] for p in pts], ls=ls, color=c, marker=mk, ms=7, lw=2.6 if e == CAND else 1.8, label=name, zorder=5 if e == CAND else 2)
+        for p in pts:
+            if e == CAND:
+                ax.annotate(f"ef {p[2]}", (p[0], p[1]), textcoords="offset points", xytext=(6, 4), fontsize=8, color="#555555")
+        best.append((name, max(p[1] for p in pts)))
+        curves[e] = sorted((p[0], p[1]) for p in pts)
+    w, v = lead(best)
+    sub = f"highest q/s: {w} ({v:,.0f} q/s)"
+    # Where the main engines' recall ranges overlap, compare them at one recall.
+    main = [e for e in (CAND, "redis", "dragonfly") if e in curves]
+    if len(main) == 3:
+        lo = max(min(p[0] for p in curves[e]) for e in main)
+        hi = min(max(p[0] for p in curves[e]) for e in main)
+        if hi - lo > 0.002:
+            t = round((lo + hi) / 2, 3)
+            vals = [(ENGINES[e][0].split(" (")[0], interp(curves[e], t)) for e in main]
+            sub = f"at recall {t}: " + ", ".join(f"{n} {q:,.0f} q/s" for n, q in vals)
+    ax.set_title(f"{DS[ds]}: queries/s vs recall@10 at {par} client{'s' if par > 1 else ''}\n" + sub,
+                 fontsize=11, loc="left")
+    ax.set_xlabel("recall@10 (higher is better)")
+    ax.set_ylabel("queries per second (median of 3 passes)")
+    ax.set_ylim(bottom=0)
+    legend_out(ax)
+    save(fig, out, f"qps-vs-recall-{SHORT[ds]}.svg")
+
+
+def chart_qps_parallel(runs, out, ds):
+    pars = [1, 16, 100]
+    eng = [e for e in engines_in(full_runs(runs)) if pick(full_runs(runs), e, ds)]
+    if not eng:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(10, 3.8))
+    for ax, par in zip(axes, pars):
+        for i, e in enumerate(eng):
+            s = search_agg(runs, e, ds).get((128, par))
+            if not s:
+                continue
+            name, c, _, _, hatch = ENGINES[e]
+            ax.bar(i, s["median_rps"], color=c if not hatch else "white", edgecolor=c, hatch=hatch, lw=1.5,
+                   label=name, yerr=[[s["median_rps"] - s["lo"]], [s["hi"] - s["median_rps"]]], capsize=3,
+                   error_kw={"ecolor": "#333333", "lw": 1})
+            ax.text(i, s["hi"], f"{s['median_rps']:,.0f}", ha="center", va="bottom", fontsize=7.5,
+                    rotation=90 if len(eng) > 4 else 0, color="#222222")
+        ax.set_title(f"{par} client{'s' if par > 1 else ''}", fontsize=10)
+        ax.set_xticks([])
+        ax.set_ylim(bottom=0)
+        ax.margins(y=0.25)
+    axes[0].set_ylabel("queries per second (ef 128)")
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper left", bbox_to_anchor=(0.99, 0.9), frameon=False)
+    fig.suptitle(f"{DS[ds]}: queries/s by client count, ef 128 (median of 3 passes, whiskers min-max)",
+                 x=0.02, ha="left", fontsize=11)
+    fig.tight_layout()
+    save(fig, out, f"qps-by-parallel-{SHORT[ds]}.svg")
+
+
+def agg(runs, e, ds, key):
+    v = [r[key] for r in pick(runs, e, ds) if r.get(key) is not None]
+    if not v:
+        return None
+    return statistics.median(v), min(v), max(v), len(v)
+
+
+def bpv_list(runs, e, ds):
+    return [(r["post_rss"] - r["idle_rss"]) / r["post_keys"] for r in pick(runs, e, ds)
+            if r.get("post_rss") and r.get("post_keys")]
+
+
+def chart_ingest(runs, out):
+    dss = [d for d in DS if any(r["dataset"] == d for r in runs)]
+    eng = engines_in(runs)
+    fig, axes = plt.subplots(1, len(dss), figsize=(3.1 * len(dss) + 1.5, 3.9))
+    if len(dss) == 1:
+        axes = [axes]
+    for ax, ds in zip(axes, dss):
+        for i, e in enumerate(eng):
+            a = agg(runs, e, ds, "ingest_s")
+            if not a:
+                continue
+            name, c, _, _, hatch = ENGINES[e]
+            ax.bar(i, a[0], color=c if not hatch else "white", edgecolor=c, hatch=hatch, lw=1.5, label=name,
+                   yerr=[[a[0] - a[1]], [a[2] - a[0]]], capsize=3, error_kw={"ecolor": "#333333", "lw": 1})
+            ax.text(i, a[2], f"{a[0]:.1f}" if a[0] < 100 else f"{a[0]:.0f}", ha="center", va="bottom", fontsize=8)
+        ax.set_title(SHORT[ds], fontsize=10)
+        ax.set_xticks([])
+        ax.set_ylim(bottom=0)
+        ax.margins(y=0.15)
+    axes[0].set_ylabel("seconds to load + index (lower is better)")
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper left", bbox_to_anchor=(0.99, 0.9), frameon=False)
+    fig.suptitle(TITLES.get("ingest", "") + "Ingest: seconds to upload every vector and finish indexing (median of 3 loads, whiskers min-max)",
+                 x=0.02, ha="left", fontsize=11)
+    fig.tight_layout()
+    save(fig, out, "ingest-time.svg")
+
+
+def first_pass(runs):
+    ps = sorted({r["pass"] for r in runs})
+    return "p1" if "p1" in ps else ps[0]
+
+
+def chart_mem_time(runs, out, ds, pas=None):
+    pas = pas or first_pass(runs)
+    eng = [e for e in engines_in(runs) if any(r["pass"] == pas for r in pick(runs, e, ds))]
+    if not eng:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.3))
+    peaks = []
+    for e in eng:
+        r = [x for x in pick(runs, e, ds) if x["pass"] == pas][0]
+        if not r.get("mem_series") or r.get("load_start_rel") is None:
+            continue
+        name, c, ls, mk, _ = ENGINES[e]
+        t0 = r["load_start_rel"]
+        end = r["load_end_rel"] - t0
+        stop = (r["cleanup_rel"] - t0) if r.get("cleanup_rel") else end * 1.25 + 10
+        stop = min(stop, end * 1.25 + 10)  # until the tool deletes the data
+        ser = [m for m in r["mem_series"] if m[1] and -5 <= m[0] - t0 <= stop]
+        xs = [m[0] - t0 for m in ser]
+        ys = [m[1] / 2**30 for m in ser]
+        ax.plot(xs, ys, color=c, ls=ls, lw=2.6 if e == CAND else 1.8, label=name, zorder=5 if e == CAND else 2)
+        yend = [m[1] for m in ser if m[0] - t0 <= end]
+        if yend:
+            ax.plot([end], [yend[-1] / 2**30], marker=mk, ms=9, color=c, mec="white", mew=1.5, ls="none")
+            if e == CAND:
+                ax.annotate("load end", (end, yend[-1] / 2**30), textcoords="offset points", xytext=(5, -12),
+                            fontsize=7.5, color="#555555")
+        peaks.append((name, max(ys)))
+    ax.axvline(0, color="#777777", lw=1, ls=":")
+    ax.text(0, ax.get_ylim()[1] * 0.97, " load start", fontsize=8, color="#555555", va="top")
+    if not peaks:
+        plt.close(fig)
+        return
+    lo = min(peaks, key=lambda p: p[1])
+    ax.set_title(f"{DS[ds]}: server RSS while loading (sampled every 0.5 s)\n"
+                 f"lowest peak: {lo[0]} ({lo[1]:.2f} GiB); marker = that engine's load end",
+                 fontsize=11, loc="left")
+    ax.set_xlabel("seconds since the client started uploading")
+    ax.set_ylabel("resident memory (GiB)")
+    ax.set_ylim(bottom=0)
+    legend_out(ax)
+    save(fig, out, f"memory-over-time-{SHORT[ds]}.svg")
+
+
+def chart_mem_vs_vectors(runs, out, ds, pas=None):
+    pas = pas or first_pass(runs)
+    eng = [e for e in engines_in(runs) if any(r["pass"] == pas for r in pick(runs, e, ds))]
+    if not eng:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.3))
+    for e in eng:
+        r = [x for x in pick(runs, e, ds) if x["pass"] == pas][0]
+        if not r.get("mem_series"):
+            continue
+        name, c, ls, _, _ = ENGINES[e]
+        end = r["load_end_rel"]
+        ser = [m for m in r["mem_series"] if m[1] and m[3] is not None and m[0] <= end + 0.6]
+        # keep the rising part only (the tool deletes the data after the run)
+        pts, kmax = [], -1
+        for m in ser:
+            if m[3] >= kmax:
+                kmax = m[3]
+                pts.append(m)
+        ax.plot([m[3] / 1e3 for m in pts], [m[1] / 2**30 for m in pts], color=c, ls=ls, lw=2.6 if e == CAND else 1.8, label=name, zorder=5 if e == CAND else 2)
+    ax.set_title(f"{DS[ds]}: memory as the dataset grows\n"
+                 "server RSS against vectors stored so far, sampled during the load", fontsize=11, loc="left")
+    ax.set_xlabel("vectors stored (thousands)")
+    ax.set_ylabel("resident memory (GiB)")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    legend_out(ax)
+    save(fig, out, f"memory-vs-vectors-{SHORT[ds]}.svg")
+
+
+def chart_after_delete(runs, out, ds, pas="p3"):
+    """RSS after the tool deleted the index and every document (pass 3 lingers 45 s)."""
+    eng = [e for e in engines_in(runs) if any(r["pass"] == pas and r.get("cleanup_rel") for r in pick(runs, e, ds))]
+    if not eng:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.3))
+    for e in eng:
+        r = [x for x in pick(runs, e, ds) if x["pass"] == pas][0]
+        name, c, ls, _, _ = ENGINES[e]
+        c0 = r["cleanup_rel"]
+        ser = [m for m in r["mem_series"] if m[1] and m[0] >= c0 - 5]
+        ax.plot([m[0] - c0 for m in ser], [m[1] / 2**30 for m in ser], color=c, ls=ls,
+                lw=2.6 if e == CAND else 1.8, label=name, zorder=5 if e == CAND else 2)
+    ax.axvline(0, color="#777777", lw=1, ls=":")
+    ax.text(0, ax.get_ylim()[1] * 0.97, " tool deletes index + documents", fontsize=8, color="#555555", va="top")
+    ax.set_title(TITLES.get("after_delete", f"{DS[ds]}: memory given back after deleting everything") +
+                 "\nserver RSS from the moment the client drops the index and deletes every document", fontsize=11, loc="left")
+    ax.set_xlabel("seconds since the delete started")
+    ax.set_ylabel("resident memory (GiB)")
+    ax.set_ylim(bottom=0)
+    legend_out(ax)
+    save(fig, out, f"memory-after-delete-{SHORT[ds]}.svg")
+
+
+def chart_bytes_per_vector(runs, out):
+    dss = [d for d in DS if any(r["dataset"] == d for r in runs)]
+    eng = engines_in(runs)
+    fig, axes = plt.subplots(1, len(dss), figsize=(3.1 * len(dss) + 1.5, 3.9))
+    if len(dss) == 1:
+        axes = [axes]
+    for ax, ds in zip(axes, dss):
+        dim = {"h-and-m-2048-angular-filters": 2048, "glove-25-angular": 25}.get(ds, 1536)
+        for i, e in enumerate(eng):
+            v = bpv_list(runs, e, ds)
+            if not v:
+                continue
+            m = statistics.median(v)
+            name, c, _, _, hatch = ENGINES[e]
+            ax.bar(i, m, color=c if not hatch else "white", edgecolor=c, hatch=hatch, lw=1.5, label=name)
+            ax.text(i, m, f"{m:,.0f}", ha="center", va="bottom", fontsize=7.5)
+        ax.axhline(dim * 4, color="#555555", lw=1, ls=":")
+        ax.text(-0.45, dim * 4, f"one float32 copy: {dim * 4:,} B", fontsize=7, ha="left", va="bottom",
+                color="#333333", bbox={"facecolor": "white", "edgecolor": "none", "pad": 1}, zorder=6)
+        ax.set_title(SHORT[ds], fontsize=10)
+        ax.set_xticks([])
+        ax.set_ylim(bottom=0)
+        ax.margins(y=0.15)
+    axes[0].set_ylabel("bytes of RSS per stored vector")
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper left", bbox_to_anchor=(0.99, 0.9), frameon=False)
+    fig.suptitle(TITLES.get("bpv", "") + "Memory per vector after loading: (RSS after load - idle RSS) / vectors, median of 3 loads",
+                 x=0.02, ha="left", fontsize=11)
+    fig.tight_layout()
+    save(fig, out, "memory-per-vector.svg")
+
+
+def regression_rows(runs):
+    """Every search point of the build under test against the reference, both over 3 passes."""
+    rows = []
+    for ds in DS:
+        a, b = search_agg(runs, BASE, ds), search_agg(runs, CAND, ds)
+        for k in sorted(a, key=lambda k: (k[1], k[0])):
+            if k not in b:
+                continue
+            sa, sb = a[k], b[k]
+            ratio = sb["median_rps"] / sa["median_rps"]
+            noise = max(sa["spread_pct"] or 0, sb["spread_pct"] or 0)
+            verdict = "regression" if (1 - ratio) * 100 > noise else ("faster" if (ratio - 1) * 100 > noise else "same")
+            rows.append({"ds": ds, "ef": k[0], "par": k[1], "a": sa, "b": sb, "ratio": ratio,
+                         "noise": noise, "verdict": verdict})
+    return rows
+
+
+def chart_regression(runs, out):
+    rows = regression_rows(runs)
+    if not rows:
+        return
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(11, 7.4), gridspec_kw={"height_ratios": [1.6, 1]})
+    x = list(range(len(rows)))
+    for off, key, e in ((-0.2, "a", BASE), (0.2, "b", CAND)):
+        name, c, *_ = ENGINES[e]
+        base = [r["a"]["median_rps"] for r in rows]
+        ys = [100 * r[key]["median_rps"] / b for r, b in zip(rows, base)]
+        lo = [100 * r[key]["lo"] / b for r, b in zip(rows, base)]
+        hi = [100 * r[key]["hi"] / b for r, b in zip(rows, base)]
+        ax.bar([i + off for i in x], ys, width=0.38, color=c, label=name,
+               yerr=[[max(0, y - l) for y, l in zip(ys, lo)], [max(0, h - y) for y, h in zip(ys, hi)]], capsize=2,
+               error_kw={"ecolor": "#333333", "lw": 0.8})
+    for i, r in zip(x, rows):
+        ax.text(i + 0.2, 100 * r["b"]["hi"] / r["a"]["median_rps"] + 0.4, f"{100 * r['ratio']:.0f}",
+                ha="center", va="bottom", fontsize=7)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{SHORT[r['ds']]}\nef{r['ef']} c{r['par']}" for r in rows], fontsize=7, rotation=90)
+    ax.set_ylim(80, 112)
+    ax.axhline(100, color="#555555", lw=0.8)
+    ax.set_ylabel(f"q/s, % of {BASE_SHORT}'s median")
+    ax.set_title(TITLES.get("regression", "") + f"Search: every point, median of 3 passes (whiskers: the passes' min-max), as % of {BASE_SHORT}",
+                 fontsize=11, loc="left")
+    legend_out(ax)
+    # ingest time and bytes per vector, per dataset
+    dss = [d for d in DS if pick(runs, CAND, d) and pick(runs, BASE, d)]
+    labels, va, vb, ea, eb = [], [], [], [], []
+    for ds in dss:
+        for what, key in (("ingest s", "ingest_s"), ("RSS B/vector", None)):
+            if key:
+                A, B = [r[key] for r in pick(runs, BASE, ds) if r.get(key)], [r[key] for r in pick(runs, CAND, ds) if r.get(key)]
+            else:
+                A, B = bpv_list(runs, BASE, ds), bpv_list(runs, CAND, ds)
+            if not A or not B:
+                continue
+            m = statistics.median(A)
+            labels.append(f"{SHORT[ds]}\n{what}")
+            va.append(100.0); vb.append(100 * statistics.median(B) / m)
+            ea.append((100 * min(A) / m, 100 * max(A) / m)); eb.append((100 * min(B) / m, 100 * max(B) / m))
+    x2 = list(range(len(labels)))
+    for off, vals, err, e in ((-0.2, va, ea, BASE), (0.2, vb, eb, CAND)):
+        name, c, *_ = ENGINES[e]
+        ax2.bar([i + off for i in x2], vals, width=0.38, color=c, label=name,
+                yerr=[[max(0, v - l) for v, (l, h) in zip(vals, err)], [max(0, h - v) for v, (l, h) in zip(vals, err)]],
+                capsize=2, error_kw={"ecolor": "#333333", "lw": 0.8})
+    for i, v in zip(x2, vb):
+        ax2.text(i + 0.2, v + 0.6, f"{v:.0f}", ha="center", va="bottom", fontsize=7)
+    ax2.set_xticks(x2)
+    ax2.set_xticklabels(labels, fontsize=7.5)
+    ax2.set_ylim(80, 112)
+    ax2.axhline(100, color="#555555", lw=0.8)
+    ax2.set_ylabel(f"% of {BASE_SHORT} (lower is better)")
+    ax2.set_title(f"Ingest time and memory per vector, median of 3 loads (whiskers min-max), as % of {BASE_SHORT}", fontsize=11, loc="left")
+    fig.tight_layout()
+    save(fig, out, f"regression-vs-{BASE_SHORT}.svg")
+
+
+def tables(runs, path):
+    f = lambda x, d=2: "-" if x is None else f"{x:,.{d}f}"
+    L = []
+    for ds in DS:
+        if not any(r["dataset"] == ds for r in runs):
+            continue
+        L.append(f"\n### {DS[ds]}\n")
+        L.append("| engine | ef | clients | q/s median (3 passes) | spread between passes | largest spread of 3 reps | recall@10 | p50 ms | p95 ms | p99 ms | p99.9 ms | client-bound? |")
+        L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+        for e in engines_in(full_runs(runs)):
+            for s in ordered_points(search_agg(runs, e, ds)):
+                L.append(f"| {ENGINES[e][0]} | {s['ef']} | {s['parallel']} | {f(s['median_rps'], 0)} | "
+                         f"{f(s['spread_pct'], 1)}% | {f(s['rep_spread_pct'], 1)}% | {f(s['recall'], 4)} | {f(s['p50_ms'])} | {f(s['p95_ms'])} | "
+                         f"{f(s['p99_ms'])} | {f(s['p999_ms'])} | {'yes' if s.get('client_saturated') else 'no'} |")
+        L.append("")
+        L.append("| engine | loads | upload s (median, min-max) | index wait s | upload+index s | peak RSS GiB | RSS after load GiB | used_memory after load GiB | RSS B/vector | used_memory B/vector |")
+        L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for e in engines_in(runs, ORDER + ([] if BASE in ORDER else [BASE])):
+            rr = [r for r in pick(runs, e, ds) if r.get("upload_s")]
+            if not rr:
+                continue
+            md = lambda k: statistics.median([r[k] for r in rr if r.get(k) is not None]) if any(r.get(k) is not None for r in rr) else None
+            up = [r["upload_s"] for r in rr]
+            bpv = statistics.median([(r["post_rss"] - r["idle_rss"]) / r["post_keys"] for r in rr if r.get("post_keys")])
+            upv = statistics.median([(r["post_used"] - r["idle_used"]) / r["post_keys"] for r in rr if r.get("post_keys") and r.get("post_used")])
+            L.append(f"| {ENGINES[e][0]} | {len(rr)} | {statistics.median(up):.1f} ({min(up):.1f}-{max(up):.1f}) | "
+                     f"{md('index_wait_s'):.2f} | {md('ingest_s'):.1f} | {md('peak_rss') / 2**30:.2f} | "
+                     f"{md('post_rss') / 2**30:.2f} | {md('post_used') / 2**30:.2f} | {bpv:,.0f} | {upv:,.0f} |")
+    rows = regression_rows(runs)
+    if rows:
+        L.append(f"\n### {CAND_NAME} against {BASE_NAME} (same VMs, same session, 3 passes each)\n")
+        A, B = BASE_SHORT, CAND_SHORT
+        L.append(f"| dataset | ef | clients | {A} q/s | {B} q/s | {B}/{A} | run-to-run spread | verdict | {A} recall | {B} recall | {A} p50 / p99 / p99.9 ms | {B} p50 / p99 / p99.9 ms |")
+        L.append("|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|")
+        for r in rows:
+            a, b = r["a"], r["b"]
+            L.append(f"| {SHORT[r['ds']]} | {r['ef']} | {r['par']} | {a['median_rps']:,.0f} | {b['median_rps']:,.0f} | "
+                     f"{r['ratio']:.3f} | {r['noise']:.1f}% | {r['verdict']} | {a['recall']:.4f} | {b['recall']:.4f} | "
+                     f"{f(a['p50_ms'])} / {f(a['p99_ms'])} / {f(a['p999_ms'])} | {f(b['p50_ms'])} / {f(b['p99_ms'])} / {f(b['p999_ms'])} |")
+        L.append("")
+        L.append(f"| dataset | {A} upload+index s (median, min-max) | {B} | {B}/{A} | {A} RSS B/vector | {B} RSS B/vector | {B}/{A} |")
+        L.append("|---|---:|---:|---:|---:|---:|---:|")
+        for ds in DS:
+            a = [r["ingest_s"] for r in pick(runs, BASE, ds) if r.get("ingest_s")]
+            b = [r["ingest_s"] for r in pick(runs, CAND, ds) if r.get("ingest_s")]
+            if not a or not b:
+                continue
+            ta, tb = statistics.median(a), statistics.median(b)
+            ba, bb = statistics.median(bpv_list(runs, BASE, ds)), statistics.median(bpv_list(runs, CAND, ds))
+            L.append(f"| {SHORT[ds]} | {ta:.1f} ({min(a):.1f}-{max(a):.1f}) | {tb:.1f} ({min(b):.1f}-{max(b):.1f}) | {tb / ta:.3f} | "
+                     f"{ba:,.0f} | {bb:,.0f} | {bb / ba:.3f} |")
+    open(path, "w", newline="\n").write("\n".join(L) + "\n")
+
+
+def main(summary, out, tables_md):
+    runs = json.load(open(summary))
+    runs = [r for r in runs if r["pass"] in ("p1", "p2", "p3")]   # purge runs have their own chart
+    os.makedirs(out, exist_ok=True)
+    for ds in DS:
+        if not any(r["dataset"] == ds for r in runs):
+            continue
+        chart_qps_recall(runs, out, ds)
+        if ds != "glove-25-angular":
+            chart_qps_parallel(runs, out, ds)
+        chart_mem_time(runs, out, ds)
+        chart_mem_vs_vectors(runs, out, ds)
+    chart_after_delete(runs, out, "dbpedia-openai-1M-1536-angular")
+    chart_ingest(runs, out)
+    chart_bytes_per_vector(runs, out)
+    chart_regression(runs, out)
+    tables(runs, tables_md)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:4])

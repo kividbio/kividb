@@ -251,6 +251,16 @@ pub fn record_command_processed() {
     tl_bump!(TL_COMMANDS);
 }
 
+/// A command counted by [`record_command_processed`] did not run after all:
+/// it is dispatched again (a write a `CLIENT PAUSE` sent back to be held),
+/// and counted then. On the thread that counted it.
+pub fn unrecord_command_processed() {
+    TL_COMMANDS.with(|mine| {
+        let now = mine.0.load(Ordering::Relaxed);
+        mine.0.store(now.saturating_sub(1), Ordering::Relaxed)
+    });
+}
+
 #[inline(always)]
 pub fn record_hit() {
     tl_bump!(TL_HITS);

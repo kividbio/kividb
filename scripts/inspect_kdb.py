@@ -141,11 +141,21 @@ def main(path):
 
     rest = buf[r.i:]
     print(f"\ntrailing bytes after db data: {len(rest):,}")
-    if rest[:8] == b"KIVIDX1\x00":
-        print("  contains KIVIDX1 (FT index schemas)")
-        if b"KIVIHN1\x00" in rest:
-            print("  contains KIVIHN1 (persisted HNSW graphs)")
-    elif rest:
+    # The sections after the databases, in whatever order they were written
+    # (the server reads each by its magic; since 1.2.1 the times to live and
+    # the function libraries come before the index sections).
+    sections = {
+        b"KIVIEX1\x00": "times to live",
+        b"KIVIFN1\x00": "function libraries",
+        b"KIVIDX1\x00": "FT index schemas",
+        b"KIVIHN1\x00": "persisted HNSW graphs",
+        b"KIVIAL1\x00": "FT index aliases",
+    }
+    found = sorted((rest.find(magic), magic, what) for magic, what in sections.items() if magic in rest)
+    for at, magic, what in found:
+        name = magic[:7].decode()
+        print(f"  contains {name} ({what}) at +{at:,}")
+    if rest and not found:
         print(f"  head: {rest[:16]!r}")
 
 

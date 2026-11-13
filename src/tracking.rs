@@ -24,11 +24,13 @@ pub type TrackingTable = Arc<TrackingTableInner>;
 use ahash::AHashMap;
 use parking_lot::RwLock;
 
+use crate::store::Key;
+
 /// A client in `BCAST` mode: the prefixes it asked for — it is told of
 /// every write to a key that begins with one; the empty prefix is every key
 /// — and whether it asked not to be told of its own writes.
 struct Broadcast {
-    prefixes: Vec<String>,
+    prefixes: Vec<Vec<u8>>,
     noloop: bool,
 }
 
@@ -36,14 +38,19 @@ struct Broadcast {
 /// of its prefixes, sent when the command that changed them is over.
 pub struct Pending {
     pub client: u64,
-    prefix: String,
-    pub keys: Vec<String>,
+    prefix: Vec<u8>,
+    pub keys: Vec<Key>,
 }
 
 pub struct TrackingTableInner {
     /// Key → the clients that have read it and are to be told when it
     /// changes. (Not the `BCAST` clients: they are told by prefix.)
-    table: RwLock<AHashMap<String, AHashSet<u64>>>,
+    table: RwLock<AHashMap<Key, AHashSet<u64>>>,
+    /// The clients of every key of `table` added up: `tracking_total_items`.
+    /// Changed only under `table`'s write lock, with it. `INFO` added it
+    /// up over every key, holding the table, which every read of a tracking
+    /// client waits for to register its key (#622).
+    items: AtomicUsize,
     broadcast: RwLock<AHashMap<u64, Broadcast>>,
     /// Number of `BCAST` clients: a write looks no further when it is zero.
     broadcasting: AtomicUsize,
@@ -63,7 +70,7 @@ impl Default for TrackingTableInner {
 }
 
 /// A key the table has let go of, and the clients that were tracking it.
-pub type Dropped = (String, AHashSet<u64>);
+pub type Dropped = (Key, AHashSet<u64>);
 
 /// `tracking-table-max-keys` of a table made from now on: the configuration
 /// file's, else Redis's default (#142). `CONFIG SET` changes the table's own.
@@ -73,6 +80,7 @@ impl TrackingTableInner {
     pub fn new() -> Self {
         Self {
             table: RwLock::new(AHashMap::new()),
+            items: AtomicUsize::new(0),
             broadcast: RwLock::new(AHashMap::new()),
             broadcasting: AtomicUsize::new(0),
             pending: parking_lot::Mutex::new(Vec::new()),
@@ -86,17 +94,39 @@ impl TrackingTableInner {
     /// that had to be dropped to keep the table within its limit: their
     /// clients are told those keys are invalid, which is always safe.
     #[must_use]
-    pub fn register(&self, key: &str, client_id: u64) -> Vec<Dropped> {
+    pub fn register(&self, key: &[u8], client_id: u64) -> Vec<Dropped> {
         let mut table = self.table.write();
-        table.entry(key.to_string()).or_default().insert(client_id);
-        Self::trim(&mut table, self.max_keys.load(Ordering::Relaxed), Some(key))
+        if table.entry(Key::new(key)).or_default().insert(client_id) {
+            self.items_changed(1, 0);
+        }
+        let dropped = Self::trim(&mut table, self.max_keys.load(Ordering::Relaxed), Some(key));
+        self.items_dropped(&dropped);
+        dropped
+    }
+
+    /// `items` up by `more` and down by `fewer`. The caller holds `table`
+    /// for writing: nobody else changes it meanwhile.
+    #[inline]
+    fn items_changed(&self, more: usize, fewer: usize) {
+        let items = self.items.load(Ordering::Relaxed);
+        self.items.store(items + more - fewer, Ordering::Relaxed);
+    }
+
+    /// `items` less the clients of keys let go of, with `table` held.
+    fn items_dropped(&self, dropped: &[Dropped]) {
+        if !dropped.is_empty() {
+            self.items_changed(0, dropped.iter().map(|(_, c)| c.len()).sum());
+        }
     }
 
     /// `tracking-table-max-keys`. Returns what no longer fits.
     #[must_use]
     pub fn set_max_keys(&self, max_keys: usize) -> Vec<Dropped> {
         self.max_keys.store(max_keys, Ordering::Relaxed);
-        Self::trim(&mut self.table.write(), max_keys, None)
+        let mut table = self.table.write();
+        let dropped = Self::trim(&mut table, max_keys, None);
+        self.items_dropped(&dropped);
+        dropped
     }
 
     pub fn max_keys(&self) -> usize {
@@ -104,17 +134,17 @@ impl TrackingTableInner {
     }
 
     fn trim(
-        table: &mut AHashMap<String, AHashSet<u64>>,
+        table: &mut AHashMap<Key, AHashSet<u64>>,
         max_keys: usize,
-        keep: Option<&str>,
+        keep: Option<&[u8]>,
     ) -> Vec<Dropped> {
         if max_keys == 0 || table.len() <= max_keys {
             return Vec::new();
         }
         let excess = table.len() - max_keys;
-        let doomed: Vec<String> = table
+        let doomed: Vec<Key> = table
             .keys()
-            .filter(|key| keep != Some(key.as_str()))
+            .filter(|key| keep != Some(key.as_bytes()))
             .take(excess)
             .cloned()
             .collect();
@@ -127,13 +157,18 @@ impl TrackingTableInner {
     /// Return the set of client IDs tracking `key`, and remove the entry.
     /// Removal is correct — after invalidation is sent, clients will
     /// re-register on their next read if they still care about the key.
-    pub fn take_clients(&self, key: &str) -> Option<AHashSet<u64>> {
-        self.table.write().remove(key)
+    pub fn take_clients(&self, key: &[u8]) -> Option<AHashSet<u64>> {
+        let mut table = self.table.write();
+        let clients = table.remove(key)?;
+        self.items_changed(0, clients.len());
+        Some(clients)
     }
 
     /// Forget every key: the keyspace was flushed.
     pub fn clear(&self) {
-        self.table.write().clear();
+        let mut table = self.table.write();
+        table.clear();
+        self.items.store(0, Ordering::Relaxed);
     }
 
     /// `(keys, clients across all keys, prefixes)`, for `INFO`.
@@ -141,7 +176,7 @@ impl TrackingTableInner {
         let table = self.table.read();
         (
             table.len(),
-            table.values().map(|clients| clients.len()).sum(),
+            self.items.load(Ordering::Relaxed),
             self.broadcast
                 .read()
                 .values()
@@ -152,7 +187,7 @@ impl TrackingTableInner {
 
     /// Put `client_id` in `BCAST` mode with these prefixes, in place of any
     /// it had.
-    pub fn set_broadcast(&self, client_id: u64, prefixes: Vec<String>, noloop: bool) {
+    pub fn set_broadcast(&self, client_id: u64, prefixes: Vec<Vec<u8>>, noloop: bool) {
         let mut broadcast = self.broadcast.write();
         broadcast.insert(client_id, Broadcast { prefixes, noloop });
         self.broadcasting.store(broadcast.len(), Ordering::Relaxed);
@@ -161,7 +196,7 @@ impl TrackingTableInner {
     /// `key` has been written, by `writer` if by a client: note it for the
     /// `BCAST` clients it concerns. They are told when the command is over
     /// ([`take_pending`](Self::take_pending)), all of a command's keys at once.
-    pub fn changed(&self, key: &str, writer: Option<u64>) {
+    pub fn changed(&self, key: &[u8], writer: Option<u64>) {
         if self.broadcasting.load(Ordering::Relaxed) == 0 {
             return;
         }
@@ -172,11 +207,7 @@ impl TrackingTableInner {
                 continue;
             }
             // Prefixes of one client do not overlap: at most one matches.
-            let Some(prefix) = mode
-                .prefixes
-                .iter()
-                .find(|prefix| key.starts_with(prefix.as_str()))
-            else {
+            let Some(prefix) = mode.prefixes.iter().find(|prefix| key.starts_with(prefix)) else {
                 continue;
             };
             match pending
@@ -184,14 +215,14 @@ impl TrackingTableInner {
                 .find(|p| p.client == *client && p.prefix == *prefix)
             {
                 Some(entry) => {
-                    if !entry.keys.iter().any(|known| known == key) {
-                        entry.keys.push(key.to_string());
+                    if !entry.keys.iter().any(|known| *known == key) {
+                        entry.keys.push(Key::new(key));
                     }
                 }
                 None => pending.push(Pending {
                     client: *client,
                     prefix: prefix.clone(),
-                    keys: vec![key.to_string()],
+                    keys: vec![Key::new(key)],
                 }),
             }
         }
@@ -212,10 +243,12 @@ impl TrackingTableInner {
     /// turns tracking off).
     pub fn unregister_client(&self, client_id: u64) {
         let mut table = self.table.write();
+        let mut removed = 0;
         table.retain(|_, clients| {
-            clients.remove(&client_id);
+            removed += usize::from(clients.remove(&client_id));
             !clients.is_empty()
         });
+        self.items_changed(0, removed);
         drop(table);
         let mut broadcast = self.broadcast.write();
         if broadcast.remove(&client_id).is_some() {
@@ -253,7 +286,7 @@ type Registry = crate::client_registry::ClientRegistry;
 pub fn tell(
     registry: &Registry,
     tracker: u64,
-    keys: Option<&[&str]>,
+    keys: Option<&[&[u8]]>,
     writer: Option<u64>,
     current: Option<u64>,
 ) {
@@ -376,7 +409,7 @@ fn preceded(reply: Vec<u8>) -> Vec<u8> {
     before
 }
 
-fn invalidation(keys: Option<&[&str]>, resp: u8) -> Vec<u8> {
+fn invalidation(keys: Option<&[&[u8]]>, resp: u8) -> Vec<u8> {
     match keys {
         Some(keys) => build_invalidation_message(keys, resp),
         None if resp >= 3 => b">2\r\n$10\r\ninvalidate\r\n_\r\n".to_vec(),
@@ -394,7 +427,7 @@ fn invalidation(keys: Option<&[&str]>, resp: u8) -> Vec<u8> {
 pub fn invalidate(
     table: &TrackingTableInner,
     registry: &Registry,
-    key: &str,
+    key: &[u8],
     writer: Option<u64>,
     current: Option<u64>,
 ) {
@@ -411,7 +444,7 @@ pub fn invalidate(
 pub fn tell_dropped(registry: &Registry, dropped: Vec<Dropped>, current: Option<u64>) {
     for (key, clients) in dropped {
         for client in clients {
-            tell(registry, client, Some(&[key.as_str()]), None, current);
+            tell(registry, client, Some(&[key.as_bytes()]), None, current);
         }
     }
 }
@@ -437,9 +470,9 @@ fn readable<'k>(
     table: &TrackingTableInner,
     registry: &Registry,
     client: u64,
-    keys: &'k [String],
-) -> Vec<&'k str> {
-    let all = || keys.iter().map(String::as_str).collect();
+    keys: &'k [Key],
+) -> Vec<&'k [u8]> {
+    let all = || keys.iter().map(Key::as_bytes).collect();
     let Some(acl) = table.acl.get() else {
         return all();
     };
@@ -455,7 +488,7 @@ fn readable<'k>(
     }
     keys.iter()
         .filter(|key| crate::acl::may_read_key(user, key))
-        .map(String::as_str)
+        .map(Key::as_bytes)
         .collect()
 }
 
@@ -528,13 +561,13 @@ pub fn register_for(
 
 /// `key` has expired and been removed: the clients caching it are told.
 #[inline]
-pub fn expired(store: &crate::store::Store, key: &str) {
-    expired_in(store_id(store), key);
+pub fn expired(store: &crate::store::Store, key: &(impl AsRef<[u8]> + ?Sized)) {
+    expired_in(store_id(store), key.as_ref());
 }
 
 /// [`expired`], for the store at address `id`.
 #[inline]
-pub fn expired_in(id: usize, key: &str) {
+pub fn expired_in(id: usize, key: &[u8]) {
     if TRACKING_CLIENT_COUNT.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -601,7 +634,7 @@ const TRACKING_CHANNEL: &str = "__redis__:invalidate";
 /// The effect is that an unsubscribed RESP2 redirect target may receive a
 /// well-formed pub/sub message it didn't subscribe to — strictly better than the
 /// previous behaviour of sending it unparseable RESP3 bytes.
-pub fn build_invalidation_message(keys: &[&str], resp: u8) -> Vec<u8> {
+pub fn build_invalidation_message(keys: &[&[u8]], resp: u8) -> Vec<u8> {
     let mut msg = if resp >= 3 {
         b">2\r\n$10\r\ninvalidate\r\n".to_vec()
     } else {
@@ -614,7 +647,9 @@ pub fn build_invalidation_message(keys: &[&str], resp: u8) -> Vec<u8> {
     };
     msg.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
     for key in keys {
-        msg.extend_from_slice(format!("${}\r\n{}\r\n", key.len(), key).as_bytes());
+        msg.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+        msg.extend_from_slice(key);
+        msg.extend_from_slice(b"\r\n");
     }
     msg
 }
@@ -625,7 +660,7 @@ mod invalidation_frame_tests {
 
     #[test]
     fn resp3_frame_is_a_two_element_push_with_no_push_literal() {
-        let msg = build_invalidation_message(&["foo"], 3);
+        let msg = build_invalidation_message(&[&b"foo"[..]], 3);
         assert_eq!(
             msg,
             b">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nfoo\r\n".to_vec(),
@@ -639,7 +674,7 @@ mod invalidation_frame_tests {
 
     #[test]
     fn resp2_frame_is_a_pubsub_message_not_a_push_type() {
-        let msg = build_invalidation_message(&["foo"], 2);
+        let msg = build_invalidation_message(&[&b"foo"[..]], 2);
         assert_eq!(
             msg,
             b"*3\r\n$7\r\nmessage\r\n$20\r\n__redis__:invalidate\r\n*1\r\n$3\r\nfoo\r\n".to_vec(),
@@ -650,7 +685,7 @@ mod invalidation_frame_tests {
 
     #[test]
     fn multiple_keys_are_framed_as_one_array_under_both_protocols() {
-        let keys = ["a", "bb"];
+        let keys: [&[u8]; 2] = [b"a", b"bb"];
         let expected_tail = b"*2\r\n$1\r\na\r\n$2\r\nbb\r\n";
 
         let r3 = build_invalidation_message(&keys, 3);
@@ -662,6 +697,41 @@ mod invalidation_frame_tests {
 
         let r2 = build_invalidation_message(&keys, 2);
         assert!(r2.ends_with(expected_tail), "RESP2 key array malformed");
+    }
+
+    /// `tracking_total_items` is kept as clients come and go, and is what
+    /// adding up the table says (#622).
+    #[test]
+    fn the_count_of_items_follows_the_table() {
+        let t = TrackingTableInner::new();
+        let recount = |t: &TrackingTableInner| {
+            let table = t.table.read();
+            let items: usize = table.values().map(|c| c.len()).sum();
+            assert_eq!(t.totals().1, items);
+            items
+        };
+        let _ = t.register(b"a", 1);
+        let _ = t.register(b"a", 1);
+        let _ = t.register(b"a", 2);
+        let _ = t.register(b"b", 1);
+        assert_eq!(recount(&t), 3);
+        assert_eq!(t.take_clients(b"a").map(|c| c.len()), Some(2));
+        assert!(t.take_clients(b"a").is_none());
+        assert_eq!(recount(&t), 1);
+        for k in 0..10u8 {
+            let _ = t.register(&[k], 7);
+            let _ = t.register(&[k], 8);
+        }
+        assert_eq!(recount(&t), 21);
+        t.unregister_client(7);
+        assert_eq!(recount(&t), 11);
+        let dropped = t.set_max_keys(4);
+        assert_eq!(dropped.len(), 7);
+        assert_eq!(recount(&t), 4);
+        let _ = t.register(b"new", 9);
+        assert_eq!((t.totals().0, recount(&t)), (4, 4));
+        t.clear();
+        assert_eq!(recount(&t), 0);
     }
 
     #[test]

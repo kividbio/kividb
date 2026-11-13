@@ -1,21 +1,19 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{
-    ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
-    ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
-    expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis, from_unix_ms,
-    get_expiry, glob_match, is_expired, lazy_expire_on_read, parse_bytes_as_i128,
-    parse_expire_modifier_flags, parse_utf8, set_expiry, system_time_from_unix_millis_i128,
-    take_key, ttl_remaining_secs_ceil,
+    ERR_INVALID_EXPIRE_EXPIREAT_CMD, ERR_INVALID_EXPIRE_PEXPIRE_CMD,
+    ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ExpireModifierFlags, TimeArg, applying_stream, delete_key,
+    delete_key_if_expired, expire_deadline, expire_modifier_allows_set, expire_on_read,
+    from_unix_ms, get_expiry, is_expired, lazy_expire_on_read, ms_to_nearest_secs,
+    parse_expire_modifier_flags, parse_utf8, set_expiry, take_key, ttl_remaining_ms,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What `OBJECT ENCODING` says of a value.
 ///
@@ -126,14 +124,24 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
 /// that followed made a new key of what came after, with no time to live,
 /// for good. Set, the key keeps its deadline, the writes go into it, and
 /// expiry takes it out once the load is done, with its `DEL` logged.
+///
+/// The same on a replica applying its master's stream (`applying_stream`),
+/// as Redis's `checkAlreadyExpired` is false there (`server.masterhost`):
+/// the master's `PEXPIREAT k t` arrives with `t` past whenever the replica
+/// lags, or the master set the time to live inside a transaction or script
+/// that ran longer than it. Deleted here, the key was gone on the replica
+/// while the master still had it, and the master's next writes to it
+/// (`INCR`, `PERSIST`) made a different key on the replica, for good
+/// (#665). Set, the replica keeps the key, hidden from reads past its
+/// time, until the master's `DEL` or its next writes say what it is.
 pub(crate) fn apply_expire(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     new_abs: SystemTime,
     deletes: bool,
     flags: &ExpireModifierFlags,
 ) -> Vec<u8> {
-    let deletes = deletes && !crate::expiry::replaying();
+    let deletes = deletes && !crate::commands::helpers::applying_stream(ctx);
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     if !read_lock!(shard).contains_key(key) {
@@ -146,14 +154,175 @@ pub(crate) fn apply_expire(
     if deletes {
         let removed = delete_key(ctx.store, *ctx.selected_db, key);
         if removed {
-            crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
             crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
         }
         return resp_integer(if removed { 1 } else { 0 });
     }
-    set_expiry(ctx.store, *ctx.selected_db, key, new_abs);
+    // Past its time since it was looked at: gone, and deleted (#628).
+    if !set_expiry(ctx.store, *ctx.selected_db, key, new_abs) {
+        return resp_integer(0);
+    }
     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
     resp_integer(1)
+}
+
+/// A `SORT` `BY` or `GET` pattern taken apart (`sort_pattern_parts`).
+struct SortPattern<'a> {
+    /// Where its first `*` is.
+    star: usize,
+    /// What follows the `*` in the key's name.
+    suffix: &'a [u8],
+    /// The hash field it names after `->`, if any.
+    field: Option<&'a [u8]>,
+}
+
+/// A `SORT` `BY` or `GET` pattern taken apart. `None` when it has no `*`:
+/// it names no key.
+fn sort_pattern_parts(pat: &[u8]) -> Option<SortPattern<'_>> {
+    let star = memchr::memchr(b'*', pat)?;
+    let rest = &pat[star + 1..];
+    let (suffix, field) = match memchr::memmem::find(rest, b"->") {
+        Some(at) if at + 2 < rest.len() => (&rest[..at], Some(&rest[at + 2..])),
+        _ => (rest, None),
+    };
+    Some(SortPattern {
+        star,
+        suffix,
+        field,
+    })
+}
+
+/// Whether `SORT` `cmd` reads a field of a hash it does not name, by a `BY`
+/// or `GET` pattern. Such a read can find the field past its time, and on a
+/// master removes it and sends its `HDEL` (`sort_pattern_value`). That is a
+/// write to a key the command holds no order of: its own order, of the keys
+/// it names, is held, and a write made inside it takes none more
+/// (`write_order`). Another client's write to the hash could then fall
+/// between the removal and its `HDEL`, and reach the replicas and the AOF
+/// ahead of it, as `HINCRBY h f 1` then `HDEL h f` (#415 review). So such a
+/// `SORT` takes the command gate alone, as a script does, which reads keys
+/// it does not name too (`handler::takes_the_gate_alone`). Options are read
+/// as `keyspec`'s `SORT` reads them.
+pub(crate) fn sort_reads_hash_fields(cmd: &[&[u8]]) -> bool {
+    sort_patterns(cmd).any(|pat| sort_pattern_parts(pat).is_some_and(|p| p.field.is_some()))
+}
+
+/// The `BY` and `GET` patterns of `SORT` or `SORT_RO` `cmd`, read as
+/// `keyspec`'s `SORT` reads its options: a `LIMIT`'s two numbers and a
+/// `STORE`'s destination are none. Case does not matter.
+fn sort_patterns<'a>(cmd: &'a [&'a [u8]]) -> impl Iterator<Item = &'a [u8]> + 'a {
+    let mut i = 2;
+    std::iter::from_fn(move || {
+        while i < cmd.len() {
+            let option = cmd[i];
+            i += 1;
+            if option.eq_ignore_ascii_case(b"LIMIT") {
+                i += 2;
+            } else if option.eq_ignore_ascii_case(b"BY") || option.eq_ignore_ascii_case(b"GET") {
+                let pat = cmd.get(i).copied();
+                i += 1;
+                if pat.is_some() {
+                    return pat;
+                }
+            } else if option.eq_ignore_ascii_case(b"STORE") {
+                i += 1;
+            }
+        }
+        None
+    })
+}
+
+/// For `SORT` or `SORT_RO` `cmd` called by a script held to a hash tag
+/// (`lua-parallel-scripts`): the first `BY` or `GET` pattern that can name
+/// a key outside the tag, which `may_touch` tells (`tag_locks`). Such a key
+/// is one the script does not name and holds no lock of: a client's write
+/// to it does not wait for the script, and a field of it the `SORT` finds
+/// past its time would be removed and its `HDEL` sent with another write to
+/// it in between (#415 review). The command gate taken alone for a `SORT`
+/// (`sort_reads_hash_fields`) is no help here, as the script holds the gate
+/// already.
+///
+/// A pattern names keys when it has a `*`; `#` and one without a `*` name
+/// none. One that names keys is kept to the tag only when what comes before
+/// its `*` holds the whole tag: then every key it names carries that tag,
+/// whatever the element (`{q}:w_*`, `{q}:obj:*->w`). Otherwise the element
+/// decides the key, and so the tag. String keys count as hashes do: a read
+/// of one outside the tag is as much outside it as a `GET` of it would be.
+pub(crate) fn sort_pattern_outside<'a>(
+    cmd: &'a [&'a [u8]],
+    may_touch: impl Fn(&[u8]) -> bool,
+) -> Option<&'a [u8]> {
+    sort_patterns(cmd).find(|pat| {
+        sort_pattern_parts(pat).is_some_and(|p| {
+            let prefix = &pat[..p.star];
+            crate::tag_locks::tag_of(prefix).is_none() || !may_touch(prefix)
+        })
+    })
+}
+
+/// What a `SORT` `BY` or `GET` pattern names for `elem`, read as Redis reads
+/// it (`lookupKeyByPattern`): the first `*` stands for the element's bytes,
+/// and a `->field` after it, with a field name, names a field of the hash
+/// at that key. `None` when the pattern has no `*`, or names nothing there.
+fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+    let SortPattern {
+        star,
+        suffix,
+        field,
+    } = sort_pattern_parts(pat)?;
+    let mut key = Vec::with_capacity(star + elem.len() + suffix.len());
+    key.extend_from_slice(&pat[..star]);
+    key.extend_from_slice(elem);
+    key.extend_from_slice(suffix);
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
+    let now = crate::types::field_now();
+    let mut tried = false;
+    loop {
+        let map = read_lock!(shard);
+        return match (map.peek(&key), field) {
+            (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
+            (Some(ValueRef::Hash(h)), Some(field)) => {
+                let name = crate::key_bytes::text_of(field);
+                h.read().get(&*name).map(|v| v.to_vec())
+            }
+            // A field past its deadline is what a hash command makes of it
+            // (#415): removed first where this node removes fields, its
+            // `HDEL` sent ahead of this `SORT`; kept where the stream or the
+            // AOF being applied says when it goes, so that a `STORE` comes
+            // out there as it did on the master; hidden from a reader
+            // otherwise.
+            (Some(ValueRef::HashEx(h)), Some(field)) => {
+                let name = crate::key_bytes::text_of(field);
+                let inner = h.read();
+                let value = inner.fields.get(&*name)?;
+                if inner
+                    .expiries
+                    .get(&*name)
+                    .is_none_or(|at| !crate::types::field_due(*at, now))
+                {
+                    return Some(value.to_vec());
+                }
+                match crate::field_expiry::policy(ctx.store) {
+                    crate::field_expiry::Policy::Keep => Some(value.to_vec()),
+                    crate::field_expiry::Policy::Expire if !tried => {
+                        drop(inner);
+                        drop(map);
+                        tried = true;
+                        crate::field_expiry::expire_due(
+                            ctx.store,
+                            ctx.index_store,
+                            *ctx.selected_db,
+                            &key,
+                            now,
+                        );
+                        continue;
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+    }
 }
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
@@ -184,7 +353,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut shard_idx = cursor >> SHARD_SHIFT;
             let mut position = cursor & ((1u64 << SHARD_SHIFT) - 1);
 
-            let mut keys: Vec<String> = Vec::new();
+            let mut keys: Vec<crate::store::Key> = Vec::new();
             let mut looked_at = 0usize;
             let mut next_cursor: u64 = 0;
             while shard_idx < num_shards {
@@ -211,7 +380,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 .as_deref()
                                 .is_none_or(|t| value.type_name().eq_ignore_ascii_case(t))
                         })
-                        .map(|(key, _)| crate::store::key_text(key).to_owned()),
+                        .map(|(key, _)| crate::store::Key::new(key)),
                 );
                 drop(map);
                 if next != 0 {
@@ -232,10 +401,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             keys.retain(|k| !lazy_expire_on_read(ctx.store, *ctx.selected_db, k));
             if let Some(ref pat) = options.pattern {
-                keys.retain(|k| glob_match(pat, k));
+                keys.retain(|k| crate::commands::helpers::glob_match_bytes(pat, k));
             }
 
-            let key_items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk_str(k)).collect();
+            let key_items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk(k)).collect();
 
             Some(resp_array(vec![
                 resp_bulk_str(&next_cursor.to_string()),
@@ -248,28 +417,26 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_error("ERR wrong number of arguments for cmd 'keys'"));
             }
 
-            let pattern = match std::str::from_utf8(cmd[1]) {
-                Ok(s) => s,
-                Err(_) => return Some(resp_error("ERR invalid pattern")),
-            };
+            // Any bytes, as Redis's `stringmatchlen` matches them.
+            let pattern = cmd[1];
 
             let db = &ctx.store[*ctx.selected_db];
             // Collect into a temporary — we need the count before we can
             // write the RESP array header, and we can't hold all shard locks
             // simultaneously. Collecting key slices (not copies) keeps this cheap.
             // Note: we can't return borrowed keys across the lock boundary,
-            // so we collect owned Strings.
-            let mut candidates: Vec<String> = Vec::new();
+            // so we collect owned keys.
+            let mut candidates: Vec<crate::store::Key> = Vec::new();
             for shard in db.iter() {
                 let map = read_lock!(shard);
-                candidates.extend(map.keys().map(|k| crate::store::key_text(k).to_owned()));
+                candidates.extend(map.keys().map(crate::store::Key::new));
             }
-            let mut matching: Vec<String> = Vec::new();
+            let mut matching: Vec<crate::store::Key> = Vec::new();
             for key in candidates {
                 if lazy_expire_on_read(ctx.store, *ctx.selected_db, &key) {
                     continue;
                 }
-                if glob_match(pattern, &key) {
+                if crate::commands::helpers::glob_match_bytes(pattern, &key) {
                     matching.push(key);
                 }
             }
@@ -300,10 +467,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR wrong number of arguments for 'object|encoding' command",
                         ));
                     }
-                    let key = match parse_utf8(cmd[2]) {
-                        Some(k) => k,
-                        None => return Some(resp_error("ERR key must be valid UTF-8")),
-                    };
+                    let key: &[u8] = cmd[2];
                     let db = *ctx.selected_db;
                     let gone = lazy_expire_on_read(ctx.store, db, key);
                     let map = read_lock!(store::get_shard(&ctx.store[db], key));
@@ -322,10 +486,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             subcommand.to_lowercase()
                         )));
                     }
-                    let key = match parse_utf8(cmd[2]) {
-                        Some(k) => k,
-                        None => return Some(resp_error("ERR key must be valid UTF-8")),
-                    };
+                    let key: &[u8] = cmd[2];
                     let db = *ctx.selected_db;
                     let gone = lazy_expire_on_read(ctx.store, db, key);
                     // The key's access word, read without counting as a use.
@@ -390,10 +551,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR wrong number of arguments for 'object|refcount' command",
                         ));
                     }
-                    let key = match parse_utf8(cmd[2]) {
-                        Some(k) => k,
-                        None => return Some(resp_error("ERR key must be valid UTF-8")),
-                    };
+                    let key: &[u8] = cmd[2];
                     if is_expired(ctx.store, *ctx.selected_db, key) {
                         expire_on_read(ctx.store, *ctx.selected_db, key);
                         return Some(resp_null_bulk());
@@ -417,10 +575,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'ttl' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -435,12 +590,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             match expires {
                 None => Some(resp_integer(-1)), // key exists but no TTL
-                Some(at) => match from_unix_ms(at)
-                    .duration_since(crate::script_clock::wall_system_time_now())
-                {
-                    Ok(d) => Some(resp_integer(ttl_remaining_secs_ceil(d))),
-                    Err(_) => Some(resp_integer(-2)),
-                },
+                Some(at) => Some(resp_integer(ms_to_nearest_secs(ttl_remaining_ms(at)))),
             }
         }
 
@@ -450,10 +600,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'persist' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             if crate::commands::helpers::clear_expiry(ctx.store, *ctx.selected_db, key) {
                 notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "persist", key);
@@ -469,10 +616,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'type' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // Expired keys are invisible — report as "none"
             if is_expired(ctx.store, *ctx.selected_db, key) {
@@ -498,27 +642,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'pexpire' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             // The options are read before the time, as in Redis.
             let flags = match parse_expire_modifier_flags(cmd.as_slice(), 3) {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let ms = match parse_bytes_as_i128(cmd[2]) {
-                Some(m) => m,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
             // The clock is read once, here.
-            let when_ms = match absolute_when_ms_from_pexpire_ms(ms) {
-                Ok(w) => w,
+            let (ms, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::Millis,
+                ERR_INVALID_EXPIRE_PEXPIRE_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
                 Err(e) => return Some(resp_error(e)),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(when_ms) {
-                Some(t) => t,
-                None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIRE_CMD)),
             };
             // Only a time to live of zero or less deletes the key here, as
             // `expire_feed` propagates it. `PEXPIRE k 1` found the clock a
@@ -537,10 +675,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'expireat' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             // Every option, and checked against the others, before anything
             // is touched: only `cmd[3]` was read, and an unknown one was
             // refused after a moment that had come had deleted the key.
@@ -548,17 +683,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let unix_secs = match parse_bytes_as_i128(cmd[2]) {
-                Some(n) => n,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
-            let unix_ms = match unix_secs.checked_mul(1000) {
-                Some(ms) => ms,
-                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
-                Some(t) => t,
-                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
+            // As Redis's `expireGenericCommand`: not an integer, then a
+            // time in seconds past `LLONG_MAX / 1000` either way, refused.
+            let (_, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::UnixSecs,
+                ERR_INVALID_EXPIRE_EXPIREAT_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
@@ -572,22 +706,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'pexpireat' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             // As `EXPIREAT`.
             let flags = match parse_expire_modifier_flags(cmd.as_slice(), 3) {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let unix_ms = match parse_bytes_as_i128(cmd[2]) {
-                Some(n) => n,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
-                Some(t) => t,
-                None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIREAT_CMD)),
+            // From a stream, 1.2.0's `PEXPIREAT` up to `u64::MAX` is taken
+            // as the latest (`applying_stream`).
+            let (_, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::UnixMillis,
+                ERR_INVALID_EXPIRE_PEXPIREAT_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
@@ -602,10 +736,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'pttl' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -620,12 +751,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             match expires {
                 None => Some(resp_integer(-1)),
-                Some(at) => match from_unix_ms(at)
-                    .duration_since(crate::script_clock::wall_system_time_now())
-                {
-                    Ok(d) => Some(resp_integer(d.as_millis() as i64)),
-                    Err(_) => Some(resp_integer(-2)),
-                },
+                Some(at) => Some(resp_integer(ttl_remaining_ms(at))),
             }
         }
 
@@ -635,14 +761,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'rename' command",
                 ));
             }
-            let src = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR invalid key")),
-            };
-            let dst = match parse_utf8(cmd[2]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR invalid key")),
-            };
+            let src: Vec<u8> = cmd[1].to_vec();
+            let dst: Vec<u8> = cmd[2].to_vec();
 
             let db = *ctx.selected_db;
             let db_ref = &ctx.store[db];
@@ -665,7 +785,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let (value, expiry) = {
                 let shard = store::get_shard(db_ref, &src);
                 let mut map = write_lock!(shard);
-                match map.remove(src.as_str()) {
+                match map.remove(src.as_slice()) {
                     Some(v) => {
                         let expiry = v.expires();
                         (v.into_value(), expiry)
@@ -676,10 +796,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Write to dst, the time to live going with the value: the one
             // dst had, if any, goes.
+            let series = matches!(value, KiviDBValue::TimeSeries(_));
             {
                 let shard = store::get_shard(db_ref, &dst);
                 let mut map = write_lock!(shard);
-                map.insert_expiring(Key::from(&*dst), value, expiry);
+                map.insert_expiring(&*dst, value, expiry);
+            }
+            if series {
+                crate::commands::ts::renamed(ctx, &src, &dst);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -692,14 +816,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'renamenx' command",
                 ));
             }
-            let src = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR invalid key")),
-            };
-            let dst = match parse_utf8(cmd[2]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR invalid key")),
-            };
+            let src: Vec<u8> = cmd[1].to_vec();
+            let dst: Vec<u8> = cmd[2].to_vec();
 
             let db = *ctx.selected_db;
             let db_ref = &ctx.store[db];
@@ -708,7 +826,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let (src_value, expiry) = {
                 let shard = store::get_shard(db_ref, &src);
                 let map = read_lock!(shard);
-                match map.get_expiring(src.as_str()) {
+                match map.get_expiring(src.as_slice()) {
                     Some((v, expiry)) => (v.to_value(), expiry),
                     None => return Some(resp_error("ERR no such key")),
                 }
@@ -718,7 +836,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             {
                 let shard = store::get_shard(db_ref, &dst);
                 let map = read_lock!(shard);
-                if map.contains_key(dst.as_str()) {
+                if map.contains_key(dst.as_slice()) {
                     return Some(resp_integer(0));
                 }
             }
@@ -726,11 +844,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Remove src, write dst
             {
                 let shard = store::get_shard(db_ref, &src);
-                write_lock!(shard).remove(src.as_str());
+                write_lock!(shard).remove(src.as_slice());
             }
+            let series = matches!(src_value, KiviDBValue::TimeSeries(_));
             {
                 let shard = store::get_shard(db_ref, &dst);
-                write_lock!(shard).insert_expiring(Key::from(&*dst), src_value, expiry);
+                write_lock!(shard).insert_expiring(&*dst, src_value, expiry);
+            }
+            if series {
+                crate::commands::ts::renamed(ctx, &src, &dst);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -744,14 +866,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'copy' command",
                 ));
             }
-            let src_key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR invalid key")),
-            };
-            let dst_key = match parse_utf8(cmd[2]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR invalid key")),
-            };
+            let src_key: Vec<u8> = cmd[1].to_vec();
+            let dst_key: Vec<u8> = cmd[2].to_vec();
 
             let src_db = *ctx.selected_db;
             let mut dst_db = src_db;
@@ -763,6 +879,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 match opt.as_str() {
                     "DB" => {
                         i += 1;
+                        // A cluster node has database 0 alone (#484): any
+                        // other is out of range, as in Redis 8, where it is
+                        // the one database a cluster node has.
+                        if ctx.cluster.enabled
+                            && parse_utf8(cmd.get(i).copied().unwrap_or(b""))
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .is_some_and(|n| n != 0)
+                        {
+                            return Some(resp_error("ERR DB index is out of range"));
+                        }
                         dst_db = match parse_utf8(cmd.get(i).copied().unwrap_or(b""))
                             .and_then(|s| s.parse().ok())
                         {
@@ -789,7 +915,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let db_ref = &ctx.store[src_db];
                 let shard = store::get_shard(db_ref, &src_key);
                 let map = read_lock!(shard);
-                match map.get_expiring(src_key.as_str()) {
+                match map.get_expiring(src_key.as_slice()) {
                     // A copy of its own, not another name for the same
                     // value. See `deep_clone`.
                     Some((v, expiry)) => (v.deep_clone(), expiry),
@@ -802,17 +928,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             {
                 let shard = store::get_shard(dst_db_ref, &dst_key);
                 let map = read_lock!(shard);
-                if map.contains_key(dst_key.as_str()) && !replace {
+                if map.contains_key(dst_key.as_slice()) && !replace {
                     return Some(resp_integer(0));
                 }
             }
 
+            if let KiviDBValue::TimeSeries(series) = &value {
+                crate::commands::ts::copied(ctx, &dst_key, series);
+            }
             // Write to destination, with the source's time to live (the
             // key replaced may have had one: the copy has the source's, or
             // none).
             {
                 let shard = store::get_shard(dst_db_ref, &dst_key);
-                write_lock!(shard).insert_expiring(Key::from(&*dst_key), value, expiry);
+                write_lock!(shard).insert_expiring(&*dst_key, value, expiry);
             }
             notify(ctx.pubsub, dst_db, KS_GENERIC, "copy_to", &dst_key);
             Some(resp_integer(1))
@@ -832,16 +961,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // `DEL` frees it here, as Redis does with `lazyfree-lazy-user-del no`.
             let unlink = cmd[0].eq_ignore_ascii_case(b"UNLINK");
 
-            for k in cmd.iter().skip(1) {
-                let key = match parse_utf8(k) {
-                    Some(k) => k,
-                    None => continue,
-                };
+            // Any bytes: what a master expires, evicts or migrates away is
+            // deleted on its replicas, and in its AOF, by the DEL or UNLINK
+            // it sends, whatever its key (#437). A key that is not text was
+            // skipped.
+            for (at, &key) in cmd.iter().enumerate().skip(1) {
                 // Redis: expireIfNeeded deletes volatile keys first; that removal does not add
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     if delete_key_if_expired(ctx.store, *ctx.selected_db, key) {
-                        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                         crate::vector::maybe_request_compaction(
                             ctx.index_store,
                             ctx.compaction_tx,
@@ -857,8 +985,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 } else {
                     delete_key(ctx.store, *ctx.selected_db, key)
                 };
+                // A document that was deleted left its indexes when the
+                // shard was let go of (`ShardMap::remove`).
                 if deleted {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -866,9 +995,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
                     removed += 1;
-                } else if ctx.watch_registry.has_watchers() {
-                    // There was nothing to delete: a client watching the key
-                    // has seen no change.
+                } else if (ctx.watch_registry.has_watchers()
+                    || crate::tracking::TRACKING_CLIENT_COUNT
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        != 0)
+                    && !cmd[1..at].contains(&key)
+                {
+                    // There was nothing to delete: a client watching the key,
+                    // or caching it, has seen no change. Unless the key was
+                    // named before in this command, and deleted then: `DEL a
+                    // a` changes `a`.
                     crate::watch::unchanged(*ctx.selected_db, key);
                 }
             }
@@ -883,10 +1019,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'move' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR invalid key")),
-            };
+            // A cluster node has database 0 alone: a key moved to another
+            // would be out of every client's reach, and would stop the node
+            // from starting again (#484). A test has it moved as before, to
+            // give a replica a master holding keys there.
+            if ctx.cluster.enabled && !crate::aof::test_behaves_as_before("cluster-move") {
+                return Some(resp_error("ERR MOVE is not allowed in cluster mode"));
+            }
+            let key: Vec<u8> = cmd[1].to_vec();
             let target_db: usize = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR invalid DB index")),
@@ -940,6 +1080,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'swapdb' command",
                 ));
             }
+            // As `MOVE`: it would put the dataset in a database a cluster
+            // node does not serve (#484).
+            if ctx.cluster.enabled {
+                return Some(resp_error("ERR SWAPDB is not allowed in cluster mode"));
+            }
             let db1: usize = match parse_utf8(cmd[1]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR invalid DB index")),
@@ -975,31 +1120,45 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // A key picked at random: from a shard picked at random, and,
             // if that one is empty, from the ones after it. A key whose
             // time has run out is not a key: it is removed, and another
-            // picked.
+            // picked, for as long as it takes, as in Redis (#566): each
+            // pick that removes one leaves one fewer to pick.
+            //
+            // An expired key that stays (on a replica, while writes are
+            // paused, or while loading) could be picked again and again:
+            // after 100 of those, as in Redis, the answer is one of them.
+            //
+            // Whether expired keys stay is asked again at every pick, as
+            // Redis does: a pause that begins while this looks must not
+            // leave it looking for ever.
             let db = *ctx.selected_db;
             let shards = ctx.store[db].len();
-            let mut expired = None;
-            for _ in 0..64 {
+            let expired_keys_stay = || {
+                crate::pause::expiry_deferred()
+                    || crate::expiry::held()
+                    || crate::expiry::of(ctx.store)
+                        .as_ref()
+                        .is_some_and(crate::expiry::Target::on_replica)
+            };
+            let mut kept_expired = 0;
+            loop {
                 let start = rand::random::<usize>() % shards.max(1);
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
                     map.random_entry(rand::random::<usize>)
-                        .map(|(key, _)| crate::store::key_text(key).to_owned())
+                        .map(|(key, _)| crate::store::Key::new(key))
                 });
                 match picked {
-                    None => break,
+                    None => break Some(resp_null_bulk()),
                     Some(key) if lazy_expire_on_read(ctx.store, db, &key) => {
-                        expired = Some(key);
+                        if expired_keys_stay() {
+                            kept_expired += 1;
+                            if kept_expired == 100 {
+                                break Some(resp_bulk(&key));
+                            }
+                        }
                     }
-                    Some(key) => return Some(resp_bulk_str(&key)),
+                    Some(key) => break Some(resp_bulk(&key)),
                 }
-            }
-            // While writes are paused an expired key is not removed, so
-            // every pick could land on one again: as in Redis, the answer is
-            // then one of them, not nil.
-            match expired {
-                Some(key) if crate::pause::expiry_deferred() => Some(resp_bulk_str(&key)),
-                _ => Some(resp_null_bulk()),
             }
         }
 
@@ -1017,10 +1176,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let mut count = 0i64;
             for raw_key in cmd.iter().skip(1) {
-                let key = match parse_utf8(raw_key) {
-                    Some(k) => k,
-                    None => continue,
-                };
+                let key: &[u8] = raw_key;
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     expire_on_read(ctx.store, *ctx.selected_db, key);
                     continue;
@@ -1043,10 +1199,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'dump' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
@@ -1076,10 +1229,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'restore' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k.to_string(),
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: Vec<u8> = cmd[1].to_vec();
             let ttl_ms: u64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR invalid TTL value")),
@@ -1137,7 +1287,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let db = &ctx.store[db_idx];
                 let shard = store::get_shard(db, &key);
                 let map = read_lock!(shard);
-                if map.contains_key(key.as_str()) {
+                if map.contains_key(key.as_slice()) {
                     return Some(resp_error("BUSYKEY Target key name already exists."));
                 }
             }
@@ -1147,6 +1297,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(v) => v,
                 Err(e) => return Some(resp_error(e.message())),
             };
+
+            // A series restored has no links to other series, as in
+            // RedisTimeSeries (`RestoreKey`): a payload of 1.2.0, or
+            // `MIGRATE` from a node of 1.2.0, carries its compaction rules
+            // and source, by key name (#593). An atomic slot migration sends
+            // the rules among the keys it moves as `TS.CREATERULE`s.
+            if let KiviDBValue::TimeSeries(series) = &value {
+                let mut series = series.write();
+                series.rules.clear();
+                series.source = None;
+            }
 
             // A restored series has to be findable by its labels, the same as
             // one made with TS.CREATE.
@@ -1160,13 +1321,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 _ => Vec::new(),
             };
 
-            // Store it, with its time to live
+            // Store it, with its time to live: at most `i64::MAX` ms after
+            // the epoch, the latest any command sets. One past it read back
+            // negative, and its `PEXPIREAT` was refused where it was sent on.
             let expires_at = (ttl_ms > 0).then(|| {
-                if absttl {
-                    expiry_unix_millis(ttl_ms)
+                let at_ms = if absttl {
+                    ttl_ms
                 } else {
-                    expiry_at_after(Duration::from_millis(ttl_ms))
-                }
+                    (crate::script_clock::ttl_wall_ms_now() as u64).saturating_add(ttl_ms)
+                };
+                from_unix_ms(at_ms.min(i64::MAX as u64))
             });
             crate::commands::helpers::store_value_expiring(
                 ctx.store, db_idx, &key, value, expires_at,
@@ -1174,15 +1338,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if !ts_labels.is_empty() {
                 let mut index = write_lock!(ctx.ts_index);
                 for (label, label_value) in ts_labels {
+                    // The index holds names (`key_bytes::text_of`).
                     index
                         .entry(format!("{label}={label_value}"))
                         .or_default()
-                        .insert(key.clone());
+                        .insert(crate::key_bytes::text_of(&key).into_owned());
                 }
             }
 
             if crate::eviction::recording() {
-                crate::eviction::restored(ctx.store, db_idx, key.as_bytes(), idle, freq);
+                crate::eviction::restored(ctx.store, db_idx, key.as_slice(), idle, freq);
             }
 
             crate::keyspace_events::notify(
@@ -1206,10 +1371,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     name.to_ascii_lowercase()
                 )));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR key must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // A source past its time is a missing one: an empty array, or with
             // STORE, the destination deleted and 0, as for any missing key.
@@ -1224,11 +1386,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut descending = false;
             let mut limit_offset: usize = 0;
             let mut limit_count: Option<usize> = None;
-            let mut store_dst: Option<String> = None;
-            // BY and GET patterns are parsed but we only support the simple
-            // nosort/GET # case; others return ERR as documented.
-            let mut by_pattern: Option<String> = None;
-            let mut get_patterns: Vec<String> = Vec::new();
+            // The destination and the patterns are bytes, as keys are.
+            let mut store_dst: Option<Vec<u8>> = None;
+            let mut by_pattern: Option<Vec<u8>> = None;
+            let mut get_patterns: Vec<Vec<u8>> = Vec::new();
 
             let mut i = 2usize;
             while i < cmd.len() {
@@ -1271,22 +1432,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             return Some(resp_error("ERR syntax error"));
                         }
                         i += 1;
-                        store_dst = match cmd.get(i).and_then(|b| parse_utf8(b)) {
-                            Some(s) => Some(s.to_string()),
+                        store_dst = match cmd.get(i) {
+                            Some(b) => Some(b.to_vec()),
                             None => return Some(resp_error("ERR syntax error")),
                         };
                     }
                     "BY" => {
                         i += 1;
-                        by_pattern = match cmd.get(i).and_then(|b| parse_utf8(b)) {
-                            Some(s) => Some(s.to_string()),
+                        by_pattern = match cmd.get(i) {
+                            Some(b) => Some(b.to_vec()),
                             None => return Some(resp_error("ERR syntax error")),
                         };
                     }
                     "GET" => {
                         i += 1;
-                        match cmd.get(i).and_then(|b| parse_utf8(b)) {
-                            Some(s) => get_patterns.push(s.to_string()),
+                        match cmd.get(i) {
+                            Some(b) => get_patterns.push(b.to_vec()),
                             None => return Some(resp_error("ERR syntax error")),
                         };
                     }
@@ -1299,8 +1460,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // read keys named by the elements. As in Redis, they need read
             // access to every key. A `BY` with no `*` reads no key: it only
             // skips the sort.
-            let by_reads_keys = by_pattern.as_deref().is_some_and(|p| p.contains('*'));
-            let get_reads_keys = get_patterns.iter().any(|p| p != "#");
+            let by_reads_keys = by_pattern.as_deref().is_some_and(|p| p.contains(&b'*'));
+            let get_reads_keys = get_patterns.iter().any(|p| p.as_slice() != b"#");
             if by_reads_keys || get_reads_keys {
                 let acl = ctx.acl_store.read();
                 let restricted = acl
@@ -1340,7 +1501,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let constant_by_lex = by_pattern
                 .as_deref()
-                .map(|p| !p.eq_ignore_ascii_case("nosort") && !p.contains('*'))
+                .map(|p| !p.eq_ignore_ascii_case(b"nosort") && !p.contains(&b'*'))
                 .unwrap_or(false);
 
             // ── BY <pattern>: resolve sort keys via external key lookups ──────────────
@@ -1360,61 +1521,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         vec![None; elements.len()]
                     }
 
-                    Some(p) if p.eq_ignore_ascii_case("nosort") => {
+                    Some(p) if p.eq_ignore_ascii_case(b"nosort") => {
                         // BY nosort
                         vec![None; elements.len()]
                     }
 
-                    Some(pat) => {
-                        let db = &ctx.store[*ctx.selected_db];
-
-                        elements
-                            .iter()
-                            .map(|elem| {
-                                let elem_str = std::str::from_utf8(elem).unwrap_or("");
-
-                                if let Some(arrow) = pat.find("->") {
-                                    // Hash field pattern
-                                    let key_pat = &pat[..arrow];
-                                    let field = &pat[arrow + 2..];
-                                    let lookup_key = key_pat.replace('*', elem_str);
-
-                                    let shard = store::get_shard(db, &lookup_key);
-                                    let map = read_lock!(shard);
-
-                                    match map.peek(lookup_key.as_str()) {
-                                        Some(ValueRef::Hash(h)) => {
-                                            let inner = h.read();
-                                            inner
-                                                .get(field)
-                                                .and_then(|v| std::str::from_utf8(v).ok())
-                                                .and_then(|s| s.parse::<f64>().ok())
-                                        }
-                                        _ => None,
-                                    }
-                                } else {
-                                    // Plain string pattern
-                                    let lookup_key = pat.replace('*', elem_str);
-                                    let shard = store::get_shard(db, &lookup_key);
-                                    let map = read_lock!(shard);
-
-                                    match map.peek(lookup_key.as_str()) {
-                                        Some(ValueRef::String(s)) => std::str::from_utf8(&s)
-                                            .ok()
-                                            .and_then(|v| v.parse::<f64>().ok()),
-                                        _ => None,
-                                    }
-                                }
-                            })
-                            .collect()
-                    }
+                    Some(pat) => elements
+                        .iter()
+                        .map(|elem| {
+                            sort_pattern_value(ctx, pat, elem)
+                                .and_then(|v| std::str::from_utf8(&v).ok()?.parse::<f64>().ok())
+                        })
+                        .collect(),
                 }
             };
 
             if missing {
                 if let Some(ref dst) = store_dst {
                     let dst_shard = store::get_shard(&ctx.store[*ctx.selected_db], dst);
-                    write_lock!(dst_shard).remove(dst.as_str());
+                    write_lock!(dst_shard).remove(dst.as_slice());
                     return Some(resp_integer(0));
                 }
                 return Some(resp_array(vec![]));
@@ -1423,7 +1548,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // ── Sort ───────────────────────────────────────────────────────────
             let is_nosort = by_pattern
                 .as_deref()
-                .map(|p| p.eq_ignore_ascii_case("nosort"))
+                .map(|p| p.eq_ignore_ascii_case(b"nosort"))
                 .unwrap_or(false);
 
             if is_nosort && in_score_order && descending {
@@ -1506,41 +1631,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Build raw output values (before RESP encoding) — used for both
             // the client response AND STORE.
-            let raw_output: Vec<Vec<u8>> = if get_patterns.is_empty() {
-                elements.iter().map(|e| e.to_vec()).collect()
+            // `None` is a lookup that found nothing: nil in the reply, an
+            // empty string in a `STORE`d list (as in Redis). An empty string
+            // that was found is an empty string, not a nil.
+            let raw_output: Vec<Option<Vec<u8>>> = if get_patterns.is_empty() {
+                elements.iter().map(|e| Some(e.to_vec())).collect()
             } else {
                 let mut out = Vec::with_capacity(elements.len() * get_patterns.len());
                 for elem in &elements {
-                    let elem_str = std::str::from_utf8(elem).unwrap_or("");
                     for pat in &get_patterns {
-                        if pat == "#" {
-                            out.push(elem.to_vec());
-                        } else if let Some(arrow) = pat.find("->") {
-                            let key_pat = &pat[..arrow];
-                            let field = &pat[arrow + 2..];
-                            let lookup_key = key_pat.replace('*', elem_str);
-
-                            let shard = store::get_shard(db, &lookup_key);
-                            let map = read_lock!(shard);
-                            // Hash field branch — push raw bytes, not resp_bulk
-                            let val = match map.peek(lookup_key.as_str()) {
-                                Some(ValueRef::Hash(h)) => {
-                                    let inner = h.read();
-                                    inner.get(field).map(|v| v.to_vec()) // raw bytes
-                                }
-                                _ => None,
-                            };
-                            // None = missing → push empty Vec as sentinel for nil
-                            out.push(val.unwrap_or_default());
+                        if pat.as_slice() == b"#" {
+                            out.push(Some(elem.to_vec()));
                         } else {
-                            let lookup_key = pat.replace('*', elem_str);
-                            let shard = store::get_shard(db, &lookup_key);
-                            let map = read_lock!(shard);
-                            let val = match map.peek(lookup_key.as_str()) {
-                                Some(ValueRef::String(s)) => Some(s.to_vec()), // raw bytes
-                                _ => None,
-                            };
-                            out.push(val.unwrap_or_default());
+                            out.push(sort_pattern_value(ctx, pat, elem));
                         }
                     }
                 }
@@ -1549,17 +1652,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // ── STORE → write result as List, return count ─────────────────────
             if let Some(ref dst) = store_dst {
-                let new_list: std::collections::VecDeque<Arc<[u8]>> =
-                    raw_output.iter().map(|v| Arc::from(v.as_slice())).collect();
+                let new_list: std::collections::VecDeque<Arc<[u8]>> = raw_output
+                    .iter()
+                    .map(|v| Arc::from(v.as_deref().unwrap_or_default()))
+                    .collect();
                 let count = new_list.len() as i64;
                 let db_idx = *ctx.selected_db;
                 let dst_shard = store::get_shard(&ctx.store[db_idx], dst);
                 let mut dst_map = write_lock!(dst_shard);
                 if new_list.is_empty() {
-                    dst_map.remove(dst.as_str());
+                    dst_map.remove(dst.as_slice());
                 } else {
                     dst_map.insert_expiring(
-                        Key::from(dst),
+                        dst,
                         KiviDBValue::List(std::sync::Arc::new(parking_lot::RwLock::new(new_list))),
                         None,
                     );
@@ -1571,12 +1676,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let nil = resp_null_for(crate::commands::handler::effective_resp_for_reply(ctx));
             let resp_output: Vec<Vec<u8>> = raw_output
                 .iter()
-                .map(|v| {
-                    if v.is_empty() {
-                        nil.clone()
-                    } else {
-                        resp_bulk(v)
-                    }
+                .map(|v| match v {
+                    Some(v) => resp_bulk(v),
+                    None => nil.clone(),
                 })
                 .collect();
             Some(resp_array(resp_output))
@@ -1594,10 +1696,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'expiretime' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             // Lazy-evict expired keys, same as TTL/PTTL do.
             if is_expired(ctx.store, *ctx.selected_db, key) {
@@ -1624,10 +1723,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'pexpiretime' command",
                 ));
             }
-            let key = match parse_utf8(cmd[1]) {
-                Some(k) => k,
-                None => return Some(resp_error("ERR must be valid UTF-8")),
-            };
+            let key: &[u8] = cmd[1];
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
@@ -1658,9 +1754,91 @@ enum TimeUnit {
 }
 
 fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
+    // Saturated: cut to 64 bits, a far deadline read back negative.
     let d = exp.duration_since(UNIX_EPOCH).unwrap_or_default();
     match unit {
-        TimeUnit::Secs => d.as_secs() as i64,
-        TimeUnit::Millis => d.as_millis() as i64,
+        // To the nearest second, as `TTL` (Redis's `(ms + 500) / 1000`).
+        TimeUnit::Secs => ms_to_nearest_secs(i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+        TimeUnit::Millis => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+#[cfg(test)]
+mod sort_gate_tests {
+    use super::sort_reads_hash_fields;
+
+    fn reads(args: &[&str]) -> bool {
+        let cmd: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        sort_reads_hash_fields(&cmd)
+    }
+
+    /// Only a `BY` or `GET` pattern that names a hash field of another key
+    /// takes the command gate alone; nothing that merely looks like one.
+    #[test]
+    fn only_a_pattern_naming_a_hash_field_counts() {
+        assert!(reads(&["SORT", "ids", "BY", "obj:*->w"]));
+        assert!(reads(&[
+            "SORT", "ids", "GET", "#", "GET", "obj:*->w", "STORE", "dst"
+        ]));
+        assert!(reads(&["sort", "ids", "by", "w_*", "get", "o_*->n"]));
+        assert!(!reads(&["SORT", "ids"]));
+        assert!(!reads(&["SORT", "ids", "BY", "nosort", "STORE", "dst"]));
+        assert!(!reads(&[
+            "SORT", "ids", "BY", "weight_*", "GET", "#", "GET", "name_*"
+        ]));
+        // No `*`: names no key. `->` with nothing after: no field.
+        assert!(!reads(&["SORT", "ids", "BY", "obj->w"]));
+        assert!(!reads(&["SORT", "ids", "GET", "obj:*->"]));
+        // A destination or a LIMIT argument is no pattern.
+        assert!(!reads(&["SORT", "ids", "STORE", "x:*->y"]));
+        assert!(!reads(&["SORT", "ids", "LIMIT", "0", "x:*->y"]));
+        assert!(!reads(&["SORT", "ids", "BY"]));
+    }
+
+    /// The first pattern of `args` that can name a key outside the tag `q`.
+    fn outside(args: &[&str]) -> Option<String> {
+        let cmd: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        super::sort_pattern_outside(&cmd, |key| crate::tag_locks::tag_of(key) == Some(&b"q"[..]))
+            .map(|pat| String::from_utf8_lossy(pat).into_owned())
+    }
+
+    /// A pattern is kept to a tag only when what comes before its `*`
+    /// holds the whole tag; string keys count as hashes do; `#`, no `*`, a
+    /// destination and a `LIMIT` name nothing.
+    #[test]
+    fn only_a_pattern_whose_prefix_holds_the_tag_keeps_to_it() {
+        let out = |args: &[&str]| outside(args).unwrap_or_default();
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "obj:*->w"]), "obj:*->w");
+        assert_eq!(
+            out(&["SORT_RO", "{q}:ids", "GET", "#", "GET", "o:*->n"]),
+            "o:*->n"
+        );
+        assert_eq!(out(&["sort", "{q}:ids", "bY", "w_*"]), "w_*");
+        assert_eq!(out(&["sort", "{q}:ids", "gEt", "{r}:*"]), "{r}:*");
+        // The element would close the tag, or there is none before the `*`.
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "{q*}->w"]), "{q*}->w");
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "*{q}->w"]), "*{q}->w");
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "{}*{q}"]), "{}*{q}");
+        // The first `*` is the element's, whatever follows.
+        assert_eq!(out(&["SORT", "{q}:ids", "BY", "a*{q}*"]), "a*{q}*");
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "{q}:obj:*->w"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "GET", "x{q}y*"]), None);
+        assert_eq!(
+            outside(&["SORT", "{q}:ids", "BY", "{q}*", "GET", "#"]),
+            None
+        );
+        assert_eq!(outside(&["SORT", "{q}:ids"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "nosort"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "BY", "obj->w"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "STORE", "x:*->y"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "LIMIT", "0", "x:*->y"]), None);
+        assert_eq!(outside(&["SORT", "{q}:ids", "GET"]), None);
+        // Each pattern is asked, not only the first.
+        assert_eq!(
+            out(&[
+                "SORT", "{q}:ids", "BY", "{q}:*", "LIMIT", "0", "1", "GET", "{q}:*", "GET", "o*"
+            ]),
+            "o*"
+        );
     }
 }

@@ -23,7 +23,7 @@ pub mod helpers;
 pub(crate) mod hotkeys;
 mod hybrid;
 pub(crate) mod hyperloglog;
-mod json;
+pub(crate) mod json;
 pub(crate) mod json_fpha;
 pub(crate) mod json_path;
 mod key_spec_table;
@@ -31,6 +31,8 @@ pub(crate) mod key_specs;
 pub mod latency;
 mod list_move;
 mod lists;
+pub(crate) mod login;
+pub(crate) mod long_double;
 #[cfg(feature = "lua")]
 mod lua;
 #[cfg(feature = "lua")]
@@ -59,6 +61,7 @@ mod lua {
 // `purge_allocator` after it swaps the old dataset out; the MEMORY subcommand
 // handlers themselves stay internal.
 pub(crate) mod memory;
+mod memory_layout;
 mod pubsub;
 pub(crate) mod search;
 pub(crate) mod search_tools;
@@ -73,7 +76,9 @@ pub(crate) mod streams;
 mod strftime;
 mod strings;
 pub mod transaction;
-mod ts;
+// `pub(crate)` only so `replication::script_feed` finds where a
+// `TS.INCRBY` has its `TIMESTAMP`, as the command reads it.
+pub(crate) mod ts;
 mod ts_query;
 mod vector;
 mod vset;

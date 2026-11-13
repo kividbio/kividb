@@ -156,6 +156,7 @@ async fn server_tokio(
     let client_registry = crate::client_registry::new_client_registry();
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let cluster_state = std::sync::Arc::new(
         crate::cluster::ClusterState::from_config(&config).expect("cluster config file"),

@@ -3,9 +3,11 @@
 //! Redis and Valkey share the RDB format up to RDB 11 (Redis 7.2, Valkey 7.2
 //! and 8). Past it they part: Redis went on to RDB 12 and later, and Valkey
 //! 9.0 jumped to RDB 80, with a `VALKEY` header in place of `REDIS` and
-//! numbers of its own for what it added. The same type byte can mean two
-//! things: 22 is Valkey's hash with field TTLs and a Redis 7.4 pre-release
-//! encoding. So the reader is told whose file it reads, by the header (a
+//! numbers of its own for what it added. The same type byte can mean more
+//! than one thing: 22 is Valkey's hash with field TTLs, a Redis 7.4
+//! pre-release encoding under RDB 12, and, under RDB 11 or older, Dragonfly's
+//! hash with field TTLs, in Valkey's encoding (`rdb_extensions`). So the
+//! reader is told whose file it reads, by the header (a
 //! file, a full sync) or by the version in the trailer (a `DUMP` payload,
 //! which has no header).
 //!
@@ -56,10 +58,12 @@ pub(super) fn from_header(header: &[u8; 9]) -> io::Result<Dialect> {
         .ok_or_else(|| rdb_invalid("a VALKEY header without an RDB version"))?;
     match version {
         VALKEY_RDB_VERSION => Ok(Dialect::Valkey),
-        newer if newer > VALKEY_RDB_VERSION => Err(rdb_invalid(format!(
-            "Valkey RDB version {newer} is newer than the one this server reads \
+        newer if newer > VALKEY_RDB_VERSION => {
+            Err(super::rdb_extensions::unrepresentable(format!(
+                "Valkey RDB version {newer} is newer than the one this server reads \
              ({VALKEY_RDB_VERSION}, Valkey 9.0 and 9.1)"
-        ))),
+            )))
+        }
         // Valkey itself never writes a VALKEY header below 80.
         older => Err(rdb_invalid(format!(
             "a VALKEY header with RDB version {older}, which Valkey does not write"
@@ -100,7 +104,7 @@ pub(super) fn read_value(
             22 => read_valkey_hash_2(r),
             // The types Valkey shares with Redis: up to RDB 11's.
             0..=21 => rdb_read_value(r, type_id),
-            other => Err(rdb_invalid(format!(
+            other => Err(super::rdb_extensions::unrepresentable(format!(
                 "RDB type {other} is not one Valkey 9.0 or 9.1 writes"
             ))),
         },
@@ -114,7 +118,7 @@ pub(super) fn read_value(
 /// with them, or without them.
 pub(super) fn refuse_slot_import(r: &mut impl Read) -> io::Error {
     let what = describe_slot_import(r).unwrap_or_default();
-    rdb_invalid(format!(
+    super::rdb_extensions::unrepresentable(format!(
         "the file holds a Valkey slot migration into this node that was in progress \
          when it was saved{what}: the keys of those slots are not all there. Finish or \
          cancel the migration on the Valkey node, then save the file again"
@@ -137,28 +141,28 @@ fn describe_slot_import(r: &mut impl Read) -> io::Result<String> {
     Ok(format!(" (job {job}, slots {})", ranges.join(" ")))
 }
 
-/// When a hash field of a Redis or Valkey file whose expiry is `at_ms`
-/// (Unix milliseconds) expires, on the clock field TTLs are kept by;
-/// `None` if that time has come, and the field is dropped. One further out
-/// than the clock can hold is a corrupt file.
+/// When a hash field of a Redis, Valkey, Dragonfly or KeyDB file or `DUMP`
+/// payload whose expiry is `at_ms` (Unix milliseconds) expires, on the clock
+/// field TTLs are kept by. One further out than the clock can hold is a
+/// corrupt file.
 ///
-/// Converted with `clock`, read once for the hash, to the nanosecond (see
-/// `FieldClock`, #448), so that `HPEXPIRETIME` reads back the very
-/// millisecond the file holds. Taken from the clock in whole milliseconds,
-/// it read back one later about every other time.
-pub(super) fn field_deadline(
-    clock: &crate::commands::helpers::FieldClock,
-    at_ms: u64,
-) -> io::Result<Option<std::time::Instant>> {
-    clock
-        .checked_instant_of(at_ms)
-        .ok_or_else(|| rdb_invalid("hash field expiry out of range"))
+/// A time that has come is kept as the moment it was, and the field with it:
+/// `field_expiry` removes it, and a master sends its `HDEL` (#415). Dropped
+/// here by the clock of each reader, a field a master kept was gone on a
+/// replica that read the same full sync or `RESTORE` a moment later, and a
+/// write the master made to the field while it lived (`HINCRBY`,
+/// `HPERSIST`) came out differently there.
+///
+/// Kept as the file holds it, Unix milliseconds, so that `HPEXPIRETIME`
+/// reads back the very millisecond the file holds (#594).
+pub(super) fn field_deadline(at_ms: u64) -> crate::types::FieldDeadline {
+    at_ms
 }
 
 /// Valkey 9's `RDB_TYPE_HASH_2`: a count, then each field's name, its value
 /// and its expiry, an 8-byte little-endian Unix time in milliseconds, or -1
-/// for none. Fields already past their time are dropped, as Valkey drops
-/// them on load (and sends the deletes of them to its replicas).
+/// for none. Fields already past their time are kept with it (see
+/// [`field_deadline`]).
 fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
     let count = rdb_read_plain_length(r)?;
     let mut fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)> =
@@ -173,9 +177,8 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         fields.push((field, value, expires_at));
     }
 
-    let clock = crate::commands::helpers::FieldClock::now();
     let mut inner = crate::types::HashInner::new();
-    // Every field's name, kept or not: one named twice is a corrupt file.
+    // One named twice is a corrupt file.
     let mut names = std::collections::HashSet::with_capacity(fields.len());
     for (field, value, expires_at) in fields {
         let field = String::from_utf8_lossy(&field).into_owned();
@@ -183,16 +186,11 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            match field_deadline(&clock, at)? {
-                Some(deadline) => {
-                    inner.expiries.insert(field.clone(), deadline);
-                }
-                None => continue,
-            }
+            inner.expiries.insert(field.clone(), field_deadline(at));
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
-    // Nothing left (or nothing there): no key, as Valkey loads none.
+    // Nothing there: no key, as Valkey loads none.
     if inner.fields.is_empty() {
         return Ok(None);
     }

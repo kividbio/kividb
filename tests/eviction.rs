@@ -246,6 +246,12 @@ impl Server {
             .append(true)
             .open(dir.join("server.log"))
             .unwrap();
+        // The tokio loop, unless the test names its own.
+        let io_model: &[&str] = if extra.contains(&"--io-model") {
+            &[]
+        } else {
+            &["--io-model", "tokio"]
+        };
         let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(&dir)
             .args([
@@ -253,13 +259,12 @@ impl Server {
                 &port.to_string(),
                 "--bind",
                 "127.0.0.1",
-                "--io-model",
-                "tokio",
                 "--threads",
                 "4",
                 "--configfile",
                 "kividb.conf",
             ])
+            .args(io_model)
             .args(extra)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
@@ -342,6 +347,34 @@ fn noeviction_refuses_what_adds_and_allows_what_frees() {
     // With room again, writes are accepted — the memory freed was seen.
     assert!(c.used_memory() < limit);
     assert!(c.cmd(&["SET", "again", &value]).ok());
+}
+
+/// While writes are paused nothing is evicted, as in Redis: a read over the
+/// limit, or a lower limit, leaves the dataset as it is, and eviction goes
+/// on once the pause is over (#424). Eviction's `DEL`s used to go on, and
+/// moved the replication offset a paused master had reported.
+#[test]
+fn nothing_is_evicted_while_writes_are_paused() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-random"]);
+    let mut c = server.conn();
+    let value = value();
+    for i in 0..2000 {
+        assert!(c.cmd(&["SET", &format!("k{i}"), &value]).ok());
+    }
+    let used = c.used_memory();
+
+    assert!(c.cmd(&["CLIENT", "PAUSE", "10000", "WRITE"]).ok());
+    c.limit_to(-used / 2);
+    for i in 0..100 {
+        assert_eq!(c.cmd(&["GET", &format!("k{i}")]).s(), value);
+    }
+    assert_eq!(c.evicted(), 0);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 2000);
+
+    assert!(c.cmd(&["CLIENT", "UNPAUSE"]).ok());
+    c.cmd(&["GET", "k0"]);
+    assert!(c.evicted() > 0);
+    assert!(c.cmd(&["DBSIZE"]).i() < 2000);
 }
 
 /// The least recently used keys go, to keep the server under its limit, and
@@ -1407,6 +1440,135 @@ fn writes_during_a_full_sync_evict_nothing_that_fits() {
     assert_eq!(r.cmd(&["GET", "s0"]).s(), big_value('b'));
 }
 
+/// Everything written while a replica is behind is queued for it, and none
+/// of it is counted: not the stream's bytes, and not what each write takes
+/// in the queue besides (its allocation, its slot). Only the bytes were
+/// taken off. A replica gigabytes behind under heavy writes left hundreds of
+/// megabytes counted, and its master evicted nearly every key for them and
+/// then refused writes (#542). Here the replica is held in its full sync,
+/// reading nothing of the stream, while small writes are queued for it: what
+/// they take besides their bytes is several times the room the master has.
+#[test]
+fn writes_queued_for_a_replica_that_is_behind_evict_nothing() {
+    let master = Server::start_holding_snapshots(&[
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--repl-backlog-size",
+        "1048576",
+    ]);
+    let replica = Server::start(&[]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    let limit = m.fill_to_the_limit();
+    assert!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()])
+            .ok()
+    );
+    let held = master.snapshot_held(1);
+
+    // Payloads of about 30 bytes, each taking about 40 more in the queue:
+    // some 16 MB besides the bytes, against 4 MB of room.
+    const WRITES: usize = 400_000;
+    const BATCH: usize = 2_000;
+    let incr = b"*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n";
+    for batch in 0..WRITES / BATCH {
+        m.writer.write_all(&incr.repeat(BATCH)).unwrap();
+        for i in 0..BATCH {
+            let reply = m.read();
+            let n = (batch * BATCH + i + 1) as i64;
+            assert_eq!(reply, V::Int(n), "write {n} was refused");
+        }
+    }
+    assert_eq!(
+        m.evicted(),
+        0,
+        "keys were evicted for what is queued for the replica"
+    );
+
+    // Once the replica has it all, nothing is left uncounted, and it has
+    // what the master has.
+    std::fs::remove_file(held).unwrap();
+    r.wait_for("replication", "master_link_status", "up");
+    assert_eq!(m.cmd(&["WAIT", "1", "30000"]).i(), 1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while m.not_counted() != 0 {
+        assert!(Instant::now() < deadline, "memory is still not counted");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let used = m.used_memory();
+    assert!(
+        used <= limit,
+        "{used} bytes used, over the limit of {limit}"
+    );
+    assert_eq!(m.evicted(), 0);
+    assert_eq!(m.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64 + 1);
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), SNAPSHOT_KEYS as i64 + 1);
+    assert_eq!(r.cmd(&["GET", "counter"]).s(), WRITES.to_string());
+    assert_eq!(r.cmd(&["GET", "s0"]).s(), big_value('a'));
+}
+
+/// A replica that stops reading while its full sync's payload is written (a
+/// stopped process, whose kernel still answers) is let go of once its queue
+/// passes the sync's limit: the payload's write is given up then, and
+/// nothing is left counted out of `maxmemory`. The write used to be waited on
+/// for good, with the replica's queue and the payload held (#542). On both
+/// I/O models where there are two.
+#[test]
+fn a_replica_that_stops_reading_during_its_full_sync_is_let_go_of() {
+    let models: &[&str] = if cfg!(target_os = "linux") {
+        &["tokio", "uring"]
+    } else {
+        &["tokio"]
+    };
+    for &model in models {
+        let master = Server::start(&["--io-model", model, "--repl-backlog-size", "1048576"]);
+        let mut m = master.conn();
+        if model == "uring" {
+            assert_eq!(m.info("server", "multiplexing_api"), "io_uring");
+        }
+        // 48 MB of values: a payload no pair of socket buffers holds.
+        let value = big_value('a');
+        for i in 0..6000 {
+            assert!(m.cmd(&["SET", &format!("s{i}"), &value]).ok());
+        }
+        for (name, bytes) in [
+            ("repl-replica-max-backlog-bytes", "1048576"),
+            ("repl-replica-sync-max-backlog-bytes", "4194304"),
+        ] {
+            assert!(m.cmd(&["CONFIG", "SET", name, bytes]).ok());
+        }
+
+        // A replica that asks for a full sync, and reads nothing.
+        let mut replica = TcpStream::connect(("127.0.0.1", master.port)).unwrap();
+        replica
+            .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+            .unwrap();
+        m.wait_for("replication", "connected_slaves", "1");
+
+        // 8 MB written meanwhile, queued for it: past the sync's limit.
+        for i in 0..1000 {
+            assert!(m.cmd(&["SET", &format!("w{i}"), &value]).ok());
+        }
+
+        // Let go of: its connection is closed, and nothing it held is left
+        // counted out.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let held = m.not_counted();
+            let replicas = m.info("replication", "connected_slaves");
+            if held == 0 && replicas == "0" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{model}: {held} bytes still not counted, {replicas} replica(s) connected"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(m.cmd(&["DBSIZE"]).i(), 7000);
+        drop(replica);
+    }
+}
+
 #[test]
 fn debug_object_shows_the_idle_time_and_is_not_a_use() {
     let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
@@ -1426,4 +1588,343 @@ fn debug_object_shows_the_idle_time_and_is_not_a_use() {
         .unwrap();
     assert!((1000..=1010).contains(&idle), "{line}");
     assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 1000);
+}
+
+// ── Sets and hashes against the limit ─────────────────────────────────────────
+
+/// `count` members (or fields) from `from`, for one `SADD` or `HSET`.
+fn members(from: usize, count: usize) -> Vec<String> {
+    (from..from + count)
+        .map(|i| format!("member:{i:08}"))
+        .collect()
+}
+
+/// `cmd key args...`, the arguments owned.
+fn cmd_with(c: &mut Conn, head: &[&str], args: &[String]) -> V {
+    let mut all: Vec<&str> = head.to_vec();
+    all.extend(args.iter().map(String::as_str));
+    c.cmd(&all)
+}
+
+/// Grows the collection at `key` with `add(c, from)` (100 members a time)
+/// until a write is refused, and checks that what it reports in `MEMORY
+/// USAGE` is what it took of the limit's room: the limit is on what the
+/// process allocates, so the key that filled the room should say it did.
+/// Then deleting it makes room again. Hands back how many members got in.
+fn grow_until_refused(
+    c: &mut Conn,
+    key: &str,
+    mut add: impl FnMut(&mut Conn, usize) -> V,
+) -> usize {
+    let before = c.used_memory();
+    let room = 2 * MB;
+    let limit = c.limit_to(room);
+    let mut added = 0;
+    let refused = loop {
+        let reply = add(c, added);
+        if reply.is_err() {
+            break reply;
+        }
+        added += 100;
+        assert!(added < 1_000_000, "{added} members under a 2 MB limit");
+    };
+    assert!(
+        refused.s().starts_with("OOM command not allowed"),
+        "{refused:?}"
+    );
+    assert_eq!(c.evicted(), 0);
+
+    // What the key took, measured, and what it reports.
+    let took = c.used_memory() - before;
+    let usage = c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).i();
+    assert!(
+        (took * 9 / 10..=took * 11 / 10).contains(&usage),
+        "{key}: MEMORY USAGE {usage}, but it took {took} of a {room}-byte room ({added} members)"
+    );
+    // The last write was refused at the limit, not long before it.
+    assert!(
+        took > room * 3 / 4 && took <= room + room / 4,
+        "took {took} of {room}"
+    );
+
+    // Reads are unaffected; deleting the key makes room.
+    assert!(c.cmd(&["EXISTS", key]).i() == 1);
+    assert_eq!(c.cmd(&["DEL", key]).i(), 1);
+    assert!(c.used_memory() < limit);
+    assert!(add(c, 0).i() > 0, "a write after the delete was refused");
+    c.lift_the_limit();
+    added
+}
+
+/// Under `noeviction`, a set that grows is refused once the process reaches
+/// its limit, across the table's growth (each doubling is one allocation of
+/// twice the buckets), and `MEMORY USAGE` says the set is what filled it.
+#[test]
+fn noeviction_refuses_a_growing_set_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    let added = grow_until_refused(&mut c, "set", |c, from| {
+        cmd_with(c, &["SADD", "set"], &members(from, 100))
+    });
+    assert!(added > 10_000, "only {added} members in 2 MB");
+}
+
+/// The same for a hash of many short fields.
+#[test]
+fn noeviction_refuses_a_growing_hash_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    grow_until_refused(&mut c, "hash", |c, from| {
+        let pairs: Vec<String> = members(from, 100)
+            .into_iter()
+            .flat_map(|f| [f, "v".to_string()])
+            .collect();
+        cmd_with(c, &["HSET", "hash"], &pairs)
+    });
+}
+
+/// And for a hash whose fields have times to live, which hold a second copy
+/// of each field's name.
+#[test]
+fn noeviction_refuses_a_hash_with_field_ttls_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    grow_until_refused(&mut c, "hash", |c, from| {
+        let fields = members(from, 100);
+        let pairs: Vec<String> = fields
+            .iter()
+            .flat_map(|f| [f.clone(), "v".to_string()])
+            .collect();
+        let added = cmd_with(c, &["HSET", "hash"], &pairs);
+        if added.is_err() {
+            return added;
+        }
+        let ttl = cmd_with(
+            c,
+            &["HPEXPIRE", "hash", "3600000", "FIELDS", "100"],
+            &fields,
+        );
+        if ttl.is_err() { ttl } else { added }
+    });
+}
+
+/// Writing values over with values as long, near the limit, adds nothing:
+/// none of it is refused.
+#[test]
+fn noeviction_allows_writing_over_hash_values_near_the_limit() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    let limit = c.limit_to(MB);
+    let mut keys = 0;
+    loop {
+        let pairs: Vec<String> = members(0, 65)
+            .into_iter()
+            .flat_map(|f| [f, "a".repeat(16)])
+            .collect();
+        if cmd_with(&mut c, &["HSET", &format!("h{keys}")], &pairs).is_err() {
+            break;
+        }
+        keys += 1;
+        assert!(keys < 10_000);
+    }
+    // Some room again: a few hashes deleted, until 64 KB is free (#681).
+    //
+    // One hash deleted left whatever room the limit happened to fall at,
+    // anywhere from nothing to one hash (about 9 KB). What the server uses
+    // besides the keys is in what is counted against the limit too: the
+    // command being run, read before it is checked (about 3 KB here, more
+    // when it comes in pieces), and allocations the server makes once under
+    // load (about 21 KB measured, with a thread's worth of resident memory).
+    // A room of a few KB was eaten, and the first write over was refused.
+    const ROOM: i64 = 64 << 10;
+    let mut deleted = 0;
+    while c.used_memory() > limit - ROOM {
+        assert_eq!(c.cmd(&["DEL", &format!("h{deleted}")]).i(), 1);
+        deleted += 1;
+        assert!(deleted < keys / 2, "{deleted} of {keys} hashes deleted");
+    }
+    for round in 0..20 {
+        for k in deleted..keys.min(deleted + 49) {
+            let fill = if round % 2 == 0 { "b" } else { "c" };
+            let pairs: Vec<String> = members(0, 65)
+                .into_iter()
+                .flat_map(|f| [f, fill.repeat(16)])
+                .collect();
+            let reply = cmd_with(&mut c, &["HSET", &format!("h{k}")], &pairs);
+            assert_eq!(reply, V::Int(0), "round {round}, h{k}: {reply:?}");
+        }
+    }
+    assert!(c.used_memory() <= limit);
+    assert_eq!(c.evicted(), 0);
+}
+
+/// Under `allkeys-lru`, sets of 65 members (just past a table doubling, so
+/// most of each is table) are evicted to keep the process under its limit,
+/// and what is left reports, in all, about what is in use.
+#[test]
+fn allkeys_lru_keeps_sets_under_the_limit_and_their_usage_adds_up() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let before = c.used_memory();
+    let limit = c.limit_to(4 * MB);
+    let set = members(0, 65);
+    let written = 3000;
+    for i in 0..written {
+        let reply = cmd_with(&mut c, &["SADD", &format!("s{i}")], &set);
+        assert_eq!(reply, V::Int(65), "write {i}: {reply:?}");
+    }
+    let used = c.used_memory();
+    assert!(
+        used <= limit + MB / 4,
+        "{used} in use, the limit is {limit}"
+    );
+    // Lift the limit before reading the counters. Room is made before any
+    // command runs, so with the limit still in place an eviction may land
+    // between the read of `evicted_keys` and the lift, and the sum then
+    // falls one key short of what was written.
+    c.lift_the_limit();
+    let evicted = c.evicted();
+    assert!(evicted > 0, "nothing was evicted");
+    let left = c.cmd(&["DBSIZE"]).i();
+    assert_eq!(left + evicted, written as i64);
+
+    let reported: i64 = (0..written)
+        .filter_map(|i| match c.cmd(&["MEMORY", "USAGE", &format!("s{i}")]) {
+            V::Int(n) => Some(n),
+            _ => None,
+        })
+        .sum();
+    let in_use = c.used_memory() - before;
+    assert!(
+        (in_use * 9 / 10..=in_use * 11 / 10).contains(&reported),
+        "{left} sets report {reported} bytes, {in_use} are in use"
+    );
+}
+
+/// Under `volatile-lru`, only hashes with a time to live go: hashes without
+/// one are written until every hash with one has been evicted, and then a
+/// write that adds is refused.
+#[test]
+fn volatile_lru_evicts_only_hashes_with_a_ttl() {
+    let server = Server::start(&["--maxmemory-policy", "volatile-lru"]);
+    let mut c = server.conn();
+    let pairs: Vec<String> = members(0, 65)
+        .into_iter()
+        .flat_map(|f| [f, "v".to_string()])
+        .collect();
+    let limit = c.limit_to(2 * MB);
+    for i in 0..50 {
+        cmd_with(&mut c, &["HSET", &format!("kept{i}")], &pairs);
+    }
+    for i in 0..50 {
+        let key = format!("ttl{i}");
+        cmd_with(&mut c, &["HSET", &key], &pairs);
+        assert_eq!(c.cmd(&["EXPIRE", &key, "100000"]).i(), 1);
+    }
+    assert_eq!(c.evicted(), 0);
+    let mut more = 0;
+    let refused = loop {
+        let reply = cmd_with(&mut c, &["HSET", &format!("more{more}")], &pairs);
+        if reply.is_err() {
+            break reply;
+        }
+        more += 1;
+        assert!(more < 50_000, "never refused");
+    };
+    assert!(
+        refused.s().starts_with("OOM command not allowed"),
+        "{refused:?}"
+    );
+    assert_eq!(c.surviving("ttl", 50), 0, "a hash with a TTL was left");
+    assert_eq!(c.evicted(), 50);
+    assert_eq!(c.surviving("kept", 50), 50);
+    assert_eq!(c.surviving("more", more), more);
+    assert!(c.used_memory() <= limit + MB / 4);
+}
+
+/// And for a sorted set, whose members are in two indexes.
+#[test]
+fn noeviction_refuses_a_growing_sorted_set_at_the_limit_and_memory_usage_says_why() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    grow_until_refused(&mut c, "zset", |c, from| {
+        let pairs: Vec<String> = members(from, 100)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, m)| [(from + i).to_string(), m])
+            .collect();
+        cmd_with(c, &["ZADD", "zset"], &pairs)
+    });
+}
+
+/// A document that is evicted leaves its indexes with its key: the store
+/// says so for every key it takes out, and eviction no longer does. What
+/// the index of vectors finds, and what the postings list, are the
+/// documents that are left.
+#[test]
+fn an_evicted_document_leaves_its_indexes() {
+    const DOCS: usize = 3000;
+    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let create = "FT.CREATE docs ON HASH PREFIX 1 doc: SCHEMA kind TAG vec VECTOR FLAT 6 TYPE \
+                  FLOAT32 DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert!(c.cmd(&create).ok());
+    // Two little-endian floats, both 2.0: bytes that are text as well.
+    let vector = "\0\0\0@\0\0\0@";
+    let value = value();
+
+    // Room for about half of the documents.
+    c.limit_to(3 * MB / 2);
+    for i in 0..DOCS {
+        let wrote = c.cmd(&[
+            "HSET",
+            &format!("doc:{i}"),
+            "kind",
+            "book",
+            "vec",
+            vector,
+            "pad",
+            &value,
+        ]);
+        assert_eq!(wrote, V::Int(3), "write {i}");
+    }
+    c.lift_the_limit();
+    let evicted = c.evicted();
+    assert!(evicted > 500, "only {evicted} documents were evicted");
+    let left = c.surviving("doc:", DOCS);
+    assert!(left > 0 && left < DOCS, "{left} documents are left");
+
+    let count = DOCS.to_string();
+    let nearest = c.cmd(&[
+        "FT.SEARCH",
+        "docs",
+        &format!("*=>[KNN {count} @vec $q]"),
+        "PARAMS",
+        "2",
+        "q",
+        vector,
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        &count,
+        "DIALECT",
+        "2",
+    ]);
+    let V::Arr(nearest) = nearest else {
+        panic!("{nearest:?}");
+    };
+    assert_eq!(nearest.len() - 1, left, "the index of vectors");
+    for key in &nearest[1..] {
+        assert_eq!(c.cmd(&["EXISTS", key.s()]), V::Int(1), "{key:?} is gone");
+    }
+
+    let V::Arr(info) = c.cmd(&["FT.INFO", "docs"]) else {
+        panic!("no FT.INFO");
+    };
+    let listed = info
+        .iter()
+        .position(|field| *field == V::Str("doc_ids".into()))
+        .map(|at| info[at + 1].i());
+    assert_eq!(listed, Some(left as i64), "the postings");
 }

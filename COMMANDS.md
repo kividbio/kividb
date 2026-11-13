@@ -337,7 +337,7 @@ place of the array.
 | `JSON.STRLEN` | `JSON.STRLEN key [path]` | The length of each matched string; nil for other types |
 | `JSON.STRAPPEND` | `JSON.STRAPPEND key [path] value` | Append a JSON string to each matched string; returns the new lengths |
 | `JSON.TOGGLE` | `JSON.TOGGLE key path` | Flip each matched boolean; returns the new values as 1 and 0 (a legacy path: `"true"` or `"false"`) |
-| `JSON.NUMINCRBY` | `JSON.NUMINCRBY key path number` | Add to each matched number. Returns the new values as one JSON array in a bulk string, `null` where the match is not a number — `"[1820,1972,null]"` (RESP3: an array of numbers). A legacy path returns the one new value. A result that is not a finite number fails the command and changes nothing |
+| `JSON.NUMINCRBY` | `JSON.NUMINCRBY key path number` | Add to each matched number. Returns the new values as one JSON array in a bulk string, `null` where the match is not a number — `"[1820,1972,null]"` (RESP3: an array of numbers). A legacy path returns the one new value. The result is an integer only when both numbers are integers, so a float stays a float even when it is whole (`1.5 + 1.5` is `3.0`). An integer result that does not fit an `i64` (`ERR numeric overflow`) or a result that is not a finite number fails the command and changes nothing |
 | `JSON.NUMMULTBY` | `JSON.NUMMULTBY key path number` | The same, multiplying |
 | `JSON.OBJKEYS` | `JSON.OBJKEYS key [path]` | The member names of each matched object, in the order they were added |
 | `JSON.OBJLEN` | `JSON.OBJLEN key [path]` | The number of members of each matched object |
@@ -659,18 +659,25 @@ KiviDB implements the RedisTimeSeries command surface. Time series are stored na
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap. Without `DUPLICATE_POLICY`, a series (made here or by `TS.ADD`) takes `ts-duplicate-policy`: `last` unless set; RedisTimeSeries's default is `block` |
-| `TS.ALTER` | `TS.ALTER key [RETENTION ms] [CHUNK SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Update retention, chunk size, duplicate policy, or labels. Updating labels atomically rebuilds the label index |
+| `TS.CREATE` | `TS.CREATE key [RETENTION ms] [ENCODING COMPRESSED\|UNCOMPRESSED] [CHUNK_SIZE size] [DUPLICATE_POLICY BLOCK\|FIRST\|LAST\|MIN\|MAX\|SUM] [LABELS label value ...]` | Create a new time series. ENCODING is accepted but ignored — storage is always BTreeMap. `CHUNK_SIZE` is a multiple of 8 from 48 to 1048576; it is reported by `TS.INFO`. Without `DUPLICATE_POLICY`, a series (made here or by `TS.ADD`) takes `ts-duplicate-policy`: `last` unless set; RedisTimeSeries's default is `block`. See [Time series options](#time-series-options) |
+| `TS.ALTER` | `TS.ALTER key [RETENTION ms] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Update retention, chunk size, duplicate policy, or labels; what is given is set, `RETENTION 0` and `LABELS` with no pairs too. Updating labels atomically rebuilds the label index |
 | `TS.DEL` | `TS.DEL key fromTimestamp toTimestamp` | Delete all samples in the inclusive timestamp range. Returns the count of deleted samples |
 
 ### Adding samples
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `TS.ADD` | `TS.ADD key timestamp value [RETENTION ms] [ENCODING ...] [CHUNK SIZE size] [ON DUPLICATE policy] [LABELS label value ...]` | Append a sample. Use `*` for current time. Auto-creates the key if absent. Returns the stored timestamp |
+| `TS.ADD` | `TS.ADD key timestamp value [RETENTION ms] [ENCODING ...] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [ON_DUPLICATE policy] [LABELS label value ...]` | Append a sample. Use `*` for current time. Auto-creates the key if absent, with the options given. `ON_DUPLICATE` is the policy for this sample alone; KiviDB's older `ON DUPLICATE policy`, and `DUPLICATE_POLICY`, make it the series' own. A sample the policy refuses changes nothing. Returns the stored timestamp |
 | `TS.MADD` | `TS.MADD key timestamp value [key timestamp value ...]` | Append samples to one or more series in a single call. Auto-creates missing series. Returns an array of stored timestamps |
-| `TS.INCRBY` | `TS.INCRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK SIZE size] [LABELS label value ...]` | Add a new sample equal to the last sample's value plus the given increment. Creates the series at 0 if absent |
-| `TS.DECRBY` | `TS.DECRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK SIZE size] [LABELS label value ...]` | Add a new sample equal to the last sample's value minus the given decrement |
+| `TS.INCRBY` | `TS.INCRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Add a new sample equal to the last sample's value plus the given increment, at or after the last one, replacing its value at the same timestamp. Creates the series at 0 if absent, with the options given; an existing series keeps its own. Trims to the retention |
+| `TS.DECRBY` | `TS.DECRBY key value [TIMESTAMP timestamp] [RETENTION ms] [CHUNK_SIZE size] [DUPLICATE_POLICY policy] [LABELS label value ...]` | Add a new sample equal to the last sample's value minus the given decrement; as `TS.INCRBY` |
+
+#### Time series options
+
+- `CHUNK SIZE size`, `ON DUPLICATE policy` and `DUPLICATE POLICY policy`, KiviDB's spellings before 1.2.1, are still accepted.
+- A word that is no option is passed over, and the options after it are read, as in RedisTimeSeries.
+- `IGNORE` is refused: KiviDB does not support it.
+- A `LABELS` list ends at the next option's name (`ON`, `CHUNK` and `DUPLICATE` only when followed by their second word). RedisTimeSeries takes every word after `LABELS` as a label, and finds options anywhere: its `LABELS a b RETENTION 5` has the labels `a=b` and `RETENTION=5` and a retention of 5; KiviDB's has the label `a=b` and a retention of 5.
 
 ### Querying
 
@@ -850,7 +857,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `BGREWRITEAOF` | `BGREWRITEAOF` | Trigger a background AOF rewrite; returns `ERR` if AOF is not enabled |
 | `LASTSAVE` | `LASTSAVE` | Return the Unix timestamp of the last successful save |
 | `TIME` | `TIME` | Return `[unix_seconds, microseconds_within_second]` as two bulk strings; uses real wall clock |
-| `HELLO` | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch the connection to RESP2 or RESP3 and return the server's details (`server`, `version`, `proto`, `id`, `mode`, `role`, `modules`) — a map under RESP3. `AUTH` and `SETNAME` apply before the reply. Unauthenticated, when a password is required, it is `NOAUTH` |
+| `HELLO` | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch the connection to RESP2 or RESP3 and return the server's details (`server`, `version`, `proto`, `id`, `mode`, `role`, `modules`) — a map under RESP3. `server` and `version` are the Redis release KiviDB follows (`redis`, `8.10.0`), as `INFO`'s `redis_version`; KiviDB's own release follows them as `kividb_version`, as in `INFO`. `AUTH` and `SETNAME` apply before the reply. Unauthenticated, when a password is required, it is `NOAUTH` |
 | `LOLWUT` | `LOLWUT [VERSION version]` | Return ASCII art and the server version |
 | `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss`, `maxmemory_policy`, the slabs of string values (`value_slab_bytes`, and `value_slab_live_bytes` in them) and active defrag's `active_defrag_running`, `active_defrag_hits` (values moved), `active_defrag_misses` (left, being held), `active_defrag_panics` (passes that panicked: each panic is caught and logged at `ERROR` with its file and line, the slabs the pass was emptying are put back in use, and the next pass comes 1, 2, 4, then 8 seconds later) and `active_defrag_disabled_by_panics` (1 once 5 passes in a row have panicked with none ending between them: active defrag has then turned itself off, `CONFIG GET activedefrag` says `no`, and `CONFIG SET activedefrag yes` sent while it is off turns it back on and sets this to 0; sent while it is on, it changes nothing. It is not kept across a restart: after a `CONFIG REWRITE`, which writes `activedefrag no` then, the server starts with active defrag off and this at 0, and the `ERROR` line "active defrag turned itself off" in the log says why); `INFO stats` reports `evicted_keys` |
 | `CONFIG GET` | `CONFIG GET parameter [parameter ...]` | Get a configuration parameter; supports `*` for all |
@@ -909,7 +916,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `CLIENT TRACKING` | `CLIENT TRACKING ON\|OFF [REDIRECT client-id] [BCAST] [PREFIX prefix [...]] [OPTIN] [OPTOUT] [NOLOOP]` | Enable or disable client-side cache invalidation. Invalidations reach a RESP3 connection as push messages; a RESP2 connection has to `REDIRECT` them to a connection subscribed to `__redis__:invalidate`, and without `REDIRECT` is sent nothing, as in Redis. Every key a command reads is tracked, and keys written by scripts, expired, evicted or flushed are invalidated. Default mode: all reads auto-register; writers receive their own invalidations. OPTIN: only reads preceded by `CLIENT CACHING yes` are registered. OPTOUT: all reads register unless preceded by `CLIENT CACHING no`. NOLOOP: suppress invalidations sent back to the client that caused the write. REDIRECT forwards invalidations to another client ID. Zero cost when no tracking clients connected — one atomic load per command on the hot path |
 | `CLIENT TRACKINGINFO` | `CLIENT TRACKINGINFO` | Return tracking state for the current connection: flags (off, on, bcast, optin, optout, noloop), redirect client ID (-1 if none), and prefix list |
 | `CLIENT SETINFO` | `CLIENT SETINFO LIB-NAME name \| LIB-VER ver` | Store the client library name and version on this connection; shown by `CLIENT LIST` and `CLIENT INFO` as `lib-name` and `lib-ver` |
-| `CLIENT UNBLOCK` | `CLIENT UNBLOCK id` | Returns 0; accepted for compatibility, not functional |
+| `CLIENT UNBLOCK` | `CLIENT UNBLOCK id [TIMEOUT \| ERROR]` | End the blocking command (`BLPOP`, `BLMOVE`, `BZPOPMIN`, `XREAD BLOCK`, ...) connection `id` waits in: as on a timeout (`TIMEOUT`, the default) or with `-UNBLOCKED client unblocked via CLIENT UNBLOCK` (`ERROR`). Returns 1 if it was blocked, 0 otherwise |
 | `CLIENT GETREDIR` | `CLIENT GETREDIR` | Return the client ID this connection redirects invalidations to, or -1 if no redirect is set |
 | `CLIENT REPLY` | `CLIENT REPLY ON\|OFF\|SKIP` | `OFF` stops replies on this connection until `ON`; `SKIP` drops the reply to the next command. Messages — Pub/Sub, RESP3 pushes — are still sent |
 
@@ -1080,24 +1087,24 @@ A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 | Command | Syntax | Notes |
 |---|---|---|
 | `CLUSTER INFO` | `CLUSTER INFO` | Cluster state, slot counts, known nodes, current/my epoch, gossip stats. |
-| `CLUSTER MYID` | `CLUSTER MYID` | Returns this node's 40-hex ID. Stable across restarts. |
-| `CLUSTER MYSHARDID` | `CLUSTER MYSHARDID` | Returns the shard ID — own ID for masters, master's ID for replicas. |
+| `CLUSTER MYID` | `CLUSTER MYID` | Returns this node's 40-hex ID. Stable across restarts. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `CLUSTER MYSHARDID` | `CLUSTER MYSHARDID` | Returns the shard ID — own ID for masters, master's ID for replicas. So it changes when a replica takes over; in Redis a shard has an ID of its own that stays the same across failovers. |
 | `CLUSTER NODES` | `CLUSTER NODES` | Full node table as a bulk string. Format matches Redis. |
 | `CLUSTER SLOTS` | `CLUSTER SLOTS` | Slot-to-node mapping. Each entry: `[start, end, [master_ip, port, id], ...replicas]`. |
 | `CLUSTER SHARDS` | `CLUSTER SHARDS` | Per-shard summary including slots and node descriptions. |
 | `CLUSTER KEYSLOT` | `CLUSTER KEYSLOT key` | CRC16/XMODEM mod 16384 with `{tag}` extraction. |
-| `CLUSTER COUNTKEYSINSLOT` | `CLUSTER COUNTKEYSINSLOT slot` | Walks the current DB to count keys hashing to `slot`. |
-| `CLUSTER GETKEYSINSLOT` | `CLUSTER GETKEYSINSLOT slot count` | Returns up to `count` keys in `slot`. |
+| `CLUSTER COUNTKEYSINSLOT` | `CLUSTER COUNTKEYSINSLOT slot` | Walks the current DB to count keys hashing to `slot`. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `CLUSTER GETKEYSINSLOT` | `CLUSTER GETKEYSINSLOT slot count` | Returns up to `count` keys in `slot`; a `count` of 0 returns an empty array, a negative one is `ERR Invalid slot or number of keys`. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
 
 ### Slot ownership
 
 | Command | Syntax | Notes |
 |---|---|---|
-| `CLUSTER ADDSLOTS` | `CLUSTER ADDSLOTS slot [slot ...]` | Claim individual slots. Atomic — rejects duplicates. |
-| `CLUSTER ADDSLOTSRANGE` | `CLUSTER ADDSLOTSRANGE start end [start end ...]` | Claim contiguous ranges. |
+| `CLUSTER ADDSLOTS` | `CLUSTER ADDSLOTS slot [slot ...]` | Claim individual slots. All or nothing, as in Redis: a slot already assigned (`Slot n is already busy`) or named twice (`Slot n specified multiple times`) claims none. A claimed slot's `IMPORTING` state is cleared. |
+| `CLUSTER ADDSLOTSRANGE` | `CLUSTER ADDSLOTSRANGE start end [start end ...]` | Claim contiguous ranges. All the ranges or none, as `ADDSLOTS`; overlapping ranges are `Slot n specified multiple times`. |
 | `CLUSTER DELSLOTS` | `CLUSTER DELSLOTS slot [slot ...]` | Release individual slots. |
 | `CLUSTER DELSLOTSRANGE` | `CLUSTER DELSLOTSRANGE start end [start end ...]` | Release contiguous ranges. |
-| `CLUSTER FLUSHSLOTS` | `CLUSTER FLUSHSLOTS` | Clear all slot ownership for this node. |
+| `CLUSTER FLUSHSLOTS` | `CLUSTER FLUSHSLOTS` | Give up every slot this node owns; other nodes' slots stay as they are. Refused with `ERR DB must be empty to perform CLUSTER FLUSHSLOTS.` while the node holds keys, as in Redis. |
 | `CLUSTER SETSLOT` | `CLUSTER SETSLOT slot <IMPORTING\|MIGRATING\|NODE> node-id` or `CLUSTER SETSLOT slot STABLE` | Mark migration state or finalize ownership transfer. |
 
 ### Discovery and membership
@@ -1108,7 +1115,7 @@ A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 | `CLUSTER FORGET` | `CLUSTER FORGET node-id` | Remove a node from the routing table. Slots owned by the forgotten node become unassigned. The node is refused re-admission for 60 seconds, so gossip from a node that has not been told yet does not bring it back. |
 | `CLUSTER LINKS` | `CLUSTER LINKS` | Report active bus links to peers. |
 | `CLUSTER REPLICAS` / `CLUSTER SLAVES` | `CLUSTER REPLICAS master-id` | The replicas of a master: an array with one `CLUSTER NODES` line per replica (empty for a master without any). Aliases. |
-| `CLUSTER COUNT-FAILURE-REPORTS` | `CLUSTER COUNT-FAILURE-REPORTS node-id` | Number of distinct nodes currently flagging this node as failing. Excludes the local node's own opinion. |
+| `CLUSTER COUNT-FAILURE-REPORTS` | `CLUSTER COUNT-FAILURE-REPORTS node-id` | Number of distinct nodes currently flagging this node as failing. Excludes the local node's own opinion. A node this one does not know is `ERR Unknown node <id>`. |
 
 ### Replication and failover
 
@@ -1209,9 +1216,9 @@ During migration:
 | Command | Syntax | Notes |
 |---|---|---|
 | `MIGRATE` | `MIGRATE host port key\|"" db timeout [COPY] [REPLACE] [AUTH password \| AUTH2 username password] [KEYS key [key ...]]` | Serialise each key, `RESTORE` it on the destination with its TTL, and delete it here once the destination has acknowledged. Every data type that `DUMP` supports. |
-| `ASKING` | `ASKING` | Per-connection single-shot flag. Required before each query against an `IMPORTING` slot. |
-| `READONLY` | `READONLY` | Per-connection flag: read commands for slots this node replicates are served here instead of redirected to the master. |
-| `READWRITE` | `READWRITE` | Clears the `READONLY` flag. |
+| `ASKING` | `ASKING` | Per-connection single-shot flag. Required before each query against an `IMPORTING` slot. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `READONLY` | `READONLY` | Per-connection flag: read commands for slots this node replicates are served here instead of redirected to the master. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
+| `READWRITE` | `READWRITE` | Clears the `READONLY` flag. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
 
 A node that loses a slot to another master without having migrated its keys —
 a bare `SETSLOT … NODE` on the other side, or the losing side of a partition —
@@ -1221,8 +1228,8 @@ deletes the keys it holds for that slot, as Redis does.
 
 | Command | Syntax | Notes |
 |---|---|---|
-| `CLUSTER BUMPEPOCH` | `CLUSTER BUMPEPOCH` | Advance `current_epoch` and return `BUMPED <new>`. |
-| `CLUSTER SET-CONFIG-EPOCH` | `CLUSTER SET-CONFIG-EPOCH epoch` | Set this node's `config_epoch`. Only valid when current value is 0. |
+| `CLUSTER BUMPEPOCH` | `CLUSTER BUMPEPOCH` | Give this node a config epoch above every epoch it knows of and reply `BUMPED <epoch>`, or reply `STILL <epoch>` when its config epoch is already the highest (and not 0), as in Redis. |
+| `CLUSTER SET-CONFIG-EPOCH` | `CLUSTER SET-CONFIG-EPOCH epoch` | Set this node's `config_epoch`, on a fresh node only, as in Redis: refused once the node knows any other node, when its config epoch is already non-zero, and for a negative epoch. |
 | `CLUSTER SAVECONFIG` | `CLUSTER SAVECONFIG` | Force a write of `nodes.conf`. |
 | `CLUSTER RESET` | `CLUSTER RESET [HARD \| SOFT]` | Clear topology: forget the other nodes and the slot assignments. `SOFT` (default) keeps the node ID and epochs, and is refused on a master that holds keys; `HARD` also resets the epochs, flushes the dataset and gives the node a new ID. |
 

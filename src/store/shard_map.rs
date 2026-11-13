@@ -48,13 +48,15 @@ use hashbrown::HashTable;
 use parking_lot::RwLock;
 
 use super::access;
-use super::entry::{Entry, Left, Relocation, Slot, prefetch_expiry};
+use super::entry::{Entry, Left, Relocation, Slot};
 pub use super::entry::{EntryRef, Taken};
+use super::ttl_list::TtlList;
 use crate::shared_bytes::SharedBytes;
 use crate::types::{
     ArrayInner, HashFields, HashInner, KiviDBValue, SortedSetInner, StreamInner, TsInner,
     VectorSetInner,
 };
+use crate::vector::IndexOn;
 
 /// A key's string value, borrowed from its shard: its bytes, kept in the
 /// key's entry, or a `SharedBytes` of their own when they are too long.
@@ -303,9 +305,9 @@ pub struct ShardMap {
     table: HashTable<Slot>,
     hash: ahash::RandomState,
     /// Every entry whose key has a time to live, each knowing where it is
-    /// here (`Entry::pos`). The order means nothing: a key that loses its
-    /// time to live, or goes, has the last one moved into its place.
-    ttl: Vec<Entry>,
+    /// here (`Entry::pos`), in two parts: those that may come due soon, and
+    /// those that cannot (see `ttl_list`).
+    ttl: TtlList,
     /// The time a write lock holds the shard at, so that a command sees one
     /// time throughout ([`now_at`]). [`UNPINNED`] while no write lock holds
     /// the shard: every look reads the clock. [`PENDING`] once one does,
@@ -319,9 +321,22 @@ pub struct ShardMap {
     /// written under the write lock, so a reader, which only ever finds
     /// [`UNPINNED`] here, never writes it.
     now: AtomicU64,
-    /// Keys past their time that writes under this lock put new values
-    /// over, to be expired when it lets go (`expiry::written_over`).
-    written_over: Vec<crate::store::Key>,
+    /// Keys a write under this lock has something to say of when it lets
+    /// go, and what ([`ToSay`]). One list, so that a write that leaves none
+    /// reads one word to find that out.
+    left: Vec<(ToSay, crate::store::Key)>,
+}
+
+/// What a write lock has to say of a key once it lets go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToSay {
+    /// It was past its time, and a write put a new value over it: to be
+    /// expired (`expiry::written_over`).
+    PastItsTime,
+    /// Its document (a hash, a JSON document) was taken out, or a value of
+    /// another kind put over it: to leave its indexes
+    /// (`vector::documents_left`).
+    Document,
 }
 
 /// What [`ShardMap::lookup`] finds under a key.
@@ -341,41 +356,6 @@ enum Ttl {
     Keep,
     /// Gives the key this one, or takes it away.
     Set(Option<u64>),
-}
-
-/// `entry`, which has a time to live, put at the end of the list.
-#[inline]
-fn ttl_push(ttl: &mut Vec<Entry>, entry: Entry) {
-    assert!(ttl.len() < u32::MAX as usize, "keys with a time to live");
-    entry.set_pos(ttl.len());
-    ttl.push(entry);
-}
-
-/// `entry` taken out of the list, the last one moved into its place.
-#[inline]
-fn ttl_take(ttl: &mut Vec<Entry>, entry: Entry) {
-    let at = entry.pos();
-    debug_assert!(ttl[at] == entry);
-    ttl.swap_remove(at);
-    if let Some(moved) = ttl.get(at) {
-        moved.set_pos(at);
-    }
-}
-
-/// The list made right for `new` taking `old`'s place in the table: either
-/// of them may have a time to live.
-#[inline(always)]
-fn ttl_replaced(ttl: &mut Vec<Entry>, old: Entry, new: Entry) {
-    match (old.has_ttl(), new.has_ttl()) {
-        (false, false) => {}
-        (true, true) => {
-            let at = old.pos();
-            new.set_pos(at);
-            ttl[at] = new;
-        }
-        (true, false) => ttl_take(ttl, old),
-        (false, true) => ttl_push(ttl, new),
-    }
 }
 
 /// No write lock holds the shard: see `ShardMap::now`.
@@ -419,13 +399,33 @@ fn now_at(now: &AtomicU64) -> u64 {
 /// the `DEL` propagated before the write's own record.
 #[cold]
 #[inline(never)]
-fn written_over_expired(over: &mut Vec<crate::store::Key>, key: &[u8]) {
+fn written_over_expired(left: &mut Vec<(ToSay, crate::store::Key)>, key: &[u8]) {
     crate::stats::record_expired();
-    over.push(crate::store::Key::new(key));
+    left.push((ToSay::PastItsTime, crate::store::Key::new(key)));
 }
 
-/// How far ahead a pass over the list asks for entries' lines.
-const TTL_AHEAD: usize = 8;
+/// A live key's document was taken out, or written over by a value of
+/// another kind: whatever command did it, the document is no longer there
+/// to find. Kept for the write lock to take out of the search indexes once
+/// it lets go (`ShardWrite`). Not every command that can do this to a
+/// document told the indexes, and a search went on finding the key (#619).
+#[cold]
+#[inline(never)]
+fn document_left(left: &mut Vec<(ToSay, crate::store::Key)>, key: &[u8]) {
+    if !crate::vector::none_anywhere() {
+        left.push((ToSay::Document, crate::store::Key::new(key)));
+    }
+}
+
+/// The kind of document a value is to the search indexes, if it is one.
+#[inline(always)]
+fn document_on(value: ValueRef<'_>) -> Option<IndexOn> {
+    match value {
+        ValueRef::Hash(_) | ValueRef::HashEx(_) => Some(IndexOn::Hash),
+        ValueRef::Json(_) => Some(IndexOn::Json),
+        _ => None,
+    }
+}
 
 impl Default for ShardMap {
     fn default() -> Self {
@@ -444,9 +444,9 @@ impl ShardMap {
         ShardMap {
             table: HashTable::new(),
             hash: ahash::RandomState::new(),
-            ttl: Vec::new(),
+            ttl: TtlList::new(),
             now: AtomicU64::new(UNPINNED),
-            written_over: Vec::new(),
+            left: Vec::new(),
         }
     }
 
@@ -454,9 +454,9 @@ impl ShardMap {
         ShardMap {
             table: HashTable::with_capacity(capacity),
             hash: ahash::RandomState::new(),
-            ttl: Vec::new(),
+            ttl: TtlList::new(),
             now: AtomicU64::new(UNPINNED),
-            written_over: Vec::new(),
+            left: Vec::new(),
         }
     }
 
@@ -493,15 +493,24 @@ impl ShardMap {
         *self.now.get_mut() = UNPINNED;
     }
 
-    /// Whether [`written_over_expired`] kept any keys.
+    /// Whether a write has anything to say once the lock lets go: a key
+    /// past its time that it put a value over ([`written_over_expired`]),
+    /// or a document that left ([`document_left`]).
     #[inline(always)]
-    pub(super) fn wrote_over_expired(&self) -> bool {
-        !self.written_over.is_empty()
+    pub(super) fn has_to_announce(&self) -> bool {
+        !self.left.is_empty()
     }
 
-    /// The keys [`written_over_expired`] kept, taken.
-    pub(super) fn take_written_over(&mut self) -> Vec<crate::store::Key> {
-        std::mem::take(&mut self.written_over)
+    /// The kind of document `key` holds, if it holds one. Not a use of the
+    /// key.
+    pub(super) fn document_at(&self, key: &[u8]) -> Option<IndexOn> {
+        self.find_live(self.hash_of(key), key)
+            .and_then(|slot| document_on(slot.entry().value()))
+    }
+
+    /// The keys [`written_over_expired`] and [`document_left`] kept, taken.
+    pub(super) fn take_left(&mut self) -> Vec<(ToSay, crate::store::Key)> {
+        std::mem::take(&mut self.left)
     }
 
     /// This table, as a number: which table a key is in, for `access`.
@@ -681,7 +690,7 @@ impl ShardMap {
         let map = self.id();
         let hasher = &self.hash;
         let list = &mut self.ttl;
-        let over = &mut self.written_over;
+        let left = &mut self.left;
         match self.table.entry(
             hash,
             |s| s.may_be(hash) && s.entry().has_key(key),
@@ -691,7 +700,7 @@ impl ShardMap {
                 let old = at.get().entry();
                 let stale = expired(old, now);
                 if stale {
-                    written_over_expired(over, key);
+                    written_over_expired(left, key);
                 }
                 if !stale && let Some(bytes) = in_place {
                     // The time to live is in the block before the key: a
@@ -702,6 +711,11 @@ impl ShardMap {
                         Ttl::Set(expires) => expires.is_some() == old.has_ttl(),
                     };
                     if room_stays && old.fits_in_place(bytes.len()) {
+                        // The time it had, for the list's sum of them.
+                        let was = match ttl {
+                            Ttl::Set(Some(_)) => old.expires(),
+                            _ => None,
+                        };
                         // SAFETY: the shard is locked for writing (`&mut
                         // self`), the table alone holds the entry, and the
                         // bytes keep it in its class; a time to live it
@@ -711,6 +725,10 @@ impl ShardMap {
                             if let Ttl::Set(Some(ms)) = ttl {
                                 old.set_expires(ms);
                             }
+                        }
+                        // A time that now ends before the horizon.
+                        if let Some(was) = was {
+                            list.retimed(old, was);
                         }
                         used(old, hash, map);
                         return Written::InPlace;
@@ -730,10 +748,14 @@ impl ShardMap {
                 // starts where a new key does.
                 if !stale {
                     entry.set_access(old.access());
+                    let was = document_on(old.value());
+                    if was.is_some() && was != document_on(entry.value()) {
+                        document_left(left, key);
+                    }
                 }
                 used(entry, hash, map);
                 *at.get_mut() = Slot::new(entry, hash);
-                ttl_replaced(list, old, entry);
+                list.replaced(old, entry);
                 // SAFETY: the table's hold on the old entry goes to the caller.
                 Written::Replaced(unsafe { Taken::new(old) })
             }
@@ -748,7 +770,7 @@ impl ShardMap {
                 used(entry, hash, map);
                 place.insert(Slot::new(entry, hash));
                 if entry.has_ttl() {
-                    ttl_push(list, entry);
+                    list.push(entry);
                 }
                 Written::New
             }
@@ -902,16 +924,18 @@ impl ShardMap {
             return false;
         }
         if old.has_ttl() && old.holders() == 1 {
+            let was = old.expires().unwrap_or(0);
             // SAFETY: the shard is locked for writing, and nothing but the
             // table holds the entry.
             unsafe { old.set_expires(expires) };
+            self.ttl.retimed(old, was);
             used(old, hash, map);
             return true;
         }
         let new = old.remade(Some(expires));
         used(new, hash, map);
         *slot = Slot::new(new, slot.hash_part());
-        ttl_replaced(&mut self.ttl, old, new);
+        self.ttl.replaced(old, new);
         // SAFETY: the table's hold, given up: whoever else holds the old
         // entry still reads it as it was.
         unsafe { old.let_go() };
@@ -939,7 +963,7 @@ impl ShardMap {
         }
         let new = old.remade(None);
         *slot = Slot::new(new, slot.hash_part());
-        ttl_replaced(&mut self.ttl, old, new);
+        self.ttl.replaced(old, new);
         // SAFETY: as in `set_expires`.
         unsafe { old.let_go() };
         true
@@ -951,15 +975,21 @@ impl ShardMap {
         self.ttl.len()
     }
 
+    /// The sum of when the times to live of the [`ShardMap::ttl_len`] keys
+    /// that have one end (milliseconds since the Unix epoch), kept as they
+    /// change: `INFO keyspace`'s `avg_ttl` without a pass over them (#622).
+    /// Keys past their time that expiry has not taken out yet are in it.
+    #[inline]
+    pub fn ttl_deadline_sum(&self) -> u128 {
+        self.ttl.deadline_sum()
+    }
+
     /// The entry at place `index` of the list of keys with a time to live:
     /// what a pick at random from them is (`index` modulo how many there
     /// are).
     pub fn ttl_entry(&self, index: usize) -> Option<EntryView<'_>> {
-        if self.ttl.is_empty() {
-            return None;
-        }
         Some(EntryView {
-            entry: self.ttl[index % self.ttl.len()],
+            entry: self.ttl.pick(index)?,
             _map: std::marker::PhantomData,
         })
     }
@@ -970,26 +1000,26 @@ impl ShardMap {
     }
 
     /// The keys whose time to live ended before `now` (milliseconds since
-    /// the Unix epoch), at most `limit` of them: one pass over the list,
-    /// stopping at the last one it takes. Returns them, and how many keys
-    /// it looked at.
+    /// the Unix epoch), at most `limit` of them: one pass over those that
+    /// may have (`ttl_list`), stopping at the last one it takes. Returns
+    /// them, and how many keys it looked at.
     pub fn due(&self, now: u64, limit: usize) -> (Vec<crate::store::Key>, usize) {
-        let list = &self.ttl;
-        let mut due = Vec::new();
-        for (i, e) in list.iter().enumerate() {
-            // Each entry is somewhere else in memory: a few are asked for
-            // ahead, so that their lines come in together.
-            if let Some(ahead) = list.get(i + TTL_AHEAD) {
-                prefetch_expiry(*ahead);
-            }
-            if e.expires().is_some_and(|at| at < now) {
-                due.push(crate::store::Key::new(e.key()));
-                if due.len() == limit {
-                    return (due, i + 1);
-                }
-            }
-        }
-        (due, list.len())
+        self.ttl.due(now, limit)
+    }
+
+    /// Whether the keys with a time to live should be sorted again at `now`
+    /// by when they may come due ([`ShardMap::sweep_ttl`]).
+    #[inline]
+    pub fn ttl_sweep_due(&self, now: u64) -> bool {
+        self.ttl.sweep_due(now)
+    }
+
+    /// Sort the keys with a time to live by whether they may come due before
+    /// the next horizon, looking at `steps` keys at most: what lets a pass
+    /// for due keys look only at those (`ttl_list`). Returns whether it is
+    /// done; if not, the next call goes on from where this one stopped.
+    pub fn sweep_ttl(&mut self, now: u64, steps: usize) -> bool {
+        self.ttl.sweep(now, steps)
     }
 
     /// Take `key` out if its time to live ended before `now`.
@@ -1012,7 +1042,10 @@ impl ShardMap {
             Ok(at) => {
                 let entry = at.remove().0.entry();
                 if entry.has_ttl() {
-                    ttl_take(&mut self.ttl, entry);
+                    self.ttl.take(entry);
+                }
+                if document_on(entry.value()).is_some() {
+                    document_left(&mut self.left, key);
                 }
                 // SAFETY: the table's hold goes to the caller.
                 Some(unsafe { Taken::new(entry) })
@@ -1050,7 +1083,10 @@ impl ShardMap {
                 }
                 let entry = at.remove().0.entry();
                 if entry.has_ttl() {
-                    ttl_take(&mut self.ttl, entry);
+                    self.ttl.take(entry);
+                }
+                if document_on(entry.value()).is_some() {
+                    document_left(&mut self.left, key);
                 }
                 // SAFETY: the table's hold goes to the caller.
                 Removal::Taken(unsafe { Taken::new(entry) })
@@ -1071,7 +1107,7 @@ impl ShardMap {
         let now = &self.now;
         let hasher = &self.hash;
         let list = &mut self.ttl;
-        let over = &mut self.written_over;
+        let left = &mut self.left;
         let key = taken.key();
         match self.table.entry(
             hash,
@@ -1083,10 +1119,10 @@ impl ShardMap {
                 if !expired(old, now) {
                     return Err(taken);
                 }
-                written_over_expired(over, key);
+                written_over_expired(left, key);
                 let entry = taken.into_entry();
                 *at.get_mut() = Slot::new(entry, hash);
-                ttl_replaced(list, old, entry);
+                list.replaced(old, entry);
                 // SAFETY: the table's hold on the old entry goes to the caller.
                 Ok(Some(unsafe { Taken::new(old) }))
             }
@@ -1094,7 +1130,7 @@ impl ShardMap {
                 let entry = taken.into_entry();
                 place.insert(Slot::new(entry, hash));
                 if entry.has_ttl() {
-                    ttl_push(list, entry);
+                    list.push(entry);
                 }
                 Ok(None)
             }
@@ -1104,7 +1140,7 @@ impl ShardMap {
     /// The value of `key`, made with `make` if there is none.
     pub fn get_or_insert_with(
         &mut self,
-        key: &str,
+        key: &(impl AsRef<[u8]> + ?Sized),
         make: impl FnOnce() -> KiviDBValue,
     ) -> ValueRef<'_> {
         if !self.contains_key(key) {
@@ -1146,6 +1182,39 @@ impl ShardMap {
         self.table.is_empty()
     }
 
+    /// What `key` takes in this shard besides its value (`MEMORY USAGE`):
+    /// its entry's block, its share of the table's buckets, and, with a
+    /// time to live, its share of the list of keys that have one. None if
+    /// the key is absent or past its time. A look, not a use.
+    pub fn entry_footprint(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<usize> {
+        let key = key.as_ref();
+        let entry = self.find_live(self.hash_of(key), key)?.entry();
+        // The table (and the list) is shared by the shard's keys, so a key
+        // is given a share of it, at most a half-full table's share. A table
+        // that has only grown is at least half full (it doubles when full),
+        // so this is the whole share until keys leave. After a mass deletion
+        // the room they left stays until the shard is shrunk (a sweep a
+        // second, and never below a minimum size); spread over the keys
+        // left, it made one key's estimate several times what it was. Under
+        // the cap it stays put, and that room is no key's: in the deletions
+        // tested, the keys' estimates then added up to typically 3-4% less
+        // than `used_memory`, and from 1.1% to 5.7% less in all of them (the
+        // most before the sweep had shrunk the shards): measured, not a
+        // bound. An estimate policy, not an exact accounting of every live
+        // allocation. (The key is in the table, so it has at least one key,
+        // and a time to live puts it on the list.)
+        let half_room = |len: usize, room: usize| len.max(room / 2).max(1);
+        let table = self.table.allocation_size()
+            / half_room(self.table.len(), self.table.num_buckets() / 8 * 7);
+        let ttl = if entry.has_ttl() {
+            self.ttl.capacity() * std::mem::size_of::<Entry>()
+                / half_room(self.ttl.len(), self.ttl.capacity())
+        } else {
+            0
+        };
+        Some(entry.block_bytes() + table + ttl)
+    }
+
     /// Keys the table has room for before it grows.
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -1167,15 +1236,13 @@ impl ShardMap {
         let hasher = &self.hash;
         self.table
             .shrink_to(keys, |s| hasher.hash_one(s.entry().key()));
-        if sparse(self.ttl.len(), self.ttl.capacity()) {
-            self.ttl.shrink_to(self.ttl.len() + self.ttl.len() / 8);
-        }
+        self.ttl.shrink_if(sparse);
     }
 
     /// Whether the table, or the list of keys with a time to live, has room
     /// for many more keys than it holds (see `store::shrink_if_sparse`).
     pub fn is_sparse(&self) -> bool {
-        sparse(self.len(), self.capacity()) || sparse(self.ttl.len(), self.ttl.capacity())
+        sparse(self.len(), self.capacity()) || self.ttl.is_sparse(sparse)
     }
 
     /// How many buckets the table has: the positions [`ShardMap::bucket`]
@@ -1320,7 +1387,7 @@ impl ShardMap {
                 // The position moved with the block.
                 let listed = if to.has_ttl() {
                     fail_point(2);
-                    let listed = &mut self.ttl[to.pos()];
+                    let listed = self.ttl.at_mut(to.pos());
                     debug_assert!(*listed == entry);
                     Some(listed)
                 } else {
@@ -1459,7 +1526,7 @@ mod tests {
         }
         let listed = |map: &ShardMap, e: Entry| {
             if ttl {
-                map.ttl.len() == 1 && map.ttl[e.pos()] == e
+                map.ttl.len() == 1 && map.ttl.at(e.pos()) == e
             } else {
                 map.ttl.is_empty()
             }
@@ -1728,8 +1795,8 @@ mod tests {
         map.insert_str_expiring("rng", "5", Some(1));
         assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
         assert_eq!(
-            map.take_written_over(),
-            vec![crate::store::Key::from("set")]
+            map.take_left(),
+            vec![(ToSay::PastItsTime, crate::store::Key::from("set"))]
         );
         // A live key is still written in place.
         map.insert_str_expiring("live", "5", Some(u64::MAX - 1));
@@ -1784,5 +1851,339 @@ mod tests {
         }
         assert_eq!(made, 1);
         assert_eq!(map.len(), 1);
+    }
+
+    /// With every key's time ending well after the horizon, a pass for due
+    /// keys looks at none of them once the shard has been swept (#618):
+    /// before, every pass looked at every one.
+    #[test]
+    fn a_pass_looks_at_no_key_that_cannot_be_due() {
+        let mut map = ShardMap::new();
+        let now = crate::commands::helpers::now_ms();
+        for i in 0..1000 {
+            map.insert_expiring(format!("k{i}"), s("v"), Some(now + 3_600_000));
+        }
+        // Not swept yet: everything is looked at.
+        assert_eq!(map.due(now, usize::MAX), (vec![], 1000));
+        assert!(map.ttl_sweep_due(now));
+        while !map.sweep_ttl(now, 64) {}
+        assert!(!map.ttl_sweep_due(now));
+        assert_eq!(map.due(now, usize::MAX), (vec![], 0));
+        // A key given a short time goes where a pass sees it, whichever way
+        // it is given.
+        map.insert_expiring("new", s("v"), Some(now + 5));
+        map.set_expires("k1", now + 5);
+        map.set_str_expiring("k2", "w", Some(now + 5));
+        map.insert_expiring("k3", s("w"), Some(now + 5));
+        map.ttl.check();
+        let (mut due, looked) = map.due(now + 10, usize::MAX);
+        due.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let due: Vec<&[u8]> = due.iter().map(|k| k.as_bytes()).collect();
+        assert_eq!(due, [&b"k1"[..], b"k2", b"k3", b"new"]);
+        assert_eq!(looked, 4);
+        // Past the horizon, with no sweep since, a pass looks at them all.
+        let later = now + super::super::ttl_list::HORIZON_MS + 1;
+        assert_eq!(map.due(later, usize::MAX).1, 1001);
+        assert!(map.ttl_sweep_due(later));
+    }
+
+    /// Whatever writes do between the steps of a sweep, a pass finds every
+    /// key past its time and no other, and every entry knows its place.
+    #[test]
+    fn a_pass_finds_exactly_the_due_keys_whatever_writes_do_meanwhile() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        // Far past the clock, so that no write takes a key for expired.
+        let mut now = crate::commands::helpers::now_ms() + 1_000_000_000;
+        let mut map = ShardMap::new();
+        // What the table says, not the list under test: every key with a
+        // time to live and when it ends.
+        let timed = |map: &ShardMap| -> Vec<(Vec<u8>, u64)> {
+            let mut timed: Vec<(Vec<u8>, u64)> = map
+                .entries()
+                .filter_map(|e| e.expires().map(|at| (e.key().to_vec(), at)))
+                .collect();
+            timed.sort();
+            timed
+        };
+        for step in 0..80_000 {
+            let key = format!("k{}", rand(300));
+            let at = now + rand(60_000);
+            match rand(16) {
+                0 => {
+                    map.set_str_expiring(&key, "v", Some(at));
+                }
+                1 => {
+                    map.insert_expiring(&key, s("v"), Some(at));
+                }
+                2 => {
+                    map.set_str(&key, "w");
+                }
+                3 => {
+                    map.insert(&key, s("w"));
+                }
+                4 => {
+                    map.set_str_expiring(&key, "v", None);
+                }
+                5 => {
+                    map.remove(&key);
+                }
+                6 => {
+                    map.set_expires(&key, at);
+                }
+                7 => {
+                    map.persist(&key);
+                }
+                8 | 9 => {
+                    map.sweep_ttl(now, 1 + rand(40) as usize);
+                }
+                10 => now += rand(4_000),
+                // The clock stepped back, now and then by much more than a
+                // horizon.
+                11 => {
+                    let most = if rand(20) == 0 { 600_000 } else { 4_000 };
+                    now -= rand(most);
+                }
+                12 => {
+                    // A key taken out and put back, as `MOVE` does.
+                    if let Some(taken) = map.remove(&key) {
+                        assert!(map.put_back(taken).is_ok_and(|old| old.is_none()));
+                    }
+                }
+                13 => {
+                    // A new time given to an entry someone else holds: a
+                    // new entry takes its place.
+                    let held = map.get_ref(&key);
+                    map.set_expires(&key, at);
+                    drop(held);
+                }
+                14 => {
+                    // The sweep under way finished, then one from now if
+                    // that is due: none is due after it, wherever the clock
+                    // has gone meanwhile.
+                    while !map.sweep_ttl(now, 64) {}
+                    if map.ttl_sweep_due(now) {
+                        while !map.sweep_ttl(now, 64) {}
+                    }
+                    assert!(!map.ttl_sweep_due(now), "step {step}");
+                }
+                _ => {
+                    // A key past its time, taken out as expiry takes one.
+                    let past = timed(&map)
+                        .into_iter()
+                        .find(|&(_, at)| at < now)
+                        .map(|(k, _)| k);
+                    if let Some(k) = past {
+                        assert!(map.remove_if_due(&k, now).is_some());
+                    }
+                }
+            }
+            map.ttl.check();
+            if step % 50 == 0 {
+                let probe = now + rand(30_000);
+                let table = timed(&map);
+                let want: Vec<Vec<u8>> = table
+                    .iter()
+                    .filter(|&&(_, at)| at < probe)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                let mut got: Vec<Vec<u8>> = map
+                    .due(probe, usize::MAX)
+                    .0
+                    .iter()
+                    .map(|k| k.as_bytes().to_vec())
+                    .collect();
+                got.sort();
+                assert_eq!(got, want, "step {step}");
+                // The list holds every key with a time to live, and nothing
+                // else.
+                let mut listed: Vec<(Vec<u8>, u64)> =
+                    map.expiring().map(|(k, at)| (k.to_vec(), at)).collect();
+                listed.sort();
+                assert_eq!(listed, table, "step {step}");
+                // And the sum of their times, kept as they changed, is the
+                // table's (#622).
+                let sum: u128 = table.iter().map(|&(_, at)| u128::from(at)).sum();
+                assert_eq!(map.ttl_deadline_sum(), sum, "step {step}");
+                assert_eq!(map.ttl_len(), table.len(), "step {step}");
+            }
+            if step % 20_000 == 19_999 {
+                // Everything taken out at once, as `FLUSHDB` does.
+                map.clear();
+                assert_eq!((map.ttl_len(), map.ttl_deadline_sum()), (0, 0));
+            }
+        }
+        // The near part is no bigger than what can come due before the
+        // horizon, once a sweep is done: the one under way, then one from now.
+        while !map.sweep_ttl(now, 7) {}
+        while !map.sweep_ttl(now, 7) {}
+        map.ttl.check();
+        let soon = timed(&map)
+            .iter()
+            .filter(|&&(_, at)| at < now + super::super::ttl_list::HORIZON_MS)
+            .count();
+        assert_eq!(map.ttl.near_len(), soon);
+    }
+
+    /// The sum of the times to live is kept through every way a key gets,
+    /// changes and loses one: what `avg_ttl` is made of (#622).
+    #[test]
+    fn the_sum_of_the_times_follows_every_change() {
+        let mut map = ShardMap::new();
+        let now = crate::commands::helpers::now_ms() + 1_000_000_000;
+        let sum = |map: &ShardMap| {
+            map.ttl.check();
+            map.ttl_deadline_sum()
+        };
+        assert_eq!(sum(&map), 0);
+        map.insert_expiring("a", s("v"), Some(now + 100));
+        map.set_str_expiring("b", "v", Some(now + 200));
+        map.set_str("c", "v");
+        assert_eq!(sum(&map), u128::from(2 * now + 300));
+        // Written over in place with a new time, and with none given (the
+        // time stays).
+        map.set_str_expiring("b", "w", Some(now + 250));
+        assert_eq!(sum(&map), u128::from(2 * now + 350));
+        map.set_str("b", "y");
+        assert_eq!(sum(&map), u128::from(2 * now + 350));
+        // A new time, in place and on an entry held elsewhere.
+        assert!(map.set_expires("a", now + 50_000));
+        let held = map.get_ref("a");
+        assert!(map.set_expires("a", now + 60_000));
+        drop(held);
+        assert_eq!(sum(&map), u128::from(2 * now + 60_250));
+        // A key without one given one, and one losing it.
+        assert!(map.set_expires("c", now + 1));
+        assert!(map.persist("a"));
+        assert_eq!(sum(&map), u128::from(2 * now + 251));
+        // Written over with its time taken away.
+        map.set_str_expiring("b", "x", None);
+        assert_eq!(sum(&map), u128::from(now + 1));
+        // Taken out and put back, as `MOVE` does.
+        let taken = map.remove("c").unwrap();
+        assert_eq!(sum(&map), 0);
+        assert!(map.put_back(taken).is_ok());
+        assert_eq!(sum(&map), u128::from(now + 1));
+        // A sweep moves entries between the lists and leaves the sum.
+        for i in 0..100u64 {
+            map.insert_expiring(format!("k{i}"), s("v"), Some(now + i * 1_000));
+        }
+        let before = sum(&map);
+        while !map.sweep_ttl(now, 7) {}
+        assert_eq!(sum(&map), before);
+        // Times up to the largest there is do not overflow it.
+        map.insert_expiring("max", s("v"), Some(u64::MAX - 1));
+        assert_eq!(sum(&map), before + u128::from(u64::MAX - 1));
+        map.clear();
+        assert_eq!(sum(&map), 0);
+    }
+
+    /// A clock stepped forward, a sweep, then the clock stepped back: the
+    /// next sweep brings the horizon back, and the keys that cannot be due
+    /// soon go back to the far list, rather than every pass looking at them
+    /// until the clock has caught up.
+    #[test]
+    fn a_clock_stepped_back_does_not_leave_every_key_near() {
+        use super::super::ttl_list::HORIZON_MS;
+        let mut map = ShardMap::new();
+        let now = crate::commands::helpers::now_ms() + 1_000_000_000;
+        for i in 0..1000 {
+            let at = if i % 10 == 0 {
+                now + 5_000
+            } else {
+                now + 3_600_000
+            };
+            map.insert_expiring(format!("k{i}"), s("v"), Some(at));
+        }
+        // An hour ahead: every key ends before that horizon.
+        let ahead = now + 3_600_000;
+        while !map.sweep_ttl(ahead, 64) {}
+        assert_eq!(map.ttl.near_len(), 1000);
+        // Back: a sweep is due at once, though the horizon is an hour off.
+        assert!(map.ttl_sweep_due(now));
+        while !map.sweep_ttl(now, 64) {}
+        map.ttl.check();
+        assert!(!map.ttl_sweep_due(now));
+        assert_eq!(map.ttl.near_len(), 100);
+        // A pass looks at those alone, and finds exactly the due ones.
+        let (due, looked) = map.due(now + 6_000, usize::MAX);
+        assert_eq!((due.len(), looked), (100, 100));
+        assert!(
+            due.iter()
+                .all(|k| map.expires(k.as_bytes()) == Some(now + 5_000))
+        );
+        assert_eq!(map.due(now + 4_000, usize::MAX), (vec![], 100));
+        // A key given a time now goes where the new horizon says.
+        map.insert_expiring("late", s("v"), Some(now + HORIZON_MS + 1));
+        map.insert_expiring("soon", s("v"), Some(now + 1));
+        map.ttl.check();
+        assert_eq!(map.ttl.near_len(), 101);
+        // Past the horizon, a pass looks at everything again.
+        let past = now + HORIZON_MS + 2;
+        assert_eq!(map.due(past, usize::MAX).0.len(), 102);
+    }
+
+    /// Compaction moving an entry while a sweep is under way: its place in
+    /// the list goes with it, and the sweep carries on.
+    #[test]
+    fn an_entry_moved_by_compaction_mid_sweep_keeps_its_place() {
+        use crate::value_slab;
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        let long = |i: usize| format!("{i:0>3000}");
+        let now = crate::commands::helpers::now_ms() + 1_000_000_000;
+        let late = now + 3_600_000;
+        // Made on a thread that ends, so that its slabs are nobody's.
+        let mut map = std::thread::spawn(move || {
+            let mut map = ShardMap::new();
+            for i in 0..64 {
+                map.insert_str_expiring(long(i), b"v", Some(late));
+            }
+            map
+        })
+        .join()
+        .unwrap();
+        // One long key left: its slab holds nothing else.
+        for i in 1..64 {
+            map.remove(&long(i));
+        }
+        for i in 0..200 {
+            let at = if i % 2 == 0 { now + 5_000 } else { late };
+            map.insert_expiring(format!("k{i}"), s("v"), Some(at));
+        }
+        // Part of the way: the long key, first in the far list, is in the
+        // part looked at.
+        assert!(!map.sweep_ttl(now, 50));
+        map.ttl.check();
+        let index = (0..map.buckets())
+            .find(|&i| {
+                map.table
+                    .get_bucket(i)
+                    .is_some_and(|s| s.entry().has_key(long(0).as_bytes()))
+            })
+            .unwrap();
+        let old = map.table.get_bucket(index).unwrap().entry();
+        let evacuating = value_slab::evacuate_only(old.base()).expect("a slab nobody owns");
+        assert_eq!(evacuating.live(), 1, "the key's slab is shared");
+        let regions = value_slab::regions_snapshot();
+        match map.relocate_at(index, &regions) {
+            Relocated::Moved(left) => drop(left),
+            _ => panic!("not moved"),
+        }
+        drop(evacuating);
+        let new = map.table.get_bucket(index).unwrap().entry();
+        assert!(new != old && map.ttl.at(new.pos()) == new);
+        map.ttl.check();
+        while !map.sweep_ttl(now, 50) {}
+        map.ttl.check();
+        assert_eq!(map.ttl.len(), 201);
+        assert_eq!(map.ttl.near_len(), 100);
+        assert_eq!(map.due(now + 6_000, usize::MAX).0.len(), 100);
+        assert_eq!(map.expires(&long(0)), Some(late));
+        assert_eq!(map.due(late + 1, usize::MAX).0.len(), 201);
     }
 }

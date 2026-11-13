@@ -528,6 +528,317 @@ fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -
 
 // ── Formation and routing ─────────────────────────────────────────────────────
 
+/// A cluster node serves database 0 alone. Started on a dataset with keys
+/// in another, from a snapshot or from its AOF, it refuses to start, as
+/// Redis does. It used to load them where no client could reach them, and
+/// slot accounting and migration never saw them (#484). The refusal says
+/// how to recover, and leaves the data on disk as it was: started again
+/// without `cluster-enabled`, the node has every key, in both databases.
+#[test]
+fn a_cluster_node_refuses_to_start_with_keys_outside_database_0() {
+    for aof in [false, true] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let persistence: &[&str] = if aof {
+            &["--aof", "--appendfsync", "always"]
+        } else {
+            &[]
+        };
+        let start_plain = |port: u16| {
+            Command::new(env!("CARGO_BIN_EXE_kividb"))
+                .current_dir(&dir)
+                .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+                .args(persistence)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let port = cluster_port();
+        let mut plain = start_plain(port);
+        let mut c = Conn::connect(port);
+        assert!(c.cmd(&["SET", "in0", "v"]).is_ok());
+        assert!(c.cmd(&["SELECT", "1"]).is_ok());
+        assert!(c.cmd(&["SET", "in1", "v"]).is_ok());
+        if !aof {
+            assert!(c.cmd(&["SAVE"]).is_ok());
+        }
+        drop(c);
+        let _ = plain.kill();
+        let _ = plain.wait();
+
+        let log = dir.join("cluster.log");
+        let mut node = Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(&dir)
+            .args(["--bind", "127.0.0.1", "--port", &cluster_port().to_string()])
+            .args(["--cluster-enabled", "yes"])
+            .args(persistence)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = node.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = node.kill();
+                let _ = node.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "aof {aof}: the cluster node started on keys in database 1:\n{log}"
+        );
+        assert!(
+            log.contains("can't have keys in a DB different than DB 0 when in Cluster mode"),
+            "aof {aof}: {log}"
+        );
+        assert!(
+            log.contains("start this node once without cluster-enabled"),
+            "aof {aof}: the refusal does not say how to recover:\n{log}"
+        );
+
+        // Nothing was lost: without cluster-enabled, every key is back.
+        let port = cluster_port();
+        let mut plain = start_plain(port);
+        let mut c = Conn::connect(port);
+        wait_until(
+            "the plain server to load its data again",
+            Duration::from_secs(30),
+            || c.cmd(&["GET", "in0"]) == Resp::Bulk(b"v".to_vec()),
+        );
+        assert!(c.cmd(&["SELECT", "1"]).is_ok());
+        assert_eq!(
+            c.cmd(&["GET", "in1"]),
+            Resp::Bulk(b"v".to_vec()),
+            "aof {aof}: the key in database 1 was lost"
+        );
+        assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(1), "aof {aof}");
+        assert!(c.cmd(&["SELECT", "0"]).is_ok());
+        assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(1), "aof {aof}");
+        drop(c);
+        let _ = plain.kill();
+        let _ = plain.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A cluster node has database 0 alone, and nothing puts a key in another:
+/// `MOVE` and `SWAPDB` are refused, and `COPY ... DB n` to any database
+/// but 0 is out of range, with Redis 8.10.2's errors. They used to put keys
+/// where no client could reach them, and the node would then refuse to
+/// start (#484).
+#[test]
+fn move_swapdb_and_copy_to_another_database_are_refused_in_cluster_mode() {
+    let (nodes, _) = form_cluster(1);
+    let mut c = nodes[0].conn();
+    assert!(c.cmd(&["SET", "{k}a", "v"]).is_ok());
+    let refused = |c: &mut Conn, args: &[&str], error: &str| {
+        assert_eq!(c.cmd(args), Resp::Error(error.to_string()), "{args:?}");
+    };
+    for args in [
+        &["MOVE", "{k}a", "1"][..],
+        &["MOVE", "{k}a", "0"],
+        &["MOVE", "{k}missing", "1"],
+        &["MOVE", "{k}a", "x"],
+    ] {
+        refused(&mut c, args, "ERR MOVE is not allowed in cluster mode");
+    }
+    for args in [
+        &["SWAPDB", "0", "1"][..],
+        &["SWAPDB", "0", "0"],
+        &["SWAPDB", "x", "1"],
+    ] {
+        refused(&mut c, args, "ERR SWAPDB is not allowed in cluster mode");
+    }
+    for args in [
+        &["COPY", "{k}a", "{k}b", "DB", "1"][..],
+        &["COPY", "{k}a", "{k}b", "DB", "15", "REPLACE"],
+        &["COPY", "{k}a", "{k}b", "DB", "99"],
+        &["COPY", "{k}a", "{k}b", "DB", "-1"],
+        &["COPY", "{k}a", "{k}b", "DB", "1", "BOGUS"],
+    ] {
+        refused(&mut c, args, "ERR DB index is out of range");
+    }
+    // A key's slot is checked first, as in Redis.
+    assert!(
+        c.cmd(&["COPY", "{k}a", "{j}b", "DB", "1"])
+            .err()
+            .is_some_and(|e| e.starts_with("CROSSSLOT")),
+    );
+    // In database 0 it copies.
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}b", "DB", "0"]), Resp::Int(1));
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}c"]), Resp::Int(1));
+    // In a transaction, each is refused as it runs.
+    assert!(c.cmd(&["MULTI"]).is_ok());
+    assert_eq!(c.cmd(&["MOVE", "{k}a", "1"]).text(), "QUEUED");
+    assert_eq!(c.cmd(&["SWAPDB", "0", "1"]).text(), "QUEUED");
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}d", "DB", "1"]).text(), "QUEUED");
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        Resp::Array(vec![
+            Resp::Error("ERR MOVE is not allowed in cluster mode".into()),
+            Resp::Error("ERR SWAPDB is not allowed in cluster mode".into()),
+            Resp::Error("ERR DB index is out of range".into()),
+        ])
+    );
+    // Every key is still in database 0.
+    assert_eq!(c.cmd(&["GET", "{k}a"]), Resp::Bulk(b"v".to_vec()));
+    assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(3));
+}
+
+/// A cluster replica whose master sends a full sync with keys outside
+/// database 0 refuses it before it touches its own dataset, and says why
+/// and what to do. The master here is one that let `MOVE` put a key in
+/// database 1, as KiviDB did before #484 (`KIVIDB_TEST_FAILPOINTS`).
+#[test]
+fn a_cluster_replica_refuses_a_full_sync_with_keys_outside_database_0() {
+    let (nodes, _) = form_cluster_with_env(1, &[("KIVIDB_TEST_FAILPOINTS", "cluster-move")]);
+    let master = &nodes[0];
+    let mut m = master.conn();
+    assert!(m.cmd(&["SET", "{k}kept", "v"]).is_ok());
+    assert!(m.cmd(&["SET", "{k}moved", "v"]).is_ok());
+    assert_eq!(m.cmd(&["MOVE", "{k}moved", "1"]), Resp::Int(1));
+
+    // A node with keys of its own, and no slots, to be the replica: the
+    // refusal must leave its keys where they are.
+    let replica = Node::start(&[]);
+    let mut r = replica.conn();
+    assert!(r.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]).is_ok());
+    wait_cluster_ok(&[&replica], 1);
+    for key in ["{r}1", "{r}2", "{r}3"] {
+        assert!(r.cmd(&["SET", key, "local"]).is_ok());
+    }
+    assert!(r.cmd(&["CLUSTER", "DELSLOTSRANGE", "0", "16383"]).is_ok());
+    assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3));
+
+    let meet = m.cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
+    assert!(meet.is_ok(), "MEET: {meet:?}");
+    let master_id = master.id();
+    wait_until(
+        "replica to learn of its master",
+        Duration::from_secs(15),
+        || {
+            r.cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .any(|l| l.starts_with(&master_id))
+        },
+    );
+    let rep = r.cmd(&["CLUSTER", "REPLICATE", &master_id]);
+    assert!(rep.is_ok(), "REPLICATE: {rep:?}");
+    wait_until(
+        "the replica to refuse the full sync",
+        Duration::from_secs(30),
+        || {
+            replica
+                .repl_info("replica_last_sync_refusal")
+                .is_some_and(|why| {
+                    why.contains("can't have keys in a DB different than DB 0 when in Cluster mode")
+                })
+        },
+    );
+    let why = replica.repl_info("replica_last_sync_refusal").unwrap();
+    assert!(
+        why.contains("Move them into database 0 on the master"),
+        "the refusal does not say what to do: {why}"
+    );
+    assert_ne!(
+        replica.repl_info("master_link_status").as_deref(),
+        Some("up")
+    );
+    // Its own keys are untouched, and none of the master's came in.
+    assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3), "{}", replica.log());
+}
+
+/// `cluster-port` sets the port the bus listens on, from a config file (as
+/// LiteLLM's tests start a node) or the command line, in place of `port` +
+/// 10000; `CONFIG GET` and `CLUSTER NODES` say it. A config file with it
+/// was refused, and the node did not start. And the node says in its log
+/// when the cluster's state changes, as Redis does: a test waits for
+/// `Cluster state changed: ok` (#430).
+#[test]
+fn cluster_port_sets_the_bus_port() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = cluster_port();
+    // A port of its own, not `port` + 10000, and outside 10000-29999, where
+    // the other tests' nodes and their buses are: `port + 1` was often the
+    // next node's port, which then could not start. Below Linux's ephemeral
+    // range (32768 and up), so no client's own port can take it.
+    let bus = (30_000 + port % 2_000..32_768)
+        .find(|p| port_is_free(*p))
+        .unwrap();
+    let conf = [
+        "bind 127.0.0.1".to_string(),
+        format!("port {port}"),
+        format!("cluster-port {bus}"),
+        "cluster-enabled yes".to_string(),
+        "cluster-config-file nodes.conf".to_string(),
+        "appendonly no".to_string(),
+    ];
+    std::fs::write(dir.join("kividb.conf"), conf.join("\n")).unwrap();
+    let log = dir.join("node.log");
+    let mut node = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(&dir)
+        .args(["--configfile", "kividb.conf"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while TcpStream::connect(("127.0.0.1", bus)).is_err() {
+        assert!(
+            node.try_wait().unwrap().is_none(),
+            "the node exited:\n{}",
+            read_log()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no bus on {bus}:\n{}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        TcpStream::connect(("127.0.0.1", port + 10_000)).is_err(),
+        "a bus on port + 10000 too"
+    );
+    let mut c = Conn::connect(port);
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "cluster-port"]),
+        Resp::Array(vec![
+            Resp::Bulk(b"cluster-port".to_vec()),
+            Resp::Bulk(bus.to_string().into_bytes()),
+        ])
+    );
+    let nodes = c.cmd(&["CLUSTER", "NODES"]).text();
+    assert!(
+        nodes.contains(&format!(":{port}@{bus}")),
+        "CLUSTER NODES: {nodes}"
+    );
+    assert!(!read_log().contains("Cluster state changed: ok"));
+    assert!(c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_log().contains("Cluster state changed: ok") {
+        assert!(
+            Instant::now() < deadline,
+            "no state change in:\n{}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = node.kill();
+    let _ = node.wait();
+}
+
 #[test]
 fn cluster_forms_and_routes_by_slot() {
     let (nodes, ranges) = form_cluster(3);
@@ -2296,7 +2607,43 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
             .is_ok()
     );
     s.cmd(&["TS.ADD", &k("ts"), "1000", "21.5"]);
-    let names = ["str", "list", "hash", "set", "zset", "stream", "ts"];
+    // A series with settings and a compaction rule (#593).
+    assert!(
+        s.cmd(&[
+            "TS.CREATE",
+            &k("tsr"),
+            "RETENTION",
+            "100000",
+            "CHUNK_SIZE",
+            "256",
+            "DUPLICATE_POLICY",
+            "MIN",
+            "LABELS",
+            "room",
+            "cellar",
+        ])
+        .is_ok()
+    );
+    assert!(s.cmd(&["TS.CREATE", &k("tsavg")]).is_ok());
+    assert!(
+        s.cmd(&[
+            "TS.CREATERULE",
+            &k("tsr"),
+            &k("tsavg"),
+            "AGGREGATION",
+            "avg",
+            "10"
+        ])
+        .is_ok()
+    );
+    for (at, value) in [("1", "1"), ("5", "3"), ("12", "4")] {
+        s.cmd(&["TS.ADD", &k("tsr"), at, value]);
+    }
+    let range_before = s.cmd(&["TS.RANGE", &k("tsr"), "-", "+"]);
+    let avg_before = s.cmd(&["TS.RANGE", &k("tsavg"), "-", "+"]);
+    let names = [
+        "str", "list", "hash", "set", "zset", "stream", "ts", "tsr", "tsavg",
+    ];
 
     // Giving the slot away while its keys are still here is refused.
     let reply = s.cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id]);
@@ -2381,6 +2728,23 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
     // The migrated series is findable by label on its new node.
     let found = d.cmd(&["TS.QUERYINDEX", "room=attic"]);
     assert_eq!(found.array().len(), 1);
+    // With its samples and settings; its rule stays behind, as MIGRATE
+    // goes by DUMP, which RedisTimeSeries leaves links to other keys out of.
+    assert_eq!(d.cmd(&["TS.RANGE", &k("tsr"), "-", "+"]), range_before);
+    assert_eq!(d.cmd(&["TS.RANGE", &k("tsavg"), "-", "+"]), avg_before);
+    let info = d.cmd(&["TS.INFO", &k("tsr")]);
+    assert_eq!(task_field(&info, "retentionTime").text(), "100000");
+    assert_eq!(task_field(&info, "chunkSize").text(), "256");
+    assert_eq!(task_field(&info, "duplicatePolicy").text(), "min");
+    assert_eq!(task_field(&info, "rules"), Resp::Array(vec![]));
+    assert_eq!(
+        task_field(&d.cmd(&["TS.INFO", &k("tsavg")]), "sourceKey"),
+        Resp::Nil
+    );
+    assert_eq!(
+        d.cmd(&["TS.QUERYINDEX", "room=cellar"]).array(),
+        [Resp::Bulk(k("tsr").into_bytes())]
+    );
 
     // The old owner now redirects, by MOVED rather than ASK.
     let reply = s.cmd(&["GET", &k("str")]);
@@ -2388,6 +2752,81 @@ fn migrate_moves_a_slot_with_every_type_and_ttl() {
         reply.err().is_some_and(|e| e.starts_with("MOVED")),
         "{reply:?}"
     );
+}
+
+/// An atomic slot migration moves time series whole: samples, retention,
+/// chunk size, duplicate policy, labels (found by `TS.QUERYINDEX` on the
+/// new owner), and compaction rules in both directions, whose keys are in
+/// one slot and move together (#593). A sample added on the new owner
+/// still reaches the compaction.
+#[test]
+fn atomic_slot_migration_moves_time_series_with_their_rules() {
+    let (nodes, _) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let tag = key_in(0..=1000, "tstag");
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    assert!(
+        s.cmd(&[
+            "TS.CREATE",
+            &k("raw"),
+            "RETENTION",
+            "100000",
+            "CHUNK_SIZE",
+            "256",
+            "DUPLICATE_POLICY",
+            "MIN",
+            "LABELS",
+            "room",
+            "loft",
+        ])
+        .is_ok()
+    );
+    assert!(s.cmd(&["TS.CREATE", &k("avg")]).is_ok());
+    assert!(
+        s.cmd(&[
+            "TS.CREATERULE",
+            &k("raw"),
+            &k("avg"),
+            "AGGREGATION",
+            "avg",
+            "10"
+        ])
+        .is_ok()
+    );
+    for (at, value) in [("1", "1"), ("5", "3"), ("12", "4")] {
+        s.cmd(&["TS.ADD", &k("raw"), at, value]);
+    }
+    let raw_before = s.cmd(&["TS.RANGE", &k("raw"), "-", "+"]);
+    let avg_before = s.cmd(&["TS.RANGE", &k("avg"), "-", "+"]);
+    assert_eq!(avg_before.array().len(), 1, "{avg_before:?}");
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(dst, &task_id);
+
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["TS.RANGE", &k("raw"), "-", "+"]), raw_before);
+    assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]), avg_before);
+    let info = d.cmd(&["TS.INFO", &k("raw")]);
+    assert_eq!(task_field(&info, "retentionTime").text(), "100000");
+    assert_eq!(task_field(&info, "chunkSize").text(), "256");
+    assert_eq!(task_field(&info, "duplicatePolicy").text(), "min");
+    assert_eq!(task_field(&info, "rules").array().len(), 1);
+    assert_eq!(
+        task_field(&d.cmd(&["TS.INFO", &k("avg")]), "sourceKey").text(),
+        k("raw")
+    );
+    assert_eq!(
+        d.cmd(&["TS.QUERYINDEX", "room=loft"]).array(),
+        [Resp::Bulk(k("raw").into_bytes())]
+    );
+    // The rule works there: a sample in a later bucket closes [10, 20).
+    d.cmd(&["TS.ADD", &k("raw"), "25", "5"]);
+    assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]).array().len(), 2);
 }
 
 /// A slot left open by a reshard that stopped part way, with keys on both
@@ -2540,6 +2979,79 @@ fn command_in_background(port: u16, args: &[&str]) -> std::thread::JoinHandle<Re
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         Conn::connect(port).cmd(&refs)
     })
+}
+
+/// A `MIGRATE` that passed its connection's pause check before a
+/// `CLIENT PAUSE WRITE` was set, and reached its gate after, is held with
+/// the other writes: its key is neither sent nor deleted, and it is not
+/// answered, until the pause ends. It used to move and delete the key after
+/// the pause had been answered, a write after the offset a switchover reads
+/// (#640).
+#[test]
+fn a_migrate_on_its_way_when_clients_are_paused_is_held() {
+    let env = [("KIVIDB_TEST_PRE_GATE_DELAY_MS", "1500")];
+    let (nodes, ranges) = form_cluster_with_env(2, &env);
+    // Made by `DEBUG POPULATE`, none of whose arguments begins with
+    // `stalled:`: the hook holds up only the first write that has one.
+    let key = "stalled:0".to_string();
+    let slot = slot_of(&key).to_string();
+    let here = usize::from(!(ranges[0].0..=ranges[0].1).contains(&slot_of(&key)));
+    let (src, dst) = (&nodes[here], &nodes[1 - here]);
+    let mut s = src.conn();
+    assert!(s.cmd(&["DEBUG", "POPULATE", "1", "stalled"]).is_ok());
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
+    let reply = dst
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src.id()]);
+    assert!(reply.is_ok(), "SETSLOT IMPORTING: {reply:?}");
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst.id()])
+            .is_ok()
+    );
+
+    let port = dst.port.to_string();
+    let args = ["MIGRATE", "127.0.0.1", &port, &key, "0", "5000"];
+    let mut m = src.conn();
+    let mut raw = format!("*{}\r\n", args.len());
+    for a in args {
+        raw.push_str(&format!("${}\r\n{a}\r\n", a.len()));
+    }
+    m.stream.write_all(raw.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut a = src.conn();
+    assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).is_ok());
+    // Past the end of the hold-up: the MIGRATE has reached its gate. And
+    // past the destination's own hold-up of the first write of the key
+    // (its `RESTORE`), which a MIGRATE that was not held would be through
+    // by now.
+    std::thread::sleep(Duration::from_millis(4000));
+    m.stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    assert!(
+        m.read().is_err(),
+        "the MIGRATE was answered while writes were paused"
+    );
+    m.stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(
+        a.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        1,
+        "the MIGRATE deleted its key while writes were paused"
+    );
+    assert_eq!(
+        dst.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        0
+    );
+
+    assert!(a.cmd(&["CLIENT", "UNPAUSE"]).is_ok());
+    assert!(m.read().unwrap().is_ok(), "MIGRATE after the pause");
+    assert_eq!(a.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    assert_eq!(
+        dst.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        1
+    );
 }
 
 /// A write to a key while `MIGRATE` has it on the wire is not lost (#274),
@@ -3470,6 +3982,188 @@ fn wait_import_completed(dst: &Node, task_id: &str) {
     });
 }
 
+/// `CLUSTER FAILOVER` on the source's replica while a `CLUSTER MIGRATION
+/// IMPORT` from that source runs loses no acknowledged write (#516). The
+/// source waits before its handoff (`KIVIDB_TEST_HANDOFF_DELAY_MS`), with
+/// its stream running, and its replica takes over meanwhile. The old master,
+/// a replica by then, used to hand the slots over all the same, from its own
+/// dataset, and the destination took them at a newer epoch. The new
+/// master's writes to them were lost: those since its promotion, which the
+/// stream never carried, and those it took until it heard of the
+/// destination's claim, deleted with the slots. Now the source gives the
+/// attempt up, and the destination imports the slots from the new master.
+#[test]
+fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (nodes, _) = form_cluster_with_env(3, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "10000")]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let replica = add_replica(&nodes, src);
+    let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+    wait_cluster_ok(&all, 4);
+    wait_until(
+        "the replica to follow the source",
+        Duration::from_secs(30),
+        || replica.repl_info("master_link_status").as_deref() == Some("up"),
+    );
+    let logs = || {
+        let logs: Vec<String> = all
+            .iter()
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect();
+        logs.join("\n")
+    };
+    let lists: Vec<String> = (0..20)
+        .map(|i| key_in(0..=1000, &format!("fo{i}")))
+        .collect();
+    let ports: Vec<u16> = all.iter().map(|n| n.port).collect();
+
+    // Writers that follow -MOVED, try another node on anything else, and
+    // keep every element they were told was pushed.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let (stop, lists, ports) = (Arc::clone(&stop), lists.clone(), ports.clone());
+            std::thread::spawn(move || {
+                let patient = |port: u16| {
+                    Conn::try_connect(port).and_then(|c| {
+                        c.stream
+                            .set_read_timeout(Some(Duration::from_secs(30)))
+                            .ok()
+                            .map(|_| c)
+                    })
+                };
+                let mut acked: Vec<(usize, String)> = Vec::new();
+                let (mut n, mut at) = (0usize, 0usize);
+                let mut conn = patient(ports[at]);
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let list = n % lists.len();
+                    let element = format!("{w}:{n}");
+                    let reply = conn
+                        .as_mut()
+                        .map(|c| c.try_cmd(&["RPUSH", &lists[list], &element]));
+                    match reply {
+                        Some(Ok(Resp::Int(_))) => acked.push((list, element)),
+                        Some(Ok(Resp::Error(e))) if e.starts_with("MOVED") => {
+                            let port = e.rsplit(':').next().and_then(|p| p.parse().ok());
+                            conn = port.and_then(patient);
+                        }
+                        _ => {
+                            at = (at + 1) % ports.len();
+                            std::thread::sleep(Duration::from_millis(5));
+                            conn = patient(ports[at]);
+                        }
+                    }
+                }
+                acked
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to wait before its handoff",
+        Duration::from_secs(30),
+        || src.log().contains("(test) the handoff of slots"),
+    );
+    let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(reply.is_ok(), "CLUSTER FAILOVER: {reply:?}");
+    wait_until("the replica to take over", Duration::from_secs(15), || {
+        replica.is_master()
+    });
+
+    wait_until("the import to complete", Duration::from_secs(90), || {
+        let status = dst
+            .conn()
+            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+        let task = &status.array()[0];
+        let state = task_field(task, "state").text();
+        assert!(
+            state == "in_progress" || state == "completed",
+            "{task:?}\n{}",
+            logs()
+        );
+        state == "completed"
+    });
+    let dst_id = dst.id();
+    wait_until(
+        "every node to agree on the new owner",
+        Duration::from_secs(30),
+        || {
+            all.iter().all(|n| {
+                n.conn()
+                    .cmd(&["CLUSTER", "NODES"])
+                    .text()
+                    .lines()
+                    .any(|l| l.starts_with(&dst_id) && l.contains(" 0-1000"))
+            })
+        },
+    );
+    // The source gave its handover up for the failover, by itself: the
+    // destination's refusal is not all that stood in its way.
+    wait_until(
+        "the source to give its handover up",
+        Duration::from_secs(30),
+        || src.log().contains("a failover of this node began"),
+    );
+    // Long enough for a node that held the slots' keys to have dropped them.
+    std::thread::sleep(Duration::from_secs(3));
+    stop.store(true, Ordering::Relaxed);
+    let acked: Vec<(usize, String)> = writers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    assert!(acked.len() > 100, "{} pushes acknowledged", acked.len());
+
+    let mut d = dst.conn();
+    let got: Vec<Vec<String>> = lists
+        .iter()
+        .map(|list| {
+            let got = d.cmd(&["LRANGE", list, "0", "-1"]);
+            got.array().iter().map(Resp::text).collect()
+        })
+        .collect();
+    // Every element is pushed once, by one attempt: one there twice was
+    // applied twice, as by the stream of an earlier attempt's source.
+    let twice: Vec<&String> = got
+        .iter()
+        .flat_map(|elements| {
+            let mut seen = std::collections::HashSet::new();
+            elements.iter().filter(move |e| !seen.insert(*e))
+        })
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "{} pushes applied twice, e.g. {:?}\n{}",
+        twice.len(),
+        &twice[..twice.len().min(5)],
+        logs()
+    );
+    let have: Vec<std::collections::HashSet<String>> = got
+        .iter()
+        .map(|elements| elements.iter().cloned().collect())
+        .collect();
+    let lost: Vec<&(usize, String)> = acked
+        .iter()
+        .filter(|(list, element)| !have[*list].contains(element))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{} of {} acknowledged pushes lost, e.g. {:?}\n{}",
+        lost.len(),
+        acked.len(),
+        &lost[..lost.len().min(5)],
+        logs()
+    );
+}
+
 /// A write routed here before an atomic slot migration handed its slot
 /// over, and held up before the write gate until the handoff had let writes
 /// go again, is sent on with `-MOVED`. It used to run here, on a slot the
@@ -3591,6 +4285,63 @@ fn a_transaction_of_a_georadius_store_during_a_slot_handoff_is_refused() {
         reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
         "the transaction is refused: {reply:?}"
     );
+}
+
+/// `SCRIPT LOAD` during an atomic slot migration's handoff is answered at
+/// once (#528). The pause does not hold it (#518), and it used to wait the
+/// handoff out in the write gate instead, in a sleep loop on its worker
+/// thread: on io_uring every other connection of that thread waited with
+/// it. The destination's `TAKEOVER` waits 3 s, so the handoff lasts that
+/// long; a write is still held for all of it.
+#[cfg(feature = "lua")]
+#[test]
+fn script_load_during_a_slot_handoff_is_answered_at_once() {
+    let (nodes, _) = form_cluster_of(vec![
+        Node::start(&[]),
+        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "3000")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let key = key_in(0..=1000, "handoff");
+    assert!(src.conn().cmd(&["SET", &key, "5"]).is_ok());
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    wait_until(
+        "the handoff to hold writes for the TAKEOVER",
+        Duration::from_secs(60),
+        || dst.log().contains("(test) TAKEOVER waits"),
+    );
+    let write =
+        patient_commands_in_background(src.port, Duration::from_secs(30), &[&["SET", &key, "6"]]);
+    let started = Instant::now();
+    let sha = src.conn().cmd(&["SCRIPT", "LOAD", "return 528"]);
+    let took = started.elapsed();
+    let finished = write.is_finished();
+    assert_eq!(sha.text().len(), 40, "SCRIPT LOAD: {sha:?}");
+    assert!(
+        took < Duration::from_millis(1000),
+        "SCRIPT LOAD waited {took:?} for the handoff"
+    );
+    assert!(!finished, "a write was not held by the handoff");
+
+    wait_import_completed(dst, &task_id);
+    let reply = write.join().unwrap();
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "the held write is sent on: {reply:?}"
+    );
+    assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+    let r = src.conn().cmd(&["EVALSHA", &sha.text(), "0"]);
+    assert_eq!(r.int(), 528, "{r:?}");
 }
 
 /// `MULTI`, the commands `queued` makes of a key holding "5", and `EXEC`,
@@ -3891,8 +4642,14 @@ fn a_write_routed_before_a_manual_failover_is_sent_on_not_run_on_the_old_master(
 /// A write routed here before `remove` took its slot from this node, and
 /// held up before the write gate until then, is refused: no node is
 /// serving the slot, in this one's view. It used to run, here (#337). Once
-/// `restore` gives the slot back, the key is as it was.
-fn a_write_routed_before_its_slot_was_removed(remove: &[&str], restore: &[&str]) {
+/// `restore` gives the slot back, the key is as it was. With
+/// `key_there_before` false the node holds no key when `remove` runs
+/// (FLUSHSLOTS refuses otherwise, #552), and the write is the key's first.
+fn a_write_routed_before_its_slot_was_removed(
+    remove: &[&str],
+    restore: &[&str],
+    key_there_before: bool,
+) {
     let key = key_in(0..=16383, "removed");
     let slot = slot_of(&key).to_string();
     let env = [
@@ -3912,10 +4669,19 @@ fn a_write_routed_before_its_slot_was_removed(remove: &[&str], restore: &[&str])
             })
             .collect()
     };
-    assert!(run_past_the_stall(node, 1, &["SET", &key, "5"]).is_ok());
+    let mut hit = 1;
+    if key_there_before {
+        assert!(run_past_the_stall(node, hit, &["SET", &key, "5"]).is_ok());
+        hit += 1;
+    }
 
-    let incr = commands_in_background(node.port, &[&["INCR", &key]]);
-    let held = routed_and_held(node, 2);
+    let write: &[&str] = if key_there_before {
+        &["INCR", &key]
+    } else {
+        &["SET", &key, "6"]
+    };
+    let incr = commands_in_background(node.port, &[write]);
+    let held = routed_and_held(node, hit);
     let remove = with_slot(remove);
     let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
     let r = node.conn().cmd(&refs);
@@ -3933,7 +4699,12 @@ fn a_write_routed_before_its_slot_was_removed(remove: &[&str], restore: &[&str])
     let r = node.conn().cmd(&refs);
     assert!(r.is_ok(), "{refs:?}: {r:?}");
     wait_cluster_ok(&[node], 1);
-    assert_eq!(run_past_the_stall(node, 3, &["GET", &key]).text(), "5");
+    let got = run_past_the_stall(node, hit + 1, &["GET", &key]);
+    if key_there_before {
+        assert_eq!(got.text(), "5");
+    } else {
+        assert_eq!(got, Resp::Nil);
+    }
 }
 
 #[test]
@@ -3941,6 +4712,7 @@ fn a_write_routed_before_delslots_took_its_slot_is_refused() {
     a_write_routed_before_its_slot_was_removed(
         &["CLUSTER", "DELSLOTS", "{slot}"],
         &["CLUSTER", "ADDSLOTS", "{slot}"],
+        true,
     );
 }
 
@@ -3949,7 +4721,147 @@ fn a_write_routed_before_flushslots_is_refused() {
     a_write_routed_before_its_slot_was_removed(
         &["CLUSTER", "FLUSHSLOTS"],
         &["CLUSTER", "ADDSLOTSRANGE", "0", "16383"],
+        false,
     );
+}
+
+/// CLUSTER FLUSHSLOTS gives up only this node's own slots, and refuses
+/// while the node holds keys, as in Redis. It used to unassign every slot
+/// in this node's view, the other masters' too, keys or not, and the node
+/// went to `cluster_state:fail` (#552).
+#[test]
+fn flushslots_gives_up_only_this_nodes_slots_and_needs_an_empty_db() {
+    let (nodes, ranges) = form_cluster(2);
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let key = key_in(ranges[1].0..=ranges[1].1, "kept");
+    assert!(b.conn().cmd(&["SET", &key, "v"]).is_ok());
+
+    // `b` holds a key: refused, and nothing changes.
+    let r = b.conn().cmd(&["CLUSTER", "FLUSHSLOTS"]);
+    assert_eq!(
+        r.err(),
+        Some("ERR DB must be empty to perform CLUSTER FLUSHSLOTS."),
+        "{r:?}"
+    );
+    assert_eq!(b.cluster_info("cluster_slots_assigned"), "16384");
+    assert_eq!(b.conn().cmd(&["GET", &key]).text(), "v");
+
+    // `a` holds none: its own slots go, `b`'s stay mapped.
+    assert!(a.conn().cmd(&["CLUSTER", "FLUSHSLOTS"]).is_ok());
+    assert_eq!(
+        a.cluster_info("cluster_slots_assigned"),
+        (ranges[1].1 - ranges[1].0 + 1).to_string()
+    );
+    let slots = a.conn().cmd(&["CLUSTER", "SLOTS"]);
+    assert_eq!(slots.array().len(), 1, "{slots:?}");
+    assert_eq!(slots.array()[0].array()[0].int(), ranges[1].0 as i64);
+    assert_eq!(slots.array()[0].array()[1].int(), ranges[1].1 as i64);
+    // `b` serves its slots as before.
+    assert_eq!(b.cluster_info("cluster_state"), "ok");
+    assert_eq!(b.conn().cmd(&["GET", &key]).text(), "v");
+}
+
+/// CLUSTER ADDSLOTS and ADDSLOTSRANGE check every slot before they claim
+/// any, as in Redis: one busy slot claims none. The slots before it used
+/// to stay claimed in memory, not saved to nodes.conf, with `cluster_state`
+/// and the slot counts stale (#553).
+#[test]
+fn addslots_that_fail_claim_nothing() {
+    let mut node = Node::start(&[]);
+    let mut c = node.conn();
+    assert!(c.cmd(&["CLUSTER", "ADDSLOTS", "200"]).is_ok());
+    let busy = Some("ERR Slot 200 is already busy");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "99", "150", "250"]);
+    assert_eq!(r.err(), busy, "{r:?}");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTS", "1", "2", "200"]);
+    assert_eq!(r.err(), busy, "{r:?}");
+    let twice = Some("ERR Slot 5 specified multiple times");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTS", "5", "6", "5"]);
+    assert_eq!(r.err(), twice, "{r:?}");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "9", "5", "20"]);
+    assert_eq!(r.err(), twice, "{r:?}");
+    let r = c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "10", "5"]);
+    assert_eq!(
+        r.err(),
+        Some("ERR start slot number 10 is greater than end slot number 5"),
+        "{r:?}"
+    );
+    assert_eq!(node.cluster_info("cluster_slots_assigned"), "1");
+    // And after a restart, from nodes.conf, the same.
+    node.restart();
+    assert_eq!(node.cluster_info("cluster_slots_assigned"), "1");
+    let mut c = node.conn();
+    assert!(
+        c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "199", "201", "16383"])
+            .is_ok()
+    );
+    wait_cluster_ok(&[&node], 1);
+}
+
+/// SET-CONFIG-EPOCH, BUMPEPOCH, COUNT-FAILURE-REPORTS and GETKEYSINSLOT
+/// answer as in Redis (#563).
+#[test]
+fn cluster_admin_commands_answer_as_redis_does() {
+    // SET-CONFIG-EPOCH only on a fresh node, and BUMPEPOCH's `STILL`.
+    let lone = Node::start(&[]);
+    let mut c = lone.conn();
+    let r = c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "-1"]);
+    assert_eq!(r.err(), Some("ERR Invalid config epoch specified: -1"));
+    assert!(c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "3"]).is_ok());
+    let r = c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "4"]);
+    assert_eq!(r.err(), Some("ERR Node config epoch is already non-zero"));
+    assert_eq!(c.cmd(&["CLUSTER", "BUMPEPOCH"]).text(), "STILL 3");
+    assert_eq!(lone.cluster_info("cluster_my_epoch"), "3");
+
+    // BUMPEPOCH gives a fresh node a config epoch, once.
+    let fresh = Node::start(&[]);
+    let mut f = fresh.conn();
+    let bumped = f.cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    let epoch = bumped
+        .strip_prefix("BUMPED ")
+        .unwrap_or_else(|| panic!("{bumped}"))
+        .to_string();
+    assert_ne!(epoch, "0");
+    assert_eq!(fresh.cluster_info("cluster_my_epoch"), epoch);
+    assert_eq!(
+        f.cmd(&["CLUSTER", "BUMPEPOCH"]).text(),
+        format!("STILL {epoch}")
+    );
+
+    // In a cluster.
+    let (nodes, ranges) = form_cluster(2);
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let mut c = a.conn();
+    let r = c.cmd(&["CLUSTER", "SET-CONFIG-EPOCH", "9"]);
+    assert_eq!(
+        r.err(),
+        Some(
+            "ERR The user can assign a config epoch only when the node does not know any other node."
+        )
+    );
+    assert_eq!(
+        c.cmd(&["CLUSTER", "COUNT-FAILURE-REPORTS", &b.id()]).int(),
+        0
+    );
+    let unknown = "0123456789012345678901234567890123456789";
+    let r = c.cmd(&["CLUSTER", "COUNT-FAILURE-REPORTS", unknown]);
+    let expected = format!("ERR Unknown node {unknown}");
+    assert_eq!(r.err(), Some(expected.as_str()));
+    let r = c.cmd(&["CLUSTER", "COUNT-FAILURE-REPORTS", "nonsense"]);
+    assert_eq!(r.err(), Some("ERR Unknown node nonsense"));
+
+    // GETKEYSINSLOT with a count of 0 is an empty array.
+    let key = key_in(ranges[0].0..=ranges[0].1, "gk");
+    let slot = slot_of(&key).to_string();
+    assert!(c.cmd(&["SET", &key, "v"]).is_ok());
+    let none = c.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "0"]);
+    assert_eq!(none, Resp::Array(vec![]));
+    assert_eq!(
+        c.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "1"]),
+        Resp::Array(vec![Resp::Bulk(key.clone().into_bytes())])
+    );
+    let r = c.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "-1"]);
+    assert_eq!(r.err(), Some("ERR Invalid slot or number of keys"));
 }
 
 /// The destination gets to the `TAKEOVER` only after the source has
@@ -6035,4 +6947,150 @@ fn a_master_stopped_cleanly_without_an_aof_carries_on_as_before() {
     assert!(masters[0].is_master() && !replicas[0].is_master());
     let log = masters[0].log();
     assert!(!log.contains("came back without its dataset"), "{log}");
+}
+
+/// A key that is not text in a slot an atomic migration moves. The
+/// destination's `RESTORE` refused it, and the import failed and tried again
+/// until it was canceled. It moves now, whole, as any key does.
+#[test]
+fn a_slot_migration_moves_a_key_that_is_not_text() {
+    // A key that is not text, in a slot the first node owns (0..=8191).
+    let key: Vec<u8> = (0u32..)
+        .map(|i| {
+            let mut k = b"bin:\xff".to_vec();
+            k.extend_from_slice(&i.to_be_bytes());
+            k
+        })
+        .find(|k| kividb::cluster::key_hash_slot(k) < 8192)
+        .unwrap();
+    let slot = kividb::cluster::key_hash_slot(&key).to_string();
+    let mut rdb = b"REDIS0011\xfe\x00\x00".to_vec();
+    rdb.push(key.len() as u8);
+    rdb.extend_from_slice(&key);
+    rdb.extend_from_slice(b"\x05value\xff");
+    rdb.extend_from_slice(&[0u8; 8]);
+    let seed = tempfile::tempdir().unwrap().keep().join("seed.rdb");
+    std::fs::write(&seed, rdb).unwrap();
+    let preload = format!("rdb:{}", seed.display());
+
+    let src = Node::start(&["--preload-file", &preload]);
+    let dst = Node::start(&[]);
+    let (nodes, _) = form_cluster_of(vec![src, dst]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    assert_eq!(src.conn().cmd(&["DBSIZE"]).int(), 1, "{}", src.log());
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot, &slot])
+        .text();
+    let status = || {
+        dst.conn()
+            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id])
+            .array()[0]
+            .clone()
+    };
+    wait_until("the import to complete", Duration::from_secs(60), || {
+        task_field(&status(), "state").text() == "completed"
+    });
+
+    // At the destination, whole, in its slot; gone from the source.
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 1);
+    assert_eq!(d.cmd_bytes(&[b"GET", &key]), Resp::Bulk(b"value".to_vec()));
+    // The source deletes a moved slot's keys after the import completes,
+    // in the background.
+    wait_until(
+        "the source to delete the moved key",
+        Duration::from_secs(30),
+        || src.conn().cmd(&["DBSIZE"]).int() == 0,
+    );
+}
+
+/// A key that is not text, and one with characters of the hash-field
+/// escape's block (U+F780..U+F7FF) in it, found by FT.SEARCH and loaded as
+/// `@__key` by FT.AGGREGATE on whichever master is asked: the coordinator
+/// gives back the key's bytes, from its own shard and from the others. It
+/// decoded the other masters' FT.SEARCH replies lossily (U+FFFD for the
+/// first key, and other bytes for the second) (#437).
+#[test]
+fn cluster_searches_give_back_keys_of_any_bytes() {
+    let (nodes, ranges) = form_cluster(2);
+    let owner = |key: &[u8]| {
+        let slot = kividb::cluster::key_hash_slot(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "docs",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "doc:",
+        "SCHEMA",
+        "f",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let raw: &[u8] = b"doc:\xff\xfe";
+    let pua = "doc:k\u{F7C3}\u{F7A9}".as_bytes().to_vec();
+    // A few of each, so that both masters hold some.
+    let mut want: Vec<Vec<u8>> = Vec::new();
+    for i in 0..8u8 {
+        for base in [raw, pua.as_slice()] {
+            let mut key = base.to_vec();
+            key.push(b'0' + i);
+            let r = nodes[owner(&key)]
+                .conn()
+                .cmd_bytes(&[b"HSET", &key, b"f", b"hello"]);
+            assert!(matches!(r, Resp::Int(1)), "{r:?}");
+            want.push(key);
+        }
+    }
+    want.sort();
+    let on_first = want.iter().filter(|k| owner(k) == 0).count();
+    assert!(on_first > 0 && on_first < want.len(), "{on_first}");
+
+    for node in &nodes {
+        let mut c = node.conn();
+        let page = c.cmd(&[
+            "FT.SEARCH",
+            "docs",
+            "hello",
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "100",
+        ]);
+        assert_eq!(page.array()[0].int(), want.len() as i64, "{page:?}");
+        let mut found: Vec<Vec<u8>> = page.array()[1..]
+            .iter()
+            .map(|r| match r {
+                Resp::Bulk(b) => b.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        found.sort();
+        assert_eq!(found, want, "FT.SEARCH on port {}", node.port);
+
+        let rows = c.cmd(&["FT.AGGREGATE", "docs", "hello", "LOAD", "1", "@__key"]);
+        let mut keys: Vec<Vec<u8>> = rows.array()[1..]
+            .iter()
+            .filter_map(|row| {
+                let cells = row.array();
+                let at = cells
+                    .iter()
+                    .position(|c| *c == Resp::Bulk(b"__key".to_vec()))?;
+                match &cells[at + 1] {
+                    Resp::Bulk(b) => Some(b.clone()),
+                    other => panic!("{other:?}"),
+                }
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, want, "FT.AGGREGATE on port {}", node.port);
+    }
 }

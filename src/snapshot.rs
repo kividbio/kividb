@@ -17,11 +17,13 @@ use std::sync::Arc;
 
 mod rdb_dialect;
 pub use rdb_dialect::is_rdb_header;
+mod rdb_extensions;
+pub use rdb_extensions::is_unrepresentable;
 
 /// Returned by `load_snapshot` — key-value data plus any index schemas that
 /// were embedded in the snapshot file.
 pub struct LoadedSnapshot {
-    pub dbs: Vec<HashMap<String, KiviDBValue>>,
+    pub dbs: Vec<HashMap<Key, KiviDBValue>>,
     /// Index schemas serialised by the previous run. May be empty when loading
     /// an older snapshot that predates index persistence.
     pub index_schemas: Vec<IndexSchema>,
@@ -38,7 +40,7 @@ pub struct LoadedSnapshot {
     /// Keys whose expiry had already passed at load time are dropped from
     /// `dbs` instead of appearing here. Empty maps for an image written before
     /// expiries were persisted.
-    pub expiries: Vec<HashMap<String, u64>>,
+    pub expiries: Vec<HashMap<Key, u64>>,
     /// The function libraries, as a `FUNCTION DUMP` payload: `None` for an
     /// image that holds none, or one written before they were kept. Loaded
     /// with [`restore_functions`].
@@ -46,7 +48,7 @@ pub struct LoadedSnapshot {
 }
 
 /// Per-database key expiries as absolute Unix milliseconds.
-pub type ExpiryMaps = Vec<HashMap<String, u64>>;
+pub type ExpiryMaps = Vec<HashMap<Key, u64>>;
 
 /// Magic opening the key-expiry section of a KDB image.
 const KDB_EXPIRY_MAGIC: &[u8; 8] = b"KIVIEX1\0";
@@ -153,7 +155,7 @@ fn fill_or_end(r: &mut impl Read, buf: &mut [u8], started: bool) -> io::Result<b
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "the image ends inside a section's magic",
+                    "the snapshot ends inside a section's magic: it is cut short",
                 ));
             }
             Ok(n) => at += n,
@@ -162,6 +164,47 @@ fn fill_or_end(r: &mut impl Read, buf: &mut [u8], started: bool) -> io::Result<b
         }
     }
     Ok(true)
+}
+
+/// `result`, the reading of the `section` section's body, with an image that
+/// ends inside it said to be cut short (#474).
+///
+/// Reaching the end of the image partway through a section is never a clean
+/// end, on any reading: a section is either all there or the image is torn.
+/// The error stays [`io::ErrorKind::UnexpectedEof`], a fault of the layout,
+/// so that [`read_retrying`] still reads a 1.2.0 image again as it says.
+fn whole_section<T>(section: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("the snapshot ends inside its {section} section: it is cut short"),
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// [`whole_section`] for the index, HNSW graph and alias sections, with one
+/// that is all there but cannot be used refused as well, saying which.
+///
+/// They were read best-effort, and one that could not be used ended the scan
+/// with a warning. The images of 1.0 to 1.2.0 hold the key expiries and the
+/// function libraries after them, so every TTL and library was dropped with
+/// it, and the indexes were not rebuilt either. No writer makes such a
+/// section, so refusing one refuses no image KiviDB wrote whole (#474).
+fn usable_section<T>(section: &str, result: io::Result<T>) -> io::Result<T> {
+    whole_section(section, result).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the snapshot's {section} section cannot be used: {e}"),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// A snapshot file that goes to the disk as it is written, a few megabytes
@@ -361,9 +404,9 @@ fn read_u64_le(r: &mut impl Read) -> io::Result<u64> {
 fn write_stream_entries(w: &mut impl Write, inner: &StreamInner) -> io::Result<()> {
     w.write_all(&(inner.entries.len() as u32).to_le_bytes())?;
     for (id, entry) in inner.entries.iter() {
-        write_stream_id(w, id)?;
-        w.write_all(&(entry.fields.len() as u32).to_le_bytes())?;
-        for (field, val) in entry.fields.iter() {
+        write_stream_id(w, &id)?;
+        w.write_all(&(entry.field_count() as u32).to_le_bytes())?;
+        for (field, val) in entry.fields() {
             write_bytes(w, field)?;
             write_bytes(w, val)?;
         }
@@ -470,7 +513,7 @@ fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
             let v = read_bytes(r)?;
             fields.push((Arc::from(f.as_slice()), Arc::from(v.as_slice())));
         }
-        stream.entries.insert(id, StreamEntry { fields });
+        stream.entries.insert_loaded(id, StreamEntry { fields });
     }
     stream.last_id = read_stream_id(r)?;
     Ok(stream)
@@ -488,19 +531,15 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
     let gcount = read_u32_le(r)? as usize;
     stream.groups.reserve(hint(gcount));
     for _ in 0..gcount {
-        let name_bytes = read_bytes(r)?;
-        let name = String::from_utf8(name_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad stream group name"))?;
+        // Group and consumer names are any bytes, as in Redis.
+        let name = crate::types::StreamName::from(read_bytes(r)?);
         let last_id = read_stream_id(r)?;
         let entries_read = read_u64_le(r)?;
         let pel_count = read_u32_le(r)? as usize;
         let mut pel = std::collections::BTreeMap::new();
         for _ in 0..pel_count {
             let id = read_stream_id(r)?;
-            let consumer_bytes = read_bytes(r)?;
-            let consumer = String::from_utf8(consumer_bytes).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "bad stream PEL consumer")
-            })?;
+            let consumer = crate::types::StreamName::from(read_bytes(r)?);
             let delivered_at = read_u64_le(r)?;
             let delivery_count = read_u64_le(r)?;
             pel.insert(
@@ -515,10 +554,7 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
         let ccount = read_u32_le(r)? as usize;
         let mut consumers = AHashMap::with_capacity(hint(ccount));
         for _ in 0..ccount {
-            let cname_bytes = read_bytes(r)?;
-            let cname = String::from_utf8(cname_bytes).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "bad stream consumer name")
-            })?;
+            let cname = crate::types::StreamName::from(read_bytes(r)?);
             let last_seen = read_u64_le(r)?;
             consumers.insert(cname, last_seen);
         }
@@ -654,14 +690,18 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::TimeSeries(arc) => {
             let inner = arc.read();
+            // Its links to other series, but in a `DUMP` (`dump_payload`).
+            let links = !WITHOUT_LINKS.get();
+            let rules: &[crate::types::CompactionRule] = if links { &inner.rules } else { &[] };
+            let source = if links { inner.source.as_ref() } else { None };
             // The duplicate policy and the compaction rules were not saved at
             // all: after a restart (or on a replica, after a full sync) every
             // series was back on the default policy and no longer fed its
             // compactions — silently.
-            let extended = !inner.rules.is_empty()
+            let extended = !rules.is_empty()
                 || inner.duplicate_policy != crate::types::DuplicatePolicy::Last
-                || inner.source.is_some();
-            w.write_all(&[if inner.source.is_some() {
+                || source.is_some();
+            w.write_all(&[if source.is_some() {
                 TAG_TIMESERIES_V3
             } else if extended {
                 TAG_TIMESERIES_V2
@@ -686,16 +726,16 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             }
             if extended {
                 write_bytes(w, inner.duplicate_policy.as_str().as_bytes())?;
-                w.write_all(&(inner.rules.len() as u32).to_le_bytes())?;
-                for rule in inner.rules.iter() {
-                    write_bytes(w, rule.dest_key.as_bytes())?;
+                w.write_all(&(rules.len() as u32).to_le_bytes())?;
+                for rule in rules.iter() {
+                    write_bytes(w, &crate::key_bytes::bytes_of(&rule.dest_key))?;
                     write_bytes(w, rule.aggregation.name().as_bytes())?;
                     w.write_all(&rule.bucket_duration.to_le_bytes())?;
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
             }
-            if let Some(source) = &inner.source {
-                write_bytes(w, source.as_bytes())?;
+            if let Some(source) = source {
+                write_bytes(w, &crate::key_bytes::bytes_of(source))?;
             }
         }
 
@@ -746,15 +786,12 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
                 write_bytes(w, field.as_bytes())?;
                 write_bytes(w, val)?;
             }
-            // Expiries: u32 count followed by (field, unix_ms) pairs.
-            // We persist as Unix ms because Instant is monotonic and
-            // can't survive a process restart — convert at write time.
+            // Expiries: u32 count followed by (field, unix_ms) pairs, the
+            // deadlines as they are kept (#594).
             w.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
-            let clock = crate::commands::helpers::FieldClock::now();
-            for (field, exp) in inner.expiries.iter() {
-                let abs_ms = clock.unix_ms_of(*exp);
+            for (field, at) in inner.expiries.iter() {
                 write_bytes(w, field.as_bytes())?;
-                w.write_all(&abs_ms.to_le_bytes())?;
+                w.write_all(&at.to_le_bytes())?;
             }
         }
 
@@ -861,9 +898,9 @@ pub fn write_kdb_index_sections(
 /// capture of the keyspace writes the same layout from the entries it holds
 /// ([`FrozenDataset`]).
 #[cfg(test)]
-pub fn write_kdb_expiry_maps(
+pub fn write_kdb_expiry_maps<K: AsRef<[u8]>>(
     w: &mut impl Write,
-    per_db: &[HashMap<String, u64>],
+    per_db: &[HashMap<K, u64>],
 ) -> io::Result<()> {
     if per_db.iter().all(|m| m.is_empty()) {
         return Ok(());
@@ -873,7 +910,7 @@ pub fn write_kdb_expiry_maps(
     for map in per_db {
         w.write_all(&(map.len() as u32).to_le_bytes())?;
         for (key, at_ms) in map {
-            write_bytes(w, key.as_bytes())?;
+            write_bytes(w, key.as_ref())?;
             w.write_all(&at_ms.to_le_bytes())?;
         }
     }
@@ -893,9 +930,9 @@ fn unix_ms_now() -> u64 {
 /// A complete KDB image of owned values: header, databases, index sections.
 /// Values in hand have no time to live: a dataset with TTLs is written from
 /// a capture of the keyspace ([`freeze_dataset`]).
-pub fn write_kdb_image(
+pub fn write_kdb_image<K: AsRef<[u8]>>(
     w: &mut impl Write,
-    maps: &[HashMap<String, KiviDBValue>],
+    maps: &[HashMap<K, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
     write_kdb_header(w, maps.len() as u32)?;
@@ -905,9 +942,10 @@ pub fn write_kdb_image(
         }
         write_kdb_db_end(w)?;
     }
+    // Functions before the best-effort index sections (see `write_to`).
+    write_kdb_functions_section(w, function_libraries().as_deref())?;
     write_kdb_index_sections(w, index_store)?;
     write_kdb_alias_section(w, index_store)?;
-    write_kdb_functions_section(w, function_libraries().as_deref())?;
     write_kdb_language_section(w, index_store)?;
     write_kdb_score_section(w, index_store)
 }
@@ -1467,9 +1505,9 @@ fn read_alias_section(r: &mut impl Read) -> io::Result<Vec<(String, String)>> {
 // Unused by the binary, which writes from a capture of the keyspace; the
 // library exports it and the snapshot tests are written against it.
 #[allow(dead_code)]
-pub fn write_snapshot(
+pub fn write_snapshot<K: AsRef<[u8]>>(
     path: &str,
-    maps: &[HashMap<String, KiviDBValue>],
+    maps: &[HashMap<K, KiviDBValue>],
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
     let display_path = std::env::current_dir()
@@ -1562,7 +1600,9 @@ fn write_index_schema(w: &mut impl Write, def: &crate::vector::IndexDef) -> io::
 }
 
 pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
-    load_snapshot_with(|| File::open(path).map(BufReader::new)).map(|(loaded, _)| loaded)
+    load_snapshot_with(|| File::open(path).map(BufReader::new))
+        .map(|(loaded, _)| loaded)
+        .map_err(|e| refusal_of_file(e, path))
 }
 
 /// Read a KDB image from anything byte-shaped.
@@ -1575,13 +1615,24 @@ pub fn load_snapshot(path: &str) -> io::Result<LoadedSnapshot> {
 /// database before its last one is not read (see [`read_retrying`]). The
 /// server reads its images with [`load_snapshot`], [`load_snapshot_bytes`]
 /// and [`load_snapshot_with`].
+///
+/// What reads it is `RESTORE`, whose payload is an image of one database:
+/// read once, it reads one way only. In the last database, the only one, the
+/// byte after a 0 tells 1.2.0's empty key from the database's end: what
+/// follows the end is the end of the image or a section, which opens with
+/// `KIVI`, never with a type tag.
 pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
     read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
 }
 
-/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]).
+/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]):
+/// database 0 alone on a cluster node ([`SNAPSHOT_CLUSTER`]).
 fn server_databases() -> usize {
-    SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
+    if SNAPSHOT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// [`load_snapshot_from`] for an image in memory, read again as
@@ -1606,15 +1657,28 @@ pub fn load_snapshot_with<R: Read>(
 /// value is parsed, exactly as loading would, and dropped. It costs the
 /// memory of one value at a time.
 ///
-/// Stricter than loading: every database has to end where the writer ends
-/// it. (The loader also accepts an image that simply stops between two
-/// entries, for the sake of files written before there was an end marker.)
+/// Every database has to end where the writer ends it, as in loading.
 pub fn verify_snapshot(image: &[u8]) -> io::Result<usize> {
     read_retrying(|| Ok(image), false, server_databases()).map(|(_, keys, _)| keys)
 }
 
-/// Readings [`read_retrying`] makes of one image at most.
+/// Readings [`read_retrying`] makes of one image at least (see
+/// [`readings_for`]).
 const READINGS: usize = 32;
+
+/// Readings [`read_retrying`] makes of one image at most, whatever the
+/// server's databases; and the most database ends [`read_image`] notes.
+const MAX_READINGS: usize = 1024;
+
+/// Readings [`read_retrying`] makes of one image at most, for a server of
+/// `databases` databases: [`READINGS`] and two for each database, for an
+/// image whose every database can have its end read again (#441) to be read
+/// every way it can be. Never more than [`MAX_READINGS`].
+fn readings_for(databases: usize) -> usize {
+    READINGS
+        .saturating_add(databases.saturating_mul(2))
+        .min(MAX_READINGS)
+}
 
 /// Read the image `open` opens with [`read_image`], and if that fails, again
 /// with the empty key as 1.2.0 wrote it in a database before the last.
@@ -1626,102 +1690,312 @@ const READINGS: usize = 32;
 /// type tag. So the image is read as written by 1.2.1 first, and only if that
 /// fails, again with such an end read as the empty key, earliest first. A
 /// wrong guess reads what follows as a value, which as a rule fails soon
-/// after (a length misread can have up to 4 GiB read before it does). 1.2.0
-/// wrote at most one empty key per database.
+/// after. 1.2.0 wrote at most one empty key per database.
 ///
 /// The image is opened again for each reading, and read no more than
-/// [`READINGS`] times. A reading that fails other than on what it read (the
-/// disk, the network) ends it. If none loads the image, the first reading's
-/// error is returned.
+/// [`readings_for`] the server's databases times. A reading that fails other
+/// than on what it read (the disk, the network) ends it. If none loads the
+/// image, the first reading's error is returned.
+///
+/// Every such reading is made, a reading that loads the image read again
+/// with one more such end too, and none of them keeps what it reads, nor
+/// holds a value's bytes (see [`read_image`]). Two readings never read the
+/// same keys: the one that takes a database's end for the empty key has an
+/// entry more in that database than the other. So if two load the image, it
+/// is refused (see [`ReadsMoreThanOneWay`]), as it is if they could not all
+/// be made: the readings run out, or one fails on the disk. Only once one
+/// reading alone loads it is it read again, that once, to keep what it
+/// reads: no more memory is taken than one reading of it takes.
+///
+/// An image that the first reading loads, as every image 1.2.1 writes, is
+/// read once.
 fn read_retrying<R: Read>(
-    mut open: impl FnMut() -> io::Result<R>,
+    open: impl FnMut() -> io::Result<R>,
     keep: bool,
     databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
-    let mut first_error: Option<io::Error> = None;
-    // Readings still to make, latest pushed first: each a reading that
-    // failed, with one database more read as holding the empty key. Never
+    read_retrying_within(open, keep, databases, readings_for(databases))
+}
+
+/// [`read_retrying`], with no more than `most` readings.
+fn read_retrying_within<R: Read>(
+    mut open: impl FnMut() -> io::Result<R>,
+    keep: bool,
+    databases: usize,
+    most: usize,
+) -> io::Result<(LoadedSnapshot, usize, R)> {
+    let mut reader = open()?;
+    let mut ends = Vec::new();
+    let first_error = match read_image(&mut reader, keep, &[], &mut ends, databases) {
+        Ok((loaded, keys)) => return Ok((loaded, keys, reader)),
+        // Read whole, and refused for its databases (#482).
+        Err(e) if is_past_databases(&e) => return Err(e),
+        Err(e) if !is_layout(&e) => return Err(e),
+        Err(e) => e,
+    };
+    // Readings still to make, latest pushed first: each a reading made
+    // before, with one database more read as holding the empty key. Never
     // more than the readings left.
-    let mut plans: Vec<Vec<usize>> = vec![Vec::new()];
-    let mut readings = 0;
+    let mut plans: Vec<Vec<usize>> = Vec::new();
+    // Whether a reading there was no room for was left out.
+    let mut left_out = !push_plans(&mut plans, &[], &ends, most - 1);
+    let mut readings = 1;
+    // The reading that loads the image, if one does: the databases it reads
+    // the empty key in, and its refusal for a key or an index in a database
+    // past the server's (#482), if it is refused for that.
+    let mut loads: Option<(Vec<usize>, Option<io::Error>)> = None;
     while let Some(plan) = plans.pop() {
-        if readings == READINGS {
+        if readings == most {
+            left_out = true;
             break;
         }
         readings += 1;
         let mut reader = match open() {
             Ok(reader) => reader,
-            Err(e) => return Err(first_error.unwrap_or(e)),
+            Err(e) if loads.is_some() => return Err(not_all_read(e)),
+            Err(_) => return Err(first_error),
         };
         let mut ends = Vec::new();
-        match read_image(&mut reader, keep, &plan, &mut ends, databases) {
-            Ok((loaded, keys)) => {
-                if !plan.is_empty() {
-                    log_warn!(
-                        "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) \
-                         {plan:?}, where 1.2.0 ends a database (#441): read as the empty key"
-                    );
+        let past = match read_image(&mut reader, false, &plan, &mut ends, databases) {
+            Ok(_) => None,
+            // Read whole: it loads but for its databases.
+            Err(e) if is_past_databases(&e) => Some(e),
+            Err(e) if !is_layout(&e) => {
+                if loads.is_some() {
+                    return Err(not_all_read(e));
                 }
-                return Ok((loaded, keys, reader));
-            }
-            // Read whole, and refused for its databases (#482): this
-            // reading's error, whichever reading it is.
-            Err(e) if is_past_databases(&e) => return Err(e),
-            Err(e) => {
-                let layout = matches!(
-                    e.kind(),
-                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                log_warn!(
+                    "snapshot: reading it again failed ({e}); what the first reading found is \
+                     returned"
                 );
-                if first_error.is_none() {
-                    if !layout {
-                        return Err(e);
-                    }
-                    first_error = Some(e);
-                    push_plans(&mut plans, &plan, &ends, READINGS - readings);
-                    continue;
-                }
-                if !layout {
-                    log_warn!(
-                        "snapshot: reading it again failed ({e}); what the first reading \
-                         found is returned"
-                    );
-                    break;
-                }
-                let room = READINGS.saturating_sub(readings + plans.len());
-                push_plans(&mut plans, &plan, &ends, room);
+                break;
             }
+            Err(_) => {
+                let room = most.saturating_sub(readings + plans.len());
+                left_out |= !push_plans(&mut plans, &plan, &ends, room);
+                continue;
+            }
+        };
+        if let Some((first, _)) = &loads {
+            return Err(reads_more_than_one_way_error(first, &plan));
         }
+        loads = Some((plan.clone(), past));
+        let room = most.saturating_sub(readings + plans.len());
+        left_out |= !push_plans(&mut plans, &plan, &ends, room);
     }
-    if readings > 1 {
-        log_warn!(
-            "snapshot could not be read as KiviDB writes it, nor in {} more reading(s) with \
-             the empty key where 1.2.0 could have written it (#441){}",
-            readings - 1,
-            if readings == READINGS {
-                ", the most it is read"
-            } else {
-                ""
-            }
-        );
+    let Some((plan, past)) = loads else {
+        if readings > 1 {
+            log_warn!(
+                "snapshot could not be read as KiviDB writes it, nor in {} more reading(s) with \
+                 the empty key where 1.2.0 could have written it (#441){}",
+                readings - 1,
+                if readings == most {
+                    ", the most it is read"
+                } else {
+                    ""
+                }
+            );
+        }
+        return Err(first_error);
+    };
+    if left_out {
+        return Err(not_all_read(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it can be read more ways than the {most} readings made of an image"),
+        )));
     }
-    Err(first_error.unwrap_or_else(|| io::Error::other("snapshot could not be read")))
+    if let Some(past) = past {
+        return Err(past);
+    }
+    // The one reading that loads it, made again to keep what it reads.
+    let mut reader = open()?;
+    let (loaded, keys) = read_image(&mut reader, keep, &plan, &mut Vec::new(), databases)?;
+    log_warn!(
+        "snapshot was written by KiviDB 1.2.0 with the empty key in database(s) {plan:?}, \
+         where 1.2.0 ends a database (#441): read as the empty key, the one reading of {} that \
+         loads it",
+        readings
+    );
+    Ok((loaded, keys, reader))
 }
 
-/// [`read_retrying`]'s next readings after one with `plan` failed: `plan` and
-/// one of the databases in `ends` after the last in it, the earliest `room`
-/// of them, pushed so that the earliest is read first.
-fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room: usize) {
+/// Whether a reading failed on what it read, not on the disk or the network.
+fn is_layout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// [`read_retrying`]'s next readings after one with `plan`: `plan` and one of
+/// the databases in `ends` after the last in it, the earliest `room` of them,
+/// pushed so that the earliest is read first. Whether every one was pushed.
+fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room: usize) -> bool {
     let after = plan.last().map_or(0, |&db| db + 1);
-    let next: Vec<usize> = ends
-        .iter()
-        .copied()
-        .filter(|&db| db >= after)
-        .take(room)
-        .collect();
-    for db in next.into_iter().rev() {
+    let all: Vec<usize> = ends.iter().copied().filter(|&db| db >= after).collect();
+    // `read_image` notes no more than MAX_READINGS ends: there can be more.
+    let whole = all.len() <= room && ends.len() < MAX_READINGS;
+    for &db in all.iter().take(room).rev() {
         let mut more = plan.to_vec();
         more.push(db);
         plans.push(more);
+    }
+    whole
+}
+
+/// The refusal of an image that two readings of [`read_retrying`]'s load,
+/// or that it could not read every way it can be read: loading one reading
+/// of it could load keys under other names, or other values, than were
+/// saved.
+#[derive(Debug)]
+struct ReadsMoreThanOneWay(String);
+
+impl std::fmt::Display for ReadsMoreThanOneWay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReadsMoreThanOneWay {}
+
+/// Whether `e` is the refusal of an image that reads more than one way.
+pub fn reads_more_than_one_way(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ReadsMoreThanOneWay>())
+}
+
+/// `e`, the refusal of the image in the file `what` as one that reads more
+/// than one way, with the file named and what to do about it. Any other
+/// error as it is.
+pub fn refusal_of_file(e: io::Error, what: &str) -> io::Error {
+    if !reads_more_than_one_way(&e) {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        ReadsMoreThanOneWay(format!(
+            "{what}: {e}. It is not loaded: restore the data from another copy (an AOF, a \
+             replica or a backup)"
+        )),
+    )
+}
+
+/// `e`, the refusal of a full-sync payload as one that reads more than one
+/// way, with what to do about it: the master wrote it with 1.2.0's empty
+/// key. Any other error as it is.
+pub fn refusal_of_payload(e: io::Error) -> io::Error {
+    if !reads_more_than_one_way(&e) {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        ReadsMoreThanOneWay(format!(
+            "{e}. It is not loaded: upgrade the master to KiviDB 1.2.1, or if it runs 1.2.1, \
+             have it save again (SAVE), and let the replica sync again"
+        )),
+    )
+}
+
+/// The refusal of an image that the readings `first` and `other` (the
+/// databases each reads 1.2.0's empty key in) both load.
+fn reads_more_than_one_way_error(first: &[usize], other: &[usize]) -> io::Error {
+    let why = format!(
+        "the snapshot can be read more than one way, with different keys: as written by KiviDB \
+         1.2.0 with the empty key (#441) in database(s) {first:?}, or in database(s) {other:?}"
+    );
+    log_error!("{why}; it is not loaded");
+    io::Error::new(io::ErrorKind::InvalidData, ReadsMoreThanOneWay(why))
+}
+
+/// The refusal of an image that one reading loads, when the other readings
+/// it can be read in could not all be made, for `e`.
+fn not_all_read(e: io::Error) -> io::Error {
+    let why = format!(
+        "the snapshot was written by KiviDB 1.2.0 with the empty key (#441), and one reading of \
+         it loads, but not every other reading of it could be made to rule out that another \
+         loads too ({e})"
+    );
+    log_error!("{why}; it is not loaded");
+    io::Error::new(e.kind(), ReadsMoreThanOneWay(why))
+}
+
+/// Pass over `len` bytes of `r`, holding none of them.
+fn skip_exactly(r: &mut impl Read, len: usize) -> io::Result<()> {
+    let passed = io::copy(&mut Read::take(&mut *r, len as u64), &mut io::sink())?;
+    if passed != len as u64 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
+/// [`read_bytes`], passed over.
+fn skip_bytes(r: &mut impl Read) -> io::Result<()> {
+    let len = read_u32_le(r)? as usize;
+    skip_exactly(r, len)
+}
+
+/// [`read_bytes`] passed over, and whether the bytes were UTF-8.
+fn skip_text(r: &mut impl Read) -> io::Result<bool> {
+    let mut left = read_u32_le(r)? as usize;
+    let mut buf = [0u8; 8192];
+    // The bytes of a character cut at the end of the last piece.
+    let mut carried = 0;
+    while left > 0 {
+        let take = (buf.len() - carried).min(left);
+        r.read_exact(&mut buf[carried..carried + take])?;
+        left -= take;
+        let filled = carried + take;
+        carried = 0;
+        if let Err(e) = std::str::from_utf8(&buf[..filled]) {
+            if e.error_len().is_some() {
+                skip_exactly(r, left)?;
+                return Ok(false);
+            }
+            buf.copy_within(e.valid_up_to()..filled, 0);
+            carried = filled - e.valid_up_to();
+        }
+    }
+    Ok(carried == 0)
+}
+
+/// Whether [`skip_value`] passes over a value of type `tag`.
+fn skipped(tag: u8) -> bool {
+    matches!(
+        tag,
+        TAG_STRING | TAG_LIST | TAG_HASH | TAG_SET | TAG_SORTEDSET | TAG_JSON
+    )
+}
+
+/// Pass over a value of type `tag` (see [`skipped`]), refusing what its
+/// reading refuses, holding none of it.
+fn skip_value(r: &mut impl Read, tag: u8) -> io::Result<()> {
+    match tag {
+        TAG_STRING | TAG_JSON => skip_bytes(r),
+        TAG_LIST | TAG_SET => {
+            for _ in 0..read_u32_le(r)? {
+                skip_bytes(r)?;
+            }
+            Ok(())
+        }
+        TAG_HASH => {
+            for _ in 0..read_u32_le(r)? {
+                if !skip_text(r)? {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bad hash field"));
+                }
+                skip_bytes(r)?;
+            }
+            Ok(())
+        }
+        TAG_SORTEDSET => {
+            for _ in 0..read_u32_le(r)? {
+                skip_bytes(r)?;
+                if zset_score(f64::from_le_bytes(read_u64_le(r)?.to_le_bytes())).is_none() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, NAN_SCORE));
+                }
+            }
+            Ok(())
+        }
+        _ => unreachable!("no value of type {tag} is passed over"),
     }
 }
 
@@ -1739,7 +2013,14 @@ fn push_plans(plans: &mut Vec<Vec<usize>>, plan: &[usize], ends: &[usize], room:
 ///
 /// A reading that takes 1.2.0's empty key reads an image 1.2.0 wrote, which
 /// holds only sections 1.2.0 knows: it does not pass over a section it does
-/// not know, or one that is damaged, as other readings do.
+/// not know, as other readings do. No reading passes over a section that is
+/// cut short or cannot be used.
+///
+/// With `keep` unset, the bytes of keys, of strings, lists, hashes, sets,
+/// sorted sets and JSON documents, of the expiries' keys and of the function
+/// libraries are passed over, not read into memory, with what reading them
+/// refuses refused all the same (see [`skip_value`]): a reading of a 1.2.0
+/// image that misread a length does not take memory for it.
 fn read_image(
     r: impl Read,
     keep: bool,
@@ -1760,9 +2041,6 @@ fn read_image(
     let db_count = u32::from_le_bytes(db_count_buf) as usize;
 
     let mut result = Vec::with_capacity(hint(db_count));
-    // The image stopped between two entries (see below): the databases it
-    // says are still to come are not there.
-    let mut ended = false;
     // The first byte of what follows a database's end (the next database or
     // a section), read to see whether it is a tag.
     let mut next_byte = None;
@@ -1775,7 +2053,7 @@ fn read_image(
     let mut past: Option<String> = None;
 
     for db in 0..db_count {
-        let mut map: HashMap<String, KiviDBValue> = HashMap::new();
+        let mut map: HashMap<Key, KiviDBValue> = HashMap::new();
         let last = db + 1 == db_count;
         // Whether this database's 1.2.0 empty key has been read.
         let mut legacy_read = false;
@@ -1791,13 +2069,14 @@ fn read_image(
                 None => r.read_exact(&mut len_buf),
             };
             match read {
-                // Verifying: an image that stops before a database's end
-                // marker is not a whole image.
-                // Nor, reading 1.2.0's empty key where the first reading
-                // could not, one that stops (a wrong guess may).
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && keep && legacy.is_empty() => {
-                    ended = true;
-                    break;
+                // An image that stops before a database's end marker is not a
+                // whole image, loaded or verified: loading it as far as it
+                // went started a server on part of the data, or none (#444).
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the snapshot ends before its last database does: it is cut short",
+                    ));
                 }
                 Err(e) => return Err(e),
                 Ok(_) => {}
@@ -1845,7 +2124,7 @@ fn read_image(
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
                         Err(e) => return Err(e),
                         Ok(()) => {
-                            if is_tag(next[0]) && ends.len() < READINGS {
+                            if is_tag(next[0]) && ends.len() < MAX_READINGS {
                                 ends.push(db);
                             }
                             next_byte = Some(next[0]);
@@ -1864,9 +2143,14 @@ fn read_image(
                 klen as usize
             };
 
-            let kbuf = read_exactly(&mut r, klen)?;
-            let key = String::from_utf8(kbuf)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad key utf8"))?;
+            let kbuf = if keep {
+                read_exactly(&mut r, klen)?
+            } else {
+                skip_exactly(&mut r, klen)?;
+                Vec::new()
+            };
+            // Any bytes: a key need not be text.
+            let key = Key::from(kbuf);
 
             // Read type tag
             let mut tag = [0u8];
@@ -1876,6 +2160,11 @@ fn read_image(
             }
 
             let value = match tag[0] {
+                // Not kept: passed over.
+                tag if !keep && skipped(tag) => {
+                    skip_value(&mut r, tag)?;
+                    KiviDBValue::String(SharedBytes::from(&b""[..]))
+                }
                 TAG_STRING => {
                     let bytes = read_bytes(&mut r)?;
                     KiviDBValue::String(SharedBytes::from(bytes.as_slice()))
@@ -1932,7 +2221,7 @@ fn read_image(
                         let Some(score) = zset_score(f64::from_le_bytes(score_buf)) else {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                format!("{NAN_SCORE} in key '{key}'"),
+                                format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
                         ss.insert(Arc::from(member.as_slice()), score);
@@ -1944,6 +2233,13 @@ fn read_image(
                     let json_bytes = read_bytes(&mut r)?;
                     let val: serde_json::Value =
                         serde_json::from_slice(&json_bytes).unwrap_or(serde_json::Value::Null);
+                    if crate::commands::json::value_depth(&val) >= crate::commands::json::MAX_DEPTH
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "JSON document nested too deeply",
+                        ));
+                    }
                     KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(val)))
                 }
                 TAG_TIMESERIES | TAG_TIMESERIES_V2 | TAG_TIMESERIES_V3 => {
@@ -1989,8 +2285,8 @@ fn read_image(
                                 .ok_or_else(|| bad("duplicate policy"))?;
                         let rules = read_u32_le(&mut r)? as usize;
                         for _ in 0..rules {
-                            let dest_key = String::from_utf8(read_bytes(&mut r)?)
-                                .map_err(|_| bad("rule destination"))?;
+                            let dest_key =
+                                crate::key_bytes::text_of(&read_bytes(&mut r)?).into_owned();
                             let aggregation = crate::types::TsAggregation::parse(
                                 &String::from_utf8_lossy(&read_bytes(&mut r)?),
                             )
@@ -2008,10 +2304,8 @@ fn read_image(
                             });
                         }
                         if tag[0] == TAG_TIMESERIES_V3 {
-                            ts.source = Some(
-                                String::from_utf8(read_bytes(&mut r)?)
-                                    .map_err(|_| bad("source"))?,
-                            );
+                            ts.source =
+                                Some(crate::key_bytes::text_of(&read_bytes(&mut r)?).into_owned());
                         }
                     }
                     KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
@@ -2038,10 +2332,8 @@ fn read_image(
 
                     for _ in 0..count {
                         // Element name
-                        let name_bytes = read_bytes(&mut r)?;
-                        let name = String::from_utf8(name_bytes).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "bad vset element name")
-                        })?;
+                        // Any bytes, as in Redis.
+                        let name = crate::key_bytes::KeyBytes::from(read_bytes(&mut r)?);
 
                         // Vector floats
                         let mut vlen_buf = [0u8; 4];
@@ -2085,15 +2377,16 @@ fn read_image(
                         let val = read_bytes(&mut r)?;
                         hmap.insert(field, Arc::from(val.as_slice()));
                     }
-                    // Expiries: re-anchor each persisted Unix ms back to a
-                    // monotonic Instant relative to "now". Fields whose
-                    // absolute time is in the past simply don't get added —
-                    // the lazy-eviction check on next access handles them.
+                    // Expiries: each persisted Unix ms kept as it is (#594). A
+                    // field whose time has passed is dropped, unless fields
+                    // are held (under an AOF, or a replica's load): then it is
+                    // kept with its deadline, for the `HDEL` that says it went.
+                    let keep_past = crate::expiry::fields_held();
                     let mut exp_count_buf = [0u8; 4];
                     r.read_exact(&mut exp_count_buf)?;
                     let exp_count = u32::from_le_bytes(exp_count_buf) as usize;
-                    let mut exps = AHashMap::with_capacity(hint(exp_count));
-                    let clock = crate::commands::helpers::FieldClock::now();
+                    let mut exps = crate::types::Expiries::with_capacity(hint(exp_count));
+                    let now = crate::types::field_now();
                     for _ in 0..exp_count {
                         let field_bytes = read_bytes(&mut r)?;
                         let field = String::from_utf8(field_bytes).map_err(|_| {
@@ -2102,8 +2395,10 @@ fn read_image(
                         let mut ms_buf = [0u8; 8];
                         r.read_exact(&mut ms_buf)?;
                         let abs_ms = u64::from_le_bytes(ms_buf);
-                        if let Some(at) = clock.instant_of(abs_ms) {
-                            exps.insert(field, at);
+                        if !crate::types::field_due(abs_ms, now)
+                            || (keep_past && hmap.contains_key(&field))
+                        {
+                            exps.insert(field, abs_ms);
                         } else {
                             crate::types::hash_remove(&mut hmap, &field);
                         }
@@ -2123,6 +2418,12 @@ fn read_image(
                         let mut idx_buf = [0u8; 8];
                         r.read_exact(&mut idx_buf)?;
                         let idx = u64::from_le_bytes(idx_buf);
+                        if idx > crate::types::ARRAY_MAX_INDEX {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "array index out of range",
+                            ));
+                        }
                         let val = read_bytes(&mut r)?;
                         arr.set(idx, Arc::from(val.as_slice()));
                     }
@@ -2163,9 +2464,6 @@ fn read_image(
         }
 
         result.push(map);
-        if ended {
-            break;
-        }
     }
 
     // ── Optional trailing sections ────────────────────────────────────────────
@@ -2173,10 +2471,12 @@ fn read_image(
     // fixed order so that an image carrying a section this build does not know
     // still loads: an unrecognised magic simply ends the scan.
     //
-    // Index schemas and HNSW graphs stay best-effort, as they always were — a
-    // snapshot that predates them, or whose index section is damaged, falls
-    // back to rebuilding. Nothing after a damaged section can be located, so
-    // that also ends the scan, and it says so because TTLs live behind it.
+    // An image that ends inside a section, its magic or its body, is cut
+    // short, and refused on every reading (#474): loading it started a server
+    // without its TTLs, its function libraries or its indexes.
+    //
+    // A section that is all there but cannot be used is refused too, the
+    // index, HNSW graph and alias sections included (see `usable_section`).
     let mut index_schemas = Vec::new();
     let mut hnsw_graphs = std::collections::HashMap::new();
     let mut dictionaries = Vec::new();
@@ -2204,65 +2504,52 @@ fn read_image(
             ));
         }
         if &magic == KDB_INDEX_MAGIC {
-            match read_index_schemas(&mut r) {
-                Ok(v) => index_schemas = v,
-                Err(e) if strict => return Err(e),
-                Err(e) => {
-                    log_warn!(
-                        "snapshot index section is unreadable ({e}); indexes will be \
-                         rebuilt, and any key expiries and function libraries stored \
-                         after it are lost"
-                    );
-                    break;
-                }
-            }
+            index_schemas = usable_section("index", read_index_schemas(&mut r))?;
         } else if &magic == KDB_HNSW_MAGIC {
-            match read_hnsw_graphs(&mut r) {
-                Ok(v) => hnsw_graphs = v,
-                Err(e) if strict => return Err(e),
-                Err(e) => {
-                    log_warn!(
-                        "snapshot HNSW section is unreadable ({e}); graphs will be \
-                         rebuilt, and any key expiries and function libraries stored \
-                         after it are lost"
-                    );
-                    break;
-                }
-            }
+            hnsw_graphs = usable_section("HNSW graph", read_hnsw_graphs(&mut r))?;
         } else if &magic == KDB_EXPIRY_MAGIC {
-            read_expiry_section(&mut r, &mut expiries)?;
+            whole_section("expiry", read_expiry_section(&mut r, &mut expiries, keep))?;
         } else if &magic == KDB_ALIAS_MAGIC {
-            match read_alias_section(&mut r) {
-                Ok(aliases) => {
-                    for (alias, index) in aliases {
-                        if let Some(schema) = index_schemas.iter_mut().find(|s| s.name == index) {
-                            schema.aliases.push(alias);
-                        }
-                    }
-                }
-                Err(e) if strict => return Err(e),
-                Err(e) => {
-                    log_warn!("snapshot index alias section is unreadable ({e})");
-                    break;
+            let aliases = usable_section("index alias", read_alias_section(&mut r))?;
+            for (alias, index) in aliases {
+                if let Some(schema) = index_schemas.iter_mut().find(|s| s.name == index) {
+                    schema.aliases.push(alias);
                 }
             }
         } else if &magic == KDB_FIELD_OPTIONS_MAGIC {
             // Not best-effort: an index that comes back without its options
             // is a different index — a TAG field split at the wrong
             // character matches different documents.
-            read_field_options_section(&mut r, &mut index_schemas)?;
+            whole_section(
+                "field options",
+                read_field_options_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_SYNONYMS_MAGIC {
-            dictionaries = read_synonyms_section(&mut r, &mut index_schemas)?;
+            dictionaries = whole_section(
+                "synonyms",
+                read_synonyms_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_VECTOR_TYPES_MAGIC {
-            read_vector_types_section(&mut r, &mut index_schemas)?;
+            whole_section(
+                "vector types",
+                read_vector_types_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_FUNCTIONS_MAGIC {
             // Not best-effort: a node that comes back without its libraries
             // fails every FCALL.
-            functions = Some(read_bytes(&mut r)?);
+            let libraries = if keep {
+                read_bytes(&mut r)
+            } else {
+                skip_bytes(&mut r).map(|()| Vec::new())
+            };
+            functions = Some(whole_section("functions", libraries)?);
         } else if &magic == KDB_LANGUAGE_MAGIC {
-            read_language_section(&mut r, &mut index_schemas)?;
+            whole_section(
+                "language",
+                read_language_section(&mut r, &mut index_schemas),
+            )?;
         } else if &magic == KDB_SCORE_MAGIC {
-            read_score_section(&mut r, &mut index_schemas)?;
+            whole_section("score", read_score_section(&mut r, &mut index_schemas))?;
         } else if strict {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2325,17 +2612,22 @@ fn read_image(
     ))
 }
 
-/// Body of the expiry section; the magic has already been consumed.
+/// Body of the expiry section; the magic has already been consumed. With
+/// `keep` unset nothing of it is kept, and its keys are passed over.
 ///
 /// Unlike the index sections this is not best-effort: a torn expiry section
 /// would silently make some keys permanent, so it fails the load instead.
-fn read_expiry_section(r: &mut impl Read, expiries: &mut ExpiryMaps) -> io::Result<()> {
+fn read_expiry_section(r: &mut impl Read, expiries: &mut ExpiryMaps, keep: bool) -> io::Result<()> {
     let db_count = read_u32_le(r)? as usize;
     for db_idx in 0..db_count {
         let count = read_u32_le(r)? as usize;
         for _ in 0..count {
-            let key = String::from_utf8(read_bytes(r)?)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad expiry key utf8"))?;
+            if !keep {
+                skip_bytes(r)?;
+                read_u64_le(r)?;
+                continue;
+            }
+            let key = Key::from(read_bytes(r)?);
             let at_ms = read_u64_le(r)?;
             if let Some(map) = expiries.get_mut(db_idx) {
                 map.insert(key, at_ms);
@@ -2558,7 +2850,7 @@ fn write_hnsw_graph(
             }
         };
         w.write_all(&[1u8])?; // live node
-        write_bytes(w, node.key.as_bytes())?;
+        write_bytes(w, &crate::key_bytes::bytes_of(&node.key))?;
         w.write_all(&(vector.len() as u32).to_le_bytes())?;
         for f in vector {
             w.write_all(&f.to_le_bytes())?;
@@ -2635,8 +2927,7 @@ fn read_hnsw_graphs(
                 nodes.push(None);
             } else {
                 let key_bytes = read_bytes(r)?;
-                let key = String::from_utf8(key_bytes)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad hnsw key"))?;
+                let key = crate::key_bytes::text_of(&key_bytes).into_owned();
 
                 let mut vlen_buf = [0u8; 4];
                 r.read_exact(&mut vlen_buf)?;
@@ -2815,6 +3106,39 @@ fn too_long() -> io::Error {
 pub static SNAPSHOT_DATABASES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(16);
 
+/// The server is a cluster node, set as it starts: a snapshot may have keys
+/// in database 0 only, the one database a cluster serves (`SELECT` is
+/// refused there). Keys in the others were loaded where no client could
+/// reach them, and slot accounting and migration never saw them (#484).
+/// Redis refuses to start with them; so does KiviDB, and a replica refuses
+/// such a full sync before it touches its dataset.
+pub static SNAPSHOT_CLUSTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What refuses a dataset with keys outside database 0 on a cluster node,
+/// as Redis words it.
+pub const CLUSTER_KEYS_OUTSIDE_DB0: &str =
+    "can't have keys in a DB different than DB 0 when in Cluster mode";
+
+/// How a node that refused to start for [`CLUSTER_KEYS_OUTSIDE_DB0`] is
+/// brought back with its keys, which it left on disk.
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_START: &str = concat!(
+    "The data on disk is kept. To recover it: start this node once without ",
+    "cluster-enabled, in the same directory and with the same persistence settings; in each ",
+    "database other than 0, move its keys into database 0 (SELECT n, then MOVE key 0) or ",
+    "delete them (FLUSHDB); then SAVE, or BGREWRITEAOF if the AOF is on, stop it, and start ",
+    "it as a cluster node again",
+);
+
+/// What a cluster replica that refused a full sync for
+/// [`CLUSTER_KEYS_OUTSIDE_DB0`] asks of its master's operator.
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_SYNC: &str = concat!(
+    "the master holds keys outside database 0, which a cluster node cannot serve (an older ",
+    "KiviDB let MOVE, SWAPDB and COPY ... DB put them there). Move them into database 0 on ",
+    "the master, or delete them: restarted once without cluster-enabled, it can reach them ",
+    "(SELECT n, then MOVE key 0, or FLUSHDB). This replica syncs again on its next try",
+);
+
 /// The largest number of databases the refusal of a snapshot advises
 /// starting with. A database number past it is more likely a damaged file
 /// than a server to configure.
@@ -2825,6 +3149,9 @@ const DATABASES_ADVISED_MAX: u64 = 1 << 16;
 fn database_of_snapshot(db: u64, databases: usize, what: &str) -> Result<usize, String> {
     match usize::try_from(db) {
         Ok(index) if index < databases => Ok(index),
+        _ if SNAPSHOT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) => Err(format!(
+            "{CLUSTER_KEYS_OUTSIDE_DB0}: the file has {what} in database {db}"
+        )),
         _ if db < DATABASES_ADVISED_MAX => Err(format!(
             "the file has {what} in database {db}, and this server has {databases} databases: \
              start it with databases {} or more",
@@ -2851,23 +3178,19 @@ impl std::fmt::Display for PastDatabases {
 
 impl std::error::Error for PastDatabases {}
 
-fn is_past_databases(e: &io::Error) -> bool {
+pub(crate) fn is_past_databases(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<PastDatabases>())
 }
 
 // Unused by the binary, which wants the expiries; see `write_snapshot`.
 #[allow(dead_code)]
-pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<String, KiviDBValue>>> {
+pub fn load_redis_rdb(path: &str) -> io::Result<Vec<HashMap<Key, KiviDBValue>>> {
     load_redis_rdb_with_expiry(path).map(|(dbs, _, _)| dbs)
 }
 
 /// What a Redis RDB file holds: its databases, their keys' expiries, and its
 /// function libraries as a Redis `FUNCTION DUMP` payload, if it has any.
-pub type RedisRdb = (
-    Vec<HashMap<String, KiviDBValue>>,
-    ExpiryMaps,
-    Option<Vec<u8>>,
-);
+pub type RedisRdb = (Vec<HashMap<Key, KiviDBValue>>, ExpiryMaps, Option<Vec<u8>>);
 
 /// Load a Redis RDB file, keeping each key's expiry.
 ///
@@ -2880,8 +3203,13 @@ pub fn load_redis_rdb_with_expiry(path: &str) -> io::Result<RedisRdb> {
 }
 
 /// [`load_redis_rdb_with_expiry`] over any byte source.
+///
+/// Refused rather than loaded as far as it goes: a file whose version is not
+/// a number, one that ends before its checksum or with the wrong one, and a
+/// file of a Dragonfly snapshot in Dragonfly's own format. Each used to load,
+/// often with no keys at all, and the server started on that (#444).
 pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
-    let mut r = r;
+    let mut r = Crc64Reader { inner: r, crc: 0 };
     let now_ms = unix_ms_now();
 
     // `REDIS` and a 4-digit RDB version, or `VALKEY` and a 3-digit one
@@ -2889,8 +3217,21 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut header = [0u8; 9];
     r.read_exact(&mut header)?;
     let dialect = rdb_dialect::from_header(&header)?;
+    // The RDB version, for the checksum that ends a file from version 5 on.
+    // A Redis one that is not a number is refused, not read as 0 (#444).
+    // Dragonfly and KeyDB write RDB 9, with types and opcodes past Redis
+    // 6.2's (see `rdb_extensions`).
+    let version: u16 = match dialect {
+        rdb_dialect::Dialect::Valkey => rdb_dialect::VALKEY_RDB_VERSION,
+        rdb_dialect::Dialect::Redis => std::str::from_utf8(&header[5..])
+            .ok()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+            .filter(|&version| version >= 1)
+            .ok_or_else(|| rdb_invalid("not a Redis RDB file: its version is not a number"))?,
+    };
 
-    let mut result: Vec<HashMap<String, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
+    let mut result: Vec<HashMap<Key, KiviDBValue>> = (0..16).map(|_| HashMap::new()).collect();
     let mut expiries: ExpiryMaps = (0..16).map(|_| HashMap::new()).collect();
 
     let mut current_db = 0usize;
@@ -2901,6 +3242,12 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
     let mut warned_search = false;
     // Each function library's code, in the order the file has them.
     let mut libraries = Vec::new();
+    // The key read last, while it is there: KeyDB writes the TTLs it gave
+    // the key's members after it.
+    let mut last_key: Option<(usize, Key)> = None;
+    let mut keydb_member: Option<Vec<u8>> = None;
+    // Keys Dragonfly kept from eviction (`STICK`), which load as any other.
+    let mut sticky = 0usize;
 
     loop {
         let mut type_byte = [0u8];
@@ -2908,14 +3255,53 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
 
         match type_byte[0] {
             0xFA => {
-                // Aux field — key/value metadata, just skip both strings
-                let _key = rdb_read_string(&mut r)?;
-                let _val = rdb_read_string(&mut r)?;
+                // Aux field: metadata, skipped, but for two kinds.
+                //
+                // Dragonfly's own format (`.dfs`) has a file for each shard
+                // and one, the summary, with none of the keys. Each is an RDB
+                // file. From Dragonfly 1.32 on, each has one of these fields,
+                // and its RDB files (`SAVE RDB`) have neither. Earlier ones
+                // write neither anywhere: see `preload` in src/aof.rs.
+                //
+                // KeyDB's member TTLs (`EXPIREMEMBER`) follow their key.
+                let aux_key = rdb_read_string(&mut r)?;
+                let aux_val = rdb_read_string(&mut r)?;
+                match aux_key.as_slice() {
+                    b"shard-id" | b"shard-count" => {
+                        return Err(rdb_invalid(
+                            "this is one file of a Dragonfly snapshot in Dragonfly's own format \
+                             (.dfs), which keeps each shard's keys in a file of its own; save one \
+                             in RDB format (Dragonfly's SAVE RDB) and load that",
+                        ));
+                    }
+                    b"keydb-subexpire-key" => keydb_member = Some(aux_val),
+                    b"keydb-subexpire-when" => {
+                        let member = keydb_member
+                            .take()
+                            .ok_or_else(|| rdb_invalid("a KeyDB member TTL without its member"))?;
+                        // A key dropped as past its time takes its members'
+                        // TTLs with it.
+                        if let Some((db, key)) = last_key.clone()
+                            && let Some(value) = result[db].get_mut(&key)
+                            && rdb_extensions::apply_keydb_subexpiry(
+                                value,
+                                &crate::key_bytes::text_of(key.as_ref()),
+                                &member,
+                                &aux_val,
+                            )? == rdb_extensions::SubExpiry::Emptied
+                        {
+                            result[db].remove(&key);
+                            expiries[db].remove(&key);
+                            last_key = None;
+                        }
+                    }
+                    _ => {}
+                }
             }
             0xFE => {
                 // Database selector
                 let (db_num, _) = rdb_read_length(&mut r)?;
-                let databases = SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
+                let databases = server_databases();
                 current_db =
                     database_of_snapshot(db_num, databases, "keys").map_err(rdb_invalid)?;
                 if current_db >= result.len() {
@@ -2929,9 +3315,25 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
                 let _ = rdb_read_length(&mut r)?;
             }
             0xFF => {
-                // End of RDB — skip 8-byte CRC64
-                let mut crc = [0u8; 8];
-                let _ = r.read_exact(&mut crc); // ignore error — file may be truncated
+                // The end, and from version 5 on, the CRC64 of everything
+                // before it. A checksum of 0 is none: Redis writes that with
+                // `rdbchecksum no`, and so does Dragonfly.
+                if version >= 5 {
+                    let sum = r.crc;
+                    let mut crc = [0u8; 8];
+                    r.read_exact(&mut crc).map_err(|_| {
+                        rdb_invalid("the file ends before its checksum: it is cut short")
+                    })?;
+                    let crc = u64::from_le_bytes(crc);
+                    // `rdbchecksum no` skips the check, as in Redis: a file
+                    // whose only fault is its checksum can still be loaded.
+                    if crc != 0 && crc != sum && rdb_checksum_checked() {
+                        return Err(rdb_invalid(
+                            "wrong RDB checksum: the file is damaged (to load it all the same, \
+                             set rdbchecksum no in the config file)",
+                        ));
+                    }
+                }
                 break;
             }
             0xFC => {
@@ -2971,39 +3373,68 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xF3 if dialect == rdb_dialect::Dialect::Valkey => {
                 return Err(rdb_dialect::refuse_slot_import(&mut r));
             }
+            // Dragonfly's RDB_OPCODE_DF_MASK: the next key's flags.
+            0xDC if version <= 11 => {
+                if rdb_extensions::read_dragonfly_mask(&mut r)? {
+                    sticky += 1;
+                }
+            }
+            opcode if rdb_extensions::is_dragonfly_opcode(version, opcode) => {
+                return Err(rdb_extensions::refuse_dragonfly_opcode(opcode));
+            }
             // A function library (`FUNCTION2`): its code.
             0xF5 => libraries.push(rdb_read_string(&mut r)?),
             // Every other opcode from 0xF0 up is refused by what it is, not
             // read as a key's type.
-            opcode @ 0xF0..=0xF6 => {
-                return Err(rdb_invalid(match opcode {
+            // Those it names are refused for what they are: a replica
+            // asking again would be sent the same (#483).
+            opcode @ (0xF2 | 0xF3 | 0xF6) => {
+                return Err(rdb_extensions::unrepresentable(match opcode {
                     0xF2 => "hash templates (opcode 0xF2) are not supported".to_string(),
                     0xF3 => "module key metadata (opcode 0xF3) is not supported".to_string(),
                     0xF6 => "function libraries in Redis 7.0's pre-release format \
                              (opcode 0xF6) are not supported"
                         .to_string(),
-                    other => format!("unknown opcode {other:#04x}"),
+                    _ => unreachable!(),
                 }));
+            }
+            opcode @ 0xF0..=0xF6 => {
+                return Err(rdb_invalid(format!("unknown opcode {opcode:#04x}")));
             }
             type_id => {
                 // A key: type byte already consumed
                 let key_bytes = rdb_read_string(&mut r)?;
-                let key = String::from_utf8_lossy(&key_bytes).into_owned();
+                // As the bytes they are: two keys that are not text used
+                // to become one (#446).
+                let key = Key::from(key_bytes);
                 let expiry_ms = pending_expiry.take();
-                if let Some(val) = rdb_dialect::read_value(&mut r, type_id, dialect)? {
+                let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+                    let name = crate::key_bytes::text_of(key.as_ref());
+                    rdb_extensions::read_dragonfly_value(&mut r, Some(&name), type_id)?
+                } else if type_id == 64 && version <= 11 {
+                    return Err(rdb_extensions::refuse_keydb_cron(
+                        &crate::key_bytes::text_of(key.as_ref()),
+                    ));
+                } else {
+                    rdb_dialect::read_value(&mut r, type_id, dialect)?
+                };
+                last_key = None;
+                if let Some(val) = value {
                     match expiry_ms {
                         // Already past its expiry: dropped. Not by a replica,
                         // or under an AOF (see `load_snapshot_from`).
                         Some(ms) if ms <= now_ms && !crate::expiry::held() => {}
                         Some(ms) => {
                             expiries[current_db].insert(key.clone(), ms);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                         None => {
                             // A plain entry replaces any earlier one for this
                             // key, including that entry's expiry.
                             expiries[current_db].remove(&key);
-                            result[current_db].insert(key, val);
+                            result[current_db].insert(key.clone(), val);
+                            last_key = Some((current_db, key));
                         }
                     }
                 }
@@ -3011,7 +3442,112 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
         }
     }
 
+    if sticky > 0 {
+        log_warn!(
+            "RDB: {sticky} keys were sticky in Dragonfly (STICK, never evicted): KiviDB has no \
+             such flag, and they load as any other key"
+        );
+    }
     Ok((result, expiries, redis_function_dump(&libraries)))
+}
+
+/// Whether an RDB file's checksum is checked as it is loaded: unless
+/// `rdbchecksum no` is set, as in Redis.
+fn rdb_checksum_checked() -> bool {
+    crate::commands::server::remembered_config("rdbchecksum").as_deref() != Some("no")
+}
+
+/// Whether the RDB file at `path` was written by Dragonfly, by its aux
+/// fields: `df-ver`, or, before Dragonfly wrote that, `redis-ver
+/// 999.999.999`. Only the fields at the start of the file are read.
+pub fn rdb_written_by_dragonfly(path: &str) -> io::Result<bool> {
+    let mut r = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 9];
+    r.read_exact(&mut magic)?;
+    if &magic[..5] != b"REDIS" {
+        return Ok(false);
+    }
+    loop {
+        let mut opcode = [0u8];
+        if r.read_exact(&mut opcode).is_err() || opcode[0] != 0xFA {
+            return Ok(false);
+        }
+        let key = rdb_read_string(&mut r)?;
+        let value = rdb_read_string(&mut r)?;
+        if key == b"df-ver" || (key == b"redis-ver" && value == b"999.999.999") {
+            return Ok(true);
+        }
+    }
+}
+
+/// Redis's CRC64 ([`redis_crc64`]) a byte at a time, from a table.
+const REDIS_CRC64_TABLE: [u64; 256] = {
+    const POLY: u64 = 0x95ac_9329_ac4b_c9b5;
+    let mut table = [0u64; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// [`redis_crc64`] of `data`, carried on from `crc`, the sum of what came
+/// before it.
+fn redis_crc64_update(mut crc: u64, data: &[u8]) -> u64 {
+    for &byte in data {
+        crc = REDIS_CRC64_TABLE[((crc ^ u64::from(byte)) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// Whether an RDB payload held whole in memory (a full sync's) ends with a
+/// checksum, and whether it is the right one: `None` for one that has none
+/// (an RDB version before 5, or a checksum of 0, as `rdbchecksum no` and
+/// Dragonfly write). A payload refused with a right checksum is what its
+/// master meant to send, not one damaged on the way (#483).
+pub fn rdb_payload_checksum(payload: &[u8]) -> Option<bool> {
+    let version_has_one = payload.starts_with(b"VALKEY")
+        || (payload.starts_with(b"REDIS")
+            && payload
+                .get(5..9)
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .and_then(|v| v.parse::<u16>().ok())
+                .is_some_and(|version| version >= 5));
+    if !version_has_one || payload.len() < 9 + 1 + 8 {
+        return None;
+    }
+    let (body, sum) = payload.split_at(payload.len() - 8);
+    let sum = u64::from_le_bytes(sum.try_into().ok()?);
+    if sum == 0 {
+        return None;
+    }
+    Some(redis_crc64_update(0, body) == sum)
+}
+
+/// A reader that sums what is read through it with Redis's CRC64: what an
+/// RDB file's checksum is checked against.
+struct Crc64Reader<R> {
+    inner: R,
+    crc: u64,
+}
+
+impl<R: Read> Read for Crc64Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.crc = redis_crc64_update(self.crc, &buf[..n]);
+        Ok(n)
+    }
 }
 
 /// Function libraries' code as Redis's `FUNCTION DUMP` lays it out: the
@@ -3104,7 +3640,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut hmap = crate::types::HashFields::default();
             for _ in 0..count {
                 let field_bytes = rdb_read_string(r)?;
-                let field = String::from_utf8_lossy(&field_bytes).into_owned();
+                let field = crate::key_bytes::text_of(&field_bytes).into_owned();
                 let val = rdb_read_string(r)?;
                 hmap.insert(field, Arc::from(val.as_slice()));
             }
@@ -3208,7 +3744,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             rdb_decode_ziplist_into_list(&blob, &mut deque);
             let mut iter = deque.into_iter();
             while let (Some(field), Some(val)) = (iter.next(), iter.next()) {
-                let field_str = String::from_utf8_lossy(&field).into_owned();
+                let field_str = crate::key_bytes::text_of(&field).into_owned();
                 hmap.insert(field_str, val);
             }
             Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
@@ -3294,11 +3830,13 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         unknown => {
             // Unknown type — we can't skip because we don't know the length.
             // Log and return an error. The caller can decide to abort or ignore.
+            // A type of a newer release, as a rule: refused for what it is
+            // (#483). A damaged payload can show one too; a replica tells
+            // the two apart by the payload's checksum.
             log_warn!("RDB: unknown type byte {unknown:#04x} — stopping load");
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported RDB type {unknown}"),
-            ))
+            Err(rdb_extensions::unrepresentable(format_args!(
+                "unsupported RDB type {unknown}"
+            )))
         }
     }
 }
@@ -3441,7 +3979,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
                 seen_live += 1;
                 stream
                     .entries
-                    .insert(crate::types::StreamId { ms, seq }, StreamEntry { fields });
+                    .insert_loaded(crate::types::StreamId { ms, seq }, StreamEntry { fields });
             }
         }
         if (seen_live, seen_deleted) != (live, deleted) {
@@ -3465,8 +4003,8 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
     }
 
     for _ in 0..rdb_read_plain_length(r)? {
-        let name = String::from_utf8(rdb_read_string(r)?)
-            .map_err(|_| rdb_invalid("consumer group name is not UTF-8"))?;
+        // Any bytes, as Redis keeps them.
+        let name = crate::types::StreamName::from(rdb_read_string(r)?);
         let last_id = rdb_read_stream_id(r)?;
         let entries_read = if type_id >= 19 {
             rdb_read_plain_length(r)?
@@ -3490,7 +4028,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             let delivery_count = rdb_read_plain_length(r)?;
             // Owned by no one until a consumer below claims it.
             let entry = PelEntry {
-                consumer: String::new(),
+                consumer: crate::types::StreamName::default(),
                 delivered_at,
                 delivery_count,
             };
@@ -3499,8 +4037,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             }
         }
         for _ in 0..rdb_read_plain_length(r)? {
-            let consumer = String::from_utf8(rdb_read_string(r)?)
-                .map_err(|_| rdb_invalid("consumer name is not UTF-8"))?;
+            let consumer = crate::types::StreamName::from(rdb_read_string(r)?);
             let seen = rdb_read_millisecond_time(r)?;
             let active = if type_id >= 21 {
                 rdb_read_millisecond_time(r)?
@@ -3582,7 +4119,7 @@ fn estimated_entries_read(stream: &crate::types::StreamInner, id: &crate::types:
     if length == 0 || key(id) == last {
         return added;
     }
-    let first = stream.entries.keys().next().map(key).unwrap();
+    let first = stream.entries.first_id().as_ref().map(key).unwrap();
     match key(id).cmp(&first) {
         std::cmp::Ordering::Less => added - length,
         std::cmp::Ordering::Equal => added - length + 1,
@@ -3599,7 +4136,8 @@ fn estimated_entries_read(stream: &crate::types::StreamInner, id: &crate::types:
 /// - Type 25, a listpack of field, value, expiry triples, each expiry in
 ///   Unix milliseconds or 0 for none.
 ///
-/// Fields already past their time are dropped, as Redis drops them.
+/// Fields already past their time are kept with that deadline, for
+/// `field_expiry` to remove (and, on a master, to send the `HDEL` of).
 fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
     let soonest = rdb_read_millisecond_time(r)?;
     let mut fields: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
@@ -3634,15 +4172,15 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         }
     }
 
-    let clock = crate::commands::helpers::FieldClock::now();
+    // A field whose time is up is kept with its deadline, which has passed:
+    // this reads `RESTORE`'s Redis payloads too, and what is restored has to
+    // be the same on every reader of the stream, whenever each restores it
+    // (see the KDB `DUMP` loader). The field goes by `field_expiry`.
     let mut inner = crate::types::HashInner::new();
     for (field, value, expires_at) in fields {
-        let field = String::from_utf8_lossy(&field).into_owned();
+        let field = crate::key_bytes::text_of(&field).into_owned();
         if expires_at != 0 {
-            let Some(deadline) = rdb_dialect::field_deadline(&clock, expires_at)? else {
-                continue;
-            };
-            inner.expiries.insert(field.clone(), deadline);
+            inner.expiries.insert(field.clone(), expires_at);
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
@@ -3676,7 +4214,7 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
         ))));
     }
     if name != "ReJSON-RL" {
-        return Err(rdb_invalid(format!(
+        return Err(rdb_extensions::unrepresentable(format!(
             "values of module type {name} are not supported"
         )));
     }
@@ -3689,6 +4227,9 @@ fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
     } else {
         serde_json::from_slice(document).map_err(|e| rdb_invalid(format!("RedisJSON: {e}")))?
     };
+    if crate::commands::json::value_depth(&json) >= crate::commands::json::MAX_DEPTH {
+        return Err(rdb_invalid("RedisJSON document nested too deeply"));
+    }
     Ok(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(json))))
 }
 
@@ -3726,7 +4267,7 @@ fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     // module type `graphdata`, and that is refused.
     let graph = name == "graphdata";
     if name != "ft_index0" && name != "scdtype00" && !graph {
-        return Err(rdb_invalid(format!(
+        return Err(rdb_extensions::unrepresentable(format!(
             "data of module type {name} (opcode 0xF7) is not supported"
         )));
     }
@@ -4248,7 +4789,7 @@ fn rdb_decode_listpack_into_hash(
     }
     let mut iter = elements.into_iter();
     while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
-        let field = String::from_utf8_lossy(&field).into_owned();
+        let field = crate::key_bytes::text_of(&field).into_owned();
         hmap.insert(field, Arc::from(value.as_slice()));
     }
     Ok(())
@@ -4274,7 +4815,7 @@ fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Re
 
 /// Load a snapshot and populate the store directly.
 /// Handles the platform difference in RwLock::write() internally.
-pub fn restore_into_store(dbs: Vec<HashMap<String, KiviDBValue>>, store: &store::Store) -> usize {
+pub fn restore_into_store(dbs: Vec<HashMap<Key, KiviDBValue>>, store: &store::Store) -> usize {
     let mut total = 0usize;
     for (db_idx, map) in dbs.into_iter().enumerate() {
         if db_idx >= store.len() {
@@ -4580,10 +5121,15 @@ impl FrozenDataset {
             }
             write_kdb_db_end(out)?;
         }
-        out.write_all(&self.index_section)?;
+        // The times to live and the function libraries before the index
+        // sections: a reader that cannot read one of those (they are read
+        // best-effort) stops there, and what comes after it is lost. Read in
+        // any order (`read_image` finds each section by its magic), as 1.2.0
+        // reads them too.
         self.write_expiries(out, &timed_strings)?;
-        out.write_all(&self.alias_section)?;
         write_kdb_functions_section(out, self.functions.as_deref())?;
+        out.write_all(&self.index_section)?;
+        out.write_all(&self.alias_section)?;
         out.write_all(&self.language_section)?;
         out.write_all(&self.score_section)
     }
@@ -4649,6 +5195,27 @@ fn write_kdb_index_schemas_only(
 /// everything before it.
 const DUMP_VERSION: [u8; 2] = [0x0a, 0x00];
 
+thread_local! {
+    /// Set while [`dump_payload`] writes: a time series is written without
+    /// its compaction rules and source.
+    static WITHOUT_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`WITHOUT_LINKS`], while this lives.
+struct WithoutLinks(bool);
+
+impl WithoutLinks {
+    fn begin() -> Self {
+        WithoutLinks(WITHOUT_LINKS.replace(true))
+    }
+}
+
+impl Drop for WithoutLinks {
+    fn drop(&mut self) {
+        WITHOUT_LINKS.set(self.0);
+    }
+}
+
 /// The key a value is filed under inside a one-entry KDB image. Any non-empty
 /// name will do — an empty one is the format's end-of-database marker.
 const DUMP_IMAGE_KEY: &str = "v";
@@ -4666,6 +5233,14 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     if let KiviDBValue::Sketch(sketch) = value {
         return Ok(crate::sketch::redis_module::dump_payload(&sketch.read()));
     }
+    // A time series goes without its links to other series, its compaction
+    // rules and the series it is a compaction of, as RedisTimeSeries leaves
+    // them out of a `DUMP`: they name keys, which the payload may be
+    // restored beside, under another name or on another server. Restored
+    // with them, a series fed a compaction that had a source of its own
+    // (#593). Its samples, settings and labels go. An atomic slot migration
+    // sends the rules among the keys it moves as `TS.CREATERULE`s.
+    let _without = WithoutLinks::begin();
     let mut out = Vec::new();
     if serialize_value(value, &mut out).is_err() {
         out.clear();
@@ -4734,7 +5309,7 @@ pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreErr
     if let Some(dialect) = rdb_dialect::of_dump_version(version)
         && sealed
     {
-        return restore_redis_payload(data, dialect).ok_or(RestoreError::BadData);
+        return restore_redis_payload(data, dialect, version).ok_or(RestoreError::BadData);
     }
     Err(RestoreError::VersionOrChecksum)
 }
@@ -4763,9 +5338,22 @@ pub fn redis_crc64(data: &[u8]) -> u64 {
 /// A value as Redis's or Valkey's `DUMP` serialises it: its RDB type, then
 /// the value in the RDB encoding of that type, which the `dump.rdb` loader
 /// reads. Every byte must belong to the value.
-fn restore_redis_payload(data: &[u8], dialect: rdb_dialect::Dialect) -> Option<KiviDBValue> {
+///
+/// Dragonfly's payloads may hold its own types (`rdb_extensions`), and
+/// KeyDB's end with an `mvcc-tstamp` aux field after the value, which is
+/// read past: it is KeyDB's version of the value for its active replication.
+fn restore_redis_payload(
+    data: &[u8],
+    dialect: rdb_dialect::Dialect,
+    version: u16,
+) -> Option<KiviDBValue> {
     let (&type_id, mut rest) = data.split_first()?;
-    let value = rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??;
+    let value = if rdb_extensions::is_dragonfly_type(version, type_id) {
+        rdb_extensions::read_dragonfly_value(&mut rest, None, type_id).ok()??
+    } else {
+        rdb_dialect::read_value(&mut rest, type_id, dialect).ok()??
+    };
+    let rest = rdb_extensions::strip_keydb_mvcc(rest)?;
     rest.is_empty().then_some(value)
 }
 
@@ -4905,11 +5493,9 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
                 write_bytes_vec(out, val)?;
             }
             out.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
-            let clock = crate::commands::helpers::FieldClock::now();
-            for (field, exp) in inner.expiries.iter() {
-                let abs_ms = clock.unix_ms_of(*exp);
+            for (field, at) in inner.expiries.iter() {
                 write_bytes_vec(out, field.as_bytes())?;
-                out.write_all(&abs_ms.to_le_bytes())?;
+                out.write_all(&at.to_le_bytes())?;
             }
         }
     }
@@ -4961,6 +5547,9 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             for _ in 0..count {
                 let idx = u64::from_le_bytes(payload.get(pos..pos + 8)?.try_into().ok()?);
                 pos += 8;
+                if idx > crate::types::ARRAY_MAX_INDEX {
+                    return None;
+                }
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
                 arr.set(idx, Arc::from(bytes));
                 pos = next;
@@ -5027,6 +5616,9 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let (bytes, _) = read_bytes_slice(payload, 0)?;
             let s = std::str::from_utf8(bytes).ok()?;
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
+            if crate::commands::json::value_depth(&v) >= crate::commands::json::MAX_DEPTH {
+                return None;
+            }
             Some(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(v))))
         }
         TAG_STREAM | TAG_STREAM_V2 | TAG_STREAM_V3 => {
@@ -5053,8 +5645,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             }
             let exp_count = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
             pos += 4;
-            let mut exps = AHashMap::new();
-            let clock = crate::commands::helpers::FieldClock::now();
+            let mut exps = crate::types::Expiries::new();
             for _ in 0..exp_count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = String::from_utf8(field_bytes.to_vec()).ok()?;
@@ -5063,13 +5654,16 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 }
                 let abs_ms = u64::from_le_bytes(payload[next..next + 8].try_into().ok()?);
                 pos = next + 8;
-                if let Some(at) = clock.instant_of(abs_ms) {
-                    exps.insert(field, at);
-                } else {
-                    // Its time is up: gone, as a snapshot's load drops it.
-                    // Kept, it lost its expiry and lived on for good (a
-                    // field `MIGRATE` read just as it ran out).
-                    crate::types::hash_remove(&mut map, &field);
+                // A field whose time is up is kept with its deadline, which
+                // has passed: what is restored is the same here and on every
+                // reader of the stream, whenever each restores it, and the
+                // field goes by `field_expiry`, its `HDEL` after the restore.
+                // Dropped here by each one's clock, a field the master kept
+                // was gone on a replica that restored it a moment later. It
+                // keeps its expiry either way: kept without one, it lived on
+                // for good (a field `MIGRATE` read just as it ran out).
+                if map.contains_key(&field) {
+                    exps.insert(field, abs_ms);
                 }
             }
             let inner = crate::types::HashInner {
@@ -5288,6 +5882,76 @@ mod dump_payload_tests {
         }
     }
 
+    /// A series with a rule to `lp:d` and the source `lp:s`: links.
+    fn linked_series() -> KiviDBValue {
+        let mut ts = TsInner::new();
+        ts.samples.insert(1, 2.5);
+        ts.last_ts = Some(1);
+        ts.labels.insert("k".into(), "v".into());
+        ts.rules.push(crate::types::CompactionRule {
+            dest_key: "lp:d".into(),
+            aggregation: crate::types::TsAggregation::Sum,
+            bucket_duration: 10,
+            align_timestamp: 0,
+        });
+        ts.source = Some("lp:s".into());
+        KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
+    }
+
+    /// The series' KDB image as a snapshot writes it.
+    fn image(value: &KiviDBValue) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, 1).unwrap();
+        write_kdb_entry(&mut out, DUMP_IMAGE_KEY, value.view()).unwrap();
+        write_kdb_db_end(&mut out).unwrap();
+        out
+    }
+
+    /// `DUMP` leaves a series' links out (#593); a snapshot written after
+    /// it on the same thread keeps them.
+    #[test]
+    fn a_dump_leaves_links_out_and_a_snapshot_after_it_keeps_them() {
+        let series = linked_series();
+        let payload = dump_payload(&series).unwrap();
+        match restore_payload(&payload).unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let ts = arc.read();
+                assert!(ts.rules.is_empty() && ts.source.is_none());
+                assert_eq!(ts.samples.get(&1), Some(&2.5));
+                assert_eq!(ts.labels.get("k").map(String::as_str), Some("v"));
+            }
+            _ => panic!("expected a time series"),
+        }
+        let loaded = load_snapshot_from(&image(&series)[..]).unwrap();
+        match loaded.dbs[0].values().next().unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let ts = arc.read();
+                assert_eq!(ts.rules.len(), 1);
+                assert_eq!(ts.source.as_deref(), Some("lp:s"));
+            }
+            _ => panic!("expected a time series"),
+        }
+    }
+
+    /// A payload as 1.2.0's `DUMP` wrote a series with links: the image,
+    /// the version, the checksum. tests/ts.rs restores it.
+    #[test]
+    fn a_payload_with_links_as_1_2_0_wrote_it() {
+        let mut payload = image(&linked_series());
+        let crc = crc64_digest(&payload);
+        payload.extend_from_slice(&DUMP_VERSION);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        println!("LINKED_PAYLOAD={hex}");
+        match restore_payload(&payload).unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                assert_eq!(arc.read().rules.len(), 1);
+                assert_eq!(arc.read().source.as_deref(), Some("lp:s"));
+            }
+            _ => panic!("expected a time series"),
+        }
+    }
+
     #[test]
     fn a_corrupted_payload_is_rejected() {
         let mut payload =
@@ -5303,33 +5967,39 @@ mod dump_payload_tests {
     }
 }
 
-/// A hash field's deadline of whole Unix milliseconds is the same
-/// millisecond after every way a hash is written and read back: a KDB image
-/// (a save, a full sync, the AOF's preamble), a `DUMP` payload (`RESTORE`,
-/// `MIGRATE`) and a Redis RDB file. The time now used to be cut to a whole
-/// millisecond before each conversion, and a field often read back 1 ms
-/// off what it was set to (#448).
+/// A hash field's deadline is the same millisecond after every way a hash
+/// is written and read back: a KDB image (a save, a full sync, the AOF's
+/// preamble), a `DUMP` payload (`RESTORE`, `MIGRATE`) and a Redis RDB file.
+/// Deadlines are kept as the Unix milliseconds they are written as, so no
+/// clock is read on the way and each round trip is exact, every time. They
+/// were kept as `Instant`s and converted by reading both clocks, and a field
+/// now and then read back 1 ms off (#448, #594).
 #[cfg(test)]
 mod field_deadline_tests {
     use super::*;
-    use crate::commands::helpers::FieldClock;
 
-    /// `n` deadlines of whole milliseconds an hour or so from now, each at a
-    /// different point of the millisecond now is in.
-    fn deadlines(n: u64) -> Vec<u64> {
+    /// Deadlines of every kind: ahead, at every point of a few seconds,
+    /// passed, the latest Redis allows, and far past it (a file from
+    /// elsewhere may hold one).
+    fn deadlines() -> Vec<u64> {
         let base = unix_ms_now() + 3_600_000;
-        (0..n).map(|i| base + i * 7 + i % 3).collect()
+        let mut out: Vec<u64> = (0..1_000).map(|i| base + i * 7 + i % 3).collect();
+        out.extend([
+            unix_ms_now() - 5_000,
+            1,
+            crate::commands::helpers::MAX_FIELD_DEADLINE_MS as u64,
+            u64::MAX >> 1,
+            u64::MAX,
+        ]);
+        out
     }
 
     fn hash_with(deadlines: &[u64]) -> KiviDBValue {
-        let clock = FieldClock::now();
         let mut inner = crate::types::HashInner::new();
         for (i, at) in deadlines.iter().enumerate() {
             let field = format!("f{i}");
             inner.fields.insert(field.clone(), Arc::from(&b"v"[..]));
-            inner
-                .expiries
-                .insert(field, clock.instant_of(*at).expect("in the future"));
+            inner.expiries.insert(field, *at);
         }
         KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)))
     }
@@ -5340,38 +6010,12 @@ mod field_deadline_tests {
             panic!("not a hash with field TTLs");
         };
         let hash = hash.read();
-        let clock = FieldClock::now();
-        (0..n)
-            .map(|i| clock.unix_ms_of(hash.expiries[&format!("f{i}")]))
-            .collect()
+        (0..n).map(|i| hash.expiries[&format!("f{i}")]).collect()
     }
 
+    /// The bounds `field_deadline_ms` puts on a deadline a command gives.
     #[test]
-    fn the_clock_converts_a_whole_millisecond_both_ways_exactly() {
-        for _ in 0..2_000 {
-            let at = unix_ms_now() + 60_000;
-            let instant = FieldClock::now().instant_of(at).unwrap();
-            // Another reading of the clocks, as a later command makes.
-            std::hint::black_box(std::time::Instant::now());
-            assert_eq!(FieldClock::now().unix_ms_of(instant), at);
-        }
-        let clock = FieldClock::now();
-        assert!(clock.instant_of(unix_ms_now().saturating_sub(1)).is_none());
-        assert!(clock.instant_of(0).is_none());
-    }
-
-    /// A deadline further out than 64 bits of milliseconds is written as
-    /// the furthest there is, not cut to 64 bits: cut, it was a moment from
-    /// now, and the field was gone once loaded.
-    #[test]
-    fn a_deadline_past_64_bits_of_milliseconds_saturates() {
-        let clock = FieldClock::now();
-        if let Some(far) = std::time::Instant::now()
-            .checked_add(std::time::Duration::from_secs(20_000_000_000_000_000))
-        {
-            assert_eq!(clock.unix_ms_of(far), u64::MAX);
-        }
-        assert!(clock.instant_of(u64::MAX).is_some());
+    fn a_command_deadline_is_bounded_as_redis_bounds_it() {
         let max = crate::commands::helpers::MAX_FIELD_DEADLINE_MS;
         use crate::commands::helpers::field_deadline_ms;
         assert_eq!(field_deadline_ms(max, false, 0), Some(max));
@@ -5386,51 +6030,107 @@ mod field_deadline_tests {
         assert_eq!(field_deadline_ms(1001, false, max - 1000), None);
     }
 
+    /// Through a `DUMP` payload every deadline is kept, a passed one too:
+    /// `RESTORE` keeps it for `field_expiry` to remove.
     #[test]
-    fn a_dump_payload_keeps_each_deadline_to_the_millisecond() {
-        for _ in 0..200 {
-            let want = deadlines(16);
-            let payload = dump_payload(&hash_with(&want)).unwrap();
-            let back = restore_payload(&payload).expect("payload restores");
-            assert_eq!(read_back(&back, want.len()), want);
-        }
+    fn a_dump_payload_keeps_each_deadline_exactly() {
+        let want = deadlines();
+        let payload = dump_payload(&hash_with(&want)).unwrap();
+        let back = restore_payload(&payload).expect("payload restores");
+        assert_eq!(read_back(&back, want.len()), want);
+        // Again from what came back: a second hop (`MIGRATE` on).
+        let again = restore_payload(&dump_payload(&back).unwrap()).unwrap();
+        assert_eq!(read_back(&again, want.len()), want);
     }
 
+    /// Through a KDB image every deadline still to come is kept; a load
+    /// with fields held (an AOF's preamble, a replica's sync) keeps the
+    /// passed one too.
     #[test]
-    fn a_kdb_image_keeps_each_deadline_to_the_millisecond() {
-        for _ in 0..200 {
-            let want = deadlines(16);
-            let mut out = Vec::new();
-            write_kdb_header(&mut out, 1).unwrap();
-            write_kdb_entry(&mut out, "h", hash_with(&want).view()).unwrap();
-            write_kdb_db_end(&mut out).unwrap();
-            write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
-            let loaded = load_snapshot_from(&out[..]).unwrap();
-            assert_eq!(read_back(&loaded.dbs[0]["h"], want.len()), want);
+    fn a_kdb_image_keeps_each_deadline_exactly() {
+        let want = deadlines();
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, 1).unwrap();
+        write_kdb_entry(&mut out, "h", hash_with(&want).view()).unwrap();
+        write_kdb_db_end(&mut out).unwrap();
+        write_kdb_expiry_maps(&mut out, &[HashMap::<Key, u64>::new()]).unwrap();
+        let _hold = crate::expiry::hold();
+        let loaded = load_snapshot_from(&out[..]).unwrap();
+        assert_eq!(read_back(&loaded.dbs[0][&b"h"[..]], want.len()), want);
+    }
+
+    /// Bytes as 1.2.0 writes them: a KDB image and a `DUMP` payload of `h`,
+    /// fields `a` `b` `c`, `a` due at 4102444800123 and `b` at
+    /// 4102444800999 (`HPEXPIREAT`), `c` with none. Saved by a server of the
+    /// format before deadlines were kept as Unix milliseconds; they load to
+    /// the very deadlines, and are written back byte for byte (#594).
+    #[test]
+    fn deadlines_written_by_1_2_0_load_exactly() {
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
         }
+        // The whole file: its header, `h`, the end of the database and an
+        // empty key-expiry section (the zeros).
+        let image: Vec<u8> = unhex(
+            "4b495649444230311000000001000000680a03000000010000006101000000310100\
+             0000620100000032010000006301000000330200000001000000617bd8c32cbb03\
+             00000100000062e7dbc32cbb03",
+        )
+        .into_iter()
+        .chain(std::iter::repeat_n(0u8, 66))
+        .collect();
+        let payload = unhex(
+            "0a030000000100000061010000003101000000620100000032010000006301000000\
+             330200000001000000617bd8c32cbb0300000100000062e7dbc32cbb0300000a00\
+             a003f06b3b4b048d",
+        );
+        let want = |value: &KiviDBValue| {
+            let KiviDBValue::HashEx(hash) = value else {
+                panic!("not a hash with field TTLs");
+            };
+            let hash = hash.read();
+            assert_eq!(hash.fields.len(), 3);
+            assert_eq!(hash.expiries.get("a"), Some(&4_102_444_800_123));
+            assert_eq!(hash.expiries.get("b"), Some(&4_102_444_800_999));
+            assert_eq!(hash.expiries.get("c"), None);
+        };
+        let loaded = load_snapshot_from(&image[..]).unwrap();
+        want(&loaded.dbs[0][&b"h"[..]]);
+        let restored = restore_payload(&payload).expect("the payload restores");
+        want(&restored);
+        // Written back as 1.2.0 wrote it, but for the order of the two
+        // deadlines, which a hash map does not keep.
+        let again = dump_payload(&restored).unwrap();
+        assert_eq!(again.len(), payload.len());
+        want(&restore_payload(&again).unwrap());
     }
 
     /// Type 24, a hash table: the soonest deadline, then for each field its
     /// deadline less the soonest one, plus 1, its name and its value.
     #[test]
-    fn a_redis_rdb_hash_keeps_each_deadline_to_the_millisecond() {
-        for _ in 0..200 {
-            let want = deadlines(16);
-            let soonest = want[0];
-            let mut rdb = Vec::new();
-            rdb.extend_from_slice(&(soonest as i64).to_le_bytes());
-            rdb_write_length(&mut rdb, want.len());
-            for (i, at) in want.iter().enumerate() {
-                rdb_write_length(&mut rdb, (at - soonest + 1) as usize);
-                let field = format!("f{i}");
-                rdb_write_length(&mut rdb, field.len());
-                rdb.extend_from_slice(field.as_bytes());
-                rdb_write_length(&mut rdb, 1);
-                rdb.push(b'v');
-            }
-            let back = rdb_read_hash_with_ttls(&mut &rdb[..], 24).unwrap();
-            assert_eq!(read_back(&back, want.len()), want);
+    fn a_redis_rdb_hash_keeps_each_deadline_exactly() {
+        let mut want: Vec<u64> = deadlines()
+            .into_iter()
+            .filter(|at| *at <= crate::commands::helpers::MAX_FIELD_DEADLINE_MS as u64)
+            .collect();
+        want.sort_unstable();
+        let soonest = want[0];
+        let mut rdb = Vec::new();
+        rdb.extend_from_slice(&(soonest as i64).to_le_bytes());
+        rdb_write_length(&mut rdb, want.len());
+        for (i, at) in want.iter().enumerate() {
+            rdb_write_length(&mut rdb, (at - soonest + 1) as usize);
+            let field = format!("f{i}");
+            rdb_write_length(&mut rdb, field.len());
+            rdb.extend_from_slice(field.as_bytes());
+            rdb_write_length(&mut rdb, 1);
+            rdb.push(b'v');
         }
+        let back = rdb_read_hash_with_ttls(&mut &rdb[..], 24).unwrap();
+        assert_eq!(read_back(&back, want.len()), want);
     }
 }
 
@@ -5442,7 +6142,7 @@ mod expiry_section_tests {
         KiviDBValue::String(SharedBytes::from(v.as_bytes()))
     }
 
-    fn image(maps: &[HashMap<String, KiviDBValue>], expiries: &[HashMap<String, u64>]) -> Vec<u8> {
+    fn image(maps: &[HashMap<Key, KiviDBValue>], expiries: &[HashMap<Key, u64>]) -> Vec<u8> {
         let mut out = Vec::new();
         write_kdb_header(&mut out, maps.len() as u32).unwrap();
         for map in maps {
@@ -5458,19 +6158,16 @@ mod expiry_section_tests {
     #[test]
     fn expiries_round_trip_per_database() {
         let far = unix_ms_now() + 3_600_000;
-        let db0 = HashMap::from([
-            ("a".to_string(), string("1")),
-            ("b".to_string(), string("2")),
-        ]);
-        let db1 = HashMap::from([("c".to_string(), string("3"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1")), (Key::from("b"), string("2"))]);
+        let db1 = HashMap::from([(Key::from("c"), string("3"))]);
         let exp = vec![
-            HashMap::from([("a".to_string(), far)]),
-            HashMap::from([("c".to_string(), far + 1)]),
+            HashMap::from([(Key::from("a"), far)]),
+            HashMap::from([(Key::from("c"), far + 1)]),
         ];
         let loaded = load_snapshot_from(&image(&[db0, db1], &exp)[..]).unwrap();
-        assert_eq!(loaded.expiries[0].get("a"), Some(&far));
-        assert_eq!(loaded.expiries[0].get("b"), None);
-        assert_eq!(loaded.expiries[1].get("c"), Some(&(far + 1)));
+        assert_eq!(loaded.expiries[0].get(&b"a"[..]), Some(&far));
+        assert_eq!(loaded.expiries[0].get(&b"b"[..]), None);
+        assert_eq!(loaded.expiries[1].get(&b"c"[..]), Some(&(far + 1)));
     }
 
     /// The whole point of persisting an expiry is that it is honoured: a key
@@ -5478,26 +6175,26 @@ mod expiry_section_tests {
     #[test]
     fn expired_keys_are_dropped_at_load() {
         let db0 = HashMap::from([
-            ("live".to_string(), string("1")),
-            ("dead".to_string(), string("2")),
+            (Key::from("live"), string("1")),
+            (Key::from("dead"), string("2")),
         ]);
         let exp = vec![HashMap::from([
-            ("live".to_string(), unix_ms_now() + 60_000),
-            ("dead".to_string(), unix_ms_now().saturating_sub(1)),
+            (Key::from("live"), unix_ms_now() + 60_000),
+            (Key::from("dead"), unix_ms_now().saturating_sub(1)),
         ])];
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
-        assert!(loaded.dbs[0].contains_key("live"));
-        assert!(!loaded.dbs[0].contains_key("dead"));
-        assert!(!loaded.expiries[0].contains_key("dead"));
+        assert!(loaded.dbs[0].contains_key(&b"live"[..]));
+        assert!(!loaded.dbs[0].contains_key(&b"dead"[..]));
+        assert!(!loaded.expiries[0].contains_key(&b"dead"[..]));
     }
 
     /// An expiry for a key that is not in the image is dropped rather than
     /// installed, where it would attach to whatever later takes that name.
     #[test]
     fn orphan_expiries_are_not_installed() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
         let exp = vec![HashMap::from([(
-            "ghost".to_string(),
+            Key::from("ghost"),
             unix_ms_now() + 60_000,
         )])];
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
@@ -5509,41 +6206,91 @@ mod expiry_section_tests {
         let mut hash = crate::types::HashInner::new();
         hash.fields
             .insert("field".to_string(), Arc::from(&b"value"[..]));
-        hash.expiries.insert(
-            "field".to_string(),
-            std::time::Instant::now() - std::time::Duration::from_secs(1),
-        );
+        hash.expiries
+            .insert("field".to_string(), crate::types::field_now() - 1_000);
         let db0 = HashMap::from([(
-            "hxgone".to_string(),
+            Key::from("hxgone"),
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash))),
         )]);
         let exp = vec![HashMap::from([(
-            "hxgone".to_string(),
+            Key::from("hxgone"),
             unix_ms_now() + 60_000,
         )])];
 
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
-        assert!(!loaded.dbs[0].contains_key("hxgone"));
-        assert!(!loaded.expiries[0].contains_key("hxgone"));
+        assert!(!loaded.dbs[0].contains_key(&b"hxgone"[..]));
+        assert!(!loaded.expiries[0].contains_key(&b"hxgone"[..]));
+    }
+
+    /// A hash field past its deadline: dropped by a load of its own, kept
+    /// with its deadline by one with fields held (under an AOF, a replica's),
+    /// for the `HDEL` that follows; kept by `RESTORE` always, which every
+    /// reader of the stream runs at its own moment.
+    #[test]
+    fn a_past_field_is_kept_where_fields_are_held_and_by_restore() {
+        let hash = || {
+            let mut hash = crate::types::HashInner::new();
+            hash.fields.insert("gone".to_string(), Arc::from(&b"1"[..]));
+            hash.fields.insert("live".to_string(), Arc::from(&b"2"[..]));
+            hash.expiries
+                .insert("gone".to_string(), crate::types::field_now() - 1_000);
+            KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash)))
+        };
+        let fields_of = |value: &KiviDBValue| match value {
+            KiviDBValue::HashEx(h) => {
+                let h = h.read();
+                let mut f: Vec<(String, bool)> = h
+                    .fields
+                    .keys()
+                    .map(|k| (k.clone(), h.expiries.contains_key(k)))
+                    .collect();
+                f.sort();
+                f
+            }
+            _ => panic!("not a hash with field TTLs"),
+        };
+        let image_of = || image(&[HashMap::from([(Key::from("h"), hash())])], &[]);
+        let loaded = load_snapshot_from(&image_of()[..]).unwrap();
+        assert_eq!(
+            fields_of(&loaded.dbs[0][&b"h"[..]]),
+            [("live".to_string(), false)]
+        );
+        {
+            let _hold = crate::expiry::hold();
+            let loaded = load_snapshot_from(&image_of()[..]).unwrap();
+            assert_eq!(
+                fields_of(&loaded.dbs[0][&b"h"[..]]),
+                [("gone".to_string(), true), ("live".to_string(), false)]
+            );
+        }
+        let restored = restore_payload(&dump_payload(&hash()).unwrap()).unwrap();
+        let fields = fields_of(&restored);
+        assert_eq!(
+            fields,
+            [("gone".to_string(), true), ("live".to_string(), false)]
+        );
+        if let KiviDBValue::HashEx(h) = &restored {
+            assert!(h.read().has_due(crate::types::field_now()));
+        }
     }
 
     /// An image with no expiry section — everything written before this
     /// section existed — still loads, with every key permanent as before.
     #[test]
     fn image_without_an_expiry_section_loads() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
         let loaded = load_snapshot_from(&image(&[db0], &[])[..]).unwrap();
         assert_eq!(loaded.dbs[0].len(), 1);
         assert_eq!(loaded.expiries.len(), 1);
         assert!(loaded.expiries[0].is_empty());
     }
 
-    /// Unlike the index sections, a torn expiry section fails the load: half
-    /// the TTLs silently missing is worse than a loud error.
+    /// A torn expiry section fails the load, as a torn section of any kind
+    /// does (#474): half the TTLs silently missing is worse than a loud error.
     #[test]
     fn a_truncated_expiry_section_fails_the_load() {
-        let db0 = HashMap::from([("a".to_string(), string("1"))]);
-        let exp = vec![HashMap::from([("a".to_string(), unix_ms_now() + 60_000)])];
+        let db0 = HashMap::from([(Key::from("a"), string("1"))]);
+        let exp = vec![HashMap::from([(Key::from("a"), unix_ms_now() + 60_000)])];
         let full = image(&[db0], &exp);
         assert!(load_snapshot_from(&full[..full.len() - 3]).is_err());
     }
@@ -5555,11 +6302,11 @@ mod expiry_section_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dump.kdb");
         let path_s = path.to_str().unwrap();
-        let first = vec![HashMap::from([("a".to_string(), string("1"))])];
+        let first = vec![HashMap::from([(Key::from("a"), string("1"))])];
         write_snapshot(path_s, &first, None).unwrap();
         let second = vec![HashMap::from([
-            ("a".to_string(), string("1")),
-            ("b".to_string(), string("2")),
+            (Key::from("a"), string("1")),
+            (Key::from("b"), string("2")),
         ])];
         write_snapshot(path_s, &second, None).unwrap();
 
@@ -5647,7 +6394,12 @@ mod field_option_tests {
         store.write().insert("bare".into(), bare);
 
         let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+        write_kdb_image(
+            &mut image,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&store),
+        )
+        .unwrap();
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
 
         let idx = loaded
@@ -5711,7 +6463,12 @@ mod field_option_tests {
             .write()
             .insert("en".into(), index("en", LanguageOptions::default()));
         let mut image = Vec::new();
-        write_kdb_image(&mut image, &[HashMap::new()], Some(&store)).unwrap();
+        write_kdb_image(
+            &mut image,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&store),
+        )
+        .unwrap();
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
         let of = |name: &str| {
             loaded
@@ -5732,34 +6489,60 @@ mod field_option_tests {
         empty
             .write()
             .insert("de".into(), index("de", LanguageOptions::default()));
-        write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
+        write_kdb_image(
+            &mut bare,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&empty),
+        )
+        .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_LANGUAGE_MAGIC));
     }
 
-    /// `SCORE` and `SCORE_FIELD` come back with the index; an index that
-    /// sets neither takes no room.
-    #[test]
-    fn index_score_survives_a_snapshot() {
-        let index = |name: &str, default_score: f64, score_field: Option<&str>| {
-            IndexSchema {
-                name: name.into(),
-                db_index: 0,
-                on: IndexOn::Hash,
-                prefixes: vec![],
-                fields: vec![SchemaField {
-                    name: "t".into(),
-                    field_type: FieldType::Text,
-                    options: FieldOptions::default(),
-                }],
-                aliases: Vec::new(),
-                stopwords: None,
-                synonyms: Default::default(),
-                language: Default::default(),
-                default_score,
-                score_field: score_field.map(str::to_string),
-            }
-            .into_def()
-        };
+    /// An index with a text field `t`, and `SCORE` and `SCORE_FIELD` as given.
+    fn score_index(
+        name: &str,
+        default_score: f64,
+        score_field: Option<&str>,
+    ) -> crate::vector::IndexDef {
+        IndexSchema {
+            name: name.into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec![],
+            fields: vec![SchemaField {
+                name: "t".into(),
+                field_type: FieldType::Text,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score,
+            score_field: score_field.map(str::to_string),
+        }
+        .into_def()
+    }
+
+    /// The magic of every section an image can carry, and its name.
+    const EVERY_SECTION: [(&str, &[u8; 8]); 10] = [
+        ("index", KDB_INDEX_MAGIC),
+        ("HNSW", KDB_HNSW_MAGIC),
+        ("expiry", KDB_EXPIRY_MAGIC),
+        ("alias", KDB_ALIAS_MAGIC),
+        ("field options", KDB_FIELD_OPTIONS_MAGIC),
+        ("synonyms", KDB_SYNONYMS_MAGIC),
+        ("vector types", KDB_VECTOR_TYPES_MAGIC),
+        ("functions", KDB_FUNCTIONS_MAGIC),
+        ("language", KDB_LANGUAGE_MAGIC),
+        ("score", KDB_SCORE_MAGIC),
+    ];
+
+    /// An image that holds every section an image can carry: one key with a
+    /// time to live, indexes with an HNSW field, an alias, field options,
+    /// synonyms, a language and a score, and function libraries.
+    fn image_with_every_section() -> Vec<u8> {
+        let index = score_index;
         let mut synonyms = crate::vector::SynonymGroups::new();
         synonyms.insert("car".into(), vec!["automobile".into()]);
         let scored = IndexSchema {
@@ -5817,23 +6600,21 @@ mod field_option_tests {
         // Include the function section even in a build without Lua, so the
         // ordering covers every section an image can carry.
         frozen.functions = Some(b"KVFN payload".to_vec());
-        let image = frozen.into_payload().unwrap();
+        frozen.into_payload().unwrap()
+    }
+
+    /// `SCORE` and `SCORE_FIELD` come back with the index; an index that
+    /// sets neither takes no room.
+    #[test]
+    fn index_score_survives_a_snapshot() {
+        let index = score_index;
+        let image = image_with_every_section();
 
         let score_at = image
             .windows(8)
             .position(|w| w == KDB_SCORE_MAGIC)
             .expect("score section");
-        for (name, magic) in [
-            ("index", KDB_INDEX_MAGIC),
-            ("HNSW", KDB_HNSW_MAGIC),
-            ("expiry", KDB_EXPIRY_MAGIC),
-            ("alias", KDB_ALIAS_MAGIC),
-            ("field options", KDB_FIELD_OPTIONS_MAGIC),
-            ("synonyms", KDB_SYNONYMS_MAGIC),
-            ("vector types", KDB_VECTOR_TYPES_MAGIC),
-            ("functions", KDB_FUNCTIONS_MAGIC),
-            ("language", KDB_LANGUAGE_MAGIC),
-        ] {
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
             let at = image
                 .windows(8)
                 .position(|w| w == magic)
@@ -5865,8 +6646,90 @@ mod field_option_tests {
         empty
             .write()
             .insert("plain".into(), index("plain", 1.0, None));
-        write_kdb_image(&mut bare, &[HashMap::new()], Some(&empty)).unwrap();
+        write_kdb_image(
+            &mut bare,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&empty),
+        )
+        .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC));
+    }
+
+    /// An image cut anywhere inside a section after its databases, in its
+    /// magic or in its body, is refused, loaded or verified, and says it is
+    /// cut short (#474). The index, HNSW and alias sections were read
+    /// best-effort: cut inside one, the image loaded without its indexes, and
+    /// without the TTLs and libraries stored after it.
+    #[test]
+    fn an_image_cut_inside_any_section_is_refused() {
+        let image = image_with_every_section();
+        assert!(load_snapshot_bytes(&image).is_ok());
+        let mut starts: Vec<(&str, usize)> = EVERY_SECTION
+            .iter()
+            .map(|(name, magic)| {
+                let at = image
+                    .windows(8)
+                    .position(|w| w == *magic)
+                    .unwrap_or_else(|| panic!("no {name} section"));
+                (*name, at)
+            })
+            .collect();
+        starts.sort_by_key(|&(_, at)| at);
+        for (i, &(name, at)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(image.len(), |&(_, next)| next);
+            let mut cuts = vec![at + 1, at + 4, at + 7, at + 8, at + 9, at + 12];
+            cuts.extend([(at + end) / 2, end - 2, end - 1]);
+            cuts.retain(|&cut| cut > at && cut < end);
+            cuts.dedup();
+            for cut in cuts {
+                let torn = &image[..cut];
+                let err = load_snapshot_bytes(torn)
+                    .err()
+                    .unwrap_or_else(|| panic!("the {name} section cut at {cut} loaded"));
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{name} at {cut}");
+                assert!(
+                    err.to_string().contains("cut short"),
+                    "{name} at {cut}: {err}"
+                );
+                assert!(load_snapshot_from(torn).is_err(), "{name} at {cut}");
+                assert!(verify_snapshot(torn).is_err(), "{name} at {cut}");
+            }
+        }
+    }
+
+    /// An index section that is all there but cannot be used, an index whose
+    /// name is not UTF-8, is refused, as one the image ends inside is: it was
+    /// passed over, and the scan ended there, with every TTL and function
+    /// library stored after it (#474).
+    #[test]
+    fn a_whole_but_unusable_index_section_is_refused() {
+        let mut whole = Vec::new();
+        write_kdb_header(&mut whole, 1).unwrap();
+        let value = KiviDBValue::String(SharedBytes::from(&b"1"[..]));
+        write_kdb_entry(&mut whole, "a", value.view()).unwrap();
+        write_kdb_db_end(&mut whole).unwrap();
+        let mut unusable = whole.clone();
+        unusable.extend_from_slice(KDB_INDEX_MAGIC);
+        unusable.extend(1u32.to_le_bytes());
+        unusable.extend(1u32.to_le_bytes());
+        unusable.push(0xFF);
+        unusable.extend(0u32.to_le_bytes());
+        let err = load_snapshot_bytes(&unusable).err().expect("loaded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("index section cannot be used"),
+            "{err}"
+        );
+        assert!(load_snapshot_from(unusable.as_slice()).is_err());
+        assert!(verify_snapshot(&unusable).is_err());
+
+        let mut cut = whole.clone();
+        cut.extend_from_slice(KDB_INDEX_MAGIC);
+        cut.extend(1u32.to_le_bytes());
+        cut.extend(5u32.to_le_bytes());
+        cut.extend(b"ab");
+        assert!(load_snapshot_bytes(&cut).is_err());
+        assert!(verify_snapshot(&cut).is_err());
     }
 }
 
@@ -5875,10 +6738,10 @@ mod verify_tests {
     use super::*;
 
     fn image(keys: usize) -> Vec<u8> {
-        let mut map: HashMap<String, KiviDBValue> = HashMap::new();
+        let mut map: HashMap<Key, KiviDBValue> = HashMap::new();
         for i in 0..keys {
             map.insert(
-                format!("key:{i}"),
+                Key::from(format!("key:{i}")),
                 KiviDBValue::String(SharedBytes::from(format!("value {i}").as_bytes())),
             );
         }
@@ -5930,6 +6793,36 @@ mod verify_tests {
         // Verifying keeps nothing, and loading still loads.
         let loaded = load_snapshot_from(whole.as_slice()).unwrap();
         assert_eq!(loaded.dbs[0].len(), 500);
+
+        // Loading refuses a cut image as verifying does, the one cut between
+        // two entries too: it used to load the keys before the cut (#444).
+        for cut in [12, 13, 40, whole.len() / 2] {
+            assert!(
+                load_snapshot_from(&whole[..cut]).is_err(),
+                "an image cut at {cut} of {} loaded",
+                whole.len()
+            );
+        }
+        // One key, in the first of two databases: cut after the key, and
+        // after the first database's end.
+        let one = image(1);
+        let entry = 4 + "key:0".len() + 1 + 4 + "value 0".len();
+        assert!(load_snapshot_from(&one[..8 + 4 + entry + 8]).is_ok());
+        assert!(load_snapshot_from(&one[..8 + 4 + entry]).is_err());
+        assert!(load_snapshot_from(&one[..8 + 4 + entry + 4]).is_err());
+    }
+
+    /// The table-driven CRC64 that checks RDB files is Redis's.
+    #[test]
+    fn the_rdb_checksum_is_redis_crc64() {
+        assert_eq!(redis_crc64_update(0, b"123456789"), 0xe9c6_d914_c4b8_d9ca);
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        assert_eq!(redis_crc64_update(0, &data), redis_crc64(&data));
+        let (a, b) = data.split_at(1234);
+        assert_eq!(
+            redis_crc64_update(redis_crc64_update(0, a), b),
+            redis_crc64(&data)
+        );
     }
 }
 
@@ -5947,7 +6840,7 @@ mod function_section_tests {
         )
         .unwrap();
         write_kdb_db_end(&mut out).unwrap();
-        write_kdb_expiry_maps(&mut out, &[HashMap::new()]).unwrap();
+        write_kdb_expiry_maps(&mut out, &[HashMap::<Key, u64>::new()]).unwrap();
         write_kdb_functions_section(&mut out, libraries).unwrap();
         out
     }
@@ -6135,7 +7028,7 @@ mod nan_score_tests {
             &zset(&[("a", f64::NEG_INFINITY), ("b", f64::INFINITY), ("c", -0.0)]),
         );
         let loaded = load_snapshot_from(&good[..]).expect("infinite scores load");
-        match loaded.dbs[0].get("scores") {
+        match loaded.dbs[0].get(&b"scores"[..]) {
             Some(KiviDBValue::SortedSet(ss)) => assert_eq!(ss.read().len(), 3),
             _ => panic!("the sorted set is not there"),
         }
@@ -6197,8 +7090,8 @@ mod empty_key_tests {
         out
     }
 
-    fn get_string(map: &HashMap<String, KiviDBValue>, key: &str) -> Vec<u8> {
-        match map.get(key) {
+    fn get_string(map: &HashMap<Key, KiviDBValue>, key: &str) -> Vec<u8> {
+        match map.get(key.as_bytes()) {
             Some(KiviDBValue::String(bytes)) => bytes.as_ref().to_vec(),
             _ => panic!("{key:?} is not a string"),
         }
@@ -6278,7 +7171,7 @@ mod empty_key_tests {
         let whole = image(&[db0, HashMap::from([("after".to_string(), string("1"))])]);
         assert_eq!(verify_snapshot(whole.as_slice()).unwrap(), 5);
         let loaded = load_snapshot_from(whole.as_slice()).unwrap();
-        match loaded.dbs[0].get("") {
+        match loaded.dbs[0].get(&b""[..]) {
             Some(KiviDBValue::Hash(hash)) => {
                 let hash = hash.read();
                 assert_eq!(hash.len(), 2);
@@ -6287,7 +7180,7 @@ mod empty_key_tests {
             }
             _ => panic!("the empty key is not a hash"),
         }
-        match loaded.dbs[0].get("set") {
+        match loaded.dbs[0].get(&b"set"[..]) {
             Some(KiviDBValue::Set(set)) => {
                 let set = set.read();
                 assert_eq!(set.len(), 2);
@@ -6295,7 +7188,7 @@ mod empty_key_tests {
             }
             _ => panic!("set is not a set"),
         }
-        match loaded.dbs[0].get("zset") {
+        match loaded.dbs[0].get(&b"zset"[..]) {
             Some(KiviDBValue::SortedSet(zset)) => {
                 let zset = zset.read();
                 assert_eq!(zset.members.len(), 2);
@@ -6307,7 +7200,7 @@ mod empty_key_tests {
             }
             _ => panic!("zset is not a sorted set"),
         }
-        match loaded.dbs[0].get("list") {
+        match loaded.dbs[0].get(&b"list"[..]) {
             Some(KiviDBValue::List(list)) => {
                 let list = list.read();
                 assert_eq!(list.len(), 2);
@@ -6369,15 +7262,15 @@ mod empty_key_tests {
         let store = crate::store::new_store(2);
         restore_into_store(
             vec![
-                HashMap::from([(String::new(), string("x"))]),
-                HashMap::from([(String::new(), hash("f", "v"))]),
+                HashMap::from([(Key::default(), string("x"))]),
+                HashMap::from([(Key::default(), hash("f", "v"))]),
             ],
             &store,
         );
         restore_expiries_into_store(
             vec![
-                HashMap::from([(String::new(), far)]),
-                HashMap::from([(String::new(), far + 1)]),
+                HashMap::from([(Key::default(), far)]),
+                HashMap::from([(Key::default(), far + 1)]),
             ],
             &store,
         );
@@ -6397,9 +7290,12 @@ mod empty_key_tests {
 
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
         assert_eq!(get_string(&loaded.dbs[0], ""), b"x");
-        assert!(matches!(loaded.dbs[1].get(""), Some(KiviDBValue::Hash(_))));
-        assert_eq!(loaded.expiries[0].get(""), Some(&far));
-        assert_eq!(loaded.expiries[1].get(""), Some(&(far + 1)));
+        assert!(matches!(
+            loaded.dbs[1].get(&b""[..]),
+            Some(KiviDBValue::Hash(_))
+        ));
+        assert_eq!(loaded.expiries[0].get(&b""[..]), Some(&far));
+        assert_eq!(loaded.expiries[1].get(&b""[..]), Some(&(far + 1)));
     }
 
     /// In the last database (with `databases 1`, the only one) a 1.2.0 empty
@@ -6426,10 +7322,13 @@ mod empty_key_tests {
             assert_eq!(loaded.dbs[0].len(), 3);
             assert_eq!(get_string(&loaded.dbs[0], "a"), b"1");
             assert_eq!(get_string(&loaded.dbs[0], "b"), b"2");
-            assert!(matches!(loaded.dbs[0].get(""), Some(KiviDBValue::Hash(_))));
-            assert_eq!(loaded.expiries[0].get("a"), Some(&far));
-            assert_eq!(loaded.expiries[0].get(""), Some(&(far + 1)));
-            assert_eq!(loaded.expiries[0].get("b"), Some(&(far + 2)));
+            assert!(matches!(
+                loaded.dbs[0].get(&b""[..]),
+                Some(KiviDBValue::Hash(_))
+            ));
+            assert_eq!(loaded.expiries[0].get(&b"a"[..]), Some(&far));
+            assert_eq!(loaded.expiries[0].get(&b""[..]), Some(&(far + 1)));
+            assert_eq!(loaded.expiries[0].get(&b"b"[..]), Some(&(far + 2)));
             assert_eq!(loaded.functions.as_deref(), Some(&b"libraries"[..]));
         }
     }
@@ -6461,8 +7360,8 @@ mod empty_key_tests {
         assert_eq!(get_string(&loaded.dbs[1], "k"), b"v");
         assert_eq!(get_string(&loaded.dbs[2], ""), b"e2");
         assert_eq!(get_string(&loaded.dbs[2], "z"), b"9");
-        assert_eq!(loaded.expiries[0].get(""), Some(&far));
-        assert_eq!(loaded.expiries[2].get("z"), Some(&(far + 1)));
+        assert_eq!(loaded.expiries[0].get(&b""[..]), Some(&far));
+        assert_eq!(loaded.expiries[2].get(&b"z"[..]), Some(&(far + 1)));
         assert_eq!(loaded.functions.as_deref(), Some(&b"libraries"[..]));
 
         // From a file, as at startup.
@@ -6607,11 +7506,59 @@ mod empty_key_tests {
         // One-byte keys: every end could be one.
         let (loaded, opened) = readings(&damaged(16, "k"));
         assert!(loaded.is_err());
-        assert!((2..=READINGS).contains(&opened), "{opened} readings");
-        // However many databases, no more than READINGS readings, nor plans.
+        assert!(
+            (2..=readings_for(server_databases())).contains(&opened),
+            "{opened} readings"
+        );
+        // However many databases, no more readings than are made, nor plans.
         let (loaded, opened) = readings(&damaged(100_000, "k"));
         assert!(loaded.is_err());
-        assert!(opened <= READINGS, "{opened} readings");
+        assert!(
+            opened <= readings_for(server_databases()),
+            "{opened} readings"
+        );
+    }
+
+    /// An image cut short inside a section is a fault of its layout, so it
+    /// is read again where 1.2.0 could have put the empty key, no more than
+    /// [`readings_for`] times, and refused with the first reading's error, which
+    /// says where it is cut (#474).
+    #[test]
+    fn an_image_cut_inside_a_section_is_read_again_a_bounded_number_of_times() {
+        for dbs in [16, 100_000] {
+            let mut image = Vec::new();
+            write_kdb_header(&mut image, dbs).unwrap();
+            for _ in 0..dbs {
+                // One-byte keys: every end could be 1.2.0's empty key.
+                write_kdb_entry(&mut image, "k", string("v").view()).unwrap();
+                write_kdb_db_end(&mut image).unwrap();
+            }
+            let whole_len = image.len();
+            for (section, magic) in [
+                ("index", KDB_INDEX_MAGIC),
+                ("HNSW graph", KDB_HNSW_MAGIC),
+                ("index alias", KDB_ALIAS_MAGIC),
+                ("expiry", KDB_EXPIRY_MAGIC),
+            ] {
+                image.truncate(whole_len);
+                image.extend_from_slice(magic);
+                image.extend(1u32.to_le_bytes());
+                image.extend(5u32.to_le_bytes());
+                image.extend(b"ab");
+                let (loaded, opened) = readings(&image);
+                let err = loaded.err().unwrap_or_else(|| panic!("{section} loaded"));
+                assert!(
+                    (2..=readings_for(server_databases())).contains(&opened),
+                    "{section}: {opened} readings"
+                );
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{section}");
+                assert!(
+                    err.to_string().contains(&format!("its {section} section")),
+                    "{section}: {err}"
+                );
+                assert!(verify_snapshot(&image).is_err(), "{section}");
+            }
+        }
     }
 
     /// A reading the disk failed is not read again; nor is an image that
@@ -6742,5 +7689,363 @@ mod empty_key_tests {
                 whole.len()
             );
         }
+    }
+}
+
+/// An image that 1.2.0's empty key lets be read more than one way (#441).
+#[cfg(test)]
+pub(crate) mod readings_tests {
+    use super::*;
+
+    const ZERO: [u8; 4] = [0; 4];
+
+    fn header(dbs: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_kdb_header(&mut out, dbs).unwrap();
+        out
+    }
+
+    fn get_string(map: &HashMap<Key, KiviDBValue>, key: &[u8]) -> Vec<u8> {
+        match map.get(key) {
+            Some(KiviDBValue::String(bytes)) => bytes.as_ref().to_vec(),
+            _ => panic!("{key:?} is not a string"),
+        }
+    }
+
+    /// Three databases, of which the reading as 1.2.1 writes fails, and two
+    /// readings with 1.2.0's empty key load, with different keys:
+    ///
+    /// - in database 0: the empty key, `"x"`; in database 1, `k`, a string
+    ///   of 255 bytes;
+    /// - in database 1: a key of 257 bytes, `""`, and the empty key, `""`.
+    ///
+    /// The second reading takes database 0's first 4 bytes for its end, and
+    /// what the first reads as the empty key's value, database 0's end and
+    /// `k` for the bytes of a key.
+    pub(crate) fn two_ways() -> Vec<u8> {
+        let mut out = header(3);
+        // Database 0: its end, or the empty key: a string, of one byte.
+        out.extend(ZERO);
+        out.push(TAG_STRING);
+        // Its length (1), or with the tag before it, the length of a key of
+        // 257 bytes, which starts with the length's last byte.
+        out.extend([1, 0, 0, 0]);
+        let key_from = out.len() - 1;
+        out.push(b'x');
+        // Database 0's end, then `k` in database 1, a string of 255 bytes
+        // that runs to database 1's end.
+        out.extend(ZERO);
+        out.extend(1u32.to_le_bytes());
+        out.push(b'k');
+        out.push(TAG_STRING);
+        out.extend(255u32.to_le_bytes());
+        let value_from = out.len();
+        out.resize(key_from + 257, b'v');
+        // The long key's value, `""`; then database 1's end, or the empty
+        // key, `""`; then its end.
+        out.push(TAG_STRING);
+        out.extend(ZERO);
+        out.extend(ZERO);
+        out.push(TAG_STRING);
+        out.extend(ZERO);
+        assert_eq!(out.len() - value_from, 255);
+        out.extend(ZERO);
+        // Database 2, empty.
+        out.extend(ZERO);
+        out
+    }
+
+    /// Whether `err` refuses an image that reads more than one way, saying
+    /// so; its text.
+    fn refused(err: io::Error) -> String {
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        let text = err.to_string();
+        assert!(text.contains("can be read more than one way"), "{text}");
+        assert!(text.contains("database(s) [0]"), "{text}");
+        assert!(text.contains("database(s) [1]"), "{text}");
+        text
+    }
+
+    /// The image reads two ways, and loading it would load either: it is
+    /// refused, saying so, wherever it is loaded or verified, before any
+    /// reading that keeps what it reads.
+    #[test]
+    fn an_image_that_two_readings_load_differently_is_refused() {
+        let image = two_ways();
+        // The image as built: the reading as 1.2.1 writes fails, and both
+        // readings with the empty key load it, differently.
+        assert!(read_image(image.as_slice(), true, &[], &mut Vec::new(), 16).is_err());
+        let (first, _) = read_image(image.as_slice(), true, &[0], &mut Vec::new(), 16).unwrap();
+        assert_eq!(get_string(&first.dbs[0], b""), b"x");
+        // `k` runs to database 1's end, which is followed by database 2's.
+        let k_end = image.len() - 8;
+        assert_eq!(get_string(&first.dbs[1], b"k"), &image[k_end - 255..k_end]);
+        let (second, _) = read_image(image.as_slice(), true, &[1], &mut Vec::new(), 16).unwrap();
+        assert!(second.dbs[0].is_empty());
+        assert_eq!(second.dbs[1].len(), 2);
+        assert_eq!(get_string(&second.dbs[1], b""), b"");
+
+        refused(load_snapshot_bytes(&image).err().expect("loaded"));
+        refused(verify_snapshot(&image).expect_err("verified"));
+        // Three readings, none of which keeps anything: no dataset, whole
+        // or in part, is made of an image that is refused.
+        let mut opened = 0;
+        refused(
+            load_snapshot_with(|| {
+                opened += 1;
+                Ok(image.as_slice())
+            })
+            .err()
+            .expect("loaded"),
+        );
+        assert_eq!(opened, 3);
+        // As before: one reading, which fails.
+        assert!(load_snapshot_from(image.as_slice()).is_err());
+    }
+
+    /// Loaded from a file, the refusal names it and says what to do; from a
+    /// master, it says what to do about the master.
+    #[test]
+    fn the_refusal_names_the_file_and_what_to_do() {
+        let image = two_ways();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        std::fs::write(&path, &image).unwrap();
+        let path = path.to_str().unwrap();
+        // At startup.
+        let text = refused(crate::replication::load_dump(path).err().expect("loaded"));
+        assert!(text.starts_with(path), "{text}");
+        assert!(
+            text.contains("restore the data from another copy"),
+            "{text}"
+        );
+        // `preload-file` and an AOF's base.
+        let text = refused(load_snapshot(path).err().expect("loaded"));
+        assert!(text.starts_with(path), "{text}");
+        // A full sync.
+        let text = refused(refusal_of_payload(
+            load_snapshot_bytes(&image).err().expect("loaded"),
+        ));
+        assert!(text.contains("upgrade the master"), "{text}");
+        assert!(!text.contains("another copy"), "{text}");
+    }
+
+    /// A reading that loads is not taken for the only one if the others
+    /// cannot all be made: the image cannot be opened again, or a reading
+    /// fails on the disk.
+    #[test]
+    fn an_image_not_read_every_way_it_can_be_is_refused() {
+        let image = two_ways();
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            if opened > 2 {
+                return Err(io::Error::other("cannot open it again"));
+            }
+            Ok(image.as_slice())
+        })
+        .err()
+        .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert!(err.to_string().contains("cannot open it again"), "{err}");
+
+        struct Failing<'a>(&'a [u8]);
+        impl Read for Failing<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.len() < 20 {
+                    return Err(io::Error::other("the disk failed"));
+                }
+                self.0.read(buf)
+            }
+        }
+        let mut opened = 0;
+        let err = load_snapshot_with(|| {
+            opened += 1;
+            Ok(if opened > 2 {
+                Box::new(Failing(&image)) as Box<dyn Read + '_>
+            } else {
+                Box::new(image.as_slice())
+            })
+        })
+        .err()
+        .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        assert!(err.to_string().contains("the disk failed"), "{err}");
+    }
+
+    /// A 1.2.0 image of `dbs` databases: the empty key, `"e0"`, in database
+    /// 0, and in each of the first `used`, `k<db>`, `v<db>`, whose length's
+    /// first byte is a tag.
+    fn image_1_2_0(dbs: u32, used: u32) -> Vec<u8> {
+        let mut image = header(dbs);
+        image.extend(ZERO);
+        let e0 = KiviDBValue::String(SharedBytes::from(&b"e0"[..]));
+        write_kdb_value(&mut image, e0.view()).unwrap();
+        for db in 0..dbs {
+            if db < used {
+                let value = KiviDBValue::String(SharedBytes::from(format!("v{db}").as_bytes()));
+                write_kdb_entry(&mut image, format!("k{db}").as_str(), value.view()).unwrap();
+            }
+            image.extend(ZERO);
+        }
+        image
+    }
+
+    fn check_1_2_0(loaded: &LoadedSnapshot, used: u32) {
+        assert_eq!(get_string(&loaded.dbs[0], b""), b"e0");
+        for db in 0..used {
+            assert_eq!(
+                get_string(&loaded.dbs[db as usize], format!("k{db}").as_bytes()),
+                format!("v{db}").into_bytes()
+            );
+        }
+    }
+
+    /// Once the reading with the empty key in database 0 loads the image, it
+    /// is read again with the ends of the databases after it taken for the
+    /// empty key too. Those readings fail, and it loads, from the one more
+    /// reading that keeps what it reads.
+    #[test]
+    fn a_1_2_0_image_whose_other_readings_fail_loads() {
+        let image = image_1_2_0(4, 4);
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        // As written, then with the empty key in database 0, and in 0 and 1,
+        // and 0 and 2; then again, kept.
+        assert_eq!(opened, 5);
+        check_1_2_0(&loaded, 4);
+        assert_eq!(verify_snapshot(&image).unwrap(), 5);
+    }
+
+    /// With `databases 64` and 40 of them holding keys, the reading that
+    /// loads the image has 39 more to be made after it: more than the
+    /// [`READINGS`] made of an image of 16. The readings made are as many
+    /// as the databases call for, and the image loads.
+    #[test]
+    fn a_1_2_0_image_of_many_databases_loads() {
+        let image = image_1_2_0(64, 40);
+        let (loaded, keys, _) = read_retrying(|| Ok(image.as_slice()), true, 64).unwrap();
+        assert_eq!(keys, 41);
+        check_1_2_0(&loaded, 40);
+        // With READINGS alone, they could not all be made: refused.
+        let err = read_retrying_within(|| Ok(image.as_slice()), true, 64, READINGS)
+            .err()
+            .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+    }
+
+    /// An image whose readings run out once one loads it, with others still
+    /// to be made, is refused, not loaded on that one; with room for them,
+    /// it loads.
+    #[test]
+    fn an_image_whose_readings_run_out_is_refused() {
+        let image = image_1_2_0(4, 4);
+        let err = read_retrying_within(|| Ok(image.as_slice()), true, 16, 3)
+            .err()
+            .expect("loaded");
+        assert!(reads_more_than_one_way(&err), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("not every other reading"), "{text}");
+        assert!(text.contains("more ways than the 3 readings"), "{text}");
+        assert!(verify_snapshot(&image).is_ok());
+        let (loaded, _, _) = read_retrying_within(|| Ok(image.as_slice()), true, 16, 5).unwrap();
+        check_1_2_0(&loaded, 4);
+    }
+
+    /// A reading that would load the image but for a key in a database past
+    /// the server's (#482) is a reading that loads it: with another that
+    /// loads it, the image reads more than one way.
+    #[test]
+    fn a_reading_refused_for_its_databases_still_loads_the_image() {
+        let image = two_ways();
+        // Reading [1] has keys in database 1.
+        let err = read_retrying(|| Ok(image.as_slice()), true, 1)
+            .err()
+            .expect("loaded");
+        refused(err);
+    }
+
+    /// The readings that are to be made but there is no room for are noted,
+    /// so that a reading that loads is not taken for the only one.
+    #[test]
+    fn readings_left_out_are_noted() {
+        let mut plans = Vec::new();
+        assert!(push_plans(&mut plans, &[], &[0, 2], 2));
+        assert_eq!(plans, vec![vec![2], vec![0]]);
+        let mut plans = Vec::new();
+        assert!(!push_plans(&mut plans, &[], &[0, 2, 3], 2));
+        assert_eq!(plans, vec![vec![2], vec![0]]);
+        let mut plans = Vec::new();
+        assert!(push_plans(&mut plans, &[2], &[0, 2, 3], 1));
+        assert_eq!(plans, vec![vec![2, 3]]);
+        let ends: Vec<usize> = (0..MAX_READINGS).collect();
+        assert!(!push_plans(&mut Vec::new(), &[], &ends, MAX_READINGS));
+        assert_eq!(readings_for(16), 64);
+        assert_eq!(readings_for(usize::MAX), MAX_READINGS);
+    }
+
+    /// Passing over a value refuses what reading it refuses: a hash field
+    /// that is not UTF-8, cut anywhere in a character or not; a sorted set
+    /// score that is not a number; a value cut short.
+    #[test]
+    fn passing_over_a_value_refuses_what_reading_it_does() {
+        let field = |bytes: &[u8]| {
+            let mut out = Vec::new();
+            write_bytes(&mut out, bytes).unwrap();
+            out
+        };
+        let mut long = "€".repeat(5000).into_bytes();
+        assert!(skip_text(&mut field(&long).as_slice()).unwrap());
+        long.push(0xC3);
+        assert!(!skip_text(&mut field(&long).as_slice()).unwrap());
+        long.pop();
+        long[4097] = 0xFF;
+        assert!(!skip_text(&mut field(&long).as_slice()).unwrap());
+
+        let mut hash = 1u32.to_le_bytes().to_vec();
+        hash.extend(field(&[0xFF]));
+        hash.extend(field(b"v"));
+        assert!(skip_value(&mut hash.as_slice(), TAG_HASH).is_err());
+        let mut zset = 1u32.to_le_bytes().to_vec();
+        zset.extend(field(b"m"));
+        zset.extend(f64::NAN.to_le_bytes());
+        assert!(skip_value(&mut zset.as_slice(), TAG_SORTEDSET).is_err());
+        let cut = field(b"value");
+        assert!(skip_value(&mut &cut[..cut.len() - 1], TAG_STRING).is_err());
+    }
+
+    /// An image as 1.2.1 writes it, the empty key in every database and
+    /// first keys whose length begins with a tag, is read once, as before.
+    #[test]
+    fn an_image_as_1_2_1_writes_it_is_read_once() {
+        let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+        let dbs: Vec<HashMap<String, KiviDBValue>> = (0..16)
+            .map(|db| {
+                HashMap::from([
+                    (String::new(), string(&format!("e{db}"))),
+                    ("k".to_string(), string("v")),
+                ])
+            })
+            .collect();
+        let mut image = Vec::new();
+        write_kdb_image(&mut image, &dbs, None).unwrap();
+        let mut opened = 0;
+        let (loaded, _) = load_snapshot_with(|| {
+            opened += 1;
+            Ok(image.as_slice())
+        })
+        .unwrap();
+        assert_eq!(opened, 1);
+        for (db, map) in loaded.dbs.iter().enumerate() {
+            assert_eq!(get_string(map, b""), format!("e{db}").into_bytes());
+            assert_eq!(get_string(map, b"k"), b"v");
+        }
+        assert_eq!(verify_snapshot(&image).unwrap(), 32);
+        assert_eq!(load_snapshot_bytes(&image).unwrap().dbs.len(), 16);
     }
 }

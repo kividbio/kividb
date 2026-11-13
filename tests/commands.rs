@@ -2058,8 +2058,10 @@ fn test_restore_reads_payloads_dumped_by_redis() {
 // A Valkey payload is read from Valkey 9's RDB version, 80, and no other
 // past Redis's: one from a newer Valkey (9.2 writes 81), or from a version
 // no server writes, is refused as Valkey refuses it. Payloads sealed with
-// Redis's versions are read as Redis's, whatever their type byte: type 22 is
-// Valkey's hash with field TTLs only in a Valkey payload (#449).
+// Redis's versions are read as Redis's: type 22 is Valkey's hash with field
+// TTLs in a Valkey payload, and under Redis's RDB 12 a Redis 7.4 pre-release
+// encoding, refused (#449). Under RDB 11 or older it is Dragonfly's, in
+// Valkey's encoding (#452).
 #[test]
 fn test_restore_reads_valkey_9_payloads_and_refuses_newer_ones() {
     let port = free_port();
@@ -2439,6 +2441,33 @@ fn test_restore_of_a_huge_claimed_length_is_bad_data_not_a_crash() {
         matches!(&reply, RespValue::Error(e) if e == "ERR DUMP payload version or checksum are wrong"),
         "{reply:?}"
     );
+}
+
+/// On a node with cluster support disabled, `CLUSTER MYID`,
+/// `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `READONLY`, `READWRITE` and `ASKING`
+/// refuse, as in Redis. They answered (#563).
+#[test]
+fn cluster_commands_refuse_when_cluster_support_is_disabled() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for cmd in [
+        &["CLUSTER", "MYID"][..],
+        &["CLUSTER", "COUNTKEYSINSLOT", "0"],
+        &["CLUSTER", "GETKEYSINSLOT", "0", "1"],
+        &["READONLY"],
+        &["READWRITE"],
+        &["ASKING"],
+    ] {
+        let reply = c.cmds(cmd);
+        assert_eq!(
+            reply,
+            RespValue::Error("ERR This instance has cluster support disabled".into()),
+            "{cmd:?}"
+        );
+    }
+    // KEYSLOT still answers.
+    assert_eq!(c.cmds(&["CLUSTER", "KEYSLOT", "foo"]).as_int(), 12182);
 }
 
 // Without Lua, every script command says which build has it: BullMQ and

@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "kividb"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
@@ -443,6 +443,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-webpki",
+ "serde",
  "serde_json",
  "sha1",
  "sha2",

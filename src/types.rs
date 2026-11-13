@@ -54,6 +54,9 @@ impl StreamId {
     }
 }
 
+mod stream_entries;
+pub use stream_entries::{EntryRef, StreamEntries};
+
 pub type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
 /// A single entry in a stream.
 #[derive(Debug, Clone)]
@@ -63,10 +66,13 @@ pub struct StreamEntry {
     pub fields: FieldsType,
 }
 
+/// The name of a consumer group or of a consumer: any bytes, as in Redis.
+pub type StreamName = crate::key_bytes::KeyBytes;
+
 /// Pending Entry List entry — tracks unacknowledged messages per consumer.
 #[derive(Debug, Clone)]
 pub struct PelEntry {
-    pub consumer: String,
+    pub consumer: StreamName,
     pub delivered_at: u64, // unix ms
     pub delivery_count: u64,
 }
@@ -74,7 +80,7 @@ pub struct PelEntry {
 /// A consumer group.
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
-    pub name: String,
+    pub name: StreamName,
     /// Last delivered ID — entries with id > last_id are "new"
     pub last_id: StreamId,
     /// How many of the entries ever added to the stream this group has been
@@ -83,11 +89,11 @@ pub struct ConsumerGroup {
     /// Pending Entry List: id → PelEntry
     pub pel: BTreeMap<StreamId, PelEntry>,
     /// Consumers: name → last-seen ms
-    pub consumers: AHashMap<String, u64>,
+    pub consumers: AHashMap<StreamName, u64>,
     /// Consumers that have been handed entries: name → when they last were,
     /// in ms. Not kept across a restart: a consumer is then one that has not
     /// been active yet.
-    pub active: AHashMap<String, u64>,
+    pub active: AHashMap<StreamName, u64>,
 }
 
 impl ConsumerGroup {
@@ -98,15 +104,15 @@ impl ConsumerGroup {
 
     /// The consumer has sent a command; with `got_entries`, one that handed
     /// it something.
-    pub fn seen(&mut self, consumer: &str, now: u64, got_entries: bool) {
+    pub fn seen(&mut self, consumer: &[u8], now: u64, got_entries: bool) {
         match self.consumers.get_mut(consumer) {
             Some(seen) => *seen = now,
             None => {
-                self.consumers.insert(consumer.to_string(), now);
+                self.consumers.insert(StreamName::from(consumer), now);
             }
         }
         if got_entries {
-            self.active.insert(consumer.to_string(), now);
+            self.active.insert(StreamName::from(consumer), now);
         }
     }
 }
@@ -156,7 +162,7 @@ impl StreamIdmp {
 #[derive(Debug, Clone)]
 pub struct StreamInner {
     /// All entries ordered by ID
-    pub entries: BTreeMap<StreamId, StreamEntry>,
+    pub entries: StreamEntries,
     /// The last generated ID — used for auto-ID generation
     pub last_id: StreamId,
     /// The max deleted ID — used by XSETID
@@ -164,7 +170,7 @@ pub struct StreamInner {
     /// Total entries ever added (not decremented on delete)
     pub entries_added: u64,
     /// Consumer groups
-    pub groups: AHashMap<String, ConsumerGroup>,
+    pub groups: AHashMap<StreamName, ConsumerGroup>,
     /// Persistent max-entries policy set by XCFGSET MAX-ENTRIES.
     /// When Some(n), every XADD trims the stream to at most n entries
     /// after inserting. None = no persistent policy.
@@ -197,7 +203,7 @@ pub struct NodeFill {
 impl StreamInner {
     pub fn new() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: StreamEntries::new(),
             last_id: StreamId::min(),
             max_deleted_id: StreamId::min(),
             entries_added: 0,
@@ -252,7 +258,13 @@ impl SortedSetInner {
 
     /// Insert or update a member. Returns true if the member is new.
     /// This is the ONLY place both maps should be written — keeps the invariant.
+    ///
+    /// A score of -0 is kept as 0, as Redis keeps it in the listpack that
+    /// holds a sorted set of up to 128 members: `ZADD z -0 m` then
+    /// `ZSCORE z m` is `0` (#422).
     pub fn insert(&mut self, member: ZMember, score: f64) -> bool {
+        // -0 + 0 is 0; any other score is itself.
+        let score = score + 0.0;
         if let Some(&old_score) = self.members.get(&member) {
             // Member exists — remove old position in the score index first
             self.by_score
@@ -329,7 +341,7 @@ pub struct VSetEntry {
 #[derive(Clone)]
 pub struct VectorSetInner {
     pub dim: usize,
-    pub entries: AHashMap<String, VSetEntry>,
+    pub entries: AHashMap<crate::key_bytes::KeyBytes, VSetEntry>,
     pub metric: DistanceMetric,
 }
 
@@ -353,6 +365,9 @@ impl VectorSetInner {
 }
 
 // ── Time Series types ────────────────────────────────────────────────────────
+
+/// The error of a sample at a timestamp that has one, under BLOCK.
+pub const BLOCKED_DUPLICATE: &str = "TSDB: Duplicate sample in BLOCK policy";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DuplicatePolicy {
@@ -540,6 +555,7 @@ impl TsAggregation {
 
 #[derive(Debug, Clone)]
 pub struct CompactionRule {
+    /// The destination series, by name: `key_bytes::text_of` of its key.
     pub dest_key: String,
     pub aggregation: TsAggregation,
     pub bucket_duration: u64, // ms
@@ -572,6 +588,7 @@ pub struct TsInner {
 
     /// The series this one is a compaction of (`TS.CREATERULE`): `sourceKey`
     /// in `TS.INFO`, and where `LATEST` finds the bucket still open (#128).
+    /// By name: `key_bytes::text_of` of its key.
     pub source: Option<String>,
 }
 
@@ -592,6 +609,27 @@ impl TsInner {
     /// Add a sample, respecting duplicate policy and retention.
     /// Returns the timestamp actually stored, or an error string.
     pub fn add_sample(&mut self, ts: u64, value: f64) -> Result<u64, &'static str> {
+        // Refused before anything changes: the trim below is a change too.
+        if self.duplicate_policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
+            return Err(BLOCKED_DUPLICATE);
+        }
+        let policy = self.duplicate_policy.clone();
+        self.add_sample_as(ts, value, &policy)
+    }
+
+    /// [`Self::add_sample`], with `policy` for a sample already at `ts` in
+    /// place of the series' own: `TS.ADD … ON_DUPLICATE`, and `TS.INCRBY`,
+    /// which replaces the latest value whatever the series' policy.
+    pub fn add_sample_as(
+        &mut self,
+        ts: u64,
+        value: f64,
+        policy: &DuplicatePolicy,
+    ) -> Result<u64, &'static str> {
+        // Refused before anything changes: the trim below is a change too.
+        if *policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
+            return Err(BLOCKED_DUPLICATE);
+        }
         // Enforce retention: trim samples older than (ts - retention)
         if self.retention > 0 && ts >= self.retention {
             let cutoff = ts - self.retention;
@@ -612,8 +650,8 @@ impl TsInner {
         }
 
         if let Some(&existing) = self.samples.get(&ts) {
-            match self.duplicate_policy {
-                DuplicatePolicy::Block => return Err("TSDB: Duplicate sample in BLOCK policy"),
+            match policy {
+                DuplicatePolicy::Block => return Err(BLOCKED_DUPLICATE),
                 DuplicatePolicy::First => { /* keep existing, do nothing */ }
                 DuplicatePolicy::Last => {
                     self.samples.insert(ts, value);
@@ -664,11 +702,8 @@ impl Default for TsInner {
 // when HEXPIRE/HEXPIREAT/HPEXPIRE/HPEXPIREAT/HSETEX is called on it. From
 // then on it stays `HashEx` until the key is DELed.
 //
-// Lazy eviction:
-//   `evict_expired_field` is the single place that decides "this field's
-//   TTL has elapsed" and removes both the value entry and the expiry entry.
-//   Every reader that wants TTL-aware behaviour calls this first; nobody
-//   writes ad-hoc field-removal logic.
+// Expiry: `field_expiry::expire_due` is the one place a field past its
+//   deadline is removed, and its removal propagated.
 /// The fields of a hash, in the order they were first set — which is the
 /// order `HGETALL`, `HKEYS`, `HVALS` and `HSCAN` give them in. Redis keeps
 /// that order for a hash small enough for a listpack, and clients have come
@@ -690,16 +725,210 @@ pub fn hash_remove(fields: &mut HashFields, field: &str) -> Option<std::sync::Ar
     }
 }
 
+/// A hash field's deadline: milliseconds since the Unix epoch, by the wall
+/// clock, as Redis keeps it and as every file, payload and stream carries it.
+///
+/// Kept as the number it came as, never converted: a deadline given as
+/// `HPEXPIREAT t` reads back as `t` through `DUMP` and `RESTORE`, `MIGRATE`,
+/// a snapshot, the AOF and a replica's sync and stream (#594). They were kept
+/// as monotonic `Instant`s and converted to and from Unix milliseconds by
+/// reading both clocks each time, and a round trip could land on the next
+/// millisecond; a relative one was sent to replicas worked out apart from
+/// the master's own, up to 1 ms earlier (#489). Eight bytes, where an
+/// `Instant` takes sixteen.
+///
+/// The deadline follows the wall clock, as a key's does here and as both do
+/// in Redis: a field set to go at 12:00 goes when the clock says 12:00, and
+/// a clock set back or forward moves when fields go with it. A time to live
+/// (`HPEXPIRE`, `EX`, `PX`) is turned into a deadline by the clock as it is
+/// when it is given.
+pub type FieldDeadline = u64;
+
+/// Now, as hash field deadlines are compared with it: Unix milliseconds by
+/// the wall clock; a script's frozen time inside a script, as Redis's
+/// `commandTimeSnapshot`.
+#[inline]
+pub fn field_now() -> FieldDeadline {
+    crate::script_clock::wall_ms_now()
+}
+
+/// Whether a field whose deadline is `at` is due at `now`: past it, not at
+/// it. A field lives through the millisecond it ends in, as a key does
+/// (`helpers::is_past`) and as Redis's `hashTypeGetValue` has it, so never
+/// for less than it was given. A deadline given that has already come
+/// (`at <= now`) deletes the field at once all the same, as Redis's
+/// `checkAlreadyExpired` does.
+#[inline(always)]
+pub fn field_due(at: FieldDeadline, now: FieldDeadline) -> bool {
+    at < now
+}
+
+/// The deadlines of a hash's fields, with the earliest of them kept, so that
+/// a command on a hash with field TTLs learns whether one is due without
+/// looking at each (#415).
+///
+/// What is kept is a bound never later than the earliest deadline, and
+/// whether it is that deadline exactly. A deadline set at or before it is
+/// the new earliest, exactly. Taking away or putting off the deadline the
+/// bound is leaves the bound where it was, earlier than it need be, and no
+/// longer exact: [`Expiries::has_due`] then looks at them all, once, and
+/// keeps what it found. A bound too early costs that one look, never a field
+/// missed. Read through `Deref`; written only through the methods here,
+/// which keep the bound.
+pub struct Expiries {
+    times: ahash::AHashMap<String, FieldDeadline>,
+    /// The bound, [`deadline_bound`] of a moment no deadline is earlier
+    /// than, shifted up one bit, and in the lowest bit whether some field's
+    /// deadline is that moment. One word, so that the two are read and
+    /// written together.
+    earliest: std::sync::atomic::AtomicU64,
+}
+
+/// The bound of `Expiries` when there is no deadline.
+const NO_DEADLINE: u64 = u64::MAX >> 1;
+
+/// What `Expiries` keeps of a deadline: the deadline, or for one further out
+/// than 63 bits hold (only a file from elsewhere has one), the furthest they
+/// do: earlier than the deadline, never later, and either way not one `now`
+/// reaches.
+fn deadline_bound(at: FieldDeadline) -> u64 {
+    at.min(NO_DEADLINE - 1)
+}
+
+fn pack(bound: u64, exact: bool) -> u64 {
+    (bound << 1) | u64::from(exact)
+}
+
+fn unpack(word: u64) -> (u64, bool) {
+    (word >> 1, word & 1 == 1)
+}
+
+impl Expiries {
+    pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            times: ahash::AHashMap::with_capacity(capacity),
+            earliest: std::sync::atomic::AtomicU64::new(pack(NO_DEADLINE, false)),
+        }
+    }
+
+    /// Set `field`'s deadline.
+    pub fn insert(&mut self, field: String, at: FieldDeadline) -> Option<FieldDeadline> {
+        let (bound, exact) = unpack(*self.earliest.get_mut());
+        let new = deadline_bound(at);
+        let old = self.times.insert(field, at);
+        let moved_the_bound = old.is_some_and(|old| deadline_bound(old) == bound);
+        *self.earliest.get_mut() = if new <= bound {
+            // Exact unless the deadline is past what the bound holds.
+            pack(new, new == at)
+        } else {
+            pack(bound, exact && !moved_the_bound)
+        };
+        old
+    }
+
+    /// Take `field`'s deadline away.
+    pub fn remove(&mut self, field: &str) -> Option<FieldDeadline> {
+        let old = self.times.remove(field)?;
+        let (bound, exact) = unpack(*self.earliest.get_mut());
+        if exact && deadline_bound(old) == bound {
+            *self.earliest.get_mut() = pack(bound, false);
+        }
+        Some(old)
+    }
+
+    pub fn clear(&mut self) {
+        self.times.clear();
+        *self.earliest.get_mut() = pack(NO_DEADLINE, false);
+    }
+
+    /// Whether a deadline is due at `now` ([`field_due`]). Only the clock:
+    /// what is done about it is `field_expiry::policy`'s to say. Looks at
+    /// no deadline while the bound is not due, or is a deadline and due;
+    /// otherwise at all of them, once, keeping the earliest.
+    #[inline]
+    pub fn has_due(&self, now: FieldDeadline) -> bool {
+        if self.times.is_empty() {
+            return false;
+        }
+        let (bound, exact) = unpack(self.earliest.load(std::sync::atomic::Ordering::Relaxed));
+        if !field_due(bound, now) {
+            return false;
+        }
+        exact || self.look_for_due(now)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn look_for_due(&self, now: FieldDeadline) -> bool {
+        let earliest = self.times.values().min().copied();
+        // Nothing can be set or taken away meanwhile: that takes the hash's
+        // lock for writing, and this has it for reading.
+        if let Some(earliest) = earliest {
+            let bound = deadline_bound(earliest);
+            self.earliest.store(
+                pack(bound, bound == earliest),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        earliest.is_some_and(|earliest| field_due(earliest, now))
+    }
+}
+
+impl Default for Expiries {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for Expiries {
+    fn clone(&self) -> Self {
+        Self {
+            times: self.times.clone(),
+            earliest: std::sync::atomic::AtomicU64::new(
+                self.earliest.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+impl std::ops::Deref for Expiries {
+    type Target = ahash::AHashMap<String, FieldDeadline>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.times
+    }
+}
+
+impl std::fmt::Debug for Expiries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.times.fmt(f)
+    }
+}
+
+impl FromIterator<(String, FieldDeadline)> for Expiries {
+    fn from_iter<I: IntoIterator<Item = (String, FieldDeadline)>>(iter: I) -> Self {
+        let mut out = Self::new();
+        for (field, at) in iter {
+            out.insert(field, at);
+        }
+        out
+    }
+}
+
 pub struct HashInner {
     pub fields: HashFields,
-    pub expiries: ahash::AHashMap<String, std::time::Instant>,
+    pub expiries: Expiries,
 }
 
 impl HashInner {
     pub fn new() -> Self {
         Self {
             fields: HashFields::default(),
-            expiries: ahash::AHashMap::new(),
+            expiries: Expiries::new(),
         }
     }
 
@@ -708,63 +937,75 @@ impl HashInner {
     pub fn from_fields(fields: HashFields) -> Self {
         Self {
             fields,
-            expiries: ahash::AHashMap::new(),
+            expiries: Expiries::new(),
         }
     }
 
     /// True when the field has an expiry that has already elapsed.
     /// False if no expiry is set, or the expiry is still in the future,
-    /// or the field doesn't exist. Never while this thread replays the AOF
-    /// (`expiry::replaying`): the log's writes to the field were made while
-    /// it lived.
+    /// or the field doesn't exist. Never while this thread loads a dataset,
+    /// replays the AOF, or applies its master's stream with fields held
+    /// (`expiry::fields_held`): the writes that follow were made while the
+    /// field lived, and the `HDEL` that follows says when it went.
     #[inline]
     pub fn is_field_expired(&self, field: &str) -> bool {
         match self.expiries.get(field) {
-            Some(exp) => std::time::Instant::now() >= *exp && !crate::expiry::replaying(),
+            Some(exp) => {
+                field_due(*exp, field_now())
+                    && !crate::expiry::replaying()
+                    && !crate::expiry::fields_held()
+            }
             None => false,
         }
     }
 
+    /// Whether a field's deadline is due at `now` ([`field_due`]). Only the
+    /// clock: what is done about it is `field_expiry::policy`'s to say.
+    #[inline]
+    pub fn has_due(&self, now: FieldDeadline) -> bool {
+        self.expiries.has_due(now)
+    }
+
+    /// The fields not due at `now`, or that have no deadline: what a reader
+    /// is shown of a hash whose due fields are left in place.
+    #[cold]
+    pub fn live_fields(&self, now: FieldDeadline) -> HashFields {
+        self.fields
+            .iter()
+            .filter(|(field, _)| {
+                self.expiries
+                    .get(*field)
+                    .is_none_or(|at| !field_due(*at, now))
+            })
+            .map(|(field, value)| (field.clone(), std::sync::Arc::clone(value)))
+            .collect()
+    }
+
     /// Remove a field's value AND its expiry entry. Returns the removed
-    /// value if the field existed. This is the only place fields get
-    /// deleted in TTL-aware code paths — call it for lazy eviction so
-    /// the expiries map never accumulates orphans.
+    /// value if the field existed.
     pub fn evict_field(&mut self, field: &str) -> Option<std::sync::Arc<[u8]>> {
         self.expiries.remove(field);
         hash_remove(&mut self.fields, field)
     }
 
-    /// Lazy-eviction check + removal. If the field is expired, removes it
-    /// and returns true. Otherwise returns false. Caller holds the write
-    /// lock.
-    pub fn lazy_evict_if_expired(&mut self, field: &str) -> bool {
-        if self.is_field_expired(field) {
-            self.evict_field(field);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Sweep all expired fields. Used by HGETALL / HKEYS / HVALS so the
-    /// caller gets a clean view in one pass under a single lock.
-    /// Returns the number of fields evicted.
+    /// Remove every field past its deadline, telling no one. For tests: a
+    /// server removes them through `field_expiry`, which propagates them.
+    #[cfg(test)]
     pub fn sweep_expired(&mut self) -> usize {
-        if self.expiries.is_empty() || crate::expiry::replaying() {
+        if self.expiries.is_empty() || crate::expiry::replaying() || crate::expiry::fields_held() {
             return 0;
         }
-        let now = std::time::Instant::now();
-        let mut to_remove: Vec<String> = Vec::new();
-        for (field, exp) in self.expiries.iter() {
-            if now >= *exp {
-                to_remove.push(field.clone());
-            }
+        let now = field_now();
+        let due: Vec<String> = self
+            .expiries
+            .iter()
+            .filter(|(_, at)| field_due(**at, now))
+            .map(|(field, _)| field.clone())
+            .collect();
+        for field in &due {
+            self.evict_field(field);
         }
-        for field in &to_remove {
-            hash_remove(&mut self.fields, field);
-            self.expiries.remove(field);
-        }
-        to_remove.len()
+        due.len()
     }
 
     pub fn len(&self) -> usize {
@@ -828,12 +1069,14 @@ const AR_SLICE_MIN_ALLOC: u32 = 8;
 /// `sizeof(arSlice)` on a 64-bit build.
 const AR_SLICE_HEADER: usize = 32;
 
-/// Highest addressable array index.
+/// Highest addressable array index: 2^64 - 2, as in Redis.
 ///
-/// Bounded by `i64::MAX` rather than `u64::MAX` because every index that crosses
-/// the wire does so as a RESP integer, which is signed 64-bit. An index that
-/// can't be reported back is not a usable index.
-pub const ARRAY_MAX_INDEX: u64 = i64::MAX as u64;
+/// An index (or a length) past `i64::MAX` is sent back as Redis sends it, a
+/// big number in RESP3 and its digits as a bulk string in RESP2 (see
+/// `resp_unsigned` in `commands/array.rs`). `ARSET` stopped at `i64::MAX`
+/// while `ARMSET` went on to here, and `ARLEN` wrapped to a negative number
+/// past it (#554). 2^64 - 1 is where an exhausted insert cursor stands.
+pub const ARRAY_MAX_INDEX: u64 = u64::MAX - 1;
 
 /// The inner data for an Array key.
 ///
@@ -1320,5 +1563,144 @@ mod sorted_set_tests {
         assert_eq!(Arc::strong_count(&a), 3); // ours, members, by_score
         assert!(zs.remove(b"a"));
         assert_eq!(Arc::strong_count(&a), 1);
+    }
+}
+
+#[cfg(test)]
+mod expiries_tests {
+    use super::{Expiries, field_due};
+
+    const NOW: u64 = 1_794_293_677_068;
+
+    /// The bound under the earliest deadline, after every way a deadline
+    /// is set, moved or taken away: a deadline due is never missed, and
+    /// once a look has found none due, the next looks at none.
+    #[test]
+    fn a_due_deadline_is_never_missed_however_the_deadlines_move() {
+        let now = NOW;
+        let later = |ms| now + ms;
+        let mut times = Expiries::new();
+        assert!(!times.has_due(now), "none");
+
+        times.insert("a".into(), later(10_000));
+        times.insert("b".into(), later(20_000));
+        assert!(!times.has_due(now));
+        assert!(!times.has_due(later(10_000)), "lives through its deadline");
+        assert!(times.has_due(later(10_001)), "past its deadline");
+
+        // Brought nearer, then past.
+        times.insert("b".into(), later(5_000));
+        assert!(times.has_due(later(5_001)));
+        times.insert("b".into(), now - 1);
+        assert!(times.has_due(now));
+
+        // Put off: the bound is left early, and the next look puts it right.
+        times.insert("b".into(), later(30_000));
+        assert!(!times.has_due(now));
+        assert!(!times.has_due(later(10_000)));
+        assert!(times.has_due(later(10_001)));
+
+        // The earliest taken away (HPERSIST, HDEL): a, then nothing.
+        times.remove("a");
+        assert!(!times.has_due(later(10_001)));
+        assert!(times.has_due(later(30_001)));
+        times.remove("b");
+        assert!(!times.has_due(later(1_000_000)));
+
+        // Cleared, then set again (a field's last deadline gone, a new one).
+        times.insert("c".into(), later(1));
+        times.clear();
+        assert!(!times.has_due(later(2)));
+        times.insert("c".into(), later(1));
+        assert!(times.has_due(later(2)));
+
+        // Built from deadlines (a load), one long past and one past what
+        // the bound holds.
+        let loaded: Expiries = [
+            ("old".to_string(), now - 3_600_000),
+            ("far".to_string(), u64::MAX),
+        ]
+        .into_iter()
+        .collect();
+        assert!(loaded.has_due(now));
+        assert!(loaded.clone().has_due(now));
+        let far: Expiries = [("far".to_string(), u64::MAX)].into_iter().collect();
+        assert!(!far.has_due(u64::MAX - 1));
+    }
+
+    /// A deadline is kept as the number it was given as: what goes in comes
+    /// out, at every millisecond (#594).
+    #[test]
+    fn a_deadline_is_kept_as_it_was_given() {
+        let mut times = Expiries::new();
+        for at in [0, 1, NOW, NOW + 1, (1 << 46) - 1, u64::MAX] {
+            times.insert("f".into(), at);
+            assert_eq!(times.get("f"), Some(&at));
+        }
+        assert!(!field_due(NOW, NOW));
+        assert!(field_due(NOW, NOW + 1));
+    }
+
+    /// Every way of moving the deadlines, at random, against a look at all
+    /// of them: `has_due` says what the look says, every time.
+    #[test]
+    fn has_due_agrees_with_a_look_at_every_deadline() {
+        let start = NOW;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut times = Expiries::new();
+        for _ in 0..200_000 {
+            let field = format!("f{}", next(16));
+            match next(10) {
+                0..=4 => {
+                    let at = start + next(1_000);
+                    times.insert(field, at);
+                }
+                5..=7 => {
+                    times.remove(&field);
+                }
+                8 if next(50) == 0 => {
+                    times.clear();
+                }
+                _ => {}
+            }
+            let now = start + next(1_100);
+            let truth = times.values().any(|at| field_due(*at, now));
+            assert_eq!(times.has_due(now), truth, "{times:?} at {now:?}");
+        }
+    }
+
+    /// Readers looking at once, each with the hash read-locked, as a
+    /// command does: none sees a due deadline as not due.
+    #[test]
+    fn readers_at_once_see_the_same() {
+        let now = NOW;
+        let mut times = Expiries::new();
+        for i in 0..1_000u64 {
+            times.insert(format!("f{i}"), now + (60 + i) * 1_000);
+        }
+        times.insert("due".into(), now);
+        times.insert("due".into(), now + 30_000);
+        let lock = std::sync::Arc::new(parking_lot::RwLock::new(times));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let lock = std::sync::Arc::clone(&lock);
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        let times = lock.read();
+                        assert!(!times.has_due(now + 30_000));
+                        assert!(times.has_due(now + 30_001));
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 }

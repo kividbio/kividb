@@ -10,6 +10,12 @@
 // Real `kividb` processes, because a restart and a replica are the points of
 // interest. Many hashes, so that their loads fall at many points of a
 // millisecond.
+//
+// Deadlines are kept as the Unix milliseconds they are given as, and none of
+// these reads a clock on the way, so each must hold exactly, every run: a
+// single millisecond off is a failure, never noise. They were kept as
+// `Instant`s and converted by reading both clocks, and `MIGRATE` once
+// brought one back 1 ms late in 300 hashes (#594).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -390,6 +396,85 @@ fn a_field_deadline_is_kept_to_the_millisecond_by_a_full_sync_and_the_stream() {
     });
     assert_deadlines(&mut r, "after a full sync", &synced, same);
     assert_deadlines(&mut r, "from the stream", &streamed, same);
+}
+
+/// `HASHES` hashes named `prefix0`, `prefix1`, ..., each of three fields,
+/// given relative times to live, one way each: `HPEXPIRE`, `HEXPIRE`,
+/// `HSETEX ... PX`, `HSETEX ... EX`, `HGETEX ... PX`, by turns. The master's
+/// own deadlines, as it reads them back.
+fn write_relative_ttls(c: &mut Conn, prefix: &str) -> Vec<(String, Vec<u64>)> {
+    let mut keys = Vec::new();
+    for i in 0..HASHES {
+        let key = format!("{prefix}{i}");
+        c.send(&[b"HSET", key.as_bytes(), b"a", b"1", b"b", b"2", b"c", b"3"]);
+        let ms = (3_600_000 + i * 13).to_string();
+        let secs = (3_600 + i).to_string();
+        let k = key.as_str();
+        let args: Vec<&str> = match i % 5 {
+            0 => vec!["HPEXPIRE", k, &ms, "FIELDS", "3", "a", "b", "c"],
+            1 => vec!["HEXPIRE", k, &secs, "FIELDS", "3", "a", "b", "c"],
+            2 => vec![
+                "HSETEX", k, "PX", &ms, "FIELDS", "3", "a", "1", "b", "2", "c", "3",
+            ],
+            3 => vec![
+                "HSETEX", k, "EX", &secs, "FIELDS", "3", "a", "1", "b", "2", "c", "3",
+            ],
+            _ => vec!["HGETEX", k, "PX", &ms, "FIELDS", "3", "a", "b", "c"],
+        };
+        let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        c.send(&args);
+        keys.push(key);
+    }
+    for _ in 0..HASHES * 2 {
+        assert!(!matches!(c.read(), V::Err(_)));
+    }
+    keys.into_iter()
+        .map(|key| {
+            let reply = c.cmd(&["HPEXPIRETIME", &key, "FIELDS", "3", "a", "b", "c"]);
+            let V::Arr(got) = &reply else {
+                panic!("HPEXPIRETIME {key}: {reply:?}");
+            };
+            let ats = got.iter().map(|v| v.int() as u64).collect();
+            (key, ats)
+        })
+        .collect()
+}
+
+/// A relative time to live reaches a replica as the very deadline the
+/// master keeps: the replica's `HPEXPIRETIME` is the master's, for every
+/// way of giving one. It was sent worked out apart from the master's own,
+/// from the time now cut to a millisecond, up to 1 ms earlier (#489).
+#[test]
+fn a_relative_field_ttl_reaches_a_replica_as_the_masters_deadline() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    let synced = write_relative_ttls(&mut m, "h");
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_until("the replica's link to come up", 60, || {
+        r.info("replication", "master_link_status") == "up"
+    });
+    let streamed = write_relative_ttls(&mut m, "s");
+    wait_until("the replica to catch up", 60, || {
+        let offset = m.info("replication", "master_repl_offset");
+        r.info("replication", "slave_repl_offset") == offset
+    });
+    assert_deadlines(&mut r, "after a full sync", &synced, same);
+    assert_deadlines(&mut r, "from the stream", &streamed, same);
+}
+
+/// The same through the AOF: a relative time to live is logged as the
+/// deadline the server keeps, and replayed as it.
+#[test]
+fn a_relative_field_ttl_is_replayed_from_the_aof_as_it_was_kept() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let want = write_relative_ttls(&mut c, "h");
+    std::thread::sleep(Duration::from_millis(1_500));
+    drop(c);
+    server.restart();
+    assert_deadlines(&mut server.conn(), "after an AOF replay", &want, same);
 }
 
 #[test]

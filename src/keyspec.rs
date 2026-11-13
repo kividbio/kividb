@@ -973,9 +973,10 @@ pub fn key_positions(name: &str, cmd: &[&[u8]]) -> Keys {
             } else if !cmd[3].is_empty() {
                 One(3)
             } else {
+                // Without `KEYS`, the empty key itself (#458).
                 match find_option(cmd, 6, b"KEYS") {
                     Some(pos) => rest(cmd, pos + 1),
-                    Option::None => None,
+                    Option::None => One(3),
                 }
             }
         }
@@ -1174,9 +1175,10 @@ mod tests {
                 } else if !cmd[3].is_empty() {
                     One(3)
                 } else {
+                    // Without `KEYS`, the empty key itself (#458).
                     match find_option(cmd, 6, b"KEYS") {
                         Some(pos) => rest(cmd, pos + 1),
-                        Option::None => None,
+                        Option::None => One(3),
                     }
                 }
             }
@@ -1496,6 +1498,7 @@ mod tests {
         );
         assert!(keys(&["EVAL", "return 1", "0"]).is_empty());
         assert_eq!(keys(&["MIGRATE", "h", "1", "k", "0", "100"]), ["k"]);
+        assert_eq!(keys(&["MIGRATE", "h", "1", "", "0", "100"]), [""]);
         assert_eq!(
             keys(&["MIGRATE", "h", "1", "", "0", "100", "KEYS", "a", "b"]),
             ["a", "b"]
