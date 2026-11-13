@@ -80,6 +80,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   could leave the sockets unpolled, so no client was accepted or read until
   they were done. They now run off the runtime, as `CONFIG SET appendonly
   yes` and `MIGRATE` do. `SAVE` still blocks its own client, as in Redis.
+
+- **Three tests that failed now and then under load no longer do (#420,
+  #515, #681).** The two tests of the allocation counter measure the whole
+  process, and each moved it by more than the other allowed for when they
+  ran at once: they now take turns. The test hold of the sync for replies
+  under `appendfsync always` was also reached by the second's sync, which
+  answers no reply, so a test could wait at a hold it never let go of: only
+  the replies' sync reaches it now. And the `noeviction` test of writing
+  over hash values left whatever room the limit happened to fall at, often
+  less than the server uses besides the keys under load: it now leaves 64 KB.
+
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

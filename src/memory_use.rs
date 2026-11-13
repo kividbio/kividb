@@ -312,8 +312,15 @@ pub fn over(limit: usize) -> bool {
 mod tests {
     use super::*;
 
+    /// Held by each test here that measures what the whole process has
+    /// allocated: they move it by hundreds of megabytes, far more than the
+    /// other's margin. Run at once, one's 256 MB block, or the other's
+    /// blocks in flight, were counted in the other's change (#420).
+    static WHOLE_PROCESS: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
     #[test]
     fn what_is_allocated_is_counted_and_what_is_freed_is_not() {
+        let _alone = WHOLE_PROCESS.lock();
         // Other tests allocate at the same time: look for a change far
         // larger than anything they do.
         const SIZE: usize = 256 << 20;
@@ -338,6 +345,7 @@ mod tests {
     /// counts.
     #[test]
     fn threads_that_free_each_others_blocks_come_out_even() {
+        let _alone = WHOLE_PROCESS.lock();
         const BLOCK: usize = 1 << 20;
         let before = allocated();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
