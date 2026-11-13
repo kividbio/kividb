@@ -46,7 +46,11 @@ The Docker image runs with protected mode off by default; see
 
 KiviDB is configured with command-line flags, or with a Redis-style configuration file
 (one directive per line, such as `port 6380` or `appendonly yes`). The file is read from
-`/etc/kividb/kividb.conf` if it exists; `--configfile <path>` names another one. A flag given
+`/etc/kividb/kividb.conf` if it exists; `--configfile <path>` names another one. A server that
+read the default file without `--configfile` naming it logs a warning and refuses
+`CONFIG REWRITE`, since other servers on the host may read the same file; a future release will
+read a config file only when one is named, as Redis does. The packaged systemd unit passes
+`--configfile /etc/kividb/kividb.conf`. A flag given
 on the command line wins over the same setting in the file. Run `kividb --help` for the full
 list.
 
