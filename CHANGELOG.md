@@ -9,6 +9,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
+  that a short key never took (#497).** The list of hashes whose fields
+  expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
+  bytes is held inside that copy rather than on the heap. The estimate now adds the key's length only
+  for a key that really is on the heap.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

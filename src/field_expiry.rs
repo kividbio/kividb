@@ -126,13 +126,17 @@ fn store_id(store: &Store) -> usize {
     std::sync::Arc::as_ptr(store) as *const () as usize
 }
 
-/// What a hash's place on the watch list takes, for a key of `key_len`
-/// bytes (`MEMORY USAGE`): its bucket and control byte in the list's
-/// table, and its own copy of the key (`to_string`, exactly as long as the
-/// key). Not the table's empty room: that is no one hash's, and deleting a
-/// hash does not give it back (the table does not shrink).
-pub fn watch_entry_size(key_len: usize) -> usize {
-    std::mem::size_of::<(Entry, FieldDeadline)>() + 1 + key_len
+/// What a hash's place on the watch list takes, for the hash at `key`
+/// (`MEMORY USAGE`): its bucket and control byte in the list's table, and
+/// its own copy of the key. That copy is a `store::Key`, which holds a key
+/// of up to twenty-three bytes in the bucket itself, so only a longer key
+/// adds its bytes, on the heap. Not the table's empty room: that is no one
+/// hash's, and deleting a hash does not give it back (the table does not
+/// shrink).
+pub fn watch_entry_size(key: &[u8]) -> usize {
+    std::mem::size_of::<(Entry, FieldDeadline)>()
+        + 1
+        + crate::key_bytes::KeyBytes::heap_bytes_of(key)
 }
 
 /// Note that the hash at `key` has a field due at `at`.
@@ -591,6 +595,27 @@ mod tests {
     use crate::types::{HashInner, KiviDBValue};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// #497: a key the watch list holds inline (up to twenty-three bytes,
+    /// `store::Key`) adds nothing to what its place takes; a longer one adds
+    /// its bytes, on the heap.
+    #[test]
+    fn watch_entry_size_counts_only_a_key_on_the_heap() {
+        let place = std::mem::size_of::<(Entry, FieldDeadline)>() + 1;
+        assert_eq!(watch_entry_size(b""), place);
+        assert_eq!(watch_entry_size(b"h"), place);
+        assert_eq!(watch_entry_size(&[b'k'; 23]), place);
+        assert_eq!(watch_entry_size(&[b'k'; 24]), place);
+        let mut heap24 = [b'k'; 24];
+        heap24[23] = 0xff;
+        assert_eq!(watch_entry_size(&heap24), place + 24);
+        assert_eq!(watch_entry_size(&[b'k'; 40]), place + 40);
+        for key in [&b"h"[..], &[b'k'; 23], &heap24, &[b'k'; 40]] {
+            let held = crate::store::Key::new(key);
+            let heap = if held.is_inline() { 0 } else { key.len() };
+            assert_eq!(watch_entry_size(key), place + heap, "{key:?}");
+        }
+    }
 
     fn hash_with(fields: &[(&str, Option<Duration>)]) -> KiviDBValue {
         let mut inner = HashInner::new();
