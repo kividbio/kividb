@@ -1824,7 +1824,9 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     let mut copy = false;
     let mut replace = false;
     let mut auth: Option<Vec<Vec<u8>>> = None;
-    let mut keys: Vec<&[u8]> = Vec::new();
+    // The key argument, or with `KEYS` what follows it: an empty key
+    // argument names the empty key unless `KEYS` follows, as in Redis (#458).
+    let mut keys: Vec<&[u8]> = vec![cmd[3]];
     let mut i = 6;
     while i < cmd.len() {
         let option = cmd[i].to_ascii_uppercase();
@@ -1853,18 +1855,13 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
                     );
                 }
                 // KEYS is the last option: everything after it is a key.
+                // None at all is a migration of nothing (`NOKEY`).
                 keys = cmd[i + 1..].to_vec();
                 break;
             }
             _ => return resp_error("ERR syntax error"),
         }
         i += 1;
-    }
-    if keys.is_empty() {
-        if cmd[3].is_empty() {
-            return resp_error("ERR syntax error");
-        }
-        keys.push(cmd[3]);
     }
 
     let db = *ctx.selected_db;

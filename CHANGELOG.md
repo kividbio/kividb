@@ -32,6 +32,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   master, as always, and run `BGREWRITEAOF` before upgrading if such
   commands are in the AOF.
 
+- **`MIGRATE` with an empty key argument and no `KEYS` migrates the empty
+  key (#458).** `MIGRATE host port "" db timeout` was a syntax error where
+  Redis migrates the key named `""`, and the key tables named no key for
+  that form, so ACL key checks did not see it. `KEYS` with nothing after
+  it now answers `NOKEY`, as in Redis.
+
 - **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
   that a short key never took (#497).** The list of hashes whose fields
   expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
