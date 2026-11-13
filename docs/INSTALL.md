@@ -229,7 +229,7 @@ docker pull ghcr.io/kividbio/kividb:latest
 docker run -d -p 6380:6380  -v kividb-data:/data kividb/kividb
 ```
 
-The `-v kividb-data:/data` flag mounts a named volume so your data survives container restarts. Without it, data is lost when the container is removed.
+The `-v kividb-data:/home/kividb` flag mounts a named volume where KiviDB keeps its data (`/home/kividb`, the image's working directory), so it survives the container being removed and recreated. Without it, the data is lost with the container.
 
 A container is reached through its network, never from loopback, so the image's default
 command is `--protected-mode no`. **Arguments you pass replace that default**, which turns
