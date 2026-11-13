@@ -1406,6 +1406,8 @@ pub enum KiviDBValue {
     TimeSeries(Arc<RwLock<TsInner>>),
     HashEx(Arc<RwLock<HashInner>>),
     Array(Arc<RwLock<ArrayInner>>),
+    /// The probabilistic types (`BF.*`; see [`crate::sketch`]).
+    Sketch(Arc<RwLock<crate::sketch::Sketch>>),
 }
 
 impl KiviDBValue {
@@ -1438,6 +1440,11 @@ impl KiviDBValue {
                 })))
             }
             KiviDBValue::Array(array) => KiviDBValue::Array(fresh(array)),
+            // A filter of its own whose layers share their bytes with the
+            // original's until either is written to, which then copies the
+            // layer it writes, with memory asked for, not assumed: a copy of
+            // a large filter costs nothing here, and cannot abort.
+            KiviDBValue::Sketch(sketch) => KiviDBValue::Sketch(fresh(sketch)),
         }
     }
 
@@ -1457,7 +1464,8 @@ impl KiviDBValue {
             | KiviDBValue::Json(_)
             | KiviDBValue::Stream(_)
             | KiviDBValue::TimeSeries(_)
-            | KiviDBValue::Array(_) => false,
+            | KiviDBValue::Array(_)
+            | KiviDBValue::Sketch(_) => false,
         }
     }
 
@@ -1477,6 +1485,7 @@ impl KiviDBValue {
             (TimeSeries(a), TimeSeries(b)) => Arc::ptr_eq(a, b),
             (HashEx(a), HashEx(b)) => Arc::ptr_eq(a, b),
             (Array(a), Array(b)) => Arc::ptr_eq(a, b),
+            (Sketch(a), Sketch(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -1494,6 +1503,7 @@ impl KiviDBValue {
             KiviDBValue::TimeSeries(_) => "TSDB-TYPE",
             KiviDBValue::HashEx(_) => "hash",
             KiviDBValue::Array(_) => "array",
+            KiviDBValue::Sketch(sketch) => sketch.read().type_name(),
         }
     }
 }

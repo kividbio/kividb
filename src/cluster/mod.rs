@@ -371,6 +371,9 @@ pub struct ClusterState {
     /// The connection each peer is pinged over, by `ip:bus_port`, kept open
     /// between heartbeats. See `bus::dialer::send_ping`.
     pub(crate) ping_links: parking_lot::Mutex<AHashMap<String, bus::dialer::PingLink>>,
+    /// The connections a search is sent on to the other masters, kept open
+    /// between searches. See `search::Pool`.
+    pub(crate) search_pool: search::Pool,
 }
 
 impl ClusterState {
@@ -431,6 +434,7 @@ impl ClusterState {
             stats_bus_connects: AtomicU64::new(0),
             links: parking_lot::Mutex::new(AHashMap::new()),
             ping_links: parking_lot::Mutex::new(AHashMap::new()),
+            search_pool: search::Pool::default(),
         };
         state.refresh_state();
         state
@@ -579,6 +583,7 @@ impl ClusterState {
         state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
         state.set_my_announced_client_port(config.cluster_announce_client_port);
+        state.search_pool.size_for(config.resolve_threads());
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
                 .bus_secret

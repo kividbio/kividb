@@ -46,8 +46,23 @@ mod imp {
     static REPLICATION_SET: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
+    /// How many times `SETTINGS` has been set: a connection kept open is
+    /// one made with the settings of the generation it was made in.
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn settings() -> Option<Arc<Settings>> {
         SETTINGS.read().clone()
+    }
+
+    fn set_settings(settings: Option<Settings>) {
+        let mut slot = SETTINGS.write();
+        *slot = settings.map(Arc::new);
+        GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Changes whenever TLS between nodes is set up again (#723).
+    pub fn generation() -> u64 {
+        GENERATION.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Checks the chain against the CA, and not the name: see the module.
@@ -119,7 +134,11 @@ mod imp {
             config.tls_replication || config.tls_cluster,
         )?;
         // The first server of the process sets it up.
-        SETTINGS.write().get_or_insert(Arc::new(built));
+        let mut slot = SETTINGS.write();
+        if slot.is_none() {
+            *slot = Some(Arc::new(built));
+            GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 
@@ -135,7 +154,7 @@ mod imp {
             return Ok(());
         };
         let built = build(files, now.cluster, now.replication)?;
-        *SETTINGS.write() = Some(Arc::new(built));
+        set_settings(Some(built));
         Ok(())
     }
 
@@ -146,10 +165,10 @@ mod imp {
     pub fn set_replication(on: bool, files: crate::tls::acceptor::Files) -> Result<(), String> {
         let cluster = cluster();
         if !on && !cluster {
-            *SETTINGS.write() = None;
+            set_settings(None);
         } else {
             let built = build(files, cluster, on || cluster)?;
-            *SETTINGS.write() = Some(Arc::new(built));
+            set_settings(Some(built));
         }
         REPLICATION_SET.store(on, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -255,9 +274,14 @@ mod imp {
 
 #[cfg(feature = "tls")]
 pub use imp::{
-    accept_bus, cluster, connect_async, connect_sync, files, init, reload, replication,
+    accept_bus, cluster, connect_async, connect_sync, files, generation, init, reload, replication,
     replication_set, set_replication,
 };
+
+#[cfg(not(feature = "tls"))]
+pub fn generation() -> u64 {
+    0
+}
 
 #[cfg(not(feature = "tls"))]
 pub fn init(config: &crate::config::Config) -> Result<(), String> {
