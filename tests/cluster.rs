@@ -755,6 +755,7 @@ fn a_cluster_replica_refuses_a_full_sync_with_keys_outside_database_0() {
     );
     // Its own keys are untouched, and none of the master's came in.
     assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3), "{}", replica.log());
+}
 
 /// `cluster-port` sets the port the bus listens on, from a config file (as
 /// LiteLLM's tests start a node) or the command line, in place of `port` +
