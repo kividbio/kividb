@@ -5109,6 +5109,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Err(RewriteError::NoConfigFile) => Some(resp_error(
                             "ERR The server is running without a config file",
                         )),
+                        Err(RewriteError::DefaultConfigFile(path)) => Some(resp_error(&format!(
+                            "ERR The server read '{path}' only because it is the default \
+                             config file, and will not rewrite it. Start the server with \
+                             '--configfile {path}' to allow CONFIG REWRITE"
+                        ))),
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }
