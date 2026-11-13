@@ -35,6 +35,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was recorded. The dataset fingerprint a restarted master
   compares with its replicas uses the same digest, so those replicas are no
   longer sent a full sync they did not need.
+
+- **A replica's full sync breaks the `WATCH`es on its keys (#673).** When
+  a full sync replaced a replica's dataset, the watches on its keys stayed,
+  and an `EXEC` after it ran although the watched values could have changed
+  under it. As in Redis, a watch on a key that is in the old dataset or the
+  new one is now broken, and one on a key in neither holds.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
