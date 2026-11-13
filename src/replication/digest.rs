@@ -386,9 +386,8 @@ mod tests {
         let make = |names: &[&str], seen: u64, delivered: u64| {
             let mut s = StreamInner::new();
             for ms in 1..=5u64 {
-                let fields: Vec<(Arc<[u8]>, Arc<[u8]>)> =
-                    vec![(Arc::from(&b"f"[..]), Arc::from(ms.to_string().as_bytes()))];
-                s.entries.push_tail(StreamId::new(ms, 0), &fields);
+                let value = ms.to_string();
+                s.entries.push_tail(StreamId::new(ms, 0), &[(&b"f"[..], value.as_bytes())]);
             }
             s.last_id = StreamId::new(5, 0);
             s.entries_added = 5;
