@@ -1372,6 +1372,7 @@ fn test_scripts_from_many_clients_at_once_run_one_at_a_time() {
 /// of a millisecond that the clock it was told by kept.
 #[test]
 fn a_time_to_live_is_told_in_full_by_the_script_that_set_it() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
@@ -1527,6 +1528,46 @@ fn a_quick_function_that_turns_endless_does_not_stop_the_server() {
     assert_eq!(Conn::connect(port).cmds(&["PING"]).as_str(), "PONG");
     c.cmds(&["CONFIG", "SET", "lua-time-limit", "5000"]);
     c.cmds(&["FUNCTION", "DELETE", "turnslib"]);
+}
+
+/// A script that waits for `TIME` to move ends, as in Redis 8.10.3: `TIME`
+/// holds the script's start until the script has run past
+/// `busy-reply-threshold`, then moves. Expiry doesn't: a key's `PTTL` is
+/// the same at the end as at the start, 300 ms later by `TIME`. Before #676
+/// `TIME` never moved and the script ran until killed.
+#[test]
+fn a_script_waiting_for_time_to_move_ends_past_the_busy_threshold() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["CONFIG", "SET", "busy-reply-threshold", "200"]);
+    c.cmds(&["SET", "timemoves", "v", "PX", "5000"]);
+
+    // Ends the script if it never returns, so the server and the tests
+    // after this one aren't left BUSY.
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let watchdog = thread::spawn(move || {
+        if wait.recv_timeout(Duration::from_secs(4)).is_err() {
+            Conn::connect(port).cmds(&["SCRIPT", "KILL"]);
+        }
+    });
+    let script = "local p0 = redis.call('PTTL', KEYS[1]) \
+                  local t0 = redis.call('TIME') \
+                  local same = redis.call('TIME')[2] == t0[2] \
+                  local t \
+                  repeat t = redis.call('TIME') \
+                  until (t[1] - t0[1]) * 1000000 + (t[2] - t0[2]) >= 300000 \
+                  return {same and 1 or 0, p0 - redis.call('PTTL', KEYS[1])}";
+    let reply = c.cmds(&["EVAL", script, "1", "timemoves"]);
+    let _ = done.send(());
+    watchdog.join().unwrap();
+    c.cmds(&["CONFIG", "SET", "busy-reply-threshold", "5000"]);
+
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![RespValue::Int(1), RespValue::Int(0)])
+    );
 }
 
 // ── error(): tables, the reply's tail, and acl_check_cmd's arity ─────────────

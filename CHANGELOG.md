@@ -23,6 +23,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A script that waits for `TIME` to move ends (#676).** `TIME` in a
+  script returned the script's start for as long as it ran, so a loop
+  waiting for it to change ran until `SCRIPT KILL`. As in Redis, `TIME`
+  now moves once the script has run past `busy-reply-threshold`. Expiry
+  still holds the script's start, and `EXEC` still holds one time.
+
 - **A server that read `/etc/kividb/kividb.conf` only because it is the
   default config file refuses `CONFIG REWRITE` (#475).** On a host with the
   deb or rpm package installed, every server started without `--configfile`
