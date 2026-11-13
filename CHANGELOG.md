@@ -15,6 +15,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bytes is held inside that copy rather than on the heap. The estimate now adds the key's length only
   for a key that really is on the heap.
 
+- **`CLIENT LIST` and `CLIENT INFO` show `x` for a client inside `MULTI`
+  (#656).** Such a client showed `flags=N`, so a tool looking for clients
+  left in a transaction found none. The flag comes after `P` and before
+  `b`, as in Redis 8.10.
+
 - **`SCRIPT LOAD` and `SCRIPT FLUSH` during a slot handoff or a manual
   failover are answered at once, instead of stalling every connection of
   their worker thread until the handoff ended (#528).** The pause does not
