@@ -1723,6 +1723,12 @@ fn sync_for_replies() {
     }
     match file {
         Some(Ok(file)) => {
+            // A test holds the sync for these replies here: only here, not
+            // in the second's sync (`do_fsync`), which answers no reply. Held
+            // there too, a tick that came first took the hit the test
+            // waited for, and the replies' sync then waited at the next one,
+            // which the test never let go of (#515).
+            failpoint("aof-fsync-before-reply");
             sync_before_reply(&file);
             AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
         }
@@ -1739,7 +1745,6 @@ fn sync_for_replies() {
 /// new log whose name may not be. A sync that fails ends the server, as in
 /// Redis: it can neither reply nor keep the promise.
 fn sync_before_reply(file: &std::fs::File) {
-    failpoint("aof-fsync-before-reply");
     let synced = (|| {
         if OLD_LOG_UNSYNCED.load(Ordering::Acquire) != 0 {
             sync_old_log()?;

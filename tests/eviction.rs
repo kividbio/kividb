@@ -1727,10 +1727,24 @@ fn noeviction_allows_writing_over_hash_values_near_the_limit() {
         keys += 1;
         assert!(keys < 10_000);
     }
-    // Some room again, less than another hash takes.
-    assert_eq!(c.cmd(&["DEL", "h0"]).i(), 1);
+    // Some room again: a few hashes deleted, until 64 KB is free (#681).
+    //
+    // One hash deleted left whatever room the limit happened to fall at,
+    // anywhere from nothing to one hash (about 9 KB). What the server uses
+    // besides the keys is in what is counted against the limit too: the
+    // command being run, read before it is checked (about 3 KB here, more
+    // when it comes in pieces), and allocations the server makes once under
+    // load (about 21 KB measured, with a thread's worth of resident memory).
+    // A room of a few KB was eaten, and the first write over was refused.
+    const ROOM: i64 = 64 << 10;
+    let mut deleted = 0;
+    while c.used_memory() > limit - ROOM {
+        assert_eq!(c.cmd(&["DEL", &format!("h{deleted}")]).i(), 1);
+        deleted += 1;
+        assert!(deleted < keys / 2, "{deleted} of {keys} hashes deleted");
+    }
     for round in 0..20 {
-        for k in 1..keys.min(50) {
+        for k in deleted..keys.min(deleted + 49) {
             let fill = if round % 2 == 0 { "b" } else { "c" };
             let pairs: Vec<String> = members(0, 65)
                 .into_iter()

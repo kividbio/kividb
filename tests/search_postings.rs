@@ -1141,11 +1141,27 @@ fn page(c: &mut Conn, index: &str, on: bool) {
 /// FT.SEARCH `index` `args`: the page from postings, every match read, and
 /// every document tried (postings off). Asked again if a key was deleted
 /// meanwhile (the active expiry cycle): relevance counts the documents.
+///
+/// What is compared before and after is the index's own count of what it
+/// holds as well as the keyspace's (#421). A key the expiry deletes leaves
+/// the keyspace under its shard's lock, and its index a moment later, once
+/// that lock is let go of: `DBSIZE` taken in between was the same after the
+/// three queries, while the first had scored with the document still in the
+/// index's statistics and the others without it (a BM25 of 1.811 against
+/// 1.821).
 fn three_ways(c: &mut Conn, index: &str, args: &[String]) -> (V, V, V) {
     let mut cmd: Vec<&str> = vec!["FT.SEARCH", index];
     cmd.extend(args.iter().map(String::as_str));
+    let held = |c: &mut Conn| {
+        let info = c.cmd(&["FT.INFO", index]);
+        (
+            c.cmd(&["DBSIZE"]),
+            info.get("num_records").clone(),
+            info.get("doc_ids").clone(),
+        )
+    };
     loop {
-        let before = c.cmd(&["DBSIZE"]);
+        let before = held(c);
         let paged = c.cmd(&cmd);
         page(c, index, false);
         let whole = c.cmd(&cmd);
@@ -1153,7 +1169,7 @@ fn three_ways(c: &mut Conn, index: &str, args: &[String]) -> (V, V, V) {
         let scanned = c.cmd(&cmd);
         postings(c, index, true);
         page(c, index, true);
-        if c.cmd(&["DBSIZE"]) == before {
+        if held(c) == before {
             return (paged, whole, scanned);
         }
     }
