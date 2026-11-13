@@ -4,8 +4,10 @@
 //! The replies and errors are Redis 8.10's, byte for byte, in RESP2 and
 //! RESP3, quirks included: `BF.EXISTS` and `BF.MEXISTS` answer 0 for a key
 //! of another type rather than `WRONGTYPE`; `BF.MADD` and `BF.INSERT` stop
-//! at an item a full filter cannot take, and the reply ends with that
-//! item's error; `BF.RESERVE` ignores words it does not know; the error
+//! at an item a full non-scaling filter cannot take, and the reply ends
+//! with that item's error, but go on past an item a filter that cannot
+//! grow cannot take, with an error in that item's place; `BF.RESERVE`
+//! ignores words it does not know; the error
 //! messages differ between `BF.RESERVE` (`ERR bad capacity`) and
 //! `BF.INSERT` (`Bad capacity`). The filter itself is `sketch::bloom`.
 //!
@@ -31,10 +33,12 @@
 //!
 //! A command of many items (`BF.MADD`, `BF.INSERT`, `BF.MEXISTS`) is held
 //! to a per-command limit (`sketch::bloom::PROBE_BUDGET`): it stops at the
-//! item that could take it past the limit, and its reply ends with an
-//! error for that item, as it ends at an item a full filter cannot take.
-//! A write that stopped early is sent to replicas and the AOF with the
-//! items it took and no others.
+//! item that could take it past the limit. `BF.MEXISTS`'s reply ends with
+//! an error for that item; `BF.MADD`'s and `BF.INSERT`'s has the error in
+//! the place of that item and of every one after it, so that it has a
+//! reply for each item. A write that did not take every item (one stopped
+//! early, or one that went on past an item it could not take) is sent to
+//! replicas and the AOF with the items it took and no others.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -42,13 +46,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::commands::ctx::Ctx;
 use crate::resp::write::{
-    resp_array, resp_bool_resp3, resp_bulk, resp_bulk_str, resp_error, resp_integer, resp_map_for,
-    resp_null_for, resp_simple,
+    push_header, resp_array, resp_bool_resp3, resp_bulk, resp_bulk_str, resp_error, resp_integer,
+    resp_map_for, resp_null_for, resp_simple,
 };
 use crate::sketch::Sketch;
 use crate::sketch::bloom::{
     BloomChain, BloomError, Limits, MAX_CAPACITY, MAX_ERROR, MAX_EXPANSION, MAX_MAX_FILTER_BYTES,
-    NO_MEMORY, Params, Probes, ShapeError, hash,
+    NO_MEMORY, PROBE_BUDGET, Params, Probes, ShapeError, hash,
 };
 use crate::store::{self, Key, ValueRef};
 use crate::types::KiviDBValue;
@@ -184,8 +188,8 @@ fn default_params() -> Params {
 
 thread_local! {
     /// What a command is to be sent as instead of itself: the `BF.INSERT`
-    /// naming how it made its filter, or the items it took when it stopped
-    /// early (none, nothing).
+    /// naming how it made its filter, or the items it took when it did not
+    /// take them all (none, nothing).
     static MADE: RefCell<Option<Vec<Vec<Vec<u8>>>>> = const { RefCell::new(None) };
     /// Whether the running write got as far as the key.
     static TOUCHED: Cell<bool> = const { Cell::new(false) };
@@ -199,7 +203,7 @@ fn begin_write() {
 /// What `BF.ADD`, `BF.MADD`, `BF.INSERT` or `BF.RESERVE` (`cmd`) is sent to
 /// replicas and the AOF as: itself; or, if it made its filter with a
 /// setting of this node's, a command that names what it took; or, if it
-/// stopped before its last item, one with the items it took.
+/// did not take every item, one with the items it took.
 pub(crate) fn propagation(cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     match MADE.with_borrow_mut(Option::take) {
         Some(cmds) => cmds,
@@ -212,19 +216,24 @@ fn send_as(cmds: Vec<Vec<Vec<u8>>>) {
 }
 
 /// What a `BF.MADD` or `BF.INSERT` (`cmd`, its items the last `items` of
-/// it) that took the first `done` of them is to be sent as, if not as
-/// itself: `made` is the parameters it made the filter with, if it made
-/// it, and `header` the filter's header if it took no item.
+/// it) that took the items at `taken` (in order) is to be sent as, if not
+/// as itself: `made` is the parameters it made the filter with, if it made
+/// it, and `header` the filter's header if it took no item. The items it
+/// took need not be the first: it goes on past one it cannot take.
 fn sent_items(
     cmd: &[&[u8]],
     key: &[u8],
     items: &[&[u8]],
-    done: usize,
+    taken: &[usize],
     made: Option<&Params>,
     header: Option<Vec<u8>>,
 ) -> Option<Vec<Vec<Vec<u8>>>> {
+    let took = || taken.iter().map(|&i| items[i]);
     match (made, header) {
-        (Some(params), _) if done > 0 => Some(vec![insert_form(key, params, &items[..done])]),
+        (Some(params), _) if !taken.is_empty() => {
+            let took: Vec<&[u8]> = took().collect();
+            Some(vec![insert_form(key, params, &took)])
+        }
         // Made, and nothing put in it: the empty filter, as its header.
         (Some(_), Some(header)) => Some(vec![vec![
             b"BF.LOADCHUNK".to_vec(),
@@ -233,14 +242,15 @@ fn sent_items(
             header,
         ]]),
         (Some(_), None) => None,
-        (None, _) if done == items.len() => None,
-        (None, _) if done == 0 => Some(Vec::new()),
+        (None, _) if taken.len() == items.len() => None,
+        (None, _) if taken.is_empty() => Some(Vec::new()),
         (None, _) => {
             let head = &cmd[..cmd.len() - items.len()];
             Some(vec![
                 head.iter()
-                    .chain(&items[..done])
-                    .map(|b| b.to_vec())
+                    .copied()
+                    .chain(took())
+                    .map(<[u8]>::to_vec)
                     .collect(),
             ])
         }
@@ -667,49 +677,113 @@ fn add(ctx: &mut Ctx) -> Vec<u8> {
     }
 }
 
-/// What [`add_each`] did: the replies, how many items it took, and the
-/// filter's header if it took none.
+/// What [`add_each`] did: the replies, the items it took (their places,
+/// in order), the filter's header if it took none, and the item it
+/// stopped at for the per-command limit, if it did.
 struct Added {
     replies: Vec<Vec<u8>>,
-    done: usize,
+    taken: Vec<usize>,
     header: Option<Vec<u8>>,
+    over_from: Option<usize>,
 }
 
-/// The items' hashes, taken before the shard's lock is.
-fn hash_all(items: &[&[u8]]) -> Vec<(u64, u64)> {
-    items.iter().map(|item| hash(item)).collect()
+/// The most items a command held to the per-command limit can get to: each
+/// item it looks at costs at least one bit of [`PROBE_BUDGET`].
+const MOST_ITEMS: usize = PROBE_BUDGET as usize + 1;
+
+/// The items' hashes, taken before the shard's lock is: of no more than
+/// [`MOST_ITEMS`] of them if the command is held to the per-command limit
+/// (`budgeted`), as it gets to no more.
+fn hash_all(items: &[&[u8]], budgeted: bool) -> Vec<(u64, u64)> {
+    let n = if budgeted {
+        items.len().min(MOST_ITEMS)
+    } else {
+        items.len()
+    };
+    items[..n].iter().map(|item| hash(item)).collect()
 }
 
-/// Add each of the items hashed to `hashed`, stopping at one the filter
-/// cannot take, or at the per-command limit (`probes`): the replies, the
-/// last of them that one's error. Nothing of the item it stopped at is
-/// written.
+/// The reply of a `BF.MADD` or `BF.INSERT` of `items` items: the replies
+/// [`add_each`] gave, then, if it stopped at the per-command limit, the
+/// limit's error for that item and every one after it, written into the
+/// one buffer.
+fn items_reply(replies: Vec<Vec<u8>>, over_from: Option<usize>, items: usize) -> Vec<u8> {
+    let rest = over_from.map_or(0, |at| items.saturating_sub(at));
+    let over = add_error(BloomError::OverBudget);
+    let bytes = replies.iter().map(Vec::len).sum::<usize>() + rest * over.len() + 16;
+    let mut out = Vec::with_capacity(bytes);
+    push_header(&mut out, b'*', replies.len() + rest);
+    for reply in replies {
+        out.extend_from_slice(&reply);
+    }
+    for _ in 0..rest {
+        out.extend_from_slice(&over);
+    }
+    out
+}
+
+/// Add each of the `items` items, the first of them hashed to `hashed`, a
+/// reply for each, as Redis 8.10 does: an item a filter that cannot grow
+/// cannot take is answered with its error, and the next item is added; an
+/// item a full non-scaling filter cannot take ends the reply with its
+/// error. At the per-command limit (`probes`) it stops, and the item it
+/// stopped at, and every one after it, is to be answered with the limit's
+/// error (`over_from`; the items not hashed are past the limit). Nothing
+/// of an item that is answered with an error is written.
 fn add_each(
     chain: &mut BloomChain,
     hashed: &[(u64, u64)],
+    items: usize,
     resp: u8,
     limits: Limits,
     mut probes: Probes,
 ) -> Added {
     let mut replies = Vec::with_capacity(hashed.len());
-    let mut done = 0;
-    for &h in hashed {
-        match chain.add_hashed(h, limits, &mut probes) {
+    let mut taken = Vec::with_capacity(hashed.len());
+    let mut over_from = None;
+    let mut full = false;
+    // The error of the first item the filter could not take. Refusing it
+    // changed nothing, so a later item the filter does not have would be
+    // refused the same way: it is answered so, without trying again.
+    let mut refused: Option<BloomError> = None;
+    for (at, &h) in hashed.iter().enumerate() {
+        let result = match refused {
+            None => chain.add_hashed(h, limits, &mut probes),
+            Some(e) => match chain.contains_hashed(h, &mut probes) {
+                Ok(true) => Ok(false),
+                Ok(false) => Err(e),
+                Err(over) => Err(over),
+            },
+        };
+        match result {
             Ok(added) => {
                 replies.push(boolean(resp, added));
-                done += 1;
+                taken.push(at);
+            }
+            Err(BloomError::Full) => {
+                replies.push(add_error(BloomError::Full));
+                full = true;
+                break;
+            }
+            Err(BloomError::OverBudget) => {
+                over_from = Some(at);
+                break;
             }
             Err(e) => {
+                refused.get_or_insert(e);
                 replies.push(add_error(e));
-                break;
             }
         }
     }
-    let header = (done == 0).then(|| chain.header());
+    if over_from.is_none() && !full && hashed.len() < items {
+        over_from = Some(hashed.len());
+    }
+    let header = taken.is_empty().then(|| chain.header());
     Added {
         replies,
-        done,
+        taken,
         header,
+        over_from,
     }
 }
 
@@ -730,17 +804,18 @@ fn madd(ctx: &mut Ctx) -> Vec<u8> {
     let probes = probes(ctx);
     let cmd = &ctx.cmd;
     let items = &cmd[2..];
-    let hashed = hash_all(items);
+    let hashed = hash_all(items, !ctx.apply_replication);
     match with_filter_mut(ctx, key, Some(params), limits, Vec::new, |chain, made| {
-        (add_each(chain, &hashed, resp, limits, probes), made)
+        let added = add_each(chain, &hashed, count, resp, limits, probes);
+        (added, made)
     }) {
         Err(e) => e,
         Ok((added, made)) => {
             let made = made.then_some(&params);
-            if let Some(cmds) = sent_items(cmd, key, items, added.done, made, added.header) {
+            if let Some(cmds) = sent_items(cmd, key, items, &added.taken, made, added.header) {
                 send_as(cmds);
             }
-            resp_array(added.replies)
+            items_reply(added.replies, added.over_from, items.len())
         }
     }
 }
@@ -816,22 +891,25 @@ fn insert(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return e,
     };
     let probes = probes(ctx);
-    let hashed = hash_all(items);
+    let hashed = hash_all(items, !ctx.apply_replication);
     match with_filter_mut(
         ctx,
         key,
         make,
         limits,
         || resp_error(NOT_FOUND),
-        |chain, made| (add_each(chain, &hashed, resp, limits, probes), made),
+        |chain, made| {
+            let added = add_each(chain, &hashed, items.len(), resp, limits, probes);
+            (added, made)
+        },
     ) {
         Err(e) => e,
         Ok((added, made)) => {
             let made = made.then_some(&params);
-            if let Some(cmds) = sent_items(&cmd, key, items, added.done, made, added.header) {
+            if let Some(cmds) = sent_items(&cmd, key, items, &added.taken, made, added.header) {
                 send_as(cmds);
             }
-            resp_array(added.replies)
+            items_reply(added.replies, added.over_from, items.len())
         }
     }
 }
@@ -862,9 +940,9 @@ fn mexists(ctx: &mut Ctx) -> Vec<u8> {
     let key = ctx.cmd[1];
     let items = &ctx.cmd[2..];
     let resp = resp(ctx);
-    let hashed = hash_all(items);
+    // A read: held to the per-command limit wherever it comes from.
+    let hashed = hash_all(items, true);
     let replies = match with_filter(ctx, key, |chain| {
-        // A read: held to the per-command limit wherever it comes from.
         let mut probes = Probes::budgeted();
         let mut out = Vec::with_capacity(hashed.len());
         for &h in &hashed {
@@ -872,9 +950,12 @@ fn mexists(ctx: &mut Ctx) -> Vec<u8> {
                 Ok(found) => out.push(boolean(resp, found)),
                 Err(e) => {
                     out.push(add_error(e));
-                    break;
+                    return out;
                 }
             }
+        }
+        if hashed.len() < items.len() {
+            out.push(add_error(BloomError::OverBudget));
         }
         out
     }) {
@@ -1086,10 +1167,11 @@ mod tests {
         }
     }
 
-    /// A write that stopped before its last item is sent with the items it
-    /// took and no others; one that took them all, as itself.
+    /// A write that did not take every item is sent with the items it took
+    /// and no others, in order, whichever they were; one that took them
+    /// all, as itself.
     #[test]
-    fn writes_that_stop_early_are_sent_with_what_they_took() {
+    fn writes_that_skip_items_are_sent_with_what_they_took() {
         let p = Params {
             capacity: 100,
             error: 0.01,
@@ -1107,28 +1189,43 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(sent_items(&cmd, b"k", items, 3, None, None), None);
+        assert_eq!(sent_items(&cmd, b"k", items, &[0, 1, 2], None, None), None);
         assert_eq!(
-            words(sent_items(&cmd, b"k", items, 2, None, None).unwrap()),
+            words(sent_items(&cmd, b"k", items, &[0, 1], None, None).unwrap()),
             [["BF.MADD", "k", "a", "b"]]
         );
+        // Past an item it could not take: the ones after it, not that one.
         assert_eq!(
-            sent_items(&cmd, b"k", items, 0, None, Some(vec![])),
+            words(sent_items(&cmd, b"k", items, &[0, 2], None, None).unwrap()),
+            [["BF.MADD", "k", "a", "c"]]
+        );
+        assert_eq!(
+            words(sent_items(&cmd, b"k", items, &[2], None, None).unwrap()),
+            [["BF.MADD", "k", "c"]]
+        );
+        assert_eq!(
+            sent_items(&cmd, b"k", items, &[], None, Some(vec![])),
             Some(vec![])
         );
         let insert: Vec<&[u8]> = vec![b"BF.INSERT", b"k", b"NOCREATE", b"ITEMS", b"a", b"b"];
         assert_eq!(
-            words(sent_items(&insert, b"k", &insert[4..], 1, None, None).unwrap()),
+            words(sent_items(&insert, b"k", &insert[4..], &[0], None, None).unwrap()),
             [["BF.INSERT", "k", "NOCREATE", "ITEMS", "a"]]
         );
+        assert_eq!(
+            words(sent_items(&insert, b"k", &insert[4..], &[1], None, None).unwrap()),
+            [["BF.INSERT", "k", "NOCREATE", "ITEMS", "b"]]
+        );
         // Made: the BF.INSERT that names how, with the items taken.
-        let made = words(sent_items(&cmd, b"k", items, 1, Some(&p), None).unwrap());
+        let made = words(sent_items(&cmd, b"k", items, &[0], Some(&p), None).unwrap());
         assert_eq!(made[0][0], "BF.INSERT");
         assert_eq!(made[0].last().map(String::as_str), Some("a"));
-        let made = words(sent_items(&cmd, b"k", items, 3, Some(&p), None).unwrap());
+        let made = words(sent_items(&cmd, b"k", items, &[1, 2], Some(&p), None).unwrap());
+        assert_eq!(made[0][made[0].len() - 3..], ["ITEMS", "b", "c"]);
+        let made = words(sent_items(&cmd, b"k", items, &[0, 1, 2], Some(&p), None).unwrap());
         assert_eq!(made[0].len(), 12);
         // Made, and nothing taken: the empty filter, as its header.
-        let sent = sent_items(&cmd, b"k", items, 0, Some(&p), Some(b"hdr".to_vec())).unwrap();
+        let sent = sent_items(&cmd, b"k", items, &[], Some(&p), Some(b"hdr".to_vec())).unwrap();
         assert_eq!(
             sent,
             vec![vec![
@@ -1138,6 +1235,88 @@ mod tests {
                 b"hdr".to_vec()
             ]]
         );
+    }
+
+    /// A command held to the per-command limit hashes no more items than
+    /// it can get to; one from a master or the AOF hashes them all.
+    #[test]
+    fn hashing_stops_where_the_per_command_limit_must_have_stopped() {
+        let items: Vec<&[u8]> = vec![b"x"; MOST_ITEMS + 10];
+        assert_eq!(hash_all(&items, true).len(), MOST_ITEMS);
+        assert_eq!(hash_all(&items, false).len(), MOST_ITEMS + 10);
+        assert_eq!(hash_all(&items[..5], true).len(), 5);
+    }
+
+    /// The limit's error for the item it stopped at and every one after it,
+    /// after the replies before it.
+    #[test]
+    fn replies_past_the_per_command_limit() {
+        let over = add_error(BloomError::OverBudget);
+        let reply = items_reply(vec![b":1\r\n".to_vec(), b":0\r\n".to_vec()], Some(2), 5);
+        let mut want = b"*5\r\n:1\r\n:0\r\n".to_vec();
+        for _ in 0..3 {
+            want.extend_from_slice(&over);
+        }
+        assert_eq!(reply, want);
+        assert_eq!(
+            items_reply(vec![b":1\r\n".to_vec()], None, 3),
+            b"*1\r\n:1\r\n"
+        );
+    }
+
+    /// An item past one a filter that cannot grow refused: answered with the
+    /// same error if the filter does not have it, without trying to grow it
+    /// again, and taken if it does.
+    #[test]
+    fn items_after_a_refused_one() {
+        let p = Params {
+            capacity: 1,
+            error: 1e-305,
+            expansion: 1,
+            nonscaling: false,
+        };
+        let mut chain = BloomChain::new(p, Limits::client()).unwrap();
+        let names: Vec<String> = (0..200).map(|i| format!("i{i}")).collect();
+        let items: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+        let hashed = hash_all(&items, true);
+        let added = add_each(
+            &mut chain,
+            &hashed,
+            items.len(),
+            2,
+            Limits::client(),
+            Probes::budgeted(),
+        );
+        assert_eq!(added.replies.len(), items.len());
+        assert_eq!(added.over_from, None);
+        let first = added
+            .replies
+            .iter()
+            .position(|r| r.starts_with(b"-"))
+            .expect("the filter stopped growing");
+        let error = added.replies[first].clone();
+        for (at, reply) in added.replies.iter().enumerate().skip(first) {
+            if reply.starts_with(b"-") {
+                assert_eq!(reply, &error, "{at}");
+                assert!(!added.taken.contains(&at));
+            } else {
+                assert_eq!(reply, b":0\r\n", "{at}");
+                assert!(added.taken.contains(&at));
+            }
+        }
+        // Nothing of a refused item was written: the same items again get
+        // the same replies.
+        let again = add_each(
+            &mut chain,
+            &hashed,
+            items.len(),
+            2,
+            Limits::client(),
+            Probes::budgeted(),
+        );
+        for at in first..items.len() {
+            assert_eq!(again.replies[at], added.replies[at], "{at}");
+        }
     }
 
     #[test]

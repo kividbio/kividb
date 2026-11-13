@@ -25,11 +25,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `BF.DEBUG`, and the `bf-error-rate`, `bf-initial-size` and
   `bf-expansion-factor` settings. Replies and errors are Redis 8.10's, byte
   for byte, in RESP2 and RESP3, quirks included (`BF.EXISTS` answers 0 for
-  a key of another type; `BF.MADD` stops at an item a full filter cannot
-  take). A filter is laid out bit for bit as Redis lays it out, so filters
-  moved from Redis answer as they did there: RDB files and full syncs from
-  Redis 8 and Redis Stack 6.2 to 7.4, `RESTORE` and `MIGRATE` of Redis's
-  `DUMP` payloads, and `BF.SCANDUMP` chunks. `DUMP` writes Redis's format,
+  a key of another type; `BF.MADD` and `BF.INSERT` stop at an item a full
+  non-scaling filter cannot take, but answer an item a filter that cannot
+  grow cannot take with an error and go on to the next, #731). A filter is
+  laid out bit for bit as Redis lays it out, so filters moved from Redis
+  answer as they did there: RDB files and full syncs from Redis 8 and
+  Redis Stack 6.2 to 7.4, `RESTORE` and `MIGRATE` of Redis's `DUMP`
+  payloads, and `BF.SCANDUMP` chunks. `DUMP` writes Redis's format,
   which every Redis since 6.0 restores. A command that made its filter with
   a setting of this node's (`BF.ADD` on a missing key, `BF.RESERVE`
   without `EXPANSION`) goes to replicas and the AOF naming what it took,
@@ -49,10 +51,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only to fixed size limits, so a replica or a restart with a lower setting
   keeps every filter the master took, and a filter Redis grew past the
   size limits for clients still loads. `BF.MADD`, `BF.INSERT` and
-  `BF.MEXISTS` have a per-command limit: a command that reaches it stops,
-  and its reply ends with an error for the item it stopped at (send fewer
-  items per command). Cuckoo filters, Count-min sketches, Top-K and
-  t-digests follow.
+  `BF.MEXISTS` have a per-command limit: a command that reaches it stops
+  (send fewer items per command). `BF.MEXISTS`'s reply then ends with an
+  error for the item it stopped at; `BF.MADD` and `BF.INSERT` answer that
+  item and every one after it with the error, so their reply has an entry
+  for each item. Replicas and the AOF get only the items a write took.
+  Cuckoo filters, Count-min sketches, Top-K and t-digests follow.
 
 ### Changed
 

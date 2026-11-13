@@ -3,7 +3,9 @@
 // Bloom filters (`BF.*`), against what Redis 8.10 does:
 //
 //   * every reply Redis 8.10.3 gave to the BF commands of four captures,
-//     byte for byte, in RESP2 and RESP3 (`fixtures/redis-8.10-bloom-replies.json`);
+//     byte for byte, in RESP2 and RESP3 (`fixtures/redis-8.10-bloom-replies.json`),
+//     and Redis 8.10.2's to `BF.MADD` and `BF.INSERT` on filters that cannot
+//     take an item (`fixtures/redis-8.10.2-bloom-per-item.json`);
 //   * RDB files with Bloom filters written by Redis 8.10 and Redis Stack
 //     6.2, 7.2 and 7.4 load, and the filters answer as they did there;
 //   * a snapshot, an AOF replay and a replica keep them; a filter a command
@@ -283,6 +285,62 @@ fn replies_are_redis_8_10_byte_for_byte() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// `BF.MADD` and `BF.INSERT` on a filter that cannot take an item, as Redis
+/// 8.10.2 answers them (#731): a full non-scaling filter ends the reply at
+/// the item, a filter that cannot grow answers that item with an error and
+/// goes on, a reply for each item; `NOCREATE` on a missing key and a key of
+/// another type fail the command.
+#[test]
+fn writes_past_an_item_a_filter_cannot_take_are_redis_8_10_2() {
+    let _serial = serial();
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/redis-8.10.2-bloom-per-item.json")).unwrap();
+    let port = start(config());
+    let mut c2 = Conn::connect(port);
+    let mut c3 = Conn::connect(port);
+    assert_eq!(c2.cmd(&["FLUSHALL"]), b"+OK\r\n");
+    c3.cmd(&["HELLO", "3"]);
+    assert_eq!(c3.cmd(&["SELECT", "1"]), b"+OK\r\n");
+    let mut failures = Vec::new();
+    for case in golden["cases"].as_array().unwrap() {
+        let args: Vec<&str> = case["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        let shown_args = args[..args.len().min(8)].join(" ");
+        for (conn, resp) in [(&mut c2, "resp2"), (&mut c3, "resp3")] {
+            let want = unhex(case[resp].as_str().unwrap());
+            let got = conn.cmd(&args);
+            if got != want {
+                failures.push(format!(
+                    "{shown_args}\n  {resp} want {}\n        got  {}",
+                    shown(&want),
+                    shown(&got)
+                ));
+            }
+        }
+    }
+    c2.cmd(&["FLUSHALL"]);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The entries of an array reply of integers, booleans and errors.
+fn entries(reply: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(reply);
+    let mut lines = text.split("\r\n");
+    let n: usize = lines
+        .next()
+        .unwrap()
+        .trim_start_matches('*')
+        .parse()
+        .unwrap();
+    let entries: Vec<String> = lines.take(n).map(str::to_string).collect();
+    assert_eq!(entries.len(), n, "{}", shown(reply));
+    entries
 }
 
 // ── Servers of their own (files, replicas) ───────────────────────────────
@@ -794,6 +852,176 @@ fn aof_text(dir: &std::path::Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// A write that goes on past an item it cannot take (a filter that cannot
+/// grow), or that stops at the per-command limit, reaches a replica and the
+/// AOF with the items it took and no others, though they are not the first
+/// (#731): the replica, its AOF and the master's AOF replayed all have the
+/// master's filters, bit for bit.
+#[test]
+fn writes_past_an_item_reach_replicas_and_the_aof_with_what_they_took() {
+    let (dir, replica_dir) = (tmp_dir("past-master"), tmp_dir("past-replica"));
+    let keys = ["g", "made", "wide"];
+    let mut skipped: Vec<String> = Vec::new();
+    let mut taken_after_skip: Vec<String> = Vec::new();
+    let mut note = |items: &[String], reply: &[u8]| {
+        let entries = entries(reply);
+        assert_eq!(entries.len(), items.len(), "{}", shown(reply));
+        let mut past = false;
+        for (item, entry) in items.iter().zip(&entries) {
+            if entry.starts_with('-') {
+                skipped.push(item.clone());
+                past = true;
+            } else if past {
+                taken_after_skip.push(item.clone());
+            }
+        }
+    };
+    let on_master: Vec<_> = {
+        let master = Child::start(&dir, &["--aof"]);
+        let replica = Child::start(
+            &replica_dir,
+            &[
+                "--aof",
+                "--replicaof",
+                "127.0.0.1",
+                &master.port.to_string(),
+            ],
+        );
+        let mut m = master.conn();
+        let mut r = replica.conn();
+        wait_until("the replica to sync", || {
+            String::from_utf8_lossy(&r.cmd(&["INFO", "replication"]))
+                .contains("master_link_status:up")
+        });
+        // A filter that cannot grow: errors, then items taken after them.
+        assert_eq!(
+            m.cmd(&["BF.RESERVE", "g", "1e-305", "1", "EXPANSION", "1"]),
+            b"+OK\r\n"
+        );
+        let items: Vec<String> = (1..=120).map(|i| format!("i{i}")).collect();
+        let mut args = vec!["BF.MADD", "g"];
+        args.extend(items.iter().map(String::as_str));
+        note(&items, &m.cmd(&args));
+        // Items in no command before: two the filter has (false
+        // positives, taken) and two it has not (refused), and a duplicate
+        // of each kind after an error.
+        let has = |m: &mut Conn, want: &[u8]| {
+            (0..100_000)
+                .map(|i| format!("q{i}"))
+                .filter(|item| m.cmd(&["BF.EXISTS", "g", item]) == want)
+                .take(2)
+                .collect::<Vec<_>>()
+        };
+        let there = has(&mut m, b":1\r\n");
+        let absent = has(&mut m, b":0\r\n");
+        assert_eq!((there.len(), absent.len()), (2, 2));
+        let items: Vec<String> = [
+            &absent[0], &there[0], &absent[1], &there[0], &there[1], &absent[0],
+        ]
+        .map(String::clone)
+        .to_vec();
+        let reply = m.cmd(&[
+            "BF.INSERT",
+            "g",
+            "NOCREATE",
+            "ITEMS",
+            &items[0],
+            &items[1],
+            &items[2],
+            &items[3],
+            &items[4],
+            &items[5],
+        ]);
+        let refused = "-ERR problem inserting into filter";
+        assert_eq!(
+            entries(&reply),
+            [refused, ":0", refused, ":0", ":0", refused],
+            "{}",
+            shown(&reply)
+        );
+        note(&items, &reply);
+        let items: Vec<String> = ["zz1", "i1", "zz2", "i2"].map(String::from).to_vec();
+        let mut args = vec!["BF.INSERT", "g", "NOCREATE", "ITEMS"];
+        args.extend(items.iter().map(String::as_str));
+        note(&items, &m.cmd(&args));
+        // A filter made by the command, full partway: it stops there.
+        let items: Vec<String> = ["a", "b", "c", "a"].map(String::from).to_vec();
+        let mut args = vec!["BF.INSERT", "made", "CAPACITY", "2", "NONSCALING", "ITEMS"];
+        args.extend(items.iter().map(String::as_str));
+        assert_eq!(
+            m.cmd(&args),
+            b"*3\r\n:1\r\n:1\r\n-ERR non scaling filter is full\r\n"
+        );
+        // The per-command limit: an error for each item from where it
+        // stopped.
+        assert_eq!(
+            m.raw(&[b"BF.LOADCHUNK", b"wide", b"1", &widest_header(60)]),
+            b"+OK\r\n"
+        );
+        for layer in 0..60u64 {
+            let iter = ((layer + 1) * 200 + 1).to_string();
+            assert_eq!(
+                m.raw(&[b"BF.LOADCHUNK", b"wide", iter.as_bytes(), &[0xff; 200]]),
+                b"+OK\r\n"
+            );
+        }
+        let items: Vec<String> = (0..300).map(|i| format!("w{i}")).collect();
+        let mut args = vec!["BF.MADD", "wide"];
+        args.extend(items.iter().map(String::as_str));
+        let reply = m.cmd(&args);
+        assert!(
+            shown(&reply).contains("per-command limit"),
+            "{}",
+            shown(&reply)
+        );
+        let entries = entries(&reply);
+        assert_eq!(entries.len(), items.len());
+        let first = entries.iter().position(|e| e.starts_with('-')).unwrap();
+        assert!(
+            entries[first..]
+                .iter()
+                .all(|e| e.contains("per-command limit"))
+        );
+        skipped.extend(items[first..].iter().cloned());
+        assert!(!skipped.is_empty());
+        assert!(!taken_after_skip.is_empty(), "no item taken after an error");
+        m.cmd(&["SET", "last", "1"]);
+        wait_until("the replica to have every filter", || {
+            r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
+        });
+        let on_master: Vec<_> = keys.iter().map(|k| scandump(&mut m, k)).collect();
+        let on_replica: Vec<_> = keys.iter().map(|k| scandump(&mut r, k)).collect();
+        assert_eq!(on_replica, on_master);
+        on_master
+    };
+    // The AOF has the items taken after an error, and none answered with
+    // one.
+    let aof = aof_text(&dir);
+    for item in &skipped {
+        assert!(
+            !aof.contains(&format!("\r\n{item}\r\n")),
+            "the AOF has {item}, which the master did not take"
+        );
+    }
+    for item in &taken_after_skip {
+        assert!(
+            aof.contains(&format!("\r\n{item}\r\n")),
+            "the AOF lacks {item}, which the master took"
+        );
+    }
+    for (what, at) in [
+        ("the master's AOF", &dir),
+        ("the replica's AOF", &replica_dir),
+    ] {
+        let server = Child::start(at, &["--aof"]);
+        let mut c = server.conn();
+        let after: Vec<_> = keys.iter().map(|k| scandump(&mut c, k)).collect();
+        assert_eq!(after, on_master, "{what} replayed");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
 /// `bloom-max-filter-bytes` holds a client, never a master, the AOF or a
 /// load: a replica with a lower setting takes every filter the master
 /// took under its higher one, in full, and keeps them when it restarts;
@@ -809,6 +1037,7 @@ fn bloom_max_filter_bytes_holds_clients_not_replication() {
     )
     .unwrap();
     let keys = ["big", "fixed", "grown", "made", "stopped"];
+    let mut refused: Vec<String> = Vec::new();
     let master = Child::start(&dir, &["--aof"]);
     let mut m = master.conn();
     let replica_args = [
@@ -856,9 +1085,10 @@ fn bloom_max_filter_bytes_holds_clients_not_replication() {
             assert!(!shown(&reply).contains("ERR"), "{}", shown(&reply));
         }
         assert_eq!(m.cmd(&["BF.INFO", "grown", "FILTERS"]), b"*1\r\n:5\r\n");
-        // The master at a lower limit of its own: its BF.MADD stops at the
-        // item that would need a fifth layer, and the replica, which is
-        // not held to any setting, takes no more than it did.
+        // The master at a lower limit of its own: its BF.MADD answers the
+        // items that would need a fifth layer with an error, and the
+        // replica, which is not held to any setting, takes no more than
+        // it did.
         assert_eq!(
             m.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "4kb"]),
             b"+OK\r\n"
@@ -868,11 +1098,16 @@ fn bloom_max_filter_bytes_holds_clients_not_replication() {
         let mut args = vec!["BF.MADD", "stopped"];
         args.extend(items.iter().map(String::as_str));
         let reply = m.cmd(&args);
-        assert!(
-            reply.ends_with(b"-ERR filter is too large\r\n"),
-            "{}",
-            shown(&reply[reply.len().saturating_sub(60)..])
+        let entries = entries(&reply);
+        assert_eq!(entries.len(), items.len());
+        refused.extend(
+            items
+                .iter()
+                .zip(&entries)
+                .filter(|(_, e)| e.as_str() == "-ERR filter is too large")
+                .map(|(i, _)| i.clone()),
         );
+        assert!(!refused.is_empty());
         assert_eq!(
             m.cmd(&["CONFIG", "SET", "bloom-max-filter-bytes", "512mb"]),
             b"+OK\r\n"
@@ -890,12 +1125,14 @@ fn bloom_max_filter_bytes_holds_clients_not_replication() {
         );
         on_master
     };
-    // The master stopped early and sent the items it took, not all 2000.
+    // The master sent the items it took, not all 2000.
     let aof = aof_text(&dir);
-    assert!(
-        !aof.contains("s1999"),
-        "the AOF has items the master did not take"
-    );
+    for item in &refused {
+        assert!(
+            !aof.contains(&format!("\r\n{item}\r\n")),
+            "the AOF has {item}, which the master did not take"
+        );
+    }
     // The replica restarted, under its lower setting.
     {
         let replica = Child::start(&replica_dir, &replica_args);
@@ -1277,16 +1514,22 @@ fn limits() {
     );
     assert_eq!(c.cmd(&["EXISTS", "l"]), b":0\r\n");
     // Growth: 144, 312, 696 and 1,536 bytes fit in 4 KiB, and the fifth
-    // layer does not: the reply ends with the item that would need it.
+    // layer does not: an item that would need it is answered with the
+    // error, and the command goes on, a reply for each item.
     assert_eq!(c.cmd(&["BF.RESERVE", "g", "0.01", "100"]), b"+OK\r\n");
     let items: Vec<String> = (0..2000).map(|i| format!("g{i}")).collect();
     let mut args = vec!["BF.INSERT", "g", "ITEMS"];
     args.extend(items.iter().map(String::as_str));
     let reply = c.cmd(&args);
+    let entries = entries(&reply);
+    assert_eq!(entries.len(), items.len());
+    let first = entries.iter().position(|e| e.starts_with('-')).unwrap();
+    assert_eq!(entries[first].as_bytes(), &too_large[..too_large.len() - 2]);
     assert!(
-        reply.ends_with(too_large),
-        "{}",
-        shown(&reply[reply.len() - 60..])
+        entries[first..]
+            .iter()
+            .all(|e| e == ":0" || e.as_bytes() == &too_large[..too_large.len() - 2]),
+        "an item past the limit was added"
     );
     assert_eq!(c.cmd(&["BF.INFO", "g", "FILTERS"]), b"*1\r\n:4\r\n");
     // LOADCHUNK: a header over the limit, in bytes; over the hashes all
@@ -1326,7 +1569,12 @@ fn limits() {
     let mut args = vec!["BF.MADD", "t"];
     args.extend(items.iter().map(String::as_str));
     let reply = c.cmd(&args);
-    assert!(reply.ends_with(too_large), "{}", shown(&reply));
+    assert!(reply.starts_with(b"*92\r\n"), "{}", shown(&reply));
+    assert!(
+        shown(&reply).contains("filter is too large"),
+        "{}",
+        shown(&reply)
+    );
     // A filter that grows and cannot, below that, says so, as Redis does.
     assert_eq!(
         c.cmd(&["BF.RESERVE", "u", "1e-305", "1", "EXPANSION", "1"]),
@@ -1357,9 +1605,11 @@ fn limits() {
 const REDIS_1E305_ITEMS: usize = 69;
 const REDIS_1E305_LAYERS: usize = 61;
 
-/// A command of many items is held to a per-command limit: a reply that
-/// reaches it ends with an error for the item it stopped at, and the
-/// filter, and the server, go on. Commands of ordinary size are not
+/// A command of many items is held to a per-command limit: `BF.MEXISTS`'s
+/// reply that reaches it ends with an error for the item it stopped at;
+/// `BF.MADD`'s and `BF.INSERT`'s has that error for it and for every item
+/// after it, a reply for each item (#731). The filter, and the server, go
+/// on. Commands of ordinary size are not
 /// touched by it.
 #[test]
 fn per_command_limit() {
@@ -1394,12 +1644,19 @@ fn per_command_limit() {
         };
         args.extend(items.iter().map(String::as_str));
         let reply = c.cmd(&args);
+        let entries = entries(&reply);
+        assert_eq!(entries.len(), 300, "{write}");
+        let over = &over[..over.len() - 2];
         assert!(
-            reply.starts_with(b"*173\r\n"),
+            entries[..172].iter().all(|e| e == ":0"),
             "{write}: {}",
-            shown(&reply[..20])
+            shown(&reply)
         );
-        assert!(reply.ends_with(over), "{write}: {}", shown(&reply));
+        assert!(
+            entries[172..].iter().all(|e| e.as_bytes() == over),
+            "{write}: {}",
+            shown(&reply)
+        );
     }
     // One item at a time is always taken.
     assert_eq!(c.cmd(&["BF.EXISTS", "wide", "w299"]), b":1\r\n");
@@ -1419,6 +1676,77 @@ fn per_command_limit() {
         assert!(!shown(&reply).contains("ERR"), "{batch}: {}", shown(&reply));
     }
     assert_eq!(c.cmd(&["BF.INFO", "n", "FILTERS"]), b"*1\r\n:10\r\n");
+    assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
+    c.cmd(&["FLUSHALL"]);
+}
+
+/// A command of millions of items past the per-command limit: a reply for
+/// each item, those from where it stopped the limit's error, and soon.
+#[test]
+fn per_command_limit_with_millions_of_items() {
+    let _serial = serial();
+    let port = start(config());
+    let mut c = Conn::connect(port);
+    const N: usize = 2_500_000;
+    let over = "-ERR command reached the per-command limit for Bloom filters; send fewer items per command";
+    for (command, head) in [
+        ("BF.MADD", &["BF.MADD", "big"][..]),
+        ("BF.INSERT", &["BF.INSERT", "big", "ITEMS"][..]),
+        ("BF.MEXISTS", &["BF.MEXISTS", "big"][..]),
+    ] {
+        let started = Instant::now();
+        let mut out = format!("*{}\r\n", head.len() + N).into_bytes();
+        for word in head {
+            out.extend_from_slice(format!("${}\r\n{word}\r\n", word.len()).as_bytes());
+        }
+        for i in 0..N {
+            out.extend_from_slice(b"$1\r\n");
+            out.push(b'a' + (i % 26) as u8);
+            out.extend_from_slice(b"\r\n");
+        }
+        c.stream.write_all(&out).unwrap();
+        // Read line by line: every entry is one line.
+        let (mut header, mut answered, mut limited) = (None, 0usize, 0usize);
+        let mut last = String::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 1 << 20];
+        while header.is_none_or(|n| answered + limited < n) {
+            let n = c.stream.read(&mut chunk).expect("a reply");
+            assert!(n > 0, "connection closed");
+            pending.extend_from_slice(&chunk[..n]);
+            let mut at = 0;
+            while let Some(end) = pending[at..].windows(2).position(|w| w == b"\r\n") {
+                let line = std::str::from_utf8(&pending[at..at + end]).unwrap();
+                match header {
+                    None => header = Some(line.trim_start_matches('*').parse::<usize>().unwrap()),
+                    Some(_) if line == over => limited += 1,
+                    Some(_) => {
+                        assert_eq!(limited, 0, "{command}: {line} after the limit's error");
+                        assert!(matches!(line, ":0" | ":1"), "{command}: {line}");
+                        answered += 1;
+                    }
+                }
+                last = line.to_string();
+                at += end + 2;
+            }
+            pending.drain(..at);
+        }
+        assert!(pending.is_empty(), "{command}: more than the reply");
+        assert!(answered > 0, "{command}");
+        assert_eq!(last, over, "{command}");
+        if command == "BF.MEXISTS" {
+            assert_eq!(limited, 1, "{command}");
+            assert_eq!(header, Some(answered + 1), "{command}");
+        } else {
+            assert_eq!(header, Some(N), "{command}");
+            assert_eq!(answered + limited, N, "{command}");
+        }
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(60), "{command} took {took:?}");
+    }
+    for letter in 'a'..='z' {
+        assert_eq!(c.cmd(&["BF.EXISTS", "big", &letter.to_string()]), b":1\r\n");
+    }
     assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
     c.cmd(&["FLUSHALL"]);
 }
