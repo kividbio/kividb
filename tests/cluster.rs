@@ -3903,6 +3903,63 @@ fn a_transaction_of_a_georadius_store_during_a_slot_handoff_is_refused() {
     );
 }
 
+/// `SCRIPT LOAD` during an atomic slot migration's handoff is answered at
+/// once (#528). The pause does not hold it (#518), and it used to wait the
+/// handoff out in the write gate instead, in a sleep loop on its worker
+/// thread: on io_uring every other connection of that thread waited with
+/// it. The destination's `TAKEOVER` waits 3 s, so the handoff lasts that
+/// long; a write is still held for all of it.
+#[cfg(feature = "lua")]
+#[test]
+fn script_load_during_a_slot_handoff_is_answered_at_once() {
+    let (nodes, _) = form_cluster_of(vec![
+        Node::start(&[]),
+        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "3000")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let key = key_in(0..=1000, "handoff");
+    assert!(src.conn().cmd(&["SET", &key, "5"]).is_ok());
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    wait_until(
+        "the handoff to hold writes for the TAKEOVER",
+        Duration::from_secs(60),
+        || dst.log().contains("(test) TAKEOVER waits"),
+    );
+    let write =
+        patient_commands_in_background(src.port, Duration::from_secs(30), &[&["SET", &key, "6"]]);
+    let started = Instant::now();
+    let sha = src.conn().cmd(&["SCRIPT", "LOAD", "return 528"]);
+    let took = started.elapsed();
+    let finished = write.is_finished();
+    assert_eq!(sha.text().len(), 40, "SCRIPT LOAD: {sha:?}");
+    assert!(
+        took < Duration::from_millis(1000),
+        "SCRIPT LOAD waited {took:?} for the handoff"
+    );
+    assert!(!finished, "a write was not held by the handoff");
+
+    wait_import_completed(dst, &task_id);
+    let reply = write.join().unwrap();
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "the held write is sent on: {reply:?}"
+    );
+    assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+    let r = src.conn().cmd(&["EVALSHA", &sha.text(), "0"]);
+    assert_eq!(r.int(), 528, "{r:?}");
+}
+
 /// `MULTI`, the commands `queued` makes of a key holding "5", and `EXEC`,
 /// held up between its routing and its gates until an atomic slot
 /// migration's handoff holds writes: `EXEC`'s reply. The destination's
