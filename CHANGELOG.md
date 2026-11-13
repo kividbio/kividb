@@ -21,6 +21,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   path reply with every match; through a legacy path they now change every
   number the path matches, as RedisJSON does, not only the first, and their
   errors for a key or a number that is not there are RedisJSON's.
+
+  **Upgrade note:** a `JSON.NUMINCRBY` or `JSON.NUMMULTBY` through a legacy
+  path (`.a`, `..x`) now changes every number it matches. The command is
+  replicated and logged as sent, so where a legacy path matches more than
+  one number, a replica on an older version changes only the first and
+  ends up with a different document, and an AOF written by an older
+  version, replayed after the upgrade, now changes every match where the
+  older server changed only the first. Upgrade replicas before their
+  master, as always, and run `BGREWRITEAOF` before upgrading if such
+  commands are in the AOF.
+
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
