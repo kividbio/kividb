@@ -23,6 +23,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Searches in a cluster no longer use up the coordinator's ports
+  (#723).** `FT.SEARCH` and `FT.AGGREGATE` opened a new connection to every
+  other master for each search and closed it after the reply, so under a
+  steady load of searches the node that received them ran out of local
+  ports (`Cannot assign requested address`). The connections are now kept
+  open and reused, up to 16 idle ones per master or one per command
+  thread if there are more, and are opened again when `masteruser`,
+  `masterauth` or the TLS files change. When a master's own password
+  changes, the connections kept to it stay logged in as before until they
+  close, as any long-lived client does, and searches fail with the login
+  error once they are replaced.
+
 - **`DEBUG SLEEP` returns Redis's errors for non-numeric and wrong-arity arguments (#657).**
   A non-numeric argument (`DEBUG SLEEP abc`) was reported as a wrong number
   of arguments, and arity errors used KiviDB's own wording. A non-numeric
