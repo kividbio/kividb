@@ -21,6 +21,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   kept. Start it once without `cluster-enabled`, move those keys into
   database 0 (`SELECT n`, `MOVE key 0`) or `FLUSHDB` them, `SAVE` (or
   `BGREWRITEAOF` with the AOF on), and start it as a cluster node again.
+
+- **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
+  that a short key never took (#497).** The list of hashes whose fields
+  expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
+  bytes is held inside that copy rather than on the heap. The estimate now adds the key's length only
+  for a key that really is on the heap.
+
 - **`SCRIPT LOAD` and `SCRIPT FLUSH` during a slot handoff or a manual
   failover are answered at once, instead of stalling every connection of
   their worker thread until the handoff ended (#528).** The pause does not
