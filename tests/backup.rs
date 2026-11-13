@@ -834,6 +834,89 @@ fn appendfsync_always_replies_only_once_the_write_is_synced() {
     }
 }
 
+/// The test hold of the sync for replies under `appendfsync always` is
+/// reached by that sync only, not by the second's sync, which answers no
+/// reply (#515). The second's sync took it too: when it ran first, with a
+/// write's record in the file, it took the hit a test waited for, and the
+/// write's own sync then waited at the next hit, which the test above never
+/// lets go of. Here the second's sync is held (at `fsync`) with a record
+/// unsynced while the setting turns to `always`, and a write is sent: the
+/// first hold of the reply's sync is the write's, and its reply comes once
+/// that is let go.
+#[test]
+fn the_reply_sync_failpoint_is_the_replys_not_the_seconds_sync() {
+    const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nw\r\n";
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let child = kividb(&dir, port, &["--aof"])
+        .env("KIVIDB_TEST_FAILPOINTS", "fsync,aof-fsync-before-reply")
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir, child };
+    let wait_for = |path: &std::path::Path, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "{what} was never reached");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let mut c = server.conn();
+    // A record written and not yet synced, under `everysec`.
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    // The second's sync, asked for, holds the writer with that record
+    // unsynced.
+    let mut waiter = server.conn();
+    waiter
+        .writer
+        .write_all(b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$1\r\n0\r\n")
+        .unwrap();
+    let fsync = server.dir.join("failpoint.fsync.1");
+    wait_for(&fsync, "the second's sync");
+    // Any later second's sync goes on at once.
+    let done = Arc::new(AtomicBool::new(false));
+    let releaser = {
+        let (dir, done) = (server.dir.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut next = 2;
+            while !done.load(Ordering::Relaxed) {
+                if std::fs::remove_file(dir.join(format!("failpoint.fsync.{next}"))).is_ok() {
+                    next += 1;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    // Now every reply to a write waits for its sync, and one is sent.
+    assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+    c.writer.write_all(SET).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::remove_file(&fsync).unwrap();
+    // The first hold of a reply's sync is the write's.
+    let held = server.dir.join("failpoint.aof-fsync-before-reply.1");
+    wait_for(&held, "the reply's sync");
+    std::fs::remove_file(&held).unwrap();
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = String::new();
+    let replied = c.reader.read_line(&mut line);
+    assert!(
+        replied.is_ok() && line == "+OK\r\n",
+        "no reply once the reply's sync was let go ({replied:?}, {line:?}); held again: {}",
+        server
+            .dir
+            .join("failpoint.aof-fsync-before-reply.2")
+            .exists()
+    );
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "w");
+    done.store(true, Ordering::Relaxed);
+    releaser.join().unwrap();
+}
+
 /// Under `appendfsync always`, a sync of the AOF that fails stops the
 /// server (#514's review). The checkpoint's sync of the old log used to be
 /// logged and passed over, its mark cleared: Linux reports a failed
