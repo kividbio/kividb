@@ -6083,24 +6083,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
         "HELLO" => {
             // HELLO is intercepted in the server loops before reaching here.
-            // If it arrives here something went wrong — return a minimal response
-            // rather than an error, so clients don't break.
-            Some(resp_array(vec![
-                resp_bulk_str("server"),
-                resp_bulk_str("redis"),
-                resp_bulk_str("version"),
-                resp_bulk_str(REDIS_VERSION),
-                resp_bulk_str("kividb_version"),
-                resp_bulk_str(env!("CARGO_PKG_VERSION")),
-                resp_bulk_str("proto"),
-                resp_integer(2),
-                resp_bulk_str("mode"),
-                resp_bulk_str("standalone"),
-                resp_bulk_str("role"),
-                resp_bulk_str("master"),
-                resp_bulk_str("modules"),
-                module_list_reply(2),
-            ]))
+            // If it arrives here something went wrong — reply as they would
+            // to a bare `HELLO`, rather than with an error, so clients don't
+            // break: the connection's protocol, id, mode and role (#502).
+            Some(crate::commands::login::hello_reply(
+                ctx.resp,
+                ctx.client_id,
+                ctx.cluster.enabled,
+                &ctx.repl_state.role(),
+            ))
         }
 
         "TIME" => {
