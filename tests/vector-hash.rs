@@ -6518,6 +6518,11 @@ fn num_docs_follows_the_documents_of_each_index() {
     // Written over, and deleted.
     step(&mut c, &["SET doc:2 x"], [1, 1, 1]);
     step(&mut c, &["DEL doc:2"], [1, 1, 1]);
+    hash_document(&mut c, "doc:2");
+    step(&mut c, &[], [2, 2, 1]);
+    step(&mut c, &["UNLINK doc:2 doc:3"], [1, 1, 0]);
+    json_document(&mut c, "doc:3");
+    step(&mut c, &[], [1, 1, 1]);
     // Renamed out of the index's keys and back, and over another kind.
     step(&mut c, &["RENAME doc:1 away:1"], [0, 0, 1]);
     step(&mut c, &["RENAME away:1 doc:1"], [1, 1, 1]);
@@ -6583,6 +6588,22 @@ fn num_docs_follows_the_documents_of_each_index() {
         ],
         [1, 1, 0],
     );
+    // `FLUSHALL` as well.
+    assert!(c.cmds(&["FLUSHALL"]).is_ok());
+    hash_document(&mut c, "doc:8");
+    hash_document(&mut c, "doc:10");
+    step(
+        &mut c,
+        &[
+            "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT kind TAG",
+            "FT.CREATE json ON JSON PREFIX 1 doc: SCHEMA $.vec AS vec VECTOR FLAT 6 TYPE FLOAT32 \
+             DIM 2 DISTANCE_METRIC L2",
+        ],
+        [2, 2, 0],
+    );
+    step(&mut c, &["DEL doc:10"], [1, 1, 0]);
     // An index told not to look at the documents that are there counts
     // those written from then on, as RediSearch does.
     for (index, schema) in [
