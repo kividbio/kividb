@@ -97,14 +97,15 @@ impl DocKeys {
     }
 
     /// The document at `key` is in the index: once, however often it is
-    /// written.
+    /// written. `key` is its name (`key_bytes::text_of`), and its slot is
+    /// that of the key's own bytes.
     pub fn add(&self, key: &str) {
         let (bits, stripe) = self.place(key);
         stripe
             .0
             .lock()
             .entry(bits)
-            .or_insert_with(|| crate::cluster::key_hash_slot(key.as_bytes()));
+            .or_insert_with(|| crate::cluster::key_hash_slot(&crate::key_bytes::bytes_of(key)));
     }
 
     /// The document at `key` has left the index, if it was in it.
@@ -180,6 +181,17 @@ mod tests {
         docs.clear();
         assert!(docs.is_empty());
         assert_eq!(docs.len_in(&vec![u64::MAX; served.len()]), 0);
+    }
+
+    #[test]
+    fn a_key_that_is_not_text_is_counted_in_the_slot_of_its_bytes() {
+        let raw = b"doc:\xff\xfe";
+        let docs = DocKeys::default();
+        docs.add(&crate::key_bytes::text_of(raw));
+        let slot = crate::cluster::key_hash_slot(raw) as usize;
+        let mut served = vec![0u64; crate::cluster::slot::CLUSTER_SLOTS.div_ceil(64)];
+        served[slot / 64] |= 1 << (slot % 64);
+        assert_eq!(docs.len_in(&served), 1);
     }
 
     #[test]
