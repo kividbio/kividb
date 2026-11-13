@@ -5999,6 +5999,124 @@ fn searches_are_answered_from_every_master() {
     );
 }
 
+/// The ids of the clients a node has under `name`, by `CLIENT LIST`.
+fn clients_named(node: &Node, name: &str) -> Vec<String> {
+    let list = node.conn().cmd(&["CLIENT", "LIST"]).text();
+    let name = format!(" name={name} ");
+    list.lines()
+        .filter(|l| l.contains(&name))
+        .filter_map(|l| {
+            l.split(' ')
+                .find_map(|f| f.strip_prefix("id="))
+                .map(String::from)
+        })
+        .collect()
+}
+
+fn connections_received(node: &Node) -> u64 {
+    info_field(
+        &node.conn().cmd(&["INFO", "stats"]).text(),
+        "total_connections_received",
+    )
+    .unwrap()
+    .parse()
+    .unwrap()
+}
+
+/// The coordinator of a search asks the other masters over connections it
+/// keeps, not a new one per search: 2,000 searches, eight at a time, open
+/// a handful on each master where they used to open 2,000 and leave as
+/// many sockets in TIME_WAIT on the coordinator, which ran out of ports
+/// (#723). Kept connections the other masters close, by `CLIENT KILL` or a
+/// restart, are replaced without the search failing.
+#[test]
+fn a_coordinator_keeps_its_connections_to_the_other_masters() {
+    const SEARCH_NAME: &str = "kividb-cluster-search";
+    // The most kept to one master (`search::POOL_IDLE_MAX`).
+    const KEPT_MAX: u64 = 16;
+    let (mut nodes, _) = form_cluster(3);
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "docs",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "doc:",
+        "SCHEMA",
+        "t",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let mut on = [0; 3];
+    for i in 0..30 {
+        let key = format!("doc:{i}");
+        let at = (0..3)
+            .find(|&n| {
+                let r = nodes[n].conn().cmd(&["HSET", &key, "t", "hello"]);
+                r.err().is_none_or(|e| !e.starts_with("MOVED"))
+            })
+            .unwrap();
+        on[at] += 1;
+    }
+    assert!(on.iter().all(|n| *n > 0), "{on:?}");
+    let all = |reply: &Resp| {
+        assert_eq!(reply.array().first(), Some(&Resp::Int(30)), "{reply:?}");
+    };
+    all(&nodes[0]
+        .conn()
+        .cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT"]));
+
+    let before: Vec<u64> = nodes[1..].iter().map(connections_received).collect();
+    let port = nodes[0].port;
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                for _ in 0..250 {
+                    let r = c.cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT", "LIMIT", "0", "0"]);
+                    assert_eq!(r.array().first(), Some(&Resp::Int(30)), "{r:?}");
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    for (node, before) in nodes[1..].iter().zip(&before) {
+        // This test's own connections, to read the figure, count too.
+        let grew = connections_received(node) - before;
+        assert!(
+            grew <= KEPT_MAX + 4,
+            "{grew} connections for 2,000 searches"
+        );
+        let kept = clients_named(node, SEARCH_NAME).len() as u64;
+        assert!((1..=KEPT_MAX).contains(&kept), "{kept} kept");
+    }
+
+    // The other masters close every connection kept to them: the next
+    // searches are sent again on new ones, and answered.
+    for node in &nodes[1..] {
+        for id in clients_named(node, SEARCH_NAME) {
+            node.conn().cmd(&["CLIENT", "KILL", "ID", &id]);
+        }
+        wait_until("kept connections closed", Duration::from_secs(10), || {
+            clients_named(node, SEARCH_NAME).is_empty()
+        });
+    }
+    let mut c = nodes[0].conn();
+    for _ in 0..20 {
+        let r = c.cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT", "LIMIT", "0", "0"]);
+        assert_eq!(r.array().first(), Some(&Resp::Int(30)), "{r:?}");
+    }
+
+    // One restarts: the search reaches it on a new connection.
+    nodes[2].restart();
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
+    let r = c.cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT", "LIMIT", "0", "0"]);
+    assert!(r.err().is_none(), "{r:?}");
+}
+
 /// A master added after an index was created gets it: from the first
 /// search sent anywhere in the cluster, or from the master it imports slots
 /// from, before their keys. Its definition is the same in every detail.

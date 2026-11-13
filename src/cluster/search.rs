@@ -205,42 +205,190 @@ fn encode(parts: &[&[u8]]) -> Vec<u8> {
     crate::resp::write::encode_resp_command(&owned)
 }
 
-/// [`ask_once`]; and a master that does not have the index (added to the
-/// cluster after it was created) is given it, and asked again.
-fn ask(
-    host: &str,
+// ── The connections a coordinator asks the other masters over ────────────────
+//
+// A search used to dial each other master afresh, log in, and close the
+// connection when the reply was in. The coordinator closed first, so every
+// search left a socket per master in TIME_WAIT on the coordinator, and a few
+// thousand searches a second used up its ephemeral ports (#723). They are
+// kept open now, logged in, and reused.
+
+/// How many idle connections to one master, opened as one login, are kept
+/// for the next search. A burst of searches may open more at once; those
+/// beyond this are closed when their search is done.
+pub(crate) const POOL_IDLE_MAX: usize = 16;
+
+/// What a kept connection was opened as: to where, logged in as whom, in
+/// which database, over which setup of TLS between nodes. A connection is
+/// reused only for the same key, so one logged in with `masteruser` and
+/// `masterauth` as they were, or made with TLS files since replaced, is
+/// never used once they change.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    host: String,
     port: u16,
-    credentials: &(String, String),
+    user: String,
+    /// The password's SHA-256, not the password: a password no longer in
+    /// use is not kept in memory for the pool's sake.
+    password: [u8; 32],
     db: usize,
-    cmd: &[Vec<u8>],
-    definition: Option<&[Vec<u8>]>,
-) -> Result<Reply, String> {
-    match ask_once(host, port, credentials, db, cmd) {
-        Err(e) if crate::commands::search::is_no_such_index(&e) && definition.is_some() => {
-            let create: Vec<&[u8]> = definition.unwrap().iter().map(Vec::as_slice).collect();
-            crate::cluster::ddl::run_on(host, port, &credentials.0, &credentials.1, &create)?;
-            log_info!("Cluster: gave {host}:{port} the definition of an index it lacked");
-            ask_once(host, port, credentials, db, cmd)
+    /// [`crate::node_tls::generation`], when TLS between nodes is on.
+    tls: Option<u64>,
+}
+
+impl PoolKey {
+    fn new(host: &str, port: u16, credentials: &(String, String), db: usize) -> Self {
+        use sha2::Digest;
+        Self {
+            host: host.to_string(),
+            port,
+            user: credentials.0.clone(),
+            password: sha2::Sha256::digest(credentials.1.as_bytes()).into(),
+            db,
+            tls: crate::node_tls::cluster().then(crate::node_tls::generation),
         }
-        other => other,
+    }
+
+    /// Whether `self` was logged in as `other` is: the same user, password
+    /// and TLS setup, whatever the address and database.
+    fn same_login(&self, other: &PoolKey) -> bool {
+        self.user == other.user && self.password == other.password && self.tls == other.tls
     }
 }
 
-fn ask_once(
+struct Conn {
+    reader: BufReader<Box<dyn crate::node_tls::ReadWrite>>,
+    /// The socket under `reader`, for its timeouts.
+    socket: std::net::TcpStream,
+}
+
+/// Idle connections to the other masters, by what they were opened as. See
+/// [`ask_once`] for when one is kept and when it is closed.
+#[derive(Default)]
+pub struct Pool {
+    idle: parking_lot::Mutex<ahash::AHashMap<PoolKey, Vec<Conn>>>,
+}
+
+impl Pool {
+    fn take(&self, key: &PoolKey) -> Option<Conn> {
+        self.idle.lock().get_mut(key).and_then(Vec::pop)
+    }
+
+    /// Keep `conn` for the next search, unless as many are kept already.
+    fn put(&self, key: &PoolKey, conn: Conn) {
+        let extra = {
+            let mut idle = self.idle.lock();
+            let conns = idle.entry(key.clone()).or_default();
+            if conns.len() < POOL_IDLE_MAX {
+                conns.push(conn);
+                None
+            } else {
+                Some(conn)
+            }
+        };
+        // Closed outside the lock.
+        drop(extra);
+    }
+
+    /// Close every connection kept as `key`.
+    fn clear(&self, key: &PoolKey) {
+        let gone = self.idle.lock().remove(key);
+        drop(gone);
+    }
+
+    /// Close the connections that are not to one of `targets`, or not
+    /// logged in as `login` is: to a master forgotten, moved, or no longer
+    /// a master, or opened with credentials or TLS files since changed. So
+    /// what is kept never grows past [`POOL_IDLE_MAX`] for each master there
+    /// is now, and each database searched.
+    fn keep_only(&self, targets: &[(String, u16)], login: &PoolKey) {
+        let mut gone = Vec::new();
+        {
+            let mut idle = self.idle.lock();
+            let stale: Vec<PoolKey> = idle
+                .keys()
+                .filter(|k| {
+                    !k.same_login(login)
+                        || !targets.iter().any(|(h, p)| *h == k.host && *p == k.port)
+                })
+                .cloned()
+                .collect();
+            for key in stale {
+                gone.extend(idle.remove(&key));
+            }
+        }
+        drop(gone);
+    }
+
+    /// How many connections are kept, to all masters.
+    #[cfg(test)]
+    fn idle(&self) -> usize {
+        self.idle.lock().values().map(Vec::len).sum()
+    }
+}
+
+/// How an exchange on a connection failed.
+enum Failed {
+    /// No byte of the reply came: the connection was found closed (a kept
+    /// one, by the other node's restart, its `timeout`, or `CLIENT KILL`).
+    /// The command did not run, or ran and said nothing; a search changes
+    /// nothing, so it may be sent again.
+    BeforeReply(String),
+    /// Anything else: a timeout, an error after part of the reply, a reply
+    /// that could not be read, a refused login.
+    Other(String),
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Send `out` on `conn` and read the replies to its first `preamble`
+/// commands, which must not be errors, then the reply to the last.
+fn exchange(conn: &mut Conn, out: &[u8], preamble: usize) -> Result<Reply, Failed> {
+    // The timeouts of every request, whichever connection it goes on.
+    let _ = conn.socket.set_read_timeout(Some(TIMEOUT));
+    let _ = conn.socket.set_write_timeout(Some(TIMEOUT));
+    let writer = conn.reader.get_mut();
+    if let Err(e) = writer.write_all(out).and_then(|()| writer.flush()) {
+        return Err(if is_timeout(&e) {
+            Failed::Other(e.to_string())
+        } else {
+            Failed::BeforeReply(e.to_string())
+        });
+    }
+    match conn.reader.fill_buf() {
+        Ok([]) => return Err(Failed::BeforeReply("connection closed".into())),
+        Ok(_) => {}
+        Err(e) if is_timeout(&e) => return Err(Failed::Other(e.to_string())),
+        Err(e) => return Err(Failed::BeforeReply(e.to_string())),
+    }
+    for _ in 0..preamble {
+        if let Reply::Error(e) = read_reply(&mut conn.reader).map_err(Failed::Other)? {
+            return Err(Failed::Other(e));
+        }
+    }
+    read_reply(&mut conn.reader).map_err(Failed::Other)
+}
+
+/// A new connection to `host:port`, and what to send on it first: the
+/// login, the name, and the database, before the command.
+fn dial(
     host: &str,
     port: u16,
     credentials: &(String, String),
     db: usize,
-    cmd: &[Vec<u8>],
-) -> Result<Reply, String> {
+) -> Result<(Conn, Vec<u8>, usize), String> {
     let addr = (host, port)
         .to_socket_addrs()
         .ok()
         .and_then(|mut it| it.next())
         .ok_or("could not resolve")?;
-    let (stream, _) =
+    let (stream, socket) =
         crate::node_tls::connect_node(host, &addr, TIMEOUT).map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(stream);
     let (user, password) = credentials;
     let mut out = Vec::new();
     let mut preamble = 0;
@@ -263,21 +411,92 @@ fn ask_once(
         out.extend(encode(&[b"SELECT", db.to_string().as_bytes()]));
         preamble += 1;
     }
+    let conn = Conn {
+        reader: BufReader::new(stream),
+        socket,
+    };
+    Ok((conn, out, preamble))
+}
+
+/// [`ask_once`]; and a master that does not have the index (added to the
+/// cluster after it was created) is given it, and asked again.
+fn ask(
+    pool: &Pool,
+    host: &str,
+    port: u16,
+    credentials: &(String, String),
+    db: usize,
+    cmd: &[Vec<u8>],
+    definition: Option<&[Vec<u8>]>,
+) -> Result<Reply, String> {
+    match ask_once(pool, host, port, credentials, db, cmd) {
+        Err(e) if crate::commands::search::is_no_such_index(&e) && definition.is_some() => {
+            let create: Vec<&[u8]> = definition.unwrap().iter().map(Vec::as_slice).collect();
+            crate::cluster::ddl::run_on(host, port, &credentials.0, &credentials.1, &create)?;
+            log_info!("Cluster: gave {host}:{port} the definition of an index it lacked");
+            ask_once(pool, host, port, credentials, db, cmd)
+        }
+        other => other,
+    }
+}
+
+/// Send `cmd` to `host:port` and read its reply: on a kept connection if
+/// there is one, else on a new one.
+///
+/// A connection goes back to the pool only once a whole reply has been
+/// read off it, which leaves it ready for the next command; one that failed
+/// in any way, timed out, or gave part of a reply is closed. A kept
+/// connection found closed before any of the reply came is given up, with
+/// the others kept to that master the same way, and the command is sent
+/// once more on a new one: searches change nothing, so sending one twice
+/// is harmless. Nothing is sent again after part of a reply.
+fn ask_once(
+    pool: &Pool,
+    host: &str,
+    port: u16,
+    credentials: &(String, String),
+    db: usize,
+    cmd: &[Vec<u8>],
+) -> Result<Reply, String> {
+    let key = PoolKey::new(host, port, credentials, db);
     let parts: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
-    out.extend(encode(&parts));
-    let writer = reader.get_mut();
-    writer
-        .write_all(&out)
-        .and_then(|()| writer.flush())
-        .map_err(|e| e.to_string())?;
-    for _ in 0..preamble {
-        if let Reply::Error(e) = read_reply(&mut reader)? {
-            return Err(e);
+    let command = encode(&parts);
+    if let Some(mut conn) = pool.take(&key) {
+        match exchange(&mut conn, &command, 0) {
+            Ok(reply) => return done(pool, &key, conn, reply),
+            // Most likely, the others kept with it were closed too.
+            Err(Failed::BeforeReply(_)) => pool.clear(&key),
+            Err(Failed::Other(e)) => return Err(e),
         }
     }
-    match read_reply(&mut reader)? {
-        Reply::Error(e) => Err(e),
-        reply => Ok(reply),
+    let (mut conn, mut out, preamble) = dial(host, port, credentials, db)?;
+    out.extend(command);
+    match exchange(&mut conn, &out, preamble) {
+        Ok(reply) => done(pool, &key, conn, reply),
+        Err(Failed::BeforeReply(e) | Failed::Other(e)) => Err(e),
+    }
+}
+
+/// The reply, read whole off `conn`; and `conn` back in the pool.
+fn done(pool: &Pool, key: &PoolKey, conn: Conn, reply: Reply) -> Result<Reply, String> {
+    // A reply read whole leaves nothing behind it. Anything there would be
+    // read as the next command's reply.
+    let clean = conn.reader.buffer().is_empty();
+    match reply {
+        Reply::Error(e) => {
+            // An error reply is a whole reply too, and the connection is as
+            // good as before: unless it is no longer logged in.
+            if clean && !e.starts_with("NOAUTH") && !e.starts_with("WRONGPASS") {
+                pool.put(key, conn);
+            }
+            Err(e)
+        }
+        reply => {
+            if clean {
+                pool.put(key, conn);
+            }
+            Ok(reply)
+        }
     }
 }
 
@@ -296,13 +515,15 @@ pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<R
         store.get(&real).map(|def| def.create_args())
     });
     let definition = definition.as_deref();
+    let pool = &ctx.cluster.search_pool;
+    pool.keep_only(&targets, &PoolKey::new("", 0, &credentials, db));
     let results: Vec<Result<Reply, String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
             .map(|(host, port)| {
                 let credentials = &credentials;
                 scope.spawn(move || {
-                    ask(host, *port, credentials, db, cmd, definition)
+                    ask(pool, host, *port, credentials, db, cmd, definition)
                         .map_err(|e| format!("{host}:{port}: {e}"))
                 })
             })
@@ -482,6 +703,130 @@ pub fn decode_rows(reply: Reply) -> (Vec<ahash::AHashMap<String, String>>, bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for another master: it answers each command with an
+    /// array holding the number of connections it has accepted, and can
+    /// close every connection it has, as `CLIENT KILL` or a restart would.
+    struct Peer {
+        port: u16,
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        open: std::sync::Arc<parking_lot::Mutex<Vec<std::net::TcpStream>>>,
+    }
+
+    impl Peer {
+        fn start() -> Self {
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let open = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let (count, streams) = (accepted.clone(), open.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+                    streams.lock().push(stream.try_clone().unwrap());
+                    std::thread::spawn(move || {
+                        let mut writer = stream.try_clone().unwrap();
+                        let mut reader = BufReader::new(stream);
+                        while let Ok(Reply::Array(cmd)) = read_reply(&mut reader) {
+                            let name = cmd.first().and_then(Reply::text).unwrap_or_default();
+                            let reply = if name.eq_ignore_ascii_case("FT.SEARCH") {
+                                format!("*1\r\n:{n}\r\n")
+                            } else {
+                                "+OK\r\n".to_string()
+                            };
+                            if writer.write_all(reply.as_bytes()).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Peer {
+                port,
+                accepted,
+                open,
+            }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn close_all(&self) {
+            for stream in self.open.lock().drain(..) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    fn search() -> Vec<Vec<u8>> {
+        vec![b"FT.SEARCH".to_vec(), b"idx".to_vec(), b"*".to_vec()]
+    }
+
+    /// Searches reuse one connection; one closed while kept is replaced
+    /// and the search sent again on the new one; a change of credentials
+    /// opens a new one and the old is closed; the pool keeps at most
+    /// [`POOL_IDLE_MAX`] to a master (#723).
+    #[test]
+    fn searches_reuse_a_kept_connection_and_survive_its_closing() {
+        let peer = Peer::start();
+        let pool = Pool::default();
+        let open = (String::new(), String::new());
+        let at = |reply: Reply| match reply {
+            Reply::Array(items) => match items.as_slice() {
+                [Reply::Int(n)] => *n as usize,
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        for _ in 0..200 {
+            let reply = ask_once(&pool, "127.0.0.1", peer.port, &open, 0, &search()).unwrap();
+            assert_eq!(at(reply), 1);
+        }
+        assert_eq!(peer.accepted(), 1);
+        assert_eq!(pool.idle(), 1);
+
+        // Closed by the other node while kept: sent again on a new one.
+        peer.close_all();
+        let reply = ask_once(&pool, "127.0.0.1", peer.port, &open, 0, &search()).unwrap();
+        assert_eq!(at(reply), 2);
+        assert_eq!(peer.accepted(), 2);
+        assert_eq!(pool.idle(), 1);
+
+        // New credentials: a new connection, never the old one.
+        let changed = ("internal".to_string(), "s3cret".to_string());
+        let reply = ask_once(&pool, "127.0.0.1", peer.port, &changed, 0, &search()).unwrap();
+        assert_eq!(at(reply), 3);
+        assert_eq!(pool.idle(), 2);
+        let targets = [("127.0.0.1".to_string(), peer.port)];
+        pool.keep_only(&targets, &PoolKey::new("", 0, &changed, 0));
+        assert_eq!(pool.idle(), 1);
+        // A master no longer among the targets: nothing kept for it.
+        pool.keep_only(&[], &PoolKey::new("", 0, &changed, 0));
+        assert_eq!(pool.idle(), 0);
+
+        // No more than POOL_IDLE_MAX kept, however many were open at once.
+        let key = PoolKey::new("127.0.0.1", peer.port, &open, 0);
+        for _ in 0..POOL_IDLE_MAX + 4 {
+            let (conn, _, _) = dial("127.0.0.1", peer.port, &open, 0).unwrap();
+            pool.put(&key, conn);
+        }
+        assert_eq!(pool.idle(), POOL_IDLE_MAX);
+    }
+
+    #[test]
+    fn a_login_is_told_apart_by_user_password_and_tls() {
+        let a = PoolKey::new("h", 1, &("u".into(), "p".into()), 0);
+        assert!(a.same_login(&PoolKey::new("x", 2, &("u".into(), "p".into()), 3)));
+        assert!(!a.same_login(&PoolKey::new("h", 1, &("u".into(), "q".into()), 0)));
+        assert!(!a.same_login(&PoolKey::new("h", 1, &("v".into(), "p".into()), 0)));
+        let mut tls = a.clone();
+        tls.tls = Some(7);
+        assert!(!a.same_login(&tls));
+        assert!(a != PoolKey::new("h", 1, &("u".into(), "p".into()), 1));
+    }
 
     #[test]
     fn replies_are_read_whole_and_rows_survive_the_trip() {

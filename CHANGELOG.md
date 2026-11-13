@@ -23,6 +23,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Searches in a cluster no longer use up the coordinator's ports
+  (#723).** `FT.SEARCH` and `FT.AGGREGATE` opened a new connection to every
+  other master for each search and closed it after the reply, so under a
+  steady load of searches the node that received them ran out of local
+  ports (`Cannot assign requested address`). The connections are now kept
+  open and reused, up to 16 idle ones per master, and are opened again
+  when `masteruser`, `masterauth` or the TLS files change.
+
 - **A script that waits for `TIME` to move ends (#676).** `TIME` in a
   script returned the script's start for as long as it ran, so a loop
   waiting for it to change ran until `SCRIPT KILL`. As in Redis, `TIME`

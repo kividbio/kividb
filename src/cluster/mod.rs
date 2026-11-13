@@ -371,6 +371,9 @@ pub struct ClusterState {
     /// The connection each peer is pinged over, by `ip:bus_port`, kept open
     /// between heartbeats. See `bus::dialer::send_ping`.
     pub(crate) ping_links: parking_lot::Mutex<AHashMap<String, bus::dialer::PingLink>>,
+    /// The connections a search is sent on to the other masters, kept open
+    /// between searches. See `search::Pool`.
+    pub(crate) search_pool: search::Pool,
 }
 
 impl ClusterState {
@@ -431,6 +434,7 @@ impl ClusterState {
             stats_bus_connects: AtomicU64::new(0),
             links: parking_lot::Mutex::new(AHashMap::new()),
             ping_links: parking_lot::Mutex::new(AHashMap::new()),
+            search_pool: search::Pool::default(),
         };
         state.refresh_state();
         state
