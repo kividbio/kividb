@@ -615,16 +615,14 @@ fn madd(ctx: &mut Ctx) -> Vec<u8> {
         return wrong_args("BF.MADD");
     }
     let key = ctx.cmd[1];
-    let items: Vec<&[u8]> = ctx.cmd[2..].to_vec();
-    let items = &items[..];
+    let count = ctx.cmd.len() - 2;
     let params = default_params();
     let resp = resp(ctx);
-    let limits = match limits(ctx, |ctx| {
-        bytes_to_add(ctx, key, Some(&params), items.len())
-    }) {
+    let limits = match limits(ctx, |ctx| bytes_to_add(ctx, key, Some(&params), count)) {
         Ok(limits) => limits,
         Err(e) => return e,
     };
+    let items = &ctx.cmd[2..];
     match with_filter_mut(ctx, key, Some(params), limits, Vec::new, |chain, made| {
         (add_each(chain, items, resp, limits), made)
     }) {
