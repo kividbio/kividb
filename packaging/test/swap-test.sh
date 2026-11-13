@@ -16,11 +16,22 @@
 # containers --privileged, for systemd. nfpm is used from PATH, or from its
 # Docker image. Each distribution's log is in target/pkgtest/<distro>.log.
 #
-# Four versions of each package are built: the version in Cargo.toml and
-# three more with the patch number raised, each with one more comment line
-# in the default kividb.conf, so that an upgrade or a swap meets an edited
-# config and a new default. packaging/test/in-container.sh says what is
-# checked at each step.
+# Four versions of each package are built: the version in Cargo.toml (or
+# 1.3.0, if that is older) and three more with the patch number raised, each
+# with one more comment line in the default kividb.conf, so that an upgrade
+# or a swap meets an edited config and a new default.
+# packaging/test/in-container.sh says what is checked at each step, and
+# packaging/test/from-1.2.sh what is checked from a released 1.2.x package.
+#
+# Environment:
+#   OLD_RELEASE  the release whose kividb package from-1.2.sh starts from
+#                (default v1.2.2; "none" to skip that part), downloaded from
+#                github.com/kividbio/kividb
+#   SHIPPED_DIR  a directory with a release's own kividb_amd64.deb,
+#                kividb-full_amd64.deb, kividb.x86_64.rpm and
+#                kividb-full.x86_64.rpm, with SHIPPED_VERSION: their fields
+#                are checked, and they are installed and swapped once, in
+#                debian:12 and rockylinux:9 (the release workflow sets it)
 set -euo pipefail
 
 default_bin="$(realpath "${1:?usage: swap-test.sh DEFAULT_BINARY FULL_BINARY [DISTRO...]}")"
@@ -53,6 +64,8 @@ nfpm() {
 # ── Versions ─────────────────────────────────────────────────────────────
 base="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version *=/{gsub(/[" ]/,"");sub(/^version=/,"");print;exit}' Cargo.toml)"
 base="${base%%-*}"
+# Above any 1.2.x, so that from-1.2.sh upgrades from the released package.
+if [ "$(printf '%s\n' "$base" 1.3.0 | sort -V | head -n 1)" != 1.3.0 ]; then base=1.3.0; fi
 IFS=. read -r major minor patch <<<"$base"
 versions=()
 for i in 0 1 2 3; do versions+=("$major.$minor.$((patch + i))"); done
@@ -78,13 +91,73 @@ for i in 0 1 2 3; do
 done
 ls -l "$work"/pkgs/*/
 
-# What each package says about the other, as built for the release.
-echo "== kividb-full_${versions[0]}_amd64.deb"
-docker run --rm -v "$PWD/$work/pkgs:/p:ro" debian:12 \
-    dpkg-deb -f "/p/${versions[0]}/kividb-full_${versions[0]}_amd64.deb" Package Version Provides Conflicts Replaces Depends
-echo "== kividb_${versions[0]}_amd64.deb"
-docker run --rm -v "$PWD/$work/pkgs:/p:ro" debian:12 \
-    dpkg-deb -f "/p/${versions[0]}/kividb_${versions[0]}_amd64.deb" Package Version Provides Conflicts Replaces Depends
+# ── What each package says about the other ───────────────────────────────
+retry() { # retry COMMAND...: up to three times, for the network
+    local t
+    for t in 1 2 3; do
+        "$@" && return 0
+        echo "attempt $t failed: $*" >&2
+        sleep $((t * 10))
+    done
+    return 1
+}
+# check_fields DIR DEB_DEFAULT DEB_FULL RPM_DEFAULT RPM_FULL VERSION
+check_fields() {
+    # nfpm writes a pre-release 1.3.0-rc1 as 1.3.0~rc1 (nfpm-config.sh).
+    local dir="$1" v="${6/-/\~}" got want
+    got="$(retry docker run --rm -v "$dir:/p:ro" debian:12 sh -c \
+        "dpkg-deb -f /p/$2 Package Provides Conflicts Replaces; echo ---; dpkg-deb -f /p/$3 Package Provides Conflicts Replaces")"
+    want="Package: kividb
+Conflicts: kividb-full
+Replaces: kividb-full
+---
+Package: kividb-full
+Provides: kividb (= $v)
+Conflicts: kividb
+Replaces: kividb"
+    if [ "$got" != "$want" ]; then
+        printf 'deb fields of %s and %s:\n%s\nwanted:\n%s\n' "$2" "$3" "$got" "$want" >&2
+        return 1
+    fi
+    got="$(retry docker run --rm -v "$dir:/p:ro" rockylinux:9 sh -c "
+        for f in /p/$4 /p/$5; do
+            echo \"name: \$(rpm -qp --nosignature --qf '%{NAME}' \$f)\"
+            echo \"conflicts:\$(rpm -qp --nosignature --conflicts \$f | sed 's/^/ /' | tr -d '\\n')\"
+            echo \"obsoletes:\$(rpm -qp --nosignature --obsoletes \$f | sed 's/^/ /' | tr -d '\\n')\"
+            rpm -qp --nosignature --provides \$f | grep -qx 'kividb = $v' && echo 'provides: kividb = $v' || true
+        done")"
+    want="name: kividb
+conflicts: kividb-full
+obsoletes:
+name: kividb-full
+conflicts: kividb
+obsoletes:
+provides: kividb = $v"
+    # No Obsoletes: with one, dnf would trade one package for the other on
+    # every upgrade.
+    if [ "$got" != "$want" ]; then
+        printf 'rpm fields of %s and %s:\n%s\nwanted:\n%s\n' "$4" "$5" "$got" "$want" >&2
+        return 1
+    fi
+    echo "ok: the Provides, Conflicts, Replaces (deb) and Obsoletes (rpm, none) of $2, $3, $4 and $5"
+}
+v0="${versions[0]}"
+check_fields "$PWD/$work/pkgs/$v0" "kividb_${v0}_amd64.deb" "kividb-full_${v0}_amd64.deb" \
+    "kividb-${v0}-1.x86_64.rpm" "kividb-full-${v0}-1.x86_64.rpm" "$v0"
+if [ -n "${SHIPPED_DIR:-}" ]; then
+    shipped="$(realpath "$SHIPPED_DIR")"
+    check_fields "$shipped" kividb_amd64.deb kividb-full_amd64.deb kividb.x86_64.rpm kividb-full.x86_64.rpm \
+        "${SHIPPED_VERSION:?set SHIPPED_VERSION with SHIPPED_DIR}"
+fi
+
+# ── The released 1.2.x package from-1.2.sh starts from ───────────────────
+OLD_RELEASE="${OLD_RELEASE:-v1.2.2}"
+if [ "$OLD_RELEASE" != none ]; then
+    mkdir -p "$work/old"
+    for f in kividb_amd64.deb kividb.x86_64.rpm; do
+        retry curl -fsSL -o "$work/old/$f" "https://github.com/kividbio/kividb/releases/download/$OLD_RELEASE/$f"
+    done
+fi
 
 # ── Homebrew formulas ────────────────────────────────────────────────────
 a="$(printf a%.0s $(seq 64))"
@@ -112,6 +185,36 @@ docker run --rm -v "$PWD/$work:/w:ro" ruby:3.3-slim sh -c 'ruby -c /w/formula-de
 echo "ok: the Homebrew formulas render, with the release's urls and checksums"
 
 # ── The distributions ────────────────────────────────────────────────────
+# run_in TAG LOG SCRIPT ARG...: SCRIPT in a new container of TAG, once
+# systemd is up. Prints PASS or FAIL; fails with the script.
+run_in() {
+    local tag="$1" log="$2" name t state
+    shift 2
+    name="$tag-$$-$RANDOM"
+    docker run -d --name "$name" --privileged --cgroupns=host \
+        -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+        -v "$PWD/$work/pkgs:/pkgs:ro" -v "$PWD/$work/old:/old:ro" \
+        -v "$PWD/packaging/test:/pkgtest:ro" ${shipped:+-v "$shipped:/shipped:ro"} \
+        "$tag" >/dev/null
+    # "degraded": a unit a container cannot run failed, which is no matter.
+    state="$(docker exec "$name" timeout 120 systemctl is-system-running --wait 2>/dev/null || true)"
+    case "$state" in
+        running | degraded) ;;
+        *) echo "systemd in $tag is '$state'" > "$log" ;;
+    esac
+    local rc=0
+    docker exec "$name" bash "$@" >> "$log" 2>&1 || rc=$?
+    docker rm -f "$name" >/dev/null
+    if [ "$rc" = 0 ]; then
+        echo "   PASS: $(basename "$log") ($(grep -c '^ok:' "$log") checks)"
+    else
+        echo "   FAIL: $(basename "$log"), the end of it:"
+        tail -n 40 "$log"
+    fi
+    return "$rc"
+}
+
+mkdir -p "$work/old"
 failed=()
 for distro in "${distros[@]}"; do
     tag="pkgtest-$(echo "$distro" | tr ':.' '--')"
@@ -131,21 +234,22 @@ CMD [\"/usr/lib/systemd/systemd\"]"
         *) echo "unknown distribution $distro" >&2; exit 1 ;;
     esac
     echo "== $distro: building $tag"
-    printf '%s\n' "$dockerfile" | docker build -q -t "$tag" - >/dev/null
-    name="$tag-$$"
-    docker run -d --name "$name" --privileged --cgroupns=host \
-        -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
-        -v "$PWD/$work/pkgs:/pkgs:ro" -v "$PWD/packaging/test:/pkgtest:ro" \
-        "$tag" >/dev/null
-    log="$work/$(echo "$distro" | tr ':' '-').log"
-    if docker exec "$name" bash /pkgtest/in-container.sh "$family" "${versions[@]}" > "$log" 2>&1; then
-        echo "== $distro: PASS ($(grep -c '^ok:' "$log") checks)"
-    else
-        echo "== $distro: FAIL; the end of $log:"
-        tail -n 40 "$log"
+    if ! printf '%s\n' "$dockerfile" | retry docker build -q -t "$tag" - >/dev/null; then
+        echo "   FAIL: cannot build $tag"
         failed+=("$distro")
+        continue
     fi
-    docker rm -f "$name" >/dev/null
+    base_log="$work/$(echo "$distro" | tr ':' '-')"
+    run_in "$tag" "$base_log.log" /pkgtest/in-container.sh "$family" "${versions[@]}" || failed+=("$distro")
+    if [ "$OLD_RELEASE" != none ]; then
+        old=/old/kividb_amd64.deb
+        [ "$family" = rpm ] && old=/old/kividb.x86_64.rpm
+        run_in "$tag" "$base_log-from-$OLD_RELEASE.log" /pkgtest/from-1.2.sh "$family" "${versions[3]}" "$old" ||
+            failed+=("$distro from $OLD_RELEASE")
+    fi
+    if [ -n "${shipped:-}" ] && { [ "$distro" = debian:12 ] || [ "$distro" = rockylinux:9 ]; }; then
+        run_in "$tag" "$base_log-shipped.log" /pkgtest/shipped.sh "$family" || failed+=("$distro shipped")
+    fi
 done
 
 if [ "${#failed[@]}" -gt 0 ]; then

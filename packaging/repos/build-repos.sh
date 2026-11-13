@@ -9,13 +9,15 @@
 # directory the first time); INCOMING holds the .deb and .rpm files to add,
 # named anything. The packages already in SITE are kept, so users can pin or
 # go back to an older version, except that only the newest $KEEP versions of
-# each package and architecture are kept (GitHub Pages sites are meant to
-# stay under 1 GB; a release adds about 56 MB: kividb and kividb-full).
+# kividb and $KEEP_FULL of kividb-full are kept, per architecture (GitHub
+# Pages sites are meant to stay under 1 GB; a release adds about 26 MB of
+# kividb and 30 MB of kividb-full).
 #
 # Environment:
 #   GPG_KEY   fingerprint of the signing key, already in gpg's keyring, usable
 #             with no passphrase prompt (the workflow presets the passphrase)
-#   KEEP      versions kept per package and architecture (default 12)
+#   KEEP      versions of each package kept per architecture (default 16)
+#   KEEP_FULL the same for kividb-full (default 8)
 #   BASE_URL  where the site is served (default https://packages.kividb.io)
 #   GLIBC_DEP_CHECK  fail (default) or warn: what to do with a package that
 #             does not say it needs glibc 2.34 or newer (docs/INSTALL.md
@@ -39,13 +41,19 @@ set -euo pipefail
 SITE="$(realpath "${1:?usage: build-repos.sh SITE INCOMING}")"
 INCOMING="$(realpath "${2:?usage: build-repos.sh SITE INCOMING}")"
 GPG_KEY="${GPG_KEY:?set GPG_KEY to the fingerprint of the signing key}"
-KEEP="${KEEP:-12}"
+KEEP="${KEEP:-16}"
+KEEP_FULL="${KEEP_FULL:-8}"
 BASE_URL="${BASE_URL:-https://packages.kividb.io}"
 BASE_URL="${BASE_URL%/}"
 
 GLIBC_DEP_CHECK="${GLIBC_DEP_CHECK:-fail}"
 
-case "$KEEP" in '' | *[!0-9]* | 0) echo "KEEP must be a positive number" >&2; exit 1 ;; esac
+for n in "$KEEP" "$KEEP_FULL"; do
+    case "$n" in '' | *[!0-9]* | 0) echo "KEEP and KEEP_FULL must be positive numbers" >&2; exit 1 ;; esac
+done
+keep_of() { # keep_of PACKAGE: how many versions of it are kept
+    if [ "$1" = kividb-full ]; then echo "$KEEP_FULL"; else echo "$KEEP"; fi
+}
 case "$GLIBC_DEP_CHECK" in fail | warn) ;; *) echo "GLIBC_DEP_CHECK must be fail or warn" >&2; exit 1 ;; esac
 
 DEB_ARCHES="amd64 arm64"
@@ -175,12 +183,12 @@ for rpmf in "$INCOMING"/*.rpm; do
 done
 echo "added $added package(s)"
 
-# ── Keep the newest $KEEP versions of each package and architecture ──────
-# Compared with newer(), above.
-prune() { # prune deb|rpm FILE... : the same package and architecture
-    local kind="$1"
-    shift
-    [ "$#" -gt "$KEEP" ] || return 0
+# ── Keep the newest versions of each package and architecture ────────────
+# $KEEP of kividb, $KEEP_FULL of kividb-full. Compared with newer(), above.
+prune() { # prune deb|rpm KEEP FILE... : the same package and architecture
+    local kind="$1" keep="$2"
+    shift 2
+    [ "$#" -gt "$keep" ] || return 0
     # Insertion sort, newest first: a few dozen files at most.
     local sorted=() f v i j vj
     local -A ver=()
@@ -202,7 +210,7 @@ prune() { # prune deb|rpm FILE... : the same package and architecture
             i=$j
         done
     done
-    for f in "${sorted[@]:$KEEP}"; do
+    for f in "${sorted[@]:$keep}"; do
         echo "pruned ${f#"$SITE"/} (${ver[$f]})"
         rm -f "$f"
     done
@@ -214,7 +222,7 @@ for pkgdir in "$SITE"/deb/pool/main/*/*/; do
         for name in $(for f in "${debs[@]}"; do dpkg-deb -f "$f" Package; done | sort -u); do
             mapfile -t same < <(for f in "${debs[@]}"; do
                 [ "$(dpkg-deb -f "$f" Package)" = "$name" ] && printf '%s\n' "$f"; done)
-            prune deb "${same[@]}"
+            prune deb "$(keep_of "$name")" "${same[@]}"
         done
     done
 done
@@ -223,10 +231,14 @@ for arch in $RPM_ARCHES; do
     [ -d "$d" ] || continue
     mapfile -t rpms < <(find "$d" -maxdepth 1 -type f -name '*.rpm')
     [ "${#rpms[@]}" -gt 0 ] || continue
-    for name in $(for f in "${rpms[@]}"; do rpm -qp --nosignature --qf '%{NAME}\n' "$f"; done | sort -u); do
+    # Each file's package name, read once: kividb and kividb-full share the
+    # directory, and the files pruned for one are gone for the next.
+    declare -A rpm_name=()
+    for f in "${rpms[@]}"; do rpm_name[$f]="$(rpm -qp --nosignature --qf '%{NAME}' "$f")"; done
+    for name in $(printf '%s\n' "${rpm_name[@]}" | sort -u); do
         mapfile -t same < <(for f in "${rpms[@]}"; do
-            [ "$(rpm -qp --nosignature --qf '%{NAME}' "$f")" = "$name" ] && printf '%s\n' "$f"; done)
-        prune rpm "${same[@]}"
+            [ "${rpm_name[$f]}" = "$name" ] && printf '%s\n' "$f"; done)
+        prune rpm "$(keep_of "$name")" "${same[@]}"
     done
 done
 
@@ -359,7 +371,7 @@ sudo apt update &amp;&amp; sudo apt install kividb      # or: kividb-full</pre>
 <pre>sudo curl -fsSL -o /etc/yum.repos.d/kividb.repo $BASE_URL/kividb.repo
 sudo dnf install kividb      # or: kividb-full</pre>
 <p>Full instructions: <a href="https://github.com/kividbio/kividb/blob/master/docs/INSTALL.md">docs/INSTALL.md</a>.
-The newest $KEEP versions are kept.</p>
+The newest $KEEP versions of <code>kividb</code> and $KEEP_FULL of <code>kividb-full</code> are kept.</p>
 <h2>Versions</h2>
 <ul>
 EOF

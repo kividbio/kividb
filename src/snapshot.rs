@@ -1087,10 +1087,10 @@ fn read_language_section(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::
 
 /// The libraries loaded now, as a `FUNCTION DUMP` payload: `None` when there
 /// is none. In a build without Lua, the libraries of the image it loaded,
-/// kept as they were ([`KEPT_FUNCTIONS`]).
-fn function_libraries() -> Option<Vec<u8>> {
+/// kept as they were ([`KEPT_FUNCTIONS`]): shared, not copied, by every save.
+fn function_libraries() -> Option<std::sync::Arc<[u8]>> {
     #[cfg(feature = "lua")]
-    let libraries = crate::commands::library_snapshot();
+    let libraries = crate::commands::library_snapshot().map(std::sync::Arc::from);
     #[cfg(not(feature = "lua"))]
     let libraries = KEPT_FUNCTIONS.get();
     libraries
@@ -1102,13 +1102,15 @@ fn function_libraries() -> Option<Vec<u8>> {
 /// every image it makes, so that going from the `full` or `lua` build to the
 /// default one and back (the `kividb-full` and `kividb` packages, #732)
 /// leaves them where they were. Replaced, like loaded libraries, by the next
-/// image loaded.
+/// image loaded, and emptied by `FUNCTION FLUSH` ([`flush_kept_functions`]).
+/// A replica keeps the libraries of its last full sync: the `FUNCTION`
+/// commands its master sends after it are refused here, and logged.
 #[cfg(not(feature = "lua"))]
 static KEPT_FUNCTIONS: KeptFunctions = KeptFunctions::new();
 
 /// A payload held as it came: see [`KEPT_FUNCTIONS`].
 #[cfg(not(feature = "lua"))]
-struct KeptFunctions(std::sync::Mutex<Option<Vec<u8>>>);
+struct KeptFunctions(std::sync::Mutex<Option<std::sync::Arc<[u8]>>>);
 
 #[cfg(not(feature = "lua"))]
 impl KeptFunctions {
@@ -1116,13 +1118,28 @@ impl KeptFunctions {
         Self(std::sync::Mutex::new(None))
     }
 
-    fn get(&self) -> Option<Vec<u8>> {
+    fn get(&self) -> Option<std::sync::Arc<[u8]>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn set(&self, payload: Option<Vec<u8>>) {
+    fn set(&self, payload: Option<std::sync::Arc<[u8]>>) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = payload;
     }
+}
+
+/// Whether a build without Lua holds function libraries it cannot run
+/// ([`KEPT_FUNCTIONS`]).
+#[cfg(not(feature = "lua"))]
+pub fn holds_kept_functions() -> bool {
+    KEPT_FUNCTIONS.get().is_some()
+}
+
+/// `FUNCTION FLUSH` in a build without Lua: the libraries it kept are
+/// dropped, and its next snapshot has none. Propagated like any write, so
+/// the AOF and the replicas drop theirs too.
+#[cfg(not(feature = "lua"))]
+pub fn flush_kept_functions() {
+    KEPT_FUNCTIONS.set(None);
 }
 
 /// The function libraries' section, which closes a KDB image. Absent when
@@ -1150,19 +1167,25 @@ pub fn restore_functions(functions: Option<Vec<u8>>) -> io::Result<()> {
         )
     })?;
     #[cfg(not(feature = "lua"))]
-    {
-        if let Some(payload) = &functions {
-            let names = function_library_names(payload)
-                .map(|names| format!(" {}", names.join(", ")))
-                .unwrap_or_default();
+    KEPT_FUNCTIONS.set(functions.and_then(|payload| {
+        // Only libraries it can read the names of: a payload of any other
+        // shape would be handed on to a build with Lua, which refuses to
+        // start on a snapshot whose libraries it cannot load.
+        let Some(names) = function_library_names(&payload) else {
             log_warn!(
-                "the snapshot's function libraries{names} are not loaded: this build was made \
-                 without Lua, so FUNCTION and FCALL are refused. They are kept as they are, \
-                 and saved again in this server's snapshots, for a build with Lua"
+                "the snapshot's function libraries are not loaded and not kept: this build \
+                 was made without Lua, and their payload cannot be read"
             );
-        }
-        KEPT_FUNCTIONS.set(functions);
-    }
+            return None;
+        };
+        log_warn!(
+            "the snapshot's function libraries {} are not loaded: this build was made \
+             without Lua, so FUNCTION and FCALL are refused. They are kept as they are, \
+             and saved again in this server's snapshots, for a build with Lua",
+            names.join(", ")
+        );
+        Some(std::sync::Arc::from(payload))
+    }));
     Ok(())
 }
 
@@ -4920,7 +4943,7 @@ pub struct FrozenDataset {
     index_section: Vec<u8>,
     alias_section: Vec<u8>,
     /// The function libraries at the same instant.
-    functions: Option<Vec<u8>>,
+    functions: Option<std::sync::Arc<[u8]>>,
     /// The indexes' languages (see [`write_kdb_language_section`]).
     language_section: Vec<u8>,
     /// The indexes' scores (see [`write_kdb_score_section`]).
@@ -5088,7 +5111,7 @@ fn freeze(
         + index_section.capacity()
         + alias_section.capacity()
         + language_section.capacity()
-        + functions.as_ref().map_or(0, Vec::capacity)
+        + functions.as_ref().map_or(0, |f| f.len())
         + score_section.capacity();
 
     Ok(FrozenDataset {
@@ -6688,7 +6711,7 @@ mod field_option_tests {
         let mut frozen = freeze_dataset_for_disk(&db, Some(&store)).unwrap();
         // Include the function section even in a build without Lua, so the
         // ordering covers every section an image can carry.
-        frozen.functions = Some(b"KVFN payload".to_vec());
+        frozen.functions = Some(std::sync::Arc::from(&b"KVFN payload"[..]));
         frozen.into_payload().unwrap()
     }
 
@@ -7021,7 +7044,7 @@ mod function_section_tests {
     fn a_build_without_lua_keeps_the_libraries_it_was_given() {
         let kept = KeptFunctions::new();
         assert_eq!(kept.get(), None);
-        kept.set(Some(b"KVFN payload".to_vec()));
+        kept.set(Some(std::sync::Arc::from(&b"KVFN payload"[..])));
         assert_eq!(kept.get().as_deref(), Some(&b"KVFN payload"[..]));
         kept.set(None);
         assert_eq!(kept.get(), None);

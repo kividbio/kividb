@@ -33,9 +33,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `INFO server` has `kividb_variant`. A build without Lua now keeps the
   function libraries of the data it loads and writes them into its own
   snapshots, so going from `kividb-full` to `kividb` and back keeps them;
-  until now its first snapshot dropped them. The repositories keep the
-  newest 12 releases of each package, down from 20, to stay within GitHub
-  Pages' size limit.
+  until now its first snapshot dropped them; `FUNCTION FLUSH` there drops
+  them. The repositories keep the newest 16 releases of `kividb`, down
+  from 20, and 8 of `kividb-full`, to stay within GitHub Pages' size limit.
+  Swap only to a package of 1.3.0 or later: from `kividb` 1.2.x with apt,
+  the unit is enabled and started whatever it was.
 
 - **Bloom filters (`BF.*`), as Redis 8 has them built in (part of #453).**
   `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.INSERT`, `BF.EXISTS`,

@@ -327,6 +327,37 @@ const NO_LUA: &str = concat!(
     "-lua, or a kividb-lua release file)"
 );
 
+/// `FUNCTION` in a build without Lua. `FUNCTION FLUSH` drops the libraries
+/// it kept from the data it loaded (`snapshot::flush_kept_functions`), so
+/// they can be got rid of here too; every other subcommand is refused. A
+/// refused one from the master leaves the kept libraries behind the
+/// master's, and says so once: a replica without Lua keeps those of its last
+/// full sync.
+#[cfg(not(feature = "lua"))]
+fn function_without_lua(ctx: &Ctx) -> Vec<u8> {
+    let sub = ctx.cmd.get(1).copied().unwrap_or_default();
+    let mode_ok = match ctx.cmd.len() {
+        2 => true,
+        3 => ctx.cmd[2].eq_ignore_ascii_case(b"SYNC") || ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC"),
+        _ => false,
+    };
+    if sub.eq_ignore_ascii_case(b"FLUSH") && mode_ok {
+        crate::snapshot::flush_kept_functions();
+        return resp_simple("OK");
+    }
+    if ctx.apply_replication && crate::snapshot::holds_kept_functions() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log_warn!(
+                "the master sent FUNCTION {}, which this build without Lua cannot run: the \
+                 function libraries it keeps are those of its last full sync, not the master's",
+                String::from_utf8_lossy(sub).to_ascii_uppercase()
+            );
+        }
+    }
+    resp_error(NO_LUA)
+}
+
 /// A setting's own name, for one Redis also takes under an older one.
 fn config_name(name: &str) -> &str {
     match name {
@@ -6403,7 +6434,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(NO_LUA))
+                Some(function_without_lua(ctx))
             }
         }
 

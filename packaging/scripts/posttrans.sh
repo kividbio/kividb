@@ -1,8 +1,9 @@
 #!/bin/sh
 # rpm only: runs once the whole transaction is done. In `dnf swap kividb
 # kividb-full` (or back), the package going away stops the unit in its
-# %preun, which runs after this package's %post; preremove.sh noted how the
-# unit was, and it is put back here, on this package's binary. The same
+# %preun, which runs after this package's %post; preinstall.sh (and, from
+# 1.3.0, the other package's preremove.sh) noted how the unit was, and it is
+# put back here, on this package's binary. The same
 # script for `kividb` and `kividb-full`; postinstall.sh has a copy of
 # restore_unit_state.
 set -e

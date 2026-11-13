@@ -14,12 +14,18 @@ scripts:
   preinstall: ./packaging/scripts/preinstall.sh
   postinstall: ./packaging/scripts/postinstall.sh
   preremove: ./packaging/scripts/preremove.sh
-# Run once a whole dnf transaction is done: after `dnf swap`, the package
-# going away has stopped the unit only after this one's %post ran (see
-# preremove.sh).
+# posttrans: run once a whole dnf transaction is done. After `dnf swap`, the
+# package going away has stopped the unit only after this one's %post ran
+# (see preinstall.sh and preremove.sh).
+# xz, not gzip: about 14% smaller (5.9 MB for 6.8 MB, the default build's
+# .deb), for the repositories' size limit (package-repos.yml, KEEP). Every
+# dpkg and rpm the packages support (glibc 2.34 and newer) reads it.
 rpm:
+  compression: xz
   scripts:
     posttrans: ./packaging/scripts/posttrans.sh
+deb:
+  compression: xz
 # `kividb` and `kividb-full` install the same files (the binary, the unit,
 # the config), so only one of them can be installed; installing the other
 # replaces it. Replaces is for deb only: nfpm writes `replaces` as rpm's

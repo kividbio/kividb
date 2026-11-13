@@ -143,8 +143,9 @@ sudo apt update && sudo apt upgrade            # Debian, Ubuntu
 sudo dnf upgrade kividb                        # Fedora, RHEL, Amazon Linux (or kividb-full)
 ```
 
-The newest 12 releases are kept in the repositories, so you can install a
-given one, or go back to it (the same with `kividb-full`):
+The newest 16 releases of `kividb` and 8 of `kividb-full` are kept in the
+repositories, so you can install a given one, or go back to it (the same
+with `kividb-full`):
 
 ```bash
 apt list -a kividb                                   # the versions on offer
@@ -176,21 +177,32 @@ sudo apt install kividb
 sudo dnf swap kividb-full kividb
 ```
 
+With dnf, use `swap`: `sudo dnf install kividb-full` while `kividb` is
+installed stops at the conflict between them, unless you add
+`--allowerasing`, which does the same as `swap`.
+
 In one step, the package you have is removed and the other one installed:
 
 - **The config is kept.** `/etc/kividb/kividb.conf` stays as you edited it.
   If the new package's default config differs from the one you started from,
   it is put beside yours as `kividb.conf.dpkg-dist` (apt asks first, at a
-  terminal) or `kividb.conf.rpmnew`. With apt, the package removed keeps its
-  config record (`apt list --installed` does not show it; `dpkg -l` shows it
-  as `rc`); `sudo apt purge kividb` then does not delete the config the other
-  package now uses.
+  terminal) or `kividb.conf.rpmnew`. With apt, the package removed is left
+  with its config record (`dpkg -l` shows it as `rc`); `sudo apt purge
+  kividb` then does not delete the config the other package now uses.
 - **The data is untouched.** The unit is stopped, so the server writes its
   final snapshot to `/var/lib/kividb`, and the new server starts from it.
 - **The service comes back as it was.** If the unit was running, it is
   started again on the new binary; if it was enabled, it stays enabled; if
-  you had stopped or disabled it, it stays that way.
+  you had stopped or disabled it, it stays that way. One exception: from a
+  `kividb` 1.2.x with apt, the unit is enabled and started whatever it was,
+  since 1.2.x's own removal script disables it before the new package is
+  unpacked (with dnf, and from 1.3.0 on, it is kept as it was).
 - **Upgrades stay on the new package.**
+
+Swap only to a package of 1.3.0 or later. `kividb` 1.2.x knows nothing of
+`kividb-full`: `sudo dnf swap kividb-full kividb-1.2.2` leaves the unit
+stopped and disabled (start it with `sudo systemctl enable --now kividb`). To
+go back to 1.2.x, swap to `kividb` first, then downgrade it.
 
 To see which build is running: `kividb --version` says `(default build: no
 Lua, no TLS)` or `(full build: Lua, TLS)`, and `INFO server` has
@@ -210,6 +222,13 @@ final snapshot (it crashed, or was killed), the libraries loaded since its
 last snapshot are only in the AOF, as `FUNCTION LOAD` commands the default
 build cannot run, and its next AOF checkpoint drops them. Swap while the
 server is running normally, or start `kividb-full` once more first.
+
+On the default build, `FUNCTION FLUSH` drops the libraries it keeps (and
+replicates like any write): use it to be rid of them for good. Every other
+`FUNCTION` subcommand is refused. A replica on the default build keeps the
+libraries of its last full sync from its master; the `FUNCTION` commands its
+master runs after that are refused on it and logged, so run replicas on the
+same build as their master.
 
 ### Removing
 
@@ -482,8 +501,9 @@ the `packages` environment:
 1. downloads the release's packages, `kividb` and `kividb-full` for each
    architecture (eight files), and checks them against `SHA256SUMS.txt` and
    their build attestations;
-2. checks out the site, adds the packages, signs each RPM, keeps the newest 12
-   versions of each package and architecture, regenerates and signs the apt
+2. checks out the site, adds the packages, signs each RPM, keeps the newest
+   16 versions of `kividb` and 8 of `kividb-full` for each architecture
+   (`KEEP` and `KEEP_FULL`), regenerates and signs the apt
    (`apt-ftparchive`) and dnf (`createrepo_c`) metadata, all with
    `packaging/repos/build-repos.sh`;
 3. pushes the site to `main` as a single commit, replacing the previous one,
@@ -501,9 +521,10 @@ the previous generation is kept beside the new one and older ones are removed.
 
 **Size.** A release adds about 56 MB: four `kividb` packages of about 6.6 MB
 and four `kividb-full` packages of about 7.4 MB. GitHub Pages sites are
-limited to 1 GB, and the job fails above 900 MB; with `KEEP` at 12, the site
-is about 670 MB. If more packages are added per release (`-lua` or `-tls`
-packages), or they grow, lower `KEEP` in the workflow.
+limited to 1 GB, and the job fails above 900 MB; keeping 16 releases of
+`kividb` (about 420 MB) and 8 of `kividb-full` (about 240 MB), the site is
+about 660 MB. If more packages are added per release (`-lua` or `-tls`
+packages), or they grow, lower `KEEP` or `KEEP_FULL` in the workflow.
 
 **Before publishing.** The release workflow's `package-test` job builds both
 packages from the release's x86_64 binaries and runs

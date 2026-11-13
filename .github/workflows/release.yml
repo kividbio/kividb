@@ -117,7 +117,17 @@ jobs:
           set -euo pipefail
           ver="${RELEASE_TAG#v}"
           pkg="${{ matrix.variant.package }}"
-          sh packaging/nfpm-config.sh "${{ matrix.variant.name }}" "${ver}" amd64 > /tmp/nfpm.yaml
+          if [ -f packaging/nfpm-config.sh ]; then
+            sh packaging/nfpm-config.sh "${{ matrix.variant.name }}" "${ver}" amd64 > /tmp/nfpm.yaml
+          elif [ "$pkg" = kividb ]; then
+            # A tag from before kividb-full (#732), released again from this
+            # workflow: the kividb package as it was made then.
+            echo "::notice::${RELEASE_TAG} has no packaging/nfpm-config.sh: the kividb package only"
+            sed -e "s/^version:.*/version: ${ver}/" -e "s/^arch:.*/arch: amd64/" packaging/nfpm.yaml > /tmp/nfpm.yaml
+          else
+            echo "::notice::${RELEASE_TAG} is from before kividb-full (#732): no $pkg package"
+            exit 0
+          fi
           mkdir -p dist
           nfpm pkg -f /tmp/nfpm.yaml --packager deb --target "dist/${pkg}_amd64.deb"
           nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target "dist/${pkg}.x86_64.rpm"
@@ -145,28 +155,52 @@ jobs:
   package-test:
     needs: [linux-amd64]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
+      # A tag from before kividb-full (#732), released again from this
+      # workflow, has neither the test nor the package: nothing to test.
+      - name: Is there a test
+        id: have
+        run: |
+          if [ -f packaging/test/swap-test.sh ]; then
+            echo "test=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${RELEASE_TAG} has no packaging/test/swap-test.sh: the packages are not tested"
+            echo "test=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Download the x86_64 builds
+        if: steps.have.outputs.test == 'true'
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: dist-linux-amd64-*
           merge-multiple: true
       - name: Install nfpm
+        if: steps.have.outputs.test == 'true'
         run: |
           set -euo pipefail
           curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
             | sudo tar xz -C /usr/local/bin nfpm
+      # The test's own packages, built from the release's binaries, and the
+      # release's packages themselves (SHIPPED_DIR): their fields checked,
+      # and installed and swapped once.
       - name: Install, swap, swap back and upgrade
+        if: steps.have.outputs.test == 'true'
+        env:
+          SHIPPED_DIR: artifacts
         run: |
           set -euo pipefail
           mkdir -p bins/default bins/full
           tar xzf artifacts/kividb-linux-x86_64.tar.gz -C bins/default
           tar xzf artifacts/kividb-full-linux-x86_64.tar.gz -C bins/full
-          bash packaging/test/swap-test.sh bins/default/kividb/kividb bins/full/kividb/kividb
+          SHIPPED_VERSION="${RELEASE_TAG#v}" \
+            bash packaging/test/swap-test.sh bins/default/kividb/kividb bins/full/kividb/kividb
       - name: Logs
         if: failure()
         run: tail -n +1 target/pkgtest/*.log || true
@@ -227,7 +261,17 @@ jobs:
           set -euo pipefail
           ver="${RELEASE_TAG#v}"
           pkg="${{ matrix.variant.package }}"
-          sh packaging/nfpm-config.sh "${{ matrix.variant.name }}" "${ver}" arm64 > /tmp/nfpm.yaml
+          if [ -f packaging/nfpm-config.sh ]; then
+            sh packaging/nfpm-config.sh "${{ matrix.variant.name }}" "${ver}" arm64 > /tmp/nfpm.yaml
+          elif [ "$pkg" = kividb ]; then
+            # A tag from before kividb-full (#732), released again from this
+            # workflow: the kividb package as it was made then.
+            echo "::notice::${RELEASE_TAG} has no packaging/nfpm-config.sh: the kividb package only"
+            sed -e "s/^version:.*/version: ${ver}/" -e "s/^arch:.*/arch: arm64/" packaging/nfpm.yaml > /tmp/nfpm.yaml
+          else
+            echo "::notice::${RELEASE_TAG} is from before kividb-full (#732): no $pkg package"
+            exit 0
+          fi
           mkdir -p dist
           nfpm pkg -f /tmp/nfpm.yaml --packager deb --target "dist/${pkg}_arm64.deb"
           nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target "dist/${pkg}.aarch64.rpm"
@@ -564,10 +608,12 @@ jobs:
     if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
-      # formula.sh, from the release's own commit.
+      # formula.sh, from this workflow's own commit: the tag's for a tag
+      # pushed, and the branch's when an older tag, from before formula.sh,
+      # is released again by hand.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ github.sha }}
           path: kividb
           persist-credentials: false
 
@@ -596,9 +642,13 @@ jobs:
           mkdir -p tap/Formula
           sh kividb/packaging/homebrew/formula.sh default "${VERSION}" "${{ github.repository }}" \
             "$(sha kividb-darwin-aarch64.tar.gz)" "$(sha kividb-darwin-x86_64.tar.gz)" > tap/Formula/kividb.rb
-          sh kividb/packaging/homebrew/formula.sh full "${VERSION}" "${{ github.repository }}" \
-            "$(sha kividb-full-darwin-aarch64.tar.gz)" "$(sha kividb-full-darwin-x86_64.tar.gz)" > tap/Formula/kividb-full.rb
-          cat tap/Formula/kividb.rb tap/Formula/kividb-full.rb
+          if [ -n "$(sha kividb-full-darwin-aarch64.tar.gz)" ]; then
+            sh kividb/packaging/homebrew/formula.sh full "${VERSION}" "${{ github.repository }}" \
+              "$(sha kividb-full-darwin-aarch64.tar.gz)" "$(sha kividb-full-darwin-x86_64.tar.gz)" > tap/Formula/kividb-full.rb
+          else
+            echo "::notice::v${VERSION} has no kividb-full macOS tarballs: Formula/kividb-full.rb is left as it is"
+          fi
+          cat tap/Formula/kividb.rb
 
       - name: Commit and push
         working-directory: tap
@@ -606,7 +656,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/kividb.rb Formula/kividb-full.rb
+          git add Formula/kividb.rb
+          if [ -f Formula/kividb-full.rb ]; then git add Formula/kividb-full.rb; fi
           # A re-run after the formulas were already pushed has nothing to add.
           if git diff --cached --quiet; then
             echo "The tap already has kividb ${{ steps.extract.outputs.version }}."
@@ -864,12 +915,13 @@ jobs:
   # benchmark results out of source archives; from 1.2.1 on, the release's
   # own commit has it. No `v`, so the tag starts no release run.
   source-tag:
-    needs: [linux-amd64, linux-arm64, darwin, docker-manifest]
+    needs: [linux-amd64, linux-arm64, darwin, docker-manifest, package-test]
     if: >-
       ${{ !cancelled()
           && !contains(github.event.inputs.tag || github.ref_name, '-')
           && needs.linux-amd64.result == 'success'
           && needs.linux-arm64.result == 'success'
+          && needs.package-test.result == 'success'
           && needs.docker-manifest.result == 'success'
           && needs.darwin.result == 'success' }}
     runs-on: ubuntu-latest
