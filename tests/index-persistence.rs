@@ -3702,9 +3702,11 @@ fn num_docs_is_the_same_after_an_aof_replay_and_a_snapshot_load() {
         assert!(Instant::now() < deadline, "the rewrite did not finish");
         thread::sleep(Duration::from_millis(50));
     }
-    thread::sleep(Duration::from_millis(500));
+    while !dir.join("dump.kdb").exists() {
+        assert!(Instant::now() < deadline, "the rewrite left no dump.kdb");
+        thread::sleep(Duration::from_millis(50));
+    }
     kill_server(&mut srv);
-    assert!(dir.join("dump.kdb").exists());
     let port = free_port();
     let mut srv = start_aof_server(port, &dir, &[]);
     assert!(wait_for_server(port, Duration::from_secs(10)), "restart");
