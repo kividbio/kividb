@@ -349,6 +349,34 @@ fn noeviction_refuses_what_adds_and_allows_what_frees() {
     assert!(c.cmd(&["SET", "again", &value]).ok());
 }
 
+/// While writes are paused nothing is evicted, as in Redis: a read over the
+/// limit, or a lower limit, leaves the dataset as it is, and eviction goes
+/// on once the pause is over (#424). Eviction's `DEL`s used to go on, and
+/// moved the replication offset a paused master had reported.
+#[test]
+fn nothing_is_evicted_while_writes_are_paused() {
+    let server = Server::start(&["--maxmemory-policy", "allkeys-random"]);
+    let mut c = server.conn();
+    let value = value();
+    for i in 0..2000 {
+        assert!(c.cmd(&["SET", &format!("k{i}"), &value]).ok());
+    }
+    let used = c.used_memory();
+
+    assert!(c.cmd(&["CLIENT", "PAUSE", "10000", "WRITE"]).ok());
+    c.limit_to(-used / 2);
+    for i in 0..100 {
+        assert_eq!(c.cmd(&["GET", &format!("k{i}")]).s(), value);
+    }
+    assert_eq!(c.evicted(), 0);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 2000);
+
+    assert!(c.cmd(&["CLIENT", "UNPAUSE"]).ok());
+    c.cmd(&["GET", "k0"]);
+    assert!(c.evicted() > 0);
+    assert!(c.cmd(&["DBSIZE"]).i() < 2000);
+}
+
 /// The least recently used keys go, to keep the server under its limit, and
 /// no write is refused.
 #[test]

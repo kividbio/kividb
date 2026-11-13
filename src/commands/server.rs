@@ -407,7 +407,9 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     crate::eviction::limit_changed();
                     // A limit below what is in use is enforced
                     // now, not at the next write.
-                    if v != 0 {
+                    // Not while writes are paused: eviction waits then
+                    // (#424).
+                    if v != 0 && !crate::pause::expiry_deferred() {
                         // Each key ordered against the writes to it (#271).
                         let _evicting = crate::write_gate::enter();
                         crate::eviction::make_room(ctx, v, !ctx.apply_replication);
