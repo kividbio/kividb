@@ -18,6 +18,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are what Redis 8.10.2 gives, digit for digit, and numbers only a
   `long double` holds (`1e400`) and hexadecimal ones are read as Redis
   reads them.
+
+- **`HINCRBYFLOAT` goes to replicas and the AOF as the value it left, as
+  `HSETEX key KEEPTTL FIELDS 1 field value`, as Redis 8.10.2 sends it.**
+  It was sent as typed, so a replica or an AOF replay ran the addition
+  again: an AOF replayed over a snapshot that already had it added twice,
+  and any change to how the sum is worked out would make versions differ.
+  The field keeps its time to live on the replica and after a replay.
+
+- **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
+  that a short key never took (#497).** The list of hashes whose fields
+  expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
+  bytes is held inside that copy rather than on the heap. The estimate now adds the key's length only
+  for a key that really is on the heap.
+
+- **`SCRIPT LOAD` and `SCRIPT FLUSH` during a slot handoff or a manual
+  failover are answered at once, instead of stalling every connection of
+  their worker thread until the handoff ended (#528).** The pause does not
+  hold them, as in Redis, and they then waited the handoff out inside the
+  write gate in a blocking sleep loop. They change only the script cache
+  and are kept out of the replication stream while writes are paused, so
+  they now run straight away.
+
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
