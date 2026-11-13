@@ -9,6 +9,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
+  that a short key never took (#497).** The list of hashes whose fields
+  expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
+  bytes is held inside that copy rather than on the heap. The estimate now adds the key's length only
+  for a key that really is on the heap.
+
 - **`CLIENT LIST` and `CLIENT INFO` show `x` for a client inside `MULTI`
   (#656).** Such a client showed `flags=N`, so a tool looking for clients
   left in a transaction found none. The flag comes after `P` and before
