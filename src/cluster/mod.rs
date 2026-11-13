@@ -1048,7 +1048,11 @@ impl ClusterState {
         }
         let fenced = self.fence_holds() || self.marked_failed.load(Ordering::Relaxed);
         let ok = ok && !fenced;
-        self.state_ok.store(ok, Ordering::Relaxed);
+        // Said in the log as Redis says it: tests and operators wait for
+        // the line (#430).
+        if self.state_ok.swap(ok, Ordering::Relaxed) != ok {
+            log_info!("Cluster state changed: {}", if ok { "ok" } else { "fail" });
+        }
         let serving = !fenced && (ok || !self.require_full_coverage.load(Ordering::Relaxed));
         if self.serving.swap(serving, Ordering::Relaxed) && !serving {
             // A write routed while this node served, and not yet in the write

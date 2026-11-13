@@ -3377,15 +3377,20 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xF5 => libraries.push(rdb_read_string(&mut r)?),
             // Every other opcode from 0xF0 up is refused by what it is, not
             // read as a key's type.
-            opcode @ 0xF0..=0xF6 => {
-                return Err(rdb_invalid(match opcode {
+            // Those it names are refused for what they are: a replica
+            // asking again would be sent the same (#483).
+            opcode @ (0xF2 | 0xF3 | 0xF6) => {
+                return Err(rdb_extensions::unrepresentable(match opcode {
                     0xF2 => "hash templates (opcode 0xF2) are not supported".to_string(),
                     0xF3 => "module key metadata (opcode 0xF3) is not supported".to_string(),
                     0xF6 => "function libraries in Redis 7.0's pre-release format \
                              (opcode 0xF6) are not supported"
                         .to_string(),
-                    other => format!("unknown opcode {other:#04x}"),
+                    _ => unreachable!(),
                 }));
+            }
+            opcode @ 0xF0..=0xF6 => {
+                return Err(rdb_invalid(format!("unknown opcode {opcode:#04x}")));
             }
             type_id => {
                 // A key: type byte already consumed
@@ -3495,6 +3500,30 @@ fn redis_crc64_update(mut crc: u64, data: &[u8]) -> u64 {
         crc = REDIS_CRC64_TABLE[((crc ^ u64::from(byte)) & 0xff) as usize] ^ (crc >> 8);
     }
     crc
+}
+
+/// Whether an RDB payload held whole in memory (a full sync's) ends with a
+/// checksum, and whether it is the right one: `None` for one that has none
+/// (an RDB version before 5, or a checksum of 0, as `rdbchecksum no` and
+/// Dragonfly write). A payload refused with a right checksum is what its
+/// master meant to send, not one damaged on the way (#483).
+pub fn rdb_payload_checksum(payload: &[u8]) -> Option<bool> {
+    let version_has_one = payload.starts_with(b"VALKEY")
+        || (payload.starts_with(b"REDIS")
+            && payload
+                .get(5..9)
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .and_then(|v| v.parse::<u16>().ok())
+                .is_some_and(|version| version >= 5));
+    if !version_has_one || payload.len() < 9 + 1 + 8 {
+        return None;
+    }
+    let (body, sum) = payload.split_at(payload.len() - 8);
+    let sum = u64::from_le_bytes(sum.try_into().ok()?);
+    if sum == 0 {
+        return None;
+    }
+    Some(redis_crc64_update(0, body) == sum)
 }
 
 /// A reader that sums what is read through it with Redis's CRC64: what an
@@ -3792,11 +3821,13 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         unknown => {
             // Unknown type — we can't skip because we don't know the length.
             // Log and return an error. The caller can decide to abort or ignore.
+            // A type of a newer release, as a rule: refused for what it is
+            // (#483). A damaged payload can show one too; a replica tells
+            // the two apart by the payload's checksum.
             log_warn!("RDB: unknown type byte {unknown:#04x} — stopping load");
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported RDB type {unknown}"),
-            ))
+            Err(rdb_extensions::unrepresentable(format_args!(
+                "unsupported RDB type {unknown}"
+            )))
         }
     }
 }
@@ -4168,7 +4199,7 @@ fn module_type_name(id: u64) -> (String, u64) {
 fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
     let (name, encoding_version) = module_type_name(rdb_read_plain_length(r)?);
     if name != "ReJSON-RL" {
-        return Err(rdb_invalid(format!(
+        return Err(rdb_extensions::unrepresentable(format!(
             "values of module type {name} are not supported"
         )));
     }
@@ -4221,7 +4252,7 @@ fn rdb_skip_module_aux(r: &mut impl Read, warned: &mut bool) -> io::Result<()> {
     // module type `graphdata`, and that is refused.
     let graph = name == "graphdata";
     if name != "ft_index0" && name != "scdtype00" && !graph {
-        return Err(rdb_invalid(format!(
+        return Err(rdb_extensions::unrepresentable(format!(
             "data of module type {name} (opcode 0xF7) is not supported"
         )));
     }
