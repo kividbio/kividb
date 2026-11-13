@@ -11,7 +11,7 @@ use crate::types::{ConsumerGroup, IdmpRecord, NodeFill, StreamId, StreamInner};
 use std::sync::Arc;
 
 /// One field of a stream entry and its value.
-type Field = (Arc<[u8]>, Arc<[u8]>);
+type Field<'a> = (&'a [u8], &'a [u8]);
 
 // ── Idempotent production ────────────────────────────────────────────────────
 
@@ -518,7 +518,7 @@ pub(crate) static NODE_MAX_BYTES: std::sync::atomic::AtomicI64 =
 /// have: it opens a new node if the newest is full by
 /// `stream-node-max-entries` or would pass `stream-node-max-bytes`. Called
 /// before the entry is inserted and `entries_added` counts it.
-pub(crate) fn record_append(stream: &mut StreamInner, fields: &crate::types::FieldsType) {
+pub(crate) fn record_append(stream: &mut StreamInner, fields: &[Field]) {
     use std::hash::{Hash, Hasher};
     let max_entries = Approx::new(None).node;
     let max_bytes = NODE_MAX_BYTES
@@ -653,9 +653,8 @@ pub(super) fn trim_stream_approx(
             TrimTo::MaxLen(max) => len - node >= *max,
             TrimTo::MinId(min) => stream
                 .entries
-                .iter()
-                .nth(node as usize - 1)
-                .is_some_and(|(last, _)| last < *min),
+                .nth_id(node as usize - 1)
+                .is_some_and(|last| last < *min),
         };
         if !whole {
             break;
@@ -903,7 +902,8 @@ pub(super) fn setid_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PelEntry, StreamEntry};
+    use crate::types::PelEntry;
+    const NO_FIELDS: &[(&[u8], &[u8])] = &[];
 
     const DEFAULTS: (u64, u64) = (100, 100);
 
@@ -914,8 +914,7 @@ mod tests {
     fn stream_with(n: u64) -> StreamInner {
         let mut s = StreamInner::new();
         for ms in 1..=n {
-            s.entries
-                .push_tail(id(ms), StreamEntry { fields: Vec::new() });
+            s.entries.push_tail(id(ms), NO_FIELDS);
             s.last_id = id(ms);
         }
         s
@@ -962,10 +961,10 @@ mod tests {
 
     #[test]
     fn content_ids_distinguish_messages_but_not_their_order() {
-        let f = |pairs: &[(&str, &str)]| -> Vec<Field> {
+        let f = |pairs: &[(&'static str, &'static str)]| -> Vec<Field<'static>> {
             pairs
                 .iter()
-                .map(|(a, b)| (Arc::from(a.as_bytes()), Arc::from(b.as_bytes())))
+                .map(|(a, b)| (a.as_bytes(), b.as_bytes()))
                 .collect()
         };
         let auto = IdmpArg::Auto { producer: b"p" };
@@ -1161,8 +1160,7 @@ mod tests {
         let add = |s: &mut StreamInner, n: u64| {
             for _ in 0..n {
                 s.entries_added += 1;
-                s.entries
-                    .push_tail(id(s.entries_added), StreamEntry { fields: Vec::new() });
+                s.entries.push_tail(id(s.entries_added), NO_FIELDS);
             }
         };
         add(&mut s, 101);
