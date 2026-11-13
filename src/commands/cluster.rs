@@ -1891,6 +1891,12 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     let db = *ctx.selected_db;
+    // The test hook that holds a write up before its gate: `MIGRATE` takes
+    // its gate here (`hold_while_moving`), not where other writes do.
+    #[cfg(debug_assertions)]
+    if !copy && !crate::write_gate::held_by_this_thread() {
+        crate::pause::test_stall_before_the_gate(&ctx.cmd);
+    }
     // From before the keys are read until they are deleted here, writes to
     // them wait (#295). Not for `COPY`, which deletes nothing.
     let _holding = if copy {
@@ -1898,6 +1904,20 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     } else {
         hold_while_moving(db, &keys)
     };
+    // A `CLIENT PAUSE` set since this passed its connection's pause check:
+    // it would delete its keys here after the pause had been answered and
+    // the master's offset read, and a switchover at that offset would keep
+    // them on the promoted replica (#640). It goes back to its connection,
+    // out of the gate, and is held there like any write during the pause,
+    // as `run_command` holds a write that finds the pause in its gate.
+    if _holding.is_some()
+        && !ctx.apply_replication
+        && crate::pause::write_held_in_gate(&ctx.cmd)
+        && !crate::commands::blocking::client_gone(ctx)
+    {
+        drop(_holding);
+        return crate::commands::blocking::hold_for_pause(ctx);
+    }
     // A node that has become a replica since this was routed: its keys are
     // its master's, and deleting them once they are sent would leave it
     // without keys its master has (#348). In the write gate, held from here

@@ -9,6 +9,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A `CLIENT PAUSE` that fails no longer undoes another pause set while it
+  waited (#634).** A pause that gives up waiting for a long write undoes
+  what it set, and it took a second `CLIENT PAUSE` that ended no later than
+  its own for its own, so that pause's caller held an OK for a pause that
+  was gone. Every pause set or ended now moves a generation count, and a
+  failed pause undoes itself only if the count has not moved.
+- **A `MIGRATE` that was on its way when `CLIENT PAUSE` was set is held
+  with the other writes (#640).** It took its gate without looking at the
+  pause, and moved and deleted its keys after the pause had been answered:
+  a write after the replication offset a switchover reads. It now goes back
+  to its connection and is held there until the pause ends.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

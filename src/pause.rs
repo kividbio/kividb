@@ -128,7 +128,22 @@ pub fn expiry_deferred() -> bool {
     PAUSE_UNTIL_MS.load(Ordering::Relaxed) != 0 && active().is_some()
 }
 
+/// Moved on by every [`set_pause`] and [`clear_pause`], under
+/// [`FLAG_LOCK`]: a `CLIENT PAUSE` that failed undoes its pause only if no
+/// other has been set or ended since. Comparing `PAUSE_UNTIL_MS` alone took
+/// a pause set meanwhile that ended no later than its own for its own, and
+/// undid it: that pause's caller had been answered OK for a pause that was
+/// gone (#634).
+static PAUSE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 pub fn set_pause(duration_ms: i64, write_only: bool) {
+    let _flag = FLAG_LOCK.lock();
+    set_pause_held(duration_ms, write_only);
+}
+
+/// [`set_pause`], with [`FLAG_LOCK`] held.
+fn set_pause_held(duration_ms: i64, write_only: bool) {
+    PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
     let end = now_ms().saturating_add(duration_ms);
     let (end, write_only) = match active() {
         Some(was_write_only) => (
@@ -208,15 +223,19 @@ fn pause_clients_within(
     write_only: bool,
     limit: std::time::Duration,
 ) -> Result<(), &'static str> {
-    let (before, ours) = {
+    let (before, ours, generation) = {
         let _flag = FLAG_LOCK.lock();
         let before =
             active().map(|was_write_only| (PAUSE_UNTIL_MS.load(Ordering::SeqCst), was_write_only));
-        set_pause(duration_ms, write_only);
+        set_pause_held(duration_ms, write_only);
         // After the pause, before the wait: a write that enters the gate once
         // the wait has passed its slot sees both.
         HANDOFF.fetch_or(CLIENT_PAUSE, Ordering::SeqCst);
-        (before, PAUSE_UNTIL_MS.load(Ordering::SeqCst))
+        (
+            before,
+            PAUSE_UNTIL_MS.load(Ordering::SeqCst),
+            PAUSE_GENERATION.load(Ordering::SeqCst),
+        )
     };
     let deadline = std::time::Instant::now() + limit;
     // A pause of no time is over at once: its writes are waited out all the
@@ -238,16 +257,15 @@ fn pause_clients_within(
         limit.as_millis()
     );
     let _flag = FLAG_LOCK.lock();
-    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ours {
+    if PAUSE_GENERATION.load(Ordering::SeqCst) == generation
+        && PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ours
+    {
         match before {
             Some((until, was_write_only)) => {
                 PAUSE_MODE_WRITE_ONLY.store(was_write_only, Ordering::Relaxed);
                 PAUSE_UNTIL_MS.store(until, Ordering::SeqCst);
             }
-            None => {
-                clear_pause();
-                lower_client_pause_flag();
-            }
+            None => clear_pause_held(),
         }
     }
     Err(PAUSE_DID_NOT_TAKE_HOLD)
@@ -353,6 +371,13 @@ pub fn test_stall_before_the_gate(cmd: &[&[u8]]) {
 }
 
 pub fn clear_pause() {
+    let _flag = FLAG_LOCK.lock();
+    clear_pause_held();
+}
+
+/// [`clear_pause`], with [`FLAG_LOCK`] held.
+fn clear_pause_held() {
+    PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
     PAUSE_MODE_WRITE_ONLY.store(false, Ordering::Relaxed);
     let held = HELD.load(Ordering::SeqCst) > 0;
     PAUSE_UNTIL_MS.store(if held { ENDING } else { 0 }, Ordering::SeqCst);
@@ -361,6 +386,9 @@ pub fn clear_pause() {
         let _ = PAUSE_UNTIL_MS.compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
     end_handoff_flag();
+    // `end_handoff_flag` cannot take the `CLIENT PAUSE` flag down itself
+    // here: the lock it would try is ours.
+    lower_client_pause_flag();
     CHANGED.notify_waiters();
 }
 
@@ -972,6 +1000,23 @@ mod tests {
         );
         assert_eq!(active(), Some(false));
         assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), before);
+        // A pause set while a failing one waits, and ending no later than
+        // it, leaves `PAUSE_UNTIL_MS` as the failing one set it. It is not
+        // undone with it (#634).
+        clear_pause();
+        let failing = std::thread::spawn(move || pause_clients_within(60_000, true, limit * 10));
+        while active().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let failing_until = PAUSE_UNTIL_MS.load(Ordering::SeqCst);
+        set_pause(30_000, true);
+        assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), failing_until);
+        assert_eq!(failing.join().unwrap(), Err(PAUSE_DID_NOT_TAKE_HOLD));
+        assert_eq!(
+            active(),
+            Some(true),
+            "the pause set meanwhile was undone with the one that failed"
+        );
         clear_pause();
         out.wait();
         writer.join().unwrap();
