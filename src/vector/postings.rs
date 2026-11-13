@@ -1723,7 +1723,8 @@ impl Postings {
         if at >= self.slots.len() {
             self.slots.resize(at + 1, 0);
         }
-        self.slots[at] = crate::cluster::key_hash_slot(key.as_bytes());
+        // Of the key's own bytes, not of its name (`key_bytes::text_of`).
+        self.slots[at] = crate::cluster::key_hash_slot(&crate::key_bytes::bytes_of(&key));
         self.ids.insert(key, id);
         self.live.set(id);
         self.order.added(id);

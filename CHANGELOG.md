@@ -68,6 +68,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   figure for a stream, and a stream's consumer groups and their pending
   entries are still not counted.
 
+- **`FT.INFO` and `FT.SPELLCHECK` no longer walk the database to count an
+  index's documents (#590).** `num_docs`, and the count `FT.SPELLCHECK`
+  divides a word's by, were counted by reading every key of the index's
+  database, each shard locked in turn: as slow as the database is large,
+  however small the index, with writes waiting behind it. The index now
+  knows how many documents it holds. With 5.4 million other keys beside a
+  1,000-document index, `FT.INFO` went from 53 ms to 0.06 ms, and `SET`
+  beside 4 clients polling `FT.INFO` from 15,000-20,000 a second to
+  50,000-65,000 (M2 laptop). An index with a TEXT, TAG or NUMERIC field
+  counts the ids it already gave its documents. An index of vectors alone
+  gave none, and now keeps 96 bits of each document key's hash to count
+  them: about 31 bytes a document (measured with 1 million). On the same
+  laptop `HSET` of a new document into such an index was about 5% slower,
+  and of one already there 1% to 3%; `DEL` was within noise.
+  An index made with `SKIPINITIALSCAN` now counts the documents written
+  since, as RediSearch does, not every document under its prefixes (a
+  restart or a full resync still indexes them all, as before, and they are
+  counted from then).
+  `FT.SPELLCHECK` sends `TERM` (RESP2) and `results` (RESP3) as simple
+  strings, as RediSearch does; they were bulk strings.
+
 ### Fixed
 
 - **`redis-cli --cluster reshard` no longer walks every key of a node for
@@ -103,6 +124,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   host name had when it was opened: if DNS moves the target during a
   resharding, `MIGRATE`s keep going to the old address until the connection
   has been idle for 10 seconds, as in Redis.
+
+- **An index created since the last dump is whole after a restart that
+  replays the AOF (#590).** The walk that indexes the documents once the
+  replay is done went by the dump's indexes when the dump had any, so an
+  index created after it was left with what its `FT.CREATE` found when
+  replayed: a search of it found none of the documents written after it
+  was made, until each was written again. An `FT.CREATE`, `FT.ALTER` or
+  `SWAPDB` in the log also walked the documents of that moment, of which
+  the replay left in those a later command deleted. The walks wait for the
+  one after the replay, which is of every index.
 
 - **Searches in a cluster no longer use up the coordinator's ports
   (#723).** `FT.SEARCH` and `FT.AGGREGATE` opened a new connection to every

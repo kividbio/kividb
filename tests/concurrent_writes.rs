@@ -1075,3 +1075,151 @@ fn mset_over_documents_beside_index_writes_keeps_the_server_answering() {
         client.join().unwrap();
     }
 }
+
+/// `num_docs` of indexes that count their own documents, read while
+/// documents come and go and indexes are made, altered and dropped beside
+/// them: the server goes on answering, and once the writes are done every
+/// index counts exactly the documents there are. The walk of an index made
+/// meanwhile meets documents the writes are indexing themselves, and each
+/// is counted once (#590).
+#[test]
+fn num_docs_is_exact_after_writes_beside_index_walks_and_counts() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    const WRITERS: u64 = 6;
+    // Each writer's own keys: it knows what each holds.
+    const KEYS: u64 = 1500;
+    const RUN_FOR: Duration = Duration::from_secs(6);
+    const VECTORS: &str = "SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC L2";
+    let server = Server::start_with(&["--threads", "8"]);
+    let create = |c: &mut Conn, name: &str, schema: &str| {
+        let command = format!("FT.CREATE {name} ON HASH PREFIX 1 d: {schema}");
+        let command: Vec<&str> = command.split_whitespace().collect();
+        c.cmd(&command)
+    };
+    let mut one = server.conn();
+    for (name, schema) in [
+        ("vectors", VECTORS),
+        ("altered", VECTORS),
+        ("words", "SCHEMA t TEXT"),
+    ] {
+        assert_eq!(create(&mut one, name, schema), V::Str("OK".into()));
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let (mut conn, done) = (server.conn(), Arc::clone(&done));
+            std::thread::spawn(move || {
+                const NONE: u8 = 0;
+                const DOCUMENT: u8 = 1;
+                const STRING: u8 = 2;
+                let mut held = vec![NONE; KEYS as usize];
+                let mut state = writer + 1;
+                while !done.load(SeqCst) {
+                    let batch: Vec<(usize, u64)> = (0..16)
+                        .map(|_| {
+                            state = state
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add(1442695040888963407);
+                            (((state >> 33) % KEYS) as usize, (state >> 20) % 8)
+                        })
+                        .collect();
+                    let commands: Vec<Vec<String>> = batch
+                        .iter()
+                        .map(|&(key, what)| {
+                            let key = format!("d:{writer}:{key}");
+                            match what {
+                                0 => args(&["DEL", &key]),
+                                1 => args(&["SET", &key, "x"]),
+                                _ => args(&["HSET", &key, "vec", "aaaabbbb", "t", "hello"]),
+                            }
+                        })
+                        .collect();
+                    let replies = conn.pipeline(&commands);
+                    for (&(key, what), reply) in batch.iter().zip(&replies) {
+                        held[key] = match what {
+                            0 => NONE,
+                            1 => STRING,
+                            // `HSET` of a key that holds a string is refused.
+                            _ if matches!(reply, V::Err(_)) => {
+                                assert_eq!(held[key], STRING, "{reply:?}");
+                                STRING
+                            }
+                            _ => DOCUMENT,
+                        };
+                    }
+                }
+                held.iter().filter(|&&holds| holds == DOCUMENT).count() as i64
+            })
+        })
+        .collect();
+
+    let mut beside = Vec::new();
+    // An index made again and again beside the writes: the last one's walk
+    // is what `walked` counts by at the end.
+    {
+        let (mut conn, done) = (server.conn(), Arc::clone(&done));
+        beside.push(std::thread::spawn(move || {
+            while !done.load(SeqCst) {
+                conn.cmd(&["FT.DROPINDEX", "walked"]);
+                let command = format!("FT.CREATE walked ON HASH PREFIX 1 d: {VECTORS}");
+                let command: Vec<&str> = command.split_whitespace().collect();
+                assert_eq!(conn.cmd(&command), V::Str("OK".into()));
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }));
+    }
+    // An index of vectors alone given its first TEXT field beside them: it
+    // counts by the ids it gives its documents from then on.
+    {
+        let mut conn = server.conn();
+        beside.push(std::thread::spawn(move || {
+            std::thread::sleep(RUN_FOR / 3);
+            let reply = conn.cmd(&["FT.ALTER", "altered", "SCHEMA", "ADD", "t", "TEXT"]);
+            assert_eq!(reply, V::Str("OK".into()));
+        }));
+    }
+    for _ in 0..4 {
+        let (mut conn, done) = (server.conn(), Arc::clone(&done));
+        beside.push(std::thread::spawn(move || {
+            while !done.load(SeqCst) {
+                for index in ["vectors", "walked", "altered", "words"] {
+                    conn.cmd(&["FT.INFO", index]);
+                }
+                conn.cmd(&["FT.ALIASUPDATE", "a", "vectors"]);
+            }
+        }));
+    }
+
+    let mut ping = server.conn();
+    ping.reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let until = Instant::now() + RUN_FOR;
+    let mut answered = true;
+    while answered && Instant::now() < until {
+        answered = ping.cmd(&["PING"]) == V::Str("PONG".into());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    done.store(true, SeqCst);
+    assert!(answered, "the server stopped answering PING");
+    let documents: i64 = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .sum();
+    for thread in beside {
+        thread.join().unwrap();
+    }
+    assert!(documents > 0);
+    for index in ["vectors", "walked", "altered", "words"] {
+        let V::Arr(info) = one.cmd(&["FT.INFO", index]) else {
+            panic!("FT.INFO {index}");
+        };
+        let at = info
+            .iter()
+            .position(|item| *item == V::Str("num_docs".into()))
+            .unwrap_or_else(|| panic!("no num_docs for {index}: {info:?}"));
+        assert_eq!(info[at + 1].i(), documents, "{index}");
+    }
+}

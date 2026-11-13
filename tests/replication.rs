@@ -2070,6 +2070,72 @@ fn test_full_resync_rebuilds_label_and_search_indexes() {
     );
 }
 
+/// `FT.INFO`'s `num_docs` is read off the documents an index holds (#590):
+/// on a replica, those the full resync brought and the index was filled
+/// with, then those its master's writes add and take away as it applies
+/// them. An index of vectors alone, which kept no list of its documents.
+#[test]
+fn num_docs_on_a_replica_follows_a_full_resync_and_the_writes_applied() {
+    let num_docs = |c: &mut Conn| {
+        let info = c.cmds(&["FT.INFO", "vectors"]);
+        let info = info.as_array();
+        let at = info
+            .iter()
+            .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+            .unwrap_or_else(|| panic!("no num_docs: {info:?}"));
+        info[at + 1].as_int()
+    };
+    let document = |c: &mut Conn, i: usize| {
+        let key = format!("doc:{i}");
+        let vec: Vec<u8> = [i as f32, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        c.cmd(&[b"HSET", key.as_bytes(), b"vec", &vec]);
+    };
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let create = "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 \
+                  DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert!(master.cmds(&create).is_ok());
+    for i in 0..30 {
+        document(&mut master, i);
+    }
+
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    wait_until("the resync's documents", Duration::from_secs(10), || {
+        num_docs(&mut replica) == 30
+    });
+
+    for i in 30..35 {
+        document(&mut master, i);
+    }
+    for command in [
+        "DEL doc:0 doc:1",
+        "SET doc:2 x",
+        "RENAME doc:3 away:3",
+        "PEXPIRE doc:4 1",
+        "HPEXPIRE doc:5 1 FIELDS 1 vec",
+        "HSET other:1 vec x",
+    ] {
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = master.cmds(&args);
+        assert!(
+            !matches!(reply, RespValue::Error(_)),
+            "{command}: {reply:?}"
+        );
+    }
+    wait_until("the master's own count", Duration::from_secs(10), || {
+        num_docs(&mut master) == 29
+    });
+    wait_until("the writes applied", Duration::from_secs(10), || {
+        num_docs(&mut replica) == 29
+    });
+}
+
 fn error_of(reply: &RespValue) -> &str {
     match reply {
         RespValue::Error(e) => e,

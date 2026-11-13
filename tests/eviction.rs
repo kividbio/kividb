@@ -1870,6 +1870,11 @@ fn an_evicted_document_leaves_its_indexes() {
                   FLOAT32 DIM 2 DISTANCE_METRIC L2";
     let create: Vec<&str> = create.split_whitespace().collect();
     assert!(c.cmd(&create).ok());
+    // An index of vectors alone, which counts its documents by their keys.
+    let create = "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 \
+                  DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert!(c.cmd(&create).ok());
     // Two little-endian floats, both 2.0: bytes that are text as well.
     let vector = "\0\0\0@\0\0\0@";
     let value = value();
@@ -1927,4 +1932,14 @@ fn an_evicted_document_leaves_its_indexes() {
         .position(|field| *field == V::Str("doc_ids".into()))
         .map(|at| info[at + 1].i());
     assert_eq!(listed, Some(left as i64), "the postings");
+    for index in ["docs", "vectors"] {
+        let V::Arr(info) = c.cmd(&["FT.INFO", index]) else {
+            panic!("no FT.INFO");
+        };
+        let counted = info
+            .iter()
+            .position(|field| *field == V::Str("num_docs".into()))
+            .map(|at| info[at + 1].i());
+        assert_eq!(counted, Some(left as i64), "num_docs of {index}");
+    }
 }
