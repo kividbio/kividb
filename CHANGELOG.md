@@ -9,6 +9,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica of a Redis or Valkey primary no longer asks for a full sync
+  every second when the primary holds data KiviDB can't load (#483).**
+  Module values other than RedisJSON's, other modules' data, opcodes 0xF2,
+  0xF3 and 0xF6, an unknown type byte and Valkey's refusals were taken for
+  a broken link, so each retry was another full sync on the primary, with
+  no reason given. They are now treated as KeyDB's and Dragonfly's
+  refusals are: the reason is in `INFO replication`, an error is logged on
+  each attempt, and the retries back off from a minute to ten. A payload
+  whose checksum is wrong is still taken for damage on the way and retried
+  after a second.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
