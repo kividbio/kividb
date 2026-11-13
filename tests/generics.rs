@@ -2378,18 +2378,9 @@ fn test_invalidation_frame_bytes_resp3() {
 
     c2.cmds(&["SET", "wire3", "v1"]);
 
-    // HELLO 3 replies with a RESP3 map, which this harness's reader doesn't
-    // parse — write it raw and drain the reply bytes instead.
-    c1.stream
-        .write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
-        .unwrap();
-    let hello =
-        try_read_with_timeout(&mut c1, Duration::from_millis(500)).expect("HELLO 3 should reply");
-    assert!(
-        hello.starts_with(b"%") || hello.starts_with(b"*"),
-        "expected a HELLO map/array reply, got {:?}",
-        String::from_utf8_lossy(&hello)
-    );
+    // Through the reader, which takes HELLO's map whole: one raw read could
+    // stop part-way through it, and the rest be taken for the next reply.
+    resp3(&mut c1);
 
     c1.cmds(&["CLIENT", "TRACKING", "ON"]);
     c1.cmds(&["GET", "wire3"]);
@@ -2397,11 +2388,18 @@ fn test_invalidation_frame_bytes_resp3() {
     c2.cmds(&["SET", "wire3", "v2"]);
     std::thread::sleep(Duration::from_millis(50));
 
-    let msg = try_read_with_timeout(&mut c1, Duration::from_millis(500))
-        .expect("RESP3 client should receive an invalidation");
+    // The frame may come in more than one read.
+    let want = b">2\r\n$10\r\ninvalidate\r\n*1\r\n$5\r\nwire3\r\n".to_vec();
+    let mut msg = Vec::new();
+    while msg.len() < want.len() {
+        match try_read_with_timeout(&mut c1, Duration::from_millis(500)) {
+            Some(bytes) => msg.extend(bytes),
+            None => break,
+        }
+    }
     assert_eq!(
         msg,
-        b">2\r\n$10\r\ninvalidate\r\n*1\r\n$5\r\nwire3\r\n".to_vec(),
+        want,
         "RESP3 invalidation must be a 2-element push frame (Redis addReplyPushLen(c,2))"
     );
 }
