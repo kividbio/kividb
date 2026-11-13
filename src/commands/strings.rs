@@ -1079,33 +1079,34 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let delta: f64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => return Some(resp_error("ERR value is not a valid float")),
-            };
+            use crate::commands::long_double::{self, Increment, LongDouble};
+            const NOT_A_FLOAT: &str = "ERR value is not a valid float";
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            let current: f64 = match map.get(key) {
-                None => 0.0,
-                Some(ValueRef::String(v)) => {
-                    match std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()) {
-                        Some(n) => n,
-                        None => return Some(resp_error("ERR value is not a valid float")),
-                    }
-                }
+            // In `long double`, as Redis on x86-64 (#387). The key's type
+            // first, then its value, then the increment, as in Redis.
+            let current = match map.get(key) {
+                None => long_double::ZERO,
+                Some(ValueRef::String(v)) => match LongDouble::parse(&v) {
+                    Some(n) => n,
+                    None => return Some(resp_error(NOT_A_FLOAT)),
+                },
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ));
                 }
             };
-            let next = current + delta;
-            if next.is_infinite() || next.is_nan() {
-                return Some(resp_error("ERR increment would produce NaN or Infinity"));
-            }
-            // Redis trims trailing zeros. format!("{}", f) already does this in Rust for many cases.
-            let s = format!("{}", next);
+            let Some(delta) = LongDouble::parse(cmd[2]) else {
+                return Some(resp_error(NOT_A_FLOAT));
+            };
+            let s = match long_double::increment(current, delta) {
+                Increment::Sum(s) => s,
+                Increment::NotFinite => {
+                    return Some(resp_error("ERR increment would produce NaN or Infinity"));
+                }
+            };
             drop(map.set_str(key, s.as_bytes()));
             drop(map);
             notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "incrbyfloat", key);
