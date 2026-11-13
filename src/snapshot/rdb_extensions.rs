@@ -41,7 +41,7 @@ impl std::error::Error for Unrepresentable {}
 
 /// The refusal of what the source holds and KiviDB can't, worded as
 /// `rdb_invalid` words its errors.
-fn unrepresentable(what: impl std::fmt::Display) -> io::Error {
+pub(super) fn unrepresentable(what: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         Unrepresentable(format!("RDB: {what}")),

@@ -36,6 +36,64 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and are kept out of the replication stream while writes are paused, so
   they now run straight away.
 
+
+- **`DEBUG DIGEST-VALUE` of a hash with field TTLs, and of a stream, stays
+  the same across a restart and an AOF replay (#519, #505).** Both were
+  digested as laid out in a snapshot, which writes field deadlines, groups,
+  consumers and producers in the order of tables whose order differs from
+  process to process, and a stream's layout also holds its consumers' last
+  seen times, which an AOF replay sets to its own clock. A hash's fields
+  are now summed with their deadlines as a plain hash's are, and a stream
+  is digested from its entries, groups, pending entries, consumer names and
+  idempotent IDs, without its consumers' times or when each idempotent ID
+  was recorded. The dataset fingerprint a restarted master
+  compares with its replicas uses the same digest, so those replicas are no
+  longer sent a full sync they did not need.
+
+- **A replica's full sync breaks the `WATCH`es on its keys (#673).** When
+  a full sync replaced a replica's dataset, the watches on its keys stayed,
+  and an `EXEC` after it ran although the watched values could have changed
+  under it. As in Redis, a watch on a key that is in the old dataset or the
+  new one is now broken, and one on a key in neither holds.
+
+- **A `CLIENT PAUSE` that fails no longer undoes another pause set while it
+  waited (#634).** A pause that gives up waiting for a long write undoes
+  what it set, and it took a second `CLIENT PAUSE` that ended no later than
+  its own for its own, so that pause's caller held an OK for a pause that
+  was gone. Every pause set or ended now moves a generation count, and a
+  failed pause undoes itself only if the count has not moved.
+- **A `MIGRATE` that was on its way when `CLIENT PAUSE` was set is held
+  with the other writes (#640).** It took its gate without looking at the
+  pause, and moved and deleted its keys after the pause had been answered:
+  a write after the replication offset a switchover reads. It now goes back
+  to its connection and is held there until the pause ends.
+
+- **A replica of a Redis or Valkey primary no longer asks for a full sync
+  every second when the primary holds data KiviDB can't load (#483).**
+  Module values other than RedisJSON's, other modules' data, opcodes 0xF2,
+  0xF3 and 0xF6, an unknown type byte and Valkey's refusals were taken for
+  a broken link, so each retry was another full sync on the primary, with
+  no reason given. They are now treated as KeyDB's and Dragonfly's
+  refusals are: the reason is in `INFO replication`, an error is logged on
+  each attempt, and the retries back off from a minute to ten. A payload
+  whose checksum is wrong is still taken for damage on the way and retried
+  after a second.
+
+- **`cluster-port` sets the port the cluster bus listens on (#430).** A
+  config file with it was refused and the server did not start, and the
+  bus always listened on `port` + 10000. It is now read from the config
+  file and the command line (`--cluster-port`), shown by `CONFIG GET`,
+  written by `CONFIG REWRITE` and fixed at startup, as in Redis: 0, the
+  default, is `port` + 10000. A cluster node also logs `Cluster state
+  changed: ok` (or `fail`) when its state changes, as Redis does, for the
+  tests and operators that wait for that line.
+
+- **`SAVE` and a `CONFIG SET maxmemory` below what is in use no longer
+  stall every other client on the tokio I/O model (#605).** Both ran their
+  long work on a runtime worker without handing its place over, which
+  could leave the sockets unpolled, so no client was accepted or read until
+  they were done. They now run off the runtime, as `CONFIG SET appendonly
+  yes` and `MIGRATE` do. `SAVE` still blocks its own client, as in Redis.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for

@@ -1112,6 +1112,84 @@ fn test_watch_on_a_replica_sees_its_masters_writes() {
     assert_eq!(r.cmds(&["EXEC"]), RespValue::Nil);
 }
 
+/// A full sync replaces a replica's dataset: a WATCH on a key that was in
+/// the old one or is in the new one fails the EXEC, one on a key in neither
+/// does not, as in Redis (`touchAllWatchedKeysInDb`). The watches survived
+/// the full sync, and every EXEC ran (#673).
+#[test]
+fn a_full_sync_breaks_the_watches_on_a_replicas_keys() {
+    // The old dataset dropped before the new one loads, and kept until it
+    // has (`swapdb`).
+    for load in ["disabled", "swapdb"] {
+        full_sync_breaks_watches(load);
+    }
+}
+
+fn full_sync_breaks_watches(load: &str) {
+    let master_a = spawn_server(Config::default());
+    let master_b = spawn_server(Config::default());
+    let mut a = Conn::connect(master_a);
+    let mut b = Conn::connect(master_b);
+    for (k, v) in [("w", "a"), ("gone", "a"), ("same", "1")] {
+        assert!(a.cmds(&["SET", k, v]).is_ok());
+    }
+    for (k, v) in [("w", "b"), ("new", "b"), ("same", "1")] {
+        assert!(b.cmds(&["SET", k, v]).is_ok());
+    }
+    let replica = spawn_server(replica_of(master_a));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    assert!(
+        r.cmds(&["CONFIG", "SET", "repl-diskless-load", load])
+            .is_ok()
+    );
+    wait_until(
+        "the replica to have a's data",
+        Duration::from_secs(10),
+        || r.cmds(&["GET", "gone"]) == RespValue::Bulk(b"a".to_vec()),
+    );
+
+    let keys = ["w", "gone", "new", "same", "never"];
+    let mut watching: Vec<Conn> = keys
+        .iter()
+        .map(|k| {
+            let mut c = Conn::connect(replica);
+            assert!(c.cmds(&["WATCH", k]).is_ok());
+            assert!(c.cmds(&["MULTI"]).is_ok());
+            assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("QUEUED".into()));
+            c
+        })
+        .collect();
+
+    // A full sync from another master.
+    assert!(
+        r.cmds(&["REPLICAOF", "127.0.0.1", &master_b.to_string()])
+            .is_ok()
+    );
+    wait_until(
+        "the replica to have b's data",
+        Duration::from_secs(20),
+        || {
+            let mut probe = Conn::connect(replica);
+            probe.cmds(&["GET", "new"]) == RespValue::Bulk(b"b".to_vec())
+                && probe.cmds(&["EXISTS", "gone"]) == RespValue::Int(0)
+        },
+    );
+
+    for (k, c) in keys.iter().zip(watching.iter_mut()) {
+        let got = c.cmds(&["EXEC"]);
+        if *k == "never" {
+            assert_eq!(
+                got,
+                RespValue::Array(vec![RespValue::SimpleStr("PONG".into())]),
+                "{load}: a watch on a key in neither dataset holds"
+            );
+        } else {
+            assert_eq!(got, RespValue::Nil, "{load}: the watch on {k} is broken");
+        }
+    }
+}
+
 /// A replica does not take replicas of its own. One that did sent its data
 /// once and nothing after, while the replica of it reported its link up
 /// (#144). It now says why, and the would-be replica's link stays down; a

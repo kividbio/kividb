@@ -1772,34 +1772,11 @@ pub fn handle_migrate(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if name != "MIGRATE" {
         return None;
     }
-    Some(off_the_runtime(|| migrate(ctx)))
-}
-
-/// Run `f`, which blocks this thread on the network for up to `MIGRATE`'s
-/// timeout, without keeping a tokio worker from the rest of the server.
-///
-/// With `--io-model tokio`, commands run on the runtime's worker threads, and
-/// one of the idle workers at a time polls the sockets and the timers for all
-/// of them. A worker that the poll itself woke, with one task to run, wakes no
-/// other: if that task is a `MIGRATE`, which then waits on the destination,
-/// nothing polls the sockets until it is done. No other client is accepted or
-/// read from, no timer fires, a replica's link is not served — for as long as
-/// the `MIGRATE` waits. A write to a key it is moving must reach the server
-/// and wait for it (#274, see [`hold_while_moving`]), not go unread.
-/// `block_in_place` hands this worker's place, the polling with it, to
-/// another thread first.
-///
-/// Only on a multi-threaded runtime. An io_uring worker runs a current-thread
-/// runtime of its own (tokio-uring), which has no other thread to hand its
-/// place to (`block_in_place` panics there): `f` just runs, as before, and
-/// waits with that worker's connections only.
-fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
+    // It blocks this thread on the network for up to its timeout: with
+    // `--io-model tokio`, a worker that waits so keeps the sockets and
+    // timers of every client unpolled unless it hands its place over first
+    // (#274, see `hold_while_moving`).
+    Some(crate::cluster::migration::off_the_runtime(|| migrate(ctx)))
 }
 
 /// One key on its way out: name, serialised value, absolute expiry (0 = none).
@@ -1891,6 +1868,12 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     let db = *ctx.selected_db;
+    // The test hook that holds a write up before its gate: `MIGRATE` takes
+    // its gate here (`hold_while_moving`), not where other writes do.
+    #[cfg(debug_assertions)]
+    if !copy && !crate::write_gate::held_by_this_thread() {
+        crate::pause::test_stall_before_the_gate(&ctx.cmd);
+    }
     // From before the keys are read until they are deleted here, writes to
     // them wait (#295). Not for `COPY`, which deletes nothing.
     let _holding = if copy {
@@ -1898,6 +1881,20 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     } else {
         hold_while_moving(db, &keys)
     };
+    // A `CLIENT PAUSE` set since this passed its connection's pause check:
+    // it would delete its keys here after the pause had been answered and
+    // the master's offset read, and a switchover at that offset would keep
+    // them on the promoted replica (#640). It goes back to its connection,
+    // out of the gate, and is held there like any write during the pause,
+    // as `run_command` holds a write that finds the pause in its gate.
+    if _holding.is_some()
+        && !ctx.apply_replication
+        && crate::pause::write_held_in_gate(&ctx.cmd)
+        && !crate::commands::blocking::client_gone(ctx)
+    {
+        drop(_holding);
+        return crate::commands::blocking::hold_for_pause(ctx);
+    }
     // A node that has become a replica since this was routed: its keys are
     // its master's, and deleting them once they are sent would leave it
     // without keys its master has (#348). In the write gate, held from here

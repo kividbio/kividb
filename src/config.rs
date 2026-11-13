@@ -493,6 +493,11 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_bus_port: u16,
 
+    /// The port the cluster bus listens on (Redis 7's `cluster-port`).
+    /// 0 = `port` + 10000. Fixed at startup.
+    #[arg(long, default_value_t = 0)]
+    pub cluster_port: u16,
+
     /// A secret every node of the cluster shares. A node connecting to
     /// another's bus port must prove it knows it (a challenge and an
     /// HMAC-SHA256 answer; the secret itself is never sent) before anything
@@ -652,6 +657,7 @@ impl Default for Config {
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
+            cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
@@ -777,6 +783,7 @@ impl Config {
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
+            cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
@@ -972,7 +979,7 @@ impl Config {
                         .into(),
                 );
             }
-            if self.client_port() > u16::MAX - 10000 {
+            if self.cluster_port == 0 && self.client_port() > u16::MAX - 10000 {
                 return Err(format!(
                     "port {} leaves no room for the cluster bus port (port + 10000)",
                     self.client_port()
@@ -998,8 +1005,12 @@ impl Config {
         Ok(warnings)
     }
 
-    /// The port the cluster bus listens on: 10000 above the client port.
+    /// The port the cluster bus listens on: `cluster-port`, or 10000 above
+    /// the client port (#430).
     pub fn cluster_bus_port(&self) -> u16 {
+        if self.cluster_port != 0 {
+            return self.cluster_port;
+        }
         self.client_port().saturating_add(10000)
     }
 
@@ -1229,6 +1240,9 @@ impl Config {
                 "cluster-announce-bus-port {}\n",
                 self.cluster_announce_bus_port
             ));
+        }
+        if self.cluster_port != 0 {
+            out.push_str(&format!("cluster-port {}\n", self.cluster_port));
         }
         if !self.cluster_bus_secret.is_empty() {
             out.push_str(&format!("cluster-bus-secret {}\n", self.cluster_bus_secret));
@@ -1576,6 +1590,7 @@ impl Config {
                 set!(cluster_announce_client_port, number(key, one()?)?)
             }
             "cluster-announce-bus-port" => set!(cluster_announce_bus_port, number(key, one()?)?),
+            "cluster-port" => set!(cluster_port, number(key, one()?)?),
             "cluster-bus-secret" => set!(cluster_bus_secret, one()?.to_string()),
             "cluster-bus-port-protected-mode" => {
                 set!(cluster_bus_port_protected_mode, yes_no(key, one()?)?)
