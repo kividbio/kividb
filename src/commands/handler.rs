@@ -2217,7 +2217,7 @@ fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
 #[inline(never)]
 fn notify_failed_bf_write(ctx: &Ctx) {
     if ctx.watch_registry.has_watchers()
-        && let Some(Ok(key)) = ctx.cmd.get(1).map(|k| std::str::from_utf8(k))
+        && let Some(key) = ctx.cmd.get(1)
     {
         ctx.watch_registry.notify(*ctx.selected_db, key);
     }
