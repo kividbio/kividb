@@ -63,6 +63,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A script that waits for `TIME` to move ends (#676).** `TIME` in a
+  script returned the script's start for as long as it ran, so a loop
+  waiting for it to change ran until `SCRIPT KILL`. As in Redis, `TIME`
+  now moves once the script has run past `busy-reply-threshold`. Expiry
+  still holds the script's start, and `EXEC` still holds one time.
+
 - **A server that read `/etc/kividb/kividb.conf` only because it is the
   default config file refuses `CONFIG REWRITE` (#475).** On a host with the
   deb or rpm package installed, every server started without `--configfile`
@@ -313,6 +319,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never goes back: when that time is not past the stream's last ID, the
   next ID is the last one's next sequence number. Replicas receive explicit
   IDs, so they never differed from their master.
+
+- **Search no longer finds a hash field past its deadline.** A field whose
+  TTL had ended but that was not removed yet (between field-expiry sweeps,
+  on a replica waiting for the master's `HDEL`, or with expiry paused) was
+  hidden from `HGET` but still matched, returned and loaded by `FT.SEARCH`,
+  `FT.AGGREGATE` and `FT.HYBRID`, and its vector still ranked in `KNN`
+  queries. These commands now leave it out, as `HGET` does, and
+  `FT.SEARCH` and `FT.AGGREGATE` leave out a hash whose fields are all
+  past their deadline; removing it is still the master's, which sends the
+  `HDEL`. Score statistics, `FT.INFO` counts and `FT.TAGVALS` still include
+  it until it is removed.
 
 - **A transaction runs at one time, as in Redis (#659).** `EXEC` read the
   clock again for each queued command, so a key or hash field whose

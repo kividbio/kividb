@@ -4351,6 +4351,12 @@ fn install_eval_timeout_hook(lua: &Lua) -> Result<(), String> {
                 }
             }
             keep_the_runtime_listening();
+            // As Redis's `scriptInterrupt` refreshing its cached time:
+            // past the threshold `TIME` moves, so a script waiting for it
+            // can end (#676).
+            if running_script_is_over_its_time_limit() {
+                crate::script_clock::let_time_move();
+            }
             // Redis: exceeding lua-time-limit makes the server BUSY for other clients; the script
             // keeps running until SCRIPT KILL (read-only) — do not abort here on time alone.
             Ok(VmState::Continue)

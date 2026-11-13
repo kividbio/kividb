@@ -622,6 +622,7 @@ pub(crate) fn text_search(
 
 /// Run the vector KNN portion. Returns (key, distance) sorted ascending.
 fn vsim_search(
+    db: &crate::store::Db,
     def: &crate::vector::IndexDef,
     field: &str,
     query_vec: &[f32],
@@ -642,19 +643,18 @@ fn vsim_search(
         .get(field)
         .ok_or_else(|| "ERR vector field has no live index".to_string())?;
 
-    let knn: Vec<KnnResult> = match live {
-        LiveIndex::Flat(idx) => knn_flat(idx, query_vec, k, &metric),
-        LiveIndex::Hnsw(idx) => {
-            let ef = ef_runtime.unwrap_or_else(|| match &vf.field_type {
-                FieldType::Vector {
-                    algo: crate::vector::VectorAlgo::Hnsw { ef_runtime, .. },
-                    ..
-                } => *ef_runtime,
-                _ => k * 2,
-            });
-            knn_hnsw(idx, query_vec, k, ef.max(k).max(50), &metric)
-        }
-    };
+    let ef = ef_runtime.unwrap_or_else(|| match &vf.field_type {
+        FieldType::Vector {
+            algo: crate::vector::VectorAlgo::Hnsw { ef_runtime, .. },
+            ..
+        } => *ef_runtime,
+        _ => k * 2,
+    });
+    let knn: Vec<KnnResult> =
+        crate::commands::vector::nearest_shown(db, &vf.name, k, |n| match live {
+            LiveIndex::Flat(idx) => knn_flat(idx, query_vec, n, &metric),
+            LiveIndex::Hnsw(idx) => knn_hnsw(idx, query_vec, n, ef.max(n).max(50), &metric),
+        });
 
     Ok(knn.into_iter().map(|r| (r.key, r.score as f64)).collect())
 }
@@ -676,7 +676,7 @@ fn read_numeric_field(
     else {
         return f64::NEG_INFINITY;
     };
-    let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value.view()) else {
+    let Some(inner) = crate::vector::query_doc_fields(&def.on, &def.fields, value.view()) else {
         return f64::NEG_INFINITY;
     };
     // By the name the query knows the field by.
@@ -744,6 +744,7 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
 
     let vsim_ranked = match vsim_search(
+        &ctx.store[*ctx.selected_db],
         &def_clone,
         &q.vsim_field,
         &query_vec,
@@ -877,7 +878,7 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .get(&*raw)
                 .map(ValueRef::to_value);
             let inner = value.as_ref().and_then(|value| {
-                crate::vector::doc_fields(&def_clone.on, &def_clone.fields, value.view())
+                crate::vector::query_doc_fields(&def_clone.on, &def_clone.fields, value.view())
             });
             if let Some(inner) = inner {
                 // A field of a JSON document goes by the name the schema
