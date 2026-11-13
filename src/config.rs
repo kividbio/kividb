@@ -1054,6 +1054,13 @@ impl Config {
             }
             let args: Vec<String> = value.split_whitespace().map(String::from).collect();
             if args.is_empty() {
+                // Set to empty at runtime: unset, not left at what the
+                // server started with.
+                match name.to_ascii_lowercase().as_str() {
+                    "cluster-announce-ip" => config.cluster_announce_ip.clear(),
+                    "cluster-announce-hostname" => config.cluster_announce_hostname.clear(),
+                    _ => {}
+                }
                 continue;
             }
             let _ = config.apply_directive(&name.to_ascii_lowercase(), &args, &|_| false);

@@ -25,6 +25,33 @@ fn avg_ttl_ms(expires: usize, deadlines: u128, now: u64) -> i64 {
     mean.saturating_sub(u128::from(now)).min(i64::MAX as u128) as i64
 }
 
+/// Why `CONFIG SET cluster-announce-ip` refuses `value`, if it does. As in
+/// Redis: shorter than 46 characters (an IPv6 address's longest text), and
+/// only letters, digits, '-', '.' and ':'. Empty unsets it.
+fn announce_ip_error(value: &str) -> Option<&'static str> {
+    if value.len() >= 46 {
+        Some("Hostnames for cluster-announce-ip must be less than 46 characters")
+    } else if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':'))
+    {
+        Some("Hostnames may only contain alphanumeric characters, hyphens or dots")
+    } else {
+        None
+    }
+}
+
+/// The reply to a `CONFIG SET` of an announce setting: it is in effect
+/// either way, but nodes.conf may not have been saved.
+fn announce_reply(saved: std::io::Result<()>) -> Option<Vec<u8>> {
+    match saved {
+        Ok(()) => Some(resp_simple("OK")),
+        Err(e) => Some(resp_error(&format!(
+            "ERR CONFIG SET applied, but saving the cluster config file failed: {e}"
+        ))),
+    }
+}
+
 /// Replication, cluster and slowlog settings as `CONFIG GET` reports them.
 ///
 /// Runtime-settable ones are read from where `CONFIG SET` writes them, so a
@@ -49,6 +76,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     // ever moved again. The cluster bus writes `nodes` on every heartbeat,
     // and a `CONFIG GET` that met one stopped the node for good, every
     // command that reads the topology queued behind it.
+    let (announce_ip, announce_port, announce_bus_port) = ctx.cluster.announce();
     let (announce_hostname, announce_client_port) = {
         let nodes = ctx.cluster.nodes.read();
         let me = nodes.get(&ctx.cluster.myself());
@@ -120,10 +148,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             "cluster-node-timeout",
             ctx.config.cluster_node_timeout.to_string(),
         ),
-        (
-            "cluster-announce-ip",
-            ctx.config.cluster_announce_ip.clone(),
-        ),
+        ("cluster-announce-ip", announce_ip),
         ("cluster-announce-hostname", announce_hostname),
         (
             "cluster-preferred-endpoint-type",
@@ -133,18 +158,12 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
                 ctx.config.cluster_preferred_endpoint_type.clone()
             },
         ),
-        (
-            "cluster-announce-port",
-            ctx.config.cluster_announce_port.to_string(),
-        ),
+        ("cluster-announce-port", announce_port.to_string()),
         (
             "cluster-announce-client-port",
             announce_client_port.to_string(),
         ),
-        (
-            "cluster-announce-bus-port",
-            ctx.config.cluster_announce_bus_port.to_string(),
-        ),
+        ("cluster-announce-bus-port", announce_bus_port.to_string()),
         ("cluster-port", ctx.config.cluster_port.to_string()),
         (
             "cluster-bus-port-protected-mode",
@@ -167,7 +186,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ),
         (
             "cluster-require-full-coverage",
-            yes_no(ctx.config.cluster_require_full_coverage),
+            yes_no(ctx.cluster.require_full_coverage()),
         ),
         (
             "cluster-slot-migration-handoff-max-lag-bytes",
@@ -840,26 +859,72 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // As in Redis, this node's address may change while it runs:
+            // peers take the new one from its next heartbeat, and
+            // nodes.conf is saved (#391).
+            "cluster-announce-ip" => match announce_ip_error(value) {
+                Some(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'cluster-announce-ip') - {why}"
+                ))),
+                None => announce_reply(ctx.cluster.set_announce(Some(value), None, None)),
+            },
+            "cluster-announce-port" | "cluster-announce-bus-port" => {
+                let port = match value.parse::<i64>() {
+                    Ok(port) => u16::try_from(port)
+                        .map_err(|_| "argument must be between 0 and 65535 inclusive"),
+                    Err(_) => Err("argument couldn't be parsed into an integer"),
+                };
+                match port {
+                    Ok(port) if param == "cluster-announce-port" => {
+                        announce_reply(ctx.cluster.set_announce(None, Some(port), None))
+                    }
+                    Ok(port) => announce_reply(ctx.cluster.set_announce(None, None, Some(port))),
+                    Err(why) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
+                    ))),
+                }
+            }
+            "cluster-require-full-coverage" => match value.to_ascii_lowercase().as_str() {
+                "yes" => {
+                    ctx.cluster.set_require_full_coverage(true);
+                    Some(resp_simple("OK"))
+                }
+                "no" => {
+                    ctx.cluster.set_require_full_coverage(false);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'cluster-require-full-coverage') - argument must be 'yes' or 'no'",
+                )),
+            },
             // Fixed at startup: changing them under a running
             // cluster would desynchronise this node from what its
             // peers and its own nodes.conf already say.
+            // `cluster-node-timeout` too, unlike in Redis: the failure
+            // detector, elections and the bus's timers take it once,
+            // at startup (docs/COMPATIBILITY.md).
             "cluster-enabled"
             | "cluster-config-file"
-            | "cluster-announce-ip"
-            | "cluster-announce-port"
-            | "cluster-announce-bus-port"
             | "cluster-port"
             | "cluster-bus-port-protected-mode"
             | "cluster-bus-secret"
             | "tls-cluster"
-            | "cluster-node-timeout"
-            | "cluster-require-full-coverage" => {
+            | "cluster-node-timeout" => {
                 // To what it already is, is no change.
                 let unchanged = config_rows(ctx)
                     .iter()
                     .any(|(name, current)| *name == param && current == value);
                 if unchanged {
                     Some(resp_simple("OK"))
+                } else if param == "cluster-node-timeout" {
+                    Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         'cluster-node-timeout') - can't set immutable config: \
+                         KiviDB reads cluster-node-timeout only at startup; set it in \
+                         the config file or with --cluster-node-timeout and restart",
+                    ))
                 } else {
                     Some(resp_error(&format!(
                         "ERR CONFIG SET failed (possibly related to argument \
