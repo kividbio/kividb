@@ -642,8 +642,9 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
             let existing = inner.members.get(member.as_ref()).copied();
 
             let final_score = if flag_incr {
-                // INCR: add to existing score (or treat as 0 if not present)
-                existing.unwrap_or(0.0) + score
+                // INCR: add to the existing score; a new member's is the
+                // increment itself, `-0` too, as Redis replies (#422).
+                existing.map_or(score, |old| old + score)
             } else {
                 score
             };
@@ -929,31 +930,101 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
     }
 }
 
-/// A score as Redis reads one (`strtod`, then a check that all of the
-/// argument was used and the result is a number): decimal, `inf` /
+/// A score as Redis 8.10 reads one (`string2d`): decimal, `inf` /
 /// `infinity` with a sign or without, or a C hexadecimal float such as
-/// `0x1p+4`. Not `nan`, not an empty string, nothing with space around it.
+/// `0x1p+4`, all of the argument. Not `nan`, not an empty string, nothing
+/// with space around it.
+///
+/// A number past the range of a double is where Redis is particular (#422).
+/// Its decimal reader (`fast_float`) takes a number of at most 19
+/// significant digits, `digits × 10^q`, as infinite or as zero, if that is
+/// what it rounds to, as long as `q` is from -342 to 308, and refuses it
+/// past them: `2e308` is infinite, `1e309` refused, `1e-342` zero, `1e-343`
+/// refused. A number of more digits, and a hexadecimal one (`strtod`), is
+/// refused if it rounds to infinity or to zero.
 pub(crate) fn parse_score(raw: &[u8]) -> Option<f64> {
     let text = std::str::from_utf8(raw).ok()?;
     if text.is_empty() || text.starts_with(char::is_whitespace) {
         return None;
     }
-    let value = match parse_hex_float(text) {
-        Some(value) => value,
-        None => text.parse::<f64>().ok()?,
-    };
-    if value.is_nan() {
+    let unsigned = text.trim_start_matches(['+', '-']);
+    if unsigned.len() + 1 < text.len() {
         return None;
     }
-    // Infinity only when infinity was written: a number too large for a
-    // double is out of range (`strtod` sets ERANGE), not infinite.
-    if value.is_infinite() {
-        let unsigned = text.trim_start_matches(['+', '-']);
-        if !unsigned.eq_ignore_ascii_case("inf") && !unsigned.eq_ignore_ascii_case("infinity") {
+    if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
+        return Some(if text.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    let (value, decimal) = match parse_hex_float(text) {
+        Some(value) => (value, false),
+        None => {
+            // Rust reads `inf` and `nan` too, but those were dealt with or
+            // are refused: only digits, a point, an exponent.
+            if !unsigned
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+            {
+                return None;
+            }
+            (text.parse::<f64>().ok()?, true)
+        }
+    };
+    let rounded_away = value.is_infinite() || (value == 0.0 && !is_zero_written(unsigned));
+    if !rounded_away {
+        return Some(value);
+    }
+    match decimal.then(|| decimal_shape(unsigned)).flatten() {
+        Some((digits, q)) if digits <= 19 && (-342..=308).contains(&q) => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether `text`, a number without its sign, is zero as written: no digit
+/// of its mantissa is other than 0.
+fn is_zero_written(text: &str) -> bool {
+    let mantissa = match text.find(['e', 'E', 'p', 'P']) {
+        Some(at) => &text[..at],
+        None => text,
+    };
+    let mantissa = mantissa
+        .strip_prefix("0x")
+        .or_else(|| mantissa.strip_prefix("0X"))
+        .unwrap_or(mantissa);
+    mantissa.bytes().all(|b| matches!(b, b'0' | b'.'))
+}
+
+/// A decimal number without its sign as `fast_float` sees it: how many
+/// significant digits it has (leading zeros are not, trailing ones are),
+/// and `q`, the power of ten that its digits are multiplied by. `None` if
+/// it is no number.
+fn decimal_shape(text: &str) -> Option<(usize, i64)> {
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(at) => (&text[..at], &text.as_bytes()[at + 1..]),
+        None => (text, &b""[..]),
+    };
+    let exponent = if exponent.is_empty() {
+        0
+    } else {
+        let (negative, digits) = match exponent[0] {
+            b'-' => (true, &exponent[1..]),
+            b'+' => (false, &exponent[1..]),
+            _ => (false, exponent),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
             return None;
         }
-    }
-    Some(value)
+        let value = digits.iter().fold(0i64, |acc, &d| {
+            (acc * 10 + i64::from(d - b'0')).min(1 << 40)
+        });
+        if negative { -value } else { value }
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all = whole.bytes().chain(fraction.bytes());
+    let significant = all.skip_while(|&b| b == b'0').count();
+    Some((significant, exponent - fraction.len() as i64))
 }
 
 /// One end of a lexicographic range: `-`, `+`, `[member` or `(member`.
@@ -1036,24 +1107,107 @@ fn parse_hex_float(text: &str) -> Option<f64> {
         .strip_prefix("0x")
         .or_else(|| rest.strip_prefix("0X"))?;
     let (mantissa, exponent) = match rest.find(['p', 'P']) {
-        Some(at) => (&rest[..at], rest[at + 1..].parse::<i32>().ok()?),
+        Some(at) => (&rest[..at], parse_binary_exponent(&rest[at + 1..])?),
         None => (rest, 0),
     };
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     if whole.is_empty() && fraction.is_empty() {
         return None;
     }
-    let mut value = 0f64;
-    for digit in whole.chars() {
-        value = value * 16.0 + digit.to_digit(16)? as f64;
+    // The value is `bits × 2^exp`, and a little more if `sticky`: the
+    // first 60 bits or so of the digits, exactly, and whether any digit
+    // after them is not 0. Rounded once, at the end, as `strtod` rounds.
+    let mut bits = 0u64;
+    let mut exp = exponent;
+    let mut sticky = false;
+    for (digit, in_fraction) in whole
+        .chars()
+        .map(|c| (c, false))
+        .chain(fraction.chars().map(|c| (c, true)))
+    {
+        let digit = u64::from(digit.to_digit(16)?);
+        if bits >> 56 == 0 {
+            bits = bits << 4 | digit;
+            if in_fraction {
+                exp -= 4;
+            }
+        } else {
+            sticky |= digit != 0;
+            if !in_fraction {
+                exp += 4;
+            }
+        }
     }
-    let mut scale = 1.0 / 16.0;
-    for digit in fraction.chars() {
-        value += digit.to_digit(16)? as f64 * scale;
-        scale /= 16.0;
-    }
-    let value = value * 2f64.powi(exponent);
+    let value = round_to_double(bits, exp, sticky);
     Some(if negative { -value } else { value })
+}
+
+/// The decimal exponent after `p`: a sign and at least one digit. Past a
+/// million it is a million, which is past the range either way.
+fn parse_binary_exponent(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value = digits.bytes().fold(0i64, |acc, d| {
+        (acc * 10 + i64::from(d - b'0')).min(1_000_000)
+    });
+    Some(if negative { -value } else { value })
+}
+
+/// `bits × 2^exp`, and a little more if `sticky`, as the nearest double,
+/// ties to even: infinite past the largest, zero under half the smallest
+/// subnormal. `bits` has at least two bits more than a double keeps, if
+/// `sticky`.
+fn round_to_double(bits: u64, exp: i64, sticky: bool) -> f64 {
+    if bits == 0 {
+        return 0.0;
+    }
+    let width = 64 - i64::from(bits.leading_zeros());
+    // bits × 2^exp < 2^top.
+    let top = exp + width;
+    if top > 1024 {
+        return f64::INFINITY;
+    }
+    if top < -1074 {
+        return 0.0;
+    }
+    // The exponent of the lowest bit kept: 53 bits, or fewer below the
+    // normal range.
+    let lowest = (top - 53).max(-1074);
+    let mut kept = if lowest <= exp {
+        bits << (exp - lowest)
+    } else {
+        let shift = (lowest - exp) as u32;
+        let kept = if shift >= 64 { 0 } else { bits >> shift };
+        let half = bits >> (shift - 1) & 1 == 1;
+        let below = sticky || bits & ((1u64 << (shift - 1)) - 1) != 0;
+        if half && (below || kept & 1 == 1) {
+            kept + 1
+        } else {
+            kept
+        }
+    };
+    let mut lowest = lowest;
+    if kept == 1 << 53 {
+        kept >>= 1;
+        lowest += 1;
+    }
+    if kept >= 1 << 52 {
+        // Normal: the leading bit is implied.
+        let biased = lowest + 52 + 1023;
+        if biased >= 2047 {
+            return f64::INFINITY;
+        }
+        f64::from_bits((biased as u64) << 52 | (kept & ((1 << 52) - 1)))
+    } else {
+        // Subnormal (or zero): `lowest` is -1074.
+        f64::from_bits(kept)
+    }
 }
 
 /// Parse a Redis score bound like "5.0", "(5.0", "-inf", "+inf"
@@ -1182,8 +1336,12 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
 
     let resp = reply_resp(ctx);
     let written = write_zset(ctx, &key, |inner| {
-        let old = inner.members.get(member.as_ref()).copied().unwrap_or(0.0);
-        let new_score = old + incr;
+        // A new member's score is the increment itself: `-0` too, as Redis
+        // replies (#422). It is stored as 0 (`SortedSetInner::insert`).
+        let new_score = match inner.members.get(member.as_ref()) {
+            Some(&old) => old + incr,
+            None => incr,
+        };
         if new_score.is_nan() {
             return Err(resp_error("ERR resulting score is not a number (NaN)"));
         }
