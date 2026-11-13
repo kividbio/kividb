@@ -41,7 +41,7 @@ const MAX_ENTRIES: usize = 64;
 /// The most bytes in a block of more than one entry.
 const MAX_BYTES: usize = 2048;
 /// Entries from one anchor to the next.
-const SEGMENT: usize = 16;
+const SEGMENT: usize = 8;
 const ANCHORS: usize = MAX_ENTRIES / SEGMENT - 1;
 
 const DELETED: u8 = 1;
@@ -133,9 +133,9 @@ struct Block {
     anchors: [u16; ANCHORS],
 }
 
-// The anchors fill what would be padding.
+// 50 bytes of fields and 14 of anchors.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Block>() == 56);
+const _: () = assert!(std::mem::size_of::<Block>() == 64);
 
 /// Where a scan of a block is: the entry at `off`, the `idx`th of the block,
 /// and the ID of the entry before it.
