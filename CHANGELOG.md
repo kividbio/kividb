@@ -28,7 +28,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `XADD … IDMP` that was recognised as a duplicate was not propagated, so
   the counter started over from the AOF and stayed at 0 on a replica.
   Redis propagates the retry as it came, and the replay counts it again;
-  KiviDB now does the same.
+  KiviDB now does the same. **Upgrade note:** a replica on 1.2.x skips the
+  lookup for replicated writes, so it adds the retry it gets from an
+  upgraded master as a new entry, and the two streams differ. Upgrade
+  replicas before their master, as always.
 
 - **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
   in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path
