@@ -442,9 +442,10 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
 /// keys, `RENAME`, `SUNIONSTORE` and the other `*STORE` commands, `SORT ...
 /// STORE`, `LMOVE`. In Redis every command is one step; here such a write
 /// takes and lets go of its keys' shard locks one key at a time, so even
-/// keys of one shard are seen half written (#159). In cluster mode the
-/// keys of a command are of one slot, and so of one shard (#294). `MSET`
-/// and `MSETNX` lock all their keys together, and need no more.
+/// keys of one shard are seen half written (#159): taken alone only for
+/// keys of several shards, a `DEL` of keys that fell in one shard was seen
+/// by a reader with some of them gone and others not. `MSET` and `MSETNX`
+/// lock all their keys together, and need no more.
 #[inline(never)]
 fn writes_several_keys(name: &str, cmd: &[&[u8]]) -> bool {
     // `key_positions` is a long match on the name: the writes that name one
@@ -2731,7 +2732,7 @@ mod applied_gate_tests {
         assert!(takes(&["flushall", "async"]));
         assert!(takes(&["SWAPDB", "0", "1"]));
         // Keys of two shards, and of one: a write of keys of one shard is
-        // no more one step than of two (#294).
+        // no more one step than of two.
         let shards = crate::store::new_store(1)[0].len();
         let of = |key: &str| crate::store::shard_index(shards, key);
         let other = (0..)

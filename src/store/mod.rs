@@ -47,6 +47,12 @@ pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
 /// GETKEYSINSLOT` and `COUNTKEYSINSLOT` look at that shard alone (#294).
 /// Set once at startup, before the store holds a key, and never cleared:
 /// every key of the process is then placed and found the same way.
+///
+/// What it costs: the keys of one hash tag (a BullMQ queue's `{queue}`, say)
+/// are in one shard, so writes to them take one shard lock in turn where
+/// they were spread over all. No worse than Redis, where every write takes
+/// the one thread. And shards are filled unevenly, so whatever picks a key
+/// at random picks a shard by its keys ([`pick_weighted`]).
 static BY_SLOT: AtomicBool = AtomicBool::new(false);
 
 /// Choose shards by slot from now on. Before the store holds any key.
@@ -72,6 +78,41 @@ fn shard_index_by_slot(shards: usize, key: &[u8]) -> usize {
 #[inline]
 pub fn shard_of_slot(shards: usize, slot: u16) -> usize {
     slot as usize & (shards - 1)
+}
+
+/// The running totals of what each shard of `shards` weighs: its keys, or
+/// (`volatile`) its keys with a time to live, as of the last write to each,
+/// read without a lock. For [`pick_weighted`].
+pub fn shard_weights(shards: &[Shard], volatile: bool, out: &mut Vec<usize>) {
+    out.clear();
+    let mut total = 0usize;
+    out.extend(shards.iter().map(|shard| {
+        total += if volatile {
+            shard.ttl_count()
+        } else {
+            shard.key_count()
+        };
+        total
+    }));
+}
+
+/// A shard picked at random in proportion to what it weighs, given the
+/// running totals of [`shard_weights`] and a random number: `None` when
+/// none weighs anything.
+///
+/// So that every key is as likely to be picked as any other, a shard is
+/// picked in proportion to its keys, and then a key of it. Picked evenly, a
+/// shard of a hundred keys came up as often as one of a million: in cluster
+/// mode, where keys are placed by slot, one busy hash tag fills one shard,
+/// and eviction then took nearly all its keys from the others (#294).
+#[inline]
+pub fn pick_weighted(weights: &[usize], random: usize) -> Option<usize> {
+    let total = *weights.last()?;
+    if total == 0 {
+        return None;
+    }
+    let at = random % total;
+    Some(weights.partition_point(|&w| w <= at))
 }
 
 /// Which of `shards` shards can hold keys of the slots `wanted` picks: the
@@ -127,8 +168,10 @@ pub struct ShardLock {
     map: RwLock<ShardMap>,
     /// Keys in `map` with a time to live, as of the last writer to let go.
     ttls: AtomicUsize,
-    /// Whether `map` holds any key, as of the last writer to let go.
-    keys: AtomicBool,
+    /// How many keys `map` holds, as of the last writer to let go: whether
+    /// it holds any, and what a shard weighs when one is picked at random
+    /// for eviction or `RANDOMKEY` (in cluster mode shards differ a lot).
+    keys: AtomicUsize,
     /// The store (its address) and database this shard is in, for what is
     /// done about keys past their time that a write puts a value over
     /// (`expiry::written_over`).
@@ -172,7 +215,7 @@ impl Drop for ShardWrite<'_> {
         if self.lock.ttls.load(Ordering::Relaxed) != ttls {
             self.lock.ttls.store(ttls, Ordering::Release);
         }
-        let keys = !self.map.is_empty();
+        let keys = self.map.len();
         if self.lock.keys.load(Ordering::Relaxed) != keys {
             self.lock.keys.store(keys, Ordering::Release);
         }
@@ -222,7 +265,7 @@ impl ShardLock {
     pub fn new(map: ShardMap) -> Self {
         ShardLock {
             ttls: AtomicUsize::new(map.ttl_len()),
-            keys: AtomicBool::new(!map.is_empty()),
+            keys: AtomicUsize::new(map.len()),
             map: RwLock::new(map),
             place: std::sync::OnceLock::new(),
         }
@@ -327,7 +370,14 @@ impl ShardLock {
     /// samples, on every write while memory is full.
     #[inline(always)]
     pub fn holds_no_keys(&self) -> bool {
-        !self.keys.load(Ordering::Acquire)
+        self.keys.load(Ordering::Acquire) == 0
+    }
+
+    /// How many keys this shard holds, as of the last write to it, read
+    /// without the lock.
+    #[inline]
+    pub fn key_count(&self) -> usize {
+        self.keys.load(Ordering::Acquire)
     }
 
     /// How many of this shard's keys have a time to live, as of the last
@@ -956,5 +1006,19 @@ mod shard_by_slot_tests {
         let used: std::collections::HashSet<usize> =
             (0..16384u16).map(|slot| shard_of_slot(64, slot)).collect();
         assert_eq!(used.len(), 64);
+    }
+
+    /// A shard is picked in proportion to what it weighs; shards that weigh
+    /// nothing never are, and with nothing anywhere, none is.
+    #[test]
+    fn shards_are_picked_by_weight() {
+        // Weights 0, 0, 5, 0, 3.
+        let totals = [0, 0, 5, 5, 8];
+        let picks: Vec<_> = (0..16)
+            .map(|r| pick_weighted(&totals, r).unwrap())
+            .collect();
+        assert_eq!(picks, [2, 2, 2, 2, 2, 4, 4, 4, 2, 2, 2, 2, 2, 4, 4, 4]);
+        assert_eq!(pick_weighted(&[], 7), None);
+        assert_eq!(pick_weighted(&[0, 0], 7), None);
     }
 }

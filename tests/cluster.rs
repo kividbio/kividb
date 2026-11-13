@@ -7517,10 +7517,10 @@ fn a_standalone_snapshot_loads_into_the_shards_of_its_slots() {
 
 /// A write of several keys of one hash tag is one step, as it is in Redis:
 /// a reader never finds some of a `DEL`'s keys gone and others not, nor a
-/// `RENAME`'s source gone and its destination not there yet. Its keys are
-/// of one slot, and so of one store shard, which a write of several keys
-/// takes and lets go of key by key: it now takes the command gate alone,
-/// as one of keys of several shards always did (#159, #294).
+/// `RENAME`'s source gone and its destination not there yet (#159). A
+/// cluster client's multi-key writes are all of this kind, and a write of
+/// keys that share a store shard takes the command gate alone as one of
+/// keys of several shards does.
 #[test]
 fn readers_never_see_a_write_of_one_hash_tag_half_done() {
     use std::sync::Arc;
@@ -7578,4 +7578,30 @@ fn readers_never_see_a_write_of_one_hash_tag_half_done() {
         0,
         "a reader saw a write half done"
     );
+}
+
+/// `RANDOMKEY` picks every key as often as any other, however its keys fill
+/// the store's shards: on a cluster node, where keys are placed by slot,
+/// the keys of one hash tag fill one shard, and picking a shard evenly gave
+/// them 3% of the picks for half of the keys (#294).
+#[test]
+fn randomkey_is_even_over_a_busy_hash_tag() {
+    let (nodes, _) = form_cluster(1);
+    let mut c = nodes[0].conn();
+    let writes: Vec<Vec<String>> = (0..2_000)
+        .flat_map(|i| {
+            [
+                vec!["SET".into(), format!("{{a}}k{i}"), "v".into()],
+                vec!["SET".into(), format!("k{i}"), "v".into()],
+            ]
+        })
+        .collect();
+    for reply in pipelined(&mut c, &writes) {
+        assert!(reply.is_ok(), "{reply:?}");
+    }
+    let picks = pipelined(&mut c, &vec![vec!["RANDOMKEY".to_string()]; 4_000]);
+    let tagged = picks.iter().filter(|k| k.text().starts_with("{a}")).count();
+    // Half; about 0.008 either way.
+    let share = tagged as f64 / picks.len() as f64;
+    assert!((0.44..0.56).contains(&share), "tagged share {share}");
 }

@@ -1285,9 +1285,8 @@ fn test_readers_never_see_a_multi_key_write_half_done() {
 }
 
 /// The same for keys that are all of one shard: such a write too takes and
-/// lets go of each key's shard lock in turn, and was seen half done (#294).
-/// In cluster mode, where a command's keys are of one slot and so of one
-/// shard, every multi-key write is of this kind (`tests/cluster.rs`).
+/// lets go of each key's shard lock in turn, and was seen half done: the
+/// gate was taken alone only for keys of several shards.
 #[test]
 fn test_readers_never_see_a_multi_key_write_of_one_shard_half_done() {
     let port = free_port();
