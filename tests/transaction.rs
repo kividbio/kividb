@@ -1278,20 +1278,47 @@ fn test_blocking_commands_in_a_transaction_take_what_is_there() {
 /// destination not there yet (#159).
 #[test]
 fn test_readers_never_see_a_multi_key_write_half_done() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
     let port = free_port();
     start_server(port);
     let keys: Vec<String> = (0..200).map(|i| format!("d{i}")).collect();
+    assert_multi_key_writes_whole(port, &keys, "from", "to");
+}
+
+/// The same for keys that are all of one shard: such a write too takes and
+/// lets go of each key's shard lock in turn, and was seen half done (#294).
+/// In cluster mode, where a command's keys are of one slot and so of one
+/// shard, every multi-key write is of this kind (`tests/cluster.rs`).
+#[test]
+fn test_readers_never_see_a_multi_key_write_of_one_shard_half_done() {
+    let port = free_port();
+    start_server(port);
+    let shards = kividb::store::num_shards();
+    let of = |key: &str| kividb::store::shard_index(shards, key);
+    let mut same = (0..).map(|i| format!("s{i}")).filter(|k| of(k) == of("s0"));
+    let keys: Vec<String> = same.by_ref().take(200).collect();
+    let (from, to) = (same.next().unwrap(), same.next().unwrap());
+    assert_multi_key_writes_whole(port, &keys, &from, &to);
+}
+
+/// While a reader reads `keys` and `from`/`to` together, one client sets
+/// and deletes all of `keys` at once and renames `from` to `to` and back,
+/// 300 times: the reader never finds some of `keys` and not others, nor
+/// neither of `from` and `to`.
+fn assert_multi_key_writes_whole(port: u16, keys: &[String], from: &str, to: &str) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let keys = keys.to_vec();
+    let (from, to) = (from.to_string(), to.to_string());
     let mut w = Conn::connect(port);
     // Before the reader starts: a reader that came first found neither
     // `from` nor `to`, and counted that as a RENAME half done.
-    w.cmds(&["SET", "from", "x"]);
+    w.cmds(&["SET", &from, "x"]);
     let stop = Arc::new(AtomicBool::new(false));
     let torn = Arc::new(AtomicU64::new(0));
     let reader = {
         let (stop, torn, keys) = (Arc::clone(&stop), Arc::clone(&torn), keys.clone());
+        let (from, to) = (from.clone(), to.clone());
         thread::spawn(move || {
             let mut r = Conn::connect(port);
             let mut args = vec!["MGET"];
@@ -1302,7 +1329,7 @@ fn test_readers_never_see_a_multi_key_write_half_done() {
                 if present != 0 && present != keys.len() {
                     torn.fetch_add(1, Ordering::Relaxed);
                 }
-                let renamed = r.cmds(&["MGET", "from", "to"]);
+                let renamed = r.cmds(&["MGET", &from, &to]);
                 if renamed.as_array().iter().all(|v| v.is_nil()) {
                     torn.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1319,8 +1346,8 @@ fn test_readers_never_see_a_multi_key_write_half_done() {
         let mut del = vec!["DEL"];
         del.extend(keys.iter().map(|k| k.as_str()));
         assert_eq!(w.cmds(&del).as_int(), keys.len() as i64);
-        assert!(w.cmds(&["RENAME", "from", "to"]).is_ok());
-        assert!(w.cmds(&["RENAME", "to", "from"]).is_ok());
+        assert!(w.cmds(&["RENAME", &from, &to]).is_ok());
+        assert!(w.cmds(&["RENAME", &to, &from]).is_ok());
     }
     stop.store(true, Ordering::Relaxed);
     reader.join().unwrap();

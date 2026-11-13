@@ -7390,6 +7390,9 @@ fn assert_slots_hold(c: &mut Conn, want: &KeysBySlot, what: &str) {
 #[test]
 fn keys_in_slot_are_found_wherever_they_came_from() {
     let (mut nodes, _) = form_cluster(1);
+    // A cluster node places keys by slot: what the rest of this checks.
+    let log = nodes[0].log();
+    assert!(log.contains("Keys placed by : cluster slot"), "{log}");
     let mut want = {
         let mut c = nodes[0].conn();
         let mut want = fill_slots(&mut c, 20_000);
@@ -7434,10 +7437,14 @@ fn keys_in_slot_are_found_wherever_they_came_from() {
         let mut c = nodes[0].conn();
         assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).is_ok());
         assert!(c.cmd(&["CONFIG", "REWRITE"]).is_ok());
-        wait_until("the AOF to be on", Duration::from_secs(20), || {
-            c.cmd(&["INFO", "persistence"])
-                .text()
-                .contains("aof_rewrite_in_progress:0")
+        // Done once a rewrite has finished: this process had none before
+        // (`aof_last_rewrite_time_ms:-1`), so `aof_rewrite_in_progress:0`
+        // alone could be read before the one asked for had begun.
+        wait_until("the AOF's first rewrite", Duration::from_secs(20), || {
+            let info = c.cmd(&["INFO", "persistence"]).text();
+            info.contains("aof_rewrite_in_progress:0")
+                && !info.contains("aof_last_rewrite_time_ms:-1")
+                && info.contains("aof_last_bgrewrite_status:ok")
         });
         let writes: Vec<Vec<String>> = (0..2000)
             .map(|i| vec!["SET".into(), format!("aof:{i}"), "v".into()])
@@ -7506,4 +7513,69 @@ fn a_standalone_snapshot_loads_into_the_shards_of_its_slots() {
     node.spawn();
     let (nodes, _) = form_cluster_of(vec![node]);
     assert_slots_hold(&mut nodes[0].conn(), &want, "a standalone snapshot");
+}
+
+/// A write of several keys of one hash tag is one step, as it is in Redis:
+/// a reader never finds some of a `DEL`'s keys gone and others not, nor a
+/// `RENAME`'s source gone and its destination not there yet. Its keys are
+/// of one slot, and so of one store shard, which a write of several keys
+/// takes and lets go of key by key: it now takes the command gate alone,
+/// as one of keys of several shards always did (#159, #294).
+#[test]
+fn readers_never_see_a_write_of_one_hash_tag_half_done() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let (nodes, _) = form_cluster(1);
+    let port = nodes[0].port;
+    let keys: Vec<String> = (0..200).map(|i| format!("{{t}}d{i}")).collect();
+    let (from, to) = ("{t}from", "{t}to");
+    let mut w = nodes[0].conn();
+    assert!(w.cmd(&["SET", from, "x"]).is_ok());
+    let stop = Arc::new(AtomicBool::new(false));
+    let torn = Arc::new(AtomicU64::new(0));
+    // Several readers, and many rounds: the window is a few microseconds.
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (stop, torn, keys) = (Arc::clone(&stop), Arc::clone(&torn), keys.clone());
+            std::thread::spawn(move || {
+                let mut r = Conn::connect(port);
+                let mut args = vec!["MGET"];
+                args.extend(keys.iter().map(String::as_str));
+                while !stop.load(Ordering::Relaxed) {
+                    let got = r.cmd(&args);
+                    let present = got.array().iter().filter(|v| **v != Resp::Nil).count();
+                    if present != 0 && present != keys.len() {
+                        torn.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let renamed = r.cmd(&["MGET", from, to]);
+                    if renamed.array().iter().all(|v| *v == Resp::Nil) {
+                        torn.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for _ in 0..1500 {
+        let mut mset = vec!["MSET"];
+        for k in &keys {
+            mset.push(k);
+            mset.push("v");
+        }
+        assert!(w.cmd(&mset).is_ok());
+        let mut del = vec!["DEL"];
+        del.extend(keys.iter().map(String::as_str));
+        assert_eq!(w.cmd(&del).int(), keys.len() as i64);
+        assert!(w.cmd(&["RENAME", from, to]).is_ok());
+        assert!(w.cmd(&["RENAME", to, from]).is_ok());
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(
+        torn.load(Ordering::Relaxed),
+        0,
+        "a reader saw a write half done"
+    );
 }

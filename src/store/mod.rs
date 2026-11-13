@@ -52,6 +52,7 @@ static BY_SLOT: AtomicBool = AtomicBool::new(false);
 /// Choose shards by slot from now on. Before the store holds any key.
 pub fn shard_by_slot() {
     BY_SLOT.store(true, Ordering::Relaxed);
+    crate::log_info!("Keys placed by : cluster slot");
 }
 
 /// Whether shards are chosen by slot.
@@ -71,6 +72,21 @@ fn shard_index_by_slot(shards: usize, key: &[u8]) -> usize {
 #[inline]
 pub fn shard_of_slot(shards: usize, slot: u16) -> usize {
     slot as usize & (shards - 1)
+}
+
+/// Which of `shards` shards can hold keys of the slots `wanted` picks: the
+/// shards of those slots when keys are placed by slot, else every one.
+pub fn shards_of_slots(shards: usize, wanted: impl Fn(u16) -> bool) -> Vec<bool> {
+    if !sharded_by_slot() {
+        return vec![true; shards];
+    }
+    let mut holds = vec![false; shards];
+    for slot in 0..crate::cluster::slot::CLUSTER_SLOTS as u16 {
+        if wanted(slot) {
+            holds[shard_of_slot(shards, slot)] = true;
+        }
+    }
+    holds
 }
 
 #[inline(always)]

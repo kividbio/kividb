@@ -1522,11 +1522,7 @@ async fn run_replication_session(
                             // goes on as long as the commands want it alone,
                             // and no further.
                             let wants_alone =
-                                crate::commands::handler::applied_takes_the_gate_alone(
-                                    store,
-                                    selected_db,
-                                    &cmd,
-                                );
+                                crate::commands::handler::applied_takes_the_gate_alone(&cmd);
                             if wants_alone && !alone {
                                 next_alone = true;
                                 break;
