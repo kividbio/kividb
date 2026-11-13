@@ -537,9 +537,12 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // An index of vectors alone that is given its first TEXT, TAG or
     // NUMERIC field counts its documents by their ids from here on: each
     // is given one below, whatever was added and with SKIPINITIALSCAN too.
+    // Its keys are let go of, not emptied: a walk that began before this
+    // (of an `FT.CREATE` or another `FT.ALTER`) goes on adding to the ones
+    // it holds, which go with it, not to ones nothing reads or frees.
     let now_gives_ids = kept_keys && def.gives_ids();
     if now_gives_ids {
-        def.docs.clear();
+        def.docs = Arc::default();
     }
     let altered = def.clone();
 

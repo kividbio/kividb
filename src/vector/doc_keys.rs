@@ -114,14 +114,6 @@ impl DocKeys {
         stripe.0.lock().remove(&bits);
     }
 
-    /// Forget every key: the index gives its documents ids from here on
-    /// (`FT.ALTER` added a field that needs them), and counts those.
-    pub fn clear(&self) {
-        for stripe in self.stripes.iter() {
-            *stripe.0.lock() = HashMap::default();
-        }
-    }
-
     /// How many documents the index holds.
     pub fn len(&self) -> usize {
         self.stripes
@@ -177,8 +169,7 @@ mod tests {
         docs.remove("doc:1");
         docs.remove("doc:3");
         assert_eq!((docs.len(), docs.len_in(&served)), (1, 0));
-
-        docs.clear();
+        docs.remove("doc:2");
         assert!(docs.is_empty());
         assert_eq!(docs.len_in(&vec![u64::MAX; served.len()]), 0);
     }
