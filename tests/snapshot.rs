@@ -18,8 +18,7 @@
 use ahash::AHashMap;
 use kividb::snapshot::{load_redis_rdb, load_snapshot, write_snapshot};
 use kividb::types::{
-    KiviDBValue, SortedSetInner, StreamEntry, StreamId, StreamInner, TsInner, VSetEntry,
-    VectorSetInner,
+    KiviDBValue, SortedSetInner, StreamId, StreamInner, TsInner, VSetEntry, VectorSetInner,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
@@ -393,24 +392,20 @@ fn kdb_stream_basic() {
     stream.last_id = StreamId::new(1000, 5);
     stream.entries.push_tail(
         StreamId::new(1000, 1),
-        StreamEntry {
-            fields: vec![
-                (
-                    Arc::from(b"name".as_slice()),
-                    Arc::from(b"alice".as_slice()),
-                ),
-                (
-                    Arc::from(b"action".as_slice()),
-                    Arc::from(b"login".as_slice()),
-                ),
-            ],
-        },
+        &[
+            (
+                Arc::from(b"name".as_slice()),
+                Arc::from(b"alice".as_slice()),
+            ),
+            (
+                Arc::from(b"action".as_slice()),
+                Arc::from(b"login".as_slice()),
+            ),
+        ],
     );
     stream.entries.push_tail(
         StreamId::new(1000, 2),
-        StreamEntry {
-            fields: vec![(Arc::from(b"name".as_slice()), Arc::from(b"bob".as_slice()))],
-        },
+        &[(Arc::from(b"name".as_slice()), Arc::from(b"bob".as_slice()))],
     );
 
     let v = roundtrip_one("stream", KiviDBValue::Stream(Arc::new(RwLock::new(stream))));
@@ -449,14 +444,12 @@ fn kdb_stream_entry_order() {
     let mut stream = StreamInner::new();
     stream.last_id = StreamId::new(9999, 0);
     for seq in [5u64, 1, 3, 2, 4] {
-        stream.entries.insert_loaded(
+        stream.entries.push_tail(
             StreamId::new(1000, seq),
-            StreamEntry {
-                fields: vec![(
-                    Arc::from(b"seq".as_slice()),
-                    Arc::from(seq.to_string().as_bytes()),
-                )],
-            },
+            &[(
+                Arc::from(b"seq".as_slice()),
+                Arc::from(seq.to_string().as_bytes()),
+            )],
         );
     }
 
@@ -485,15 +478,11 @@ fn kdb_stream_consumer_groups_and_meta() {
     stream.max_entries = Some(100);
     stream.entries.push_tail(
         StreamId::new(1000, 1),
-        StreamEntry {
-            fields: vec![(Arc::from(b"f".as_slice()), Arc::from(b"v0".as_slice()))],
-        },
+        &[(Arc::from(b"f".as_slice()), Arc::from(b"v0".as_slice()))],
     );
     stream.entries.push_tail(
         StreamId::new(1000, 2),
-        StreamEntry {
-            fields: vec![(Arc::from(b"f".as_slice()), Arc::from(b"v1".as_slice()))],
-        },
+        &[(Arc::from(b"f".as_slice()), Arc::from(b"v1".as_slice()))],
     );
     let mut pel = std::collections::BTreeMap::new();
     pel.insert(
@@ -928,9 +917,7 @@ fn kdb_all_types_together() {
     stream.last_id = StreamId::new(1, 0);
     stream.entries.push_tail(
         StreamId::new(1, 0),
-        StreamEntry {
-            fields: vec![(Arc::from(b"k".as_slice()), Arc::from(b"v".as_slice()))],
-        },
+        &[(Arc::from(b"k".as_slice()), Arc::from(b"v".as_slice()))],
     );
     map.insert(
         "stream".to_string(),

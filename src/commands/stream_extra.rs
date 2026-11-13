@@ -653,9 +653,8 @@ pub(super) fn trim_stream_approx(
             TrimTo::MaxLen(max) => len - node >= *max,
             TrimTo::MinId(min) => stream
                 .entries
-                .iter()
-                .nth(node as usize - 1)
-                .is_some_and(|(last, _)| last < *min),
+                .nth_id(node as usize - 1)
+                .is_some_and(|last| last < *min),
         };
         if !whole {
             break;
@@ -903,7 +902,8 @@ pub(super) fn setid_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PelEntry, StreamEntry};
+    use crate::types::PelEntry;
+    const NO_FIELDS: &[(&[u8], &[u8])] = &[];
 
     const DEFAULTS: (u64, u64) = (100, 100);
 
@@ -914,8 +914,7 @@ mod tests {
     fn stream_with(n: u64) -> StreamInner {
         let mut s = StreamInner::new();
         for ms in 1..=n {
-            s.entries
-                .push_tail(id(ms), StreamEntry { fields: Vec::new() });
+            s.entries.push_tail(id(ms), NO_FIELDS);
             s.last_id = id(ms);
         }
         s
@@ -1161,8 +1160,7 @@ mod tests {
         let add = |s: &mut StreamInner, n: u64| {
             for _ in 0..n {
                 s.entries_added += 1;
-                s.entries
-                    .push_tail(id(s.entries_added), StreamEntry { fields: Vec::new() });
+                s.entries.push_tail(id(s.entries_added), NO_FIELDS);
             }
         };
         add(&mut s, 101);

@@ -12,9 +12,7 @@ use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin}
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{
-    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner,
-};
+use crate::types::{ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamId, StreamInner};
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
 use parking_lot::RwLock;
@@ -635,9 +633,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
 
     let id_str_out = entry_id.to_string();
     stream_extra::record_append(&mut inner, &fields);
-    inner
-        .entries
-        .push_tail(entry_id.clone(), StreamEntry { fields });
+    inner.entries.push_tail(entry_id.clone(), &fields);
     inner.last_id = entry_id.clone();
     inner.entries_added += 1;
 
@@ -2832,14 +2828,12 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
             }
             let first_entry = inner
                 .entries
-                .iter()
-                .next()
+                .first()
                 .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
             let last_entry = inner
                 .entries
-                .range_rev(..)
-                .next()
+                .last()
                 .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
 

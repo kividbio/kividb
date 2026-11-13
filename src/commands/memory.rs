@@ -6,7 +6,7 @@ use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{HashFields, HashInner, SortedSetInner, ZMember};
+use crate::types::{HashFields, HashInner, SortedSetInner, StreamInner, ZMember};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
@@ -185,22 +185,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::Stream(arc) => {
             let inner = arc.read();
-            let len = inner.entries.len();
-            let avg = if len == 0 {
-                0
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let total: usize = inner
-                    .entries
-                    .iter()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|(_, e)| e.fields().map(|(k, v)| k.len() + v.len()).sum::<usize>())
-                    .sum();
-                total / sample_n.max(1)
-            };
-            key_overhead + avg * len + 200
+            // Its entries are counted exactly: a few blocks of packed
+            // entries. Its groups are not counted.
+            entry() + layout::arc_of::<RwLock<StreamInner>>() + inner.entries.heap_bytes()
         }
 
         ValueRef::Json(arc) => {
