@@ -21,6 +21,7 @@ fn dispatch_command_handlers_fallback(ctx: &mut Ctx, name: &str) -> Option<Vec<u
         .or_else(|| hash::handle(ctx, name))
         .or_else(|| zset::handle(ctx, name))
         .or_else(|| bitmap::handle(ctx, name))
+        .or_else(|| bf::handle(ctx, name))
         .or_else(|| hyperloglog::handle(ctx, name))
         .or_else(|| geo::handle(ctx, name))
         .or_else(|| ts::handle(ctx, name))
@@ -102,7 +103,7 @@ pub(crate) fn dispatch_command_handlers(ctx: &mut Ctx, name: &str) -> Option<Vec
         b'l' => lists::handle(ctx, name),
         b'h' => hash::handle(ctx, name).or_else(|| hyperloglog::handle(ctx, name)),
         b'z' => zset::handle(ctx, name),
-        b'b' => bitmap::handle(ctx, name),
+        b'b' => bitmap::handle(ctx, name).or_else(|| bf::handle(ctx, name)),
         b'f' => vector::handle(ctx, name),
         b'j' => json::handle(ctx, name),
         b'x' => streams::handle(ctx, name),
@@ -437,19 +438,17 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Whether `cmd` is a write naming keys of more than one shard of `db`,
-/// which would be seen half done by another client without the gate alone:
-/// a `DEL` of several keys, `RENAME`, `SUNIONSTORE` and the other `*STORE`
-/// commands, `SORT ... STORE`, `LMOVE`. In Redis every command is one step;
-/// here the shards are worked on at once (#159). `MSET` and `MSETNX` lock
-/// all their shards together, and need no more.
+/// Whether `cmd` is a write naming more than one key, which would be seen
+/// half done by another client without the gate alone: a `DEL` of several
+/// keys, `RENAME`, `SUNIONSTORE` and the other `*STORE` commands, `SORT ...
+/// STORE`, `LMOVE`. In Redis every command is one step; here such a write
+/// takes and lets go of its keys' shard locks one key at a time, so even
+/// keys of one shard are seen half written (#159): taken alone only for
+/// keys of several shards, a `DEL` of keys that fell in one shard was seen
+/// by a reader with some of them gone and others not. `MSET` and `MSETNX`
+/// lock all their keys together, and need no more.
 #[inline(never)]
-fn keys_of_several_shards(
-    store: &crate::store::Store,
-    db: usize,
-    name: &str,
-    cmd: &[&[u8]],
-) -> bool {
+fn writes_several_keys(name: &str, cmd: &[&[u8]]) -> bool {
     // `key_positions` is a long match on the name: the writes that name one
     // key are told apart first.
     if cmd.len() < 3
@@ -462,17 +461,11 @@ fn keys_of_several_shards(
         return false;
     }
     let keys = crate::keyspec::key_positions(name, cmd);
-    if keys.iter().nth(1).is_none() {
-        return false;
-    }
-    let Some(db) = store.get(db) else {
+    let mut keys = keys.iter().map(|pos| cmd[pos]);
+    let Some(first) = keys.next() else {
         return false;
     };
-    let mut shards = keys
-        .iter()
-        .map(|pos| crate::store::shard_index_of_bytes(db.len(), cmd[pos]));
-    let first = shards.next();
-    first.is_none() || shards.any(|shard| Some(shard) != first)
+    keys.any(|key| key != first)
 }
 
 /// Whether a command takes the command gate alone: the one rule, asked by
@@ -482,14 +475,7 @@ fn keys_of_several_shards(
 /// `gated`: a write, or a script. A flush and `SWAPDB` are not taken alone
 /// while the AOF is replayed, where nothing else runs.
 #[inline(always)]
-fn takes_the_gate_alone(
-    store: &crate::store::Store,
-    db: usize,
-    name: &str,
-    cmd: &[&[u8]],
-    script_alone: bool,
-    gated: bool,
-) -> bool {
+fn takes_the_gate_alone(name: &str, cmd: &[&[u8]], script_alone: bool, gated: bool) -> bool {
     script_alone
         || (gated
             && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB")
@@ -499,7 +485,7 @@ fn takes_the_gate_alone(
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
         // stays small.
-        || (cmd.len() >= 3 && keys_of_several_shards(store, db, name, cmd))
+        || (cmd.len() >= 3 && writes_several_keys(name, cmd))
         // A `SORT` that reads fields of hashes it does not name, which may
         // remove one past its time (`generics::sort_reads_hash_fields`).
         // Not `SORT_RO`: it is no write, and takes the order of what it
@@ -562,11 +548,7 @@ fn one_key_write(name: &str) -> bool {
 /// nothing and applied nothing more (#373). A script from the stream never
 /// runs beside others. `run_command` then finds the gate held on its thread
 /// and takes nothing of it.
-pub(crate) fn applied_takes_the_gate_alone(
-    store: &crate::store::Store,
-    db: usize,
-    cmd: &[&[u8]],
-) -> bool {
+pub(crate) fn applied_takes_the_gate_alone(cmd: &[&[u8]]) -> bool {
     let Some(&cmd0) = cmd.first() else {
         return false;
     };
@@ -591,7 +573,7 @@ pub(crate) fn applied_takes_the_gate_alone(
         name,
         "EVAL" | "EVALSHA" | "FCALL" | "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO"
     );
-    takes_the_gate_alone(store, db, name, cmd, script, true)
+    takes_the_gate_alone(name, cmd, script, true)
 }
 
 /// The order of the keys of an `MSET` or `MSETNX`, held shared (see
@@ -1392,14 +1374,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     }
     let gates = if crate::command_gate::skips(name, &ctx.cmd) {
         Some((None, None))
-    } else if takes_the_gate_alone(
-        ctx.store,
-        *ctx.selected_db,
-        name,
-        &ctx.cmd,
-        any_script && !beside_others,
-        gated,
-    ) {
+    } else if takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated) {
         crate::command_gate::enter_alone_unless(SLICE, overrun).map(|alone| (None, Some(alone)))
     } else {
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
@@ -2208,6 +2183,20 @@ fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
     }
 }
 
+/// [`notify_watchers`] for a `BF.*` write that failed after finding its key,
+/// which is always `cmd[1]`. Kept apart and out of line so `notify_watchers`
+/// keeps its one call site in [`side_effects`], where it is inlined: a second
+/// call site there cost every successful write about 20 instructions.
+#[cold]
+#[inline(never)]
+fn notify_failed_bf_write(ctx: &Ctx) {
+    if ctx.watch_registry.has_watchers()
+        && let Some(key) = ctx.cmd.get(1)
+    {
+        ctx.watch_registry.notify(*ctx.selected_db, key);
+    }
+}
+
 /// Whether the command is one that reads and writes its one key, `cmd[1]`,
 /// under one hold of the key's shard lock: two of them on the key run one
 /// before the other with nothing more, and while nothing reads the write
@@ -2612,6 +2601,17 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         }
     }
 
+    // A `BF.*` write that failed once it had found its key (`BF.RESERVE` of
+    // one there already, `BF.ADD` to a full filter) invalidates a `WATCH`
+    // on it all the same, as Redis's do.
+    if writes_operation
+        && !is_mutating_ok_write
+        && name.starts_with("BF.")
+        && crate::commands::bf::take_touched()
+    {
+        notify_failed_bf_write(ctx);
+    }
+
     // ── PUBLISH reaches replicas' subscribers too ───────────────────────────
     // Not a write — nothing is stored, and it never goes to the AOF — but
     // Redis propagates it so a client subscribed on a replica receives what
@@ -2738,9 +2738,8 @@ mod applied_gate_tests {
     use super::applied_takes_the_gate_alone;
 
     fn takes(cmd: &[&str]) -> bool {
-        let store = crate::store::new_store(2);
         let cmd: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
-        applied_takes_the_gate_alone(&store, 0, &cmd)
+        applied_takes_the_gate_alone(&cmd)
     }
 
     /// What the replica's applier takes the gate alone for, before its own
@@ -2758,7 +2757,8 @@ mod applied_gate_tests {
         assert!(takes(&["FLUSHDB"]));
         assert!(takes(&["flushall", "async"]));
         assert!(takes(&["SWAPDB", "0", "1"]));
-        // Keys of two shards, and of one.
+        // Keys of two shards, and of one: a write of keys of one shard is
+        // no more one step than of two.
         let shards = crate::store::new_store(1)[0].len();
         let of = |key: &str| crate::store::shard_index(shards, key);
         let other = (0..)
@@ -2770,7 +2770,13 @@ mod applied_gate_tests {
             .find(|c| of(c) == of("a"))
             .unwrap();
         assert!(takes(&["COPY", "a", &other, "REPLACE"]));
-        assert!(!takes(&["COPY", "a", &same, "REPLACE"]));
+        assert!(takes(&["COPY", "a", &same, "REPLACE"]));
+        assert!(takes(&["DEL", "a", &same]));
+        assert!(takes(&["RENAME", "{t}a", "{t}b"]));
+        assert!(takes(&["SMOVE", "{t}a", "{t}b", "m"]));
+        // One key named twice is one key.
+        assert!(!takes(&["DEL", "a", "a"]));
+        assert!(!takes(&["RENAME", "a", "a"]));
     }
 }
 

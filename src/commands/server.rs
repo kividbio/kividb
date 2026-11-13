@@ -257,6 +257,9 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
     ]
+    .into_iter()
+    .chain(crate::commands::bf::config_rows())
+    .collect()
 }
 
 /// `CONFIG SET` of the array settings, as Redis checks them: the slice size
@@ -1229,6 +1232,10 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
                 Some(config_set_array(&param, value))
             }
+            "bf-error-rate"
+            | "bf-initial-size"
+            | "bf-expansion-factor"
+            | "bloom-max-filter-bytes" => Some(crate::commands::bf::config_set(&param, value)),
             "stream-node-max-entries" => match value.parse::<i64>() {
                 Ok(v) if v >= 0 => {
                     crate::commands::stream_extra::NODE_MAX_ENTRIES
@@ -2387,6 +2394,18 @@ const ALL_COMMANDS: &[&str] = &[
     "ARSEEK",
     "ARSET",
     "AUTH",
+    // Bloom filters
+    "BF.ADD",
+    "BF.CARD",
+    "BF.DEBUG",
+    "BF.EXISTS",
+    "BF.INFO",
+    "BF.INSERT",
+    "BF.LOADCHUNK",
+    "BF.MADD",
+    "BF.MEXISTS",
+    "BF.RESERVE",
+    "BF.SCANDUMP",
     "BGSAVE",
     "BGREWRITEAOF",
     "BITCOUNT",
@@ -2850,6 +2869,9 @@ const FAST_COMMANDS: &[&str] = &[
     "APPEND",
     "ASKING",
     "AUTH",
+    "BF.CARD",
+    "BF.INFO",
+    "BF.RESERVE",
     "DBSIZE",
     "DECR",
     "DECRBY",
@@ -2959,6 +2981,7 @@ pub(crate) const ACL_CATEGORIES: &[&str] = &[
     "array",
     "bitmap",
     "blocking",
+    "bloom",
     "cluster",
     "connection",
     "dangerous",
@@ -3038,6 +3061,7 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             // One of Redis's commands has Redis's arity. The guess above is
             // for the rest.
             let arity = crate::commands::arity::of(name)
+                .or_else(|| crate::commands::bf::arity(name))
                 .or_else(|| module_arity(name))
                 .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
@@ -3450,6 +3474,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         // The module families, taken from the command table by prefix so a new
         // command joins its category by being registered.
         "json" => commands_with_prefix("JSON."),
+        "bloom" => commands_with_prefix("BF."),
         "search" => commands_with_prefix("FT."),
         "timeseries" => commands_with_prefix("TS."),
         "vector" => vec![
@@ -3545,6 +3570,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
                 "sortedset",
                 "hash",
                 "bitmap",
+                "bloom",
                 "hyperloglog",
                 "geo",
                 "stream",
@@ -3580,11 +3606,12 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
 /// to connect without `search`), so `MODULE LIST`, `HELLO` and
 /// `COMMAND LIST FILTERBY MODULE` report them as Redis reports its own
 /// built-in `vectorset`: an empty path and no args.
-const BUILT_IN_MODULES: [(&str, i64); 4] = [
+const BUILT_IN_MODULES: [(&str, i64); 5] = [
     ("search", 81001),
     ("ReJSON", 81000),
     ("timeseries", 81001),
     ("vectorset", 1),
+    ("bf", 81001),
 ];
 
 /// One entry per built-in module family, as `MODULE LIST` and `HELLO`'s
@@ -3619,6 +3646,10 @@ fn in_module(module: &str, name: &str) -> bool {
         "search" => name.starts_with("ft.") || name.starts_with("_ft."),
         "rejson" => name.starts_with("json."),
         "timeseries" => name.starts_with("ts."),
+        // The probabilistic types: Redis 8's `bf` module.
+        "bf" => ["bf.", "cf.", "cms.", "topk.", "tdigest."]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)),
         // The vector set commands are the only ones that begin with `v`.
         "vectorset" => name.starts_with('v'),
         _ => false,

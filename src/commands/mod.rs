@@ -3,6 +3,7 @@ mod aggregate_pipeline;
 pub(crate) mod arity;
 mod array;
 pub(crate) mod backup;
+pub(crate) mod bf;
 mod bitmap;
 pub mod blocking;
 pub(crate) mod cluster;

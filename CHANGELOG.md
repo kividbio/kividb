@@ -7,6 +7,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Upgrading
+
+- **Upgrade replicas before their master.** A master sends `BF.*` commands
+  and, in a full sync, Bloom filters under a new snapshot record (tag 40);
+  a replica of an earlier release cannot apply either.
+- **No downgrade once a Bloom filter exists.** A snapshot or an AOF
+  checkpoint with a Bloom filter in it cannot be read by an earlier release.
+  Delete the filters (or move them off with `DUMP`, which Redis restores)
+  before going back.
+
+### Added
+
+- **Bloom filters (`BF.*`), as Redis 8 has them built in (part of #453).**
+  `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.INSERT`, `BF.EXISTS`,
+  `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`, `BF.LOADCHUNK` and
+  `BF.DEBUG`, and the `bf-error-rate`, `bf-initial-size` and
+  `bf-expansion-factor` settings. Replies and errors are Redis 8.10's, byte
+  for byte, in RESP2 and RESP3, quirks included (`BF.EXISTS` answers 0 for
+  a key of another type; `BF.MADD` stops at an item a full filter cannot
+  take). A filter is laid out bit for bit as Redis lays it out, so filters
+  moved from Redis answer as they did there: RDB files and full syncs from
+  Redis 8 and Redis Stack 6.2 to 7.4, `RESTORE` and `MIGRATE` of Redis's
+  `DUMP` payloads, and `BF.SCANDUMP` chunks. `DUMP` writes Redis's format,
+  which every Redis since 6.0 restores. A command that made its filter with
+  a setting of this node's (`BF.ADD` on a missing key, `BF.RESERVE`
+  without `EXPANSION`) goes to replicas and the AOF naming what it took,
+  so a replica or a replay with other settings makes the same filter.
+  `maxmemory` holds back clients, not a master or the AOF: a client's
+  command that would not fit evicts first under the policy, and gets `OOM`
+  only if that is not enough. `COPY` copies a filter (Redis refuses); a
+  copy, a snapshot and a `DUMP` share the filter's bytes until it is next
+  written. As in Redis 8.10, no `BF.*` command sends a keyspace event but
+  `new` for a key it made. `MODULE LIST` reports Redis 8's `bf` module,
+  and `ACL` has the `@bloom` category. Snapshots keep filters under a new
+  record (tag 40), so a snapshot with a Bloom filter in it cannot be read
+  by an earlier release (see Upgrading). Unlike Redis, a filter has size
+  limits: `bloom-max-filter-bytes`, a new setting, is 512 MiB by default
+  and holds a client's commands; raise it for larger filters. Replication,
+  the AOF and loads (snapshots, full syncs, RDB files, `RESTORE`) are held
+  only to fixed size limits, so a replica or a restart with a lower setting
+  keeps every filter the master took, and a filter Redis grew past the
+  size limits for clients still loads. `BF.MADD`, `BF.INSERT` and
+  `BF.MEXISTS` have a per-command limit: a command that reaches it stops,
+  and its reply ends with an error for the item it stopped at (send fewer
+  items per command). Cuckoo filters, Count-min sketches, Top-K and
+  t-digests follow.
+
 ### Changed
 
 - **`MEMORY USAGE` of a stream is what its entries take, and reads
@@ -43,6 +90,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   strings, as RediSearch does; they were bulk strings.
 
 ### Fixed
+
+- **`redis-cli --cluster reshard` no longer walks every key of a node for
+  each batch it moves (#294).** `CLUSTER GETKEYSINSLOT`, `COUNTKEYSINSLOT`
+  and the empty-slot check of `CLUSTER SETSLOT` looked at every key of the
+  node to find one slot's, so on a node of millions of keys each call took
+  hundreds of milliseconds and resharding moved a few slots a minute. A
+  cluster node now keeps each key in the store shard of its slot, and these
+  commands look at that shard alone. Servers not in cluster mode place keys
+  as before, and pay nothing for it. Eviction and `RANDOMKEY` now pick a
+  shard in proportion to its keys, so the keys of one busy hash tag, all in
+  one shard, are as likely to be evicted or returned as any others. Writes
+  to the keys of one hash tag on a cluster node now share one shard lock,
+  as all writes in Redis share one thread.
+
+- **A write of several keys that share a store shard is no longer seen
+  half done.** A `DEL` of several keys, `RENAME`, `SMOVE`, `COPY` and the
+  other writes of more than one key work on their keys one at a time, and
+  were made one step for other clients only when their keys were in
+  different shards (#159). When all the keys fell in one shard, a client
+  reading them at the same moment could find some deleted and others not,
+  or a renamed key in neither place. Every write of more than one key is
+  now one step.
 
 - **An index created since the last dump is whole after a restart that
   replays the AOF (#590).** The walk that indexes the documents once the
