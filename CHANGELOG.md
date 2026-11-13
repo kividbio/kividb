@@ -38,6 +38,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that form, so ACL key checks did not see it. `KEYS` with nothing after
   it now answers `NOKEY`, as in Redis.
 
+- **`INCRBYFLOAT` and `HINCRBYFLOAT` add as Redis does on x86-64, in
+  `long double`: `0.1 + 0.2` is `0.3`, not `0.30000000000000004` (#387).**
+  Redis reads both numbers with `strtold`, adds them in the 80-bit x87
+  format and writes the sum with 17 places, the zeros at the end left out;
+  KiviDB added in a double. The same arithmetic is now done exactly in
+  software, so the sum, the stored value and what replicas and the AOF get
+  are what Redis 8.10.2 gives, digit for digit, and numbers only a
+  `long double` holds (`1e400`) and hexadecimal ones are read as Redis
+  reads them.
+
+- **`HINCRBYFLOAT` goes to replicas and the AOF as the value it left, as
+  `HSETEX key KEEPTTL FIELDS 1 field value`, as Redis 8.10.2 sends it.**
+  It was sent as typed, so a replica or an AOF replay ran the addition
+  again: an AOF replayed over a snapshot that already had it added twice,
+  and any change to how the sum is worked out would make versions differ.
+  The field keeps its time to live on the replica and after a replay.
+
 - **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes
   that a short key never took (#497).** The list of hashes whose fields
   expire keeps its own copy of each key, and since 1.2.1 a key of up to 23
