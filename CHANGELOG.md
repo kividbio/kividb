@@ -23,6 +23,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`redis-cli --cluster reshard` no longer walks every key of a node for
+  each batch it moves (#294).** `CLUSTER GETKEYSINSLOT`, `COUNTKEYSINSLOT`
+  and the empty-slot check of `CLUSTER SETSLOT` looked at every key of the
+  node to find one slot's, so on a node of millions of keys each call took
+  hundreds of milliseconds and resharding moved a few slots a minute. A
+  cluster node now keeps each key in the store shard of its slot, and these
+  commands look at that shard alone. Servers not in cluster mode place keys
+  as before, and pay nothing for it.
+
 - **A script that waits for `TIME` to move ends (#676).** `TIME` in a
   script returned the script's start for as long as it ran, so a loop
   waiting for it to change ran until `SCRIPT KILL`. As in Redis, `TIME`

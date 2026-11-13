@@ -21,21 +21,56 @@ pub use shard_map::{
 ///
 /// 64-bit FNV-1a on every target (a 32-bit `usize` can't hold its
 /// constants); the shard is taken from its low bits.
-#[inline]
+#[inline(always)]
 pub fn shard_index(shards: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> usize {
     shard_index_of_bytes(shards, key.as_ref())
 }
 
 /// [`shard_index`] of a key as the command gave it, not yet checked to be
-/// UTF-8 (the same shard: the hash is of the bytes).
-#[inline]
+/// UTF-8 (the same shard: the hash is of the bytes). In cluster mode the
+/// shard is the key's slot's instead ([`shard_by_slot`]).
+#[inline(always)]
 pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
+    if BY_SLOT.load(Ordering::Relaxed) {
+        return shard_index_by_slot(shards, key);
+    }
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in key {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     (hash as usize) & (shards - 1)
+}
+
+/// Whether a key's shard is chosen by its cluster slot (cluster mode), so
+/// that the keys of one slot are all in one shard and `CLUSTER
+/// GETKEYSINSLOT` and `COUNTKEYSINSLOT` look at that shard alone (#294).
+/// Set once at startup, before the store holds a key, and never cleared:
+/// every key of the process is then placed and found the same way.
+static BY_SLOT: AtomicBool = AtomicBool::new(false);
+
+/// Choose shards by slot from now on. Before the store holds any key.
+pub fn shard_by_slot() {
+    BY_SLOT.store(true, Ordering::Relaxed);
+}
+
+/// Whether shards are chosen by slot.
+pub fn sharded_by_slot() -> bool {
+    BY_SLOT.load(Ordering::Relaxed)
+}
+
+/// [`shard_index_of_bytes`] in cluster mode. Out of line, so that the slot
+/// hash is not inlined into every place a key's shard is looked up.
+#[cold]
+#[inline(never)]
+fn shard_index_by_slot(shards: usize, key: &[u8]) -> usize {
+    shard_of_slot(shards, crate::cluster::slot::key_hash_slot(key))
+}
+
+/// The shard of `slot`'s keys, of `shards`, when they are chosen by slot.
+#[inline]
+pub fn shard_of_slot(shards: usize, slot: u16) -> usize {
+    slot as usize & (shards - 1)
 }
 
 #[inline(always)]
@@ -871,5 +906,39 @@ mod shard_lock_tests {
         assert!(!cell.holds_no_keys());
         assert!(other.holds_no_keys());
         assert_eq!(cell.read().ttl_len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod shard_by_slot_tests {
+    use super::*;
+    use crate::cluster::slot::key_hash_slot;
+
+    /// In cluster mode a key's shard is its slot's: every key of a slot,
+    /// hash tags and all, in one shard (#294). Called directly, not through
+    /// the switch, which is the whole test process's.
+    #[test]
+    fn the_keys_of_a_slot_share_a_shard() {
+        for shards in [1, 8, 64, 512] {
+            for i in 0..2000 {
+                let key = format!("key:{i}");
+                let slot = key_hash_slot(key.as_bytes());
+                assert_eq!(
+                    shard_index_by_slot(shards, key.as_bytes()),
+                    shard_of_slot(shards, slot)
+                );
+                let tagged = format!("{{{key}}}:other");
+                assert_eq!(key_hash_slot(tagged.as_bytes()), slot);
+                assert_eq!(
+                    shard_index_by_slot(shards, tagged.as_bytes()),
+                    shard_index_by_slot(shards, key.as_bytes())
+                );
+                assert!(shard_of_slot(shards, slot) < shards);
+            }
+        }
+        // A node's slots are spread over every shard.
+        let used: std::collections::HashSet<usize> =
+            (0..16384u16).map(|slot| shard_of_slot(64, slot)).collect();
+        assert_eq!(used.len(), 64);
     }
 }
