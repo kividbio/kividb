@@ -380,15 +380,15 @@ mod tests {
     /// entries, groups, pending entries and consumer names are part of it.
     #[test]
     fn a_streams_digest_leaves_out_its_consumers_times_and_its_order() {
-        use crate::types::{ConsumerGroup, PelEntry, StreamEntry, StreamId, StreamInner};
+        use crate::types::{ConsumerGroup, PelEntry, StreamId, StreamInner};
         use std::sync::Arc;
         let store = crate::store::new_store(1);
         let make = |names: &[&str], seen: u64, delivered: u64| {
             let mut s = StreamInner::new();
             for ms in 1..=5u64 {
-                let fields = vec![(Arc::from(&b"f"[..]), Arc::from(ms.to_string().as_bytes()))];
-                s.entries
-                    .insert_loaded(StreamId::new(ms, 0), StreamEntry { fields });
+                let fields: Vec<(Arc<[u8]>, Arc<[u8]>)> =
+                    vec![(Arc::from(&b"f"[..]), Arc::from(ms.to_string().as_bytes()))];
+                s.entries.push_tail(StreamId::new(ms, 0), &fields);
             }
             s.last_id = StreamId::new(5, 0);
             s.entries_added = 5;
