@@ -10,18 +10,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **A `WATCH` fails only when a watched key really changes: an expired key
-  `GETEX`/`GETDEL` finds and an empty `SINTERSTORE` into an absent
-  destination no longer abort the `EXEC` (#674).** Redis fails a watch only
-  on a real modification. `GETEX` or `GETDEL` of a key whose time was up
-  answered nil having written and deleted nothing, but the expiry fired the
-  watch and the `EXEC` failed; a key aging out is not a change. The same
-  held where a `SWAPDB` brought the key in already expired. An `SINTERSTORE`
-  whose intersection was empty, into a destination that was not there,
-  wrote nothing and deleted nothing, yet failed a watch on the destination.
-  Both now leave such watches standing, as Redis does; a destination that
-  exists is still emptied and fails its watch, and a write to a watched key
-  still fails it. `GETEX`/`GETDEL` read the key with the expiry that keeps a
-  replica's key for its master's `DEL` untouched, as before.
+  `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
+  `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
+  nothing (#674).** Redis fails a watch only on a real modification, and
+  only spares one whose key had already expired when it was watched
+  (`touchWatchedKey`). `GETEX` or `GETDEL` of a key whose time was up
+  answered nil having written and deleted nothing, yet failed a watch like
+  that — one a `SWAPDB` had brought in already expired, for instance: the
+  expiry now tells the watches as Redis's `deleteExpiredKeyAndPropagate`
+  does, and the command no longer marks the key as changed on top of it. A
+  watch set while the key was still alive is still failed when the key runs
+  out of time, as in Redis. An `SINTERSTORE`, `SUNIONSTORE` or `SDIFFSTORE`
+  whose result was empty, into a destination that was not there, wrote
+  nothing and deleted nothing, yet failed a watch on the destination; all
+  three now leave such a watch standing, as Redis's
+  `sunionDiffGenericCommand` does, which signals the destination only when
+  it writes it or `dbDelete` removes it. A destination that exists is still
+  emptied and fails its watch, and a write to a watched key still fails it.
+  `GETEX`/`GETDEL` read the key with the expiry that keeps a replica's key
+  for its master's `DEL` untouched, as before.
 
 - **A watch on a key that had already expired when it was watched holds
   when the key is then deleted, on a replica too (#666).** A replica keeps

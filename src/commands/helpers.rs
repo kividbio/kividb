@@ -1015,30 +1015,6 @@ pub fn take_key(
 /// 1.1.3): then the replica deletes the key, and tells no one.
 #[inline]
 pub fn delete_key_if_expired(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
-    delete_key_if(store, db, key, true)
-}
-
-/// [`delete_key_if_expired`] for `GETEX` and `GETDEL` (#674): a key whose
-/// time is up is not there for them — they answer nil, having written and
-/// deleted nothing — so its going fails no `WATCH` on it, as in Redis,
-/// where a key expiring is not a change a watch fails for.
-#[inline]
-pub fn delete_key_if_expired_keeping_watches(
-    store: &Store,
-    db: usize,
-    key: &(impl AsRef<[u8]> + ?Sized),
-) -> bool {
-    delete_key_if(store, db, key, false)
-}
-
-/// The body of both. `fails_watches` is false for `GETEX` and `GETDEL`
-/// (#674): they find the key's time up and take it as never there.
-fn delete_key_if(
-    store: &Store,
-    db: usize,
-    key: &(impl AsRef<[u8]> + ?Sized),
-    fails_watches: bool,
-) -> bool {
     // Loading, or applying the master's stream: a key's time does not make
     // it gone. The `DEL` that follows does.
     if crate::expiry::held() {
@@ -1090,9 +1066,7 @@ fn delete_key_if(
     drop(removed);
     if gone {
         crate::stats::record_expired();
-        if fails_watches {
-            crate::watch::expired(store, db, key);
-        }
+        crate::watch::expired(store, db, key);
         crate::tracking::expired(store, key);
         // Out of its indexes too, when the shard was let go of
         // (`ShardMap::remove`): it used to stay in the graph, and be found

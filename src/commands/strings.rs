@@ -709,9 +709,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 // The key's time is up: nil as for one that was never
-                // there. Nothing was written or deleted, so the watch on
-                // it holds (#674).
-                delete_key_if_expired_keeping_watches(ctx.store, *ctx.selected_db, key);
+                // there. Its going still tells the watches — a key that
+                // was alive when it was watched and runs out of time
+                // afterwards does fail the `EXEC`, as in Redis
+                // (`deleteExpiredKeyAndPropagate`) — while one already
+                // marked expired holds. `unchanged` keeps the dispatcher,
+                // which marks every key a successful write names, from
+                // marking this one on top of that (#674).
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                 crate::watch::unchanged(*ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
@@ -1281,9 +1286,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 // The key's time is up: nil as for one that was never
-                // there. Nothing was written or deleted, so the watch on
-                // it holds (#674).
-                delete_key_if_expired_keeping_watches(ctx.store, *ctx.selected_db, key);
+                // there. Its going still tells the watches — a key that
+                // was alive when it was watched and runs out of time
+                // afterwards does fail the `EXEC`, as in Redis
+                // (`deleteExpiredKeyAndPropagate`) — while one already
+                // marked expired holds. `unchanged` keeps the dispatcher,
+                // which marks every key a successful write names, from
+                // marking this one on top of that (#674).
+                delete_key_if_expired(ctx.store, *ctx.selected_db, key);
                 crate::watch::unchanged(*ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }

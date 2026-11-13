@@ -824,8 +824,10 @@ fn test_a_write_fails_only_the_watches_on_the_keys_it_changed() {
 /// there writes nothing and deletes nothing, and a watch on it holds, as in
 /// Redis: an `EXEC` fails only when a watched key was really modified
 /// (#674). A destination that is there is emptied and fails its watch, one
-/// given a result is written and fails its watch — and `SDIFFSTORE`, which
-/// #674 does not name, is left as it was.
+/// given a result is written and fails its watch — and `SDIFFSTORE` (and
+/// `SUNIONSTORE`) of an empty result into an absent destination is the
+/// same no-change, which `sunionDiffGenericCommand` does not signal
+/// either.
 #[test]
 fn test_sinterstore_that_writes_nothing_fails_no_watch() {
     let port = free_port();
@@ -877,9 +879,11 @@ fn test_sinterstore_that_writes_nothing_fails_no_watch() {
     c.cmds(&["PING"]);
     assert!(c.cmds(&["EXEC"]).is_nil(), "the written destination");
 
-    // `SDIFFSTORE` is not among the commands #674 names: an empty result
-    // into a destination that is not there still fails a watch on it, as
-    // it did before.
+    // `SDIFFSTORE` (and `SUNIONSTORE`) of an empty result into a
+    // destination that is not there is the same no-change as an empty
+    // `SINTERSTORE`: nothing is written, nothing is deleted, and the
+    // watch holds (`sunionDiffGenericCommand` signals the destination
+    // only when it writes it or `dbDelete` removes it).
     assert!(c.cmds(&["WATCH", "sd:none"]).is_ok());
     assert_eq!(
         other
@@ -888,8 +892,40 @@ fn test_sinterstore_that_writes_nothing_fails_no_watch() {
         0
     );
     assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+    let held = c.cmds(&["EXEC"]);
+    assert_eq!(
+        held.as_array().len(),
+        1,
+        "empty SDIFFSTORE into absent: {held:?}"
+    );
+
+    assert!(c.cmds(&["WATCH", "su:none"]).is_ok());
+    assert_eq!(
+        other
+            .cmds(&["SUNIONSTORE", "su:none", "si:s1", "si:s2"])
+            .as_int(),
+        2
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
     c.cmds(&["PING"]);
-    assert!(c.cmds(&["EXEC"]).is_nil(), "SDIFFSTORE left as it was");
+    assert!(c.cmds(&["EXEC"]).is_nil(), "the written union destination");
+
+    assert!(c.cmds(&["WATCH", "su:empty"]).is_ok());
+    assert_eq!(
+        other
+            .cmds(&["SUNIONSTORE", "su:empty", "su:missing"])
+            .as_int(),
+        0
+    );
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+    let held = c.cmds(&["EXEC"]);
+    assert_eq!(
+        held.as_array().len(),
+        1,
+        "empty SUNIONSTORE into absent: {held:?}"
+    );
 }
 
 /// For `SWAPDB`: a watch on a key that had expired when it was watched,
@@ -938,7 +974,9 @@ fn test_swapdb_takes_an_expired_key_as_absent() {
 
 /// `GETEX` and `GETDEL` of a key that is not there — including one a
 /// `SWAPDB` brought in already expired — write nothing and delete nothing,
-/// and a watch on it holds, as in Redis (#674). A write to a watched key
+/// and a watch on it holds, as in Redis (#674). A key that was alive when
+/// it was watched and runs out of time before they find it is really
+/// taken, and its watch fails, as in Redis. A write to a watched key
 /// still fails it.
 #[test]
 fn test_getex_and_getdel_that_change_nothing_fail_no_watch() {
@@ -989,6 +1027,27 @@ fn test_getex_and_getdel_that_change_nothing_fail_no_watch() {
         held.as_array().len(),
         1,
         "GETEX/GETDEL of an expired key: {held:?}"
+    );
+
+    // A key that was alive when it was watched and runs out of time
+    // before `GETEX` / `GETDEL` find it: the expiry takes a real key, so
+    // the watch fails, as in Redis — `deleteExpiredKeyAndPropagate`
+    // signals the key, and `touchWatchedKey` spares only a watch whose
+    // key had already expired when it was watched (Redis 8.10: `SET k v
+    // PX 100`, `WATCH k`, wait, `GETDEL k` from another client, then
+    // `MULTI` / `PING` / `EXEC` gives nil).
+    assert!(c.cmds(&["SET", "gx:ttl", "v", "PX", "50"]).is_ok());
+    assert!(c.cmds(&["SET", "gd:ttl", "v", "PX", "50"]).is_ok());
+    assert!(c.cmds(&["WATCH", "gx:ttl"]).is_ok());
+    assert!(c.cmds(&["WATCH", "gd:ttl"]).is_ok());
+    thread::sleep(Duration::from_millis(100));
+    assert!(other.cmds(&["GETEX", "gx:ttl"]).is_nil());
+    assert!(other.cmds(&["GETDEL", "gd:ttl"]).is_nil());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["PING"]).as_str(), "QUEUED");
+    assert!(
+        c.cmds(&["EXEC"]).is_nil(),
+        "alive at WATCH, expired at GETEX/GETDEL"
     );
 
     // A write to a watched key still fails it.
