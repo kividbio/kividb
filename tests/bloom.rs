@@ -902,6 +902,44 @@ fn writes_past_an_item_reach_replicas_and_the_aof_with_what_they_took() {
         let mut args = vec!["BF.MADD", "g"];
         args.extend(items.iter().map(String::as_str));
         note(&items, &m.cmd(&args));
+        // Items in no command before: two the filter has (false
+        // positives, taken) and two it has not (refused), and a duplicate
+        // of each kind after an error.
+        let has = |m: &mut Conn, want: &[u8]| {
+            (0..100_000)
+                .map(|i| format!("q{i}"))
+                .filter(|item| m.cmd(&["BF.EXISTS", "g", item]) == want)
+                .take(2)
+                .collect::<Vec<_>>()
+        };
+        let there = has(&mut m, b":1\r\n");
+        let absent = has(&mut m, b":0\r\n");
+        assert_eq!((there.len(), absent.len()), (2, 2));
+        let items: Vec<String> = [
+            &absent[0], &there[0], &absent[1], &there[0], &there[1], &absent[0],
+        ]
+        .map(String::clone)
+        .to_vec();
+        let reply = m.cmd(&[
+            "BF.INSERT",
+            "g",
+            "NOCREATE",
+            "ITEMS",
+            &items[0],
+            &items[1],
+            &items[2],
+            &items[3],
+            &items[4],
+            &items[5],
+        ]);
+        let refused = "-ERR problem inserting into filter";
+        assert_eq!(
+            entries(&reply),
+            [refused, ":0", refused, ":0", ":0", refused],
+            "{}",
+            shown(&reply)
+        );
+        note(&items, &reply);
         let items: Vec<String> = ["zz1", "i1", "zz2", "i2"].map(String::from).to_vec();
         let mut args = vec!["BF.INSERT", "g", "NOCREATE", "ITEMS"];
         args.extend(items.iter().map(String::as_str));
@@ -1638,6 +1676,77 @@ fn per_command_limit() {
         assert!(!shown(&reply).contains("ERR"), "{batch}: {}", shown(&reply));
     }
     assert_eq!(c.cmd(&["BF.INFO", "n", "FILTERS"]), b"*1\r\n:10\r\n");
+    assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
+    c.cmd(&["FLUSHALL"]);
+}
+
+/// A command of millions of items past the per-command limit: a reply for
+/// each item, those from where it stopped the limit's error, and soon.
+#[test]
+fn per_command_limit_with_millions_of_items() {
+    let _serial = serial();
+    let port = start(config());
+    let mut c = Conn::connect(port);
+    const N: usize = 2_500_000;
+    let over = "-ERR command reached the per-command limit for Bloom filters; send fewer items per command";
+    for (command, head) in [
+        ("BF.MADD", &["BF.MADD", "big"][..]),
+        ("BF.INSERT", &["BF.INSERT", "big", "ITEMS"][..]),
+        ("BF.MEXISTS", &["BF.MEXISTS", "big"][..]),
+    ] {
+        let started = Instant::now();
+        let mut out = format!("*{}\r\n", head.len() + N).into_bytes();
+        for word in head {
+            out.extend_from_slice(format!("${}\r\n{word}\r\n", word.len()).as_bytes());
+        }
+        for i in 0..N {
+            out.extend_from_slice(b"$1\r\n");
+            out.push(b'a' + (i % 26) as u8);
+            out.extend_from_slice(b"\r\n");
+        }
+        c.stream.write_all(&out).unwrap();
+        // Read line by line: every entry is one line.
+        let (mut header, mut answered, mut limited) = (None, 0usize, 0usize);
+        let mut last = String::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 1 << 20];
+        while header.is_none_or(|n| answered + limited < n) {
+            let n = c.stream.read(&mut chunk).expect("a reply");
+            assert!(n > 0, "connection closed");
+            pending.extend_from_slice(&chunk[..n]);
+            let mut at = 0;
+            while let Some(end) = pending[at..].windows(2).position(|w| w == b"\r\n") {
+                let line = std::str::from_utf8(&pending[at..at + end]).unwrap();
+                match header {
+                    None => header = Some(line.trim_start_matches('*').parse::<usize>().unwrap()),
+                    Some(_) if line == over => limited += 1,
+                    Some(_) => {
+                        assert_eq!(limited, 0, "{command}: {line} after the limit's error");
+                        assert!(matches!(line, ":0" | ":1"), "{command}: {line}");
+                        answered += 1;
+                    }
+                }
+                last = line.to_string();
+                at += end + 2;
+            }
+            pending.drain(..at);
+        }
+        assert!(pending.is_empty(), "{command}: more than the reply");
+        assert!(answered > 0, "{command}");
+        assert_eq!(last, over, "{command}");
+        if command == "BF.MEXISTS" {
+            assert_eq!(limited, 1, "{command}");
+            assert_eq!(header, Some(answered + 1), "{command}");
+        } else {
+            assert_eq!(header, Some(N), "{command}");
+            assert_eq!(answered + limited, N, "{command}");
+        }
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(60), "{command} took {took:?}");
+    }
+    for letter in 'a'..='z' {
+        assert_eq!(c.cmd(&["BF.EXISTS", "big", &letter.to_string()]), b":1\r\n");
+    }
     assert_eq!(c.cmd(&["PING"]), b"+PONG\r\n");
     c.cmd(&["FLUSHALL"]);
 }
