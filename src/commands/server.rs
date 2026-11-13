@@ -4160,6 +4160,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // (`replication::expiry_propagated_by`).
                 out.push_str(crate::replication::EXPIRY_PROPAGATED_INFO);
                 out.push_str("\r\n");
+                out.push_str(crate::replication::VSET_QUANT_INFO);
+                out.push_str("\r\n");
                 // And each hash field expired here, as an `HDEL`
                 // (`replication::field_expiry_propagated_by`). Not said under
                 // `KIVIDB_TEST_NO_FIELD_EXPIRY_CAPABILITY`, for the tests of a

@@ -13,6 +13,7 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, VSetEntry, VectorSetInner};
+use crate::vector::quant::{Quant, StoredVector};
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -38,25 +39,30 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Get or create a VectorSet at `key` with a given dimension.
-/// Returns Err(resp bytes) on type mismatch or dim mismatch, or when
-/// `asked` names a `DISTANCE` other than the existing set's.
-fn get_or_create_vset(
+/// Quantizes before inserting, so a rejected vector never leaves an empty set.
+fn add_to_vset(
     ctx: &mut Ctx,
     key: &[u8],
-    dim: usize,
-    asked: Option<crate::vector::DistanceMetric>,
-) -> Result<Arc<RwLock<VectorSetInner>>, Vec<u8>> {
-    let metric = asked
-        .clone()
-        .unwrap_or(crate::vector::DistanceMetric::Cosine);
+    element: crate::key_bytes::KeyBytes,
+    vector: Vec<f32>,
+    attrs: Option<Box<str>>,
+    asked_metric: Option<crate::vector::DistanceMetric>,
+    asked_quant: Option<Quant>,
+) -> Result<bool, Vec<u8>> {
+    let dim = vector.len();
+    let quantize = |quant: Quant, vector: Vec<f32>| {
+        StoredVector::quantize(quant, vector)
+            .map_err(|_| resp_error("ERR invalid vector specification"))
+    };
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let mut map = write_lock!(shard);
 
     match map.get(key) {
         Some(ValueRef::VectorSet(vs)) => {
-            let inner = vs.read();
+            let vs = Arc::clone(vs);
+            let mut inner = vs.write();
+            drop(map);
             if inner.dim != dim {
                 // Redis's words.
                 return Err(resp_error(&format!(
@@ -67,20 +73,44 @@ fn get_or_create_vset(
             // A `DISTANCE` the set was not made with is refused, as Redis
             // refuses a quantization the set was not made with. One not
             // given takes the set's.
-            if asked.as_ref().is_some_and(|m| *m != inner.metric) {
+            if asked_metric.as_ref().is_some_and(|m| *m != inner.metric) {
                 return Err(resp_error(
                     "ERR asked distance mismatch with existing vector set",
                 ));
             }
-            Ok(Arc::clone(vs))
+            // Unchosen sets, replays and replicated writes accept any option.
+            let strict = inner.quant_chosen && !ctx.apply_replication;
+            if strict && asked_quant.is_some_and(|q| q != inner.quant) {
+                return Err(resp_error(
+                    "ERR asked quantization mismatch with existing vector set",
+                ));
+            }
+            let stored = quantize(inner.quant, vector)?;
+            let entry = VSetEntry {
+                vector: stored,
+                attrs,
+            };
+            Ok(inner.entries.insert(element, entry).is_none())
         }
         Some(_) => Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
         None => {
-            let vs = Arc::new(RwLock::new(VectorSetInner::with_metric(dim, metric)));
-            map.insert(key, KiviDBValue::VectorSet(Arc::clone(&vs)));
-            Ok(vs)
+            let metric = asked_metric.unwrap_or(crate::vector::DistanceMetric::Cosine);
+            let mut inner = VectorSetInner::with_metric(dim, metric);
+            // Default stays f32; Redis defaults to Q8.
+            inner.quant = asked_quant.unwrap_or(Quant::F32);
+            inner.quant_chosen = asked_quant.is_some();
+            let stored = quantize(inner.quant, vector)?;
+            inner.entries.insert(
+                element,
+                VSetEntry {
+                    vector: stored,
+                    attrs,
+                },
+            );
+            map.insert(key, KiviDBValue::VectorSet(Arc::new(RwLock::new(inner))));
+            Ok(true)
         }
     }
 }
@@ -149,7 +179,8 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // Walk arguments to find vector encoding and element name
     let mut i = 2usize;
-    let mut attrs: Option<String> = None;
+    let mut attrs: Option<Box<str>> = None;
+    let mut asked_quant: Option<Quant> = None;
 
     // REDUCE projects the vectors to fewer dimensions, at random, with a
     // projection kept with the set for every query after. It was taken and
@@ -229,8 +260,6 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return bad_vector();
     }
 
-    let dim = vec.len();
-
     // Next: element name
     // Any bytes, as in Redis: a name that was not UTF-8 was taken for a
     // missing one.
@@ -252,9 +281,14 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let tok = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
         let value = cmd.get(i + 1);
         match tok.as_str() {
-            // Kept at full precision whichever is asked for: `VINFO` says
-            // so (`f32`).
-            "NOQUANT" | "Q8" | "BIN" | "CAS" => {
+            // Last one wins, as in Redis.
+            "NOQUANT" | "Q8" | "BIN" => {
+                asked_quant = Quant::parse_option(cmd[i]);
+                i += 1;
+                continue;
+            }
+            // Threading hint in Redis; no effect here.
+            "CAS" => {
                 i += 1;
                 continue;
             }
@@ -273,7 +307,7 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
             }
             "SETATTR" => {
-                attrs = value.map(|a| String::from_utf8_lossy(a).into_owned());
+                attrs = value.map(|a| String::from_utf8_lossy(a).into());
             }
             "DISTANCE" => match metric_of(value) {
                 Ok(metric) => parsed_metric = Some(metric),
@@ -284,21 +318,15 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         i += 2;
     }
 
-    // Get or create the VectorSet
-    let vs = match get_or_create_vset(ctx, &key, dim, parsed_metric) {
-        Ok(v) => v,
-        Err(e) => return Some(e),
-    };
-
-    let mut inner = vs.write();
-    let is_new = !inner.entries.contains_key(&element);
-    inner
-        .entries
-        .insert(element, VSetEntry { vector: vec, attrs });
-
-    let result = resp_integer(if is_new { 1 } else { 0 });
-
-    Some(result)
+    // Copy an older master, which stored f32 whatever was asked.
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    if ctx.apply_replication && !ctx.repl_state.master_keeps_vset_quant.load(relaxed) {
+        asked_quant = None;
+    }
+    match add_to_vset(ctx, &key, element, vec, attrs, parsed_metric, asked_quant) {
+        Ok(is_new) => Some(resp_integer(is_new as i64)),
+        Err(e) => Some(e),
+    }
 }
 
 // ── VREM ──────────────────────────────────────────────────────────────────────
@@ -415,6 +443,7 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("ERR invalid option"));
     }
     let raw = cmd.len() > 3;
+    let resp = ctx.resp;
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -423,24 +452,46 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key) {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
-            match inner.entries.get(element) {
-                None => Some(resp_null_bulk()),
-                Some(entry) => {
-                    if raw {
-                        // Return raw little-endian FP32 bytes
-                        let bytes: Vec<u8> =
-                            entry.vector.iter().flat_map(|f| f.to_le_bytes()).collect();
-                        Some(resp_bulk(&bytes))
-                    } else {
-                        // Return as array of float strings — easier to read in redis-cli
-                        let items: Vec<Vec<u8>> = entry
-                            .vector
-                            .iter()
-                            .map(|f| resp_bulk_str(&f.to_string()))
-                            .collect();
-                        Some(resp_array(items))
+            let entry = match inner.entries.get(element) {
+                None => return Some(resp_null_bulk()),
+                Some(entry) => entry,
+            };
+            if raw {
+                // Redis shape: type, stored bytes, norm, and range for int8.
+                let mut out = vec![resp_simple(entry.vector.quant().name())];
+                match &entry.vector {
+                    StoredVector::F32(v) => {
+                        let (norm, unit) = StoredVector::f32_unit(v);
+                        let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
+                        out.push(resp_bulk(&bytes));
+                        out.push(resp_double_for(resp, norm as f64));
+                    }
+                    StoredVector::Q8 {
+                        norm,
+                        range,
+                        values,
+                    } => {
+                        let bytes: Vec<u8> = values.iter().map(|&q| q as u8).collect();
+                        out.push(resp_bulk(&bytes));
+                        out.push(resp_double_for(resp, *norm as f64));
+                        out.push(resp_double_for(resp, *range as f64));
+                    }
+                    StoredVector::Bin { norm, bits } => {
+                        let bytes: Vec<u8> = bits.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        out.push(resp_bulk(&bytes));
+                        out.push(resp_double_for(resp, *norm as f64));
                     }
                 }
+                Some(resp_array(out))
+            } else {
+                // Redis replies with doubles, not strings.
+                let mut values = Vec::with_capacity(inner.dim);
+                entry.vector.to_f32(inner.dim, &mut values);
+                let items: Vec<Vec<u8>> = values
+                    .iter()
+                    .map(|&f| resp_double_for(resp, f as f64))
+                    .collect();
+                Some(resp_array(items))
             }
         }
         Some(_) => Some(resp_error(
@@ -547,7 +598,7 @@ fn vsetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     entry.attrs = if attr_str.is_empty() {
                         None
                     } else {
-                        Some(attr_str)
+                        Some(attr_str.into_boxed_str())
                     };
                     Some(resp_integer(1))
                 }
@@ -589,9 +640,8 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 resp_integer(dim as i64),
                 resp_bulk_str("vector-count"),
                 resp_integer(count as i64),
-                // Redis's name for vectors kept unquantized.
                 resp_bulk_str("quant-type"),
-                resp_bulk_str("f32"),
+                resp_bulk_str(inner.quant.name()),
                 resp_bulk_str("index-type"),
                 resp_bulk_str("FLAT"),
                 resp_bulk_str("max-level"),
@@ -623,6 +673,11 @@ fn similarity(metric: &crate::vector::DistanceMetric, distance: f32) -> f32 {
     }
 }
 
+/// Ties are common with BIN; names keep the order stable across processes.
+fn by_distance_then_name(a: &(f32, &[u8]), b: &(f32, &[u8])) -> std::cmp::Ordering {
+    a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1))
+}
+
 // VLINKS key element [WITHSCORES]
 // Returns the HNSW graph neighbours of an element.
 // Since we use brute-force, every other element is a "neighbour".
@@ -652,7 +707,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let inner = vs.read();
             let query_vec = match inner.entries.get(element) {
                 None => return Some(resp_null_bulk()),
-                Some(e) => e.vector.clone(),
+                Some(e) => &e.vector,
             };
 
             // Brute-force: find 16 nearest neighbours
@@ -662,12 +717,12 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .filter(|(name, _)| *name != element)
                 .map(|(name, entry)| {
                     (
-                        crate::vector::distance(&inner.metric, &query_vec, &entry.vector),
+                        query_vec.distance(&entry.vector, &inner.metric, inner.dim),
                         name.as_bytes(),
                     )
                 })
                 .collect();
-            scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            scored.sort_unstable_by(by_distance_then_name);
             scored.truncate(16);
 
             // VLINKS returns an array of arrays (one per HNSW layer).
@@ -1008,21 +1063,34 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let inner = vs.read();
 
-    // Resolve ELE query — look up from the VectorSet
-    let query_vec: Vec<f32> = match query_vec {
-        Ok(v) => v,
+    // Quantize the query like the set, as Redis does, so scores match.
+    let given;
+    let query: &StoredVector = match query_vec {
+        Ok(v) => {
+            if v.len() != inner.dim {
+                return Some(resp_error(&format!(
+                    "ERR Vector dimension mismatch - got {} but set has {}",
+                    v.len(),
+                    inner.dim
+                )));
+            }
+            given = match StoredVector::quantize(inner.quant, v) {
+                Ok(q) => q,
+                Err(_) => return Some(resp_error("ERR invalid vector specification")),
+            };
+            &given
+        }
         Err(elem_name) => match inner.entries.get(elem_name.as_slice()) {
-            Some(e) => e.vector.clone(),
+            Some(e) => &e.vector,
             None => return Some(resp_error("ERR element not found in vector set")),
         },
     };
 
-    // Brute-force cosine similarity search
+    // Brute-force search
     // Using select_nth_unstable: O(n) average, same trick as FT flat search
     let mut scored: Vec<(f32, &[u8])> = inner
         .entries
         .iter()
-        .filter(|(_, entry)| entry.vector.len() == query_vec.len())
         .filter(|(_, entry)| {
             filter
                 .as_ref()
@@ -1030,17 +1098,17 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
         })
         .map(|(name, entry)| {
             (
-                crate::vector::distance(&inner.metric, &query_vec, &entry.vector),
+                query.distance(&entry.vector, &inner.metric, inner.dim),
                 name.as_bytes(),
             )
         })
         .collect();
 
     if scored.len() > count {
-        scored.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0));
+        scored.select_nth_unstable_by(count, by_distance_then_name);
         scored.truncate(count);
     }
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    scored.sort_unstable_by(by_distance_then_name);
 
     // Build response
     // Redis VSIM returns: [element, [score?, attribs?], ...]

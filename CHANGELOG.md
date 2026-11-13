@@ -7,6 +7,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Vector sets store vectors quantized when `VADD` asks for it (#697).**
+  `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
+  bit per component, as Redis 8 does: about 3.6-3.8x and 15-22x less memory
+  than f32 at 768-1536 dimensions. Scores, `VEMB` and `VEMB RAW` match
+  Redis 8.10.3; Q8 recall equals Redis's exact search, and BIN recall is
+  within 0.004 of it. Q8 and BIN refuse infinite components. A set made
+  without an option stays f32 (Redis's default is `Q8`) and, as in 1.2,
+  accepts any option later. Snapshots of quantized sets use a new type tag,
+  which 1.2 refuses rather than misreads; sets made without an option are
+  saved as before, and one whose vector does not have the set's dimension
+  is refused. A replica of a 1.2 master ignores the options as its master
+  does. Upgrade replicas before masters. `VEMB` now replies with doubles
+  and `VEMB RAW` with Redis's array; `VSIM` refuses a query of the wrong
+  dimension, and `VSIM` and `VLINKS` order equal scores by element name.
+  `MEMORY USAGE` of a vector set counts the bytes it stores instead of
+  estimating f32.
+
+  **Upgrading with `appendonly` on:** 1.3 replaying a 1.2 log applies the
+  `Q8` and `BIN` options 1.2 ignored to every write that no successful save
+  covers, so those sets would no longer match a 1.2 replica or snapshot.
+  The log does not say which release wrote it. Before upgrading, make sure
+  a save covering the last write succeeded: stop 1.2 with `SHUTDOWN` (not
+  `NOSAVE`) and check that it logged `Goodbye.` after `writing final
+  snapshot`, not `Final snapshot failed` (a replica in the middle of a full
+  sync skips the save), or stop the writes and run `SAVE`, which must
+  answer `OK`. After a crash, restart once on 1.2 and do the same.
+
 ### Fixed
 
 - **`MEMORY USAGE` of a hash with field TTLs no longer counts heap bytes

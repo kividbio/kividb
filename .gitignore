@@ -7,6 +7,8 @@
 *.txt
 ./*.py
 *.kdb
+# Test fixtures are committed.
+!tests/fixtures/*.kdb
 # What a server run in the repository writes beside its dump.kdb.
 dump.kdb.*
 *.pyc

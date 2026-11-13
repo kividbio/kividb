@@ -134,6 +134,8 @@ const TAG_TIMESERIES_V2: u8 = 14;
 /// `TAG_TIMESERIES_V2` followed by the series it is a compaction of. Written
 /// only for a compaction, so other series stay readable by older builds.
 const TAG_TIMESERIES_V3: u8 = 15;
+/// New tag so older builds reject quantized sets instead of misreading them.
+const TAG_VECTORSET_V2: u8 = 16;
 
 /// Whether `byte` is a value's type tag: what follows the empty key as 1.2.0
 /// wrote it ([`read_image`]).
@@ -312,6 +314,24 @@ impl Write for PacedFile {
 fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     w.write_all(&(data.len() as u32).to_le_bytes())?;
     w.write_all(data)
+}
+
+/// `buf` is reused across vectors to avoid one allocation per vector.
+fn write_f32s(w: &mut impl Write, v: &[f32], buf: &mut Vec<u8>) -> io::Result<()> {
+    buf.clear();
+    buf.extend(v.iter().flat_map(|f| f.to_le_bytes()));
+    w.write_all(buf)
+}
+
+/// Checked multiply so a corrupt length errors instead of overflowing.
+fn read_items(r: &mut impl Read, count: usize, size: usize) -> io::Result<Vec<u8>> {
+    let len = count.checked_mul(size).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a vector set's vector is too long",
+        )
+    })?;
+    read_exactly(r, len)
 }
 
 fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
@@ -740,8 +760,13 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
         }
 
         ValueRef::VectorSet(arc) => {
-            w.write_all(&[TAG_VECTORSET])?;
             let inner = arc.read();
+            let legacy = !inner.quant_chosen && inner.quant == crate::vector::quant::Quant::F32;
+            w.write_all(&[if legacy {
+                TAG_VECTORSET
+            } else {
+                TAG_VECTORSET_V2
+            }])?;
             w.write_all(&(inner.dim as u32).to_le_bytes())?;
 
             // Persist metric as a single byte
@@ -751,18 +776,52 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
                 crate::vector::DistanceMetric::InnerProduct => 2,
             };
             w.write_all(&[metric_byte])?;
+            if !legacy {
+                w.write_all(&[inner.quant.to_byte()])?;
+            }
 
             w.write_all(&(inner.entries.len() as u32).to_le_bytes())?;
 
+            let mut floats = Vec::new();
+            let mut buf = Vec::new();
             for (name, entry) in inner.entries.iter() {
                 // Element name
                 write_bytes(w, name.as_bytes())?;
 
-                // Vector: write count then raw f32 LE bytes
-                let vec_len = entry.vector.len() as u32;
-                w.write_all(&vec_len.to_le_bytes())?;
-                for f in &entry.vector {
-                    w.write_all(&f.to_le_bytes())?;
+                use crate::vector::quant::StoredVector;
+                match (&entry.vector, legacy) {
+                    // Legacy layout keeps a per-vector length.
+                    (StoredVector::F32(v), true) => {
+                        w.write_all(&(v.len() as u32).to_le_bytes())?;
+                        write_f32s(w, v, &mut buf)?;
+                    }
+                    (StoredVector::F32(v), false) => write_f32s(w, v, &mut buf)?,
+                    (
+                        StoredVector::Q8 {
+                            norm,
+                            range,
+                            values,
+                        },
+                        false,
+                    ) => {
+                        w.write_all(&norm.to_le_bytes())?;
+                        w.write_all(&range.to_le_bytes())?;
+                        buf.clear();
+                        buf.extend(values.iter().map(|&q| q as u8));
+                        w.write_all(&buf)?;
+                    }
+                    (StoredVector::Bin { norm, bits }, false) => {
+                        w.write_all(&norm.to_le_bytes())?;
+                        for word in bits.iter() {
+                            w.write_all(&word.to_le_bytes())?;
+                        }
+                    }
+                    // Unreachable via commands; fall back to floats.
+                    (other, true) => {
+                        other.to_f32(inner.dim, &mut floats);
+                        w.write_all(&(floats.len() as u32).to_le_bytes())?;
+                        write_f32s(w, &floats, &mut buf)?;
+                    }
                 }
 
                 // Optional attrs JSON
@@ -2299,7 +2358,8 @@ fn read_image(
                     }
                     KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
                 }
-                TAG_VECTORSET => {
+                TAG_VECTORSET | TAG_VECTORSET_V2 => {
+                    use crate::vector::quant::{Quant, StoredVector};
                     let mut dim_buf = [0u8; 4];
                     r.read_exact(&mut dim_buf)?;
                     let dim = u32::from_le_bytes(dim_buf) as usize;
@@ -2313,34 +2373,101 @@ fn read_image(
                         _ => crate::vector::DistanceMetric::Cosine,
                     };
 
+                    let legacy = tag[0] == TAG_VECTORSET;
+                    let quant = if legacy {
+                        Quant::F32
+                    } else {
+                        let mut quant_buf = [0u8];
+                        r.read_exact(&mut quant_buf)?;
+                        Quant::from_byte(quant_buf[0]).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unknown vector set quantization {}", quant_buf[0]),
+                            )
+                        })?
+                    };
+
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
 
                     let mut vs = VectorSetInner::with_metric(dim, metric);
+                    vs.quant = quant;
+                    vs.quant_chosen = !legacy;
+                    vs.entries.reserve(hint(count));
+
+                    let f32s = |bytes: Vec<u8>| -> Box<[f32]> {
+                        bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_le_bytes(*b))
+                            .collect()
+                    };
+                    let read_f32 = |r: &mut _| -> io::Result<f32> {
+                        let mut buf = [0u8; 4];
+                        Read::read_exact(r, &mut buf)?;
+                        Ok(f32::from_le_bytes(buf))
+                    };
 
                     for _ in 0..count {
                         // Element name
                         // Any bytes, as in Redis.
                         let name = crate::key_bytes::KeyBytes::from(read_bytes(&mut r)?);
 
-                        // Vector floats
-                        let mut vlen_buf = [0u8; 4];
-                        r.read_exact(&mut vlen_buf)?;
-                        let vec_len = u32::from_le_bytes(vlen_buf) as usize;
-                        let mut vector = Vec::with_capacity(hint(vec_len));
-                        for _ in 0..vec_len {
-                            let mut f_buf = [0u8; 4];
-                            r.read_exact(&mut f_buf)?;
-                            vector.push(f32::from_le_bytes(f_buf));
-                        }
+                        let vector = match quant {
+                            Quant::F32 => {
+                                let len = if legacy {
+                                    let mut vlen_buf = [0u8; 4];
+                                    r.read_exact(&mut vlen_buf)?;
+                                    let len = u32::from_le_bytes(vlen_buf) as usize;
+                                    // VADD always kept this equal; kernels would truncate.
+                                    if len != dim {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "a vector set's vector has {len} components, not {dim}"
+                                            ),
+                                        ));
+                                    }
+                                    len
+                                } else {
+                                    dim
+                                };
+                                StoredVector::F32(f32s(read_items(&mut r, len, 4)?))
+                            }
+                            Quant::Q8 => {
+                                let norm = read_f32(&mut r)?;
+                                let range = read_f32(&mut r)?;
+                                let values = read_items(&mut r, dim, 1)?
+                                    .into_iter()
+                                    .map(|b| b as i8)
+                                    .collect();
+                                StoredVector::Q8 {
+                                    norm,
+                                    range,
+                                    values,
+                                }
+                            }
+                            Quant::Bin => {
+                                let norm = read_f32(&mut r)?;
+                                let words = crate::vector::quant::bin_words(dim);
+                                let bits = read_items(&mut r, words, 8)?
+                                    .as_chunks::<8>()
+                                    .0
+                                    .iter()
+                                    .map(|b| u64::from_le_bytes(*b))
+                                    .collect();
+                                StoredVector::Bin { norm, bits }
+                            }
+                        };
 
                         // Optional attrs
                         let mut has_attrs = [0u8];
                         r.read_exact(&mut has_attrs)?;
                         let attrs = if has_attrs[0] == 1 {
                             let attr_bytes = read_bytes(&mut r)?;
-                            Some(String::from_utf8_lossy(&attr_bytes).into_owned())
+                            Some(String::from_utf8_lossy(&attr_bytes).into())
                         } else {
                             None
                         };
@@ -5783,7 +5910,7 @@ mod dump_payload_tests {
         vs.entries.insert(
             "a".into(),
             VSetEntry {
-                vector: vec![1.0, 2.0],
+                vector: vec![1.0, 2.0].into(),
                 attrs: None,
             },
         );

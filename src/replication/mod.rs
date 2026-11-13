@@ -72,6 +72,8 @@ pub struct ReplState {
     /// documents on the master. Set at each connection to a master, from the
     /// release it says it is (`INFO server`); see [`dd_deleted_by`].
     pub master_dd_deletes: AtomicBool,
+    /// False while following a KiviDB master that ignores `VADD` quantization.
+    pub master_keeps_vset_quant: AtomicBool,
     /// Whether this replica's master sends a `DEL` (or `UNLINK`) for every
     /// key it expires, as KiviDB does since 1.1.3 and Redis always has. Then
     /// the replica deletes no expired key itself and waits for that `DEL`
@@ -504,6 +506,7 @@ impl ReplState {
             repl_stream_last_db: AtomicU64::new(u64::MAX),
             several_databases: AtomicBool::new(false),
             master_dd_deletes: AtomicBool::new(false),
+            master_keeps_vset_quant: AtomicBool::new(true),
             master_propagates_expiry: AtomicBool::new(true),
             expiry_sweep_owed: AtomicBool::new(true),
             master_propagates_field_expiry: AtomicBool::new(true),
@@ -2262,6 +2265,25 @@ pub fn expiry_propagated_by(info: Option<&str>) -> bool {
     }
 }
 
+/// Says this master stores the quantization `VADD` asks for.
+pub const VSET_QUANT_INFO: &str = "kividb_vset_quantization:1";
+
+/// KiviDB masters without the line ignored `VADD` quantization options.
+pub fn vset_quant_kept_by(info: Option<&str>) -> bool {
+    let Some(info) = info else {
+        return true;
+    };
+    let mut kividb = false;
+    for line in info.lines() {
+        let line = line.trim();
+        if line == VSET_QUANT_INFO {
+            return true;
+        }
+        kividb |= line.starts_with("kividb_version:");
+    }
+    !kividb
+}
+
 /// The line of `INFO server` by which a KiviDB master says it sends an
 /// `HDEL` (or a `DEL`) for every hash field it expires.
 pub const FIELD_EXPIRY_PROPAGATED_INFO: &str = "kividb_expired_fields_propagated:1";
@@ -2355,6 +2377,25 @@ mod expiry_version_tests {
         assert!(expiry_propagated_by(Some(&kividb("garbage"))));
         assert_eq!(uptime_in(redis), Some(5));
         assert_eq!(uptime_in(&kividb("1.1.2")), None);
+    }
+}
+
+#[cfg(test)]
+mod vset_quant_version_tests {
+    use super::{VSET_QUANT_INFO, vset_quant_kept_by};
+
+    #[test]
+    fn only_older_kividb_masters_drop_quantization() {
+        let old = "# Server\r\nredis_version:8.10.0\r\nkividb_version:1.2.1\r\n";
+        assert!(!vset_quant_kept_by(Some(old)));
+        assert!(vset_quant_kept_by(Some(&format!(
+            "{old}{VSET_QUANT_INFO}\r\n"
+        ))));
+        // Redis keeps what it is asked for; no answer is taken the same way.
+        assert!(vset_quant_kept_by(Some(
+            "# Server\r\nredis_version:8.10.3\r\n"
+        )));
+        assert!(vset_quant_kept_by(None));
     }
 }
 

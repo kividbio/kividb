@@ -669,6 +669,10 @@ async fn run_replication_session(
             .find_map(|line| line.strip_prefix("kividb_version:"))
             .map(|version| version.trim().to_string())
     });
+    repl_state.master_keeps_vset_quant.store(
+        crate::replication::vset_quant_kept_by(master_info.as_deref()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     repl_state.master_dd_deletes.store(
         master_version
             .as_deref()
