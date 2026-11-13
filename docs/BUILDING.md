@@ -23,7 +23,8 @@ commands are available in builds with `--features lua` (see
 feature too (`--features tls`).
 
 Docker images, release tarballs and `cargo install` offer every variant; the apt and dnf
-packages and Homebrew install the default one. See [INSTALL.md](INSTALL.md).
+packages and Homebrew offer the default one (`kividb`) and, from 1.3.0, the full one
+(`kividb-full`). See [INSTALL.md](INSTALL.md).
 
 ## Building from source
 

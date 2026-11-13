@@ -322,10 +322,60 @@ pub(crate) const REDIS_VERSION: &str = "8.10.0";
 #[cfg(not(feature = "lua"))]
 const NO_LUA: &str = concat!(
     "ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the ",
-    "lua or full variant (Docker image kividb/kividb:v",
+    "lua or full variant (the kividb-full apt/dnf package, Docker image kividb/kividb:v",
     env!("CARGO_PKG_VERSION"),
     "-lua, or a kividb-lua release file)"
 );
+
+/// `FUNCTION` in a build without Lua. `FUNCTION FLUSH` drops the libraries
+/// it kept from the data it loaded (`snapshot::flush_kept_functions`), so
+/// they can be got rid of here too, from a client, the master or the AOF;
+/// every other subcommand is refused. One refused from the master or the
+/// AOF leaves this server with other libraries than the master had, so it
+/// is logged, once for each: a replica without Lua keeps those of its last
+/// full sync.
+#[cfg(not(feature = "lua"))]
+fn function_without_lua(ctx: &Ctx) -> Vec<u8> {
+    use std::sync::atomic::AtomicBool;
+    let sub = ctx.cmd.get(1).copied().unwrap_or_default();
+    if sub.eq_ignore_ascii_case(b"FLUSH") {
+        // As Redis answers these.
+        match ctx.cmd.len() {
+            2 => {}
+            3 if ctx.cmd[2].eq_ignore_ascii_case(b"SYNC")
+                || ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC") => {}
+            3 => return resp_error("ERR FUNCTION FLUSH only supports SYNC|ASYNC option"),
+            _ => {
+                return resp_error(
+                    "ERR unknown subcommand or wrong number of arguments for 'flush'. Try \
+                     FUNCTION HELP.",
+                );
+            }
+        }
+        crate::snapshot::flush_kept_functions();
+        return resp_simple("OK");
+    }
+    if ctx.apply_replication {
+        static FROM_MASTER: AtomicBool = AtomicBool::new(false);
+        static FROM_AOF: AtomicBool = AtomicBool::new(false);
+        // The AOF is replayed with the dataset counted as loading; the
+        // master's stream is applied once it is loaded.
+        let (source, warned) = if crate::expiry::loading() {
+            ("the AOF", &FROM_AOF)
+        } else {
+            ("the master", &FROM_MASTER)
+        };
+        if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log_warn!(
+                "FUNCTION {} from {source} was refused: this build has no Lua, so its function \
+                 libraries are not those the master has (those of the data it loaded, if any). \
+                 Run the lua or full build on replicas of a master that uses them",
+                String::from_utf8_lossy(sub).to_ascii_uppercase()
+            );
+        }
+    }
+    resp_error(NO_LUA)
+}
 
 /// A setting's own name, for one Redis also takes under an older one.
 fn config_name(name: &str) -> &str {
@@ -4253,6 +4303,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
                 out.push_str(&format!("arch_bits:{}\r\n", usize::BITS));
                 out.push_str(&format!("kividb_version:{}\r\n", env!("CARGO_PKG_VERSION")));
+                // Which of the release's builds: default, lua, tls or full
+                // (the `kividb` and `kividb-full` packages, #732).
+                out.push_str(&format!(
+                    "kividb_variant:{}\r\n",
+                    crate::update_check::variant()
+                ));
                 // That a replica of this server need not expire keys
                 // itself: each one expired here is sent to it as a `DEL`
                 // (`replication::expiry_propagated_by`).
@@ -6397,7 +6453,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(NO_LUA))
+                Some(function_without_lua(ctx))
             }
         }
 
