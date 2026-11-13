@@ -379,7 +379,9 @@ fn parse_decimal_in_words(neg: bool, int: &[u8], frac: &[u8], exp10: i64) -> Opt
         let power = *POW10.get(usize::try_from(exp10).ok()?)?;
         round_u128(neg, u128::from(digits).checked_mul(power)?, 0, false)
     } else {
-        let power = *POW10.get(usize::try_from(-exp10).ok()?).filter(|_| exp10 >= -18)?;
+        let power = *POW10
+            .get(usize::try_from(-exp10).ok()?)
+            .filter(|_| exp10 >= -18)?;
         let shift = u128::from(digits).leading_zeros();
         let dividend = u128::from(digits) << shift;
         round_u128(
@@ -770,7 +772,6 @@ pub(crate) const ZERO: Parsed = Parsed::Finite(LongDouble::ZERO);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fmt::Write as _;
 
     fn incr(current: &str, by: &str) -> String {
         let a = LongDouble::parse(current.as_bytes()).expect(current);
@@ -950,12 +951,13 @@ mod tests {
             ) else {
                 panic!("{other}");
             };
-            if long.mant != 0 && other.mant != 0 {
-                if let Some(sum) = long.add_in_words(other) {
-                    let slow = long.add_long(other).unwrap();
-                    assert_eq!(canonical(sum), canonical(slow), "{text} + {other:?}");
-                    short_sums += 1;
-                }
+            if long.mant != 0
+                && other.mant != 0
+                && let Some(sum) = long.add_in_words(other)
+            {
+                let slow = long.add_long(other).unwrap();
+                assert_eq!(canonical(sum), canonical(slow), "{text} + {other:?}");
+                short_sums += 1;
             }
         }
         // Most of them take the short way.
@@ -985,7 +987,10 @@ mod tests {
             else {
                 panic!("{line:?}");
             };
-            let got = match (LongDouble::parse(a.as_bytes()), LongDouble::parse(b.as_bytes())) {
+            let got = match (
+                LongDouble::parse(a.as_bytes()),
+                LongDouble::parse(b.as_bytes()),
+            ) {
                 (Some(a), Some(b)) => match increment(a, b) {
                     Increment::Sum(sum) => sum,
                     Increment::NotFinite => "NOTFINITE".to_string(),
