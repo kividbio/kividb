@@ -339,8 +339,29 @@ pub fn connect_node(
     Ok((Box::new(tcp), handle))
 }
 
-pub trait ReadWrite: std::io::Read + std::io::Write + Send {}
-impl<T: std::io::Read + std::io::Write + Send> ReadWrite for T {}
+/// A blocking stream to another node: a plain socket, or TLS over one.
+pub trait ReadWrite: std::io::Read + std::io::Write + Send {
+    /// Whether bytes already taken off the socket wait in the stream itself
+    /// to be read: with TLS, plaintext rustls has decrypted, or records it
+    /// has received and not yet processed. Also when the peer has closed
+    /// the TLS session, or what it sent cannot be processed. A connection
+    /// kept for reuse must have none (`cluster::migrate_conns`).
+    fn holds_unread(&mut self) -> bool {
+        false
+    }
+}
+
+impl ReadWrite for std::net::TcpStream {}
+
+#[cfg(feature = "tls")]
+impl ReadWrite for imp::SyncTls {
+    fn holds_unread(&mut self) -> bool {
+        match self.conn.process_new_packets() {
+            Ok(state) => state.plaintext_bytes_to_read() > 0 || state.peer_has_closed(),
+            Err(_) => true,
+        }
+    }
+}
 
 /// An async stream to another node: the bus, or a replica's link.
 pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}

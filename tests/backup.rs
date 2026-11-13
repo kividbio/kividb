@@ -2345,6 +2345,171 @@ fn the_empty_key_can_be_migrated() {
     assert_eq!(reply.s(), "NOKEY");
 }
 
+// ── MIGRATE's connections ─────────────────────────────────────────────────────
+//
+// MIGRATE keeps its connection to a target for the next call, as Redis does,
+// rather than dialling one per call and leaving a socket in TIME_WAIT per
+// call on the source (#726).
+
+/// The connections `server` has accepted so far.
+fn connections_received(c: &mut Conn) -> i64 {
+    let info = c.cmd(&["INFO", "stats"]);
+    info.s()
+        .lines()
+        .find_map(|l| l.strip_prefix("total_connections_received:"))
+        .expect("total_connections_received")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `MIGRATE` of `key` from `c` to the server on `port`, with `extra` after
+/// the timeout.
+fn migrate(c: &mut Conn, port: &str, key: &str, db: &str, extra: &[&str]) -> V {
+    let mut args = vec!["MIGRATE", "127.0.0.1", port, key, db, "5000"];
+    args.extend_from_slice(extra);
+    c.cmd(&args)
+}
+
+/// Two thousand `MIGRATE`s of one key each to one target go over one
+/// connection: they each opened one. Going from one database to another
+/// selects the other on it, and every key lands where it was sent.
+#[test]
+fn many_migrates_to_one_target_go_over_one_connection() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    let before = connections_received(&mut t);
+    for i in 0..2000 {
+        let key = format!("k{i}");
+        assert!(c.cmd(&["SET", &key, "v"]).ok());
+        let reply = migrate(&mut c, &port, &key, "0", &[]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    let opened = connections_received(&mut t) - before;
+    assert!(opened <= 3, "{opened} connections for 2000 MIGRATEs");
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 0);
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 2000);
+
+    // Database 3, then 0 again, on the same connection.
+    for (key, db) in [("in3", "3"), ("also3", "3"), ("in0", "0")] {
+        assert!(c.cmd(&["SET", key, db]).ok());
+        let reply = migrate(&mut c, &port, key, db, &[]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(connections_received(&mut t) - before, opened);
+    assert_eq!(t.cmd(&["GET", "in0"]).s(), "0");
+    assert!(t.cmd(&["SELECT", "3"]).ok());
+    assert_eq!(t.cmd(&["GET", "in3"]).s(), "3");
+    assert_eq!(t.cmd(&["GET", "also3"]).s(), "3");
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 2);
+}
+
+/// A kept connection the target has closed since (`CLIENT KILL`) is not
+/// used: the next `MIGRATE` dials a new one, and goes through.
+#[test]
+fn a_migrate_after_the_target_killed_its_connection_goes_through() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    assert!(c.cmd(&["SET", "first", "1"]).ok());
+    assert!(migrate(&mut c, &port, "first", "0", &[]).ok());
+    let killed = t.cmd(&["CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes"]);
+    assert!(killed.i() >= 1, "the MIGRATE connection: {killed:?}");
+    std::thread::sleep(Duration::from_millis(100));
+    let before = connections_received(&mut t);
+    assert!(c.cmd(&["SET", "second", "2"]).ok());
+    let reply = migrate(&mut c, &port, "second", "0", &[]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(connections_received(&mut t) - before, 1);
+    assert_eq!(t.cmd(&["GET", "second"]).s(), "2");
+    assert_eq!(c.cmd(&["EXISTS", "second"]).i(), 0);
+}
+
+/// A connection is kept for the `AUTH` or `AUTH2` it was opened with: other
+/// credentials open another. A wrong password fails the call, and keeps
+/// the key here.
+#[test]
+fn migrate_keeps_a_connection_per_login() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    assert!(t.cmd(&["CONFIG", "SET", "requirepass", "pw"]).ok());
+    assert!(t.cmd(&["AUTH", "pw"]).ok());
+    let port = to.port.to_string();
+    let before = connections_received(&mut t);
+    let opened = |t: &mut Conn| connections_received(t) - before;
+
+    for key in ["a", "b"] {
+        assert!(c.cmd(&["SET", key, "v"]).ok());
+        let reply = migrate(&mut c, &port, key, "0", &["AUTH", "pw"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(opened(&mut t), 1);
+    for key in ["c", "d"] {
+        assert!(c.cmd(&["SET", key, "v"]).ok());
+        let reply = migrate(&mut c, &port, key, "0", &["AUTH2", "default", "pw"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(opened(&mut t), 2);
+
+    assert!(c.cmd(&["SET", "e", "v"]).ok());
+    let reply = migrate(&mut c, &port, "e", "0", &["AUTH", "wrong"]);
+    assert!(
+        reply.is_err() && reply.s().contains("AUTH"),
+        "MIGRATE: {reply:?}"
+    );
+    assert_eq!(c.cmd(&["GET", "e"]).s(), "v");
+    assert_eq!(opened(&mut t), 3);
+    // Without credentials: refused by the target, on a new connection.
+    let reply = migrate(&mut c, &port, "e", "0", &[]);
+    assert!(reply.is_err(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["GET", "e"]).s(), "v");
+    assert_eq!(opened(&mut t), 4);
+    // The first login's connection is still kept.
+    let reply = migrate(&mut c, &port, "e", "0", &["AUTH", "pw"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(opened(&mut t), 4);
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 5);
+}
+
+/// A `RESTORE` refused by the target (`BUSYKEY`, without `REPLACE`) fails
+/// the call and keeps the key here, as before. Its reply was whole, so the
+/// connection is kept, and the next call goes over it.
+#[test]
+fn a_migrate_whose_restore_fails_keeps_its_key() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    assert!(t.cmd(&["SET", "busy", "there"]).ok());
+    assert!(c.cmd(&["SET", "busy", "here"]).ok());
+    assert!(c.cmd(&["SET", "free", "here"]).ok());
+    let before = connections_received(&mut t);
+
+    let reply = migrate(&mut c, &port, "busy", "0", &[]);
+    assert!(
+        reply.is_err() && reply.s().contains("BUSYKEY"),
+        "MIGRATE: {reply:?}"
+    );
+    assert_eq!(c.cmd(&["GET", "busy"]).s(), "here");
+    assert_eq!(t.cmd(&["GET", "busy"]).s(), "there");
+
+    let reply = migrate(&mut c, &port, "free", "0", &[]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    let reply = migrate(&mut c, &port, "busy", "0", &["REPLACE"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(t.cmd(&["GET", "busy"]).s(), "here");
+    assert_eq!(c.cmd(&["EXISTS", "busy", "free"]).i(), 0);
+    assert_eq!(connections_received(&mut t) - before, 1);
+}
+
 /// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
 /// ends a database: `databases` databases, the empty key in `at`, and every
 /// key with a time to live.

@@ -117,6 +117,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or a renamed key in neither place. Every write of more than one key is
   now one step.
 
+- **`MIGRATE` no longer opens a new connection for every call (#726).**
+  It dialled its target each time and closed the connection after the
+  replies, so a resharding, which sends one `MIGRATE` per batch of keys,
+  left a socket in TIME_WAIT on the source node for every batch. As in
+  Redis, the connection is now kept for 10 seconds and reused by the next
+  `MIGRATE` to the same target with the same `AUTH`/`AUTH2` and TLS setup,
+  at most 16 kept in all; it is closed on any error or timeout, and nothing
+  is ever sent on it twice. A kept connection stays with the address its
+  host name had when it was opened: if DNS moves the target during a
+  resharding, `MIGRATE`s keep going to the old address until the connection
+  has been idle for 10 seconds, as in Redis.
+
 - **An index created since the last dump is whole after a restart that
   replays the AOF (#590).** The walk that indexes the documents once the
   replay is done went by the dump's indexes when the dump had any, so an
