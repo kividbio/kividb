@@ -13,10 +13,12 @@
 //! Rust has no such type, so here it is done by hand: a value is a 64-bit
 //! integer times a power of two, and reading, adding and writing are exact
 //! on big integers and rounded once, to nearest, ties to even, as the x87
-//! and glibc round. Nothing here is fast, and nothing needs to be: it is two
-//! commands, and a usual number is a few machine words.
+//! and glibc round. The usual numbers, of up to 19 digits and not far from
+//! 1, are read, added and written in 64- and 128-bit words, with the same
+//! rounding; anything else goes the long way, on big integers.
 
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 
 /// The exponent of the lowest bit of the smallest subnormal: 2^-16445.
 const MIN_EXP: i64 = -16445;
@@ -27,6 +29,18 @@ const MAX_TOP: i64 = 16384;
 const MAX_CHARS: usize = 5 * 1024;
 /// The digits written after the point (`%.17Lf`).
 const DECIMALS: u32 = 17;
+/// 10^DECIMALS, under 2^57.
+const SCALE: u128 = 10u128.pow(DECIMALS);
+/// 10^n, n up to 38: every power of ten a `u128` holds.
+const POW10: [u128; 39] = {
+    let mut table = [1u128; 39];
+    let mut at = 1;
+    while at < table.len() {
+        table[at] = table[at - 1] * 10;
+        at += 1;
+    }
+    table
+};
 
 /// A finite value: `-1^neg × mant × 2^exp`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -87,6 +101,14 @@ impl LongDouble {
         if other.mant == 0 {
             return Some(self);
         }
+        match self.add_in_words(other) {
+            Some(sum) => Some(sum),
+            None => self.add_long(other),
+        }
+    }
+
+    /// [`LongDouble::add`] on big integers, for any two values but zero.
+    fn add_long(self, other: LongDouble) -> Option<LongDouble> {
         let exp = self.exp.min(other.exp);
         let a = Big::from_u64(self.mant).shl((self.exp - exp) as usize);
         let b = Big::from_u64(other.mant).shl((other.exp - exp) as usize);
@@ -108,10 +130,44 @@ impl LongDouble {
         }
     }
 
+    /// [`LongDouble::add`] of two values whose lowest bits are no more than
+    /// 63 apart, both lined up in a `u128`, and far from the ends of the
+    /// range: `None` for the others. Neither is zero.
+    fn add_in_words(self, other: LongDouble) -> Option<LongDouble> {
+        let exp = self.exp.min(other.exp);
+        let (a_shift, b_shift) = (self.exp - exp, other.exp - exp);
+        // The sum is under 2^128, and rounded to 64 bits it is a normal
+        // value, nowhere near infinite (a subnormal one is all there is
+        // below `exp`, which a value read has already).
+        if a_shift > 63 || b_shift > 63 || exp > MAX_TOP - 200 {
+            return None;
+        }
+        let a = u128::from(self.mant) << a_shift;
+        let b = u128::from(other.mant) << b_shift;
+        let (neg, sum) = if self.neg == other.neg {
+            (self.neg, a + b)
+        } else {
+            match a.cmp(&b) {
+                Ordering::Equal => return Some(LongDouble::ZERO),
+                Ordering::Greater => (self.neg, a - b),
+                Ordering::Less => (other.neg, b - a),
+            }
+        };
+        Some(round_u128(neg, sum, exp, false))
+    }
+
     /// As Redis writes it (`ld2string`, `LD_STR_HUMAN`): `%.17Lf`, the zeros
     /// at the end of the fraction and then a point at the end left out, and
     /// `-0` as `0`.
     pub(crate) fn to_redis_string(self) -> String {
+        match self.to_redis_string_in_words() {
+            Some(text) => text,
+            None => self.to_redis_string_long(),
+        }
+    }
+
+    /// [`LongDouble::to_redis_string`] on big integers, for any value.
+    fn to_redis_string_long(self) -> String {
         // The value times 10^17, rounded to an integer, ties to even.
         let scaled = Big::from_u64(self.mant).mul_pow10(DECIMALS);
         let whole = if self.exp >= 0 {
@@ -141,6 +197,58 @@ impl LongDouble {
             out.push_str(frac);
         }
         out
+    }
+
+    /// [`LongDouble::to_redis_string`] of a value whose 10^17 times fits in
+    /// a `u128` (under 3.4e21), or `None`.
+    fn to_redis_string_in_words(self) -> Option<String> {
+        let whole = if self.exp >= 0 {
+            let bits = i64::from(64 - self.mant.leading_zeros());
+            // 10^17 < 2^57.
+            if bits + self.exp + 57 > 128 {
+                return None;
+            }
+            (u128::from(self.mant) << self.exp) * SCALE
+        } else {
+            // Under 2^121, so under half of 2^128 and past.
+            let scaled = u128::from(self.mant) * SCALE;
+            let shift = self.exp.unsigned_abs();
+            if shift >= 128 {
+                0
+            } else {
+                let shift = shift as u32;
+                let kept = scaled >> shift;
+                let half = (scaled >> (shift - 1)) & 1 == 1;
+                let below = scaled & ((1u128 << (shift - 1)) - 1) != 0;
+                if half && (below || kept & 1 == 1) {
+                    kept + 1
+                } else {
+                    kept
+                }
+            }
+        };
+        if whole == 0 {
+            return Some("0".to_string());
+        }
+        let (int, mut frac) = (whole / SCALE, (whole % SCALE) as u64);
+        let mut out = String::with_capacity(48);
+        if self.neg {
+            out.push('-');
+        }
+        match u64::try_from(int) {
+            Ok(int) => write!(out, "{int}"),
+            Err(_) => write!(out, "{int}"),
+        }
+        .ok()?;
+        if frac != 0 {
+            let mut places = DECIMALS as usize;
+            while frac % 10 == 0 {
+                frac /= 10;
+                places -= 1;
+            }
+            write!(out, ".{frac:0places$}").ok()?;
+        }
+        Some(out)
     }
 }
 
@@ -191,6 +299,15 @@ fn parse_decimal(neg: bool, text: &[u8]) -> Option<Rounded> {
         Some((b'e' | b'E', after)) => parse_exponent(after)?,
         Some(_) => return None,
     };
+    if let Some(rounded) = parse_decimal_in_words(neg, int, frac, exp10) {
+        return Some(rounded);
+    }
+    parse_decimal_long(neg, int, frac, exp10)
+}
+
+/// [`parse_decimal`] on big integers, for any number: its digits before and
+/// after the point, and the exponent after them.
+fn parse_decimal_long(neg: bool, int: &[u8], frac: &[u8], exp10: i64) -> Option<Rounded> {
     // The value is `digits × 10^exp10`, its digits without leading zeros.
     let all: Vec<u8> = int.iter().chain(frac).copied().collect();
     let first = all.iter().position(|&d| d != b'0');
@@ -230,6 +347,51 @@ fn parse_decimal(neg: bool, text: &[u8]) -> Option<Rounded> {
     Some(round(neg, quotient, -shift, !remainder.is_zero()))
 }
 
+/// [`parse_decimal`] of the usual numbers, in machine words: at most 19
+/// digits, leading zeros aside (10^19 < 2^64), times a power of ten from
+/// 10^-18 to what a `u128` holds. `None` for the others.
+///
+/// A whole number is exact in a `u128` and rounded once. A fraction is the
+/// digits, shifted to the top of a `u128`, divided by 10^k (k ≤ 18, under
+/// 2^60): a quotient of 68 bits or more, four past the 64 kept, and the
+/// remainder says whether anything is left below them.
+fn parse_decimal_in_words(neg: bool, int: &[u8], frac: &[u8], exp10: i64) -> Option<Rounded> {
+    let mut digits = 0u64;
+    let mut count = 0;
+    for &digit in int.iter().chain(frac) {
+        if digits == 0 && digit == b'0' {
+            continue;
+        }
+        count += 1;
+        if count > 19 {
+            return None;
+        }
+        digits = digits * 10 + u64::from(digit - b'0');
+    }
+    if digits == 0 {
+        return Some(Rounded::Value(LongDouble {
+            neg,
+            ..LongDouble::ZERO
+        }));
+    }
+    let exp10 = exp10 - frac.len() as i64;
+    let value = if exp10 >= 0 {
+        let power = *POW10.get(usize::try_from(exp10).ok()?)?;
+        round_u128(neg, u128::from(digits).checked_mul(power)?, 0, false)
+    } else {
+        let power = *POW10.get(usize::try_from(-exp10).ok()?).filter(|_| exp10 >= -18)?;
+        let shift = u128::from(digits).leading_zeros();
+        let dividend = u128::from(digits) << shift;
+        round_u128(
+            neg,
+            dividend / power,
+            -i64::from(shift),
+            dividend % power != 0,
+        )
+    };
+    Some(Rounded::Value(value))
+}
+
 fn parse_hex(neg: bool, text: &[u8]) -> Option<Rounded> {
     let (int, frac, rest) = split_mantissa(text, u8::is_ascii_hexdigit)?;
     let exp2 = match rest.split_first() {
@@ -237,10 +399,10 @@ fn parse_hex(neg: bool, text: &[u8]) -> Option<Rounded> {
         Some((b'p' | b'P', after)) => parse_exponent(after)?,
         Some(_) => return None,
     };
-    let mut mantissa = Big::from_u64(0);
+    let mut mantissa = Big(Vec::with_capacity((int.len() + frac.len()) / 8 + 1));
     for &digit in int.iter().chain(frac) {
         let value = (digit as char).to_digit(16).unwrap_or(0);
-        mantissa = mantissa.mul_small(16).add(&Big::from_u64(u64::from(value)));
+        mantissa.mul_add_small(16, value);
     }
     if mantissa.is_zero() {
         return Some(Rounded::Value(LongDouble {
@@ -301,6 +463,35 @@ fn round(neg: bool, value: Big, exp: i64, sticky: bool) -> Rounded {
     Rounded::Value(LongDouble { neg, mant, exp })
 }
 
+/// [`round`] of a value held in a `u128` and far from the ends of the
+/// range, where the format's limits do not come in: to 64 bits, to nearest,
+/// ties to even. If `sticky`, `value` has more than 64 bits.
+fn round_u128(neg: bool, value: u128, exp: i64, sticky: bool) -> LongDouble {
+    let bits = 128 - value.leading_zeros();
+    if bits <= 64 {
+        return LongDouble {
+            neg,
+            mant: value as u64,
+            exp,
+        };
+    }
+    let shift = bits - 64;
+    let mut mant = (value >> shift) as u64;
+    let mut exp = exp + i64::from(shift);
+    let half = (value >> (shift - 1)) & 1 == 1;
+    let below = sticky || value & ((1u128 << (shift - 1)) - 1) != 0;
+    if half && (below || mant & 1 == 1) {
+        match mant.checked_add(1) {
+            Some(next) => mant = next,
+            None => {
+                mant = 1 << 63;
+                exp += 1;
+            }
+        }
+    }
+    LongDouble { neg, mant, exp }
+}
+
 /// An unsigned integer of any size: 32-bit limbs, the lowest first, with no
 /// zero limb at the top.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,15 +504,25 @@ impl Big {
         big
     }
 
+    fn from_u128(value: u128) -> Big {
+        let mut big = Big(vec![
+            value as u32,
+            (value >> 32) as u32,
+            (value >> 64) as u32,
+            (value >> 96) as u32,
+        ]);
+        big.trim();
+        big
+    }
+
     fn from_decimal(digits: &[u8]) -> Big {
-        let mut big = Big(Vec::new());
+        // 9 digits to a limb, a little under 32 bits' worth.
+        let mut big = Big(Vec::with_capacity(digits.len() / 9 + 2));
         for chunk in digits.chunks(9) {
             let value = chunk
                 .iter()
                 .fold(0u32, |acc, &d| acc * 10 + u32::from(d - b'0'));
-            big = big
-                .mul_small(10u32.pow(chunk.len() as u32))
-                .add(&Big::from_u64(u64::from(value)));
+            big.mul_add_small(10u32.pow(chunk.len() as u32), value);
         }
         big
     }
@@ -358,27 +559,27 @@ impl Big {
             .is_some_and(|limb| limb >> (at % 32) & 1 == 1)
     }
 
-    fn mul_small(&self, factor: u32) -> Big {
-        let mut out = Vec::with_capacity(self.0.len() + 1);
-        let mut carry = 0u64;
-        for &limb in &self.0 {
-            let product = u64::from(limb) * u64::from(factor) + carry;
-            out.push(product as u32);
+    /// `self × factor + addend`, in place. `factor` is not zero.
+    fn mul_add_small(&mut self, factor: u32, addend: u32) {
+        let mut carry = u64::from(addend);
+        for limb in &mut self.0 {
+            let product = u64::from(*limb) * u64::from(factor) + carry;
+            *limb = product as u32;
             carry = product >> 32;
         }
-        out.push(carry as u32);
-        let mut big = Big(out);
-        big.trim();
-        big
+        if carry != 0 {
+            self.0.push(carry as u32);
+        }
     }
 
-    fn mul_pow10(&self, mut exp: u32) -> Big {
-        let mut big = self.clone();
+    fn mul_pow10(mut self, mut exp: u32) -> Big {
+        self.0.reserve(exp as usize / 9 + 1);
         while exp >= 9 {
-            big = big.mul_small(1_000_000_000);
+            self.mul_add_small(1_000_000_000, 0);
             exp -= 9;
         }
-        big.mul_small(10u32.pow(exp))
+        self.mul_add_small(10u32.pow(exp), 0);
+        self
     }
 
     fn add(&self, other: &Big) -> Big {
@@ -400,21 +601,39 @@ impl Big {
 
     /// `self - other`, `other` being no larger.
     fn sub(&self, other: &Big) -> Big {
-        let mut out = Vec::with_capacity(self.0.len());
+        let mut big = self.clone();
+        big.sub_assign(other);
+        big
+    }
+
+    /// `self -= other`, `other` being no larger.
+    fn sub_assign(&mut self, other: &Big) {
         let mut borrow = 0i64;
-        for at in 0..self.0.len() {
-            let mut diff =
-                i64::from(self.0[at]) - i64::from(other.0.get(at).copied().unwrap_or(0)) - borrow;
+        for (at, limb) in self.0.iter_mut().enumerate() {
+            let take = other.0.get(at).copied();
+            if take.is_none() && borrow == 0 {
+                break;
+            }
+            let mut diff = i64::from(*limb) - i64::from(take.unwrap_or(0)) - borrow;
             borrow = 0;
             if diff < 0 {
                 diff += 1 << 32;
                 borrow = 1;
             }
-            out.push(diff as u32);
+            *limb = diff as u32;
         }
-        let mut big = Big(out);
-        big.trim();
-        big
+        self.trim();
+    }
+
+    /// `self >>= 1`.
+    fn shr1_assign(&mut self) {
+        let mut carry = 0u32;
+        for limb in self.0.iter_mut().rev() {
+            let low = *limb << 31;
+            *limb = (*limb >> 1) | carry;
+            carry = low;
+        }
+        self.trim();
     }
 
     fn cmp(&self, other: &Big) -> Ordering {
@@ -478,21 +697,21 @@ impl Big {
     }
 
     /// `self / divisor` and its remainder, for a quotient of at most
-    /// `quotient_bits` bits: one bit at a time, which for a quotient that
-    /// small is as quick as the long way.
-    fn div_small_quotient(&self, divisor: &Big, quotient_bits: usize) -> (Big, Big) {
-        let mut remainder = self.clone();
+    /// `quotient_bits` bits (128 at most): one bit at a time, which for a
+    /// quotient that small is as quick as the long way. In place: the
+    /// divisor is shifted once to the top and then down a bit a step, and
+    /// what is left of `self` is the remainder.
+    fn div_small_quotient(mut self, divisor: &Big, quotient_bits: usize) -> (Big, Big) {
+        let mut shifted = divisor.shl(quotient_bits - 1);
         let mut quotient = 0u128;
         for bit in (0..quotient_bits).rev() {
-            let shifted = divisor.shl(bit);
-            if remainder.cmp(&shifted) != Ordering::Less {
-                remainder = remainder.sub(&shifted);
+            if self.cmp(&shifted) != Ordering::Less {
+                self.sub_assign(&shifted);
                 quotient |= 1 << bit;
             }
+            shifted.shr1_assign();
         }
-        let quotient =
-            Big::from_u64(quotient as u64).add(&Big::from_u64((quotient >> 64) as u64).shl(64));
-        (quotient, remainder)
+        (Big::from_u128(quotient), self)
     }
 
     /// The decimal digits, without leading zeros.
@@ -551,6 +770,7 @@ pub(crate) const ZERO: Parsed = Parsed::Finite(LongDouble::ZERO);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn incr(current: &str, by: &str) -> String {
         let a = LongDouble::parse(current.as_bytes()).expect(current);
@@ -666,6 +886,116 @@ mod tests {
         });
         assert!(matches!(increment(max, max), Increment::NotFinite));
         assert!(matches!(increment(max, ZERO), Increment::Sum(_)));
+    }
+
+    /// The words and the big integers give the same, in reading, adding and
+    /// writing, for what both take.
+    #[test]
+    fn the_short_way_and_the_long_way_agree() {
+        // The same value, however its bits are written.
+        let canonical = |v: LongDouble| {
+            if v.mant == 0 {
+                return (false, 0, 0);
+            }
+            let zeros = v.mant.trailing_zeros();
+            (v.neg, v.mant >> zeros, v.exp + i64::from(zeros))
+        };
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut number = || {
+            let digit = |n: u64| char::from(b'0' + (n % 10) as u8);
+            let int_len = (next() % 12) as usize;
+            let frac_len = (next() % 14) as usize;
+            let mut text: String = (0..int_len).map(|_| digit(next())).collect();
+            text.push('.');
+            text.extend((0..frac_len).map(|_| digit(next())));
+            if text == "." {
+                text = "7".to_string();
+            }
+            if next() % 3 == 0 {
+                write!(text, "e{}", (next() % 50) as i64 - 25).unwrap();
+            }
+            (next() % 2 == 0, text)
+        };
+        let mut short_reads = 0;
+        let mut short_sums = 0;
+        for _ in 0..20_000 {
+            let (neg, text) = number();
+            let (int, frac, rest) = split_mantissa(text.as_bytes(), u8::is_ascii_digit).unwrap();
+            let exp10 = match rest.split_first() {
+                None => 0,
+                Some((_, after)) => parse_exponent(after).unwrap(),
+            };
+            let Some(Rounded::Value(long)) = parse_decimal_long(neg, int, frac, exp10) else {
+                panic!("{text}");
+            };
+            if let Some(short) = parse_decimal_in_words(neg, int, frac, exp10) {
+                let Rounded::Value(short) = short else {
+                    panic!("{text}");
+                };
+                assert_eq!(canonical(short), canonical(long), "{text}");
+                short_reads += 1;
+            }
+            if let Some(text) = long.to_redis_string_in_words() {
+                assert_eq!(text, long.to_redis_string_long(), "{neg} {text}");
+            }
+            let (other_neg, other) = number();
+            let Some(Parsed::Finite(other)) = LongDouble::parse(
+                format!("{}{other}", if other_neg { "-" } else { "" }).as_bytes(),
+            ) else {
+                panic!("{other}");
+            };
+            if long.mant != 0 && other.mant != 0 {
+                if let Some(sum) = long.add_in_words(other) {
+                    let slow = long.add_long(other).unwrap();
+                    assert_eq!(canonical(sum), canonical(slow), "{text} + {other:?}");
+                    short_sums += 1;
+                }
+            }
+        }
+        // Most of them take the short way.
+        assert!(short_reads > 10_000, "{short_reads}");
+        assert!(short_sums > 10_000, "{short_sums}");
+    }
+
+    /// 2,500 random pairs, with what Redis 8.10.2 on x86-64 replied to
+    /// `SET k a` and `INCRBYFLOAT k b`: the sum, `ERRPARSE` for `ERR value
+    /// is not a valid float`, `NOTFINITE` for `ERR increment would produce
+    /// NaN or Infinity`. Half are numbers of up to 19 digits, which take the
+    /// short way; half anything, hexadecimal, exponents near the ends of the
+    /// range and text that is no number among them. (A trimmed run of the
+    /// differential check against `redis-server`, 50,000 pairs a seed.)
+    #[test]
+    fn sums_are_what_redis_8_10_2_replied_to_random_pairs() {
+        let table = include_str!("../../tests/fixtures/redis-8.10.2-incrbyfloat.tsv");
+        let mut checked = 0;
+        for line in table.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split('\t');
+            let (Some(a), Some(b), Some(want), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                panic!("{line:?}");
+            };
+            let got = match (LongDouble::parse(a.as_bytes()), LongDouble::parse(b.as_bytes())) {
+                (Some(a), Some(b)) => match increment(a, b) {
+                    Increment::Sum(sum) => sum,
+                    Increment::NotFinite => "NOTFINITE".to_string(),
+                },
+                _ => "ERRPARSE".to_string(),
+            };
+            assert_eq!(got, want, "{a:?} + {b:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 2500);
     }
 
     /// A tie is rounded to the even neighbour, in reading and in writing.

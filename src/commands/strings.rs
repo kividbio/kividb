@@ -1081,11 +1081,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             use crate::commands::long_double::{self, Increment, LongDouble};
             const NOT_A_FLOAT: &str = "ERR value is not a valid float";
+            // Read before the shard is locked, and refused only after the
+            // stored value is: the key's type first, then its value, then
+            // the increment, as in Redis.
+            let delta = LongDouble::parse(cmd[2]);
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            // In `long double`, as Redis on x86-64 (#387). The key's type
-            // first, then its value, then the increment, as in Redis.
+            // In `long double`, as Redis on x86-64 (#387).
             let current = match map.get(key) {
                 None => long_double::ZERO,
                 Some(ValueRef::String(v)) => match LongDouble::parse(&v) {
@@ -1098,7 +1101,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ));
                 }
             };
-            let Some(delta) = LongDouble::parse(cmd[2]) else {
+            let Some(delta) = delta else {
                 return Some(resp_error(NOT_A_FLOAT));
             };
             let s = match long_double::increment(current, delta) {

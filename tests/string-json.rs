@@ -505,6 +505,23 @@ fn incrbyfloat_adds_as_redis_does() {
         c.cmds(&["HINCRBYFLOAT", "h", "f", "nan"]).error_str(),
         "ERR value is not a valid float"
     );
+    // Which error comes first, as in Redis 8.10.2: for `INCRBYFLOAT` the
+    // key's type, then the increment; for `HINCRBYFLOAT` the increment.
+    c.cmds(&["RPUSH", "l", "a"]);
+    for by in ["xyz", "inf"] {
+        assert_eq!(
+            c.cmds(&["INCRBYFLOAT", "l", by]).error_str(),
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+    }
+    assert_eq!(
+        c.cmds(&["HINCRBYFLOAT", "l", "f", "xyz"]).error_str(),
+        "ERR value is not a valid float"
+    );
+    assert_eq!(
+        c.cmds(&["HINCRBYFLOAT", "l", "f", "inf"]).error_str(),
+        "ERR value is NaN or Infinity"
+    );
 }
 
 // Manual test scenario:
