@@ -2305,6 +2305,7 @@ fn refuse_keys_outside_db0(store: &store::Store) {
                 "{}: {keys} keys were loaded into database {db}",
                 snapshot::CLUSTER_KEYS_OUTSIDE_DB0
             );
+            log_fatal!("{}.", snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
             std::process::exit(1);
         }
     }

@@ -2936,6 +2936,12 @@ fn classify_tail(rest: &[u8]) -> Tail {
 /// KiviDB.
 pub(crate) fn fatal_persistence(what: &str) -> ! {
     log_fatal!("{what}");
+    // Keys outside database 0 of a cluster node: the file is fine, the
+    // node cannot serve them (#484).
+    if what.contains(crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0) {
+        log_fatal!("{}.", crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+        std::process::exit(1);
+    }
     log_fatal!(
         "Refusing to start with an empty dataset in place of one that could not be \
          loaded. Fix the file (or its permissions), or move it out of the working directory \
@@ -3867,6 +3873,12 @@ fn failpoint_named(name: &str) -> bool {
 /// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
 /// [`failpoint`] is: whether it is to fail.
 fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// What a node did before, that a test has it do again, named in
+/// `KIVIDB_TEST_FAILPOINTS` as a [`failpoint`] is: whether it is to.
+pub(crate) fn test_behaves_as_before(name: &str) -> bool {
     failpoint_named(name)
 }
 

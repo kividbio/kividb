@@ -14,7 +14,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   client can reach in cluster mode, where slot accounting and migration
   never saw them. As in Redis, it now exits with `can't have keys in a DB
   different than DB 0 when in Cluster mode`, and a cluster replica refuses
-  such a full sync before it touches its own dataset.
+  such a full sync before it touches its own dataset. `MOVE`, `SWAPDB` and
+  `COPY ... DB n` put keys there and are now refused in cluster mode, with
+  Redis's errors. **Upgrade note:** a cluster node that already holds keys
+  outside database 0 will not start after the upgrade; its data on disk is
+  kept. Start it once without `cluster-enabled`, move those keys into
+  database 0 (`SELECT n`, `MOVE key 0`) or `FLUSHDB` them, `SAVE` (or
+  `BGREWRITEAOF` with the AOF on), and start it as a cluster node again.
 - **A `WATCH` fails only when a watched key really changes: an expired key
   `GETEX`/`GETDEL` finds, and an empty `SINTERSTORE`, `SUNIONSTORE` or
   `SDIFFSTORE` into an absent destination, no longer abort the `EXEC` for
