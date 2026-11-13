@@ -270,7 +270,7 @@ fn cmd_countkeysinslot(ctx: &Ctx) -> Vec<u8> {
 
     let db = &ctx.store[*ctx.selected_db];
     let mut count: i64 = 0;
-    for shard in db.iter() {
+    for shard in shards_of_slot(db, slot) {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
             if key_hash_slot(k) == slot {
@@ -310,7 +310,7 @@ fn cmd_getkeysinslot(ctx: &Ctx) -> Vec<u8> {
     if count == 0 {
         return resp_array(out);
     }
-    'outer: for shard in db.iter() {
+    'outer: for shard in shards_of_slot(db, slot) {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
             if key_hash_slot(k) == slot {
@@ -1747,9 +1747,23 @@ fn syncslots_apply(ctx: &mut Ctx, task_id: &str) -> Vec<u8> {
     }
 }
 
+/// The shards of `db` that can hold keys of `slot`: one, when shards are
+/// chosen by slot (EXPERIMENT #294), else all of them.
+fn shards_of_slot(
+    db: &crate::store::Db,
+    slot: u16,
+) -> impl Iterator<Item = &crate::store::Shard> {
+    let (skip, take) = if crate::store::sharded_by_slot() {
+        (crate::store::shard_of_slot(db.len(), slot), 1)
+    } else {
+        (0, db.len())
+    };
+    db.iter().skip(skip).take(take)
+}
+
 /// Whether any key in the selected database hashes to `slot`.
 fn slot_has_keys(ctx: &Ctx, slot: u16) -> bool {
-    ctx.store[*ctx.selected_db].iter().any(|shard| {
+    shards_of_slot(&ctx.store[*ctx.selected_db], slot).any(|shard| {
         crate::read_lock!(shard)
             .keys()
             .any(|k| key_hash_slot(k) == slot)

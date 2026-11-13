@@ -30,12 +30,35 @@ pub fn shard_index(shards: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> usize {
 /// UTF-8 (the same shard: the hash is of the bytes).
 #[inline]
 pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
+    if BY_SLOT.load(Ordering::Relaxed) {
+        return shard_of_slot(shards, crate::cluster::slot::key_hash_slot(key));
+    }
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in key {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     (hash as usize) & (shards - 1)
+}
+
+/// EXPERIMENT (#294): in cluster mode a key's shard is chosen by its slot,
+/// so the keys of one slot are all in one shard.
+static BY_SLOT: AtomicBool = AtomicBool::new(false);
+
+/// Choose shards by slot from now on. Before the store holds any key.
+pub fn shard_by_slot() {
+    BY_SLOT.store(true, Ordering::Relaxed);
+}
+
+/// Whether shards are chosen by slot.
+pub fn sharded_by_slot() -> bool {
+    BY_SLOT.load(Ordering::Relaxed)
+}
+
+/// The shard of `slot`'s keys, of `shards`, when they are chosen by slot.
+#[inline]
+pub fn shard_of_slot(shards: usize, slot: u16) -> usize {
+    slot as usize & (shards - 1)
 }
 
 #[inline(always)]
