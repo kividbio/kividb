@@ -1467,3 +1467,106 @@ fn every_way_of_running_a_script_sends_its_false_in_the_clients_protocol() {
         assert_wire!(c.raw(&["EXEC"]), want, "EXEC of scripts");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FUNCTION LIST and FUNCTION STATS (#476, #439)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Under RESP3 the expected bytes are Redis 8.10's: each library, each function
+// and the stats are maps, a missing value is `_` and `flags` is a set of simple
+// strings. Under RESP2 they are as they were: flat arrays, `$-1` and each flag
+// a bulk string (Redis sends a flag as a simple string under both).
+
+#[cfg(feature = "lua")]
+#[test]
+fn function_list_follows_the_clients_protocol() {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    let lib = "#!lua name=fnlist_476\n\
+               redis.register_function('fnlist_476_a', function() return 1 end)\n\
+               redis.register_function{function_name='fnlist_476_b', callback=function() return 2 end, \
+               description='has one', flags={'no-writes', 'allow-stale'}}";
+    assert_wire!(
+        c2.raw(&["FUNCTION", "LOAD", "REPLACE", lib]),
+        b"$10\r\nfnlist_476\r\n",
+        "FUNCTION LOAD"
+    );
+    let list = ["FUNCTION", "LIST", "LIBRARYNAME", "fnlist_476"];
+    assert_wire!(
+        c2.raw(&list),
+        b"*1\r\n*6\r\n$12\r\nlibrary_name\r\n$10\r\nfnlist_476\r\n$6\r\nengine\r\n$3\r\nLUA\r\n\
+          $9\r\nfunctions\r\n*2\r\n\
+          *6\r\n$4\r\nname\r\n$12\r\nfnlist_476_a\r\n$11\r\ndescription\r\n$-1\r\n$5\r\nflags\r\n*0\r\n\
+          *6\r\n$4\r\nname\r\n$12\r\nfnlist_476_b\r\n$11\r\ndescription\r\n$7\r\nhas one\r\n\
+          $5\r\nflags\r\n*2\r\n$9\r\nno-writes\r\n$11\r\nallow-stale\r\n",
+        "RESP2 FUNCTION LIST"
+    );
+    assert_wire!(
+        c3.raw(&list),
+        b"*1\r\n%3\r\n$12\r\nlibrary_name\r\n$10\r\nfnlist_476\r\n$6\r\nengine\r\n$3\r\nLUA\r\n\
+          $9\r\nfunctions\r\n*2\r\n\
+          %3\r\n$4\r\nname\r\n$12\r\nfnlist_476_a\r\n$11\r\ndescription\r\n_\r\n$5\r\nflags\r\n~0\r\n\
+          %3\r\n$4\r\nname\r\n$12\r\nfnlist_476_b\r\n$11\r\ndescription\r\n$7\r\nhas one\r\n\
+          $5\r\nflags\r\n~2\r\n+no-writes\r\n+allow-stale\r\n",
+        "RESP3 FUNCTION LIST"
+    );
+    // WITHCODE adds a fourth pair: the library's map is `%4`.
+    let with_code = c3.raw(&["FUNCTION", "LIST", "WITHCODE", "LIBRARYNAME", "fnlist_476"]);
+    assert!(with_code.starts_with(b"*1\r\n%4\r\n"), "{}", s(&with_code));
+    assert!(
+        with_code
+            .windows(b"$12\r\nlibrary_code\r\n".len())
+            .any(|w| w == b"$12\r\nlibrary_code\r\n"),
+        "{}",
+        s(&with_code)
+    );
+    c2.raw(&["FUNCTION", "DELETE", "fnlist_476"]);
+}
+
+/// Neither the counts nor what `running_script` holds are pinned: the
+/// function store and the Lua VM are the test process's, and other tests
+/// load libraries and run functions in it meanwhile (#431's `f431_s3` was
+/// once running here). `running_script` is the protocol's null or its map;
+/// the running map's bytes are `function_stats_reply`'s unit test.
+#[cfg(feature = "lua")]
+#[test]
+fn function_stats_follows_the_clients_protocol() {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    let cases: [(&mut RawConn, &str, &[u8], &[u8], &[u8], &[u8]); 2] = [
+        (
+            &mut c2,
+            "RESP2",
+            b"*4\r\n$14\r\nrunning_script\r\n",
+            b"$-1\r\n",
+            b"*6\r\n",
+            b"$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n$15\r\nlibraries_count\r\n:",
+        ),
+        (
+            &mut c3,
+            "RESP3",
+            b"%2\r\n$14\r\nrunning_script\r\n",
+            b"_\r\n",
+            b"%3\r\n",
+            b"$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n%2\r\n$15\r\nlibraries_count\r\n:",
+        ),
+    ];
+    for (c, protocol, head, idle, running, engines) in cases {
+        let stats = c.raw(&["FUNCTION", "STATS"]);
+        let rest = stats
+            .strip_prefix(head)
+            .unwrap_or_else(|| panic!("{protocol}: {}", s(&stats)));
+        assert!(
+            rest.starts_with(idle) || rest.starts_with(running),
+            "{protocol} running_script: {}",
+            s(&stats)
+        );
+        assert!(
+            stats.windows(engines.len()).any(|w| w == engines),
+            "{protocol} engines: {}",
+            s(&stats)
+        );
+    }
+}
