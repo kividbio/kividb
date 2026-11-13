@@ -532,7 +532,18 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             _ => {}
         }
     }
+    let kept_keys = !def.gives_ids();
     def.fields.extend(new_fields);
+    // An index of vectors alone that is given its first TEXT, TAG or
+    // NUMERIC field counts its documents by their ids from here on: each
+    // is given one below, whatever was added and with SKIPINITIALSCAN too.
+    // Its keys are let go of, not emptied: a walk that began before this
+    // (of an `FT.CREATE` or another `FT.ALTER`) goes on adding to the ones
+    // it holds, which go with it, not to ones nothing reads or frees.
+    let now_gives_ids = kept_keys && def.gives_ids();
+    if now_gives_ids {
+        def.docs = Arc::default();
+    }
     let altered = def.clone();
 
     // We need to drop the write lock before backfilling — backfill takes
@@ -556,7 +567,7 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             &newly_added_text_fields,
         );
     }
-    if !added_filter_fields.is_empty() {
+    if !added_filter_fields.is_empty() || now_gives_ids {
         crate::vector::backfill_postings(
             &ctx.store[altered.db_index],
             &altered,
@@ -1489,12 +1500,12 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // What RediSearch divides a word's document count by: every document of
     // the index (`docs.size - 1`), as `FT.INFO`'s `num_docs` counts them.
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
-    let total_docs =
-        crate::commands::search::count_docs(&ctx.store[def.db_index], &def, cluster).max(1) as f64;
+    let total_docs = crate::commands::search::count_docs(&def, cluster).max(1) as f64;
 
     // RediSearch's reply per misspelled word, RESP2:
     //   ["TERM", word, [[score, suggestion], ...]]
     // and RESP3: {"results": {word: [{suggestion: score}, ...], ...}}.
+    // `TERM` and `results` are simple strings there, and so here.
     // A suggestion's score is the share of the index's documents that hold
     // it (`spell_check.c`), best first, written as Redis writes a double; a
     // word only in an INCLUDE dictionary scores 0.
@@ -1549,7 +1560,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
             out.push(resp_array(suggestions));
         } else {
             out.push(resp_array(vec![
-                resp_bulk_str("TERM"),
+                resp_simple("TERM"),
                 resp_bulk_str(&token_clean),
                 resp_array(suggestions),
             ]));
@@ -1557,7 +1568,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     if resp3 {
-        return Some(resp_map(vec![resp_bulk_str("results"), resp_map(out)]));
+        return Some(resp_map(vec![resp_simple("results"), resp_map(out)]));
     }
     Some(resp_array(out))
 }
@@ -2043,7 +2054,15 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
     // `vector::walk_documents` (#275). The walk used to index the fields as
     // it found them, and a write to the key meanwhile, which indexed what it
     // wrote, could be overwritten in the index by the walk's older copy.
+    //
+    // An index that gives its documents no ids counts each one the walk
+    // meets: made with `SKIPINITIALSCAN`, it has not met them before, and
+    // a search of the new field finds them from here on.
+    let keeps_keys = !def.gives_ids();
     crate::vector::walk_documents(&ctx.store[def.db_index], &def, |key, inner| {
+        if keeps_keys {
+            def.docs.add(key);
+        }
         for w in &work {
             let raw_bytes = match inner.get(&w.name) {
                 Some(b) => b,
