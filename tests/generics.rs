@@ -2398,8 +2398,7 @@ fn test_invalidation_frame_bytes_resp3() {
         }
     }
     assert_eq!(
-        msg,
-        want,
+        msg, want,
         "RESP3 invalidation must be a 2-element push frame (Redis addReplyPushLen(c,2))"
     );
 }
