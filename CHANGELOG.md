@@ -36,11 +36,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   laptop `HSET` of a new document into such an index was about 5% slower,
   and of one already there 1% to 3%; `DEL` was within noise.
   An index made with `SKIPINITIALSCAN` now counts the documents written
-  since, as RediSearch does, not every document under its prefixes.
+  since, as RediSearch does, not every document under its prefixes (a
+  restart or a full resync still indexes them all, as before, and they are
+  counted from then).
   `FT.SPELLCHECK` sends `TERM` (RESP2) and `results` (RESP3) as simple
   strings, as RediSearch does; they were bulk strings.
 
 ### Fixed
+
+- **An index created since the last dump is whole after a restart that
+  replays the AOF (#590).** The walk that indexes the documents once the
+  replay is done went by the dump's indexes when the dump had any, so an
+  index created after it was left with what its `FT.CREATE` found when
+  replayed: a search of it found none of the documents written after it
+  was made, until each was written again. An `FT.CREATE`, `FT.ALTER` or
+  `SWAPDB` in the log also walked the documents of that moment, of which
+  the replay left in those a later command deleted. The walks wait for the
+  one after the replay, which is of every index.
 
 - **A script that waits for `TIME` to move ends (#676).** `TIME` in a
   script returned the script's start for as long as it ran, so a loop
