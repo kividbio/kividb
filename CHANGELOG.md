@@ -19,6 +19,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`kividb-full` packages, with Lua and TLS, in the apt and dnf
+  repositories and the Homebrew tap (#732).** `sudo apt install
+  kividb-full`, `sudo dnf install kividb-full` or `brew install
+  kividbio/tap/kividb-full` installs the full build, which job queues such
+  as BullMQ and Sidekiq need, with the same binary path, unit, config and
+  data directory as `kividb`. One or the other is installed: `sudo apt
+  install kividb-full` or `sudo dnf swap kividb kividb-full` switches, and
+  the same back. The edited config is kept, the data stays, the service
+  comes back as it was on the new binary, and upgrades stay on the package
+  installed (docs/INSTALL.md, "Switching between kividb and kividb-full").
+  `kividb --version` names the build (`1.3.0 (full build: Lua, TLS)`), and
+  `INFO server` has `kividb_variant`. A build without Lua now keeps the
+  function libraries of the data it loads and writes them into its own
+  snapshots, so going from `kividb-full` to `kividb` and back keeps them;
+  until now its first snapshot dropped them. The repositories keep the
+  newest 12 releases of each package, down from 20, to stay within GitHub
+  Pages' size limit.
+
 - **Bloom filters (`BF.*`), as Redis 8 has them built in (part of #453).**
   `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.INSERT`, `BF.EXISTS`,
   `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`, `BF.LOADCHUNK` and

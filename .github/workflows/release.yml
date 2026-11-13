@@ -27,7 +27,10 @@ env:
 #   tls      tls           -tls             v1.2.3-tls
 #   full     lua,tls       -full            v1.2.3-full
 #
-# Each Linux job also produces .deb / .rpm for the default variant only.
+# The Linux jobs of the default and full variants also produce .deb / .rpm
+# packages: `kividb` and `kividb-full`, which conflict with each other
+# (packaging/nfpm-config.sh; docs/INSTALL.md, "Switching between kividb and
+# kividb-full").
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
@@ -76,17 +79,17 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { name: default, features: "",        tarball: "kividb-linux-x86_64",      package: true  }
-          - { name: lua,     features: "lua",     tarball: "kividb-lua-linux-x86_64",  package: false }
-          - { name: tls,     features: "tls",     tarball: "kividb-tls-linux-x86_64",  package: false }
-          - { name: full,    features: "lua,tls", tarball: "kividb-full-linux-x86_64", package: false }
+          - { name: default, features: "",        tarball: "kividb-linux-x86_64",      package: "kividb"      }
+          - { name: lua,     features: "lua",     tarball: "kividb-lua-linux-x86_64",  package: ""            }
+          - { name: tls,     features: "tls",     tarball: "kividb-tls-linux-x86_64",  package: ""            }
+          - { name: full,    features: "lua,tls", tarball: "kividb-full-linux-x86_64", package: "kividb-full" }
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - name: Install nfpm
-        if: matrix.variant.package
+        if: matrix.variant.package != ''
         run: |
           set -euo pipefail
           curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
@@ -109,14 +112,15 @@ jobs:
             '
 
       - name: Build .deb and .rpm
-        if: matrix.variant.package
+        if: matrix.variant.package != ''
         run: |
           set -euo pipefail
           ver="${RELEASE_TAG#v}"
-          sed -e "s/^version:.*/version: ${ver}/" -e "s/^arch:.*/arch: amd64/" packaging/nfpm.yaml > /tmp/nfpm.yaml
+          pkg="${{ matrix.variant.package }}"
+          sh packaging/nfpm-config.sh "${{ matrix.variant.name }}" "${ver}" amd64 > /tmp/nfpm.yaml
           mkdir -p dist
-          nfpm pkg -f /tmp/nfpm.yaml --packager deb --target dist/kividb_amd64.deb
-          nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target dist/kividb.x86_64.rpm
+          nfpm pkg -f /tmp/nfpm.yaml --packager deb --target "dist/${pkg}_amd64.deb"
+          nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target "dist/${pkg}.x86_64.rpm"
 
       - name: Stage tarball
         run: |
@@ -132,6 +136,41 @@ jobs:
           name: dist-linux-amd64-${{ matrix.variant.name }}
           path: dist/*
 
+  # ── The packages, swapped for each other ────────────────────────────────
+  # `kividb` and `kividb-full` install the same files: install one, swap to
+  # the other and back, and upgrade, in clean Debian 12, Ubuntu 24.04, Rocky
+  # Linux 9 and Amazon Linux 2023 containers running systemd, with this
+  # release's x86_64 binaries (packaging/test/swap-test.sh). `publish` waits
+  # for it. About ten minutes, once per release.
+  package-test:
+    needs: [linux-amd64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Download the x86_64 builds
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dist-linux-amd64-*
+          merge-multiple: true
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin nfpm
+      - name: Install, swap, swap back and upgrade
+        run: |
+          set -euo pipefail
+          mkdir -p bins/default bins/full
+          tar xzf artifacts/kividb-linux-x86_64.tar.gz -C bins/default
+          tar xzf artifacts/kividb-full-linux-x86_64.tar.gz -C bins/full
+          bash packaging/test/swap-test.sh bins/default/kividb/kividb bins/full/kividb/kividb
+      - name: Logs
+        if: failure()
+        run: tail -n +1 target/pkgtest/*.log || true
+
   # ── Linux aarch64 ────────────────────────────────────────────────────────
   # Built INSIDE an amazonlinux:2023 container — see the linux-amd64 job's
   # comment for why (musl doesn't work here at all: tokio-uring 0.5 doesn't
@@ -145,17 +184,17 @@ jobs:
     strategy:
       matrix:
         variant:
-          - { name: default, features: "",        tarball: "kividb-linux-aarch64",      package: true  }
-          - { name: lua,     features: "lua",     tarball: "kividb-lua-linux-aarch64",  package: false }
-          - { name: tls,     features: "tls",     tarball: "kividb-tls-linux-aarch64",  package: false }
-          - { name: full,    features: "lua,tls", tarball: "kividb-full-linux-aarch64", package: false }
+          - { name: default, features: "",        tarball: "kividb-linux-aarch64",      package: "kividb"      }
+          - { name: lua,     features: "lua",     tarball: "kividb-lua-linux-aarch64",  package: ""            }
+          - { name: tls,     features: "tls",     tarball: "kividb-tls-linux-aarch64",  package: ""            }
+          - { name: full,    features: "lua,tls", tarball: "kividb-full-linux-aarch64", package: "kividb-full" }
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - name: Install nfpm
-        if: matrix.variant.package
+        if: matrix.variant.package != ''
         run: |
           set -euo pipefail
           curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_arm64.tar.gz" \
@@ -183,14 +222,15 @@ jobs:
             '
 
       - name: Build .deb and .rpm
-        if: matrix.variant.package
+        if: matrix.variant.package != ''
         run: |
           set -euo pipefail
           ver="${RELEASE_TAG#v}"
-          sed -e "s/^version:.*/version: ${ver}/" -e "s/^arch:.*/arch: arm64/" packaging/nfpm.yaml > /tmp/nfpm.yaml
+          pkg="${{ matrix.variant.package }}"
+          sh packaging/nfpm-config.sh "${{ matrix.variant.name }}" "${ver}" arm64 > /tmp/nfpm.yaml
           mkdir -p dist
-          nfpm pkg -f /tmp/nfpm.yaml --packager deb --target dist/kividb_arm64.deb
-          nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target dist/kividb.aarch64.rpm
+          nfpm pkg -f /tmp/nfpm.yaml --packager deb --target "dist/${pkg}_arm64.deb"
+          nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target "dist/${pkg}.aarch64.rpm"
 
       - name: Stage tarball
         run: |
@@ -524,86 +564,55 @@ jobs:
     if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
+      # formula.sh, from the release's own commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          path: kividb
+          persist-credentials: false
+
       - name: Checkout tap repository
         uses: actions/checkout@v4
         with:
           repository: kividbio/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           ref: master
+          path: tap
 
-      - name: Create Formula directory
-        run: mkdir -p Formula
-
-      - name: Extract version and checksums
+      # Formula/kividb.rb, the default variant, and Formula/kividb-full.rb,
+      # Lua and TLS (#732). Each conflicts with the other: both install
+      # bin/kividb. formula.sh refuses a missing checksum.
+      - name: Write the formulas
         id: extract
         run: |
           set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
           # SHA256SUMS.txt is published as an asset of the GitHub Release.
           curl -fsSL "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/SHA256SUMS.txt" -o /tmp/SHA256SUMS.txt
+          sha() { awk -v f="$1" '$2 == f || $2 == "./" f { print $1 }' /tmp/SHA256SUMS.txt; }
 
-          # Default (no-feature) binaries used by Homebrew
-          INTEL_SHA=$(grep "kividb-darwin-x86_64\.tar\.gz$"  /tmp/SHA256SUMS.txt | awk '{print $1}')
-          ARM_SHA=$(grep   "kividb-darwin-aarch64\.tar\.gz$" /tmp/SHA256SUMS.txt | awk '{print $1}')
-          echo "intel_sha=${INTEL_SHA}" >> $GITHUB_OUTPUT
-          echo "arm_sha=${ARM_SHA}"     >> $GITHUB_OUTPUT
-
-          echo "Version: ${VERSION}  Intel: ${INTEL_SHA}  ARM: ${ARM_SHA}"
-
-      - name: Update Homebrew formula
-        run: |
-          set -euo pipefail
-
-          cat > Formula/kividb.rb << 'EOF'
-          class Kividb < Formula
-            desc "A fast Redis-compatible in-memory store written in Rust"
-            homepage "https://kividb.io/"
-            license "AGPL-3.0-only"
-            version "${{ steps.extract.outputs.version }}"
-
-            on_macos do
-              on_arm do
-                url "https://github.com/${{ github.repository }}/releases/download/v${{ steps.extract.outputs.version }}/kividb-darwin-aarch64.tar.gz"
-                sha256 "${{ steps.extract.outputs.arm_sha }}"
-              end
-              on_intel do
-                url "https://github.com/${{ github.repository }}/releases/download/v${{ steps.extract.outputs.version }}/kividb-darwin-x86_64.tar.gz"
-                sha256 "${{ steps.extract.outputs.intel_sha }}"
-              end
-            end
-
-            def install
-              bin.install "kividb"
-              doc.install "LICENSE", "NOTICE"
-            end
-
-            service do
-              run [opt_bin/"kividb"]
-              keep_alive true
-              log_path var/"log/kividb.log"
-              error_log_path var/"log/kividb.error.log"
-            end
-
-            test do
-              system "#{bin}/kividb", "--version"
-            end
-          end
-          EOF
+          mkdir -p tap/Formula
+          sh kividb/packaging/homebrew/formula.sh default "${VERSION}" "${{ github.repository }}" \
+            "$(sha kividb-darwin-aarch64.tar.gz)" "$(sha kividb-darwin-x86_64.tar.gz)" > tap/Formula/kividb.rb
+          sh kividb/packaging/homebrew/formula.sh full "${VERSION}" "${{ github.repository }}" \
+            "$(sha kividb-full-darwin-aarch64.tar.gz)" "$(sha kividb-full-darwin-x86_64.tar.gz)" > tap/Formula/kividb-full.rb
+          cat tap/Formula/kividb.rb tap/Formula/kividb-full.rb
 
       - name: Commit and push
+        working-directory: tap
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/kividb.rb
-          # A re-run after the formula was already pushed has nothing to add.
+          git add Formula/kividb.rb Formula/kividb-full.rb
+          # A re-run after the formulas were already pushed has nothing to add.
           if git diff --cached --quiet; then
             echo "The tap already has kividb ${{ steps.extract.outputs.version }}."
             exit 0
           fi
-          git commit -m "chore: update kividb to ${{ steps.extract.outputs.version }}"
+          git commit -m "chore: update kividb and kividb-full to ${{ steps.extract.outputs.version }}"
           git push
 
   # ── apt and dnf repositories — stable releases only ─────────────────────
@@ -699,12 +708,13 @@ jobs:
           echo "Pushed ${REPO}:${RELEASE_TAG}: oras pull ${REPO}:${RELEASE_TAG}"
 
   publish:
-    needs: [linux-amd64, linux-arm64, darwin, docker-manifest]
+    needs: [linux-amd64, linux-arm64, darwin, docker-manifest, package-test]
     if: >-
       ${{ !cancelled()
           && !contains(github.event.inputs.tag || github.ref_name, '-')
           && needs.linux-amd64.result == 'success'
           && needs.linux-arm64.result == 'success'
+          && needs.package-test.result == 'success'
           && needs.docker-manifest.result == 'success'
           && needs.darwin.result == 'success' }}
     runs-on: ubuntu-latest

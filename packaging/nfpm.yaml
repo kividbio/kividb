@@ -1,4 +1,7 @@
-# Template: version and arch are overridden in CI via a generated file (see .github/workflows/release.yml).
+# Template for the `kividb` package, the default build (no Lua, no TLS).
+# packaging/nfpm-config.sh writes the file nfpm is given, for this package or
+# for `kividb-full` (the full build: Lua and TLS), with the version and the
+# architecture: see .github/workflows/release.yml.
 name: kividb
 arch: amd64
 version: 0.0.0
@@ -11,6 +14,19 @@ scripts:
   preinstall: ./packaging/scripts/preinstall.sh
   postinstall: ./packaging/scripts/postinstall.sh
   preremove: ./packaging/scripts/preremove.sh
+# Run once a whole dnf transaction is done: after `dnf swap`, the package
+# going away has stopped the unit only after this one's %post ran (see
+# preremove.sh).
+rpm:
+  scripts:
+    posttrans: ./packaging/scripts/posttrans.sh
+# `kividb` and `kividb-full` install the same files (the binary, the unit,
+# the config), so only one of them can be installed; installing the other
+# replaces it. Replaces is for deb only: nfpm writes `replaces` as rpm's
+# Obsoletes, and with that dnf would trade one for the other on every
+# upgrade. `dnf swap` does it when asked.
+conflicts:
+  - kividb-full
 # The binary is built on Amazon Linux 2023 and needs its glibc, 2.34, or newer:
 # Debian 12, Ubuntu 22.04, RHEL 9 and Fedora 35 or later. Saying so makes apt
 # and dnf refuse an older system rather than install a server that cannot
@@ -20,6 +36,8 @@ overrides:
   deb:
     depends:
       - libc6 (>= 2.34)
+    replaces:
+      - kividb-full
   rpm:
     depends:
       - shadow-utils

@@ -10,12 +10,12 @@
 # named anything. The packages already in SITE are kept, so users can pin or
 # go back to an older version, except that only the newest $KEEP versions of
 # each package and architecture are kept (GitHub Pages sites are meant to
-# stay under 1 GB; a release adds about 25 MB).
+# stay under 1 GB; a release adds about 56 MB: kividb and kividb-full).
 #
 # Environment:
 #   GPG_KEY   fingerprint of the signing key, already in gpg's keyring, usable
 #             with no passphrase prompt (the workflow presets the passphrase)
-#   KEEP      versions kept per package and architecture (default 20)
+#   KEEP      versions kept per package and architecture (default 12)
 #   BASE_URL  where the site is served (default https://packages.kividb.io)
 #   GLIBC_DEP_CHECK  fail (default) or warn: what to do with a package that
 #             does not say it needs glibc 2.34 or newer (docs/INSTALL.md
@@ -39,7 +39,7 @@ set -euo pipefail
 SITE="$(realpath "${1:?usage: build-repos.sh SITE INCOMING}")"
 INCOMING="$(realpath "${2:?usage: build-repos.sh SITE INCOMING}")"
 GPG_KEY="${GPG_KEY:?set GPG_KEY to the fingerprint of the signing key}"
-KEEP="${KEEP:-20}"
+KEEP="${KEEP:-12}"
 BASE_URL="${BASE_URL:-https://packages.kividb.io}"
 BASE_URL="${BASE_URL%/}"
 
@@ -346,17 +346,18 @@ touch .nojekyll
 <style>body{font:16px/1.5 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem}pre{background:#f4f4f4;padding:.75rem;overflow-x:auto}code{font-size:.9em}</style>
 </head><body>
 <h1>KiviDB packages</h1>
-<p>apt and dnf repositories for <a href="https://github.com/kividbio/kividb">KiviDB</a>, the default
-build (no Lua, no TLS), for amd64/x86_64 and arm64/aarch64. Metadata and RPMs are signed with the key
-<code>$fpr</code>.</p>
+<p>apt and dnf repositories for <a href="https://github.com/kividbio/kividb">KiviDB</a>, for
+amd64/x86_64 and arm64/aarch64: <code>kividb</code>, the default build (no Lua, no TLS), and
+<code>kividb-full</code>, with Lua scripting and TLS. Install one or the other; installing one replaces
+the other. Metadata and RPMs are signed with the key <code>$fpr</code>.</p>
 <h2>Debian and Ubuntu</h2>
 <pre>sudo install -d -m 0755 /etc/apt/keyrings
 curl -fsSL $BASE_URL/kividb.gpg | sudo tee /etc/apt/keyrings/kividb.gpg &gt;/dev/null
 curl -fsSL $BASE_URL/kividb.sources | sudo tee /etc/apt/sources.list.d/kividb.sources &gt;/dev/null
-sudo apt update &amp;&amp; sudo apt install kividb</pre>
+sudo apt update &amp;&amp; sudo apt install kividb      # or: kividb-full</pre>
 <h2>Fedora, RHEL and compatibles, Amazon Linux 2023</h2>
 <pre>sudo curl -fsSL -o /etc/yum.repos.d/kividb.repo $BASE_URL/kividb.repo
-sudo dnf install kividb</pre>
+sudo dnf install kividb      # or: kividb-full</pre>
 <p>Full instructions: <a href="https://github.com/kividbio/kividb/blob/master/docs/INSTALL.md">docs/INSTALL.md</a>.
 The newest $KEEP versions are kept.</p>
 <h2>Versions</h2>

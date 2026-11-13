@@ -322,7 +322,7 @@ pub(crate) const REDIS_VERSION: &str = "8.10.0";
 #[cfg(not(feature = "lua"))]
 const NO_LUA: &str = concat!(
     "ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the ",
-    "lua or full variant (Docker image kividb/kividb:v",
+    "lua or full variant (the kividb-full apt/dnf package, Docker image kividb/kividb:v",
     env!("CARGO_PKG_VERSION"),
     "-lua, or a kividb-lua release file)"
 );
@@ -4253,6 +4253,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
                 out.push_str(&format!("arch_bits:{}\r\n", usize::BITS));
                 out.push_str(&format!("kividb_version:{}\r\n", env!("CARGO_PKG_VERSION")));
+                // Which of the release's builds: default, lua, tls or full
+                // (the `kividb` and `kividb-full` packages, #732).
+                out.push_str(&format!(
+                    "kividb_variant:{}\r\n",
+                    crate::update_check::variant()
+                ));
                 // That a replica of this server need not expire keys
                 // itself: each one expired here is sent to it as a `DEL`
                 // (`replication::expiry_propagated_by`).

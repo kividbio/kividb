@@ -1086,13 +1086,43 @@ fn read_language_section(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::
 }
 
 /// The libraries loaded now, as a `FUNCTION DUMP` payload: `None` when there
-/// is none, or in a build without Lua, which cannot load any.
+/// is none. In a build without Lua, the libraries of the image it loaded,
+/// kept as they were ([`KEPT_FUNCTIONS`]).
 fn function_libraries() -> Option<Vec<u8>> {
     #[cfg(feature = "lua")]
     let libraries = crate::commands::library_snapshot();
     #[cfg(not(feature = "lua"))]
-    let libraries = None;
+    let libraries = KEPT_FUNCTIONS.get();
     libraries
+}
+
+/// The function libraries a build without Lua was given (by a snapshot, an
+/// AOF's preamble, a Redis RDB file or a master's full sync), as the payload
+/// they came in. It cannot run them, but it writes them back unchanged into
+/// every image it makes, so that going from the `full` or `lua` build to the
+/// default one and back (the `kividb-full` and `kividb` packages, #732)
+/// leaves them where they were. Replaced, like loaded libraries, by the next
+/// image loaded.
+#[cfg(not(feature = "lua"))]
+static KEPT_FUNCTIONS: KeptFunctions = KeptFunctions::new();
+
+/// A payload held as it came: see [`KEPT_FUNCTIONS`].
+#[cfg(not(feature = "lua"))]
+struct KeptFunctions(std::sync::Mutex<Option<Vec<u8>>>);
+
+#[cfg(not(feature = "lua"))]
+impl KeptFunctions {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    fn get(&self) -> Option<Vec<u8>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set(&self, payload: Option<Vec<u8>>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = payload;
+    }
 }
 
 /// The function libraries' section, which closes a KDB image. Absent when
@@ -1109,8 +1139,8 @@ fn write_kdb_functions_section(w: &mut impl Write, libraries: Option<&[u8]>) -> 
 /// in place of those loaded, as Redis does with the ones in an RDB file: an
 /// image without any leaves none.
 ///
-/// A build without Lua cannot load them, and says so: they are not in its
-/// next snapshot.
+/// A build without Lua cannot load them, and says so. It keeps them as they
+/// came and writes them back into its next snapshot ([`KEPT_FUNCTIONS`]).
 pub fn restore_functions(functions: Option<Vec<u8>>) -> io::Result<()> {
     #[cfg(feature = "lua")]
     crate::commands::restore_library_snapshot(functions.as_deref()).map_err(|e| {
@@ -1120,14 +1150,18 @@ pub fn restore_functions(functions: Option<Vec<u8>>) -> io::Result<()> {
         )
     })?;
     #[cfg(not(feature = "lua"))]
-    if let Some(payload) = functions {
-        let names = function_library_names(&payload)
-            .map(|names| format!(" {}", names.join(", ")))
-            .unwrap_or_default();
-        log_warn!(
-            "the snapshot's function libraries{names} are not loaded: this build was made \
-             without Lua, and they are not in its next snapshot"
-        );
+    {
+        if let Some(payload) = &functions {
+            let names = function_library_names(payload)
+                .map(|names| format!(" {}", names.join(", ")))
+                .unwrap_or_default();
+            log_warn!(
+                "the snapshot's function libraries{names} are not loaded: this build was made \
+                 without Lua, so FUNCTION and FCALL are refused. They are kept as they are, \
+                 and saved again in this server's snapshots, for a build with Lua"
+            );
+        }
+        KEPT_FUNCTIONS.set(functions);
     }
     Ok(())
 }
@@ -6978,11 +7012,19 @@ mod function_section_tests {
         }
     }
 
-    /// A build without Lua loads such an image, and leaves the libraries out.
+    /// A build without Lua holds the libraries it was given as they came,
+    /// and lets them go when it is given none. On a holder of its own: the
+    /// server's one is process-global, and every other test here writes
+    /// images (tests/functions_without_lua.rs has the server's own).
     #[cfg(not(feature = "lua"))]
     #[test]
-    fn a_build_without_lua_loads_an_image_with_libraries() {
-        assert!(restore_functions(Some(b"KVFN payload".to_vec())).is_ok());
+    fn a_build_without_lua_keeps_the_libraries_it_was_given() {
+        let kept = KeptFunctions::new();
+        assert_eq!(kept.get(), None);
+        kept.set(Some(b"KVFN payload".to_vec()));
+        assert_eq!(kept.get().as_deref(), Some(&b"KVFN payload"[..]));
+        kept.set(None);
+        assert_eq!(kept.get(), None);
     }
 }
 

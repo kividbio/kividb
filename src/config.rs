@@ -59,11 +59,27 @@ pub enum IoModel {
     Tokio, // always use tokio
 }
 
+/// What `kividb --version` prints after the name: the version, and which of
+/// the release's builds this is (`update_check::variant`), since the
+/// `kividb` and `kividb-full` packages install the same `/usr/bin/kividb`
+/// (#732).
+#[cfg(all(feature = "lua", feature = "tls"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (full build: Lua, TLS)");
+#[cfg(all(feature = "lua", not(feature = "tls")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (lua build: Lua, no TLS)");
+#[cfg(all(not(feature = "lua"), feature = "tls"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (tls build: TLS, no Lua)");
+#[cfg(all(not(feature = "lua"), not(feature = "tls")))]
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (default build: no Lua, no TLS)"
+);
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "kividb",
     about = "Fast Redis-compatible store",
-    version = env!("CARGO_PKG_VERSION"),
+    version = VERSION,
     author = env!("CARGO_PKG_AUTHORS")
 )]
 pub struct Config {

@@ -9,6 +9,7 @@ GitHub Releases; [BUILDING.md](BUILDING.md) covers building from source, and
 - [Fedora, RHEL and compatibles, Amazon Linux 2023 (dnf)](#fedora-rhel-and-compatibles-amazon-linux-2023-dnf)
 - [What the package installs](#what-the-package-installs)
 - [Upgrading, pinning and going back](#upgrading-pinning-and-going-back)
+- [Switching between kividb and kividb-full](#switching-between-kividb-and-kividb-full)
 - [Removing](#removing)
 - [The signing key](#the-signing-key)
 - [Homebrew](#homebrew)
@@ -29,9 +30,19 @@ published, so `apt upgrade` and `dnf upgrade` keep KiviDB current. Until then,
 and for 1.2.0, use the `.deb` and `.rpm` files attached to each GitHub Release
 (see [Linux packages from GitHub Releases](#linux-packages-from-github-releases)).
 
-The packages are the default build, without Lua or TLS (see
-[Builds](BUILDING.md#builds)). For `EVAL` or a TLS listener, use the `-lua`,
-`-tls` or `-full` tarball or image.
+There are two packages, and one or the other is installed:
+
+- `kividb`, the default build, without Lua or TLS (see
+  [Builds](BUILDING.md#builds));
+- `kividb-full`, from 1.3.0, the full build: Lua scripting (`EVAL`,
+  `FUNCTION`, `FCALL`, which job queues such as BullMQ and Sidekiq need) and
+  TLS.
+
+They install the same files, so you go on running `kividb ...` and
+`systemctl ... kividb` whichever is installed, and installing one replaces
+the other: see
+[Switching between kividb and kividb-full](#switching-between-kividb-and-kividb-full).
+For the `lua` or `tls` build alone, use its tarball or image.
 
 They need glibc 2.34 or newer: Debian 12, Ubuntu 22.04, RHEL, Rocky Linux and
 AlmaLinux 9, Fedora 35, Amazon Linux 2023, or later. On an older system the
@@ -52,7 +63,7 @@ Suites: stable
 Components: main
 Signed-By: /etc/apt/keyrings/kividb.gpg
 EOF
-sudo apt update && sudo apt install -y kividb
+sudo apt update && sudo apt install -y kividb     # or kividb-full, for Lua and TLS
 ```
 
 Check that the key you downloaded has the fingerprint under
@@ -72,7 +83,7 @@ Use one or the other, not both. Both files can also be downloaded:
 
 ```bash
 sudo curl -fsSL -o /etc/yum.repos.d/kividb.repo https://packages.kividb.io/kividb.repo
-sudo dnf install -y kividb
+sudo dnf install -y kividb      # or kividb-full, for Lua and TLS
 ```
 
 `kividb.repo` is:
@@ -94,6 +105,8 @@ key: check that its fingerprint is the one under
 you).
 
 ### What the package installs
+
+`kividb` and `kividb-full` install the same files:
 
 - `/usr/bin/kividb`;
 - a systemd unit, `kividb.service`, which runs the server as the `kividb`
@@ -121,15 +134,17 @@ user, from `/var/lib/kividb`.
 ### Upgrading, pinning and going back
 
 An upgrade restarts the unit if it is running, and leaves it stopped or
-disabled if you stopped or disabled it.
+disabled if you stopped or disabled it. It stays on the package you have:
+`kividb-full` is upgraded to the next `kividb-full`, and `kividb` to the next
+`kividb`.
 
 ```bash
 sudo apt update && sudo apt upgrade            # Debian, Ubuntu
-sudo dnf upgrade kividb                        # Fedora, RHEL, Amazon Linux
+sudo dnf upgrade kividb                        # Fedora, RHEL, Amazon Linux (or kividb-full)
 ```
 
-The newest 20 releases are kept in the repositories, so you can install a
-given one, or go back to it:
+The newest 12 releases are kept in the repositories, so you can install a
+given one, or go back to it (the same with `kividb-full`):
 
 ```bash
 apt list -a kividb                                   # the versions on offer
@@ -144,6 +159,57 @@ sudo dnf versionlock add kividb                      # needs the versionlock plu
 Before going back across a minor release, read that release's upgrade notes
 in [CHANGELOG.md](../CHANGELOG.md): a newer server may have written files an
 older one cannot read.
+
+### Switching between kividb and kividb-full
+
+To go from `kividb` to `kividb-full`:
+
+```bash
+sudo apt install kividb-full          # Debian, Ubuntu: removes kividb
+sudo dnf swap kividb kividb-full      # Fedora, RHEL, Amazon Linux
+```
+
+And back:
+
+```bash
+sudo apt install kividb
+sudo dnf swap kividb-full kividb
+```
+
+In one step, the package you have is removed and the other one installed:
+
+- **The config is kept.** `/etc/kividb/kividb.conf` stays as you edited it.
+  If the new package's default config differs from the one you started from,
+  it is put beside yours as `kividb.conf.dpkg-dist` (apt asks first, at a
+  terminal) or `kividb.conf.rpmnew`. With apt, the package removed keeps its
+  config record (`apt list --installed` does not show it; `dpkg -l` shows it
+  as `rc`); `sudo apt purge kividb` then does not delete the config the other
+  package now uses.
+- **The data is untouched.** The unit is stopped, so the server writes its
+  final snapshot to `/var/lib/kividb`, and the new server starts from it.
+- **The service comes back as it was.** If the unit was running, it is
+  started again on the new binary; if it was enabled, it stays enabled; if
+  you had stopped or disabled it, it stays that way.
+- **Upgrades stay on the new package.**
+
+To see which build is running: `kividb --version` says `(default build: no
+Lua, no TLS)` or `(full build: Lua, TLS)`, and `INFO server` has
+`kividb_variant:default` or `kividb_variant:full`.
+
+**Going back to `kividb` with Lua functions stored.** The default build has
+no Lua. It starts on the data `kividb-full` saved, every key in it, and
+refuses `EVAL`, `FCALL`, `FUNCTION` and `SCRIPT` with `ERR this build of
+KiviDB has no Lua`; the log names the function libraries it holds. Whatever
+uses them (BullMQ and Sidekiq, for example) stops working, so stop those
+first. The libraries stored with `FUNCTION LOAD` are kept as they are: the
+default build writes them into its own snapshots, so after swapping back to
+`kividb-full` they are there again. Scripts loaded with `SCRIPT LOAD` are
+saved by neither build, as in Redis; clients load them again. One case loses
+libraries: with `appendonly yes`, after `kividb-full` stopped without its
+final snapshot (it crashed, or was killed), the libraries loaded since its
+last snapshot are only in the AOF, as `FUNCTION LOAD` commands the default
+build cannot run, and its next AOF checkpoint drops them. Swap while the
+server is running normally, or start `kividb-full` once more first.
 
 ### Removing
 
@@ -184,11 +250,25 @@ added, so their checksums differ from the release's files.
 
 ## Homebrew
 
-On macOS, Homebrew installs the default variant:
+On macOS, the tap has the default variant and, from 1.3.0, the full one (Lua
+and TLS):
 
 ```bash
 brew install kividbio/tap/kividb
+brew install kividbio/tap/kividb-full
 ```
+
+Both install `kividb`, so one or the other is installed. To switch:
+
+```bash
+brew uninstall kividb && brew install kividbio/tap/kividb-full
+brew uninstall kividb-full && brew install kividbio/tap/kividb      # and back
+```
+
+With `brew services`, stop the service before and start the other one after
+(`brew services stop kividb`, `brew services start kividb-full`). What is
+said above about [Lua functions stored](#switching-between-kividb-and-kividb-full)
+holds here too.
 
 ## Cargo
 
@@ -347,9 +427,11 @@ Each tarball unpacks to a `kividb/` directory holding the `kividb` binary, `LICE
 
 Each variant other than the default has its name in the file: `kividb-lua-linux-x86_64.tar.gz`,
 `kividb-tls-…`, `kividb-full-…`. The default variant is also packaged for Linux as
-`kividb_amd64.deb` / `kividb_arm64.deb` and `kividb.x86_64.rpm` / `kividb.aarch64.rpm`,
-built with [nfpm](https://github.com/goreleaser/nfpm) from
-[`packaging/nfpm.yaml`](../packaging/nfpm.yaml). A `SHA256SUMS.txt` file lists the checksum
+`kividb_amd64.deb` / `kividb_arm64.deb` and `kividb.x86_64.rpm` / `kividb.aarch64.rpm`, and
+from 1.3.0 the full variant as `kividb-full_amd64.deb` / `kividb-full_arm64.deb` and
+`kividb-full.x86_64.rpm` / `kividb-full.aarch64.rpm`, built with
+[nfpm](https://github.com/goreleaser/nfpm) from [`packaging/nfpm.yaml`](../packaging/nfpm.yaml)
+(`packaging/nfpm-config.sh`). A `SHA256SUMS.txt` file lists the checksum
 of every file in a release.
 
 ## Linux packages from GitHub Releases
@@ -363,6 +445,9 @@ starts the unit, and an upgrade restarts it:
 sudo apt install ./kividb_amd64.deb     # or: sudo dnf install ./kividb.x86_64.rpm
 redis-cli -p 6380 PING
 ```
+
+`kividb-full_amd64.deb` and `kividb-full.x86_64.rpm` are the full build (Lua
+and TLS), from 1.3.0; installing one package replaces the other, as above.
 
 ```bash
 curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb_amd64.deb && sudo dpkg -i kividb_amd64.deb
@@ -394,9 +479,10 @@ The repositories are the GitHub Pages site of
 workflow's `package-repos` job (`.github/workflows/package-repos.yml`), in
 the `packages` environment:
 
-1. downloads the release's four packages and checks them against
-   `SHA256SUMS.txt` and their build attestations;
-2. checks out the site, adds the packages, signs each RPM, keeps the newest 20
+1. downloads the release's packages, `kividb` and `kividb-full` for each
+   architecture (eight files), and checks them against `SHA256SUMS.txt` and
+   their build attestations;
+2. checks out the site, adds the packages, signs each RPM, keeps the newest 12
    versions of each package and architecture, regenerates and signs the apt
    (`apt-ftparchive`) and dnf (`createrepo_c`) metadata, all with
    `packaging/repos/build-repos.sh`;
@@ -413,10 +499,27 @@ find the indexes they were told about: apt's indexes are also served by their
 digest (`by-hash`), and the dnf metadata files are named by theirs. In both,
 the previous generation is kept beside the new one and older ones are removed.
 
-**Size.** A release adds about 25 MB. GitHub Pages sites are limited to 1 GB,
-and the job fails above 900 MB; 20 releases are about 500 MB. If more
-packages are added per release (for example `-lua`, `-tls` and `-full`
-packages, about four times as much), lower `KEEP` in the workflow.
+**Size.** A release adds about 56 MB: four `kividb` packages of about 6.6 MB
+and four `kividb-full` packages of about 7.4 MB. GitHub Pages sites are
+limited to 1 GB, and the job fails above 900 MB; with `KEEP` at 12, the site
+is about 670 MB. If more packages are added per release (`-lua` or `-tls`
+packages), or they grow, lower `KEEP` in the workflow.
+
+**Before publishing.** The release workflow's `package-test` job builds both
+packages from the release's x86_64 binaries and runs
+`packaging/test/swap-test.sh`: in Debian 12, Ubuntu 24.04, Rocky Linux 9 and
+Amazon Linux 2023 containers running systemd, it installs `kividb`, swaps to
+`kividb-full` and back, and upgrades each, checking the config, the data,
+the service and the stored functions at each step. `publish` waits for it.
+It runs anywhere with Docker:
+`bash packaging/test/swap-test.sh <default kividb> <full kividb>`, with
+binaries built on glibc 2.34 (in `amazonlinux:2023`).
+
+**Homebrew.** The release workflow's `homebrew-tap-update` job writes
+`Formula/kividb.rb` and `Formula/kividb-full.rb` in
+[`kividbio/homebrew-tap`](https://github.com/kividbio/homebrew-tap) with
+`packaging/homebrew/formula.sh`, from the release's `SHA256SUMS.txt`, and
+pushes them with the `HOMEBREW_TAP_TOKEN` secret.
 
 **Secrets.** The job is skipped, with a notice, until the key and the deploy
 key are set in the `packages` environment of `kividbio/kividb`:
