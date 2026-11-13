@@ -485,27 +485,32 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
             let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
-            let incr: f64 = match parse_utf8(cmd[3]).and_then(|s| s.parse::<f64>().ok()) {
-                Some(n) if n.is_finite() => n,
-                Some(_) => return Some(resp_error("ERR value is NaN or Infinity")),
+            // In `long double`, as `INCRBYFLOAT` (#387).
+            use crate::commands::long_double::{self, Increment, LongDouble, Parsed};
+            let incr = match LongDouble::parse(cmd[3]) {
+                Some(Parsed::Infinite) => {
+                    return Some(resp_error("ERR value is NaN or Infinity"));
+                }
+                Some(n) => n,
                 None => return Some(resp_error("ERR value is not a valid float")),
             };
 
             // As `HINCRBY`.
             lazy_expire_key(ctx.store, *ctx.selected_db, key);
             let result = match write_hash(ctx, key, |fields, _expiries| {
-                let current: f64 = match fields.get(&field) {
-                    None => 0.0,
-                    Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                let current = match fields.get(&field) {
+                    None => long_double::ZERO,
+                    Some(v) => match LongDouble::parse(v) {
                         Some(n) => n,
                         None => return Err(resp_error("ERR hash value is not a float")),
                     },
                 };
-                let next = current + incr;
-                if !next.is_finite() {
-                    return Err(resp_error("ERR increment would produce NaN or Infinity"));
-                }
-                let s = format!("{}", next);
+                let s = match long_double::increment(current, incr) {
+                    Increment::Sum(s) => s,
+                    Increment::NotFinite => {
+                        return Err(resp_error("ERR increment would produce NaN or Infinity"));
+                    }
+                };
                 fields.insert(field.clone(), Arc::from(s.as_bytes()));
                 Ok(resp_bulk_str(&s))
             }) {

@@ -31,6 +31,7 @@ pub mod latency;
 mod list_move;
 mod lists;
 pub(crate) mod login;
+pub(crate) mod long_double;
 #[cfg(feature = "lua")]
 mod lua;
 #[cfg(feature = "lua")]

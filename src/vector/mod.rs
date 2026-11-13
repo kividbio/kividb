@@ -2191,7 +2191,7 @@ pub fn json_return_value(doc: &serde_json::Value, path: &str) -> Option<Vec<u8>>
     let values = query.values(doc);
     Some(match values.first()?.as_ref() {
         serde_json::Value::String(s) => s.clone().into_bytes(),
-        other => serde_json::to_vec(other).ok()?,
+        other => crate::commands::json::json_bytes(other),
     })
 }
 

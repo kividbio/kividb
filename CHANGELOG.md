@@ -9,6 +9,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **JSON replies and doubles are written as Redis 8.10 writes them: `1e21`
+  in JSON text, doubles in `JSON.RESP`, `JSON.TYPE` and legacy-path
+  `JSON.NUMINCRBY` replies shaped for RESP3, and whole numbers up to 2^62
+  with all their digits (#471, #472, #473).** JSON text had `1e+21` where
+  RedisJSON writes `1e21`, `JSON.RESP` sent a float as the bulk string of
+  its JSON text, and a RESP3 double was never written with an exponent, so
+  `1e300` went out as 301 digits, and `-0` as `0`; a score of `100000000`
+  was `1e+8`. Under RESP3, `JSON.TYPE` replies in an array of one, as
+  RedisJSON does, and `JSON.NUMINCRBY`/`JSON.NUMMULTBY` through a legacy
+  path reply with every match; through a legacy path they now change every
+  number the path matches, as RedisJSON does, not only the first, and their
+  errors for a key or a number that is not there are RedisJSON's.
+
+  **Upgrade note:** a `JSON.NUMINCRBY` or `JSON.NUMMULTBY` through a legacy
+  path (`.a`, `..x`) now changes every number it matches. The command is
+  replicated and logged as sent, so where a legacy path matches more than
+  one number, a replica on an older version changes only the first and
+  ends up with a different document, and an AOF written by an older
+  version, replayed after the upgrade, now changes every match where the
+  older server changed only the first. Upgrade replicas before their
+  master, as always, and run `BGREWRITEAOF` before upgrading if such
+  commands are in the AOF.
+
+- **`MIGRATE` with an empty key argument and no `KEYS` migrates the empty
+  key (#458).** `MIGRATE host port "" db timeout` was a syntax error where
+  Redis migrates the key named `""`, and the key tables named no key for
+  that form, so ACL key checks did not see it. `KEYS` with nothing after
+  it now answers `NOKEY`, as in Redis.
+
+- **`INCRBYFLOAT` and `HINCRBYFLOAT` add as Redis does on x86-64, in
+  `long double`: `0.1 + 0.2` is `0.3`, not `0.30000000000000004` (#387).**
+  Redis reads both numbers with `strtold`, adds them in the 80-bit x87
+  format and writes the sum with 17 places, the zeros at the end left out;
+  KiviDB added in a double. The same arithmetic is now done exactly in
+  software, so the sum, the stored value and what replicas and the AOF get
+  are what Redis 8.10.2 gives, digit for digit, and numbers only a
+  `long double` holds (`1e400`) and hexadecimal ones are read as Redis
+  reads them.
+
+- **`HINCRBYFLOAT` goes to replicas and the AOF as the value it left, as
+  `HSETEX key KEEPTTL FIELDS 1 field value`, as Redis 8.10.2 sends it.**
+  It was sent as typed, so a replica or an AOF replay ran the addition
+  again: an AOF replayed over a snapshot that already had it added twice,
+  and any change to how the sum is worked out would make versions differ.
+  The field keeps its time to live on the replica and after a replay.
+
 - **A cluster node refuses to start with keys outside database 0 (#484).**
   It loaded them from a snapshot, an RDB file or its AOF into databases no
   client can reach in cluster mode, where slot accounting and migration

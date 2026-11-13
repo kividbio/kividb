@@ -2330,6 +2330,19 @@ fn the_empty_key_can_be_migrated() {
     assert!(reply.ok(), "MIGRATE: {reply:?}");
     assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
     assert_eq!(to.conn().cmd(&["HGET", "", ""]).s(), "v");
+
+    // Without `KEYS`, the empty key argument is the empty key, as in Redis:
+    // it was a syntax error (#458). `KEYS` and nothing after it moves
+    // nothing.
+    assert!(c.cmd(&["SET", "", "plain"]).ok());
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "REPLACE"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
+    assert_eq!(to.conn().cmd(&["GET", ""]).s(), "plain");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000"]);
+    assert_eq!(reply.s(), "NOKEY");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]);
+    assert_eq!(reply.s(), "NOKEY");
 }
 
 /// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
