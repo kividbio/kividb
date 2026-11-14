@@ -77,6 +77,8 @@ engines_fetch_release "$REFERENCE_TAG" full "$REGRESS_CACHE/releases" >/dev/null
 BIN[candidate]=$(engines_resolve_candidate "$CANDIDATE" "$REGRESS_CACHE/releases")
 BIN[redis]=$(engines_resolve_redis "$REGRESS_CACHE/redis")
 KIND[v1_2_2]=kividb KIND[candidate]=kividb KIND[redis]=redis
+# redis-cli and redis-benchmark of the same build, for the suites that drive them.
+export REGRESS_REDIS_SERVER=${BIN[redis]}
 if [ -z "$CAND_COMMIT" ]; then
   CAND_COMMIT=$("${BIN[candidate]}" --version 2>/dev/null | head -1 || true)
 fi
@@ -122,16 +124,24 @@ for f in "${SUITES[@]}"; do
     io=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["io"])' "$cfg")
     threads=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["threads"])' "$cfg")
     engs=$("$PYTHON" -c 'import json,sys;print(" ".join(json.loads(sys.argv[1])["engines"]))' "$cfg")
+    selfh=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1]).get("self_hosted", False)))' "$cfg")
     "$PYTHON" -c 'import json,sys;c=json.loads(sys.argv[1]);print(json.dumps({"suite":sys.argv[2],"config":c["name"],"engines":c["engines"]}))' \
       "$cfg" "$suite" >>"$EXPECTED"
     for e in $engs; do
       want_engine "$e" || continue
       echo "--- $suite $name $e"
       ran=$((ran + 1))
-      engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
+      srv=()
+      if [ "$selfh" = 1 ]; then
+        # The suite starts (and always stops) its own servers from --bin.
+        ENGINE_LOG=/dev/null
+      else
+        engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
+        srv=(--port "$ENGINE_PORT" --pid "$ENGINE_PID")
+      fi
       # In the background and waited for, so that a signal stops the run at once.
       timeout "$SUITE_TIMEOUT" "$PYTHON" "$here/suites/$f" --config "$name" --engine "$e" \
-        --kind "${KIND[$e]}" --port "$ENGINE_PORT" --pid "$ENGINE_PID" --out "$WORK" </dev/null &
+        --kind "${KIND[$e]}" "${srv[@]}" --bin "${BIN[$e]}" --out "$WORK" </dev/null &
       CHILD=$!
       rc=0
       wait "$CHILD" || rc=$?
