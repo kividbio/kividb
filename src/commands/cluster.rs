@@ -1791,6 +1791,27 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             ))
         }
         "APPLY" => syncslots_apply(ctx, &task_id),
+        // `CLUSTER SYNCSLOTS ORPHANCHECK <asker-id> <slot> ...`: what this
+        // node, the owner another one's slot table names, says of those
+        // slots before that one deletes its keys of them (#517).
+        "ORPHANCHECK" => {
+            let mut slots = Vec::with_capacity(ctx.cmd.len().saturating_sub(4));
+            for arg in &ctx.cmd[4..] {
+                match parse_slot_arg(arg) {
+                    Ok(slot) => slots.push(slot),
+                    Err(e) => return e,
+                }
+            }
+            let answer = crate::cluster::migration::off_the_runtime(|| {
+                crate::cluster::orphans::orphan_check_answer(
+                    ctx.cluster,
+                    ctx.store,
+                    ctx.repl_state,
+                    &slots,
+                )
+            });
+            resp_simple(&answer)
+        }
         other => resp_error(&format!(
             "ERR unknown CLUSTER SYNCSLOTS subcommand '{other}'"
         )),

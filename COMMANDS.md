@@ -1277,22 +1277,31 @@ are ways (`SETSLOT`/`MIGRATE` resharding, late heartbeats, restarts part way
 through a handover) in which they are the only copy of the slot's data. So
 the node reports them, and an operator deletes them:
 
-- A master logs a warning when it finds any: at startup, after it is
-  promoted, and after the slots it serves change (once they have settled,
+- A master logs a warning when it finds any. It counts them in full at
+  startup and after it is promoted, and after the slots it serves change it
+  counts only the slots that became orphans (once the change has settled,
   and not more often than every few seconds). The line names the slots and
   the count of keys, and is repeated only when they change, or after ten
   minutes.
 - `INFO cluster` reports `cluster_orphan_slots` and `cluster_orphan_keys`,
   as last counted. A replica reports 0: its keys are its master's.
-- `CLUSTER ORPHANSLOTS` lists them, counted afresh.
-- `CLUSTER DROPORPHANS` deletes them, once you know their owner has the
-  slots' data: compare the owner's `CLUSTER COUNTKEYSINSLOT` for the slots,
-  or read some of the keys there.
+- `CLUSTER ORPHANSLOTS` lists them, counted afresh, with their owners as
+  this node's slot table names them.
+- `CLUSTER DROPORPHANS` deletes them. This node's slot table can be out of
+  date (a destination that crashed before its claim reached this node, a
+  resharding left half done, a restart before the table was saved), and
+  then the keys here can be the only copy of the slot's data. So before it
+  deletes anything it asks each owner its table names, over a node-to-node
+  connection, and goes ahead only if that node says it owns the slot in its
+  own table, is not importing or migrating it, and holds keys of it. That
+  catches the cases above that a node can see; it cannot tell whether the
+  owner holds *these* keys. Look at the slots' data on the owner first
+  (read some of the keys there) all the same.
 
 | Command | Syntax | Notes |
 |---|---|---|
-| `CLUSTER ORPHANSLOTS` | `CLUSTER ORPHANSLOTS` | KiviDB's own. An array with one entry per run of consecutive slots this master holds keys of, does not serve, and that have the same owner: `[start-slot, end-slot, key-count, owner-id]`, the owner `nil` for an unassigned slot. Slots whose keys are already being deleted (a slot that left this node, an atomic migration's handover) are not listed. Empty on a replica. Walks the keys of the shards of those slots, a few thousand at a time per hold of a shard's lock. |
-| `CLUSTER DROPORPHANS` | `CLUSTER DROPORPHANS [SLOT slot [slot ...] \| SLOTSRANGE start end [start end ...]]` | KiviDB's own. Deletes this master's keys of the slots given, or, without arguments, of every slot `CLUSTER ORPHANSLOTS` lists. Replies with the number of keys found to delete and deletes them in the background, in batches, as a master deletes the keys of a slot it lost: through the write path, so the `DEL`s reach its replicas and its AOF. The log says when it is done. All the slots or none: it refuses, naming the slot and why, on a replica; for a slot this node owns, imports or migrates (`CLUSTER SETSLOT`); for a slot in an atomic slot migration here, running or ended in the last few seconds, or whose keys are already being deleted; while an atomic migration away from this node is handing slots over, or ended in the last few seconds; while this node does not know yet whether a replica of it took its slots over; and unless the slot's owner is another master that this node sees as up (not `fail` or `fail?`, not in a handshake, and heard from since this node started). A slot that comes back to this node while it runs keeps its keys. In `@admin`, `@dangerous` and `@slow`; refused in scripts. Never run on its own. |
+| `CLUSTER ORPHANSLOTS` | `CLUSTER ORPHANSLOTS` | KiviDB's own. An array with one entry per run of consecutive slots this master holds keys of, does not serve, and that have the same owner: `[start-slot, end-slot, key-count, owner-id]`, the owner `nil` for an unassigned slot (the owner as this node's slot table names it: `CLUSTER DROPORPHANS` asks the owner itself). Slots whose keys are already being deleted (a slot that left this node, an atomic migration's handover) are not listed. Empty on a replica. O(N) in the node's keys: the slots a master does not serve have keys in every shard; it walks them a few thousand buckets per hold of a shard's lock. In `@admin`, `@dangerous` and `@slow`; refused in scripts. |
+| `CLUSTER DROPORPHANS` | `CLUSTER DROPORPHANS [SLOT slot [slot ...] \| SLOTSRANGE start end [start end ...]]` | KiviDB's own. Deletes this master's keys of the slots given, or, without arguments, of every slot `CLUSTER ORPHANSLOTS` lists. Replies with the number of keys found to delete and deletes them in the background, in batches, as a master deletes the keys of a slot it lost: through the write path, so the `DEL`s reach its replicas and its AOF. The log says when it is done. All the slots or none: it refuses, naming the slot and why, on a replica; for a slot this node owns, imports or migrates (`CLUSTER SETSLOT`); for a slot in an atomic slot migration here, running or ended in the last few seconds, or whose keys are already being deleted; while an atomic migration away from this node is handing slots over, or ended in the last few seconds; while this node does not know yet whether a replica of it took its slots over; unless the slot's owner is another master that this node sees as up (not `fail` or `fail?`, not in a handshake, and heard from since this node started); and unless that owner, asked directly (`CLUSTER SYNCSLOTS ORPHANCHECK`, over the connection and with the credentials an atomic slot migration uses), says it owns the slot in its own table, is not importing or migrating it (`SETSLOT`, or an atomic slot migration running or ended in the last few seconds), and holds keys of it whenever this node does. An owner that cannot be asked, or runs a version without `ORPHANCHECK`, refuses it too. There is no option to skip any of this. A slot that comes back to this node while it runs keeps its keys. In `@admin`, `@dangerous` and `@slow`; refused in scripts. Never run on its own. |
 
 ### Configuration flags
 

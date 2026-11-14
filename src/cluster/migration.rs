@@ -581,6 +581,36 @@ impl Peer {
             Err(e) => Err(format!("read from the other node failed: {e}")),
         }
     }
+
+    /// Send one already-encoded command and return its status reply's text.
+    fn ask(&mut self, encoded: &[u8]) -> Result<String, String> {
+        let stream = self.reader.get_mut();
+        stream
+            .write_all(encoded)
+            .and_then(|()| stream.flush())
+            .map_err(|e| format!("write to the other node failed: {e}"))?;
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Err("the other node closed the connection".into()),
+            Ok(_) => {
+                let line = line.trim_end();
+                match line.strip_prefix('+') {
+                    Some(text) => Ok(text.to_string()),
+                    None => Err(line.trim_start_matches('-').to_string()),
+                }
+            }
+            Err(e) => Err(format!("read from the other node failed: {e}")),
+        }
+    }
+}
+
+/// Send `parts` to `node` over a node-to-node connection of its own (the
+/// one an atomic slot migration uses: `tls-cluster`, and the replication
+/// credentials), and return its status reply's text. For `CLUSTER SYNCSLOTS
+/// ORPHANCHECK` (#517).
+pub(crate) fn ask_node(env: &Env, node: &NodeId, parts: &[&[u8]]) -> Result<String, String> {
+    let mut peer = Peer::connect(env, node)?;
+    peer.ask(&command(parts))
 }
 
 // ── Key helpers ──────────────────────────────────────────────────────────────

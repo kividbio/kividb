@@ -1498,6 +1498,7 @@ fn test_dangerous_category_denies_what_it_names() {
         "CLUSTER|MIGRATION",
         "CLUSTER|SYNCSLOTS",
         "CLUSTER|DROPORPHANS",
+        "CLUSTER|ORPHANSLOTS",
         "CLIENT|KILL",
         "BACKUP|START",
         "HOTKEYS|START",

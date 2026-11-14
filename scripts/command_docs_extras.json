@@ -932,7 +932,7 @@
     },
     "CLUSTER DROPORPHANS": {
         "summary": "Deletes, in the background, the keys a master holds of slots another master owns.",
-        "complexity": "O(N), N being the number of keys in the shards of the slots given.",
+        "complexity": "O(N), N being the number of keys in the node.",
         "group": "cluster",
         "since": "",
         "arguments": [
@@ -969,7 +969,7 @@
     },
     "CLUSTER ORPHANSLOTS": {
         "summary": "Returns the slots a master holds keys of but does not serve, with their key counts and owners.",
-        "complexity": "O(N), N being the number of keys in the shards of the slots this node does not serve.",
+        "complexity": "O(N), N being the number of keys in the node.",
         "group": "cluster",
         "since": ""
     },

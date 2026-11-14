@@ -20,19 +20,25 @@
 // * `orphan_counts` counts them, per slot: the keys of the slots that are
 //   not this node's, nor being imported into it, nor migrating away from
 //   it, nor in an atomic slot migration here, nor having their keys deleted
-//   already. Keys are placed by slot in cluster mode, so only the shards of
-//   those slots are walked, a few thousand buckets per hold of a shard's
-//   read lock.
-// * A thread of its own counts them at startup, after a promotion, and
-//   after the slots this node serves change (once they have stayed the same
-//   for a moment, and no more than every few seconds), and logs a warning
-//   when it finds any. `INFO cluster` reports the last count.
+//   already. The slots a master does not serve have keys in every shard,
+//   so a full count is O(N) in the node's keys, a few thousand buckets per
+//   hold of a shard's read lock.
+// * A thread of its own counts them in full at startup and after a
+//   promotion, and after the slots this node serves change counts only the
+//   slots that became orphans (once they have stayed the same for a moment,
+//   and no more than every few seconds). It logs a warning when it finds
+//   any. `INFO cluster` reports the last count.
 // * `CLUSTER ORPHANSLOTS` lists them, counted afresh, with each slot's
-//   owner.
+//   owner as this node's slot table names it.
 // * `CLUSTER DROPORPHANS` deletes them, on a master only, and only for
 //   slots another master owns, that this node sees as up, with no slot
 //   migration or handover of them under way that this node knows of
-//   (`check_droppable`).
+//   (`check_droppable`). This node's slot table can be out of date (a
+//   destination that crashed before its claim reached this node, a
+//   resharding half done, a restart before the table was saved), so the
+//   owner it names is asked as well (`CLUSTER SYNCSLOTS ORPHANCHECK`): it
+//   must own the slot in its own table, not be moving it, and hold keys of
+//   it (`confirm_with_owners`). Anything else refuses, with no way round.
 
 use super::migration::{self, Env, TaskState, in_ranges};
 use super::{
@@ -148,9 +154,10 @@ impl Orphans {
             "Cluster: {why}, this node holds {keys} key(s) of {slots} slot(s) it does not serve \
              ({}). No client is sent to them here (they get -MOVED), but they take memory, \
              count in DBSIZE, SCAN and INFO keyspace, and are saved and replicated. CLUSTER \
-             ORPHANSLOTS lists them with their owners; once the owner is known to hold the \
-             slots' data, CLUSTER DROPORPHANS deletes them here. Nothing deletes them on its \
-             own (#517)",
+             ORPHANSLOTS lists them with their owners as this node's slot table names them. \
+             CLUSTER DROPORPHANS deletes them, once each owner has confirmed that it owns the \
+             slot and holds keys of it; check the slots' data on the owner first all the same. \
+             Nothing deletes them on its own (#517)",
             ranges_logged(found.iter().map(|&(slot, _)| slot))
         );
     }
@@ -193,24 +200,111 @@ pub(crate) fn orphan_counts(
     store: &crate::store::Store,
     repl_state: &ReplState,
 ) -> Found {
-    if !is_master(cluster, repl_state) {
-        return Vec::new();
-    }
-    let unserved = unserved(cluster);
-    let Some(db) = store.first() else {
-        return Vec::new();
+    found_of(&count_all(cluster, store, repl_state).counts)
+}
+
+/// What a count saw: the slots this node did not serve then, and per slot
+/// its keys of them.
+struct Counted {
+    master: bool,
+    generation: u64,
+    unserved: Vec<bool>,
+    counts: Vec<u64>,
+}
+
+/// Whether this node is a master, its replication generation, and per slot
+/// whether it does not serve it.
+type View = (bool, u64, Vec<bool>);
+
+/// The slots this node does not serve now, as [`Counted`] has them, before
+/// any key is counted.
+fn view(cluster: &ClusterState, repl_state: &ReplState) -> View {
+    let master = is_master(cluster, repl_state);
+    let unserved = if master {
+        unserved(cluster)
+    } else {
+        vec![false; CLUSTER_SLOTS]
     };
+    (master, repl_state.generation(), unserved)
+}
+
+/// Count every orphan key: O(N) in this node's keys, as the slots it does
+/// not serve have keys in every shard.
+fn count_all(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &ReplState,
+) -> Counted {
+    let (master, generation, unserved) = view(cluster, repl_state);
+    let counts = count_slots(store, &unserved);
+    Counted {
+        master,
+        generation,
+        unserved,
+        counts,
+    }
+}
+
+/// Count again after the slots this node serves changed, but for the
+/// change alone: the keys of the slots that were already orphans are as
+/// `before` counted them (nothing writes to them; `CLUSTER DROPORPHANS`
+/// and an old count in `INFO` ask for a full count), and only the shards of
+/// the slots that became orphans since are walked. A change of role is
+/// counted in full.
+fn count_change(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &ReplState,
+    before: &Counted,
+) -> Counted {
+    let (master, generation, unserved) = view(cluster, repl_state);
+    if (master, generation) != (before.master, before.generation) {
+        return count_all(cluster, store, repl_state);
+    }
+    let new: Vec<bool> = unserved
+        .iter()
+        .zip(&before.unserved)
+        .map(|(&now, &then)| now && !then)
+        .collect();
+    let mut counts = count_slots(store, &new);
+    for (slot, count) in counts.iter_mut().enumerate() {
+        if unserved[slot] && before.unserved[slot] {
+            *count = before.counts[slot];
+        }
+    }
+    Counted {
+        master,
+        generation,
+        unserved,
+        counts,
+    }
+}
+
+/// The slots with keys of `counts`, with their counts.
+fn found_of(counts: &[u64]) -> Found {
+    counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(slot, &n)| (slot as u16, n))
+        .collect()
+}
+
+/// Per slot, this node's keys of the slots `wanted` picks (0 for the
+/// others). Walks the shards of those slots only.
+fn count_slots(store: &crate::store::Store, wanted: &[bool]) -> Vec<u64> {
     let mut counts = vec![0u64; CLUSTER_SLOTS];
-    let holds = crate::store::shards_of_slots(db.len(), |slot| unserved[slot as usize]);
+    let Some(db) = store.first() else {
+        return counts;
+    };
+    if !wanted.iter().any(|&w| w) {
+        return counts;
+    }
+    let holds = crate::store::shards_of_slots(db.len(), |slot| wanted[slot as usize]);
     for (shard, _) in db.iter().zip(holds).filter(|(_, holds)| *holds) {
-        count_shard(shard, &unserved, &mut counts);
+        count_shard(shard, wanted, &mut counts);
     }
     counts
-        .into_iter()
-        .enumerate()
-        .filter(|&(_, n)| n > 0)
-        .map(|(slot, n)| (slot as u16, n))
-        .collect()
 }
 
 /// How many buckets of a shard's table a count looks at per hold of the
@@ -426,11 +520,21 @@ pub(crate) fn drop_orphans(env: &Env, wanted: Option<Vec<u16>>) -> Result<u64, S
         return Ok(0);
     }
     check_droppable(cluster, &slots)?;
-    let keys: u64 = found
+    let here: Vec<(u16, u64)> = slots
         .iter()
-        .filter(|(slot, _)| slots.binary_search(slot).is_ok())
-        .map(|&(_, n)| n)
-        .sum();
+        .map(|&slot| {
+            let n = found
+                .binary_search_by_key(&slot, |&(s, _)| s)
+                .map_or(0, |i| found[i].1);
+            (slot, n)
+        })
+        .collect();
+    // This node's slot table can be out of date: the owner it names must
+    // say so itself. Then the checks here once more, as the asking took a
+    // moment.
+    confirm_with_owners(env, &here)?;
+    check_droppable(cluster, &slots)?;
+    let keys: u64 = here.iter().map(|&(_, n)| n).sum();
     log_info!(
         "Cluster: CLUSTER DROPORPHANS: deleting the {keys} key(s) this node holds of {} slot(s) \
          owned by other masters ({})",
@@ -447,6 +551,181 @@ pub(crate) fn drop_orphans(env: &Env, wanted: Option<Vec<u16>>) -> Result<u64, S
         move || orphans.ask(Some("after CLUSTER DROPORPHANS")),
     )?;
     Ok(keys)
+}
+
+/// What `CLUSTER SYNCSLOTS ORPHANCHECK` asks and is told: per slot, whether
+/// the node asked owns it in its own slot table (and is a master), whether
+/// it is importing or migrating it (`SETSLOT`, or an atomic slot migration
+/// running or ended a moment ago), and how many keys of it it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerSays {
+    pub owned: bool,
+    pub moving: bool,
+    pub keys: u64,
+}
+
+/// The owner's side of `CLUSTER SYNCSLOTS ORPHANCHECK slot ...`: one word
+/// per slot, `slot:owned:moving:keys` (0 or 1 for the flags).
+pub(crate) fn orphan_check_answer(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &ReplState,
+    slots: &[u16],
+) -> String {
+    let says = owner_says(cluster, store, repl_state, slots);
+    slots
+        .iter()
+        .zip(says)
+        .map(|(slot, s)| {
+            format!(
+                "{slot}:{}:{}:{}",
+                u8::from(s.owned),
+                u8::from(s.moving),
+                s.keys
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn owner_says(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &ReplState,
+    slots: &[u16],
+) -> Vec<OwnerSays> {
+    let me = cluster.myself();
+    let master = is_master(cluster, repl_state);
+    let flags: Vec<(bool, bool)> = cluster.slot_migrations.with_tasks(|tasks| {
+        let owners = cluster.slots.read();
+        let migrations = cluster.migrations.read();
+        slots
+            .iter()
+            .map(|&slot| {
+                let owned = master && owners[slot as usize] == Some(me);
+                let moving = migrations.contains_key(&slot)
+                    || tasks.iter().any(|t| {
+                        in_ranges(&t.ranges, slot)
+                            && (t.state == TaskState::InProgress
+                                || t.ended_at
+                                    .is_some_and(|e| e.elapsed() < HANDOVER_FAILOVER_GRACE))
+                    });
+                (owned, moving)
+            })
+            .collect()
+    });
+    let mut wanted = vec![false; CLUSTER_SLOTS];
+    for &slot in slots {
+        wanted[slot as usize] = true;
+    }
+    let counts = count_slots(store, &wanted);
+    slots
+        .iter()
+        .zip(flags)
+        .map(|(&slot, (owned, moving))| OwnerSays {
+            owned,
+            moving,
+            keys: counts[slot as usize],
+        })
+        .collect()
+}
+
+/// Parse an `ORPHANCHECK` answer.
+fn parse_answer(text: &str) -> Option<Vec<(u16, OwnerSays)>> {
+    text.split_ascii_whitespace()
+        .map(|word| {
+            let mut parts = word.split(':');
+            let slot = parts.next()?.parse().ok()?;
+            let owned = parts.next()? == "1";
+            let moving = parts.next()? == "1";
+            let keys = parts.next()?.parse().ok()?;
+            Some((
+                slot,
+                OwnerSays {
+                    owned,
+                    moving,
+                    keys,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Whether `says`, the owner's answer for `slot`, of which this node holds
+/// `here` keys, lets this node delete them, or why not.
+fn owner_allows(slot: u16, owner: &str, here: u64, says: Option<OwnerSays>) -> Result<(), String> {
+    let Some(says) = says else {
+        return Err(format!(
+            "the owner of slot {slot}, {owner}, did not answer for it: nothing is deleted"
+        ));
+    };
+    if says.moving {
+        return Err(format!(
+            "the owner of slot {slot} in this node's slot table, {owner}, is importing or \
+             migrating it, or just has: send it again once the migration has settled"
+        ));
+    }
+    if !says.owned {
+        return Err(format!(
+            "slot {slot} is {owner}'s in this node's slot table, but {owner} says it does not \
+             own it: this node's slot table may be out of date, and these keys may be the only \
+             copy of the slot's"
+        ));
+    }
+    if here > 0 && says.keys == 0 {
+        return Err(format!(
+            "the owner of slot {slot}, {owner}, holds no keys of it, and this node holds \
+             {here}: these may be the only copy of the slot's"
+        ));
+    }
+    Ok(())
+}
+
+/// Ask the owner of each slot of `here` (`(slot, keys this node holds)`),
+/// as this node's slot table names it, over a node-to-node connection
+/// (`CLUSTER SYNCSLOTS ORPHANCHECK`) whether it owns the slot in its own
+/// table, is not moving it, and holds keys of it. Any slot it does not, or
+/// an owner that cannot be asked (unreachable, or of a version without the
+/// command), refuses the lot.
+fn confirm_with_owners(env: &Env, here: &[(u16, u64)]) -> Result<(), String> {
+    let mut by_owner: std::collections::BTreeMap<NodeId, Vec<(u16, u64)>> = Default::default();
+    {
+        let owners = env.cluster.slots.read();
+        for &(slot, n) in here {
+            // `check_droppable` has made sure there is one.
+            let Some(owner) = owners[slot as usize] else {
+                return Err(format!("slot {slot} has no owner"));
+            };
+            by_owner.entry(owner).or_default().push((slot, n));
+        }
+    }
+    let me = env.cluster.myself();
+    for (owner, slots) in by_owner {
+        let owner_id = node_id_str(&owner).to_string();
+        let words: Vec<String> = slots.iter().map(|(slot, _)| slot.to_string()).collect();
+        let mut parts: Vec<&[u8]> = vec![
+            &b"CLUSTER"[..],
+            &b"SYNCSLOTS"[..],
+            &b"ORPHANCHECK"[..],
+            &me[..],
+        ];
+        parts.extend(words.iter().map(|w| w.as_bytes()));
+        let answer = migration::ask_node(env, &owner, &parts).map_err(|e| {
+            format!(
+                "could not ask the owner of slot {}, {owner_id}, whether it holds the slot \
+                 ({e}): nothing is deleted",
+                slots[0].0
+            )
+        })?;
+        let says = parse_answer(&answer).ok_or_else(|| {
+            format!("the owner {owner_id} gave an answer this node cannot read: {answer}")
+        })?;
+        for &(slot, n) in &slots {
+            let said = says.iter().find(|(s, _)| *s == slot).map(|&(_, s)| s);
+            owner_allows(slot, &owner_id, n, said)?;
+        }
+    }
+    Ok(())
 }
 
 /// Runs of consecutive slots of `slots` (ascending), as `(first, last)`.
@@ -481,19 +760,6 @@ fn ranges_logged(slots: impl IntoIterator<Item = u16>) -> String {
     format!("slots {}", text.join(" "))
 }
 
-/// What the slots this node serves look like now, as a number that changes
-/// when they do, or when it becomes a master or a replica.
-fn fingerprint(cluster: &ClusterState, repl_state: &ReplState) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let master = is_master(cluster, repl_state);
-    (master, repl_state.generation()).hash(&mut hasher);
-    if master {
-        unserved(cluster).hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 /// Start the thread that counts the orphan keys when something may have
 /// left some ([`Orphans`]). Once, from `ClusterState::start`.
 pub(crate) fn start_watching(cluster: &Arc<ClusterState>) {
@@ -512,10 +778,10 @@ pub(crate) fn start_watching(cluster: &Arc<ClusterState>) {
 
 fn watch(cluster: &Weak<ClusterState>, orphans: &Orphans) {
     let started = Instant::now();
-    // The fingerprint of the last count, and when it was made.
-    let mut counted: Option<(u64, Instant)> = None;
-    // A fingerprint unlike it, and since when it has been the same.
-    let mut changed: Option<(u64, Instant)> = None;
+    // The last count, and when it was made.
+    let mut counted: Option<(Counted, Instant)> = None;
+    // A view unlike the last count's, and since when it has stayed so.
+    let mut changed: Option<(View, Instant)> = None;
     loop {
         let asked = orphans.wait(POLL);
         let Some(cluster) = cluster.upgrade() else {
@@ -525,29 +791,36 @@ fn watch(cluster: &Weak<ClusterState>, orphans: &Orphans) {
             continue;
         };
         let starter = &hooks.replica_starter;
-        let print = fingerprint(&cluster, &starter.repl_state);
-        let why = match (asked, counted) {
-            (Some(why), _) => Some(why),
-            (None, None) => (started.elapsed() >= STARTUP_DELAY).then_some(Some("at startup")),
-            (None, Some((seen, at))) if seen != print => {
-                let since = match changed {
-                    Some((p, since)) if p == print => since,
+        let (store, repl_state) = (&starter.store, &starter.repl_state);
+        let now = view(&cluster, repl_state);
+        let next = match (asked, &counted) {
+            (Some(why), _) => Some((count_all(&cluster, store, repl_state), why)),
+            (None, None) => (started.elapsed() >= STARTUP_DELAY)
+                .then(|| (count_all(&cluster, store, repl_state), Some("at startup"))),
+            (None, Some((last, at)))
+                if (now.0, now.1, &now.2) != (last.master, last.generation, &last.unserved) =>
+            {
+                let since = match &changed {
+                    Some((seen, since)) if *seen == now => *since,
                     _ => {
-                        changed = Some((print, Instant::now()));
+                        changed = Some((now, Instant::now()));
                         continue;
                     }
                 };
-                (since.elapsed() >= SETTLE && at.elapsed() >= MIN_GAP)
-                    .then_some(Some("after the slots it serves changed"))
+                (since.elapsed() >= SETTLE && at.elapsed() >= MIN_GAP).then(|| {
+                    (
+                        count_change(&cluster, store, repl_state, last),
+                        Some("after the slots it serves changed"),
+                    )
+                })
             }
             (None, Some(_)) => None,
         };
-        let Some(why) = why else {
+        let Some((count, why)) = next else {
             continue;
         };
-        let found = orphan_counts(&cluster, &starter.store, &starter.repl_state);
-        orphans.record(&found, why);
-        counted = Some((print, Instant::now()));
+        orphans.record(&found_of(&count.counts), why);
+        counted = Some((count, Instant::now()));
         changed = None;
     }
 }
@@ -653,6 +926,111 @@ mod tests {
         assert_eq!(check_droppable(&cs, &[100]), Ok(()));
         cs.marked_failed.store(true, Ordering::SeqCst);
         assert!(refused(&cs, 100).contains("marked as failed"));
+    }
+
+    /// A key of `slot`.
+    fn key_of(slot: u16) -> String {
+        (0..)
+            .map(|i| format!("k{i}"))
+            .find(|k| key_hash_slot(k.as_bytes()) == slot)
+            .unwrap()
+    }
+
+    fn put(store: &crate::store::Store, key: &str) {
+        let _ = crate::store::get_shard(&store[0], key)
+            .write()
+            .insert_str(key, "v");
+    }
+
+    /// Unless the owner says that it owns the slot, is not moving it, and
+    /// holds keys of it (when this node does), nothing is deleted. No answer
+    /// refuses too.
+    #[test]
+    fn the_owner_must_own_the_slot_not_move_it_and_hold_keys_of_it() {
+        let ok = OwnerSays {
+            owned: true,
+            moving: false,
+            keys: 3,
+        };
+        assert_eq!(owner_allows(5, "x", 2, Some(ok)), Ok(()));
+        let refused = |here, says| owner_allows(5, "x", here, says).unwrap_err();
+        assert!(refused(2, None).contains("did not answer"));
+        let not_owned = OwnerSays { owned: false, ..ok };
+        assert!(refused(2, Some(not_owned)).contains("says it does not own it"));
+        let moving = OwnerSays { moving: true, ..ok };
+        assert!(refused(2, Some(moving)).contains("importing or migrating"));
+        let empty = OwnerSays { keys: 0, ..ok };
+        assert!(refused(2, Some(empty)).contains("holds no keys of it"));
+        assert_eq!(owner_allows(5, "x", 0, Some(empty)), Ok(()));
+
+        assert_eq!(
+            parse_answer("5:1:0:3 7:0:1:0"),
+            Some(vec![
+                (5, ok),
+                (
+                    7,
+                    OwnerSays {
+                        owned: false,
+                        moving: true,
+                        keys: 0
+                    }
+                )
+            ])
+        );
+        assert_eq!(parse_answer("5:1"), None);
+        assert_eq!(parse_answer("x:1:0:0"), None);
+        assert_eq!(parse_answer(""), Some(Vec::new()));
+    }
+
+    /// What an owner answers: a slot of its own, on a master, not moving,
+    /// with its keys counted.
+    #[test]
+    fn an_owner_says_what_it_owns_moves_and_holds() {
+        let (cs, other) = two_masters();
+        let store = crate::store::new_store(1);
+        put(&store, &key_of(5));
+        let repl = ReplState::new_master();
+        let says = owner_says(&cs, &store, &repl, &[5, 6, 150]);
+        let mine = |keys| OwnerSays {
+            owned: true,
+            moving: false,
+            keys,
+        };
+        assert_eq!(says[0], mine(1));
+        assert_eq!(says[1], mine(0));
+        assert!(!says[2].owned);
+        cs.migrations
+            .write()
+            .insert(6, MigrationState::Migrating { dest_id: other });
+        assert!(owner_says(&cs, &store, &repl, &[6])[0].moving);
+        assert_eq!(orphan_check_answer(&cs, &store, &repl, &[6]), "6:1:1:0");
+        // A replica owns nothing.
+        repl.become_slave();
+        assert!(!owner_says(&cs, &store, &repl, &[5])[0].owned);
+    }
+
+    /// After the slots it serves change, only the slots that became
+    /// orphans are counted; those that were stay as counted.
+    #[test]
+    fn a_change_counts_the_new_orphans_alone() {
+        let (cs, other) = two_masters();
+        let store = crate::store::new_store(1);
+        let repl = ReplState::new_master();
+        put(&store, &key_of(150));
+        put(&store, &key_of(50));
+        let first = count_all(&cs, &store, &repl);
+        assert_eq!(found_of(&first.counts), vec![(150, 1)]);
+        // Slot 50 goes to the other master, its key left here.
+        cs.slots.write()[50] = Some(other);
+        let next = count_change(&cs, &store, &repl, &first);
+        assert_eq!(found_of(&next.counts), vec![(50, 1), (150, 1)]);
+        // Back here: no longer an orphan.
+        cs.slots.write()[50] = Some(cs.myself());
+        let back = count_change(&cs, &store, &repl, &next);
+        assert_eq!(found_of(&back.counts), vec![(150, 1)]);
+        // A replica's are its master's: counted in full, and none.
+        repl.become_slave();
+        assert!(found_of(&count_change(&cs, &store, &repl, &back).counts).is_empty());
     }
 
     #[test]

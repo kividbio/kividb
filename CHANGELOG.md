@@ -129,7 +129,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   background through the write path, so replicas and the AOF follow. It
   refuses on a replica, for a slot this node owns, imports or migrates,
   while a slot migration or handover of the slot is under way, and unless
-  the slot's owner is another master this node sees as up.
+  the slot's owner is another master this node sees as up. As this node's
+  slot table can be out of date, it also asks each owner directly, and
+  refuses unless the owner says it owns the slot, is not moving it, and
+  holds keys of it.
 - **A master refuses its vote to a replica that claims slots it knows a
   newer owner of (#524).** A replica that had not heard that its master
   handed slots over in an atomic slot migration, or lost them in a

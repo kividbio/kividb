@@ -350,7 +350,6 @@ fn not_allowed_from_script(name: &str, sub: Option<&[u8]>) -> bool {
             "MYID",
             "MYSHARDID",
             "NODES",
-            "ORPHANSLOTS",
             "SHARDS",
             "SLOT-STATS",
             "SLOTS",
