@@ -233,6 +233,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`Q8` and `BIN` vector sets search and load at full speed on x86-64
+  (#793).** The int8 dot product, the Hamming distance and quantizing
+  compiled for the baseline x86-64 target, which has no SSE4.1 or POPCNT, so
+  a `Q8` `VSIM` was slower than an f32 one there. They now pick AVX-512BW or
+  AVX2 and POPCNT at run time, once, as the f32 kernels already did; release
+  binaries still run on any x86-64, arm64 is unchanged, and stored vectors and
+  scores are the same bits as before. Measured on x86-64 Azure D4s_v5 (768
+  dimensions, 10,000 vectors, 8 clients): `Q8` `VSIM` 910 -> 2,621 q/s
+  (f32: 699; v1.2.2: 686; Redis 8.10.2 Q8 with HNSW: 6,960), `BIN` 3,704 ->
+  4,963 q/s, and `VADD ... Q8` 51.6k -> 61.4k a second, the f32 rate.
+
 - **`DUMP`/`RESTORE`, `MIGRATE` and slot migration of vector sets and time
   series work between KiviDB nodes, and the docs no longer say they don't
   (#722).** Payloads are a one-entry snapshot image: Redis can't read

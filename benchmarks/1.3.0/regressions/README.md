@@ -269,8 +269,10 @@ Why a few rows differ from the plan's defaults:
   rate (30-115 a second) is too noisy a denominator.
 - `SAVE` time (`07`) and `VADD` rates of the 50k memory rows (`09`) are shown,
   not gated (the same build's `SAVE` took 339 and 503 ms in two runs).
-- `09-vector-sets` `VSIM` q/s: rel 25 % (#730 saw 15 % between repeats) and no
-  ratio, because the Q8 search gain does not show on this VM (see below).
+- `09-vector-sets` `VSIM` q/s: rel 25 % (#730 saw 15 % between repeats). Q8 at
+  10K also keeps 60 % of its gain over v1.2.2's f32 search, measured within the
+  run: since #793 (run-time AVX-512BW / AVX2 int8 kernel) it is 3.7x on this VM
+  size; before it, Q8 was 0.9x and had no gain to keep.
 
 ## Baselines
 
@@ -490,6 +492,12 @@ Runs, all in `results/`:
   this run's spread (see Tolerances).
 - `master-d66f0f93-d4s_v5-part2-rerun2` and `master-d66f0f93-d4s_v5-part2-09-rerun`:
   the second noise check with the final gates: every gate passed.
+- `simd-9501caa6-d4s_v5-09` and `simd-9501caa6-d4s_v5-09-rerun`: suite 09 on
+  #793's branch, on a D4s_v5 about 40 % slower at f32 `VSIM` than the one
+  above (v1.2.2: 639-679 q/s against 1,104-1,124), so the unchanged f32 row
+  failed its absolute q/s gate in both while the f32 code did not change.
+  Only `q8_768_10k` `vsim_qps` was re-recorded from the first, with the new
+  ratio gate; the rerun is its noise check.
 
 Run time per suite: 05 109 s, 06 27 s, 07 10 s, 08 59 s, 09 180 s, 10 2 s
 (after the RedisVL venv exists; its first install takes about a minute),
@@ -518,6 +526,7 @@ gates compare within this suite):
 | vector set, 768-d, 50k, `Q8`, B a vector | #730 | 3,168 / 864 / 1,526 | 3,168 / 863.7 / 1,526 |
 | the same, `BIN` | #730 | 3,168 / 192 / 854 | 3,168 / 191.7 / 853 |
 | `VSIM` q/s, 768-d, 10k, `Q8`, 8 clients | #730 | 1,637 / 12,635 / 23,625 (HNSW) | 1,093-1,151 / 970-986 / 7,840-7,880 (HNSW) |
+| the same after #793 (another D4s_v5, slower: v1.2.2 f32 639-679) | #793 | 686 / 2,621 / 6,960 (HNSW) | 679 / 2,493 / 6,732 (HNSW) |
 | RedisVL 0.32.0 checks passed | #779 | 59 / 67 / 67 | 59 / 67 / not run (no Query Engine module in this Redis build) |
 
 Recorded values (counts, timings shown for information and the rows of
@@ -554,7 +563,7 @@ Recorded values (counts, timings shown for information and the rows of
 | 09-vector-sets / f32_768_10k | vsim_qps (q/s) | 1,124 | 1,116 | 6,629 | rel 25% |
 | 09-vector-sets / q8_768_10k | recall_at_10 (ratio) | 1 | 0.972 | 0.972 | rel 2% |
 | 09-vector-sets / q8_768_10k | vadd_per_s (VADD/s) | 66,887 | 52,817 | 3,991 | rel 25% |
-| 09-vector-sets / q8_768_10k | vsim_qps (q/s) | 1,109 | 986.1 | 7,877 | rel 25% |
+| 09-vector-sets / q8_768_10k | vsim_qps (q/s) | 678.6 | 2,493 | 6,732 | rel 25%; keep 60% of gain |
 | 09-vector-sets / q8_768_50k | bytes_per_vector (B) | 3,168 | 863.7 | 1,526 | rel 5%; keep 60% of gain |
 | 09-vector-sets / q8_768_50k | recall_at_10 (ratio) | 1 | 0.965 | 0.963 | rel 2% |
 | 10-redisvl / redisvl | checks_failed (checks) | 8 | 0 | - | max 0 |
