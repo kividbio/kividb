@@ -156,7 +156,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   matched by comparing bytes. A full `SCAN 0 MATCH schedule:* COUNT 1000`
   over 2,002,000 keys went from 1.31 s to 0.48 s (Redis 8.10.2:
   0.53 s), and one without `MATCH` from 2.98 s to 1.93 s (Redis: 2.04 s).
-  `HSCAN`, `SSCAN` and `ZSCAN` match patterns the same way.
+  `HSCAN`, `SSCAN` and `ZSCAN` match patterns the same way. A `SCAN`
+  cursor is now valid only on the server that gave it, until it restarts,
+  as in Redis: one from before a restart, a failover or another replica
+  ends the iteration or skips keys, rather than resuming it.
 
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
