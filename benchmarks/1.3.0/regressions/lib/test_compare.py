@@ -126,6 +126,30 @@ class HostSpeed(unittest.TestCase):
         self.assertFalse(compare.is_speed_metric("ms", {"kind": "rel", "speed": False}))
         self.assertTrue(compare.is_speed_metric("ratio", {"kind": "rel", "speed": True}))
 
+class RealSlowHost(unittest.TestCase):
+    """PR #799's runs (simd-9501caa6-d4s_v5-09): a D4s_v5 whose VSIM was ~40 %
+    slower than the recorded one, while its VADD was not."""
+
+    def test_f32_vsim_on_the_slow_host(self):
+        rows = [  # metric, unit, better, rec v1.2.2, rec candidate, now v1.2.2, now candidate
+            ("vadd_per_s", "VADD/s", "higher", 66395.4, 62037.9, 65358.5, 59838.8),
+            ("vsim_qps", "q/s", "higher", 1123.9, 1115.5, 639.1, 616.2),
+            ("vsim_p50_ms", "ms", "lower", 1.853, 1.908, 3.2, 3.3)]
+        b, res = {"metrics": {}}, {}
+        for n, u, bt, rv, rc, nv, nc in rows:
+            k = "09/f32/" + n
+            g = [{"kind": "rel", "pct": 25}]
+            b["metrics"][k] = {"suite": "09", "config": "f32", "metric": n, "unit": u, "better": bt,
+                               "recorded": {"v1_2_2": rv, "candidate": rc}, "gate": g}
+            res[k] = {"suite": "09", "config": "f32", "metric": n, "unit": u, "better": bt, "gate": g,
+                      "values": {"v1_2_2": nv, "candidate": nc}, "samples": {}}
+        r, _, hf = compare.evaluate(res, b)
+        self.assertTrue(all(x["status"] == "pass" for x in r), [x["status"] for x in r])
+        self.assertAlmostEqual(hf["groups"]["09/f32"], 0.579, places=2)
+        res["09/f32/vsim_qps"]["values"]["candidate"] = 616.2 * 0.7  # a real loss on top
+        r, _, _ = compare.evaluate(res, b)
+        self.assertEqual([x["status"] for x in r if x["metric"] == "vsim_qps"], ["FAIL"])
+
 
 if __name__ == "__main__":
     unittest.main()
