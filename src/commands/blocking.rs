@@ -271,7 +271,11 @@ fn parse_rounded_away_timeout(raw: &[u8], parsed: Option<f64>) -> Result<f64, Ve
     let Some((negative, magnitude)) = std::str::from_utf8(raw).ok().and_then(split_timeout_parts)
     else {
         // A hexadecimal zero (`0x0`) is a zero all the same.
-        return if parsed.is_some() { Ok(0.0) } else { Err(not_a_float()) };
+        return if parsed.is_some() {
+            Ok(0.0)
+        } else {
+            Err(not_a_float())
+        };
     };
     // A zero as written is a timeout that never ends, and `parse_score`
     // has read it already.
@@ -1285,7 +1289,11 @@ mod gone_resume_tests {
             "1.1e4932",
             "1.18973149535723176503e4932",
         ] {
-            assert_eq!(err(raw.as_bytes()), "-ERR timeout is out of range\r\n", "{raw}");
+            assert_eq!(
+                err(raw.as_bytes()),
+                "-ERR timeout is out of range\r\n",
+                "{raw}"
+            );
         }
         for raw in ["-1", "-inf", "-2e308", "-1e-343", "-1e-4950", "-1e-330"] {
             assert_eq!(err(raw.as_bytes()), "-ERR timeout is negative\r\n", "{raw}");
