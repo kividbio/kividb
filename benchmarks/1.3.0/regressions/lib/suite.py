@@ -50,8 +50,10 @@ import traceback
 ENGINES = ("v1_2_2", "candidate", "redis")
 
 
-def rel(pct, abs=None, redis_plus=None):
+def rel(pct, abs=None, redis_plus=None, anchor=None):
     g = {"kind": "rel", "pct": pct}
+    if anchor is not None:  # False: never judge by this metric's own v1.2.2 value (a noisy denominator)
+        g["anchor"] = anchor
     if abs is not None:
         g["abs"] = abs
     if redis_plus is not None:
@@ -80,6 +82,14 @@ def bound(eq=None, max=None, min=None):
 
 def info():
     return {"kind": "info"}
+
+
+def jitter(gates):
+    """Mark a gate (or a list of them) as scheduling jitter, not CPU speed: compare.py
+    neither scales it by the host speed nor counts it toward a host factor."""
+    one = isinstance(gates, dict)
+    out = [dict(g, speed=False) for g in ([gates] if one else gates)]
+    return out[0] if one else out
 
 
 # The plan's standard tolerances, so suites say which one they mean.
@@ -120,6 +130,9 @@ class Ctx:
     def client(self, **kw):
         import redis
         kw.setdefault("socket_timeout", 600)
+        if self.port is None and "port" not in kw:
+            raise RuntimeError("ctx.client() on self-hosted config %r has no server port: "
+                               "start nodes with lib/nodes.py and use node.client()" % self.config.name)
         kw.setdefault("port", self.port)
         return redis.Redis(host="127.0.0.1", **kw)
 

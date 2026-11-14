@@ -19,7 +19,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import Suite, Config, rel, bound, info, scaled, median  # noqa: E402
+from suite import Suite, Config, rel, bound, info, jitter, scaled, median  # noqa: E402
 from probe import Probe  # noqa: E402
 
 S = Suite("07-save-ping", [Config("tokio1", io="tokio", threads=1)])
@@ -45,7 +45,7 @@ def run(ctx):
         each.append(pr.worst_each(t0, t1))
         save_ms.append((t1 - t0) * 1000)
     ctx.raw["probe_worst_each"] = each
-    gate = info() if ctx.kind == "redis" else [bound(max=20)]
+    gate = jitter(info() if ctx.kind == "redis" else [bound(max=20)])
     ctx.emit("ping_during_save_ms", median(worst), "ms", "lower", gate=gate, samples=worst)
     ctx.emit("ping_during_save_max_ms", max(worst), "ms", "lower", gate=gate)
     ctx.emit("save_ms", median(save_ms), "ms", "lower", gate=info(), samples=save_ms)

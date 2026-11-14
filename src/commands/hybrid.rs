@@ -41,6 +41,13 @@ use crate::resp::write::{
 use crate::vector::score::Scorer;
 use crate::vector::{DistanceMetric, FieldType, KnnResult, LiveIndex, VectorAlgo};
 
+/// The protocol a reply is written in: a script's own (`redis.setresp`)
+/// inside one, the client's otherwise.
+#[inline]
+fn reply_resp(ctx: &Ctx) -> u8 {
+    crate::commands::handler::effective_resp_for_reply(ctx)
+}
+
 // ── Parsed command ──────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
@@ -887,10 +894,10 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
         .into_iter()
         .skip(q.limit_offset)
         .take(q.limit_count)
-        .map(|row| row_reply(&row, &shown, grouped, load_all, ctx.resp))
+        .map(|row| row_reply(&row, &shown, grouped, load_all, reply_resp(ctx)))
         .collect();
 
-    let resp = ctx.resp;
+    let resp = reply_resp(ctx);
     let millis = started.elapsed().as_secs_f64() * 1000.0;
     let execution_time = if resp == 3 {
         resp_double_resp3(millis)

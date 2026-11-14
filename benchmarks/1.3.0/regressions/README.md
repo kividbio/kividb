@@ -121,7 +121,14 @@ and a C compiler).
 - Client and server share the machine. Absolute numbers depend on it; the
   gates that compare with v1.2.2 or Redis measure both in the same session,
   and the gates against recorded values are only meaningful on the VM size
-  they were recorded on (`recorded.vm`).
+  they were recorded on (`recorded.vm`). A different VM size is `INVALID`.
+  The same size can still land on another CPU generation (two
+  `Standard_D4s_v5` differed by about 40 %: f32 `VSIM` 639-679 q/s against
+  1,104-1,124), so speed gates are judged against v1.2.2 of the same session,
+  see "Host speed" below. A different CPU model is not `INVALID`:
+  `env.json` has `cpu`, `nproc` and `calib_ms` (best of 3 of 200k chained
+  sha256 on one core; indicative only, not used by any gate) and `summary.md`
+  shows the recorded and the current CPU model.
 - Fixed data: the datasets are generated in order, and the churn scenario uses
   `random.Random(7)`.
 - Warm-ups and medians: SCAN cases run one warm-up iteration and three timed
@@ -151,6 +158,10 @@ and a C compiler).
   from `run-all.sh`; the suite starts its own from the engine's binary
   (`lib/nodes.py`), each in an empty directory on its own port (cluster nodes
   also keep the bus port, port + 10000, below the ephemeral range), forms the
+  a node that fails to start has its directory and log removed before the error is raised, and every node's pid
+  goes to a run-scoped directory (`$REGRESS_PIDDIR`) so that `run-all.sh` kills nodes a SIGKILLed suite left
+  behind, only pids whose `/proc/<pid>/cmdline` still holds the recorded binary; `ctx.client()` on such a
+  configuration raises (use `node.client()`),
   cluster with `CLUSTER ADDSLOTSRANGE` (slots split evenly) and `CLUSTER MEET`,
   waits for `cluster_state:ok` on every node, and stops every node on exit,
   on an error and on `SIGTERM` (the suite timeout). The nodes share the VM's 4
@@ -173,6 +184,65 @@ They are checked against the candidate only.
 | `bound` | absolute: `eq` (`"recorded"`: equal to the recorded value), `max`, `min` | counts (exact); worst PING on Tokio during a long command: 20 ms |
 | `info` | shown, never gated | call counts, PINGs over 10 ms, probes stalled |
 
+### Host speed
+
+v1.2.2 is re-measured in every session, so it tells how fast this host is
+compared with the one the baseline was recorded on. A **speed-dependent** metric
+is one whose unit is a time or a rate: `ms`, `s`, `us`, `ns` or anything ending
+in `/s`. A gate can say `"speed": false` (or `true`) to override the unit rule.
+Bytes, MiB, counts, connections, recall and ratios are never scaled.
+
+For a `rel` gate on a speed-dependent metric, `compare.py` scales the recorded
+candidate value by an effective factor `f` before applying `pct`/`abs`: rates
+are multiplied by `f`, times divided by it (1.00 = same host, 0.6 = this host is
+40 % slower). `abs` is not scaled. `own` is the metric's own v1.2.2
+now/recorded (rates) or recorded/now (times), from that entry's own recorded
+v1.2.2 value; `grp` is the median of `own` over the speed metrics of the same
+suite/configuration (at least 3 of them, else the median over all suites).
+
+| case | f | rule in `summary.json` |
+|---|---|---|
+| v1.2.2 has no usable value for the metric (missing, 0, NaN) | `grp` | `group` / `global` |
+| `own` < `grp` / 1.3: this metric slowed more than its group | `own` | `own-slower` |
+| `own` > `grp` x 1.3: it slowed less than its group | `min(own, max(grp, 1))` | `own-capped` |
+| otherwise | `grp` | `group` / `global` |
+| no v1.2.2 value in the whole run | 1 (compared absolutely; `summary.md` and the console say so) | `none` |
+
+A gate can force the rule: `"anchor": true` always uses `own`, `"anchor": false`
+never does (`set_rps_beside_ft_info` has it: v1.2.2's rate there varies 3x). The
+summary lists every metric whose `own` and `grp` differ by more than 1.3x.
+
+Two real cases decided these rules:
+
+- `09-vector-sets` f32 on a `Standard_D4s_v5` where v1.2.2 `VSIM` ran 639-679
+  q/s against 1,124 recorded, while its `VADD` was unchanged (65.4k against
+  66.4k/s). The config's `grp` is 0.57 (VSIM-bound), so `VSIM` is judged at 0.57
+  and passes. A `VADD` that had collapsed to 27k/s is judged at its own 0.98
+  (`own-capped`: it did not slow, so it gets no excuse) and fails.
+- `13-cluster-reshard` `reshard_s`: v1.2.2 does it by another, 10x slower
+  method, and its v1.2.2 time was 1.43x faster than recorded on the same host as
+  everything else. `min(own, max(grp, 1))` keeps it at 1.0: one noisy v1.2.2
+  number never makes a gate stricter than the recorded value.
+
+Sanity: if an `own` or a `grp` that is used for scaling is outside 0.4-2.5 (v1.2.2
+was starved, or the host is of another class), the run is `INVALID` and names the
+metric: rerun. A higher-is-better `rel` gate whose `abs` is not below the
+(scaled) recorded value is a configuration error and also `INVALID`.
+
+Scheduling jitter is not CPU speed. The PING latency rows (`02-growth-ping`
+`ping_p99_ms`/`ping_max_ms`, `04-long-commands` `*_worst_ping_*`/`*_least_worst_ping_ms`,
+`07-save-ping` `ping_during_save_*`) are marked `"speed": false` in the suites
+(`jitter()` in `lib/suite.py`) and in `baseline.json`: they are neither scaled
+nor counted toward a factor. `04` and `07` are `bound` gates anyway.
+
+Still absolute: `bound` gates (a worst PING of at most 20 ms is a promise to
+users, not a ratio), `eq` counts, all memory gates, and `info`. `ratio` and
+`vs_redis` already compare within the session. If the global factor is under
+0.7 or over 1.4, the summary adds a `WARN` line (not a failure): the bounds were
+recorded on a faster or slower host. `--record` stores the CPU model in
+`recorded.cpu`. Re-run the self-test with `python lib/test_compare.py` after
+changing this logic.
+
 Why a few rows differ from the plan's defaults:
 
 - `04-long-commands` on Tokio: the worst PING is 0.4-8 ms against 130-260 ms
@@ -189,6 +259,8 @@ Why a few rows differ from the plan's defaults:
 - Memory per item (`05`, `06`, `08`, `09`) is deterministic, so 5 % is wide;
   a few bytes of `abs` slack (1-4 B) keep the small values (6.2 B per one-field
   stream entry) from failing on an allocator rounding.
+- `06`'s `xinfo_polls` (XINFO CONSUMERS calls during the second XADD run) is gated `min` 5 (recorded 42, v1.2.2 14);
+  a poller thread that raises fails the suite instead of leaving the XADD rate unpolled.
 - Connection counts (`11`, `12`) and the worst `PING` during a `SAVE` (`07`)
   are absolute bounds, from the PRs' own tests: at most 3 connections for
   2,000 `MIGRATE`s, at most 20 per other master for 2,000 searches (16 kept +
@@ -233,7 +305,13 @@ re-record that hides a regression defeats the suite.
    release, or an intended change that is explained in the release PR, after
    which the baseline is re-recorded.
 3. Commit `results/<label>/` with the release PR, so the release's numbers
-   stay next to the harness that produced them.
+   stay next to the harness that produced them. The release workflow
+   refuses a stable tag without it (`scripts/release/check-regression-results.sh`:
+   a full run with verdict `ok` whose candidate commit is an ancestor of the tag,
+   with `src/`, `Cargo.toml` and `Cargo.lock` unchanged since).
+   The Actions workflow "Regression suite" (`.github/workflows/regression-suite.yml`)
+   makes the VM, builds the candidate, runs the suite and uploads
+   `results/<label>/` as an artifact; docs/RELEASING.md has the steps.
 4. For a new improvement in the release, its suite and its first recorded
    values land with the fix's PR (or right after it), not at release time.
 
