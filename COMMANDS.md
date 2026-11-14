@@ -66,7 +66,7 @@ checks respect lazy expiry — an expired key is treated as absent.
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `DUMP` | `DUMP key` | Serialize the value at key to a binary string in KiviDB's snapshot format with a 10-byte CRC64 envelope; returns nil if key missing or expired; TimeSeries and VectorSet keys are not portable |
+| `DUMP` | `DUMP key` | Serialize the value at key to a binary string in KiviDB's snapshot format with a 10-byte CRC64 envelope; returns nil if key missing or expired; TimeSeries and VectorSet payloads are KiviDB's own: they restore on KiviDB nodes, not on Redis |
 | `RESTORE` | `RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]` | Deserialize a value from a `DUMP` payload and store it at key; ttl is in milliseconds (0 = no expiry); `REPLACE` overwrites an existing key; `ABSTTL` treats ttl as a Unix timestamp in milliseconds; returns `BUSYKEY` error if key exists without `REPLACE` |
 
 ### Sorting
@@ -1576,7 +1576,6 @@ names; with no session running the cost to a command is one atomic load.
 ### MEMORY
 
 - **`MEMORY USAGE` estimates are approximate.** Usage is computed by sampling up to `SAMPLES` elements (default 5) and extrapolating — it does not walk every element for large collections. Results will differ from Redis's estimates because Redis tracks allocator-level overhead per object (jemalloc metadata, sds header, dictEntry, etc.) which KiviDB does not model. Treat the output as an order-of-magnitude guide, not an exact byte count.
-- **`MEMORY USAGE` is not supported for `TimeSeries` and `VectorSet` keys via `DUMP`/`RESTORE`.** Usage estimation for these types is implemented but the underlying values cannot be serialised portably, so tools relying on DUMP+MEMORY USAGE combinations will not work for these types.
 - **`MEMORY STATS`: `used_memory` is what the process has allocated**, counted by the allocator on every platform. The resident-set figures come from `/proc/self/status` on Linux and the process counters on Windows. The allocator's own fragmentation fields are always `1.0`/`0`: KiviDB does not read them from the allocator (the system allocator, or mimalloc on Linux in the builds with Lua).
 - **`MEMORY PURGE` calls `malloc_trim(0)` on Linux only.** On other platforms it is a no-op that returns `OK`. Even on Linux, `malloc_trim` only works with glibc's allocator, so it has no effect on what the builds with Lua allocate through mimalloc.
 - **`MEMORY MALLOC-STATS` returns a minimal stub XML.** Full `malloc_info` output is not implemented. Tools that parse the detailed allocator statistics from Redis will receive an empty placeholder.
@@ -1586,7 +1585,6 @@ names; with no session running the cost to a command is one atomic load.
 
 | Command / Feature | Notes |
 |-------------------|-------|
-| `DUMP` / `RESTORE` for TimeSeries and VectorSet | Format not portable; returns ERR by design |
 | `XIDMPRECORD` | Redis 8.8 internal command for setting IDMP metadata on an existing stream message. Documented as internal, with no client-facing contract to implement against — omitted deliberately rather than guessed at. Every other Redis 8.8 command is supported; see [`docs/REDIS_8_8_COMMANDS.md`](docs/REDIS_8_8_COMMANDS.md). |
 
 | Compact hash encoding (Redis 8.10) | `HIMPORT` is implemented and creates ordinary hashes; there is no separate memory-saving encoding for hashes that share field names |

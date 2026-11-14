@@ -2834,6 +2834,193 @@ fn atomic_slot_migration_moves_time_series_with_their_rules() {
     assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]).array().len(), 2);
 }
 
+/// Vector sets of each quantization (the default one last) and a series.
+const MOVED_VSETS: [(&str, &str); 4] = [
+    ("vq8", "Q8"),
+    ("vbin", "BIN"),
+    ("vnoq", "NOQUANT"),
+    ("vdef", ""),
+];
+
+/// [`MOVED_VSETS`] with attributes, and a series with labels and settings,
+/// under `k`; `vq8` with a time to live.
+fn add_vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) {
+    for (name, opt) in MOVED_VSETS {
+        let key = k(name);
+        for n in 0..8 {
+            let v: Vec<String> = (0..16)
+                .map(|i| (((i * 7 + n * 5) % 13) as f32 - 6.5).to_string())
+                .collect();
+            let e = format!("e{n}");
+            let mut args = vec!["VADD", &key, "VALUES", "16"];
+            args.extend(v.iter().map(String::as_str));
+            args.push(&e);
+            if !opt.is_empty() {
+                args.push(opt);
+            }
+            assert_eq!(c.cmd(&args), Resp::Int(1), "{key} {e}");
+        }
+        assert_eq!(c.cmd(&["VSETATTR", &key, "e3", r#"{"n":3}"#]), Resp::Int(1));
+    }
+    assert_eq!(c.cmd(&["PEXPIRE", &k("vq8"), "500000"]), Resp::Int(1));
+    assert!(
+        c.cmd(&[
+            "TS.CREATE",
+            &k("ts"),
+            "RETENTION",
+            "100000",
+            "CHUNK_SIZE",
+            "128",
+            "DUPLICATE_POLICY",
+            "MAX",
+            "LABELS",
+            "kind",
+            "moved722",
+        ])
+        .is_ok()
+    );
+    for (at, value) in [("1", "1.5"), ("2", "-2"), ("3", "1e300")] {
+        assert_eq!(
+            c.cmd(&["TS.ADD", &k("ts"), at, value]).int().to_string(),
+            at
+        );
+    }
+}
+
+/// What a move must keep of [`add_vsets_and_series`]'s keys.
+fn vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) -> Vec<Resp> {
+    let mut out = Vec::new();
+    for (name, _) in MOVED_VSETS {
+        let key = k(name);
+        out.push(c.cmd(&["VINFO", &key]));
+        out.push(c.cmd(&["VCARD", &key]));
+        out.push(c.cmd(&["VSIM", &key, "ELE", "e1", "COUNT", "4", "WITHSCORES"]));
+        for n in 0..8 {
+            let e = format!("e{n}");
+            out.push(c.cmd(&["VEMB", &key, &e, "RAW"]));
+            out.push(c.cmd(&["VGETATTR", &key, &e]));
+        }
+    }
+    out.push(c.cmd(&["TS.RANGE", &k("ts"), "-", "+"]));
+    let info = c.cmd(&["TS.INFO", &k("ts")]);
+    for field in [
+        "totalSamples",
+        "retentionTime",
+        "chunkSize",
+        "duplicatePolicy",
+        "labels",
+    ] {
+        out.push(task_field(&info, field));
+    }
+    out
+}
+
+/// After a move: the time to live came along, the series is found by its
+/// label, and the Q8 and BIN sets still refuse another quantization. A
+/// `NOQUANT` set takes one, as after a reload: its choice is not kept.
+fn check_moved(c: &mut Conn, k: &dyn Fn(&str) -> String) {
+    let pttl = c.cmd(&["PTTL", &k("vq8")]).int();
+    assert!((1..=500_000).contains(&pttl), "PTTL {pttl}");
+    assert_eq!(c.cmd(&["PTTL", &k("vbin")]).int(), -1);
+    assert_eq!(
+        c.cmd(&["TS.QUERYINDEX", "kind=moved722"]).array(),
+        [Resp::Bulk(k("ts").into_bytes())]
+    );
+    let v: Vec<String> = (0..16).map(|i| (i as f32 + 0.5).to_string()).collect();
+    for (name, opt, refused) in [
+        ("vq8", "BIN", true),
+        ("vbin", "Q8", true),
+        ("vnoq", "Q8", false),
+        ("vdef", "Q8", false),
+    ] {
+        let key = k(name);
+        let mut args = vec!["VADD", &key, "VALUES", "16"];
+        args.extend(v.iter().map(String::as_str));
+        args.extend(["new", opt]);
+        let r = c.cmd(&args);
+        if refused {
+            assert!(
+                r.err().is_some_and(|e| e.contains("quantization mismatch")),
+                "{name}: {r:?}"
+            );
+        } else {
+            assert_eq!(r, Resp::Int(1), "{name}");
+        }
+    }
+}
+
+/// A slot holding vector sets of each quantization and a series moves by
+/// `MIGRATE`, as the resharding tools move it, whole (#722).
+#[test]
+fn migrate_moves_a_slot_of_vector_sets_and_series_whole() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "vs722");
+    let slot = slot_of(&tag).to_string();
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    add_vsets_and_series(&mut s, &k);
+    let before = vsets_and_series(&mut s, &k);
+
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let keys: Vec<String> = MOVED_VSETS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(["ts"])
+        .map(k)
+        .collect();
+    let mut args = vec!["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"];
+    args.extend(keys.iter().map(String::as_str));
+    let reply = s.cmd(&args);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 5);
+    assert_eq!(vsets_and_series(&mut d, &k), before);
+    check_moved(&mut d, &k);
+}
+
+/// The same slot moved by an atomic slot migration (#722).
+#[test]
+fn atomic_slot_migration_moves_vector_sets_and_series_whole() {
+    let (nodes, _) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let tag = key_in(0..=1000, "vs722");
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    add_vsets_and_series(&mut s, &k);
+    let before = vsets_and_series(&mut s, &k);
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(dst, &task_id);
+
+    let mut d = dst.conn();
+    assert_eq!(vsets_and_series(&mut d, &k), before);
+    check_moved(&mut d, &k);
+}
+
 /// A slot left open by a reshard that stopped part way, with keys on both
 /// sides, is closed by the commands `redis-cli --cluster fix` sends, and
 /// every key reads back (#295). Fix picks the node with the most keys as
