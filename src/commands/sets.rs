@@ -1,13 +1,12 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
-use crate::commands::set_card::{diff_each, distinct, inter_each, read_all, sets_at};
+use crate::commands::set_card::{diff_each, inter_each, sets_at, union_of};
 use crate::keyspace_events::{KS_SET, notify};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
-use ahash::AHashSet;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -23,9 +22,9 @@ fn reply_resp(ctx: &Ctx) -> u8 {
 }
 
 // ── set algebra ───────────────────────────────────────────────────────────────
-// The sets are read where they are stored, under their read locks (taken
-// together, in one global order: see `set_card::read_all`), and nothing is
-// copied out first. A missing or expired key is an empty set; a key of another
+// The sets are read where they are stored, under their read locks, and
+// nothing is copied out first. SINTER and SDIFF lock their sets together, in
+// one global order (see `set_card::distinct`); SUNION one at a time. A missing or expired key is an empty set; a key of another
 // type is a WRONGTYPE error wherever it is.
 //
 // SINTER walks the smallest set and looks its members up in the others, so
@@ -52,13 +51,7 @@ fn set_inter(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
 /// Returns all unique elements across every set.
 fn set_union(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
     let sets = sets_at(ctx, key_args)?;
-    let guards = read_all(&distinct(sets.iter().flatten()));
-    let mut result =
-        AHashSet::<Arc<[u8]>>::with_capacity(guards.iter().map(|set| set.len()).max().unwrap_or(0));
-    for set in &guards {
-        result.extend(set.iter().cloned());
-    }
-    Ok(result.into_iter().collect())
+    Ok(union_of(&sets))
 }
 
 // ── store_set ─────────────────────────────────────────────────────────────────

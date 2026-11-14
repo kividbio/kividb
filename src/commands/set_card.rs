@@ -11,7 +11,7 @@
 //! size of the others (#759).
 
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
+use crate::commands::helpers::{lazy_expire_on_read, long_work, parse_utf8};
 use crate::member_set::MemberSet;
 use crate::read_lock;
 use crate::resp::write::*;
@@ -94,34 +94,29 @@ pub(super) fn sets_at(ctx: &Ctx, keys: &[&[u8]]) -> Result<Vec<Option<Set>>, Vec
     Ok(out)
 }
 
-/// Each set once: a key named twice is one set, and its lock must be taken
-/// once (a second read lock on one thread can wait behind a queued writer).
-pub(super) fn distinct<'a>(sets: impl Iterator<Item = &'a Set>) -> Vec<&'a Set> {
-    let mut out: Vec<&Set> = Vec::new();
-    for set in sets {
-        if !out.iter().any(|seen| Arc::ptr_eq(seen, set)) {
-            out.push(set);
-        }
-    }
+/// Each set once, in address order: the order their locks are taken in.
+///
+/// A key named twice is one set, and its lock must be taken once (a second
+/// read lock on one thread can wait behind a queued writer). Sorting and then
+/// dropping neighbours keeps this O(k log k) in the number of keys: a store
+/// command (`SINTERSTORE d k1 ... k50000`) runs with the command gate held
+/// alone, so a quadratic pass there would stall every client.
+///
+/// Locks are taken in address order, not argument order. A reader waits
+/// behind a queued writer, so two commands holding one set each and each
+/// waiting for the other's (`SINTER a b` and `SINTER b a`, with an `SADD`
+/// queued on each) would wait forever. With one global order, the second
+/// command waits for the first set before it holds any.
+fn distinct<'a>(sets: impl Iterator<Item = &'a Set>) -> Vec<&'a Set> {
+    let mut out: Vec<&Set> = sets.collect();
+    out.sort_unstable_by_key(|set| Arc::as_ptr(set) as usize);
+    out.dedup_by(|a, b| Arc::ptr_eq(a, b));
     out
 }
 
-/// Read guards on `sets` (distinct sets), in the order given.
-///
-/// The locks are taken in address order, not argument order. A reader waits
-/// behind a queued writer, so two commands holding one set each and each
-/// waiting for the other's (`SINTER a b` and `SINTER b a`, with an `SADD` queued
-/// on each) would wait forever. With one global order, the second command
-/// waits for the first set before it holds any.
-pub(super) fn read_all<'a>(sets: &[&'a Set]) -> Vec<RwLockReadGuard<'a, MemberSet>> {
-    let mut order: Vec<usize> = (0..sets.len()).collect();
-    order.sort_unstable_by_key(|&i| Arc::as_ptr(sets[i]) as usize);
-    let mut guards: Vec<Option<RwLockReadGuard<'a, MemberSet>>> =
-        sets.iter().map(|_| None).collect();
-    for i in order {
-        guards[i] = Some(sets[i].read());
-    }
-    guards.into_iter().flatten().collect()
+/// Read guards on `sets`, in the order given: `distinct`'s, so address order.
+fn read_all<'a>(sets: &[&'a Set]) -> Vec<RwLockReadGuard<'a, MemberSet>> {
+    sets.iter().map(|set| set.read()).collect()
 }
 
 /// The intersection of `sets`: calls `each` for every member of it, up to
@@ -130,6 +125,7 @@ pub(super) fn read_all<'a>(sets: &[&'a Set]) -> Vec<RwLockReadGuard<'a, MemberSe
 /// It walks the smallest set and looks each member up in the others, smallest
 /// first, so it costs O(smallest x number of sets) and never touches the rest
 /// of a big set (#759). A missing key is an empty set, and so is the result.
+/// The sets are read-locked together, so the answer is of one moment.
 pub(super) fn inter_each(
     sets: &[Option<Set>],
     limit: usize,
@@ -144,22 +140,26 @@ pub(super) fn inter_each(
     let Some((smallest, others)) = guards.split_first() else {
         return 0;
     };
-    let mut count = 0usize;
-    for member in smallest.iter() {
-        if others.iter().all(|other| other.contains(member)) {
-            each(member);
-            count += 1;
-            if limit > 0 && count >= limit {
-                break;
+    let walk = || {
+        let mut count = 0usize;
+        for member in smallest.iter() {
+            if others.iter().all(|other| other.contains(member)) {
+                each(member);
+                count += 1;
+                if limit > 0 && count >= limit {
+                    break;
+                }
             }
         }
-    }
-    count
+        count
+    };
+    long_work(smallest.len().saturating_mul(guards.len()), walk)
 }
 
 /// The members of the first set that no other set has: calls `each` for each
 /// of them, up to `limit` (`0`: all), and returns how many that was. It walks
-/// the first set only and looks its members up in the others.
+/// the first set only and looks its members up in the others, all of them
+/// read-locked together.
 pub(super) fn diff_each(
     sets: &[Option<Set>],
     limit: usize,
@@ -168,31 +168,53 @@ pub(super) fn diff_each(
     let Some(Some(first)) = sets.first() else {
         return 0;
     };
-    let mut handles: Vec<&Set> = vec![first];
-    for other in sets[1..].iter().flatten() {
-        if Arc::ptr_eq(other, first) {
-            // A set minus itself.
-            return 0;
-        }
-        if !handles.iter().any(|seen| Arc::ptr_eq(seen, other)) {
-            handles.push(other);
-        }
-    }
-    let guards = read_all(&handles);
-    let Some((first, others)) = guards.split_first() else {
-        return 0;
+    // The first set keeps its place as the one walked; the others are
+    // deduplicated. A set minus itself is empty.
+    let mut handles = distinct(sets[1..].iter().flatten());
+    let at = match handles.binary_search_by_key(&(Arc::as_ptr(first) as usize), |set| {
+        Arc::as_ptr(set) as usize
+    }) {
+        Ok(_) => return 0,
+        Err(at) => at,
     };
-    let mut count = 0usize;
-    for member in first.iter() {
-        if others.iter().all(|other| !other.contains(member)) {
-            each(member);
-            count += 1;
-            if limit > 0 && count >= limit {
-                break;
+    handles.insert(at, first);
+    let mut guards = read_all(&handles);
+    let first = guards.remove(at);
+    let others = guards;
+    let walk = || {
+        let mut count = 0usize;
+        for member in first.iter() {
+            if others.iter().all(|other| !other.contains(member)) {
+                each(member);
+                count += 1;
+                if limit > 0 && count >= limit {
+                    break;
+                }
             }
         }
-    }
-    count
+        count
+    };
+    long_work(first.len().saturating_mul(others.len().max(1)), walk)
+}
+
+/// The union of `sets`, each distinct set read in turn under its own lock, as
+/// before #759 (when each was copied out in turn). Holding every set's lock
+/// for the whole build would keep a writer of a small set waiting for the
+/// walk of a big one. A write of several keys still cannot land part-way: it
+/// takes the command gate alone (#729).
+pub(super) fn union_of(sets: &[Option<Set>]) -> Vec<Arc<[u8]>> {
+    let handles = distinct(sets.iter().flatten());
+    let sizes: Vec<usize> = handles.iter().map(|set| set.read().len()).collect();
+    let total = sizes.iter().sum::<usize>();
+    long_work(total, || {
+        let mut result = MemberSet::with_capacity(sizes.iter().copied().max().unwrap_or(0));
+        for set in &handles {
+            for member in set.read().iter() {
+                result.insert(Arc::clone(member));
+            }
+        }
+        result.into_iter().collect()
+    })
 }
 
 fn union_card(sets: &[Option<Set>], limit: usize) -> usize {
@@ -332,6 +354,27 @@ mod tests {
         assert_eq!(out, [b"a".to_vec(), b"c".to_vec()]);
         assert_eq!(diff_each(&[first.clone(), first.clone()], 0, |_| {}), 0);
         assert_eq!(diff_each(&[None, first], 0, |_| {}), 0);
+    }
+
+    #[test]
+    fn many_repeated_keys_are_one_set_each() {
+        let a = set(&["1", "2", "3"]);
+        let b = set(&["2", "3", "4"]);
+        let c = set(&["3", "9"]);
+        let many: Vec<Option<Set>> = (0..60_000)
+            .map(|i| [a.clone(), b.clone(), c.clone()][i % 3].clone())
+            .collect();
+        assert_eq!(inter(&many, 0), ["3"]);
+        let mut tail = vec![a.clone()];
+        tail.extend(many[1..].iter().cloned());
+        assert_eq!(diff_each(&tail, 0, |_| {}), 0); // `a` is among the others
+        let mut tail = vec![a.clone()];
+        tail.extend((0..60_000).map(|i| [b.clone(), None][i % 2].clone()));
+        assert_eq!(diff_each(&tail, 0, |_| {}), 1); // a - b = {1}
+        let mut union = union_of(&many);
+        union.sort();
+        assert_eq!(union.len(), 5);
+        assert_eq!(distinct(many.iter().flatten()).len(), 3);
     }
 
     #[test]

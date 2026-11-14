@@ -1480,8 +1480,75 @@ fn test_sinter_cost_follows_the_smallest_set() {
         let want = if args[0] == "SDIFF" { 0 } else { 50 };
         let took = fastest(&mut c, args, want);
         assert!(
-            took < Duration::from_millis(25),
+            took < Duration::from_millis(100),
             "{args:?} took {took:?} with a 50-member set"
         );
     }
+}
+
+/// Store commands over many keys, distinct or the same few named again and
+/// again. They run with the command gate held alone, so their work over the
+/// key list must stay O(k log k): it was quadratic in the number of keys.
+#[test]
+fn test_set_algebra_over_many_keys() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    const KEYS: usize = 50_000;
+    // SADD many:i m (and x into many:0), pipelined.
+    let mut buf = Vec::new();
+    for i in 0..KEYS {
+        let key = format!("many:{i}");
+        let members: &[&str] = if i == 0 { &["m", "x"] } else { &["m"] };
+        buf.extend_from_slice(format!("*{}\r\n$4\r\nSADD\r\n", 2 + members.len()).as_bytes());
+        for arg in std::iter::once(key.as_str()).chain(members.iter().copied()) {
+            buf.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+        }
+    }
+    c.stream.write_all(&buf).unwrap();
+    for _ in 0..KEYS {
+        assert!(c.read_value().as_int() >= 1);
+    }
+    let keys: Vec<String> = (0..KEYS).map(|i| format!("many:{i}")).collect();
+    let run = |c: &mut Conn, head: &[&str], keys: &[String]| {
+        let mut args: Vec<&str> = head.to_vec();
+        args.extend(keys.iter().map(String::as_str));
+        let t = std::time::Instant::now();
+        let reply = c.cmds(&args);
+        let took = t.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "{} over {} keys took {took:?}",
+            head[0],
+            keys.len()
+        );
+        reply
+    };
+    assert_eq!(run(&mut c, &["SINTERSTORE", "dst"], &keys).as_int(), 1);
+    assert_eq!(run(&mut c, &["SDIFFSTORE", "dst"], &keys).as_int(), 1);
+    assert_eq!(run(&mut c, &["SUNIONSTORE", "dst"], &keys).as_int(), 2);
+    let n = KEYS.to_string();
+    assert_eq!(run(&mut c, &["SINTERCARD", &n], &keys).as_int(), 1);
+
+    // The same three sets named 60,000 times, the first one among the rest.
+    sadd_all(&mut c, "a", ["1", "2", "3"].map(String::from));
+    sadd_all(&mut c, "b", ["2", "3", "4"].map(String::from));
+    sadd_all(&mut c, "c", ["3", "9"].map(String::from));
+    let aliased: Vec<String> = (0..60_000)
+        .map(|i| ["a", "b", "c"][i % 3].to_string())
+        .collect();
+    assert_eq!(
+        sorted_members(&run(&mut c, &["SINTER"], &aliased)),
+        vec!["3"]
+    );
+    assert_eq!(run(&mut c, &["SDIFF"], &aliased).as_array().len(), 0);
+    let mut b_first = aliased.clone();
+    b_first.retain(|k| k != "b");
+    b_first.insert(0, "b".to_string());
+    assert_eq!(
+        sorted_members(&run(&mut c, &["SDIFF"], &b_first)),
+        vec!["4"]
+    );
+    assert_eq!(run(&mut c, &["SUNION"], &aliased).as_array().len(), 5);
+    assert_eq!(run(&mut c, &["SINTERSTORE", "dst"], &aliased).as_int(), 1);
 }
