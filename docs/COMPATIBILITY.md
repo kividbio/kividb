@@ -163,7 +163,10 @@ other files:
 - `DUMP`/`RESTORE` and `MIGRATE` of time series and vector sets work between
   KiviDB nodes only: their payloads are KiviDB's own, and Redis's for these
   types (module values) aren't read either. A series' compaction rules and
-  source are left out, as RedisTimeSeries leaves them out. A vector set made
+  source are left out, as RedisTimeSeries leaves them out, so after
+  `RESTORE`, `MIGRATE` or `MIGRATE`-based resharding run `TS.CREATERULE`
+  again; an atomic slot migration (`CLUSTER MIGRATION`) recreates the rules
+  itself. A vector set made
   `NOQUANT` arrives as a set made without an option, so it then accepts a
   `VADD` with any quantization option, the same as after a snapshot reload.
 - Search: no stemming or phonetic matching (`NOSTEM` and `PHONETIC` are

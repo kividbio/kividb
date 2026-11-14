@@ -216,12 +216,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`DUMP`/`RESTORE`, `MIGRATE` and slot migration of vector sets and time
   series work between KiviDB nodes, and the docs no longer say they don't
-  (#722).** They are moved whole, every quantization included, as a
-  one-entry snapshot image. Redis can't read these payloads, and KiviDB
-  doesn't read Redis's for these two types. As through a snapshot, a
-  `NOQUANT` set's explicit choice isn't kept, so a 1.2 node still restores
-  it during a rolling upgrade; the set then accepts a `VADD` with any
-  quantization option.
+  (#722).** Payloads are a one-entry snapshot image: Redis can't read
+  them, and KiviDB doesn't read Redis's for these two types. A vector set
+  moves whole, every quantization included, except that, as through a
+  snapshot, a `NOQUANT` set's explicit choice isn't kept (so a 1.2 node
+  still restores it during a rolling upgrade; the set then accepts a
+  `VADD` with any quantization option). A time series moves with its
+  samples, labels, retention, chunk size and duplicate policy, but not its
+  compaction rules: an atomic slot migration (`CLUSTER MIGRATION`)
+  recreates them on the new owner, while `DUMP`/`RESTORE`, `MIGRATE` and
+  `MIGRATE`-based resharding (`redis-cli --cluster reshard`) drop them, so
+  run `TS.CREATERULE` again afterwards.
 
 - **`FT.HYBRID` takes `SCORER` and answers as Redis 8.10 does, so RedisVL's
   `HybridQuery` works (#767).** Every `HybridQuery` sends `SCORER BM25STD`
