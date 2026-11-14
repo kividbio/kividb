@@ -3374,18 +3374,22 @@
       "unit": "q/s",
       "better": "higher",
       "recorded": {
-        "v1_2_2": 1109.0,
-        "candidate": 986.1,
-        "redis": 7876.9,
+        "v1_2_2": 678.6,
+        "candidate": 2493.0,
+        "redis": 6731.8,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "d66f0f93",
-        "label": "master-d66f0f93-d4s_v5-part2-09"
+        "commit": "9501caa6",
+        "label": "simd-9501caa6-d4s_v5-09"
       },
       "gate": [
         {
           "kind": "rel",
           "pct": 25
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
         }
       ]
     },
@@ -3842,8 +3846,9 @@
         "candidate": 1000000.0,
         "redis": 1000000.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3860,12 +3865,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 71.2186,
-        "candidate": 1.942,
-        "redis": 2.5702,
+        "v1_2_2": 69.9267,
+        "candidate": 1.9515,
+        "redis": 2.5662,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3895,8 +3901,9 @@
         "candidate": 1999.0,
         "redis": 1999.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3913,12 +3920,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 290.5072,
-        "candidate": 259.7301,
-        "redis": 320.8611,
+        "v1_2_2": 288.1315,
+        "candidate": 253.6446,
+        "redis": 314.2446,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3939,8 +3947,9 @@
         "candidate": 997903.0,
         "redis": 997903.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3957,12 +3966,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 101.8765,
-        "candidate": 2.2311,
-        "redis": 2.771,
+        "v1_2_2": 95.7535,
+        "candidate": 2.3294,
+        "redis": 2.5632,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3992,8 +4002,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4010,12 +4021,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 71.2124,
-        "candidate": 2.0872,
-        "redis": 2.4596,
+        "v1_2_2": 69.4768,
+        "candidate": 2.0918,
+        "redis": 2.2959,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4045,8 +4057,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4063,12 +4076,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 100.5459,
-        "candidate": 0.0573,
-        "redis": 0.0883,
+        "v1_2_2": 93.1755,
+        "candidate": 0.0547,
+        "redis": 0.0629,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4090,8 +4104,9 @@
         "candidate": 100.0,
         "redis": 100.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4108,12 +4123,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 99.3772,
-        "candidate": 0.1938,
-        "redis": 0.5574,
+        "v1_2_2": 92.7057,
+        "candidate": 0.1842,
+        "redis": 0.4597,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4135,8 +4151,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4153,12 +4170,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 99.7248,
-        "candidate": 0.3095,
-        "redis": 0.9436,
+        "v1_2_2": 93.6633,
+        "candidate": 0.3002,
+        "redis": 0.8541,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4180,8 +4198,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4202,8 +4221,9 @@
         "candidate": 5000000.0,
         "redis": 5000000.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4220,12 +4240,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 452.4885,
-        "candidate": 2.0373,
-        "redis": 3.9827,
+        "v1_2_2": 447.1668,
+        "candidate": 2.0325,
+        "redis": 3.9447,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4255,8 +4276,9 @@
         "candidate": 1998.0,
         "redis": 1998.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4273,12 +4295,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1638.7029,
-        "candidate": 1441.868,
-        "redis": 1815.2296,
+        "v1_2_2": 1644.8126,
+        "candidate": 1424.3741,
+        "redis": 1825.2524,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4299,8 +4322,9 @@
         "candidate": 4997902.0,
         "redis": 4997902.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4317,12 +4341,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 554.6359,
-        "candidate": 2.3312,
-        "redis": 3.6909,
+        "v1_2_2": 535.324,
+        "candidate": 2.2152,
+        "redis": 3.8705,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4352,8 +4377,9 @@
         "candidate": 2098.0,
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4370,12 +4396,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 450.7933,
-        "candidate": 2.0625,
-        "redis": 3.4128,
+        "v1_2_2": 446.3426,
+        "candidate": 2.0588,
+        "redis": 3.5221,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4405,8 +4432,9 @@
         "candidate": 2098.0,
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4423,12 +4451,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 548.8004,
-        "candidate": 0.0537,
-        "redis": 0.125,
+        "v1_2_2": 533.386,
+        "candidate": 0.0539,
+        "redis": 0.1161,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4450,8 +4479,9 @@
         "candidate": 100.0,
         "redis": 100.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4468,12 +4498,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 549.4704,
-        "candidate": 0.2474,
-        "redis": 1.5861,
+        "v1_2_2": 533.2514,
+        "candidate": 0.2229,
+        "redis": 1.5606,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4495,8 +4526,9 @@
         "candidate": 2098.0,
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4513,12 +4545,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 550.5818,
-        "candidate": 0.3846,
-        "redis": 2.5314,
+        "v1_2_2": 533.2993,
+        "candidate": 0.4757,
+        "redis": 2.5163,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4540,8 +4573,9 @@
         "candidate": 2098.0,
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4562,8 +4596,9 @@
         "candidate": 20000000.0,
         "redis": 20000000.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4580,12 +4615,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2349.5761,
-        "candidate": 2.0502,
-        "redis": 4.7721,
+        "v1_2_2": 2457.3847,
+        "candidate": 2.0114,
+        "redis": 4.6982,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4615,8 +4651,9 @@
         "candidate": 1999.0,
         "redis": 1999.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4633,12 +4670,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 7800.9543,
-        "candidate": 6642.3059,
-        "redis": 8186.1949,
+        "v1_2_2": 7992.5875,
+        "candidate": 6899.1259,
+        "redis": 8067.2576,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4659,8 +4697,9 @@
         "candidate": 19997903.0,
         "redis": 19997903.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4677,12 +4716,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2512.2337,
-        "candidate": 2.3226,
-        "redis": 4.0858,
+        "v1_2_2": 2572.6635,
+        "candidate": 2.2869,
+        "redis": 4.764,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4712,8 +4752,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4730,12 +4771,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2354.8261,
-        "candidate": 2.1452,
-        "redis": 3.7744,
+        "v1_2_2": 2431.3822,
+        "candidate": 2.1015,
+        "redis": 3.82,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4765,8 +4807,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4783,12 +4826,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2515.4358,
-        "candidate": 0.0892,
-        "redis": 0.1245,
+        "v1_2_2": 2570.7956,
+        "candidate": 0.0569,
+        "redis": 0.1336,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4810,8 +4854,9 @@
         "candidate": 100.0,
         "redis": 100.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4828,12 +4873,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2505.2097,
-        "candidate": 0.2997,
-        "redis": 1.8298,
+        "v1_2_2": 2568.344,
+        "candidate": 0.2963,
+        "redis": 1.8905,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4855,8 +4901,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4873,12 +4920,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2510.2784,
-        "candidate": 0.4274,
-        "redis": 2.9392,
+        "v1_2_2": 2572.5174,
+        "candidate": 0.3809,
+        "redis": 2.8357,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4900,8 +4948,9 @@
         "candidate": 2097.0,
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4918,12 +4967,13 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1330.1216,
-        "candidate": 1325.2326,
-        "redis": 1310.5159,
+        "v1_2_2": 1330.1266,
+        "candidate": 1331.2085,
+        "redis": 1305.2851,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4944,8 +4994,9 @@
         "candidate": 1001999.0,
         "redis": 1001999.0,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4962,18 +5013,20 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 358.2401,
-        "candidate": 0.7335,
-        "redis": 319.5877,
+        "v1_2_2": 362.7095,
+        "candidate": 0.4816,
+        "redis": 321.8868,
         "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-14",
-        "commit": "9ca8ce62",
+        "commit": "219b9656",
         "label": "pr759-d4s_v5"
       },
       "gate": [
         {
           "kind": "bound",
-          "max": 20
+          "max": 20,
+          "speed": false
         }
       ]
     }

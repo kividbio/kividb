@@ -3,66 +3,73 @@
 Verdict: **ok**
 
 - Machine: Standard_D4s_v5, 4 vCPU, Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, kernel 7.0.0-1017-azure, glibc 2.39
+- CPU: recorded on Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz; now Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
+- calibration (indicative only): 92.3 ms for a fixed sha256 loop, 4 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`
-- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `3cef4ff6eedc894e304cb22a64593a19b8ac687ba4f762409289a1f43d1a47c6`
+- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `a8dbc8ad25e0dbbb41ec655f9f79e2a3f5452f2aa158524b72e2036ec95ff6a4`
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
-- candidate commit: `9ca8ce62`
+- candidate commit: `219b9656`
 - date: 2026-11-14; FULL=1, SCALE=1
 - run time: 14-sinter-big-small 388s
+
+Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 1.01x over 22 metrics
+- 14-sinter-big-small/default: 1.01x (14 metrics)
+- 14-sinter-big-small/n20m: 1.03x (7 metrics)
+- 14-sinter-big-small/sunion: 0.99x (1 metrics, too few: the global factor is used)
 
 ## 14-sinter-big-small
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
 | default | 1m_big_card | members | 1,000,000 | 1,000,000 | 1,000,000 | 1,000,000 | bound: == 1,000,000 | pass |
-| default | 1m_sdiff_small_big_ms | ms | 70.35 | 2 | 2.51 | 1.94 | rel: <= 3.94 (50% over 1.94, +2)<br>ratio: gain over v1.2.2 35.23x >= 22.00x (60% of recorded 36.67x)<br>vs_redis: 0.80x Redis <= 2x | pass<br>pass<br>pass |
+| default | 1m_sdiff_small_big_ms | ms | 71.55 | 1.92 | 2.59 | 1.95 | rel: <= 3.94 (50% over 1.94, +2, recorded 1.95 scaled by host speed 1.01x (group))<br>ratio: gain over v1.2.2 37.31x >= 21.50x (60% of recorded 35.83x)<br>vs_redis: 0.74x Redis <= 2x | pass<br>pass<br>pass |
 | default | 1m_sdiff_small_big_reply | members | 1,999 | 1,999 | 1,999 | 1,999 | bound: == 1,999 | pass |
-| default | 1m_sdiffstore_big_small_ms | ms | 290.7 | 262.1 | 317.3 | 259.7 | rel: <= 324.7 (25% over 259.7) | pass |
+| default | 1m_sdiffstore_big_small_ms | ms | 292.6 | 252.4 | 318.9 | 253.6 | rel: <= 314.9 (25% over 251.9, recorded 253.6 scaled by host speed 1.01x (group)) | pass |
 | default | 1m_sdiffstore_big_small_reply | members | 997,903 | 997,903 | 997,903 | 997,903 | bound: == 997,903 | pass |
-| default | 1m_sinter_big_small_ms | ms | 95.49 | 2.34 | 2.63 | 2.23 | rel: <= 4.23 (50% over 2.23, +2)<br>ratio: gain over v1.2.2 40.88x >= 27.40x (60% of recorded 45.66x)<br>vs_redis: 0.89x Redis <= 2x | pass<br>pass<br>pass |
+| default | 1m_sinter_big_small_ms | ms | 95.25 | 2.14 | 2.5 | 2.33 | rel: <= 4.31 (50% over 2.31, +2, recorded 2.33 scaled by host speed 1.01x (group))<br>ratio: gain over v1.2.2 44.42x >= 24.66x (60% of recorded 41.11x)<br>vs_redis: 0.86x Redis <= 2x | pass<br>pass<br>pass |
 | default | 1m_sinter_big_small_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
-| default | 1m_sinter_small_big_ms | ms | 70.43 | 2.17 | 2.4 | 2.09 | rel: <= 4.09 (50% over 2.09, +2)<br>ratio: gain over v1.2.2 32.45x >= 20.47x (60% of recorded 34.12x)<br>vs_redis: 0.91x Redis <= 2x | pass<br>pass<br>pass |
+| default | 1m_sinter_small_big_ms | ms | 70.09 | 2.1 | 2.34 | 2.09 | rel: <= 4.08 (50% over 2.08, +2, recorded 2.09 scaled by host speed 1.01x (group))<br>ratio: gain over v1.2.2 33.43x >= 19.93x (60% of recorded 33.21x)<br>vs_redis: 0.89x Redis <= 2x | pass<br>pass<br>pass |
 | default | 1m_sinter_small_big_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
-| default | 1m_sintercard_limit_ms | ms | 93.26 | 0.0729 | 0.0821 | 0.0573 | rel: <= 2.06 (50% over 0.0573, +2) | pass |
+| default | 1m_sintercard_limit_ms | ms | 93.37 | 0.055 | 0.0586 | 0.0547 | rel: <= 2.05 (50% over 0.0543, +2, recorded 0.0547 scaled by host speed 1.01x (group)) | pass |
 | default | 1m_sintercard_limit_reply | members | 100.0 | 100.0 | 100.0 | 100.0 | bound: == 100.0 | pass |
-| default | 1m_sintercard_ms | ms | 93.53 | 0.256 | 0.525 | 0.194 | rel: <= 2.19 (50% over 0.194, +2) | pass |
+| default | 1m_sintercard_ms | ms | 92.39 | 0.186 | 0.476 | 0.184 | rel: <= 2.18 (50% over 0.183, +2, recorded 0.184 scaled by host speed 1.01x (group)) | pass |
 | default | 1m_sintercard_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
-| default | 1m_sinterstore_ms | ms | 93.91 | 0.38 | 0.923 | 0.309 | rel: <= 2.31 (50% over 0.309, +2) | pass |
+| default | 1m_sinterstore_ms | ms | 93.27 | 0.312 | 0.879 | 0.3 | rel: <= 2.3 (50% over 0.298, +2, recorded 0.3 scaled by host speed 1.01x (group)) | pass |
 | default | 1m_sinterstore_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
 | default | 5m_big_card | members | 5,000,000 | 5,000,000 | 5,000,000 | 5,000,000 | bound: == 5,000,000 | pass |
-| default | 5m_sdiff_small_big_ms | ms | 446.8 | 2.01 | 3.92 | 2.04 | rel: <= 4.04 (50% over 2.04, +2)<br>ratio: gain over v1.2.2 222.50x >= 133.26x (60% of recorded 222.10x)<br>vs_redis: 0.51x Redis <= 2x | pass<br>pass<br>pass |
+| default | 5m_sdiff_small_big_ms | ms | 441.0 | 1.99 | 3.87 | 2.03 | rel: <= 4.02 (50% over 2.02, +2, recorded 2.03 scaled by host speed 1.01x (group))<br>ratio: gain over v1.2.2 221.67x >= 132.00x (60% of recorded 220.01x)<br>vs_redis: 0.51x Redis <= 2x | pass<br>pass<br>pass |
 | default | 5m_sdiff_small_big_reply | members | 1,998 | 1,998 | 1,998 | 1,998 | bound: == 1,998 | pass |
-| default | 5m_sdiffstore_big_small_ms | ms | 1,628 | 1,423 | 1,832 | 1,442 | rel: <= 1,802 (25% over 1,442) | pass |
+| default | 5m_sdiffstore_big_small_ms | ms | 1,622 | 1,467 | 1,811 | 1,424 | rel: <= 1,769 (25% over 1,415, recorded 1,424 scaled by host speed 1.01x (group)) | pass |
 | default | 5m_sdiffstore_big_small_reply | members | 4,997,902 | 4,997,902 | 4,997,902 | 4,997,902 | bound: == 4,997,902 | pass |
-| default | 5m_sinter_big_small_ms | ms | 534.8 | 2.31 | 3.53 | 2.33 | rel: <= 4.33 (50% over 2.33, +2)<br>ratio: gain over v1.2.2 231.94x >= 142.75x (60% of recorded 237.92x)<br>vs_redis: 0.65x Redis <= 2x | pass<br>pass<br>pass |
+| default | 5m_sinter_big_small_ms | ms | 524.5 | 2.15 | 3.55 | 2.22 | rel: <= 4.2 (50% over 2.2, +2, recorded 2.22 scaled by host speed 1.01x (group))<br>ratio: gain over v1.2.2 243.73x >= 145.00x (60% of recorded 241.66x)<br>vs_redis: 0.61x Redis <= 2x | pass<br>pass<br>pass |
 | default | 5m_sinter_big_small_reply | members | 2,098 | 2,098 | 2,098 | 2,098 | bound: == 2,098 | pass |
-| default | 5m_sinter_small_big_ms | ms | 449.4 | 2.08 | 3.42 | 2.06 | rel: <= 4.06 (50% over 2.06, +2)<br>ratio: gain over v1.2.2 216.32x >= 131.14x (60% of recorded 218.57x)<br>vs_redis: 0.61x Redis <= 2x | pass<br>pass<br>pass |
+| default | 5m_sinter_small_big_ms | ms | 442.7 | 2.06 | 3.37 | 2.06 | rel: <= 4.04 (50% over 2.04, +2, recorded 2.06 scaled by host speed 1.01x (group))<br>ratio: gain over v1.2.2 215.30x >= 130.08x (60% of recorded 216.80x)<br>vs_redis: 0.61x Redis <= 2x | pass<br>pass<br>pass |
 | default | 5m_sinter_small_big_reply | members | 2,098 | 2,098 | 2,098 | 2,098 | bound: == 2,098 | pass |
-| default | 5m_sintercard_limit_ms | ms | 531.4 | 0.0541 | 0.11 | 0.0537 | rel: <= 2.05 (50% over 0.0537, +2) | pass |
+| default | 5m_sintercard_limit_ms | ms | 522.6 | 0.0549 | 0.116 | 0.0539 | rel: <= 2.05 (50% over 0.0535, +2, recorded 0.0539 scaled by host speed 1.01x (group)) | pass |
 | default | 5m_sintercard_limit_reply | members | 100.0 | 100.0 | 100.0 | 100.0 | bound: == 100.0 | pass |
-| default | 5m_sintercard_ms | ms | 531.0 | 0.23 | 1.56 | 0.247 | rel: <= 2.25 (50% over 0.247, +2) | pass |
+| default | 5m_sintercard_ms | ms | 524.5 | 0.233 | 1.55 | 0.223 | rel: <= 2.22 (50% over 0.221, +2, recorded 0.223 scaled by host speed 1.01x (group)) | pass |
 | default | 5m_sintercard_reply | members | 2,098 | 2,098 | 2,098 | 2,098 | bound: == 2,098 | pass |
-| default | 5m_sinterstore_ms | ms | 532.3 | 0.354 | 2.36 | 0.385 | rel: <= 2.38 (50% over 0.385, +2) | pass |
+| default | 5m_sinterstore_ms | ms | 526.7 | 0.369 | 2.39 | 0.476 | rel: <= 2.47 (50% over 0.473, +2, recorded 0.476 scaled by host speed 1.01x (group)) | pass |
 | default | 5m_sinterstore_reply | members | 2,098 | 2,098 | 2,098 | 2,098 | bound: == 2,098 | pass |
 | n20m | 20m_big_card | members | 20,000,000 | 20,000,000 | 20,000,000 | 20,000,000 | bound: == 20,000,000 | pass |
-| n20m | 20m_sdiff_small_big_ms | ms | 2,358 | 2.03 | 4.33 | 2.05 | rel: <= 4.05 (50% over 2.05, +2)<br>ratio: gain over v1.2.2 1163.95x >= 687.61x (60% of recorded 1146.02x)<br>vs_redis: 0.47x Redis <= 2x | pass<br>pass<br>pass |
+| n20m | 20m_sdiff_small_big_ms | ms | 2,348 | 2.03 | 4.49 | 2.01 | rel: <= 3.96 (50% over 1.96, +2, recorded 2.01 scaled by host speed 1.03x (group))<br>ratio: gain over v1.2.2 1158.11x >= 733.04x (60% of recorded 1221.73x)<br>vs_redis: 0.45x Redis <= 2x | pass<br>pass<br>pass |
 | n20m | 20m_sdiff_small_big_reply | members | 1,999 | 1,999 | 1,999 | 1,999 | bound: == 1,999 | pass |
-| n20m | 20m_sdiffstore_big_small_ms | ms | 7,793 | 6,734 | 7,961 | 6,642 | rel: <= 8,303 (25% over 6,642) | pass |
+| n20m | 20m_sdiffstore_big_small_ms | ms | 7,903 | 6,889 | 8,111 | 6,899 | rel: <= 8,407 (25% over 6,725, recorded 6,899 scaled by host speed 1.03x (group)) | pass |
 | n20m | 20m_sdiffstore_big_small_reply | members | 19,997,903 | 19,997,903 | 19,997,903 | 19,997,903 | bound: == 19,997,903 | pass |
-| n20m | 20m_sinter_big_small_ms | ms | 2,581 | 2.25 | 3.99 | 2.32 | rel: <= 4.32 (50% over 2.32, +2)<br>ratio: gain over v1.2.2 1145.35x >= 648.99x (60% of recorded 1081.65x)<br>vs_redis: 0.57x Redis <= 2x | pass<br>pass<br>pass |
+| n20m | 20m_sinter_big_small_ms | ms | 2,508 | 2.38 | 4.09 | 2.29 | rel: <= 4.23 (50% over 2.23, +2, recorded 2.29 scaled by host speed 1.03x (group))<br>ratio: gain over v1.2.2 1055.38x >= 674.97x (60% of recorded 1124.96x)<br>vs_redis: 0.58x Redis <= 2x | pass<br>pass<br>pass |
 | n20m | 20m_sinter_big_small_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
-| n20m | 20m_sinter_small_big_ms | ms | 2,355 | 2.16 | 3.67 | 2.15 | rel: <= 4.15 (50% over 2.15, +2)<br>ratio: gain over v1.2.2 1092.21x >= 658.63x (60% of recorded 1097.72x)<br>vs_redis: 0.59x Redis <= 2x | pass<br>pass<br>pass |
+| n20m | 20m_sinter_small_big_ms | ms | 2,342 | 2.12 | 3.63 | 2.1 | rel: <= 4.05 (50% over 2.05, +2, recorded 2.1 scaled by host speed 1.03x (group))<br>ratio: gain over v1.2.2 1104.61x >= 694.18x (60% of recorded 1156.97x)<br>vs_redis: 0.58x Redis <= 2x | pass<br>pass<br>pass |
 | n20m | 20m_sinter_small_big_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
-| n20m | 20m_sintercard_limit_ms | ms | 2,515 | 0.0842 | 0.122 | 0.0892 | rel: <= 2.09 (50% over 0.0892, +2) | pass |
+| n20m | 20m_sintercard_limit_ms | ms | 2,509 | 0.0556 | 0.121 | 0.0569 | rel: <= 2.06 (50% over 0.0555, +2, recorded 0.0569 scaled by host speed 1.03x (group)) | pass |
 | n20m | 20m_sintercard_limit_reply | members | 100.0 | 100.0 | 100.0 | 100.0 | bound: == 100.0 | pass |
-| n20m | 20m_sintercard_ms | ms | 2,530 | 0.304 | 1.8 | 0.3 | rel: <= 2.3 (50% over 0.3, +2) | pass |
+| n20m | 20m_sintercard_ms | ms | 2,499 | 0.24 | 1.79 | 0.296 | rel: <= 2.29 (50% over 0.289, +2, recorded 0.296 scaled by host speed 1.03x (group)) | pass |
 | n20m | 20m_sintercard_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
-| n20m | 20m_sinterstore_ms | ms | 2,523 | 0.424 | 2.77 | 0.427 | rel: <= 2.43 (50% over 0.427, +2) | pass |
+| n20m | 20m_sinterstore_ms | ms | 2,523 | 0.378 | 2.64 | 0.381 | rel: <= 2.37 (50% over 0.371, +2, recorded 0.381 scaled by host speed 1.03x (group)) | pass |
 | n20m | 20m_sinterstore_reply | members | 2,097 | 2,097 | 2,097 | 2,097 | bound: == 2,097 | pass |
-| sunion | sunion_ms | ms | 1,330 | 1,322 | 1,291 | 1,325 | rel: <= 1,657 (25% over 1,325) | pass |
+| sunion | sunion_ms | ms | 1,342 | 1,322 | 1,295 | 1,331 | rel: <= 1,642 (25% over 1,314, recorded 1,331 scaled by host speed 1.01x (global)) | pass |
 | sunion | sunion_reply | members | 1,001,999 | 1,001,999 | 1,001,999 | 1,001,999 | bound: == 1,001,999 | pass |
-| sunion | sunion_worst_sadd_ms | ms | 350.5 | 3.88 | 310.7 | 0.734 | bound: <= 20.00 | pass |
+| sunion | sunion_worst_sadd_ms | ms | 353.2 | 0.427 | 317.5 | 0.482 | bound: <= 20.00 | pass |
 
 ## Not run this time
 

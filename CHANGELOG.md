@@ -368,11 +368,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   intersection walks the smallest set and looks its members up in the
   others, a difference walks only the first set, and `SINTERCARD` stops at
   its `LIMIT`. `SINTER` of a 20M-member set with a 4,096-member one went
-  from 2,512 ms to 2.3 ms (Redis 8.10.2: 4.1 ms), and `SINTERCARD` of the
-  two from 2,505 ms to 0.30 ms (Redis: 1.8 ms); at 1M members, 101.9 ms to
-  2.2 ms (Redis: 2.8 ms). `SUNION` reads one set at a time, so an `SADD`
-  to the small set no longer waits for a union with a big one (worst 0.7 ms
-  against 358 ms during `SUNION` of 1M and 4,096 members). Replies are the
+  from 2,573 ms to 2.3 ms (Redis 8.10.2: 4.8 ms), and `SINTERCARD` of the
+  two from 2,568 ms to 0.30 ms (Redis: 1.9 ms); at 1M members, 95.8 ms to
+  2.3 ms (Redis: 2.6 ms). `SUNION` reads one set at a time, so an `SADD`
+  to the small set no longer waits for a union with a big one (worst 0.5 ms
+  against 363 ms during `SUNION` of 1M and 4,096 members). Replies are the
   same as before.
 
 - **A full `SCAN … MATCH` over a large keyspace no longer trails Redis
