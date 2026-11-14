@@ -109,7 +109,7 @@ rustls-pemfile = { version = "2",   optional = true }
 # The names in a client certificate, for `tls-auth-clients-allowed-names`:
 # the X.509 parser rustls already builds with.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"], optional = true }
-mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
+mlua = { version = "0.10", features = ["lua51", "vendored", "send"], optional = true }
 sha1 = { version = "0.10", optional = true }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 # The startup update check (src/update_check.rs): one HTTPS request to

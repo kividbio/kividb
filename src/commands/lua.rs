@@ -20,111 +20,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// Redis's `struct` library (Roberto Ierusalimschy's lua_struct):
-/// `struct.pack`, `struct.unpack`, `struct.size`, on Lua 5.4's `string.pack`,
-/// one item at a time, so that `c0` (a string as long as the value before it)
-/// works (#154). Its formats as Redis's: `s` is a zero-terminated string,
-/// `l`, `L` and `T` are 8 bytes, `c` alone is one byte, numbers given for
-/// integers are cut to integers. The chunk returns the library.
-const STRUCT_LIBRARY: &str = r##"
-local struct = {}
-local function struct_items(fmt)
-    local items, at = {}, 1
-    while at <= #fmt do
-        local option = fmt:sub(at, at)
-        local size = fmt:match("^%d+", at + 1) or ""
-        at = at + 1 + #size
-        items[#items + 1] = { option, size }
-    end
-    return items
-end
-local struct_plain = {}
-for option in ("xbBhHiIfd"):gmatch(".") do struct_plain[option] = true end
-local function struct_option(option, size)
-    if option == "s" then return "z" end
-    if option == "l" then return "i8" end
-    if option == "L" or option == "T" then return "I8" end
-    if option == "c" then return "c" .. (size == "" and "1" or size) end
-    if struct_plain[option] then return option .. size end
-    error("invalid format option '" .. option .. "'")
-end
-local function struct_integer(value)
-    local n = tonumber(value)
-    if n == nil then error("bad argument to 'pack' (number expected)") end
-    return math.tointeger(n) or (n >= 0 and math.floor(n) or math.ceil(n))
-end
-local function struct_state(option)
-    return option == "<" or option == ">" or option == "=" or option == "!"
-end
-struct.pack = function(fmt, ...)
-    local values, next_value, state, out = table.pack(...), 1, "", {}
-    for _, item in ipairs(struct_items(fmt)) do
-        local option, size = item[1], item[2]
-        if struct_state(option) then
-            state = state .. option .. size
-        elseif option == " " then
-        elseif option == "x" then
-            out[#out + 1] = string.pack(state .. "x" .. size)
-        elseif option == "c" and size == "0" then
-            out[#out + 1] = tostring(values[next_value])
-            next_value = next_value + 1
-        else
-            local value = values[next_value]
-            next_value = next_value + 1
-            if option == "s" or option == "c" then
-                value = tostring(value)
-            elseif option ~= "f" and option ~= "d" then
-                value = struct_integer(value)
-            end
-            out[#out + 1] = string.pack(state .. struct_option(option, size), value)
-        end
-    end
-    return table.concat(out)
-end
-struct.unpack = function(fmt, data, at)
-    at = at or 1
-    local state, out, last = "", {}, nil
-    for _, item in ipairs(struct_items(fmt)) do
-        local option, size = item[1], item[2]
-        if struct_state(option) then
-            state = state .. option .. size
-        elseif option == " " then
-        elseif option == "x" then
-            at = string.unpack(state .. "x" .. size, data, at)
-        elseif option == "c" and size == "0" then
-            local length = math.tointeger(last)
-            if length == nil then error("format 'c0' needs a previous size") end
-            if at + length - 1 > #data then error("data string too short") end
-            last = data:sub(at, at + length - 1)
-            out[#out + 1] = last
-            at = at + length
-        else
-            local value
-            value, at = string.unpack(state .. struct_option(option, size), data, at)
-            out[#out + 1] = value
-            last = value
-        end
-    end
-    out[#out + 1] = at
-    return table.unpack(out)
-end
-struct.size = function(fmt)
-    local state, total = "", 0
-    for _, item in ipairs(struct_items(fmt)) do
-        local option, size = item[1], item[2]
-        if struct_state(option) then
-            state = state .. option .. size
-        elseif option == "s" or (option == "c" and size == "0") then
-            error("options 'c0' - 's' have undefined sizes")
-        elseif option ~= " " then
-            total = total + string.packsize(state .. struct_option(option, size))
-        end
-    end
-    return total
-end
-return struct
-"##;
-
 /// Scripts by SHA1. A source is shared with whoever runs it: scripts are a
 /// few kilobytes each, and one was copied whole for every call.
 static SCRIPT_STORE: OnceLock<RwLock<HashMap<String, Arc<str>>>> = OnceLock::new();
@@ -695,11 +590,8 @@ fn lua_error_message(error: &LuaError) -> String {
 }
 
 /// A step of the collector every [`GC_LOADS`] loads, as Redis's `luaGC`
-/// takes one. A load leaves the chunk it ran behind, and the collector left
-/// to itself lets a run of loads pile that up: 50,000 small functions held
-/// 18.7 MB, of which 14.3 MB was live (what a full collection leaves).
-/// Redis steps 50 KB, but a step of Lua 5.4's is of a debt in allocation,
-/// not 5.1's: 50 KB left 16.3 MB, [`GC_STEP_KB`] leaves 14.4 MB.
+/// takes one, of the same 50 KB. A load leaves the chunk it ran behind, and
+/// the collector left to itself lets a run of loads pile that up.
 fn gc_after_load(lua: &Lua) {
     static LOADS: AtomicU32 = AtomicU32::new(0);
     if LOADS.fetch_add(1, Ordering::Relaxed) + 1 >= GC_LOADS {
@@ -709,7 +601,7 @@ fn gc_after_load(lua: &Lua) {
 }
 
 const GC_LOADS: u32 = 50;
-const GC_STEP_KB: i32 = 1000;
+const GC_STEP_KB: i32 = 50;
 
 /// Run a library as `FUNCTION LOAD` runs it, and return what it registered.
 /// The functions are not callable yet: [`commit_registered`] makes them so,
@@ -1375,6 +1267,12 @@ fn msgpack_encode(val: &LuaValue, buf: &mut Vec<u8>, depth: u32) {
         LuaValue::Boolean(false) => buf.push(0xc2),
         LuaValue::Boolean(true) => buf.push(0xc3),
         LuaValue::Integer(n) => msgpack_encode_int(*n, buf),
+        // As Redis's cmsgpack: a float that a 32-bit one holds exactly is
+        // written as one.
+        LuaValue::Number(f) if (*f as f32) as f64 == *f => {
+            buf.push(0xca);
+            buf.extend_from_slice(&(*f as f32).to_bits().to_be_bytes());
+        }
         LuaValue::Number(f) => {
             buf.push(0xcb);
             buf.extend_from_slice(&f.to_bits().to_be_bytes());
@@ -1426,18 +1324,24 @@ fn msgpack_encode_int(n: i64, buf: &mut Vec<u8>) {
     }
 }
 
-fn cmp_msgpack_map_key(a: &LuaValue, b: &LuaValue) -> std::cmp::Ordering {
-    use LuaValue::*;
-    match (a, b) {
-        (Integer(i), Integer(j)) => i.cmp(j),
-        (Integer(_), _) => std::cmp::Ordering::Less,
-        (_, Integer(_)) => std::cmp::Ordering::Greater,
-        // LuaJIT's cmsgpack encodes map keys in hash-table order; reverse lexicographic
-        // matches the Redis reference output for typical `{x=..., y=...}` tables.
-        (String(sa), String(sb)) => sb.as_bytes().cmp(&sa.as_bytes()),
-        (String(_), _) => std::cmp::Ordering::Less,
-        (_, String(_)) => std::cmp::Ordering::Greater,
-        _ => std::cmp::Ordering::Equal,
+/// What a map key sorts by: integers first, in order; then strings, in
+/// reverse byte order; then the rest, as found.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum MsgpackMapKey {
+    Integer(i64),
+    String(std::cmp::Reverse<Vec<u8>>),
+    Other,
+}
+
+impl MsgpackMapKey {
+    fn of(key: &LuaValue) -> Self {
+        match key {
+            LuaValue::Integer(n) => MsgpackMapKey::Integer(*n),
+            // LuaJIT's cmsgpack encodes map keys in hash-table order; reverse lexicographic
+            // matches the Redis reference output for typical `{x=..., y=...}` tables.
+            LuaValue::String(s) => MsgpackMapKey::String(std::cmp::Reverse(s.as_bytes().to_vec())),
+            _ => MsgpackMapKey::Other,
+        }
     }
 }
 
@@ -1459,21 +1363,23 @@ fn msgpack_encode_str(s: &[u8], buf: &mut Vec<u8>) {
 
 fn msgpack_encode_table(t: &LuaTable, buf: &mut Vec<u8>, depth: u32) {
     let seq_len = t.raw_len();
-    // Collect all key-value pairs.
-    let mut pairs: Vec<(LuaValue, LuaValue)> = t
+    // Pairs are not kept as Lua values: Lua 5.1 lets a host hold only some
+    // 8,000 of those at once, and a table may have many more pairs. One
+    // pass to tell an array, and for a map, one to encode each pair as it
+    // is read.
+    let mut total = 0usize;
+    let mut all_sequence = true;
+    for (key, _) in t
         .clone()
         .pairs::<LuaValue, LuaValue>()
         .filter_map(|r| r.ok())
-        .collect();
-    pairs.sort_by(|(k1, _), (k2, _)| cmp_msgpack_map_key(k1, k2));
-    let total = pairs.len();
+    {
+        total += 1;
+        all_sequence &= matches!(key, LuaValue::Integer(n) if n >= 1 && n as usize <= seq_len);
+    }
 
     // Treat table as array if all keys are consecutive integers 1..seq_len.
-    let is_array = seq_len > 0
-        && total == seq_len
-        && pairs
-            .iter()
-            .all(|(k, _)| matches!(k, LuaValue::Integer(n) if *n >= 1 && *n as usize <= seq_len));
+    let is_array = seq_len > 0 && total == seq_len && all_sequence;
 
     if is_array {
         if seq_len <= 15 {
@@ -1499,12 +1405,26 @@ fn msgpack_encode_table(t: &LuaTable, buf: &mut Vec<u8>, depth: u32) {
             buf.push(0xdf);
             buf.extend_from_slice(&(total as u32).to_be_bytes());
         }
-        for (k, v) in &pairs {
-            msgpack_encode(k, buf, depth + 1);
-            msgpack_encode(v, buf, depth + 1);
+        let mut pairs: Vec<(MsgpackMapKey, Vec<u8>)> = Vec::with_capacity(total);
+        for (key, value) in t
+            .clone()
+            .pairs::<LuaValue, LuaValue>()
+            .filter_map(|r| r.ok())
+        {
+            let mut encoded = Vec::new();
+            msgpack_encode(&key, &mut encoded, depth + 1);
+            msgpack_encode(&value, &mut encoded, depth + 1);
+            pairs.push((MsgpackMapKey::of(&key), encoded));
+        }
+        pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (_, encoded) in &pairs {
+            buf.extend_from_slice(encoded);
         }
     }
 }
+
+/// How many values `cmsgpack.unpack` returns at most.
+const MSGPACK_UNPACK_RESULTS_MAX: usize = 4000;
 
 /// How deep a MessagePack value may nest to be decoded.
 const MSGPACK_DECODE_DEPTH_MAX: u32 = 256;
@@ -1999,7 +1919,7 @@ fn new_lua_vm() -> Lua {
             for arg in args.into_iter() {
                 match arg {
                     LuaValue::String(s) => parts.push(s.as_bytes().as_ref().to_vec()),
-                    LuaValue::Integer(n) => parts.push(n.to_string().into_bytes()),
+                    LuaValue::Integer(n) => parts.push(lua_float_redis_arg(n as f64)),
                     LuaValue::Number(n) => parts.push(lua_float_redis_arg(n)),
                     LuaValue::Boolean(true) => parts.push(b"1".to_vec()),
                     LuaValue::Boolean(false) => parts.push(b"0".to_vec()),
@@ -2103,10 +2023,24 @@ fn new_lua_vm() -> Lua {
         .unwrap();
 
     let unpack_fn = lua
+        // Every value packed in it, as Redis's `cmsgpack.unpack` returns.
         .create_function(|lua, data: LuaValue| {
             let bytes = lua_value_to_bytes(&data)?;
-            let (val, _) = msgpack_decode(lua, &bytes, 0)?;
-            Ok(val)
+            let mut values = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                // Lua 5.1 has room for some 8,000 results, and the host
+                // for as many values held at once.
+                if values.len() >= MSGPACK_UNPACK_RESULTS_MAX {
+                    return Err(LuaError::RuntimeError(
+                        "too many results to unpack".into(),
+                    ));
+                }
+                let (value, used) = msgpack_decode(lua, &bytes[at..], 0)?;
+                values.push(value);
+                at += used;
+            }
+            Ok(LuaMultiValue::from_vec(values))
         })
         .unwrap();
 
@@ -2203,63 +2137,13 @@ fn new_lua_vm() -> Lua {
     lua.globals().set("cjson", cjson).unwrap();
     lua.globals().set("cmsgpack", cmsgpack).unwrap();
 
-    // LuaJIT BitOp library (bit.*): emulated using Lua 5.4's built-in bitwise operators.
-    lua.load(
-        r#"
-bit = {}
-bit.tobit  = function(n) return n & 0xFFFFFFFF end
-bit.band   = function(a, ...) local r = a for _, v in ipairs({...}) do r = r & v end return r & 0xFFFFFFFF end
-bit.bor    = function(a, ...) local r = a for _, v in ipairs({...}) do r = r | v end return r & 0xFFFFFFFF end
-bit.bxor   = function(a, ...) local r = a for _, v in ipairs({...}) do r = r ~ v end return r & 0xFFFFFFFF end
-bit.bnot   = function(a) return (~a) & 0xFFFFFFFF end
-bit.lshift = function(a, n) return (a << n) & 0xFFFFFFFF end
-bit.rshift = function(a, n) return (a >> n) & 0xFFFFFFFF end
-bit.arshift= function(a, n) return (a >> n) end
-bit.rol    = function(a, n) n = n & 31; return ((a << n) | (a >> (32 - n))) & 0xFFFFFFFF end
-bit.ror    = function(a, n) n = n & 31; return ((a >> n) | (a << (32 - n))) & 0xFFFFFFFF end
-bit.bswap  = function(a)
-    return ((a & 0xFF) << 24) | (((a >> 8) & 0xFF) << 16) | (((a >> 16) & 0xFF) << 8) | ((a >> 24) & 0xFF)
-end
-bit.tohex = function(n, width)
-    n = n & 0xFFFFFFFF
-    width = width or 8
-    if width < 0 then width = -width end
-    -- LuaJIT widens INT_MIN negation; clamp so string.format never sees a bogus width.
-    if width > 8 then width = 8 end
-    if width < 1 then width = 8 end
-    return string.format("%0" .. width .. "X", n)
-end
-
-"#,
-    )
-    .exec()
-    .unwrap();
-
-    // Redis's `struct` library: see [`STRUCT_LIBRARY`]. Compiled into a VM
-    // the first time a script there reaches for it: every VM made it up
-    // front, and the functions VM held a third of a megabyte more.
-    let stub = lua.create_table().unwrap();
-    let meta = lua.create_table().unwrap();
-    meta.set(
-        "__index",
-        lua.create_function(|lua, (stub, key): (LuaTable, LuaValue)| {
-            let library: LuaTable = lua.load(STRUCT_LIBRARY).set_name("=struct").eval()?;
-            for pair in library.pairs::<LuaValue, LuaValue>() {
-                let (name, value) = pair?;
-                stub.raw_set(name, value)?;
-            }
-            stub.set_metatable(None);
-            stub.raw_get::<LuaValue>(key)
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    stub.set_metatable(Some(meta));
-    lua.globals().set("struct", stub).unwrap();
-
-    // Lua 5.1 compat: `unpack` was a global; in 5.2+ it moved to `table.unpack`.
-    // Redis's scripting environment re-exports it as a global, so scripts can use either form.
-    lua.load("unpack = table.unpack").exec().unwrap();
+    // Redis's `bit` (LuaBitOp) and `struct` libraries: see [`super::lua_libs`].
+    lua.globals()
+        .set("bit", super::lua_libs::bit_library(&lua).unwrap())
+        .unwrap();
+    lua.globals()
+        .set("struct", super::lua_libs::struct_library(&lua).unwrap())
+        .unwrap();
 
     // A table raised by `error` is kept with its `err` and the line, as
     // Redis's error handler reads one: see [`remember_error_table`]. `pcall`
@@ -2276,6 +2160,12 @@ end
             .unwrap();
         globals
             .set("pcall", lua.create_c_function(script_pcall).unwrap())
+            .unwrap();
+        globals
+            .set(
+                "unpack",
+                lua.create_c_function(super::lua_libs::unpack).unwrap(),
+            )
             .unwrap();
     }
 
@@ -2322,23 +2212,48 @@ _setmetatable(os, {
 
 -- Nothing that reaches outside the sandbox. `package.loaded` still held the
 -- real `io` and `os` (and so `os.execute`, `io.popen`) after the globals were
--- replaced: a script could run programs on the host. `require`, `loadfile`
--- and `dofile` read files; `string.dump` and binary chunks given to `load`
--- are bytecode, which Lua does not check and which can corrupt memory. As
--- in Redis, `load` takes source text only.
+-- replaced: a script could run programs on the host. `require`, `module`,
+-- `loadfile` and `dofile` read files. `setfenv`, `getfenv` and `newproxy`
+-- are what Redis leaves out unless `lua-enable-deprecated-api` is on.
 package = nil
 require = nil
+module = nil
 loadfile = nil
 dofile = nil
 debug = nil
-string.dump = nil
+setfenv = nil
+getfenv = nil
+newproxy = nil
+-- Binary chunks are bytecode, which Lua does not check and which can
+-- corrupt memory. As in Redis, `loadstring` and `load` take source text
+-- only: given bytecode, they return nil and an error.
 do
-    local _load = load
-    load = function(chunk, name, mode, ...)
-        if select('#', ...) > 0 then
-            return _load(chunk, name, "t", ...)
+    local _load, _loadstring, _type, _byte = load, loadstring, type, string.byte
+    local _error = error
+    local BINARY = 27
+    local REFUSED = "binary chunks are not allowed"
+    loadstring = function(chunk, ...)
+        if _type(chunk) == "string" and _byte(chunk, 1) == BINARY then
+            return nil, REFUSED
         end
-        return _load(chunk, name, "t")
+        return _loadstring(chunk, ...)
+    end
+    load = function(reader, ...)
+        local first = true
+        local function checked()
+            local piece = reader()
+            if first and _type(piece) == "string" and piece ~= "" then
+                first = false
+                if _byte(piece, 1) == BINARY then
+                    _error(REFUSED, 0)
+                end
+            end
+            return piece
+        end
+        if _type(reader) ~= "function" then
+            _error("bad argument #1 to 'load' (function expected, got " .. _type(reader) .. ")", 2)
+        end
+        return _load(checked, ...)
     end
 end
 
@@ -2487,13 +2402,14 @@ end
     .exec()
     .unwrap();
 
-    let loadstring_nil_call = lua
-        .create_function(|_, _: LuaMultiValue| -> LuaResult<LuaMultiValue> {
-            Err(LuaError::RuntimeError("attempt to call a nil value".into()))
-        })
+    // Lua 5.1's parser does not keep the chunk's name alive while it
+    // parses, and a collection in the middle frees it. Names held here are
+    // never collected: the ones scripts and libraries are loaded under, and
+    // `load`'s default.
+    let names = lua
+        .create_sequence_from(["=user_script", "=library", "=(load)"])
         .unwrap();
-    lua.globals()
-        .raw_set("loadstring", loadstring_nil_call)
+    lua.set_named_registry_value("__kividb_chunk_names", names)
         .unwrap();
 
     // Standard Lua base library registers these; remove so `_G.__index` reports undeclared globals
@@ -2823,7 +2739,9 @@ fn lua_to_json_value(lua: &Lua, val: &LuaValue, depth: i64) -> LuaResult<serde_j
                     "Cannot serialise number: NaN/Inf".into(),
                 ));
             }
-            Ok(serde_json::Number::from_f64(*n)
+            // Redis's cjson writes numbers with 14 significant digits.
+            let n: f64 = format!("{n:.13e}").parse().unwrap_or(*n);
+            Ok(serde_json::Number::from_f64(n)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null))
         }
@@ -3148,7 +3066,7 @@ fn lua_to_resp_inner(
             resp_null_for(protocol.client)
         }),
         LuaValue::Integer(n) => Ok(resp_integer(n)),
-        LuaValue::Number(n) => Ok(resp_integer(n as i64)),
+        LuaValue::Number(n) => Ok(resp_integer(lua_number_reply(n))),
         LuaValue::String(s) => Ok(resp_bulk(s.as_bytes().as_ref())),
         LuaValue::Table(t) => {
             let eff_resp = protocol.client;
@@ -3324,18 +3242,62 @@ fn strip_shebang_for_lua(body: &str) -> String {
     }
 }
 
-/// Format a Lua `number` for `redis.call` argv (must preserve `0.01` for `DEBUG SLEEP`, etc.).
-#[inline]
+/// A Lua number as `redis.call` passes it to a command, as Redis writes
+/// one: an integer within 2^62 in plain digits, and anything else as its
+/// shortest round-trip digits, in plain notation while that stays short
+/// (`1000000000000000.5`, `9223372036854776000`, `0.00001`) and in
+/// exponent notation past that (`1e+20`, `1e-7`). `0.01` stays `0.01`, for
+/// sub-second sleeps.
 fn lua_float_redis_arg(n: f64) -> Vec<u8> {
-    if !n.is_finite() {
-        return b"0".to_vec();
+    const LIMIT: f64 = 4_611_686_018_427_387_904.0; // 2^62
+    if (-LIMIT..=LIMIT).contains(&n) && n.trunc() == n {
+        return (n as i64).to_string().into_bytes();
     }
-    // Redis uses integer digits when the value is integral (INCRBY args, scores as ints).
-    // Truncating every float to `i64` breaks sub-second sleeps: `0.01 as i64` → `"0"`.
-    if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-        ((n as i64).to_string()).into_bytes()
+    let sign = if n.is_sign_negative() { "-" } else { "" };
+    if n.is_nan() {
+        return format!("{sign}nan").into_bytes();
+    }
+    if n.is_infinite() {
+        return format!("{sign}inf").into_bytes();
+    }
+    // The shortest digits that read back as `n`, and the power of ten of
+    // the first: "1.5e300" is digits "15", exponent 300.
+    let scientific = format!("{:e}", n.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let count = digits.len() as i32;
+    // The power of ten of the last digit.
+    let last = exponent - (count - 1);
+    let magnitude = exponent.abs();
+    let text = if last >= 0 && magnitude < count + 7 {
+        format!("{digits}{}", "0".repeat(last as usize))
+    } else if last < 0 && (last > -7 || magnitude < 4) {
+        let point = count + last;
+        if point <= 0 {
+            format!("0.{}{digits}", "0".repeat((-point) as usize))
+        } else {
+            let (whole, fraction) = digits.split_at(point as usize);
+            format!("{whole}.{fraction}")
+        }
     } else {
-        n.to_string().into_bytes()
+        let (first, rest) = digits.split_at(1);
+        let point = if rest.is_empty() { "" } else { "." };
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        format!("{first}{point}{rest}e{exponent_sign}{magnitude}")
+    };
+    format!("{sign}{text}").into_bytes()
+}
+
+/// A Lua number as an integer reply: cut toward zero, as Redis's
+/// `(long long)` cast does on x86-64, which gives the lowest integer for
+/// what does not fit (NaN, infinity, 1e30).
+fn lua_number_reply(n: f64) -> i64 {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    if (-LIMIT..LIMIT).contains(&n) {
+        n as i64
+    } else {
+        i64::MIN
     }
 }
 
@@ -3460,13 +3422,7 @@ unsafe fn run_and_push(state: *mut mlua::ffi::lua_State) -> bool {
                 continue;
             }
             ffi::LUA_TNUMBER => {
-                if unsafe { ffi::lua_isinteger(state, index) } != 0 {
-                    unsafe { ffi::lua_tointeger(state, index) }
-                        .to_string()
-                        .into_bytes()
-                } else {
-                    lua_float_redis_arg(unsafe { ffi::lua_tonumber(state, index) })
-                }
+                lua_float_redis_arg(unsafe { ffi::lua_tonumber(state, index) })
             }
             ffi::LUA_TBOOLEAN => {
                 if unsafe { ffi::lua_toboolean(state, index) } != 0 {
@@ -3666,7 +3622,7 @@ fn set_global_keys_argv<A: AsRef<[u8]>>(lua: &Lua, keys: &[A], argv: &[A]) -> Re
         lua.exec_raw::<()>((), |state| {
             use mlua::ffi;
             ffi::lua_checkstack(state, 6);
-            ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
+            ffi::lua_pushvalue(state, ffi::LUA_GLOBALSINDEX);
             for (name, items) in [(c"KEYS", keys), (c"ARGV", argv)] {
                 ffi::lua_pushstring(state, name.as_ptr());
                 ffi::lua_createtable(state, items.len() as std::ffi::c_int, 0);
@@ -3914,9 +3870,8 @@ unsafe extern "C-unwind" fn script_assert(state: *mut mlua::ffi::lua_State) -> s
     }
 }
 
-/// The name the running C function was called by, as Lua 5.1 gives it in a
-/// bad-argument error: `'?'` when the call gives none, as from `pcall` (5.4
-/// would look for a global of that value).
+/// The name the running C function was called by, as Lua gives it in a
+/// bad-argument error: `'?'` when the call gives none, as from `pcall`.
 unsafe fn called_as(state: *mut mlua::ffi::lua_State) -> *const std::ffi::c_char {
     use mlua::ffi;
     unsafe {
@@ -3932,42 +3887,23 @@ unsafe fn called_as(state: *mut mlua::ffi::lua_State) -> *const std::ffi::c_char
     }
 }
 
-/// `pcall` in scripts: Lua's own (`luaB_pcall`, so a coroutine can still
-/// yield inside it), but what it catches is handed back as Redis's `pcall`
-/// (`luaRedisPcall`) hands it back (#90): see [`caught_as_redis`].
+/// `pcall` in scripts: Lua's own (`luaB_pcall`), but what it catches is
+/// handed back as Redis's `pcall` (`luaRedisPcall`) hands it back (#90): see
+/// [`caught_as_redis`].
 unsafe extern "C-unwind" fn script_pcall(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
     use mlua::ffi;
     unsafe {
         ffi::luaL_checkany(state, 1);
         ffi::lua_pushboolean(state, 1);
         ffi::lua_insert(state, 1);
-        let status = ffi::lua_pcallk(
-            state,
-            ffi::lua_gettop(state) - 2,
-            ffi::LUA_MULTRET,
-            0,
-            0,
-            Some(finish_script_pcall),
-        );
-        finish_script_pcall(state, status, 0)
-    }
-}
-
-/// The rest of [`script_pcall`], as `finishpcall` is of `luaB_pcall`.
-unsafe extern "C-unwind" fn finish_script_pcall(
-    state: *mut mlua::ffi::lua_State,
-    status: std::ffi::c_int,
-    extra: mlua::ffi::lua_KContext,
-) -> std::ffi::c_int {
-    use mlua::ffi;
-    unsafe {
-        if status != ffi::LUA_OK && status != ffi::LUA_YIELD {
+        let status = ffi::lua_pcall(state, ffi::lua_gettop(state) - 2, ffi::LUA_MULTRET, 0);
+        if status != ffi::LUA_OK {
             let caught = caught_as_redis(state);
             ffi::lua_pushboolean(state, 0);
             ffi::lua_rotate(state, -(caught + 1), 1);
             return caught + 1;
         }
-        ffi::lua_gettop(state) - extra as std::ffi::c_int
+        ffi::lua_gettop(state)
     }
 }
 
@@ -4085,14 +4021,8 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
         match ffi::lua_rawget(state, 1) {
             ffi::LUA_TSTRING => {}
             ffi::LUA_TNUMBER => {
-                let mut integer = 0;
-                let n = ffi::lua_tointegerx(state, -1, &mut integer);
-                if integer != 0 {
-                    ffi::lua_pushfstring(state, c"%I".as_ptr(), n);
-                } else {
-                    ffi::lua_pushfstring(state, c"%f".as_ptr(), ffi::lua_tonumber(state, -1));
-                }
-                ffi::lua_replace(state, -2);
+                // As Lua writes a number: `%.14g`.
+                ffi::lua_tolstring(state, -1, std::ptr::null_mut());
             }
             _ => {
                 ffi::lua_pop(state, 1);

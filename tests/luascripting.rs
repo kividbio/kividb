@@ -728,14 +728,10 @@ fn the_struct_library_packs_and_unpacks_as_redis_s() {
     assert_eq!(
         eval(
             &mut c,
-            "local n, s, at = struct.unpack('Bc0', struct.pack('Bc0', 5, 'hello')) \
-             return {n, s, at}"
+            "return {struct.unpack('Bc0', struct.pack('Bc0', 5, 'hello'))}"
         ),
-        RespValue::Array(vec![
-            RespValue::Int(5),
-            RespValue::Bulk(b"hello".to_vec()),
-            RespValue::Int(7)
-        ])
+        // The length is taken by `c0`, not returned, as in Redis.
+        RespValue::Array(vec![RespValue::Bulk(b"hello".to_vec()), RespValue::Int(7)])
     );
     // A number given for an integer is cut to one, as Redis's struct does.
     assert_eq!(
@@ -1440,8 +1436,7 @@ fn a_key_is_not_gone_before_its_time() {
 /// Nothing in a script reaches outside the sandbox: no `package` (whose
 /// `loaded` table held the real `io` and `os`, and so `os.execute` and
 /// `io.popen`), no `require`, `loadfile`, `dofile` or `debug`, and no
-/// bytecode — `string.dump` is gone and `load` takes source text only, as in
-/// Redis.
+/// bytecode: `loadstring` and `load` take source text only, as in Redis.
 #[test]
 fn a_script_cannot_reach_outside_the_sandbox() {
     let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
@@ -1455,10 +1450,6 @@ fn a_script_cannot_reach_outside_the_sandbox() {
         assert!(reply.is_error(), "{name}");
     }
     assert_eq!(
-        c.cmds(&["EVAL", "return type(string.dump)", "0"]).as_str(),
-        "nil"
-    );
-    assert_eq!(
         c.cmds(&["EVAL", "return type(os.execute)", "0"]).as_str(),
         "function",
         "a stub that refuses, as Redis has"
@@ -1469,19 +1460,30 @@ fn a_script_cannot_reach_outside_the_sandbox() {
     );
     // Source text still loads; bytecode does not.
     assert!(matches!(
-        c.cmds(&["EVAL", "return load('return 7')()", "0"]),
+        c.cmds(&["EVAL", "return loadstring('return 7')()", "0"]),
         RespValue::Int(7)
     ));
-    let bytecode = c.cmds(&[
-        "EVAL",
-        r"local f, err = load('\27Lua') return tostring(err)",
-        "0",
-    ]);
-    assert!(
-        bytecode.as_str().contains("binary"),
-        "{:?}",
-        bytecode.as_str()
-    );
+    assert!(matches!(
+        c.cmds(&[
+            "EVAL",
+            "local done = false \
+             return load(function() if done then return nil end done = true return 'return 8' end)()",
+            "0"
+        ]),
+        RespValue::Int(8)
+    ));
+    for script in [
+        r"local f, err = loadstring('\27Lua') return tostring(err)",
+        r"local s = '\27Lua' local f, err = load(function() local p = s s = nil return p end) return tostring(err)",
+        "local f, err = loadstring(string.dump(function() return 1 end)) return tostring(err)",
+    ] {
+        let bytecode = c.cmds(&["EVAL", script, "0"]);
+        assert!(
+            bytecode.as_str().contains("binary"),
+            "{script}: {:?}",
+            bytecode.as_str()
+        );
+    }
 }
 
 /// A function that has shown itself quick runs on the worker that read it.
@@ -2304,4 +2306,137 @@ fn a_ts_time_above_i64_max_is_refused_in_a_script() {
         "5",
     ]);
     assert!(matches!(reply, RespValue::Int(5)), "{reply:?}");
+}
+
+/// Scripts run on Lua 5.1, as Redis's do, with its rules for numbers (#747):
+/// `string.format('%d')` cuts a fraction instead of failing, `10 / 2` is
+/// written `5` and not `5.0` (in `tostring`, `..` and keys made with it),
+/// and `_VERSION` says so. What the sandbox has is Redis's: `unpack` and
+/// `loadstring`, no `table.unpack`, no `setfenv`/`getfenv`, no `//` or `&`.
+/// The replies are Redis 8.10.2's for the same scripts.
+#[test]
+fn scripts_run_on_lua_5_1_with_redis_s_number_rules() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut eval = |script: &str| c.cmds(&["EVAL", script, "0"]);
+    let bulk = |text: &str| RespValue::Bulk(text.as_bytes().to_vec());
+    let cases: Vec<(&str, RespValue)> = vec![
+        // The issue's table.
+        ("return string.format('%d', 1.5)", bulk("1")),
+        ("return string.format('%d', 3.0)", bulk("3")),
+        (
+            "return string.format('%d%03d', 1731571200, 123456 / 1000)",
+            bulk("1731571200123"),
+        ),
+        ("return string.format('%x', 255.9)", bulk("ff")),
+        ("return tostring(10 / 2)", bulk("5")),
+        ("return 7 / 2", RespValue::Int(3)),
+        ("return _VERSION", bulk("Lua 5.1")),
+        // affinidi-messaging-mediator's store_message: TIME's seconds and
+        // microseconds as milliseconds.
+        (
+            "local t = redis.call('TIME') \
+             local ms = string.format('%d%03d', t[1], t[2] / 1000) \
+             return #ms == #t[1] + 3 and ms:sub(1, #t[1]) == t[1]",
+            RespValue::Int(1),
+        ),
+        ("return 'k:' .. 10 / 2", bulk("k:5")),
+        ("return string.format('%s|%d', 10 / 2, -1.5)", bulk("5|-1")),
+        ("return tostring(0.1 + 0.2)", bulk("0.3")),
+        ("return tostring(2^53)", bulk("9.007199254741e+15")),
+        // The sandbox.
+        ("return type(unpack)", bulk("function")),
+        ("return type(table.unpack)", bulk("nil")),
+        ("return select('#', unpack({1, 2, 3}))", RespValue::Int(3)),
+        ("return loadstring('return 1 + 1')()", RespValue::Int(2)),
+        ("return type(gcinfo)", bulk("function")),
+        ("return type(math.tointeger)", bulk("nil")),
+        ("return type(string.pack)", bulk("nil")),
+        // LuaBitOp: signed 32-bit results.
+        ("return bit.bnot(0)", RespValue::Int(-1)),
+        ("return bit.tobit(0xffffffff)", RespValue::Int(-1)),
+        ("return bit.lshift(1, 31)", RespValue::Int(-2147483648)),
+        ("return bit.rshift(-1, 1)", RespValue::Int(2147483647)),
+        ("return bit.arshift(-256, 4)", RespValue::Int(-16)),
+        ("return bit.bswap(0x12345678)", RespValue::Int(2018915346)),
+        ("return bit.tohex(-1)", bulk("ffffffff")),
+        ("return bit.tohex(255, -4)", bulk("00FF")),
+        ("return bit.tohex(65535, -2147483648)", bulk("0000FFFF")),
+        // Numbers as replies: cut toward zero, the lowest integer when out
+        // of range.
+        (
+            "return {1.9, -1.9, 1e30}",
+            RespValue::Array(vec![
+                RespValue::Int(1),
+                RespValue::Int(-1),
+                RespValue::Int(i64::MIN),
+            ]),
+        ),
+        // Numbers as command arguments.
+        (
+            "redis.call('SET', 'lua747', 10 / 2) return redis.call('GET', 'lua747')",
+            bulk("5"),
+        ),
+        (
+            "redis.call('SET', 'lua747', 1e20) return redis.call('GET', 'lua747')",
+            bulk("1e+20"),
+        ),
+        (
+            "redis.call('SET', 'lua747', 2^63) return redis.call('GET', 'lua747')",
+            bulk("9223372036854776000"),
+        ),
+        (
+            "redis.call('SET', 'lua747', 0.00001) return redis.call('GET', 'lua747')",
+            bulk("0.00001"),
+        ),
+        (
+            "redis.call('SET', 'lua747', -1e-7) return redis.call('GET', 'lua747')",
+            bulk("-1e-7"),
+        ),
+        (
+            "redis.call('SET', 'lua747', 1.5e300) return redis.call('GET', 'lua747')",
+            bulk("1.5e+300"),
+        ),
+        // cjson and cmsgpack, as Redis's.
+        (
+            "return cjson.encode({a = 1/3})",
+            bulk(r#"{"a":0.33333333333333}"#),
+        ),
+        (
+            "return cmsgpack.pack(1.5, 10 / 2)",
+            RespValue::Bulk(vec![0xca, 0x3f, 0xc0, 0, 0, 5]),
+        ),
+        (
+            "return {cmsgpack.unpack(cmsgpack.pack(1, 1.5, 10 / 2))}",
+            RespValue::Array(vec![
+                RespValue::Int(1),
+                RespValue::Int(1),
+                RespValue::Int(5),
+            ]),
+        ),
+    ];
+    for (script, expected) in cases {
+        assert_eq!(eval(script), expected, "{script}");
+    }
+    // Not in Redis's sandbox, and not Lua 5.1.
+    for script in [
+        "return type(setfenv)",
+        "return type(getfenv)",
+        "return type(newproxy)",
+        "return 7 // 2",
+        "return 1 & 3",
+        "local x <const> = 1 return x",
+        "return load('return 1')",
+    ] {
+        assert!(eval(script).is_error(), "{script}");
+    }
+    let error = eval("return type(setfenv)");
+    assert!(
+        error
+            .as_str()
+            .contains("nonexistent global variable 'setfenv'"),
+        "{error:?}"
+    );
 }

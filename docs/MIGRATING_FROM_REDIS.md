@@ -24,6 +24,12 @@ If you aren't sure whether your application runs scripts, run
 `INFO commandstats` on your Redis and look for `cmdstat_eval`,
 `cmdstat_evalsha` and `cmdstat_fcall`.
 
+Scripts and function libraries run on Lua 5.1, as on Redis, with the same
+sandbox and libraries (`cjson`, `cmsgpack`, `struct`, `bit`), so they move
+over unchanged. Releases up to 1.2 ran Lua 5.4: there,
+`string.format('%d', x)` failed when `x` had a fraction, and `10 / 2` was
+written `5.0`.
+
 ## 2. Port and network
 
 - **KiviDB listens on 6380, not 6379**, so the two can run side by side

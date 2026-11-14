@@ -115,6 +115,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Scripts run on Lua 5.1, as in Redis, and follow its number rules
+  (#747).** The `lua` and `full` builds embedded Lua 5.4, whose numbers
+  differ from Redis's Lua 5.1: `string.format('%d', 1.5)` failed with
+  "number has no integer representation" where Redis gives `1`, and
+  `tostring(10 / 2)` (so `..` and any key built with it) was `5.0` where
+  Redis has `5`. Scripts now run on Lua 5.1 with Redis's sandbox (`unpack`
+  and `loadstring`, no `table.unpack`, `setfenv` or `getfenv`) and `_VERSION`
+  is `Lua 5.1`. With it, as in Redis: `bit` returns signed 32-bit numbers
+  (`bit.bnot(0)` is `-1`), `struct.unpack` with `c0` returns the string
+  without its length, `cjson` writes numbers with 14 digits, `cmsgpack`
+  writes floats a 32-bit float holds as one and `cmsgpack.unpack` returns
+  every value, a number passed to `redis.call` is written as Redis writes it
+  (`1e+20`), and a number too large for an integer reply is the lowest
+  integer. A script written for KiviDB's Lua 5.4 that uses `//`, `&`, `|`,
+  `~`, `<<`, `>>`, `goto`, `math.tointeger`, `string.pack` or `utf8` must
+  move to their Lua 5.1 or `bit` forms, as on Redis. The default build has
+  no Lua and is not affected.
+
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
   master crashed right after a `CLUSTER MIGRATION IMPORT` handover kept the

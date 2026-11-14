@@ -104,7 +104,10 @@ other files:
 - The default port is **6380**, not 6379.
 - The default build has no Lua. The scripting commands return an error
   there; use the `lua` or `full` build for job queues and anything else that
-  runs scripts.
+  runs scripts. Those run scripts on Lua 5.1 with Redis's sandbox and
+  libraries, as Redis does ([SCRIPTS.md](SCRIPTS.md)); releases up to 1.2
+  ran Lua 5.4, where `string.format('%d', 1.5)` failed and `10 / 2` was
+  written `5.0`.
 - `save <points>` has no effect: KiviDB doesn't snapshot on a schedule. Use
   the AOF or `BGSAVE`.
 - `appendfsync no` is taken as `everysec`; `always` and `everysec` do what

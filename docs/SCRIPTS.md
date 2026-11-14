@@ -5,11 +5,22 @@ Lua: the `lua` and `full` variants.
 
 ## What a script may do
 
+- **A script runs on Lua 5.1, as in Redis** (`_VERSION` is `Lua 5.1`), with
+  Redis's libraries: `string`, `table`, `math`, `os.clock`, `cjson`,
+  `cmsgpack`, `struct` and `bit` (LuaBitOp). Numbers are Lua 5.1's doubles,
+  so `10 / 2` is written `5`, `string.format('%d', 1.5)` is `1`, and a
+  number returned from a script is cut toward zero to an integer reply.
+  Lua 5.2+ syntax and functions (`//`, `&`, `goto`, `table.unpack`,
+  `math.tointeger`, `string.pack`, `utf8`) are not there, as on Redis. (Up
+  to 1.2, KiviDB embedded Lua 5.4, whose numbers differ: see the changelog,
+  #747.)
 - **A script runs in a sandbox.** As in Redis, it has no `package`,
-  `require`, `loadfile`, `dofile`, `loadstring`, `print`, `debug` or
-  `string.dump`, and `load` takes source text only, not bytecode. (Before
-  1.1.0, `package`, `require`, `loadfile`, `dofile`, `debug` and
-  `string.dump` were reachable, and with them the host.)
+  `require`, `module`, `loadfile`, `dofile`, `print`, `debug`, `setfenv`,
+  `getfenv` or `newproxy`, and `loadstring` and `load` take source text
+  only, not bytecode. (Before 1.1.0, `package`, `require`, `loadfile`,
+  `dofile`, `debug` and `string.dump` were reachable, and with them the
+  host.) KiviDB has no `lua-enable-deprecated-api` setting:
+  `setfenv`, `getfenv` and `newproxy` stay out.
 - **A command a script runs is checked against the user's ACL**: `redis.call`
   of a command or key the user may not use fails, as it would if the user
   had sent it.
