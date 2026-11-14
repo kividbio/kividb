@@ -44,3 +44,4 @@ add a step for it to `compat.yml` with its own `timeout-minutes`.
 | `semantic-kernel` | semantic-kernel 1.47.0 | a few seconds, after a `uv sync` of several minutes |
 | `haystack-valkey` | valkey-haystack 1.0.0 | under 30 s |
 | `gptcache` | GPTCache 0.1.44 | 1 to 5 min (the first run downloads its ONNX model) |
+| `redisvl` | redisvl 0.32.0, through this folder's own harness (67 checks) | seconds, after an install of under a minute (not yet timed in CI) |

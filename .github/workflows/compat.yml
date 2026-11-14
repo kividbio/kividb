@@ -26,7 +26,7 @@ permissions:
 jobs:
   compat:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       REDIS_IMAGE: redis:8.10.3@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
       OUT: ${{ github.workspace }}/compat-results
@@ -71,6 +71,11 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: benchmarks/ci/run-harness.sh gptcache
+
+      - name: redisvl
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh redisvl
 
       - name: Keep the results
         if: ${{ !cancelled() }}
