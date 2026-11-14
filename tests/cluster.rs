@@ -2829,6 +2829,56 @@ fn atomic_slot_migration_moves_time_series_with_their_rules() {
     assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]).array().len(), 2);
 }
 
+/// `ASKING` before `MULTI` covers the whole transaction on a node importing
+/// the slot, up to its `EXEC` or `DISCARD`, as in Redis (#698).
+#[test]
+fn asking_before_multi_covers_the_transaction() {
+    let (nodes, ranges) = form_cluster(2);
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let tag = key_in(ranges[0].0..=ranges[0].1, "ask-tx");
+    let slot = slot_of(&tag).to_string();
+    let (k1, k2) = (format!("{{{tag}}}:1"), format!("{{{tag}}}:2"));
+    let mut cb = b.conn();
+    assert!(
+        cb.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &a.id()])
+            .is_ok()
+    );
+    let moved = |reply: &Resp| reply.err().is_some_and(|e| e.starts_with("MOVED"));
+
+    assert!(cb.cmd(&["ASKING"]).is_ok());
+    assert!(cb.cmd(&["MULTI"]).is_ok());
+    assert_eq!(cb.cmd(&["SET", &k1, "1"]).text(), "QUEUED");
+    assert_eq!(cb.cmd(&["SET", &k2, "2"]).text(), "QUEUED");
+    let exec = cb.cmd(&["EXEC"]);
+    assert!(
+        exec.array().len() == 2 && exec.array().iter().all(Resp::is_ok),
+        "{exec:?}"
+    );
+    let reply = cb.cmd(&["GET", &k1]);
+    assert!(moved(&reply), "ASKING is used up by EXEC: {reply:?}");
+
+    assert!(cb.cmd(&["ASKING"]).is_ok());
+    assert!(cb.cmd(&["MULTI"]).is_ok());
+    assert!(cb.cmd(&["DISCARD"]).is_ok());
+    let reply = cb.cmd(&["GET", &k1]);
+    assert!(moved(&reply), "ASKING is used up by DISCARD: {reply:?}");
+
+    assert!(cb.cmd(&["ASKING"]).is_ok());
+    assert!(cb.cmd(&["MULTI"]).is_ok());
+    assert_eq!(cb.cmd(&["SET", &k1, "3"]).text(), "QUEUED");
+    assert!(cb.cmd(&["NO-SUCH-COMMAND"]).err().is_some());
+    assert!(
+        cb.cmd(&["EXEC"])
+            .err()
+            .is_some_and(|e| e.starts_with("EXECABORT"))
+    );
+    let reply = cb.cmd(&["GET", &k1]);
+    assert!(
+        moved(&reply),
+        "ASKING is used up by a refused EXEC: {reply:?}"
+    );
+}
+
 /// A slot left open by a reshard that stopped part way, with keys on both
 /// sides, is closed by the commands `redis-cli --cluster fix` sends, and
 /// every key reads back (#295). Fix picks the node with the most keys as

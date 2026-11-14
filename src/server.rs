@@ -1599,6 +1599,7 @@ where
                         info.tracking_prefixes.clear();
                         info.tracking_redirect = None;
                         info.tracking_redirect_broken = false;
+                        info.asking = false;
                         info.flags = "N".to_string();
                         info.user = "default".to_string();
                     });
@@ -2581,6 +2582,13 @@ where
                     &[word.as_slice()],
                     &response,
                     std::time::Duration::ZERO,
+                );
+            }
+            if matches!(cmd_name.as_str(), "EXEC" | "DISCARD") {
+                crate::cluster::routing::transaction_ended(
+                    &cluster_state,
+                    &client_registry,
+                    client_id,
                 );
             }
             combined.extend_from_slice(&response);

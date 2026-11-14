@@ -1147,8 +1147,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
                 || registry.get_readonly(client_id),
                 has_key_locally,
             );
-            // ASKING is single-shot: clear after this command regardless of outcome.
-            if asking_flag {
+            // ASKING is single-shot: clear after this command regardless of
+            // outcome. A command `EXEC` runs leaves it to the end of the
+            // transaction (`routing::transaction_ended`), as in Redis (#698).
+            if asking_flag && !crate::command_gate::alone_on_this_thread() {
                 ctx.client_registry.update(ctx.client_id, |info| {
                     info.asking = false;
                 });

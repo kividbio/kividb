@@ -115,6 +115,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ASKING` before `MULTI` covers the whole transaction on a node
+  importing the slot (#698).** It was used up by the first queued command,
+  so the next one, or the `EXEC`, was answered `MOVED`, and a transaction
+  on a key moving in a reshard could not run. As in Redis, it now lasts
+  until `EXEC` or `DISCARD` ends the transaction, and covers every command
+  `EXEC` runs. `RESET` clears it, as in Redis.
+
 - **A master refuses its vote to a replica that claims slots it knows a
   newer owner of (#524).** A replica that had not heard that its master
   handed slots over in an atomic slot migration, or lost them in a
