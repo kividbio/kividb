@@ -1,0 +1,435 @@
+{
+  "label": "kividb",
+  "url": "redis://127.0.0.1:6380",
+  "redis_version": "8.10.0",
+  "redisvl": "0.32.0",
+  "redis_py": "8.1.0",
+  "numpy": "2.5.4",
+  "python": "3.12.3",
+  "lua_commands": [],
+  "commands": {
+    "client|setinfo": 27,
+    "del": 5,
+    "ft._list": 1,
+    "ft.aggregate": 7,
+    "ft.create": 8,
+    "ft.dropindex": 8,
+    "ft.hybrid": 8,
+    "ft.info": 24,
+    "ft.search": 39,
+    "hgetall": 4,
+    "hset": 21,
+    "info": 1,
+    "json.get": 2,
+    "json.set": 10,
+    "scan": 9
+  },
+  "counts": {
+    "PASS": 59,
+    "FAIL": 8
+  },
+  "checks": [
+    {
+      "check": "connection: PING",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: create and load",
+      "status": "PASS",
+      "detail": "",
+      "ms": 47
+    },
+    {
+      "check": "SearchIndex hash flat: vector query returns the closest document first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "SearchIndex hash flat: vector distances ascend",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: tag filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: tag filter excludes a value",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: numeric filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: numeric range filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: text phrase filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: tag and numeric filter together",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: filter query",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: text query",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: fetch by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash flat: drop a document",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "SearchIndex hash flat: delete the index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: create and load",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "SearchIndex hash hnsw: vector query returns the closest document first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: vector distances ascend",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: tag filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: tag filter excludes a value",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: numeric filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: numeric range filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: text phrase filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: tag and numeric filter together",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: filter query",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: fetch by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: drop a document",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex hash hnsw: delete the index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: create and load",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "SearchIndex json flat: vector query returns the closest document first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: vector distances ascend",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: tag filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: tag filter excludes a value",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: numeric filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: numeric range filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: text phrase filter",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: tag and numeric filter together",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: filter query",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: text query",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: fetch by id",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: drop a document",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SearchIndex json flat: delete the index",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "HybridQuery hash: create and load",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "HybridQuery hash: LINEAR fusion weighted toward the vector",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 1
+    },
+    {
+      "check": "HybridQuery hash: LINEAR fusion weighted toward the text",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 0
+    },
+    {
+      "check": "HybridQuery hash: RRF fusion",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 6
+    },
+    {
+      "check": "HybridQuery hash: hybrid query with a tag filter",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 0
+    },
+    {
+      "check": "HybridQuery json: create and load",
+      "status": "PASS",
+      "detail": "",
+      "ms": 5
+    },
+    {
+      "check": "HybridQuery json: LINEAR fusion weighted toward the vector",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 2
+    },
+    {
+      "check": "HybridQuery json: LINEAR fusion weighted toward the text",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 0
+    },
+    {
+      "check": "HybridQuery json: RRF fusion",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 0
+    },
+    {
+      "check": "HybridQuery json: hybrid query with a tag filter",
+      "status": "FAIL",
+      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "ms": 0
+    },
+    {
+      "check": "AggregateHybridQuery: create and load",
+      "status": "PASS",
+      "detail": "",
+      "ms": 4
+    },
+    {
+      "check": "AggregateHybridQuery: vector weight 0.1 ranks the text match first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "AggregateHybridQuery: vector weight 0.9 ranks the vector match first",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticCache: store",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "SemanticCache: an exact prompt hits",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticCache: a close prompt hits",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticCache: a far prompt misses",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticCache: a filter for another value misses",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticCache: a filter for the stored value hits",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticCache: clear removes the entries",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "SemanticRouter: an exact reference routes to that route",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "SemanticRouter: a near statement routes under the threshold",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticRouter: a far statement matches nothing",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticRouter: route_many returns the closest route",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SemanticRouter: a route added later matches",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    }
+  ]
+}
