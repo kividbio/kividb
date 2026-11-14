@@ -621,6 +621,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -644,6 +645,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -797,6 +799,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         },
@@ -824,6 +827,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -977,6 +981,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         },
@@ -1004,6 +1009,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -1736,6 +1742,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1758,6 +1765,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1845,6 +1853,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1867,6 +1876,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1953,6 +1963,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1975,6 +1986,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -2041,6 +2053,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "abs": 10
         }
@@ -2106,7 +2119,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "info",
+          "speed": false
         }
       ]
     },
@@ -2150,6 +2164,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "abs": 10
         }
@@ -2215,7 +2230,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "info",
+          "speed": false
         }
       ]
     },
@@ -2259,6 +2275,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "abs": 10
         }
@@ -2323,7 +2340,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "info",
+          "speed": false
         }
       ]
     },
@@ -2894,6 +2912,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -2916,6 +2935,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -3077,6 +3097,7 @@
       "gate": [
         {
           "kind": "rel",
+          "anchor": false,
           "pct": 20
         }
       ]

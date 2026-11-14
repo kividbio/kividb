@@ -206,10 +206,24 @@ try:
     cpu = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
 except Exception:
     pass
+# Indicative only: best of 3 of a fixed sha256 loop, to tell a slow host from a fast one at a glance.
+calib = None
+try:
+    import time
+    best = None
+    for _ in range(3):
+        t = time.perf_counter()
+        d = b"x" * 64
+        for _ in range(200000):
+            d = hashlib.sha256(d).digest()
+        best = min(best or 1e9, time.perf_counter() - t)
+    calib = round(best * 1000, 1)
+except Exception:
+    pass
 import redis
 env = {
     "label": label, "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
-    "vm": vm, "cpu": cpu, "nproc": os.cpu_count(), "kernel": platform.release(),
+    "vm": vm, "cpu": cpu, "nproc": os.cpu_count(), "calib_ms": calib, "kernel": platform.release(),
     "glibc": platform.libc_ver()[1], "python": platform.python_version(), "redis_py": redis.__version__,
     "candidate_commit": commit, "candidate_allocator": alloc, "suite_seconds": json.loads(secs),
     "scale": scale, "full": full, "only": only, "engines_selected": engines.split(","),
