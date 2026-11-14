@@ -225,19 +225,91 @@ pub struct Interrupted {
 /// deadline in milliseconds would overflow.
 pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
     use crate::resp::write::resp_error;
-    let Some(secs) = crate::commands::zset::parse_score(raw).filter(|t| t.is_finite()) else {
-        return Err(resp_error("ERR timeout is not a float or out of range"));
-    };
-    if secs < 0.0 {
-        return Err(resp_error("ERR timeout is negative"));
+    let text = std::str::from_utf8(raw).unwrap_or("").trim();
+
+    match crate::commands::zset::parse_score(raw) {
+        Some(v) if v.is_infinite() => {
+            return Err(resp_error("ERR timeout is out of range"));
+        }
+        Some(v) if v == 0.0 => {
+            // Real "0" = block forever. Non-zero text that rounded
+            // to 0, like 1e-342, = 1ms (Redis behaviour).
+            if is_zero_written_timeout(text) {
+                return Ok(0.0);
+            }
+            return Ok(0.001);
+        }
+        Some(v) => {
+            if v < 0.0 {
+                return Err(resp_error("ERR timeout is negative"));
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_millis() as f64);
+            if v * 1000.0 + now_ms >= i64::MAX as f64 {
+                return Err(resp_error("ERR timeout is out of range"));
+            }
+            return Ok(v);
+        }
+        None => {
+            // parse_score refused it. Work out why from the exponent.
+            // "1e-343" -> tiny but real -> 1ms.
+            // "1e-5000" -> exponent absurdly small -> not a float.
+            if let Some(exp) = timeout_exponent(text) {
+                if exp > 308 {
+                    return Err(resp_error("ERR timeout is out of range"));
+                }
+                if exp < -1000 {
+                    return Err(resp_error(
+                        "ERR timeout is not a float or out of range",
+                    ));
+                }
+                if !is_zero_written_timeout(text) {
+                    return Ok(0.001);
+                }
+                return Ok(0.0);
+            }
+            return Err(resp_error(
+                "ERR timeout is not a float or out of range",
+            ));
+        }
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_millis() as f64);
-    if secs * 1000.0 + now_ms >= i64::MAX as f64 {
-        return Err(resp_error("ERR timeout is out of range"));
+}
+
+// Is the number zero as written? e.g. "0", "0.0", "0e10"
+fn is_zero_written_timeout(text: &str) -> bool {
+    let unsigned = text.trim_start_matches(['+', '-']);
+    let mantissa = unsigned.split(['e', 'E']).next().unwrap_or(unsigned);
+    !mantissa.is_empty() && mantissa.bytes().all(|b| b == b'0' || b == b'.')
+}
+
+// Exponent after 'e'/'E', e.g. -343 for "1e-343". None if no exponent.
+fn timeout_exponent(text: &str) -> Option<i64> {
+    let unsigned = text.trim_start_matches(['+', '-']);
+    let at = unsigned.find(['e', 'E'])?;
+    let exp_text = &unsigned[at + 1..];
+    if exp_text.is_empty() {
+        return None;
     }
-    Ok(secs)
+    let mut value: i64 = 0;
+    let mut negative = false;
+    let mut digits = exp_text;
+    if let Some(rest) = digits.strip_prefix('+') {
+        digits = rest;
+    } else if let Some(rest) = digits.strip_prefix('-') {
+        negative = true;
+        digits = rest;
+    }
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    for b in digits.bytes() {
+        value = value.saturating_mul(10).saturating_add((b - b'0') as i64);
+        if value > 100_000 {
+            value = 100_000;
+        }
+    }
+    Some(if negative { -value } else { value })
 }
 
 /// Mark an error reply as one a woken client is told even though it says
@@ -609,7 +681,6 @@ pub fn wait_for_keys(
         // Park once with zero time so a write landing in this window
         // still wakes us. On resume, timed_out is true, so we fall
         // through to null below and never loop.
-        (None, None) if !timed_out && deadline.is_some() => Err(Some(std::time::Duration::ZERO)),
         (None, _) => {
             crate::stats::record_miss();
             // A wait that ran out is answered with a null array. A caller
