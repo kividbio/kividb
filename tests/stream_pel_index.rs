@@ -719,3 +719,109 @@ fn xpending_for_a_consumer_whose_name_is_not_utf8_lists_only_its_entries() {
     let counts = view(&mut c, "s", "g").counts;
     assert_eq!(counts[odd], 2);
 }
+
+/// Each consumer of `group` with its pending count, from `XINFO CONSUMERS`.
+fn consumers(c: &mut Conn, key: &str, group: &str) -> Vec<(String, i64)> {
+    c.ok(&["XINFO", "CONSUMERS", key, group])
+        .arr()
+        .iter()
+        .map(|row| (row.field("name").str(), row.field("pending").int()))
+        .collect()
+}
+
+/// Waits until `replica` has every write `master` took before this.
+fn caught_up(master: &mut Conn, replica: &mut Conn, marker: &str) {
+    master.ok(&["SET", marker, "1"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while replica.cmd(&["EXISTS", marker]).int() != 1 {
+        assert!(Instant::now() < deadline, "the replica did not catch up");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_consumer_made_by_a_read_that_delivered_nothing_is_kept_by_the_aof_and_a_replica() {
+    // An `XREADGROUP` creates its consumer whether or not it delivers
+    // anything, and Redis 8.10 propagates the creation as `XGROUP
+    // CREATECONSUMER` in every such case — when the read waits, at once.
+    // One that waited and timed out was propagated as nothing: the
+    // consumer was gone after an AOF replay, and never reached a replica
+    // (#654).
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let rdir = tempfile::tempdir().unwrap();
+    let replica = Server::start(
+        rdir.path(),
+        &["--replicaof", "127.0.0.1", &server.port.to_string()],
+    );
+    let mut c = server.conn();
+    let mut rc = replica.conn();
+    caught_up(&mut c, &mut rc, "synced");
+
+    // An empty stream: a read that waits and one that does not.
+    c.ok(&["XGROUP", "CREATE", "s", "g", "$", "MKSTREAM"]);
+    fn read(c: &mut Conn, args: &[&str]) -> V {
+        let mut cmd = vec!["XREADGROUP", "GROUP", "g"];
+        cmd.extend_from_slice(args);
+        c.ok(&cmd)
+    }
+    assert_eq!(
+        read(&mut c, &["alice", "BLOCK", "100", "STREAMS", "s", ">"]),
+        V::Nil
+    );
+    assert_eq!(read(&mut c, &["bob", "STREAMS", "s", ">"]), V::Nil);
+    // A stream with entries, all delivered already; a read of a consumer's
+    // own history, which has none; a read with NOACK.
+    c.ok(&["XADD", "t", "1-1", "f", "v"]);
+    c.ok(&["XGROUP", "CREATE", "t", "g", "$"]);
+    assert_eq!(
+        read(&mut c, &["carol", "BLOCK", "100", "STREAMS", "t", ">"]),
+        V::Nil
+    );
+    assert_eq!(read(&mut c, &["dan", "STREAMS", "t", ">"]), V::Nil);
+    read(&mut c, &["erin", "STREAMS", "t", "0"]);
+    assert_eq!(read(&mut c, &["fay", "NOACK", "STREAMS", "t", ">"]), V::Nil);
+    // A read that waits and is then given an entry.
+    c.ok(&["XGROUP", "CREATE", "u", "g", "$", "MKSTREAM"]);
+    let port = server.port;
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        Conn::connect(port).ok(&["XADD", "u", "2-1", "f", "v"]);
+    });
+    let woken = read(&mut c, &["gus", "BLOCK", "10000", "STREAMS", "u", ">"]);
+    writer.join().unwrap();
+    assert_ne!(woken, V::Nil);
+
+    let names = |c: &mut Conn| {
+        [
+            consumers(c, "s", "g"),
+            consumers(c, "t", "g"),
+            consumers(c, "u", "g"),
+        ]
+    };
+    let want = names(&mut c);
+    let got: Vec<Vec<&str>> = want
+        .iter()
+        .map(|list| list.iter().map(|(name, _)| name.as_str()).collect())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            vec!["alice", "bob"],
+            vec!["carol", "dan", "erin", "fay"],
+            vec!["gus"]
+        ]
+    );
+    assert_eq!(want[2][0].1, 1, "gus has the entry");
+
+    caught_up(&mut c, &mut rc, "marker");
+    assert_eq!(names(&mut rc), want, "replica");
+    drop(rc);
+    replica.kill();
+
+    drop(c);
+    server.kill();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(names(&mut c), want, "AOF");
+}
