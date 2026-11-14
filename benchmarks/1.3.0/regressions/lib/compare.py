@@ -19,6 +19,22 @@ Verdicts and exit status:
   SMOKE      SCALE != 1: gates are not checked, only that every       exit 0
              metric came out
 
+Host speed. The same VM size can land on different CPU generations (two
+Standard_D4s_v5 differed by ~40 %), so a `rel` gate on a speed-dependent metric
+(unit ms, s, us or */s; a gate's "speed": false/true overrides) is not judged
+against the recorded absolute. v1.2.2 is measured in every session, so the
+recorded candidate value is first scaled to this host:
+  - the host factor of the metric's suite/config: the median, over that
+    suite/config's speed metrics that have a v1.2.2 value both recorded and now
+    (at least 3), of "this host is X times as fast as the recorded one" (rates
+    now/recorded, times recorded/now);
+  - otherwise the same median over all suites (global factor);
+  - a gate with "anchor": true uses its own metric's v1.2.2 ratio instead. Not
+    the default: on the committed runs (same host) single-metric v1.2.2 ratios
+    strayed 15-45 % while the medians stayed within 2 %.
+Bytes, counts, recall and ratios are never scaled. `bound` gates stay absolute;
+a global factor under 0.7 or over 1.4 only adds a WARN line to the summary.
+
 --record writes this run's values into the baseline as the new recorded
 values (v1.2.2, candidate and Redis, with the VM, date and candidate commit).
 It refuses (exit 1, nothing written) when the run is INVALID, is a SCALE
@@ -35,6 +51,53 @@ import os
 import sys
 
 ENG = ("v1_2_2", "candidate", "redis")
+
+# The host-speed rules: see the module docstring.
+SPEED_UNITS = {"ms", "s", "us", "ns"}
+MIN_GROUP = 3  # speed metrics a suite/config needs for its own factor
+FACTOR_WARN_LOW, FACTOR_WARN_HIGH = 0.7, 1.4
+
+
+def is_speed_metric(unit, gate=None):
+    """Does the metric's value move with the host's speed (times, rates)?"""
+    if gate is not None and "speed" in gate:
+        return bool(gate["speed"])
+    return unit in SPEED_UNITS or str(unit).endswith("/s")
+
+
+def metric_speed(m, rec):
+    """How many times as fast this host is as the recorded one, from v1.2.2's
+    value of the metric (rates: now/recorded; times: recorded/now), or None."""
+    a, b = rec.get("v1_2_2"), m["values"].get("v1_2_2")
+    if a is None or b is None or a <= 0 or b <= 0:
+        return None
+    return b / a if m["better"] == "higher" else a / b
+
+
+def median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    return None if not n else xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+
+
+def host_factors(results, baseline):
+    """-> {"global": f|None, "groups": {"suite/config": f}, "counts": {...}}."""
+    per_group, allf = {}, []
+    for key, m in results.items():
+        entry = baseline.get("metrics", {}).get(key)
+        if not entry:
+            continue
+        gates = entry.get("gate") or m["gate"]
+        gates = [gates] if isinstance(gates, dict) else gates
+        if not is_speed_metric(m["unit"]) or any(g.get("speed") is False for g in gates):
+            continue
+        f = metric_speed(m, entry.get("recorded", {}))
+        if f is not None:
+            per_group.setdefault("%s/%s" % (m["suite"], m["config"]), []).append(f)
+            allf.append(f)
+    return {"global": median(allf), "n": len(allf),
+            "groups": {g: median(v) for g, v in sorted(per_group.items())},
+            "counts": {g: len(v) for g, v in sorted(per_group.items())}}
 
 
 def load_results(path):
@@ -78,8 +141,12 @@ def improvement(better, old, new):
     return old / new if better == "lower" else new / old
 
 
-def check_gate(g, m, rec):
-    """-> (status, limit_text). status: pass, FAIL, new, skip, info."""
+def check_gate(g, m, rec, host=None):
+    """-> (status, limit_text). status: pass, FAIL, new, skip, info.
+
+    host: {"mode": "anchor"|"suite"|"global", "speed": f} for a speed-dependent
+    metric: a `rel` gate then judges against the recorded candidate value
+    scaled to this host (see the module docstring)."""
     kind = g.get("kind")
     better = m["better"]
     now = m["values"]
@@ -92,6 +159,13 @@ def check_gate(g, m, rec):
         r = rec.get("candidate")
         if r is None:
             return "new", "rel %g%%: nothing recorded" % g["pct"]
+        note = ""
+        if host and host.get("speed") not in (None, 1.0):
+            was = r
+            r = r * host["speed"] if better == "higher" else r / host["speed"]
+            note = ", recorded %s scaled by host speed %.2fx (%s)" % (fmt(was), host["speed"], host["mode"])
+        elif host:
+            note = ", host speed 1.00x (%s)" % host["mode"]
         if better == "lower":
             lim = r * (1 + g["pct"] / 100.0)
             parts = ["%g%% over %s" % (g["pct"], fmt(r))]
@@ -101,11 +175,11 @@ def check_gate(g, m, rec):
             if "redis_plus" in g and now.get("redis") is not None:
                 lim = max(lim, now["redis"] + g["redis_plus"])
                 parts.append("Redis %s + %g" % (fmt(now["redis"]), g["redis_plus"]))
-            return ("pass" if cand <= lim else "FAIL"), "<= %s (%s)" % (fmt(lim), ", ".join(parts))
+            return ("pass" if cand <= lim else "FAIL"), "<= %s (%s%s)" % (fmt(lim), ", ".join(parts), note)
         lim = r * (1 - g["pct"] / 100.0)
         if "abs" in g:
             lim = min(lim, r - g["abs"])
-        return ("pass" if cand >= lim else "FAIL"), ">= %s (%g%% under %s)" % (fmt(lim), g["pct"], fmt(r))
+        return ("pass" if cand >= lim else "FAIL"), ">= %s (%g%% under %s%s)" % (fmt(lim), g["pct"], fmt(r), note)
     if kind == "ratio":
         imp_rec = improvement(better, rec.get("v1_2_2"), rec.get("candidate"))
         if imp_rec is None:
@@ -140,7 +214,24 @@ def check_gate(g, m, rec):
     return "FAIL", "unknown gate kind %r" % kind
 
 
+def host_for(g, m, rec, hf):
+    """The host-speed scaling of one gate of one metric, or None."""
+    if g.get("kind") != "rel" or not is_speed_metric(m["unit"], g):
+        return None
+    f = metric_speed(m, rec)
+    if f is not None and g.get("anchor"):  # opt-in: this metric's v1.2.2 is a stable proxy
+        return {"mode": "anchor", "speed": f}
+    k = "%s/%s" % (m["suite"], m["config"])
+    if hf["counts"].get(k, 0) >= MIN_GROUP:
+        return {"mode": "suite", "speed": hf["groups"][k]}
+    if hf["global"] is not None:
+        return {"mode": "global", "speed": hf["global"]}
+    return {"mode": "none", "speed": 1.0}
+
+
 def evaluate(results, baseline, smoke=False):
+    """-> (rows, not_run, host factors)."""
+    hf = host_factors(results, baseline)
     rows = []
     for key in sorted(results):
         m = results[key]
@@ -152,17 +243,37 @@ def evaluate(results, baseline, smoke=False):
         if smoke:  # SCALE != 1: the numbers mean nothing
             checks = [(g, "smoke", "") for g in gates]
         else:
-            checks = [(g,) + check_gate(g, m, rec) for g in gates]
+            checks = [(g,) + check_gate(g, m, rec, host_for(g, m, rec, hf)) for g in gates]
         sts = [c[1] for c in checks]
         status = "FAIL" if "FAIL" in sts else "pass" if "pass" in sts else \
             "new" if "new" in sts else "skip" if "skip" in sts else "smoke" if "smoke" in sts else "info"
         rows.append({"key": key, "suite": m["suite"], "config": m["config"], "metric": m["metric"],
                      "unit": m["unit"], "better": m["better"], "values": m["values"],
                      "samples": m["samples"], "recorded_candidate": rec.get("candidate"),
+                     "host": next(({"mode": h["mode"], "speed": round(h["speed"], 4)}
+                                   for h in [host_for(g, m, rec, hf) for g in gates] if h), None),
                      "gates": [{"gate": g, "status": s, "limit": t} for g, s, t in checks],
                      "status": status})
     not_run = sorted(set(baseline.get("metrics", {})) - set(results))
-    return rows, not_run
+    return rows, not_run, hf
+
+
+def host_warnings(hf):
+    f = hf["global"]
+    if f is None:
+        return []
+    if f < FACTOR_WARN_LOW:
+        return ["WARN: this host is %.2fx as fast as the one the baseline was recorded on: absolute "
+                "bounds (max ms) were recorded on a faster host and may fail without a regression" % f]
+    if f > FACTOR_WARN_HIGH:
+        return ["WARN: this host is %.2fx as fast as the one the baseline was recorded on: absolute "
+                "bounds (max ms) were recorded on a slower host and may be too loose" % f]
+    return []
+
+
+def recorded_cpus(baseline):
+    return sorted({m["recorded"]["cpu"] for m in baseline.get("metrics", {}).values()
+                   if m.get("recorded", {}).get("cpu")})
 
 
 def validity_problems(env, baseline, results, smoke, allow_vm_change):
@@ -212,11 +323,16 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
     return probs
 
 
-def write_summary(outdir, rows, not_run, env, label, problems, smoke):
+def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, baseline=None):
+    hf = hf or {"global": None, "groups": {}, "counts": {}, "n": 0}
+    warns = host_warnings(hf)
+    rec_cpus = recorded_cpus(baseline or {})
     fails = [r for r in rows if r["status"] == "FAIL"]
     verdict = "INVALID" if problems else "SMOKE" if smoke else "REGRESSED" if fails else "ok"
     summary = {"label": label, "env": env, "rows": rows, "not_run": not_run, "problems": problems,
-               "failed": [r["key"] for r in fails], "verdict": verdict}
+               "failed": [r["key"] for r in fails], "verdict": verdict,
+               "host_factor": {"global": hf["global"], "metrics": hf["n"], "suites": hf["groups"]},
+               "recorded_cpu": rec_cpus, "warnings": warns}
     with open(os.path.join(outdir, "summary.json"), "w") as f:
         json.dump(summary, f, separators=(",", ":"))  # one line: keeps result commits small
         f.write("\n")
@@ -227,9 +343,18 @@ def write_summary(outdir, rows, not_run, env, label, problems, smoke):
         L += ["Why the run is invalid:", ""] + ["- %s" % p for p in problems] + [""]
     if smoke:
         L += ["SCALE=%s: a smoke run. The gates were not checked." % env.get("scale"), ""]
+    if warns:
+        L += ["- %s" % w for w in warns] + [""]
     if env:
         L.append("- Machine: %s, %s vCPU, %s, kernel %s, glibc %s" % (
             env.get("vm", "?"), env.get("nproc", "?"), env.get("cpu", "?"), env.get("kernel", "?"), env.get("glibc", "?")))
+        cur = env.get("cpu", "?")
+        if rec_cpus:
+            L.append("- CPU: recorded on %s; now %s%s" % (" / ".join(rec_cpus), cur,
+                                                          "" if cur in rec_cpus else " (a different model: speed gates are session-relative)"))
+        if env.get("calib_ms") is not None:
+            L.append("- calibration (indicative only): %s ms for a fixed sha256 loop, %s cores" % (
+                env["calib_ms"], env.get("nproc", "?")))
         L.append("- Client: Python %s, redis-py %s" % (env.get("python", "?"), env.get("redis_py", "?")))
         for e in ENG:
             d = env.get("engines", {}).get(e)
@@ -241,6 +366,11 @@ def write_summary(outdir, rows, not_run, env, label, problems, smoke):
             L.append("- date: %s; FULL=%s, SCALE=%s" % (env["date"], env.get("full", "?"), env.get("scale", "?")))
         if env.get("suite_seconds"):
             L.append("- run time: " + ", ".join("%s %ss" % kv for kv in sorted(env["suite_seconds"].items())))
+        L.append("")
+    if hf["global"] is not None:
+        L += ["Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 "
+              "measured in both sessions: global %.2fx over %d metrics" % (hf["global"], hf["n"])]
+        L += ["- %s: %.2fx (%d metrics)" % (g, f, hf["counts"][g]) for g, f in hf["groups"].items()]
         L.append("")
     suite = None
     for r in rows:
@@ -290,7 +420,7 @@ def record(baseline, results, env, label, reset_gates):
         for e in ENG:  # never overwrite a value with null
             v = m["values"].get(e)
             rec[e] = v if v is not None else old_rec.get(e)
-        rec.update({"vm": env.get("vm"), "date": date, "commit": env.get("candidate_commit"), "label": label})
+        rec.update({"vm": env.get("vm"), "cpu": env.get("cpu"), "date": date, "commit": env.get("candidate_commit"), "label": label})
         ms[key] = {
             "suite": m["suite"], "config": m["config"], "metric": m["metric"],
             "unit": m["unit"], "better": m["better"], "recorded": rec,
@@ -329,10 +459,14 @@ def main():
     smoke = str(env.get("scale", "1")) not in ("1", "1.0")
     label = a.label or env.get("label") or os.path.basename(os.path.abspath(a.results_dir))
     problems = validity_problems(env, baseline, results, smoke, a.allow_vm_change)
-    rows, not_run = evaluate(results, baseline, smoke)
-    summary = write_summary(a.results_dir, rows, not_run, env, label, problems, smoke)
+    rows, not_run, hf = evaluate(results, baseline, smoke)
+    summary = write_summary(a.results_dir, rows, not_run, env, label, problems, smoke, hf, baseline)
     for p in problems:
         print("INVALID: %s" % p)
+    for w in summary["warnings"]:
+        print(w)
+    if hf["global"] is not None:
+        print("host speed vs recorded: %.2fx (%d v1.2.2 metrics)" % (hf["global"], hf["n"]))
     for r in rows:
         if r["status"] == "FAIL":
             print("FAIL %s: candidate %s; %s" % (r["key"], fmt(r["values"].get("candidate")),
