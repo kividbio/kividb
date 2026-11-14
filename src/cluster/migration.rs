@@ -351,6 +351,13 @@ impl Registry {
         f(&importing)
     }
 
+    /// `f` of every task, running and recently finished, with the tasks
+    /// locked: none begins or ends meanwhile. The tasks come first in the
+    /// order of `ClusterState`'s locks.
+    pub(crate) fn with_tasks<R>(&self, f: impl FnOnce(&[Task]) -> R) -> R {
+        f(&self.tasks.lock())
+    }
+
     /// Ask running tasks to stop: the one with this id, or all of them.
     /// Returns how many were asked.
     pub fn cancel(&self, id: Option<&str>) -> usize {
@@ -702,6 +709,16 @@ impl SlotDeletions {
     pub fn running(&self, mut slots: impl Iterator<Item = u16>) -> bool {
         let counts = self.counts.lock();
         !counts.running.is_empty() && slots.any(|slot| counts.running[slot as usize] > 0)
+    }
+
+    /// Per slot, whether its keys are being deleted. Taken holding no other
+    /// lock (see the field).
+    pub(crate) fn running_slots(&self) -> Vec<bool> {
+        let counts = self.counts.lock();
+        if counts.running.is_empty() {
+            return vec![false; super::CLUSTER_SLOTS];
+        }
+        counts.running.iter().map(|&n| n > 0).collect()
     }
 
     /// Those of `slots` whose keys are being deleted.
@@ -1067,6 +1084,64 @@ fn start_dropping(
             None
         }
     }
+}
+
+/// `CLUSTER DROPORPHANS`: delete the keys this master holds of `slots`,
+/// which another master owns (`super::orphans::check_droppable` has said
+/// so), as [`drop_lost_slots`] deletes those of a slot it lost: on a thread
+/// of its own, in batches, through the write path (replicas and the AOF are
+/// told), for as long as the dataset is this node's own, and of each slot
+/// for as long as it has not come back to this node. Never begun by
+/// anything but that command (#517). `done` is called once it has ended.
+pub(crate) fn start_dropping_orphans(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    slots: Vec<u16>,
+    done: impl FnOnce() + Send + 'static,
+) -> Result<(), String> {
+    let own = match OwnDataset::now(repl_state) {
+        Some(own) if cluster.my_master_id().is_none() => own,
+        _ => return Err(super::orphans::ON_A_REPLICA.into()),
+    };
+    // Begun here, before the reply: an import into one of the slots waits
+    // for it from now on, and a slot that came here since the checks is
+    // left out.
+    let mut run = DeleteRun::begin(cluster, slots.iter().copied(), None);
+    if !run.deletes_any() {
+        done();
+        return Ok(());
+    }
+    let store = Arc::clone(store);
+    let repl_state = Arc::clone(repl_state);
+    let hub_tx = hub_tx.clone();
+    std::thread::Builder::new()
+        .name("kividb-drop-orphans".into())
+        .spawn(move || {
+            let deleted = delete_keys(
+                &store,
+                &repl_state,
+                &hub_tx,
+                &mut run,
+                own,
+                || {},
+                // Out of the write gate and every lock: a test holds the
+                // deletion here, after its first batch.
+                stall_once_for_test("orphan-keys-deleting"),
+            );
+            drop(run);
+            log_deletion("CLUSTER DROPORPHANS", &deleted);
+            log_info!(
+                "Cluster: CLUSTER DROPORPHANS: done with the keys of {} slot(s) owned by \
+                 other masters: {} deleted",
+                slots.len(),
+                deleted.removed
+            );
+            done();
+        })
+        .map(|_| ())
+        .map_err(|e| format!("could not start the thread that deletes the keys: {e}"))
 }
 
 /// A key captured at the cut, with a copy of its value of its own: a list,
@@ -2614,6 +2689,37 @@ mod tests {
         assert_eq!(source_failed(&cs, "b", "x", &[], None), Ok(()));
     }
 
+    /// `CLUSTER DROPORPHANS` leaves the keys of a slot in an atomic slot
+    /// migration here, running or ended a moment ago, and of one whose keys
+    /// are being deleted already (#517).
+    #[test]
+    fn orphans_of_a_slot_migrating_or_being_deleted_are_left() {
+        use super::super::orphans::check_droppable;
+        let cs = ClusterState::new_enabled(None, 15000);
+        let other = super::super::generate_node_id();
+        let mut node = super::super::ClusterNode::new(other, "10.0.0.1".into(), 7000, 17000);
+        node.flags |= super::super::NodeFlags::MASTER;
+        cs.nodes.write().insert(other, node);
+        for slot in 0..100 {
+            cs.slots.write()[slot] = Some(other);
+        }
+        assert_eq!(check_droppable(&cs, &[15, 40]), Ok(()));
+
+        cs.slot_migrations.add(task("a", vec![(10, 20)])).unwrap();
+        let refused = check_droppable(&cs, &[15]).unwrap_err();
+        assert!(refused.contains("is in progress"), "{refused}");
+        cs.slot_migrations.finish("a", TaskState::Completed, None);
+        let refused = check_droppable(&cs, &[15]).unwrap_err();
+        assert!(refused.contains("ended"), "{refused}");
+        assert_eq!(check_droppable(&cs, &[40]), Ok(()));
+
+        let run = DeleteRun::begin(&cs, [40], None);
+        let refused = check_droppable(&cs, &[40]).unwrap_err();
+        assert!(refused.contains("being deleted already"), "{refused}");
+        drop(run);
+        assert_eq!(check_droppable(&cs, &[40]), Ok(()));
+    }
+
     #[test]
     fn cancel_targets_running_tasks() {
         let registry = Registry::default();
@@ -2934,6 +3040,58 @@ mod tests {
         assert_eq!((deleted.removed, deleted.stopped), (OLD, false));
         assert_eq!(lost.old_keys_left(), 0);
         assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+    }
+
+    /// The keys of a slot another master owns are counted as orphans on a
+    /// master, but for those being deleted already, and on a replica not
+    /// at all; `CLUSTER DROPORPHANS`' deletion takes them on a master only,
+    /// and those alone (#517).
+    #[test]
+    fn orphans_are_counted_and_dropped_on_a_master_only() {
+        use super::super::orphans::orphan_counts;
+        let lost = Lost::new();
+        let mine = "kept";
+        set(&lost.store, mine, "v");
+        assert_eq!(
+            orphan_counts(&lost.cluster, &lost.store, &lost.repl_state),
+            vec![(LOST, OLD as u64)]
+        );
+        // Not while a deletion of them runs.
+        let run = DeleteRun::begin(&lost.cluster, [LOST], None);
+        assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
+        drop(run);
+
+        let drop_them = |lost: &Lost| {
+            let (done, ended) = std::sync::mpsc::channel();
+            start_dropping_orphans(
+                &lost.cluster,
+                &lost.store,
+                &lost.repl_state,
+                &lost.hub_tx,
+                vec![LOST],
+                move || {
+                    let _ = done.send(());
+                },
+            )
+            .map(|()| ended)
+        };
+        let replica = Lost::new();
+        replica.repl_state.become_slave();
+        assert!(orphan_counts(&replica.cluster, &replica.store, &replica.repl_state).is_empty());
+        assert!(drop_them(&replica).is_err());
+        assert_eq!(replica.old_keys_left(), OLD);
+
+        drop_them(&lost)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(lost.old_keys_left(), 0);
+        assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
+        assert!(
+            crate::store::get_shard(&lost.store[0], mine)
+                .read()
+                .contains_key(mine)
+        );
     }
 
     /// The keys of an import that did not complete are not deleted on a

@@ -211,6 +211,17 @@ other files:
   (`cluster-announce-ip`, `-port`, `-bus-port`, `-hostname`,
   `-client-port`) and `cluster-require-full-coverage` can be changed at
   runtime, as in Redis.
+- Keys a master holds of slots it does not serve (left, for example, on a
+  replica promoted after its master crashed right after handing slots over
+  in an atomic slot migration) are not deleted on their own. KiviDB logs a
+  warning, reports them in `INFO cluster` (`cluster_orphan_slots`,
+  `cluster_orphan_keys`) and `CLUSTER ORPHANSLOTS`, and deletes them when
+  told with `CLUSTER DROPORPHANS`, which only runs on a master, for slots
+  another master that is up owns, with no migration of them under way.
+  Use it once the owner is known to hold the slots' data. Both commands
+  are KiviDB's own: Valkey's `CLUSTER FLUSHSLOT` deletes any slot's keys,
+  the node's own included, and Redis's `SFLUSH` only those of slots the
+  node owns. See [COMMANDS.md](../COMMANDS.md#keys-of-slots-a-master-does-not-serve).
 
 **Performance**
 - Many clients writing to **one key** are slower while something follows the

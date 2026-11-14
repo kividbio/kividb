@@ -89,6 +89,8 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "RESET" => cmd_reset(ctx),
         "MYSHARDID" => cmd_myshardid(ctx),
         "SLOT-STATS" => cmd_slot_stats(ctx),
+        "ORPHANSLOTS" => cmd_orphanslots(ctx),
+        "DROPORPHANS" => cmd_droporphans(ctx),
 
         "MIGRATION" => cmd_migration(ctx),
         // Node-to-node half of CLUSTER MIGRATION; not for clients.
@@ -167,6 +169,12 @@ fn cluster_help() -> Vec<u8> {
         "LINKS",
         "    Return information about all network links between this node and its peers.",
         "    Output format is an array where each array element is a map containing attributes of a link",
+        "ORPHANSLOTS",
+        "    Return the slots this node holds keys of but does not serve, with their key",
+        "    counts and owners: [start, end, keys, owner-id] (KiviDB).",
+        "DROPORPHANS [SLOT <slot> [<slot> ...] | SLOTSRANGE <start slot> <end slot> [...]]",
+        "    Delete, in the background, the keys this master holds of slots another master",
+        "    owns: those ORPHANSLOTS lists, or the slots given (KiviDB).",
         "MIGRATION IMPORT <start-slot end-slot [start-slot end-slot ...]> |",
         "          STATUS [ID <task-id> | ALL] | CANCEL [ID <task-id> | ALL]",
         "    Start, monitor and cancel slot migration.",
@@ -279,6 +287,105 @@ fn cmd_countkeysinslot(ctx: &Ctx) -> Vec<u8> {
         }
     }
     resp_integer(count)
+}
+
+// ── CLUSTER ORPHANSLOTS / DROPORPHANS (KiviDB) ───────────────────────────────
+//
+// Keys a master holds of slots it does not serve, which nothing deletes on
+// its own (#517; see `cluster::orphans`).
+//
+//   CLUSTER ORPHANSLOTS
+//     [[start-slot, end-slot, key-count, owner-id | nil], ...]: runs of
+//     consecutive slots with keys here and the same owner, counted afresh.
+//   CLUSTER DROPORPHANS [SLOT slot [slot ...] | SLOTSRANGE start end [...]]
+//     Begin deleting this master's keys of the slots given, or of every
+//     slot ORPHANSLOTS lists: all of them, or none if one may not be. The
+//     number of keys found to delete; they are deleted in the background.
+
+fn cmd_orphanslots(ctx: &Ctx) -> Vec<u8> {
+    if ctx.cmd.len() != 2 {
+        return resp_error("ERR wrong number of arguments for 'cluster|orphanslots' command");
+    }
+    let found = crate::cluster::migration::off_the_runtime(|| {
+        crate::cluster::orphans::orphan_counts(ctx.cluster, ctx.store, ctx.repl_state)
+    });
+    ctx.cluster.orphans.record(&found, None);
+    let owners: Vec<Option<NodeId>> = {
+        let table = ctx.cluster.slots.read();
+        found
+            .iter()
+            .map(|&(slot, _)| table[slot as usize])
+            .collect()
+    };
+    // Runs of consecutive slots of one owner.
+    let mut runs: Vec<(u16, u16, u64, Option<NodeId>)> = Vec::new();
+    for (&(slot, keys), owner) in found.iter().zip(owners) {
+        match runs.last_mut() {
+            Some((_, end, n, o)) if *end + 1 == slot && *o == owner => {
+                *end = slot;
+                *n += keys;
+            }
+            _ => runs.push((slot, slot, keys, owner)),
+        }
+    }
+    resp_array(
+        runs.into_iter()
+            .map(|(start, end, keys, owner)| {
+                resp_array(vec![
+                    resp_integer(i64::from(start)),
+                    resp_integer(i64::from(end)),
+                    resp_integer(keys as i64),
+                    owner.map_or_else(resp_null_bulk, |id| resp_bulk_str(node_id_str(&id))),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn cmd_droporphans(ctx: &Ctx) -> Vec<u8> {
+    let args = &ctx.cmd[2..];
+    let wanted = match args.first().map(|a| a.to_ascii_uppercase()) {
+        None => None,
+        Some(form) if form == b"SLOT" && args.len() > 1 => {
+            let mut slots = Vec::with_capacity(args.len() - 1);
+            for arg in &args[1..] {
+                match parse_slot_arg(arg) {
+                    Ok(slot) => slots.push(slot),
+                    Err(e) => return e,
+                }
+            }
+            Some(slots)
+        }
+        Some(form) if form == b"SLOTSRANGE" && args.len() > 1 && args.len() % 2 == 1 => {
+            let mut slots = Vec::new();
+            for pair in args[1..].chunks(2) {
+                let (start, end) = match (parse_slot_arg(pair[0]), parse_slot_arg(pair[1])) {
+                    (Ok(start), Ok(end)) => (start, end),
+                    (Err(e), _) | (_, Err(e)) => return e,
+                };
+                if start > end {
+                    return resp_error(&format!(
+                        "ERR start slot number {start} is greater than end slot number {end}"
+                    ));
+                }
+                slots.extend(start..=end);
+            }
+            Some(slots)
+        }
+        Some(_) => {
+            return resp_error(
+                "ERR syntax error: CLUSTER DROPORPHANS [SLOT slot [slot ...] | SLOTSRANGE \
+                 start-slot end-slot [start-slot end-slot ...]]",
+            );
+        }
+    };
+    let env = crate::cluster::migration::Env::from_ctx(ctx);
+    match crate::cluster::migration::off_the_runtime(|| {
+        crate::cluster::orphans::drop_orphans(&env, wanted)
+    }) {
+        Ok(keys) => resp_integer(keys as i64),
+        Err(e) => resp_error(&format!("ERR {e}")),
+    }
 }
 
 // ── CLUSTER GETKEYSINSLOT ────────────────────────────────────────────────────

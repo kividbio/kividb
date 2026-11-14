@@ -1259,6 +1259,41 @@ deletes the keys it holds for that slot, as Redis does.
 |---|---|---|
 | `CLUSTER SLOT-STATS` | `CLUSTER SLOT-STATS SLOTSRANGE start end` or `CLUSTER SLOT-STATS ORDERBY metric [LIMIT n] [ASC \| DESC]` | Per-slot stats. Only `key-count` carries real data; `cpu-usec` / `network-bytes-in` / `network-bytes-out` are reported as 0 (no per-slot instrumentation yet). `ORDERBY` only accepts `key-count`, and sorts descending (the busiest slots first) unless `ASC` is given, as in Redis. |
 
+### Keys of slots a master does not serve
+
+A master can be left holding keys of slots it does not serve: slots another
+master owns, that are not being imported into it or migrating away from it.
+The case that leaves them: a master crashes right after it hands slots over
+in an atomic slot migration (`CLUSTER MIGRATION IMPORT`), before its
+deletion of their keys has reached its replica; the replica, promoted, has
+every key of the slots that moved away (#517). No client is served them
+(every command for them gets `-MOVED`), but they take memory, count in
+`DBSIZE`, `SCAN`, `KEYS`, `RANDOMKEY` and `INFO keyspace`, and are saved and
+replicated to the node's replicas.
+
+KiviDB never deletes them on its own. Deciding automatically that the keys
+are stale, from what the cluster bus says, could not be made safe: there
+are ways (`SETSLOT`/`MIGRATE` resharding, late heartbeats, restarts part way
+through a handover) in which they are the only copy of the slot's data. So
+the node reports them, and an operator deletes them:
+
+- A master logs a warning when it finds any: at startup, after it is
+  promoted, and after the slots it serves change (once they have settled,
+  and not more often than every few seconds). The line names the slots and
+  the count of keys, and is repeated only when they change, or after ten
+  minutes.
+- `INFO cluster` reports `cluster_orphan_slots` and `cluster_orphan_keys`,
+  as last counted. A replica reports 0: its keys are its master's.
+- `CLUSTER ORPHANSLOTS` lists them, counted afresh.
+- `CLUSTER DROPORPHANS` deletes them, once you know their owner has the
+  slots' data: compare the owner's `CLUSTER COUNTKEYSINSLOT` for the slots,
+  or read some of the keys there.
+
+| Command | Syntax | Notes |
+|---|---|---|
+| `CLUSTER ORPHANSLOTS` | `CLUSTER ORPHANSLOTS` | KiviDB's own. An array with one entry per run of consecutive slots this master holds keys of, does not serve, and that have the same owner: `[start-slot, end-slot, key-count, owner-id]`, the owner `nil` for an unassigned slot. Slots whose keys are already being deleted (a slot that left this node, an atomic migration's handover) are not listed. Empty on a replica. Walks the keys of the shards of those slots, a few thousand at a time per hold of a shard's lock. |
+| `CLUSTER DROPORPHANS` | `CLUSTER DROPORPHANS [SLOT slot [slot ...] \| SLOTSRANGE start end [start end ...]]` | KiviDB's own. Deletes this master's keys of the slots given, or, without arguments, of every slot `CLUSTER ORPHANSLOTS` lists. Replies with the number of keys found to delete and deletes them in the background, in batches, as a master deletes the keys of a slot it lost: through the write path, so the `DEL`s reach its replicas and its AOF. The log says when it is done. All the slots or none: it refuses, naming the slot and why, on a replica; for a slot this node owns, imports or migrates (`CLUSTER SETSLOT`); for a slot in an atomic slot migration here, running or ended in the last few seconds, or whose keys are already being deleted; while an atomic migration away from this node is handing slots over, or ended in the last few seconds; while this node does not know yet whether a replica of it took its slots over; and unless the slot's owner is another master that this node sees as up (not `fail` or `fail?`, not in a handshake, and heard from since this node started). A slot that comes back to this node while it runs keeps its keys. In `@admin`, `@dangerous` and `@slow`; refused in scripts. Never run on its own. |
+
 ### Configuration flags
 
 | Flag | Default | Purpose |

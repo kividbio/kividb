@@ -115,6 +115,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A master reports the keys it holds of slots it does not serve, and
+  `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
+  master crashed right after a `CLUSTER MIGRATION IMPORT` handover kept the
+  keys of the slots that had moved away for good: never served (`-MOVED`),
+  but in memory, `DBSIZE`, `SCAN`, `INFO keyspace`, snapshots and full
+  syncs. Such a node now logs a warning (at startup, after a promotion, and
+  after the slots it serves change), reports them in `INFO cluster`
+  (`cluster_orphan_slots`, `cluster_orphan_keys`), and lists them with
+  their owners in `CLUSTER ORPHANSLOTS`. Nothing deletes them on its own:
+  once their owner is known to hold the slots' data, `CLUSTER DROPORPHANS
+  [SLOT slot ... | SLOTSRANGE start end ...]` deletes them in the
+  background through the write path, so replicas and the AOF follow. It
+  refuses on a replica, for a slot this node owns, imports or migrates,
+  while a slot migration or handover of the slot is under way, and unless
+  the slot's owner is another master this node sees as up.
 - **A master refuses its vote to a replica that claims slots it knows a
   newer owner of (#524).** A replica that had not heard that its master
   handed slots over in an atomic slot migration, or lost them in a

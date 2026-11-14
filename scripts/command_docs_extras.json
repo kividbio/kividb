@@ -930,6 +930,49 @@
             }
         ]
     },
+    "CLUSTER DROPORPHANS": {
+        "summary": "Deletes, in the background, the keys a master holds of slots another master owns.",
+        "complexity": "O(N), N being the number of keys in the shards of the slots given.",
+        "group": "cluster",
+        "since": "",
+        "arguments": [
+            {
+                "name": "slots",
+                "type": "oneof",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "slot",
+                        "type": "integer",
+                        "token": "SLOT",
+                        "multiple": true
+                    },
+                    {
+                        "name": "range",
+                        "type": "block",
+                        "token": "SLOTSRANGE",
+                        "multiple": true,
+                        "arguments": [
+                            {
+                                "name": "start-slot",
+                                "type": "integer"
+                            },
+                            {
+                                "name": "end-slot",
+                                "type": "integer"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    },
+    "CLUSTER ORPHANSLOTS": {
+        "summary": "Returns the slots a master holds keys of but does not serve, with their key counts and owners.",
+        "complexity": "O(N), N being the number of keys in the shards of the slots this node does not serve.",
+        "group": "cluster",
+        "since": ""
+    },
     "CLUSTER MIGRATION": {
         "summary": "Starts, cancels or reports on moving slot ranges into this node.",
         "complexity": "O(N), N being the number of slots in the ranges given.",
