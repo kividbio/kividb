@@ -134,7 +134,7 @@ def run(ctx):
     polls = sum(q.get(timeout=30) for _ in procs)
     for pr in procs:
         pr.join(5)
-    ctx.emit("set_rps_beside_ft_info", rate, "req/s", "higher", gate=rel(20))
+    ctx.emit("set_rps_beside_ft_info", rate, "req/s", "higher", gate=rel(20, anchor=False))
     ctx.emit("ft_info_polls_per_s", polls / secs, "calls/s", "higher", gate=info())
 
 

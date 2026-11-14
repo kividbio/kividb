@@ -188,22 +188,51 @@ They are checked against the candidate only.
 v1.2.2 is re-measured in every session, so it tells how fast this host is
 compared with the one the baseline was recorded on. A **speed-dependent** metric
 is one whose unit is a time or a rate: `ms`, `s`, `us`, `ns` or anything ending
-in `/s` (a gate can say `"speed": false` or `true` to override the unit rule).
+in `/s`. A gate can say `"speed": false` (or `true`) to override the unit rule.
 Bytes, MiB, counts, connections, recall and ratios are never scaled.
 
 For a `rel` gate on a speed-dependent metric, `compare.py` scales the recorded
-candidate value to this host before applying `pct`/`abs`: rates are multiplied
-by the host speed, times divided by it (1.00 = same host, 0.6 = this host is 40
-% slower). The host speed is the median, over the speed metrics of the same
-suite/configuration that have a v1.2.2 value both recorded and now (at least 3),
-of this-session/recorded for rates and recorded/this-session for times. A
-suite/configuration with fewer than 3 such metrics (and metrics v1.2.2 lacks,
-such as Q8/BIN vector sets) uses the median over all suites, the global factor.
-The factors are printed in `summary.md` and `summary.json` (`host_factor`).
-A single metric's own v1.2.2 ratio is not the default: on the committed runs,
-all on one host, such ratios strayed 15-45 % while the medians stayed within
-2 %, which is more than a 10 % gate tolerates. A gate that wants it anyway
-(its v1.2.2 is a stable proxy) says `"anchor": true`.
+candidate value by an effective factor `f` before applying `pct`/`abs`: rates
+are multiplied by `f`, times divided by it (1.00 = same host, 0.6 = this host is
+40 % slower). `abs` is not scaled. `own` is the metric's own v1.2.2
+now/recorded (rates) or recorded/now (times), from that entry's own recorded
+v1.2.2 value; `grp` is the median of `own` over the speed metrics of the same
+suite/configuration (at least 3 of them, else the median over all suites).
+
+| case | f | rule in `summary.json` |
+|---|---|---|
+| v1.2.2 has no usable value for the metric (missing, 0, NaN) | `grp` | `group` / `global` |
+| `own` < `grp` / 1.3: this metric slowed more than its group | `own` | `own-slower` |
+| `own` > `grp` x 1.3: it slowed less than its group | `min(own, max(grp, 1))` | `own-capped` |
+| otherwise | `grp` | `group` / `global` |
+| no v1.2.2 value in the whole run | 1 (compared absolutely; `summary.md` and the console say so) | `none` |
+
+A gate can force the rule: `"anchor": true` always uses `own`, `"anchor": false`
+never does (`set_rps_beside_ft_info` has it: v1.2.2's rate there varies 3x). The
+summary lists every metric whose `own` and `grp` differ by more than 1.3x.
+
+Two real cases decided these rules:
+
+- `09-vector-sets` f32 on a `Standard_D4s_v5` where v1.2.2 `VSIM` ran 639-679
+  q/s against 1,124 recorded, while its `VADD` was unchanged (65.4k against
+  66.4k/s). The config's `grp` is 0.57 (VSIM-bound), so `VSIM` is judged at 0.57
+  and passes. A `VADD` that had collapsed to 27k/s is judged at its own 0.98
+  (`own-capped`: it did not slow, so it gets no excuse) and fails.
+- `13-cluster-reshard` `reshard_s`: v1.2.2 does it by another, 10x slower
+  method, and its v1.2.2 time was 1.43x faster than recorded on the same host as
+  everything else. `min(own, max(grp, 1))` keeps it at 1.0: one noisy v1.2.2
+  number never makes a gate stricter than the recorded value.
+
+Sanity: if an `own` or a `grp` that is used for scaling is outside 0.4-2.5 (v1.2.2
+was starved, or the host is of another class), the run is `INVALID` and names the
+metric: rerun. A higher-is-better `rel` gate whose `abs` is not below the
+(scaled) recorded value is a configuration error and also `INVALID`.
+
+Scheduling jitter is not CPU speed. The PING latency rows (`02-growth-ping`
+`ping_p99_ms`/`ping_max_ms`, `04-long-commands` `*_worst_ping_*`/`*_least_worst_ping_ms`,
+`07-save-ping` `ping_during_save_*`) are marked `"speed": false` in the suites
+(`jitter()` in `lib/suite.py`) and in `baseline.json`: they are neither scaled
+nor counted toward a factor. `04` and `07` are `bound` gates anyway.
 
 Still absolute: `bound` gates (a worst PING of at most 20 ms is a promise to
 users, not a ratio), `eq` counts, all memory gates, and `info`. `ratio` and

@@ -23,7 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, THROUGHPUT, MEMORY, WORST_PING, KEEP_IMPROVEMENT, EXACT, info, scaled)  # noqa: E402
+from suite import (Suite, Config, THROUGHPUT, MEMORY, WORST_PING, KEEP_IMPROVEMENT, EXACT, info, scaled, jitter)  # noqa: E402
 from probe import Probe  # noqa: E402
 from rss import vmrss_mib, used_memory_mib  # noqa: E402
 
@@ -61,8 +61,8 @@ def run(ctx):
     ctx.raw["t0"] = t0
     ctx.emit("load_s", load_s, "s", "lower", gate=THROUGHPUT)
     ctx.emit("ping_max_ms", pr.max(), "ms", "lower",
-             gate=[WORST_PING] + ([KEEP_IMPROVEMENT] if ctx.config.name in ("tokio", "uring1") else []))
-    ctx.emit("ping_p99_ms", pr.p99(), "ms", "lower", gate=WORST_PING)
+             gate=jitter([WORST_PING]) + ([KEEP_IMPROVEMENT] if ctx.config.name in ("tokio", "uring1") else []))
+    ctx.emit("ping_p99_ms", pr.p99(), "ms", "lower", gate=jitter(WORST_PING))
     ctx.emit("pings_over_10ms", pr.over(10), "pings", "lower", gate=info())
     ctx.emit("pings", pr.count(), "pings", "higher", gate=info())
     ctx.emit("dbsize", c.dbsize(), "keys", "higher", gate=EXACT)
