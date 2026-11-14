@@ -24,7 +24,8 @@ one set at a time, and past 65,536 members its walk runs off the Tokio
 worker (`long_work`), so a writer of the small set waits neither for the walk
 of the big one nor behind it on the worker: the candidate's worst SADD must
 stay under 20 ms. Redis runs everything on one thread, so its worst SADD is
-the whole SUNION; it and v1.2.2 are shown, not gated.
+the whole SUNION; it and v1.2.2 are shown, not gated. The worst SADD is
+scheduling jitter, not CPU speed (`jitter()`): never scaled by the host factor.
 
 v1.2.2 copied every set out of the store before intersecting, so its time
 grew with N (1.9 s at 20M against Redis's 3.7 ms in the issue); the
@@ -48,7 +49,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, bound, vs_redis, median, scaled)  # noqa: E402
+from suite import (Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, bound, jitter, vs_redis, median, scaled)  # noqa: E402
 
 RUNS = 5
 S = Suite("14-sinter-big-small", [
@@ -161,7 +162,7 @@ def run_sunion(ctx, c):
                          "sadds": sum(len(one) for one in samples)}
     ctx.emit("sunion_ms", median(ms), "ms", "lower", gate=[rel(25)], samples=ms)
     ctx.emit("sunion_reply", size, "members", "higher", gate=EXACT)
-    ctx.emit("sunion_worst_sadd_ms", max(worst), "ms", "lower", gate=[bound(max=20)], samples=worst)
+    ctx.emit("sunion_worst_sadd_ms", max(worst), "ms", "lower", gate=jitter([bound(max=20)]), samples=worst)
 
 
 @S.run
