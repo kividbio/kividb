@@ -811,6 +811,18 @@ pub fn long_work<R>(units: usize, f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// How long the Tokio runtime keeps an idle thread of its blocking pool.
+///
+/// [`long_work`] hands its worker's tasks to a thread of that pool, and the
+/// thread the command ran on joins the pool when it ends. With Tokio's
+/// default of 10 s, long commands further apart than that made a new thread
+/// each time, and every new thread that runs a command takes, for good, a
+/// slot of the command gate and of the write gate and a stripe of
+/// `memory_use`: past 128 slots every `EXEC` and script takes all 128.
+/// Kept for hours, the threads that served long commands serve the next.
+pub const RUNTIME_THREAD_KEEP_ALIVE: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
 /// How many keys database `db` holds, expired ones not yet removed included:
 /// `DBSIZE`. A shard's lock at a time.
 pub fn db_len(db: &crate::store::Db) -> usize {

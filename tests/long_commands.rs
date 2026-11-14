@@ -14,10 +14,17 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// The tests here measure time, and count the process's command gate
+/// slots: they take turns.
+fn one_at_a_time() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct Conn {
     stream: TcpStream,
@@ -230,6 +237,7 @@ fn assert_not_held_up(what: &str, runs: &[(Duration, Duration)]) {
 
 #[test]
 fn keys_and_scan_over_many_keys_do_not_hold_up_other_connections() {
+    let _turn = one_at_a_time();
     let port = start_server();
     let mut c = Conn::connect(port);
     c.ok(&["DEBUG", "POPULATE", "1000000", "user"]);
@@ -261,6 +269,7 @@ fn keys_and_scan_over_many_keys_do_not_hold_up_other_connections() {
 
 #[test]
 fn freeing_a_big_value_after_del_does_not_hold_up_other_connections() {
+    let _turn = one_at_a_time();
     let port = start_server();
     let mut c = Conn::connect(port);
     let mut timed = Vec::new();
@@ -272,4 +281,65 @@ fn freeing_a_big_value_after_del_does_not_hold_up_other_connections() {
         assert_eq!(c.cmd(&["EXISTS", "big"]), V::Int(0));
     }
     assert_not_held_up("DEL of a hash of 1,000,000 fields", &timed);
+}
+
+/// Each long command hands its worker's tasks to a thread of the runtime's
+/// blocking pool; the thread it ran on joins the pool. Those threads must
+/// be the ones the next long commands use, or every long command makes a
+/// new thread, and each takes a command gate slot for good: past 128 every
+/// `EXEC` and script takes them all. With Tokio's default, idle pool
+/// threads went after 10 s, so long commands further apart than that each
+/// made one (`helpers::RUNTIME_THREAD_KEEP_ALIVE`).
+#[test]
+fn long_commands_do_not_use_up_command_gate_slots() {
+    let _turn = one_at_a_time();
+    let port = start_server();
+    let mut c = Conn::connect(port);
+    // Past `helpers::LONG_WORK`, so that each `KEYS` is long work.
+    c.ok(&["DEBUG", "POPULATE", "70000", "k"]);
+    // Other connections send commands all along, so that a thread that
+    // takes over a worker's tasks while a `KEYS` runs serves some of them,
+    // and takes its slot then.
+    let stop = Arc::new(AtomicBool::new(false));
+    let pingers: Vec<_> = (0..3)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut other = Conn::connect(port);
+                while !stop.load(Ordering::Relaxed) {
+                    assert_eq!(other.cmd(&["PING"]), V::Simple("PONG".into()));
+                    thread::sleep(Duration::from_micros(200));
+                }
+            })
+        })
+        .collect();
+    let mut long = |runs: usize| {
+        for _ in 0..runs {
+            let V::Array(found) = c.cmd(&["KEYS", "k:1234*"]) else {
+                panic!("KEYS answers an array");
+            };
+            assert_eq!(found.len(), 11);
+        }
+    };
+    long(10);
+    let before = kividb::command_gate::slots_handed_out();
+
+    long(200);
+    // And spaced by more than Tokio's default keep-alive of idle threads.
+    for _ in 0..3 {
+        thread::sleep(Duration::from_secs(11));
+        long(10);
+    }
+    stop.store(true, Ordering::Relaxed);
+    for pinger in pingers {
+        pinger.join().unwrap();
+    }
+    let after = kividb::command_gate::slots_handed_out();
+    eprintln!("command gate slots: {before} before, {after} after");
+    assert!(
+        after <= before + 2,
+        "the command gate handed out {} slots over 230 long commands \
+         ({before} before, {after} after)",
+        after - before
+    );
 }

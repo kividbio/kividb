@@ -161,6 +161,7 @@ pub fn release(value: KiviDBValue) {
 /// Freeing millions of elements takes a while. It takes no lock, but on the
 /// Tokio runtime it used to hold up every other connection's commands for as
 /// long (#754): it runs as other long work does (`helpers::long_work`).
+#[inline]
 pub fn release_deleted(value: KiviDBValue) {
     let effort = effort(&value);
     if effort <= THRESHOLD {

@@ -412,7 +412,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 keys.retain(|k| !lazy_expire_on_read(ctx.store, *ctx.selected_db, k));
                 (keys, next_cursor)
             };
-            let (keys, next_cursor) = crate::commands::helpers::long_work(options.count, walk);
+            // The keys it looks at: no more than `COUNT`, nor than there are.
+            // Counted only for a `COUNT` that could be long work.
+            let units = if options.count >= crate::commands::helpers::LONG_WORK {
+                options.count.min(crate::commands::helpers::db_len(db))
+            } else {
+                options.count
+            };
+            let (keys, next_cursor) = crate::commands::helpers::long_work(units, walk);
 
             let key_items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk(k)).collect();
 
@@ -998,7 +1005,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     .map(|value| {
                         if unlink {
                             crate::lazyfree::release(value)
-                        } else {
+                        } else if !matches!(value, KiviDBValue::String(_)) {
+                            // A string is one allocation: freed here, as
+                            // it is dropped, with nothing to weigh.
                             crate::lazyfree::release_deleted(value)
                         }
                     })

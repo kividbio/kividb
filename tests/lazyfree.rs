@@ -226,8 +226,18 @@ fn unlink_frees_a_large_value_in_the_background_and_counts_it() {
 /// and what else the `DEL` names is deleted as it was.
 #[test]
 fn del_frees_in_the_background_under_lazyfree_lazy_user_del() {
+    /// The setting is the process's: put back to `no` however the test
+    /// ends, for the other tests here, which go by it.
+    struct BackToNo(u16);
+    impl Drop for BackToNo {
+        fn drop(&mut self) {
+            Conn::connect(self.0).ok(&["CONFIG", "SET", "lazyfree-lazy-user-del", "no"]);
+        }
+    }
+
     let _turn = counters();
     let mut c = start_server();
+    let _back = BackToNo(c.stream.peer_addr().unwrap().port());
     c.ok(&["CONFIG", "RESETSTAT"]);
 
     c.big_set("big", 1000);
