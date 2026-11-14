@@ -205,7 +205,10 @@ other files:
   in `HELLO` and in `INFO`.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set.
-- `client-output-buffer-limit` isn't configurable.
+- `client-output-buffer-limit`'s replica hard limit is
+  `repl-replica-max-backlog-bytes`; during a full sync a replica is held to
+  `repl-replica-sync-max-backlog-bytes` instead. The limits count the bytes
+  waiting, not the allocator's rounding of them.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica
   of a KiviDB master older than 1.1.3 expires keys by its own clock (such a
   master sends no `DEL` for the keys it expires). A replica of a 1.2.0

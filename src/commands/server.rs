@@ -838,6 +838,33 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     ))),
                 }
             }
+            // `<class> <hard> <soft> <seconds>`, for one class or more (#774).
+            // Normal and subscribed clients' limits are the hub's, read as
+            // each reply or message is queued; a replica's are the
+            // replication's, read for each write the hub queues, its hard
+            // limit being `repl-replica-max-backlog-bytes`.
+            "client-output-buffer-limit" => match crate::output_limits::parse(value) {
+                Ok(classes) => {
+                    for (class, limit) in classes {
+                        if class == crate::output_limits::Class::Replica {
+                            let rs = &ctx.repl_state;
+                            rs.replica_max_backlog_bytes
+                                .store(limit.hard, Ordering::Relaxed);
+                            rs.replica_soft_limit_bytes
+                                .store(limit.soft, Ordering::Relaxed);
+                            rs.replica_soft_limit_secs
+                                .store(limit.soft_seconds, Ordering::Relaxed);
+                        } else {
+                            ctx.pubsub.limits().set(class, limit);
+                        }
+                    }
+                    Some(resp_simple("OK"))
+                }
+                Err(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'client-output-buffer-limit') - {why}"
+                ))),
+            },
             // Read when a shutdown begins to wait for the replicas.
             "shutdown-timeout" => match value.parse::<u64>() {
                 Ok(v) if v <= i32::MAX as u64 => {
@@ -1994,6 +2021,26 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
     )
 });
 
+/// `client-output-buffer-limit` in effect now, as `CONFIG GET` gives it.
+fn output_buffer_limits(ctx: &Ctx) -> String {
+    use crate::output_limits::{Class, Limit, Limits};
+    use std::sync::atomic::Ordering::Relaxed;
+    let rs = &ctx.repl_state;
+    let mut limits = Limits::default();
+    for class in [Class::Normal, Class::PubSub] {
+        limits.set(class, ctx.pubsub.limits().get(class));
+    }
+    limits.set(
+        Class::Replica,
+        Limit {
+            hard: rs.replica_max_backlog_bytes.load(Relaxed),
+            soft: rs.replica_soft_limit_bytes.load(Relaxed),
+            soft_seconds: rs.replica_soft_limit_secs.load(Relaxed),
+        },
+    );
+    limits.to_config_string()
+}
+
 /// Every setting `CONFIG GET` knows, with its value now: the ones that are
 /// in effect, then the ones that are only remembered.
 fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
@@ -2035,6 +2082,8 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("logfile", ctx.config.logfile.clone()),
         ("log-format", ctx.config.log_format.clone()),
         ("databases", ctx.config.databases.to_string()),
+        // All three classes, always, as Redis gives them (#774).
+        ("client-output-buffer-limit", output_buffer_limits(ctx)),
         // As given with `--threads` (0: one per core), the value `CONFIG
         // REWRITE` keeps, not the count it resolved to on this machine.
         ("threads", ctx.config.threads.to_string()),
@@ -4563,6 +4612,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     slow_us_max as f64 / 1000.0
                 ));
                 out.push_str(&format!(
+                    "client_output_buffer_limit_disconnections:{}\r\n",
+                    crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.load(Ordering::Relaxed)
+                ));
+                out.push_str(&format!(
                     "total_error_replies:{}\r\n",
                     crate::stats::TOTAL_ERROR_REPLIES.load(Ordering::Relaxed)
                 ));
@@ -5294,6 +5347,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // resets its `stat_active_defrag_*` (#370).
                     crate::compaction::reset_stats();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
+                    crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.store(0, Ordering::Relaxed);
                     // Not `rdb_changes_since_last_save`: that is not a
                     // statistic, and Redis keeps it (#566).
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);

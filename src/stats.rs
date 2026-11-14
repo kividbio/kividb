@@ -93,6 +93,9 @@ pub static TOTAL_NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_ERROR_REPLIES: AtomicU64 = AtomicU64::new(0);
 pub static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Clients closed for `client-output-buffer-limit`: `INFO`'s
+/// `client_output_buffer_limit_disconnections`.
+pub static OUTPUT_BUFFER_LIMIT_DISCONNECTIONS: AtomicU64 = AtomicU64::new(0);
 /// Changes to the dataset since it was last saved, a counter to each thread
 /// that has made one. See [`record_rdb_change`].
 static RDB_CHANGES: parking_lot::Mutex<Vec<std::sync::Arc<AtomicU64>>> =

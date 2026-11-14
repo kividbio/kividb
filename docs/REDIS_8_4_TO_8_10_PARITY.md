@@ -338,7 +338,7 @@ Beyond the report:
 | Per-iterator timings in `FT.PROFILE` | — | The times reported are the query's as a whole. |
 | Parse-batch metrics in `INFO` and `CLIENT LIST` | 8.8 | Not reported. |
 | `XIDMPRECORD` | 8.6 | Internal to Redis's AOF rewrite; KiviDB saves idempotency state in its snapshot instead. |
-| `client-output-buffer-limit` | — | Not configurable: Pub/Sub uses Redis's default limits, replicas `repl-replica-max-backlog-bytes`. |
+| `client-output-buffer-limit` | — | Configurable since 1.3.0 (#774). A replica's hard limit is `repl-replica-max-backlog-bytes`; during a full sync it is held to `repl-replica-sync-max-backlog-bytes` instead. |
 | A master's replication ID across a restart, without the AOF | — | A master restarted without the AOF has a new ID, and its replicas resync in full. Since 1.1.0, with the AOF on, a master stopped cleanly keeps its ID and offset. A restarted replica continues by partial resync. |
 
 ## Known gaps in what is implemented

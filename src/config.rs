@@ -313,6 +313,12 @@ pub struct Config {
     #[arg(skip)]
     pub configfile_named: bool,
 
+    /// `client-output-buffer-limit`, from the configuration file (#774):
+    /// see [`crate::output_limits`]. The replica class's hard limit is
+    /// `repl_replica_max_backlog_bytes`; the one here is not read.
+    #[arg(skip)]
+    pub client_output_buffer_limit: crate::output_limits::Limits,
+
     /// Port to accept TLS connections on. 0 = TLS disabled.
     /// Separate from `port` so the uring hot-path on `port` is untouched.
     #[arg(long, default_value_t = 0)]
@@ -670,6 +676,7 @@ impl Default for Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            client_output_buffer_limit: crate::output_limits::Limits::default(),
             repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -798,6 +805,7 @@ impl Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            client_output_buffer_limit: crate::output_limits::Limits::default(),
             repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -1059,6 +1067,17 @@ impl Config {
         }
     }
 
+    /// `client-output-buffer-limit` as configured, the replica class's hard
+    /// limit being `repl-replica-max-backlog-bytes`.
+    pub fn output_buffer_limits(&self) -> crate::output_limits::Limits {
+        use crate::output_limits::Class;
+        let mut limits = self.client_output_buffer_limit;
+        let mut replica = limits.get(Class::Replica);
+        replica.hard = self.repl_replica_max_backlog_bytes;
+        limits.set(Class::Replica, replica);
+        limits
+    }
+
     /// Returns true if TLS should be enabled.
     /// Requires tls_port > 0 AND both cert + key files configured.
     pub fn tls_enabled(&self) -> bool {
@@ -1215,6 +1234,8 @@ impl Config {
             "repl-replica-sync-max-backlog-bytes {}\n",
             self.repl_replica_sync_max_backlog_bytes
         ));
+        // A line for each class not at Redis's default, as Redis writes them.
+        out.push_str(&self.output_buffer_limits().rewrite_lines());
         if !self.masterauth.is_empty() {
             out.push_str(&format!("masterauth {}\n", quote(&self.masterauth)));
         }
@@ -1672,6 +1693,23 @@ impl Config {
             ),
             "repl-replica-max-backlog-bytes" => {
                 set!(repl_replica_max_backlog_bytes, parse_memory(key, one()?)?)
+            }
+            // `<class> <hard> <soft> <seconds>`, for one class or more; a
+            // line for each class, as Redis writes them, or all on one. A
+            // replica's hard limit is `repl-replica-max-backlog-bytes` (#774).
+            "client-output-buffer-limit" => {
+                if args.is_empty() {
+                    return Err(format!("'{key}' needs a value"));
+                }
+                let value = args.join(" ");
+                let classes = crate::output_limits::parse(&value)
+                    .map_err(|why| format!("invalid value '{value}' for '{key}': {why}"))?;
+                for (class, limit) in classes {
+                    if class == crate::output_limits::Class::Replica {
+                        set!(repl_replica_max_backlog_bytes, limit.hard);
+                    }
+                    self.client_output_buffer_limit.set(class, limit);
+                }
             }
             "repl-replica-sync-max-backlog-bytes" => {
                 set!(
