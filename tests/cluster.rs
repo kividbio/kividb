@@ -5409,6 +5409,225 @@ fn slot_migration_refuses_what_it_cannot_do() {
     assert_eq!(nodes[0].cluster_info("cluster_state"), "ok");
 }
 
+/// Redis's reply to an atomic slot migration of a slot in a legacy one.
+const NOT_STABLE: &str = "all slot states must be STABLE to start a slot migration task.";
+
+/// An atomic slot import (`CLUSTER MIGRATION IMPORT`) and a legacy one
+/// (`CLUSTER SETSLOT IMPORTING` / `MIGRATING` and `MIGRATE`) refuse each
+/// other's slots (#755). The import counted the keys a `MIGRATE` or an
+/// `ASKING` client wrote meanwhile as its own, and deleted them if it did
+/// not complete: they may be the only copy.
+///
+/// Here, an import of a slot in a legacy migration: the destination
+/// refuses it while the slot is `IMPORTING` there; the source refuses to
+/// start it while the slot is `MIGRATING` there, and the import tries again
+/// until it is `STABLE`, then completes.
+#[test]
+fn an_atomic_import_is_refused_on_a_slot_in_a_legacy_migration() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let slot = ranges[0].0 + 10;
+    let slot_s = slot.to_string();
+    let wider = (slot + 5).to_string();
+    let key = key_in(slot..=slot, "legacy");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+    assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+
+    // The destination: the slot is IMPORTING there.
+    assert!(
+        d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    for (a, b) in [(&slot_s, &slot_s), (&ranges[0].0.to_string(), &wider)] {
+        // Redis's reply, byte for byte.
+        let refused = d.cmd(&["CLUSTER", "MIGRATION", "IMPORT", a, b]);
+        assert_eq!(
+            refused.err(),
+            Some(&*format!("ERR {NOT_STABLE}")),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(
+        d.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ALL"])
+            .array()
+            .len(),
+        0
+    );
+    assert!(d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "STABLE"]).is_ok());
+
+    // The source: the slot is MIGRATING there. The import is taken, and
+    // its attempts are refused by the source until the slot is STABLE.
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to refuse the import",
+        Duration::from_secs(30),
+        || {
+            let status = d.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+            status
+                .array()
+                .first()
+                .is_some_and(|task| task_field(task, "last_error").text().contains(NOT_STABLE))
+        },
+    );
+    // The source has no task, still owns the slot, and serves the key.
+    assert_eq!(
+        s.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ALL"])
+            .array()
+            .len(),
+        0
+    );
+    assert_eq!(s.cmd(&["GET", &key]).text(), "v");
+    assert!(s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "STABLE"]).is_ok());
+
+    wait_import_completed(dst, &task_id);
+    assert_eq!(d.cmd(&["GET", &key]).text(), "v");
+}
+
+/// No form of `CLUSTER SETSLOT` changes a slot that an atomic slot
+/// migration is moving, on either side, as in Redis (#755): `IMPORTING`
+/// on the destination would have let `MIGRATE` and `ASKING` clients write
+/// keys the import counted as its own, and deleted if it did not complete;
+/// `MIGRATING` on the source would have sent keys on to the destination by
+/// `MIGRATE`. Other slots are not held up, and the import completes.
+#[test]
+fn setslot_is_refused_on_a_slot_an_atomic_migration_is_moving() {
+    let (nodes, ranges) = form_cluster_with_env(2, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "6000")]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let slot = ranges[0].0 + 10;
+    let slot_s = slot.to_string();
+    let other = (ranges[0].0 + 500).to_string();
+    let key = key_in(slot..=slot, "atomic");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+    assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to wait before its handoff",
+        Duration::from_secs(30),
+        || src.log().contains("(test) the handoff of slots"),
+    );
+
+    let refused = |c: &mut Conn, args: &[&str]| {
+        let mut cmd = vec!["CLUSTER", "SETSLOT", slot_s.as_str()];
+        cmd.extend_from_slice(args);
+        let reply = c.cmd(&cmd);
+        assert!(
+            reply
+                .err()
+                .is_some_and(|e| e.contains("active atomic slot migration")),
+            "{cmd:?}: {reply:?}"
+        );
+    };
+    // The destination, importing the slot.
+    refused(&mut d, &["IMPORTING", &src_id]);
+    refused(&mut d, &["STABLE"]);
+    refused(&mut d, &["NODE", &dst_id]);
+    refused(&mut d, &["NODE", &src_id]);
+    // The source, exporting it.
+    refused(&mut s, &["MIGRATING", &dst_id]);
+    refused(&mut s, &["STABLE"]);
+    refused(&mut s, &["NODE", &dst_id]);
+    // A slot the migration does not move: as before.
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &other, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    assert!(s.cmd(&["CLUSTER", "SETSLOT", &other, "STABLE"]).is_ok());
+
+    wait_import_completed(dst, &task_id);
+    assert_eq!(d.cmd(&["GET", &key]).text(), "v");
+}
+
+/// Once an atomic import is canceled and has stopped on both sides, a
+/// legacy migration of its slots, as `redis-cli --cluster reshard` makes
+/// one, goes ahead and moves every key (#755): the way Redis's error points
+/// to.
+#[test]
+fn a_canceled_atomic_import_lets_a_legacy_migration_of_its_slots_begin() {
+    let (nodes, ranges) = form_cluster_with_env(2, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "3000")]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let slot = ranges[0].0 + 10;
+    let slot_s = slot.to_string();
+    let key = key_in(slot..=slot, "both");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+    assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to wait before its handoff",
+        Duration::from_secs(30),
+        || src.log().contains("(test) the handoff of slots"),
+    );
+    let refused = d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", &src_id]);
+    assert!(refused.err().is_some(), "{refused:?}");
+    assert_eq!(
+        d.cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &task_id])
+            .int(),
+        1
+    );
+    let running = |c: &mut Conn| {
+        let status = c.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+        status
+            .array()
+            .first()
+            .is_some_and(|task| task_field(task, "state").text() == "in_progress")
+    };
+    wait_until("the import to stop", Duration::from_secs(30), || {
+        !running(&mut d)
+    });
+    wait_until("the source to stop", Duration::from_secs(30), || {
+        !running(&mut s)
+    });
+
+    // The legacy migration, step by step.
+    assert!(
+        d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    // And no atomic import of the slot meanwhile.
+    let again = d.cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s]);
+    assert!(
+        again.err().is_some_and(|e| e.contains(NOT_STABLE)),
+        "{again:?}"
+    );
+    let port = dst.port.to_string();
+    let reply = s.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS", &key]);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert!(
+        d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "NODE", &dst_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "NODE", &dst_id])
+            .is_ok()
+    );
+    assert_eq!(d.cmd(&["GET", &key]).text(), "v");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot_s]).int(), 0);
+}
+
 /// A slot taken over by another master without its keys being moved — here
 /// with a bare `SETSLOT … NODE` on the other node — leaves nothing behind on
 /// the node that lost it.
