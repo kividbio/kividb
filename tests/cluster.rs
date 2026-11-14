@@ -5391,11 +5391,19 @@ fn a_replica_promoted_after_its_master_handed_slots_over_drops_their_keys() {
         Duration::from_secs(30),
         || replica.conn().cmd(&["DBSIZE"]).int() == kept.len() as i64,
     );
+    // The drop may be split across the owner's heartbeats: each slot is
+    // dropped once, so the messages add up to all of them.
     let log = replica.log();
-    assert!(
-        log.contains("dropping the keys of 1001 slot(s) the old master gave away"),
-        "{log}"
-    );
+    let marker = "dropping the keys of ";
+    let dropped: usize = log
+        .lines()
+        .filter(|l| l.contains("slot(s) the old master gave away while"))
+        .filter_map(|l| {
+            let rest = &l[l.find(marker)? + marker.len()..];
+            rest.split(' ').next()?.parse::<usize>().ok()
+        })
+        .sum();
+    assert_eq!(dropped, 1001, "{log}");
     let lost = not_as_written(&replica, &kept, "v");
     assert!(
         lost.is_empty(),
