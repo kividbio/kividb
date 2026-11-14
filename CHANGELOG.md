@@ -179,6 +179,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A grouped `FT.AGGREGATE` reports how many groups there are (#761).** The
+  first element of the reply (`total_results` under RESP3) was the number of
+  rows on the page, so `GROUPBY 1 @f REDUCE COUNT 0 AS n LIMIT 0 10` over a
+  thousand groups said 10. It now says 1000, as Redis 8.10 does, which is
+  what clients such as redis-py's `AggregateResult.total` page by. It counts
+  the groups the last `GROUPBY` made, before `LIMIT` or `SORTBY ... MAX` cut
+  them down; with `WITHCURSOR` the first page carries it and `FT.CURSOR READ`
+  answers 0 after. A `FILTER` after the `GROUPBY`, and aggregations without a
+  `GROUPBY`, are left as they were.
+
 - **Geo coordinates and distances are written as Redis 8.10 writes them
   (#701).** Under RESP2, `GEOPOS` and `WITHCOORD` give the fewest digits
   that read back as the same coordinate (`13.361389338970184`), not 17

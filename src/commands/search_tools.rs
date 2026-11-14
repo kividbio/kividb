@@ -108,6 +108,9 @@ struct Cursor {
     /// Whether the aggregation ran out of time: every page of a partial
     /// result says so, not only the first.
     timed_out: bool,
+    /// Whether the rows are groups: Redis reports their number with the
+    /// first page and 0 with the pages after it.
+    grouped: bool,
 }
 
 static CURSORS: LazyLock<Mutex<AHashMap<u64, Cursor>>> =
@@ -119,9 +122,15 @@ const MAX_CURSORS: usize = 1024;
 const DEFAULT_COUNT: usize = 1000;
 
 /// `[rows, cursor]`.
-fn cursor_reply(resp: u8, rows: &[ShownRow], cursor: u64, timed_out: bool) -> Vec<u8> {
+fn cursor_reply(
+    resp: u8,
+    total: usize,
+    rows: &[ShownRow],
+    cursor: u64,
+    timed_out: bool,
+) -> Vec<u8> {
     resp_array(vec![
-        rows_reply(resp, rows.len(), rows, timed_out),
+        rows_reply(resp, total, rows, timed_out),
         resp_integer(cursor as i64),
     ])
 }
@@ -170,11 +179,13 @@ pub(crate) fn open_cursor(
     count: usize,
     max_idle: Duration,
     timed_out: bool,
+    groups: Option<usize>,
 ) -> Vec<u8> {
     let mut rows: VecDeque<ShownRow> = rows.into();
     let first: Vec<ShownRow> = rows.drain(..count.min(rows.len())).collect();
+    let total = groups.unwrap_or(first.len());
     if rows.is_empty() {
-        return cursor_reply(resp, &first, 0, timed_out);
+        return cursor_reply(resp, total, &first, 0, timed_out);
     }
     let mut cursors = CURSORS.lock();
     forget_idle(&mut cursors);
@@ -197,9 +208,10 @@ pub(crate) fn open_cursor(
             max_idle,
             used: Instant::now(),
             timed_out,
+            grouped: groups.is_some(),
         },
     );
-    cursor_reply(resp, &first, id, timed_out)
+    cursor_reply(resp, total, &first, id, timed_out)
 }
 
 /// `FT.CURSOR READ index cursor [COUNT n]` / `FT.CURSOR DEL index cursor`.
@@ -280,11 +292,13 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
     cursor.used = Instant::now();
     let left = !cursor.rows.is_empty();
     let timed_out = cursor.timed_out;
+    let total = if cursor.grouped { 0 } else { rows.len() };
     if !left {
         cursors.remove(&id);
     }
     Some(cursor_reply(
         crate::commands::handler::effective_resp_for_reply(ctx),
+        total,
         &rows,
         if left { id } else { 0 },
         timed_out,
@@ -1124,6 +1138,7 @@ mod tests {
             2,
             Duration::from_secs(60),
             false,
+            None,
         );
         // [[2, row, row], cursor]
         assert!(first.starts_with(b"*2\r\n*3\r\n:2\r\n"), "{first:?}");
@@ -1137,6 +1152,7 @@ mod tests {
             10,
             Duration::from_secs(60),
             false,
+            None,
         );
         assert!(all.starts_with(b"*2\r\n*6\r\n:5\r\n"), "{all:?}");
         assert!(all.ends_with(b":0\r\n"));
