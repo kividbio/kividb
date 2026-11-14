@@ -12,29 +12,60 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
   bit per component, as Redis 8 does: about 3.6-3.8x and 15-22x less memory
-  than f32 at 768-1536 dimensions. Scores, `VEMB` and `VEMB RAW` match
-  Redis 8.10.3; Q8 recall equals Redis's exact search, and BIN recall is
-  within 0.004 of it. Q8 and BIN refuse infinite components. A set made
-  without an option stays f32 (Redis's default is `Q8`) and, as in 1.2,
-  accepts any option later. Snapshots of quantized sets use a new type tag,
-  which 1.2 refuses rather than misreads; sets made without an option are
-  saved as before, and one whose vector does not have the set's dimension
-  is refused. A replica of a 1.2 master ignores the options as its master
-  does. Upgrade replicas before masters. `VEMB` now replies with doubles
-  and `VEMB RAW` with Redis's array; `VSIM` refuses a query of the wrong
-  dimension, and `VSIM` and `VLINKS` order equal scores by element name.
-  `MEMORY USAGE` of a vector set counts the bytes it stores instead of
-  estimating f32.
+  than f32 at 768-1536 dimensions. Quantization, dequantization and scores
+  follow Redis 8.10.3's formulas, and the Q8 distance is clamped to [0, 2]
+  as in Redis. The norm is computed in f64, so a stored component, norm or
+  range can differ from Redis's in the last bit (Redis's own bytes differ
+  between builds with and without FMA); KiviDB's are the same on every CPU,
+  and it keeps vectors whose f32 norm would overflow or underflow, which
+  Redis returns as NaN or keeps unnormalized. Q8 recall equals Redis's exact
+  search, and BIN recall is within 0.004 of it. Q8 and BIN refuse infinite
+  components. `VEMB` now replies with doubles and `VEMB RAW` with Redis's
+  array; `VSIM` refuses a query of the wrong dimension, and `VSIM` and
+  `VLINKS` order equal scores by element name. `MEMORY USAGE` of a vector
+  set counts the bytes it stores instead of estimating f32.
 
-  **Upgrading with `appendonly` on:** 1.3 replaying a 1.2 log applies the
-  `Q8` and `BIN` options 1.2 ignored to every write that no successful save
-  covers, so those sets would no longer match a 1.2 replica or snapshot.
-  The log does not say which release wrote it. Before upgrading, make sure
-  a save covering the last write succeeded: stop 1.2 with `SHUTDOWN` (not
-  `NOSAVE`) and check that it logged `Goodbye.` after `writing final
-  snapshot`, not `Final snapshot failed` (a replica in the middle of a full
-  sync skips the save), or stop the writes and run `SAVE`, which must
-  answer `OK`. After a crash, restart once on 1.2 and do the same.
+  Two differences from Redis, both lenient and as in 1.2: a set made
+  without an option stays f32 (Redis's default is `Q8`) and accepts any
+  option later, staying f32; and a `VADD` without an option into a set made
+  with one is accepted, in the set's quantization (Redis refuses it unless
+  the set is `Q8`).
+
+  **Mixed versions.** 1.2 accepted `NOQUANT`, `Q8` and `BIN` and stored
+  f32; 1.3 keeps each node storing what the writer's release stored:
+  - *Snapshots.* `Q8` and `BIN` sets use a new type tag, which 1.2 refuses
+    rather than misreads. Every f32 set, `NOQUANT` ones included, is saved
+    as before, so 1.2 reads it; a `NOQUANT` set reloads as one made without
+    an option. An element of a 1.2 snapshot whose vector does not have its
+    set's dimension is logged and not loaded, instead of stopping startup.
+  - *AOF.* A `VADD` with `NOQUANT`, `Q8` or `BIN` is followed in the log,
+    and in backup increments, by a 32-byte `KIVIDB.AOF-VSET-QUANT` record
+    (about 1% of a 768-dimension `FP32` `VADD`). Replay applies an option
+    only when that record follows its `VADD`; a `VADD` without one, as 1.2
+    wrote it, is applied with the option dropped, as 1.2 applied it. So
+    upgrading with `appendonly` on, or moving between 1.2 and 1.3 after
+    crashes, needs no extra step. If a crash cuts off the record after the
+    `VADD` that made a set, the set is f32, as if made without an option,
+    and accepts later `VADD`s. 1.2 replays a 1.3 log, logging each record as
+    an unknown command, and stores every set as f32. `BGREWRITEAOF` saves
+    each set as stored, in the snapshot format above, so records do not
+    pile up.
+  - *Replication.* 1.3 replicas announce `REPLCONF capa vset-quant`; a 1.3
+    master answers them with `vset-quant` after the offset of `+FULLRESYNC`
+    or the ID of `+CONTINUE`. A replica applies the options only with that
+    word or, from a master that sends none, if `INFO server` shows Redis, or
+    KiviDB with `kividb_vset_quantization:1` (printed by a node that keeps
+    the options). Otherwise, from 1.2 or from a master whose `INFO` it may
+    not run, it logs why and drops the options before applying the stream,
+    so its AOF holds what it applied. Redis's minimal replica ACL (`+psync
+    +replconf +ping`) does not allow `INFO`: give the replication user
+    `+info`, or a Redis master's `Q8` and `BIN` sets are f32 on 1.3
+    replicas. KiviDB replicas do not chain. A replica's backlog keeps its
+    master's bytes so offsets match; promoted, it syncs in full a replica
+    that would continue from before the last option it dropped. A 1.3
+    master holding a `Q8` or `BIN` set refuses a full sync to a KiviDB
+    replica without `vset-quant`, which logs why, instead of sending
+    snapshots 1.2 refuses. **Upgrade replicas before masters.**
 
 ### Fixed
 

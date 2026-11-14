@@ -63,6 +63,79 @@ impl Quant {
     }
 }
 
+/// Whether any database holds a Q8 or BIN set, which 1.2 cannot read.
+pub fn store_holds_quantized_set(store: &crate::store::Store) -> bool {
+    store.iter().flat_map(|db| db.iter()).any(|shard| {
+        crate::read_lock!(shard).values().any(|value| match value {
+            crate::store::ValueRef::VectorSet(vs) => vs.read().quant != Quant::F32,
+            _ => false,
+        })
+    })
+}
+
+/// Where `VADD`'s options start: past the vector and the element.
+fn vadd_options_start(cmd: &[Vec<u8>]) -> Option<usize> {
+    let word = |i: usize, w: &[u8]| cmd.get(i).is_some_and(|a| a.eq_ignore_ascii_case(w));
+    let mut i = 2;
+    if word(i, b"DISTANCE") {
+        i += 2;
+    }
+    if word(i, b"FP32") {
+        i += 2;
+    } else if word(i, b"VALUES") {
+        let count: usize = std::str::from_utf8(cmd.get(i + 1)?).ok()?.parse().ok()?;
+        i = i.checked_add(2)?.checked_add(count)?;
+    } else {
+        return None;
+    }
+    // The element.
+    (i < cmd.len()).then_some(i + 1)
+}
+
+/// Where a `VADD`'s quantization options are; none for another command.
+fn quant_options(cmd: &[Vec<u8>]) -> Vec<usize> {
+    let mut found = Vec::new();
+    if !cmd.first().is_some_and(|c| c.eq_ignore_ascii_case(b"VADD")) {
+        return found;
+    }
+    let Some(start) = vadd_options_start(cmd) else {
+        return found;
+    };
+    let mut i = start;
+    // As `vadd` walks them: these and `CAS` stand alone, the rest take a value.
+    while i < cmd.len() {
+        if Quant::parse_option(&cmd[i]).is_some() {
+            found.push(i);
+            i += 1;
+        } else if cmd[i].eq_ignore_ascii_case(b"CAS") {
+            i += 1;
+        } else {
+            i += 2;
+        }
+    }
+    found
+}
+
+/// A `VADD` with `NOQUANT`, `Q8` or `BIN`: its AOF record takes a marker.
+pub fn carries_quant_option(cmd: &[Vec<u8>]) -> bool {
+    !quant_options(cmd).is_empty()
+}
+
+/// Strips quantization options by position, so an element named `Q8` survives.
+pub fn without_quant_options(cmd: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, bool) {
+    let dropped = quant_options(&cmd);
+    if dropped.is_empty() {
+        return (cmd, false);
+    }
+    let kept = cmd
+        .into_iter()
+        .enumerate()
+        .filter(|(at, _)| !dropped.contains(at))
+        .map(|(_, arg)| arg)
+        .collect();
+    (kept, true)
+}
+
 /// Number of u64 words holding `dim` sign bits.
 #[inline]
 pub fn bin_words(dim: usize) -> usize {
@@ -92,7 +165,7 @@ pub enum QuantError {
     NotFinite,
 }
 
-/// Summed in f64 so large finite components cannot overflow the norm.
+/// In f64: the same bits on every CPU, without f32 overflow or underflow.
 fn norm_of(v: &[f32]) -> f64 {
     v.iter()
         .map(|&x| (x as f64) * (x as f64))
@@ -121,7 +194,7 @@ fn to_unit(v: &mut [f32]) -> Result<f32, QuantError> {
     Ok(norm32)
 }
 
-/// Same formula and rounding as Redis, so stored bytes match exactly.
+/// Redis's formula and rounding; the f64 norm can change the last bit.
 fn q8_of_unit(unit: &[f32]) -> (Box<[i8]>, f32) {
     let max_abs = unit.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     if max_abs == 0.0 {
@@ -261,7 +334,8 @@ impl StoredVector {
                 },
             ) => {
                 let dot = dot_i8(a, b) as f32 * (ra / 127.0) * (rb / 127.0);
-                from_unit_dot(metric, dot, *na, *nb)
+                // Rounding can leave |dot| above 1; Redis clamps distance to [0, 2].
+                from_unit_dot(metric, dot.clamp(-1.0, 1.0), *na, *nb)
             }
             (StoredVector::Bin { norm: na, bits: a }, StoredVector::Bin { norm: nb, bits: b }) => {
                 // Sign agreement estimates the cosine, as in Redis.
@@ -393,6 +467,24 @@ mod tests {
         assert!((out[1] / 1e30 + 1.0).abs() < 1e-6, "{out:?}");
     }
 
+    /// Redis's f32 norm underflows here: it keeps norm 1, or reads 1e-45 as -0.
+    #[test]
+    fn tiny_vectors_keep_their_values() {
+        for v in [[1e-23f32, 2e-23], [1e-45, 0.0]] {
+            let stored = q(Quant::Q8, &v);
+            let StoredVector::Q8 { norm, .. } = &stored else {
+                panic!("{stored:?}")
+            };
+            let want = ((v[0] as f64).powi(2) + (v[1] as f64).powi(2)).sqrt() as f32;
+            assert_eq!(*norm, want);
+            let mut out = Vec::new();
+            stored.to_f32(2, &mut out);
+            for (got, want) in out.iter().zip(v) {
+                assert!((got - want).abs() <= want * 0.01, "{out:?} for {v:?}");
+            }
+        }
+    }
+
     /// Score from Redis 8.10, which also quantizes the query.
     #[test]
     fn q8_score_is_redis_score() {
@@ -401,6 +493,118 @@ mod tests {
         let d = a.distance(&query, &DistanceMetric::Cosine, 3);
         let score = 1.0 - d / 2.0;
         assert!((score as f64 - 0.6325784027576447).abs() < 1e-7, "{score}");
+    }
+
+    /// Q8 distance from `a` to `b`, and the dot product before the clamp.
+    fn q8_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> (f32, f32) {
+        let (qa, qb) = (q(Quant::Q8, a), q(Quant::Q8, b));
+        let (
+            StoredVector::Q8 {
+                range: ra,
+                values: va,
+                ..
+            },
+            StoredVector::Q8 {
+                range: rb,
+                values: vb,
+                ..
+            },
+        ) = (&qa, &qb)
+        else {
+            panic!()
+        };
+        let dot = dot_i8(va, vb) as f32 * (ra / 127.0) * (rb / 127.0);
+        (qa.distance(&qb, &metric, a.len()), dot)
+    }
+
+    /// Rounding up past 1 is clamped as Redis clamps it: distance in [0, 2].
+    #[test]
+    fn q8_distance_is_clamped() {
+        // 127 * 0.50315 = 63.9, stored as 64: the dot comes out above 1.
+        let v = [1.0f32, 0.50315];
+        let opposite = [-1.0f32, -0.50315];
+        let (same, dot) = q8_distance(&v, &v, DistanceMetric::Cosine);
+        assert!(dot > 1.0, "the case needs a dot above 1: {dot}");
+        assert_eq!(same, 0.0);
+        let (far, dot) = q8_distance(&v, &opposite, DistanceMetric::Cosine);
+        assert!(dot < -1.0, "the case needs a dot below -1: {dot}");
+        assert_eq!(far, 2.0);
+        // Scores stay in [0, 1].
+        assert_eq!(1.0 - same / 2.0, 1.0);
+        assert_eq!(1.0 - far / 2.0, 0.0);
+        // Nearly the same: small, and never below 0.
+        let (near, _) = q8_distance(&v, &[1.0, 0.5032], DistanceMetric::Cosine);
+        assert!((0.0..0.001).contains(&near), "{near}");
+        // Unclamped, L2 between unit vectors fell below 0 and IP below -1.
+        let (l2, _) = q8_distance(&v, &v, DistanceMetric::L2);
+        assert!(l2 >= 0.0, "{l2}");
+        let unit = [1.0f32, 0.0];
+        let (ip, _) = q8_distance(&unit, &unit, DistanceMetric::InnerProduct);
+        assert_eq!(ip, 0.0);
+    }
+
+    fn args(words: &[&str]) -> Vec<Vec<u8>> {
+        words.iter().map(|w| w.as_bytes().to_vec()).collect()
+    }
+
+    /// Options go by position: an element, value or attribute named `Q8` stays.
+    #[test]
+    fn quant_options_are_dropped_by_position() {
+        let blob = std::str::from_utf8(&[b'0'; 8]).unwrap().to_string();
+        let cases: [(&[&str], &[&str], bool); 9] = [
+            (
+                &["VADD", "k", "VALUES", "3", "1", "2", "3", "e", "Q8"],
+                &["VADD", "k", "VALUES", "3", "1", "2", "3", "e"],
+                true,
+            ),
+            (
+                &["VADD", "k", "VALUES", "3", "1", "2", "3", "Q8", "BIN"],
+                &["VADD", "k", "VALUES", "3", "1", "2", "3", "Q8"],
+                true,
+            ),
+            (
+                &["vadd", "k", "FP32", &blob, "e", "NOQUANT", "EF", "200"],
+                &["vadd", "k", "FP32", &blob, "e", "EF", "200"],
+                true,
+            ),
+            (
+                &["VADD", "k", "VALUES", "1", "1", "e", "SETATTR", "Q8"],
+                &["VADD", "k", "VALUES", "1", "1", "e", "SETATTR", "Q8"],
+                false,
+            ),
+            (
+                &[
+                    "VADD", "k", "DISTANCE", "L2", "VALUES", "1", "1", "e", "q8", "cas",
+                ],
+                &[
+                    "VADD", "k", "DISTANCE", "L2", "VALUES", "1", "1", "e", "cas",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "VADD", "k", "VALUES", "2", "Q8", "BIN", "e", "Q8", "M", "16", "BIN",
+                ],
+                &["VADD", "k", "VALUES", "2", "Q8", "BIN", "e", "M", "16"],
+                true,
+            ),
+            (
+                &["VADD", "k", "VALUES", "x", "Q8", "e", "Q8"],
+                &["VADD", "k", "VALUES", "x", "Q8", "e", "Q8"],
+                false,
+            ),
+            (
+                &["VADD", "k", "VALUES", "9", "1", "Q8"],
+                &["VADD", "k", "VALUES", "9", "1", "Q8"],
+                false,
+            ),
+            (&["SET", "Q8", "BIN"], &["SET", "Q8", "BIN"], false),
+        ];
+        for (given, want, dropped) in cases {
+            assert_eq!(carries_quant_option(&args(given)), dropped, "{given:?}");
+            let got = without_quant_options(args(given));
+            assert_eq!(got, (args(want), dropped), "{given:?}");
+        }
     }
 
     /// Redis gives 0.5 when half the signs differ.

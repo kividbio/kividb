@@ -761,7 +761,8 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::VectorSet(arc) => {
             let inner = arc.read();
-            let legacy = !inner.quant_chosen && inner.quant == crate::vector::quant::Quant::F32;
+            // Any f32 set stays readable by 1.2; NOQUANT is lost on reload.
+            let legacy = inner.quant == crate::vector::quant::Quant::F32;
             w.write_all(&[if legacy {
                 TAG_VECTORSET
             } else {
@@ -2415,20 +2416,17 @@ fn read_image(
                         // Any bytes, as in Redis.
                         let name = crate::key_bytes::KeyBytes::from(read_bytes(&mut r)?);
 
+                        // Set when the element's length is not the set's dimension.
+                        let mut wrong_len = None;
                         let vector = match quant {
                             Quant::F32 => {
                                 let len = if legacy {
                                     let mut vlen_buf = [0u8; 4];
                                     r.read_exact(&mut vlen_buf)?;
                                     let len = u32::from_le_bytes(vlen_buf) as usize;
-                                    // VADD always kept this equal; kernels would truncate.
+                                    // Kernels would truncate it; read past it, then drop it.
                                     if len != dim {
-                                        return Err(io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            format!(
-                                                "a vector set's vector has {len} components, not {dim}"
-                                            ),
-                                        ));
+                                        wrong_len = Some(len);
                                     }
                                     len
                                 } else {
@@ -2472,6 +2470,15 @@ fn read_image(
                             None
                         };
 
+                        if let Some(len) = wrong_len {
+                            log_warn!(
+                                "Snapshot: element {:?} of vector set {:?} has {len} \
+                                 components, not {dim}: it is not loaded",
+                                String::from_utf8_lossy(name.as_bytes()),
+                                String::from_utf8_lossy(&key)
+                            );
+                            continue;
+                        }
                         vs.entries.insert(name, VSetEntry { vector, attrs });
                     }
 
@@ -2569,6 +2576,8 @@ fn read_image(
             keys_read += 1;
             let has_value = match &value {
                 KiviDBValue::HashEx(hash) => !hash.read().is_empty(),
+                // Every element was dropped as corrupt.
+                KiviDBValue::VectorSet(vs) => !vs.read().entries.is_empty(),
                 _ => true,
             };
             if keep && has_value && !past_databases {

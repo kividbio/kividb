@@ -297,6 +297,30 @@ fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(rest.try_into().ok()?))
 }
 
+// ── Vector set quantization in the log ───────────────────────────────────────
+
+/// Follows a `VADD` whose options were kept; 1.2 skips it as unknown.
+pub(crate) const VSET_QUANT_MARKER: &[u8] = b"*1\r\n$21\r\nKIVIDB.AOF-VSET-QUANT\r\n";
+
+/// The marker's one argument: clients cannot send it.
+const VSET_QUANT_MARKER_NAME: &[u8] = b"KIVIDB.AOF-VSET-QUANT";
+
+fn is_vset_quant_marker(cmd: &[Vec<u8>]) -> bool {
+    matches!(cmd, [name] if name.as_slice() == VSET_QUANT_MARKER_NAME)
+}
+
+/// Whether a stream payload ends with a `VADD` that needs the marker.
+pub(crate) fn needs_vset_quant_marker(payload: &[u8]) -> bool {
+    // Most payloads are no `VADD`: not parsed.
+    if !payload.windows(4).any(|w| w.eq_ignore_ascii_case(b"VADD")) {
+        return false;
+    }
+    parse_aof_commands(payload)
+        .0
+        .last()
+        .is_some_and(|cmd| crate::vector::quant::carries_quant_option(cmd))
+}
+
 // ── Written before it is acknowledged ────────────────────────────────────────
 //
 // A write was acknowledged as soon as its record was queued for the writer:
@@ -3135,7 +3159,12 @@ pub fn replay_aof(
 
     let _indexing = DeferIndexing::start();
 
-    for (cmd, live) in commands.into_iter().zip(live) {
+    let mut records = commands.into_iter().zip(live).peekable();
+    while let Some((cmd, live)) = records.next() {
+        // Read with the record before it, below.
+        if is_vset_quant_marker(&cmd) {
+            continue;
+        }
         // What is left of a transaction here is whole: its commands are
         // applied in order, and nothing runs beside a replay to see them
         // half done. Its `MULTI` and `EXEC` have nothing more to do.
@@ -3147,6 +3176,15 @@ pub fn replay_aof(
             continue;
         }
         stats.commands += 1;
+        // Without its marker, a `VADD` is 1.2's, which stored f32.
+        let marked = records
+            .peek()
+            .is_some_and(|(next, _)| is_vset_quant_marker(next));
+        let cmd = if marked {
+            cmd
+        } else {
+            crate::vector::quant::without_quant_options(cmd).0
+        };
         if env
             .apply_command(
                 cmd,
@@ -5089,6 +5127,310 @@ mod may_log_tests {
             &["EVAL_RO", "return 1", "0"],
         ] {
             assert!(!logs(read), "{read:?}");
+        }
+    }
+}
+
+/// A marker keeps its own `VADD`'s options; unmarked ones replay as 1.2.
+#[cfg(test)]
+mod vset_quant_marker_tests {
+    use super::*;
+    use crate::store::{Store, ValueRef};
+    use crate::vector::quant::{Quant, StoredVector};
+
+    fn record(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    fn vadd_e(key: &str, element: &str, option: &str) -> Vec<u8> {
+        let mut parts = vec!["VADD", key, "VALUES", "3", "3", "-4", "0.5", element];
+        if !option.is_empty() {
+            parts.push(option);
+        }
+        record(&parts)
+    }
+
+    fn vadd(key: &str, option: &str) -> Vec<u8> {
+        vadd_e(key, "e", option)
+    }
+
+    const M: &[u8] = VSET_QUANT_MARKER;
+
+    /// `log` replayed into a new store.
+    fn replay(log: &[u8]) -> (Store, ReplayStats) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        std::fs::write(&path, log).expect("write");
+        let store = crate::store::new_store(1);
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let stats = replay_aof(
+            &path.to_string_lossy(),
+            &store,
+            &crate::vector::new_index_store(),
+            &crate::vector::new_dict_store(),
+            &std::sync::Arc::new(crate::wait_table::WaitTable::new()),
+            &crate::store::new_ts_index(),
+            &std::sync::Arc::new(crate::config::Config::default()),
+            &compaction_tx,
+            &std::sync::Arc::new(crate::replication::ReplState::new_master()),
+            false,
+        )
+        .expect("replay");
+        (store, stats)
+    }
+
+    /// The set's quantization, whether it was asked for, and `element`'s storage.
+    fn set(store: &Store, key: &str, element: &str) -> Option<(Quant, bool, &'static str)> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.get(key.as_bytes()) {
+            Some(ValueRef::VectorSet(vs)) => {
+                let vs = vs.read();
+                let name = crate::key_bytes::KeyBytes::from(element.as_bytes());
+                let stored = match vs.entries.get(&name).map(|e| &e.vector) {
+                    Some(StoredVector::F32(_)) => "f32",
+                    Some(StoredVector::Q8 { .. }) => "int8",
+                    Some(StoredVector::Bin { .. }) => "bin",
+                    None => "none",
+                };
+                Some((vs.quant, vs.quant_chosen, stored))
+            }
+            _ => None,
+        }
+    }
+
+    fn quant(store: &Store, key: &str) -> Option<(Quant, bool)> {
+        set(store, key, "e").map(|(q, chosen, _)| (q, chosen))
+    }
+
+    fn delta(records: &[u8]) -> Vec<u8> {
+        let mut log = delta_header(7).to_vec();
+        log.extend_from_slice(records);
+        log
+    }
+
+    #[test]
+    fn the_marker_is_one_record_no_client_can_send() {
+        assert_eq!(
+            M,
+            crate::resp::write::encode_resp_command(&[VSET_QUANT_MARKER_NAME.to_vec()])
+        );
+        let (cmds, used) = parse_aof_commands(M);
+        assert_eq!(used, M.len());
+        assert!(is_vset_quant_marker(&cmds[0]));
+        assert!(!crate::commands::arity::is_known("KIVIDB.AOF-VSET-QUANT"));
+    }
+
+    #[test]
+    fn a_log_of_1_2_replays_as_1_2_stored_it() {
+        let records = [vadd("a", "Q8"), vadd("b", "BIN"), vadd("c", "NOQUANT")].concat();
+        for log in [records.clone(), delta(&records)] {
+            let (store, stats) = replay(&log);
+            assert_eq!((stats.errors, stats.commands), (0, 3));
+            for key in ["a", "b", "c"] {
+                assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_vadd_replays_as_asked() {
+        let records = [
+            vadd("a", "Q8"),
+            M.to_vec(),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(
+            (stats.errors, stats.commands),
+            (0, 3),
+            "a marker is no command"
+        );
+        assert_eq!(set(&store, "a", "e"), Some((Quant::Q8, true, "int8")));
+        assert_eq!(set(&store, "b", "e"), Some((Quant::Bin, true, "bin")));
+        assert_eq!(set(&store, "c", "e"), Some((Quant::F32, true, "f32")));
+    }
+
+    /// Only the record just before a marker is marked, and only a `VADD`.
+    #[test]
+    fn a_marker_never_reaches_past_its_own_record() {
+        let records = [
+            // At the start: nothing before it.
+            M.to_vec(),
+            vadd("first", "Q8"),
+            // 1.2's, then a 1.3 one after it.
+            vadd("old", "BIN"),
+            vadd("new", "BIN"),
+            M.to_vec(),
+            // After another command, or a `VADD` with no option.
+            record(&["SET", "s", "1"]),
+            M.to_vec(),
+            vadd("after_set", "Q8"),
+            vadd("plain", ""),
+            M.to_vec(),
+            vadd("after_plain", "Q8"),
+            // Two in a row mark one record.
+            vadd("twice", "Q8"),
+            M.to_vec(),
+            M.to_vec(),
+            vadd("after_twice", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for key in [
+            "first",
+            "old",
+            "after_set",
+            "plain",
+            "after_plain",
+            "after_twice",
+        ] {
+            assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+        }
+        assert_eq!(quant(&store, "new"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "twice"), Some((Quant::Q8, true)));
+    }
+
+    /// Cut while being written, the marker is dropped and its `VADD` replays as f32.
+    #[test]
+    fn a_torn_marker_leaves_its_vadd_f32() {
+        for option in ["Q8", "BIN", "NOQUANT"] {
+            for cut in [1, 10, M.len() - 1] {
+                let mut log = delta(&vadd("a", option));
+                let whole = log.len();
+                log.extend_from_slice(&M[..cut]);
+                let (store, stats) = replay(&log);
+                assert!(stats.truncated_tail, "{option} {cut}");
+                assert_eq!(stats.valid_len as usize, whole, "{option} {cut}");
+                assert_eq!(
+                    set(&store, "a", "e"),
+                    Some((Quant::F32, false, "f32")),
+                    "{option} {cut}"
+                );
+            }
+        }
+    }
+
+    /// A later `VADD` follows the set, marked or not: only creation reads the marker.
+    #[test]
+    fn a_later_vadd_follows_the_set() {
+        let records = [
+            vadd_e("q", "e", "Q8"),
+            M.to_vec(),
+            vadd_e("q", "unmarked", "Q8"),
+            vadd_e("q", "other", "BIN"),
+            vadd_e("q", "none", ""),
+            vadd_e("f", "e", "Q8"),
+            vadd_e("f", "marked", "Q8"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for element in ["e", "unmarked", "other", "none"] {
+            assert_eq!(
+                set(&store, "q", element),
+                Some((Quant::Q8, true, "int8")),
+                "{element}"
+            );
+        }
+        for element in ["e", "marked"] {
+            assert_eq!(
+                set(&store, "f", element),
+                Some((Quant::F32, false, "f32")),
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_inside_a_transaction() {
+        let records = [
+            record(&["MULTI"]),
+            vadd("a", "Q8"),
+            M.to_vec(),
+            record(&["SET", "s", "1"]),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            record(&["EXEC"]),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        assert_eq!(quant(&store, "a"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "b"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "c"), Some((Quant::F32, false)));
+
+        // Its `EXEC` never written: dropped whole, markers too.
+        let whole = delta(&vadd("x", "Q8"));
+        let mut log = whole.clone();
+        log.extend([record(&["MULTI"]), vadd("y", "Q8"), M.to_vec()].concat());
+        let (store, stats) = replay(&log);
+        assert!(stats.truncated_tail);
+        assert_eq!(stats.valid_len as usize, whole.len());
+        assert_eq!(quant(&store, "x"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "y"), None);
+    }
+
+    /// A flush skips the `VADD` before it; its marker reaches nothing further.
+    #[test]
+    fn a_flush_after_a_marked_vadd() {
+        let records = [
+            vadd("gone", "Q8"),
+            M.to_vec(),
+            record(&["FLUSHALL"]),
+            vadd("kept", "Q8"),
+            M.to_vec(),
+            vadd("unmarked", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(quant(&store, "gone"), None);
+        assert_eq!(quant(&store, "kept"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "unmarked"), Some((Quant::F32, false)));
+    }
+
+    /// The draft form, with an argument, marks nothing.
+    #[test]
+    fn a_marker_with_arguments_is_no_marker() {
+        let records = [
+            vadd("a", "Q8"),
+            record(&["KIVIDB.AOF-VSET-QUANT", "1"]),
+            vadd("b", "Q8"),
+        ]
+        .concat();
+        let (store, _) = replay(&delta(&records));
+        assert_eq!(quant(&store, "a"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "b"), Some((Quant::F32, false)));
+    }
+
+    /// What a backup increment adds after a stream payload.
+    #[test]
+    fn payloads_that_need_a_marker() {
+        let select = record(&["SELECT", "0"]);
+        for (payload, needs) in [
+            (vadd("a", "Q8"), true),
+            ([select.clone(), vadd("a", "bin")].concat(), true),
+            (vadd("a", "NOQUANT"), true),
+            (vadd("a", ""), false),
+            ([vadd("a", "Q8"), select.clone()].concat(), false),
+            (record(&["SET", "VADD", "Q8"]), false),
+            (record(&["VREM", "a", "Q8"]), false),
+        ] {
+            assert_eq!(
+                needs_vset_quant_marker(&payload),
+                needs,
+                "{}",
+                String::from_utf8_lossy(&payload)
+            );
         }
     }
 }

@@ -318,11 +318,6 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         i += 2;
     }
 
-    // Copy an older master, which stored f32 whatever was asked.
-    let relaxed = std::sync::atomic::Ordering::Relaxed;
-    if ctx.apply_replication && !ctx.repl_state.master_keeps_vset_quant.load(relaxed) {
-        asked_quant = None;
-    }
     match add_to_vset(ctx, &key, element, vec, attrs, parsed_metric, asked_quant) {
         Ok(is_new) => Some(resp_integer(is_new as i64)),
         Err(e) => Some(e),

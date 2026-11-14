@@ -98,12 +98,15 @@ From `cargo test --release --lib vector::quant::tests::kernel_timings -- --ignor
 
 - **Memory:** NOQUANT takes the same bytes as master. Q8 takes 3.6-3.8x less than f32 at 768-1536 dimensions
   (2.5-2.7x at 128, where per-element overhead weighs more). BIN takes 15-22x less.
-- **Q8 recall:** KiviDB's Q8 recall@10 equals Redis's Q8 `TRUTH` recall at every point (0.956-0.975), as the stored
-  bytes are Redis's.
+- **Q8 recall:** KiviDB's Q8 recall@10 equals Redis's Q8 `TRUTH` recall at every point (0.956-0.975), as both
+  quantize with the same formulas. Stored values can differ from Redis's in the last bit, since KiviDB computes the
+  norm in f64 and Redis in f32; over 54,000 `VSIM` scores against Redis 8.10.3, the largest difference was 5.6e-7.
 - **BIN recall:** 0.10-0.23 on this data, within 0.004 of Redis's. Sign bits keep too little of these vectors for
   top-10 search. BIN distances tie often, and the two order ties differently (KiviDB by name, Redis by insertion).
 - **Q8 search:** VSIM is 1.6-7.7x faster than f32 (5.7x at 128-d/50K against the re-run master). The int8 kernel
-  is 4-9x faster, but at 50K elements the scan is bound by walking the hash table, not by arithmetic.
+  is 4-9x faster, but at 50K elements the scan is bound by memory traffic, not by arithmetic: p50 grows with
+  dimension (0.94 / 6.42 / 11.07 ms at 128 / 768 / 1536), a steady 6-7 GB/s of int8 data read from one allocation
+  per element, of which the kernel takes 10-26%.
 - **VADD:** within run-to-run noise of master. Quantizing costs up to 3.4 µs, against ~100 µs per call.
 - **Against Redis:** the gap in VSIM q/s at 50K (Q8 455 vs HNSW 11,286 at 1536-d) is the search algorithm,
   not the storage. Against Redis's exact scan of Q8, KiviDB is faster at 10K (1.3-2.2x) and 0.68-1.14x at 50K.

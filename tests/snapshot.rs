@@ -766,12 +766,13 @@ fn first_tag(vs: VectorSetInner) -> u8 {
     out[0]
 }
 
-/// Default sets keep the 1.2 tag; chosen ones use a tag 1.2 rejects.
+/// f32 sets, NOQUANT too, keep 1.2's tag; Q8 and BIN get a new one.
 #[test]
 fn kdb_vectorset_tags() {
     use kividb::vector::quant::Quant;
     assert_eq!(first_tag(quantized_set(Quant::F32, false)), 9);
-    for quant in [Quant::F32, Quant::Q8, Quant::Bin] {
+    assert_eq!(first_tag(quantized_set(Quant::F32, true)), 9);
+    for quant in [Quant::Q8, Quant::Bin] {
         assert_eq!(first_tag(quantized_set(quant, true)), 16, "{quant:?}");
     }
 }
@@ -800,6 +801,8 @@ fn kdb_vectorset_quantized_roundtrip() {
             panic!("wrong type")
         };
         let inner = vs.read();
+        // NOQUANT is written as a plain f32 set, and read back as one.
+        let chosen = chosen && quant != Quant::F32;
         assert_eq!(
             (inner.quant, inner.quant_chosen, inner.dim),
             (quant, chosen, 70)
@@ -847,17 +850,21 @@ fn kdb_vectorset_corrupt_is_refused() {
     assert!(kividb::snapshot::load_snapshot_bytes(&good).is_ok());
 }
 
-/// Kernels truncate mismatched vectors, so a wrong length must fail the load.
+/// Kernels truncate mismatched vectors: such an element is dropped, the rest load.
 #[test]
-fn kdb_vectorset_legacy_wrong_length_is_refused() {
+fn kdb_vectorset_legacy_wrong_length_is_skipped() {
+    let names = ["a", "b", "c", "d"];
+    let vector = |n: usize| vec![n as f32 + 1.0, -2.0, 0.5];
     let mut set = VectorSetInner::new(3);
-    set.entries.insert(
-        "a".into(),
-        VSetEntry {
-            vector: vec![1.0, 2.0, 3.0].into(),
-            attrs: None,
-        },
-    );
+    for (n, name) in names.iter().enumerate() {
+        set.entries.insert(
+            (*name).into(),
+            VSetEntry {
+                vector: vector(n).into(),
+                attrs: Some(format!("{{\"n\":{n}}}").into()),
+            },
+        );
+    }
     let mut map = HashMap::new();
     map.insert(
         "v".to_string(),
@@ -867,29 +874,69 @@ fn kdb_vectorset_legacy_wrong_length_is_refused() {
     write_snapshot(&path, &[map], None).unwrap();
     let good = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).ok();
-    // tag 9, dim 3, cosine, one entry "a", then its length 3.
-    let layout = [9u8, 3, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, b'a', 3, 0, 0, 0];
-    let at = good
-        .windows(layout.len())
-        .position(|w| w == layout)
-        .expect("the legacy set")
-        + layout.len()
-        - 4;
-    // Self-consistent streams, so only the length check can refuse them.
-    let mut short = good.clone();
-    short[at] = 2;
-    short.drain(at + 4 + 8..at + 4 + 12);
-    let mut long = good.clone();
-    long[at] = 4;
-    long.splice(at + 4 + 12..at + 4 + 12, 4.0f32.to_le_bytes());
-    for (what, image) in [("short", short), ("long", long)] {
-        let err = kividb::snapshot::load_snapshot_bytes(&image)
-            .err()
-            .unwrap_or_else(|| panic!("{what} vector was loaded"));
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{what}: {err}");
+    // Where an element's length is: after its 1-byte name.
+    let length_at = |image: &[u8], name: u8| {
+        let layout = [1u8, 0, 0, 0, name, 3, 0, 0, 0];
+        image
+            .windows(layout.len())
+            .position(|w| w == layout)
+            .expect("the element")
+            + 5
+    };
+    // Self-consistent streams: the length and the floats agree.
+    let shorten = |image: &mut Vec<u8>, name: u8| {
+        let at = length_at(image, name);
+        image[at] = 2;
+        image.drain(at + 4 + 8..at + 4 + 12);
+    };
+    let lengthen = |image: &mut Vec<u8>, name: u8| {
+        let at = length_at(image, name);
+        image[at] = 4;
+        image.splice(at + 4 + 12..at + 4 + 12, 4.0f32.to_le_bytes());
+    };
+    let elements = |image: &[u8]| {
+        let mut loaded = kividb::snapshot::load_snapshot_bytes(image).expect("the image loads");
+        let Some(KiviDBValue::VectorSet(vs)) = texted(loaded.dbs.remove(0)).remove("v") else {
+            return None;
+        };
+        let inner = vs.read();
+        assert_eq!(inner.dim, 3);
+        let mut got: Vec<_> = inner
+            .entries
+            .iter()
+            .map(|(k, e)| {
+                let name = String::from_utf8(k.as_bytes().to_vec()).unwrap();
+                let v = e.vector.as_f32().unwrap().to_vec();
+                (name, v, e.attrs.as_deref().map(str::to_string))
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(got)
+    };
+    let kept = |list: &[usize]| -> Vec<_> {
+        list.iter()
+            .map(|&n| {
+                let attrs = format!("{{\"n\":{n}}}");
+                (names[n].to_string(), vector(n), Some(attrs))
+            })
+            .collect()
+    };
+
+    assert_eq!(elements(&good), Some(kept(&[0, 1, 2, 3])));
+    // One short, one long: both dropped, their neighbours read in step.
+    let mut two = good.clone();
+    shorten(&mut two, b'b');
+    lengthen(&mut two, b'd');
+    assert_eq!(elements(&two), Some(kept(&[0, 2])));
+    // Every element dropped: no empty set is left behind.
+    let mut all = good.clone();
+    for name in *b"ac" {
+        shorten(&mut all, name);
     }
-    let loaded = kividb::snapshot::load_snapshot_bytes(&good).unwrap();
-    assert_eq!(loaded.dbs[0].len(), 1);
+    for name in *b"bd" {
+        lengthen(&mut all, name);
+    }
+    assert_eq!(elements(&all), None);
 }
 
 #[test]

@@ -37,6 +37,8 @@ pub async fn handle_replica_connection_uring(
     listening_port: Option<u16>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
+    // It sent `REPLCONF capa vset-quant`.
+    vset_quant_announced: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
@@ -114,9 +116,10 @@ pub async fn handle_replica_connection_uring(
     };
 
     // ── 3. `+CONTINUE`, or `+FULLRESYNC` (omitted for legacy `SYNC`) ──────
+    let word = repl_state.vset_quant_word(vset_quant_announced);
     let greeting = match &full_sync {
-        None => Some(format!("+CONTINUE {}\r\n", repl_state.repl_id())),
-        Some(sync) if !legacy_sync => Some(sync.announcement(&repl_state.repl_id())),
+        None => Some(format!("+CONTINUE {}{word}\r\n", repl_state.repl_id())),
+        Some(sync) if !legacy_sync => Some(sync.announcement(&repl_state.repl_id(), word)),
         Some(_) => None,
     };
     if let Some(greeting) = greeting {
@@ -1614,8 +1617,13 @@ pub async fn handle_client(
             }
             if cmd_name == "PSYNC"
                 && !tx.active
-                && let Some(offer) =
-                    repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
+                && let Some(offer) = repl_state.psync_offer(
+                    &cluster_state,
+                    &client_registry,
+                    client_id,
+                    &cmd,
+                    &store,
+                )
             {
                 out_buf.extend_from_slice(&offer);
                 parse_offset += consumed;
@@ -2886,6 +2894,9 @@ pub async fn handle_client(
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                let vset_quant_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_vset_quant == Some(true));
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595). `CLIENT KILL` shuts its socket, as
                 // any client's, which ends the link.
@@ -2902,6 +2913,7 @@ pub async fn handle_client(
                     legacy_sync,
                     listening_port,
                     psync,
+                    vset_quant_announced,
                 )
                 .await?;
 
