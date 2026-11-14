@@ -24,6 +24,7 @@ mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+mod give_back;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
@@ -351,6 +352,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
     compaction::configure(&config);
+    give_back::set_enabled(config.allocator_give_back);
     snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
     snapshot::SNAPSHOT_CLUSTER.store(config.cluster_enabled, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
@@ -821,6 +823,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     if config.cluster_enabled {
         log_info!(
             "Cluster: Node ID        : {}",
@@ -1651,6 +1654,7 @@ async fn async_main_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();

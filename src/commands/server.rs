@@ -542,6 +542,16 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR CONFIG SET failed (possibly related to argument 'activedefrag') - argument must be 'yes' or 'no'",
                 )),
             },
+            // Giving free memory back once idle (#753): see src/give_back.rs.
+            "allocator-give-back" => match value.to_ascii_lowercase().as_str() {
+                "yes" | "no" => {
+                    crate::give_back::set_enabled(value.eq_ignore_ascii_case("yes"));
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'allocator-give-back') - argument must be 'yes' or 'no'",
+                )),
+            },
             "active-defrag-ignore-bytes" => match memory_size(value) {
                 Some(bytes) => {
                     crate::compaction::set_ignore_bytes(bytes as u64);
@@ -2049,6 +2059,15 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "activedefrag",
             if crate::compaction::enabled() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        (
+            "allocator-give-back",
+            if crate::give_back::enabled() {
                 "yes"
             } else {
                 "no"
@@ -4812,6 +4831,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let fill = crate::value_slab::fill();
                 out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
                 out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
+                // Times freed memory was given back to the system after a
+                // large fall in what is allocated (#753).
+                out.push_str(&format!(
+                    "allocator_trims:{}\r\n",
+                    crate::give_back::trims()
+                ));
+                // ... and times one was put off while the server was busy.
+                out.push_str(&format!(
+                    "allocator_trims_skipped_busy:{}\r\n",
+                    crate::give_back::skipped_busy()
+                ));
                 out.push_str(&format!(
                     "used_memory_rss_human:{}\r\n",
                     crate::commands::memory::human_bytes_pub(rss)

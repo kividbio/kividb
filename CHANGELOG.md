@@ -121,6 +121,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Memory freed by a large delete goes back to the system once the server
+  is idle (#753).** Deleting a hash of 3M fields left `used_memory` at
+  1.4 MB but RSS at 200 MiB, and deleting 1M fields with `HDEL` left
+  78 MiB: the free pages stayed in the system allocator until a `MEMORY
+  PURGE`. A background thread now gives them back once what is allocated
+  has fallen by 32 MiB and by an eighth, and the server has served fewer
+  than 100 commands in the last second; RSS falls to 17 MiB in both cases.
+  A busy server is not trimmed, since a trim can hold up its threads for
+  tens of milliseconds: `MEMORY PURGE` gives the memory back on demand.
+  `INFO memory` has `allocator_trims` and `allocator_trims_skipped_busy`;
+  `allocator-give-back no` turns it off. Linux builds on glibc only.
+
 - **An atomic slot import that does not complete keeps the keys the node
   held of those slots before it (#745).** A canceled, failed or timed-out
   `CLUSTER MIGRATION IMPORT` deleted every key of its slots on the

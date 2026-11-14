@@ -26,6 +26,7 @@ pub mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod give_back;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod latency;
@@ -94,6 +95,7 @@ pub fn run_for_test(config: config::Config) {
     }
     crate::eviction::configure(&cfg);
     crate::compaction::configure(&cfg);
+    crate::give_back::set_enabled(cfg.allocator_give_back);
     // Only ever raised here, as the servers of one test process share it.
     crate::snapshot::SNAPSHOT_DATABASES
         .fetch_max(cfg.databases, std::sync::atomic::Ordering::Relaxed);
@@ -158,6 +160,7 @@ async fn server_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
