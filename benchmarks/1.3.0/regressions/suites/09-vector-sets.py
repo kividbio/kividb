@@ -20,9 +20,11 @@ quantization with its HNSW search (the PR's "with its HNSW graph" memory and
 Gates: bytes a vector within 5 % and keeping 60 % of the gain; recall@10 not
 more than 2 % under recorded (deterministic: any drop is a change in the
 quantizer); VSIM q/s and VADD/s at 10K within 25 % (#730 saw repeats move by
-up to 15 %). The Q8 q/s gain #730 measured on an Apple M3 Pro (7.7x at
-768-d/10K) does not show on this x86-64 VM (see README.md), so there is no
-gain to keep and no ratio gate on it.
+up to 15 %). Q8 VSIM q/s at 10K also keeps 60 % of its gain over v1.2.2
+(which searches stored f32): until #793 the int8 kernel was an SSE2 loop on
+x86-64 and Q8 was slower than f32 here; with the run-time AVX-512BW / AVX2
+kernels it is about 3.8x f32 on this VM (#730 measured 7.7x on an Apple M3
+Pro). The ratio is measured within one run, so it holds however fast the VM.
 """
 import json
 import os
@@ -68,7 +70,9 @@ def run(ctx):
         ctx.emit("vsim_qps", row["vsim_qps"], "q/s", "higher", gate=info())
         ctx.emit("vadd_per_s", row["vadd_per_s"], "VADD/s", "higher", gate=info())
     else:
-        ctx.emit("vsim_qps", row["vsim_qps"], "q/s", "higher", gate=rel(25))
+        # Q8 against v1.2.2's f32: the kernel's gain (#793).
+        qps_gate = [rel(25), KEEP_IMPROVEMENT] if ctx.config.name == "q8_768_10k" else rel(25)
+        ctx.emit("vsim_qps", row["vsim_qps"], "q/s", "higher", gate=qps_gate)
         ctx.emit("vsim_p50_ms", row["vsim_p50_ms"], "ms", "lower", gate=info())
         ctx.emit("vadd_per_s", row["vadd_per_s"], "VADD/s", "higher", gate=rel(25))
 

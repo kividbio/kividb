@@ -166,6 +166,7 @@ pub enum QuantError {
 }
 
 /// In f64: the same bits on every CPU, without f32 overflow or underflow.
+#[inline(always)]
 fn norm_of(v: &[f32]) -> f64 {
     v.iter()
         .map(|&x| (x as f64) * (x as f64))
@@ -174,6 +175,7 @@ fn norm_of(v: &[f32]) -> f64 {
 }
 
 /// Normalizes in place; a zero vector gets norm 1, like Redis.
+#[inline(always)]
 fn to_unit(v: &mut [f32]) -> Result<f32, QuantError> {
     if v.iter().any(|x| !x.is_finite()) {
         return Err(QuantError::NotFinite);
@@ -195,6 +197,7 @@ fn to_unit(v: &mut [f32]) -> Result<f32, QuantError> {
 }
 
 /// Redis's formula and rounding; the f64 norm can change the last bit.
+#[inline(always)]
 fn q8_of_unit(unit: &[f32]) -> (Box<[i8]>, f32) {
     let max_abs = unit.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     if max_abs == 0.0 {
@@ -209,6 +212,7 @@ fn q8_of_unit(unit: &[f32]) -> (Box<[i8]>, f32) {
 }
 
 /// Bit set only for values above zero, so 0 and -0 read as -1.
+#[inline(always)]
 fn bin_of(v: &[f32]) -> Box<[u64]> {
     let mut bits = vec![0u64; bin_words(v.len())].into_boxed_slice();
     for (i, &x) in v.iter().enumerate() {
@@ -234,7 +238,46 @@ impl StoredVector {
     }
 
     /// Takes ownership to reuse the allocation instead of copying.
-    pub fn quantize(quant: Quant, mut v: Vec<f32>) -> Result<StoredVector, QuantError> {
+    ///
+    /// On x86_64 with AVX2 the same code runs compiled for AVX2 (#793): the
+    /// default target has no SSE4.1, so each `round` was a call into libm,
+    /// and the loops ran a lane at a time. Rust does not fuse or reorder
+    /// float operations for a target feature, so the result is the same
+    /// bits; a test compares the two.
+    pub fn quantize(quant: Quant, v: Vec<f32>) -> Result<StoredVector, QuantError> {
+        Self::quantize_at(super::simd::int_level(), quant, v)
+    }
+
+    /// [`Self::quantize`] compiled for the given level's instruction set.
+    /// Panics if this machine cannot run `level`.
+    pub(crate) fn quantize_at(
+        level: super::simd::IntLevel,
+        quant: Quant,
+        v: Vec<f32>,
+    ) -> Result<StoredVector, QuantError> {
+        use super::simd::IntLevel;
+        match level {
+            IntLevel::Portable => Self::quantize_portable(quant, v),
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: both levels need AVX2, which `has_int` saw on this CPU.
+            IntLevel::Avx2 | IntLevel::Avx512 if super::simd::has_int(level) => unsafe {
+                Self::quantize_avx2(quant, v)
+            },
+            #[allow(unreachable_patterns)]
+            other => panic!("this CPU cannot run {other:?} quantization"),
+        }
+    }
+
+    /// # Safety
+    /// The CPU has AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_avx2(quant: Quant, v: Vec<f32>) -> Result<StoredVector, QuantError> {
+        Self::quantize_portable(quant, v)
+    }
+
+    #[inline(always)]
+    fn quantize_portable(quant: Quant, mut v: Vec<f32>) -> Result<StoredVector, QuantError> {
         match quant {
             Quant::F32 => Ok(StoredVector::F32(v.into_boxed_slice())),
             Quant::Q8 => {
@@ -357,27 +400,16 @@ fn from_unit_dot(metric: &DistanceMetric, dot: f32, na: f32, nb: f32) -> f32 {
     }
 }
 
-/// Chunked so the i32 accumulator never overflows; the loop auto-vectorizes.
+/// Exact int8 dot product: AVX-512BW or AVX2 picked at run time on x86_64.
 #[inline]
 pub fn dot_i8(a: &[i8], b: &[i8]) -> i64 {
-    const PIECE: usize = 1 << 16;
-    let n = a.len().min(b.len());
-    let (a, b) = (&a[..n], &b[..n]);
-    let mut total = 0i64;
-    for (pa, pb) in a.chunks(PIECE).zip(b.chunks(PIECE)) {
-        let mut sum = 0i32;
-        for (x, y) in pa.iter().zip(pb) {
-            sum += *x as i32 * *y as i32;
-        }
-        total += sum as i64;
-    }
-    total
+    super::simd::dot_i8(a, b)
 }
 
-/// Count of components with opposite signs.
+/// Count of components with opposite signs: POPCNT when the CPU has it.
 #[inline]
 pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
-    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+    super::simd::hamming(a, b)
 }
 
 #[cfg(test)]
@@ -677,22 +709,27 @@ mod tests {
                 f();
             }
             let ns = t.elapsed().as_nanos() as f64 / rounds as f64;
-            println!("{dim:>5} {what:<16} {ns:>9.1} ns");
+            println!("{dim:>5} {what:<24} {ns:>9.1} ns");
         };
         for dim in [128usize, 768, 1536] {
             let a: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin()).collect();
             let b: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.11).cos()).collect();
             let n = 200_000;
             for quant in [Quant::F32, Quant::Q8, Quant::Bin] {
-                let v = a.clone();
-                time(
-                    &format!("quantize {}", quant.name()),
-                    dim,
-                    n,
-                    Box::new(move || {
-                        black_box(StoredVector::quantize(quant, black_box(v.clone())).unwrap());
-                    }),
-                );
+                for level in crate::vector::simd::available_int() {
+                    let v = a.clone();
+                    time(
+                        &format!("quantize {} {level:?}", quant.name()),
+                        dim,
+                        n,
+                        Box::new(move || {
+                            black_box(
+                                StoredVector::quantize_at(level, quant, black_box(v.clone()))
+                                    .unwrap(),
+                            );
+                        }),
+                    );
+                }
                 let (x, y) = (q(quant, &a), q(quant, &b));
                 time(
                     &format!("distance {}", quant.name()),
@@ -725,6 +762,127 @@ mod tests {
     #[test]
     fn entry_size() {
         assert_eq!(std::mem::size_of::<crate::types::VSetEntry>(), 48);
+    }
+
+    /// Quantizing compiled for AVX2 (#793) keeps every bit: random vectors
+    /// of many lengths and scales, ties at .5 that `round` takes away from
+    /// zero, zeros, signed zeros, subnormals and huge values.
+    #[test]
+    fn quantize_is_the_same_at_every_level() {
+        use crate::vector::simd::{IntLevel, available_int};
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        let mut cases: Vec<Vec<f32>> = Vec::new();
+        for dim in [
+            1usize, 2, 3, 7, 8, 15, 16, 17, 31, 33, 64, 65, 128, 768, 1536, 4096,
+        ] {
+            for scale in [1e-30f32, 1e-3, 1.0, 10.0, 1e20] {
+                cases.push((0..dim).map(|_| next() * scale).collect());
+            }
+        }
+        // Components that land on .5 steps, and the edges `to_unit` handles.
+        cases.push(vec![
+            1.0,
+            0.5 / 127.0,
+            1.5 / 127.0,
+            -2.5 / 127.0,
+            63.5 / 127.0,
+        ]);
+        cases.push(vec![0.0; 9]);
+        cases.push(vec![-0.0, 0.0, -0.0]);
+        cases.push(vec![1e-45, -1e-45, 0.0, 2e-45]);
+        cases.push(vec![1e30, -1e30, 3e29]);
+        cases.push(vec![f32::NAN, 1.0]);
+        cases.push(vec![f32::INFINITY, 1.0]);
+        cases.push(vec![f32::MAX, f32::MAX]);
+        for v in &cases {
+            for quant in [Quant::Q8, Quant::Bin] {
+                let want = StoredVector::quantize_at(IntLevel::Portable, quant, v.clone());
+                for level in available_int() {
+                    let got = StoredVector::quantize_at(level, quant, v.clone());
+                    // Compare bits, so that -0 and NaN count too.
+                    let bits = |r: &Result<StoredVector, QuantError>| match r {
+                        Ok(StoredVector::Q8 {
+                            norm,
+                            range,
+                            values,
+                        }) => Ok((norm.to_bits(), range.to_bits(), values.to_vec(), vec![])),
+                        Ok(StoredVector::Bin { norm, bits }) => {
+                            Ok((norm.to_bits(), 0, vec![], bits.to_vec()))
+                        }
+                        Ok(StoredVector::F32(_)) => unreachable!(),
+                        Err(e) => Err(format!("{e:?}")),
+                    };
+                    assert_eq!(bits(&got), bits(&want), "{level:?} {quant:?} {v:?}");
+                }
+            }
+        }
+    }
+
+    /// Distances through the dispatched kernels are the portable ones, bit
+    /// for bit, for every metric.
+    #[test]
+    fn q8_and_bin_distances_are_the_portable_ones() {
+        use crate::vector::simd::{IntLevel, dot_i8_at, hamming_at};
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        for dim in [3usize, 100, 768, 1536, 4096] {
+            for _ in 0..10 {
+                let a: Vec<f32> = (0..dim).map(|_| next()).collect();
+                let b: Vec<f32> = (0..dim).map(|_| next()).collect();
+                for metric in [
+                    DistanceMetric::Cosine,
+                    DistanceMetric::L2,
+                    DistanceMetric::InnerProduct,
+                ] {
+                    let (qa, qb) = (q(Quant::Q8, &a), q(Quant::Q8, &b));
+                    let (
+                        StoredVector::Q8 {
+                            norm: na,
+                            range: ra,
+                            values: va,
+                        },
+                        StoredVector::Q8 {
+                            norm: nb,
+                            range: rb,
+                            values: vb,
+                        },
+                    ) = (&qa, &qb)
+                    else {
+                        panic!()
+                    };
+                    let dot =
+                        dot_i8_at(IntLevel::Portable, va, vb) as f32 * (ra / 127.0) * (rb / 127.0);
+                    let want = from_unit_dot(&metric, dot.clamp(-1.0, 1.0), *na, *nb);
+                    let got = qa.distance(&qb, &metric, dim);
+                    assert_eq!(got.to_bits(), want.to_bits(), "q8 {dim} {metric:?}");
+
+                    let (ba, bb) = (q(Quant::Bin, &a), q(Quant::Bin, &b));
+                    let (
+                        StoredVector::Bin { norm: na, bits: xa },
+                        StoredVector::Bin { norm: nb, bits: xb },
+                    ) = (&ba, &bb)
+                    else {
+                        panic!()
+                    };
+                    let opposite = hamming_at(IntLevel::Portable, xa, xb) as f32;
+                    let dot = 1.0 - 2.0 * opposite / dim as f32;
+                    let want = from_unit_dot(&metric, dot, *na, *nb);
+                    let got = ba.distance(&bb, &metric, dim);
+                    assert_eq!(got.to_bits(), want.to_bits(), "bin {dim} {metric:?}");
+                }
+            }
+        }
     }
 
     #[test]
