@@ -110,6 +110,11 @@ other files:
 - `appendfsync no` is taken as `everysec`; `always` and `everysec` do what
   they do in Redis.
 - The config file is read strictly: an unknown directive stops the server.
+- Without `--configfile`, KiviDB still reads `/etc/kividb/kividb.conf` if it
+  exists, where Redis reads a config file only when one is named. Such a
+  server logs a deprecation warning at startup and refuses `CONFIG REWRITE`;
+  start it with `--configfile` to rewrite the file. A future minor release
+  will read only a named config file.
 
 **Durability**
 - With the AOF on, a write is acknowledged once its record is in the file,
