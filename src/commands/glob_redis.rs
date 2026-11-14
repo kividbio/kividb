@@ -80,8 +80,10 @@ impl Glob {
         }
     }
 
-    /// Whether `text` matches: what [`matches`] says.
-    #[inline]
+    /// Whether `text` matches: what [`matches`] says. Inlined into the
+    /// scans' loops: called for every key, a call cost as much as the
+    /// comparison (#789).
+    #[inline(always)]
     pub(crate) fn matches(&self, text: &[u8]) -> bool {
         // An empty text is the one place the matcher's trailing `*`s are
         // not simply "anything": it says what it says.
@@ -91,17 +93,31 @@ impl Glob {
         match &self.shape {
             Shape::All => true,
             Shape::Exact(bytes) => text == &bytes[..],
-            Shape::Prefix(front) => text.starts_with(front),
-            Shape::Suffix(back) => text.ends_with(back),
+            Shape::Prefix(front) => starts_with(text, front),
+            Shape::Suffix(back) => ends_with(text, back),
             Shape::Both(front, back) => {
                 text.len() >= front.len() + back.len()
-                    && text.starts_with(front)
-                    && text.ends_with(back)
+                    && starts_with(text, front)
+                    && ends_with(text, back)
             }
             Shape::Contains(finder) => finder.find(text).is_some(),
             Shape::General => matches(&self.pattern, text),
         }
     }
+}
+
+/// `text.starts_with(front)`, told by the first byte when it differs: most
+/// keys of a scan do not match, and most differ there, without a call to
+/// `memcmp` for each (#789).
+#[inline(always)]
+fn starts_with(text: &[u8], front: &[u8]) -> bool {
+    text.first() == front.first() && text.starts_with(front)
+}
+
+/// `text.ends_with(back)`, told by the last byte when it differs.
+#[inline(always)]
+fn ends_with(text: &[u8], back: &[u8]) -> bool {
+    text.last() == back.last() && text.ends_with(back)
 }
 
 /// The plain bytes of `pattern` between its `*`s (a run of them as one),
