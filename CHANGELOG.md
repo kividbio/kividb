@@ -219,6 +219,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   counted from then).
   `FT.SPELLCHECK` sends `TERM` (RESP2) and `results` (RESP3) as simple
   strings, as RediSearch does; they were bulk strings.
+- **`ARLASTITEMS` and the search and vector replies follow the protocol of
+  the client or the script (#439).** `ARLASTITEMS` sent `$-1` for an empty
+  slot to a RESP3 client; it is now `_`, as in Redis 8.10. `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.CURSOR`, `FT.CONFIG GET`, `FT.SPELLCHECK`, `FT.INFO`,
+  `FT.PROFILE`, `FT.HYBRID`, `VEMB` and `ARINFO` took the connection's
+  protocol, so inside a script they ignored `redis.setresp`. They now follow
+  it, as the other commands do: RESP2 shapes by default, RESP3 ones after
+  `redis.setresp(3)`. A script can now read a RESP3 map or set whose key is
+  a status reply, as `FT.SPELLCHECK`'s `results` is (#797): as in Redis, the
+  key is the table `{ok='results'}`. It was an error ("map key must be
+  string or integer").
 
 ### Fixed
 
