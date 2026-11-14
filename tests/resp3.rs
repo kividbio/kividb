@@ -200,6 +200,103 @@ macro_rules! assert_wire {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Geo — coordinates and distances, as Redis 8.10.2 writes them (#701)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn geo_points(c: &mut RawConn) {
+    c.raw(&[
+        "GEOADD",
+        "g",
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania",
+    ]);
+}
+
+#[test]
+fn geo_coordinates_have_the_fewest_digits_that_read_back_the_same() {
+    let port = free_port();
+    start_server(port);
+
+    let mut c2 = RawConn::connect(port);
+    geo_points(&mut c2);
+    assert_wire!(
+        c2.raw(&["GEOPOS", "g", "Palermo"]),
+        b"*1\r\n*2\r\n$18\r\n13.361389338970184\r\n$16\r\n38.1155563954963\r\n",
+        "RESP2 GEOPOS"
+    );
+
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+    assert_wire!(
+        c3.raw(&["GEOPOS", "g", "Palermo"]),
+        b"*1\r\n*2\r\n,13.361389338970184\r\n,38.1155563954963\r\n",
+        "RESP3 GEOPOS"
+    );
+}
+
+#[test]
+fn geo_distances_are_bulk_strings_under_both_protocols() {
+    let port = free_port();
+    start_server(port);
+    let search = [
+        "GEOSEARCH",
+        "g",
+        "FROMLONLAT",
+        "15",
+        "37",
+        "BYRADIUS",
+        "200",
+        "km",
+        "WITHCOORD",
+        "WITHDIST",
+        "ASC",
+    ];
+
+    let mut c2 = RawConn::connect(port);
+    geo_points(&mut c2);
+    assert_wire!(
+        c2.raw(&["GEODIST", "g", "Palermo", "Catania"]),
+        b"$11\r\n166274.1516\r\n",
+        "RESP2 GEODIST"
+    );
+    assert_wire!(
+        c2.raw(&search),
+        b"*2\r\n\
+          *3\r\n$7\r\nCatania\r\n$7\r\n56.4413\r\n\
+          *2\r\n$18\r\n15.087267458438873\r\n$17\r\n37.50266842333162\r\n\
+          *3\r\n$7\r\nPalermo\r\n$8\r\n190.4424\r\n\
+          *2\r\n$18\r\n13.361389338970184\r\n$16\r\n38.1155563954963\r\n",
+        "RESP2 GEOSEARCH WITHCOORD WITHDIST"
+    );
+
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+    assert_wire!(
+        c3.raw(&["GEODIST", "g", "Palermo", "Catania"]),
+        b"$11\r\n166274.1516\r\n",
+        "RESP3 GEODIST"
+    );
+    assert_wire!(
+        c3.raw(&["GEODIST", "g", "Palermo", "Palermo"]),
+        b"$6\r\n0.0000\r\n",
+        "RESP3 GEODIST of a member to itself"
+    );
+    assert_wire!(
+        c3.raw(&search),
+        b"*2\r\n\
+          *3\r\n$7\r\nCatania\r\n$7\r\n56.4413\r\n\
+          *2\r\n,15.087267458438873\r\n,37.50266842333162\r\n\
+          *3\r\n$7\r\nPalermo\r\n$8\r\n190.4424\r\n\
+          *2\r\n,13.361389338970184\r\n,38.1155563954963\r\n",
+        "RESP3 GEOSEARCH WITHCOORD WITHDIST"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Sorted sets — doubles and WITHSCORES nesting
 // ═══════════════════════════════════════════════════════════════════════════
 

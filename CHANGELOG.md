@@ -179,6 +179,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Geo coordinates and distances are written as Redis 8.10 writes them
+  (#701).** Under RESP2, `GEOPOS` and `WITHCOORD` give the fewest digits
+  that read back as the same coordinate (`13.361389338970184`), not 17
+  decimals (`13.36138933897018433`). Under RESP3, `GEODIST` and `WITHDIST`
+  give a bulk string (`166274.1516`), as under RESP2, not a double. A client
+  that parses the numbers gets the same values; one that compares the text,
+  or reads a RESP3 distance as a double, sees the change.
+
 - **`MEMORY USAGE` of a stream is what its entries take, and reads
   differently (#683).** Stream entries are now packed into blocks, and
   `MEMORY USAGE` counts those blocks exactly instead of estimating from a
