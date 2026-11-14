@@ -822,3 +822,144 @@ fn memory_usage_and_used_memory_follow_the_entries() {
     let held = used(&mut c) - before;
     assert!(held < 8_000, "{held} B held after the stream went");
 }
+
+#[test]
+fn idempotent_duplicates_are_counted_again_by_an_aof_replay() {
+    // Redis 8.10 propagates an `XADD … IDMP` that its producer had already
+    // delivered, so that a replay of the AOF counts it in `iids-duplicates`
+    // as the first run did. It used to be propagated as nothing, and the
+    // count started over after a restart (#655). The entries and the IDs
+    // remembered come back as they were.
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    let first = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+    for _ in 0..2 {
+        let retry = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+        assert_eq!(retry, first);
+    }
+    let auto = c.ok(&["XADD", "s", "IDMPAUTO", "p2", "*", "f", "w"]);
+    let retry = c.ok(&["XADD", "s", "IDMPAUTO", "p2", "*", "f", "w"]);
+    assert_eq!(retry, auto);
+
+    let info = |c: &mut Conn| {
+        let info = c.ok(&["XINFO", "STREAM", "s"]);
+        let n = |name: &str| info.field(name).int();
+        (
+            n("length"),
+            n("iids-tracked"),
+            n("iids-added"),
+            n("iids-duplicates"),
+            info.field("last-generated-id").str(),
+        )
+    };
+    let want = info(&mut c);
+    assert_eq!((want.0, want.1, want.2, want.3), (2, 2, 2, 3));
+
+    drop(c);
+    server.kill();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(info(&mut c), want, "AOF");
+    // A retry after the replay is still recognised, and counted.
+    let retry = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+    assert_eq!(retry, first);
+    assert_eq!(info(&mut c).3, 4);
+}
+
+/// Waits until `replica` has every write `master` took before this.
+fn caught_up(master: &mut Conn, replica: &mut Conn, marker: &str) {
+    master.ok(&["SET", marker, "1"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while replica.cmd(&["EXISTS", marker]).int() != 1 {
+        assert!(Instant::now() < deadline, "the replica did not catch up");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_replica_keeps_the_duplicates_it_counted_in_its_own_aof() {
+    // A replica writes what it applies to its own AOF: the duplicates its
+    // master propagated too, or it restarts — or is promoted — with a
+    // count that started over (#655).
+    let mdir = tempfile::tempdir().unwrap();
+    let master = Server::start(mdir.path(), &[]);
+    let rdir = tempfile::tempdir().unwrap();
+    let replica = Server::start(
+        rdir.path(),
+        &[
+            "--aof",
+            "--replicaof",
+            "127.0.0.1",
+            &master.port.to_string(),
+        ],
+    );
+    let mut c = master.conn();
+    let mut rc = replica.conn();
+    caught_up(&mut c, &mut rc, "synced");
+    let first = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+    for _ in 0..2 {
+        let retry = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+        assert_eq!(retry, first);
+    }
+    caught_up(&mut c, &mut rc, "marker");
+    let duplicates = |c: &mut Conn| {
+        let info = c.ok(&["XINFO", "STREAM", "s"]);
+        (
+            info.field("length").int(),
+            info.field("iids-duplicates").int(),
+        )
+    };
+    assert_eq!(duplicates(&mut rc), (1, 2), "replica");
+
+    // Restarted from its own AOF, on its own.
+    drop(rc);
+    replica.kill();
+    let replica = Server::start(rdir.path(), &["--aof"]);
+    let mut rc = replica.conn();
+    assert_eq!(duplicates(&mut rc), (1, 2), "the replica's AOF");
+}
+
+#[test]
+fn a_duplicate_past_the_streams_last_id_is_not_propagated() {
+    // `XTRIM … MAXLEN 0` leaves the remembered IDs, and `XSETID` may then
+    // move the last ID below them. A retry still gets its entry's ID, but
+    // propagated under that ID it would be a new entry to a build that does
+    // not know duplicates — and to this one: it is past the last ID. So it
+    // is propagated as nothing, and no entry appears on a replica or in an
+    // AOF replay.
+    let dir = tempfile::tempdir().unwrap();
+    let master = Server::start(dir.path(), &["--aof"]);
+    let rdir = tempfile::tempdir().unwrap();
+    let replica = Server::start(
+        rdir.path(),
+        &["--replicaof", "127.0.0.1", &master.port.to_string()],
+    );
+    let mut c = master.conn();
+    let mut rc = replica.conn();
+    caught_up(&mut c, &mut rc, "synced");
+    let first = c.ok(&["XADD", "s", "IDMP", "p", "i", "*", "f", "v"]);
+    c.ok(&["XTRIM", "s", "MAXLEN", "0"]);
+    c.ok(&["XSETID", "s", "0-1"]);
+    let retry = c.ok(&["XADD", "s", "IDMP", "p", "i", "*", "f", "v"]);
+    assert_eq!(retry, first);
+    let state = |c: &mut Conn| {
+        let info = c.ok(&["XINFO", "STREAM", "s"]);
+        (
+            info.field("length").int(),
+            info.field("last-generated-id").str(),
+        )
+    };
+    let want = (0, "0-1".to_string());
+    assert_eq!(state(&mut c), want, "master");
+    caught_up(&mut c, &mut rc, "marker");
+    assert_eq!(state(&mut rc), want, "replica");
+    drop(rc);
+    replica.kill();
+
+    drop(c);
+    master.kill();
+    let master = Server::start(dir.path(), &["--aof"]);
+    let mut c = master.conn();
+    assert_eq!(state(&mut c), want, "AOF");
+}

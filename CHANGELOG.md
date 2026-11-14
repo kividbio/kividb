@@ -16,6 +16,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint with a Bloom filter in it cannot be read by an earlier release.
   Delete the filters (or move them off with `DUMP`, which Redis restores)
   before going back.
+- **A 1.2.x replica warns once for each idempotent duplicate.** A master
+  now propagates an `XADD … IDMP` that was a duplicate (#655), and a
+  replica of an earlier release refuses it ("equal or smaller than the
+  target stream top item"), logs a warning and goes on: nothing is lost,
+  only its `iids-duplicates` count stays behind. An earlier release
+  replaying such an AOF skips those lines the same way.
 
 ### Added
 
@@ -562,6 +568,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `_`, and `flags` is a set of simple strings, as in Redis. They were RESP2
   arrays with `$-1`, which redis-py's RESP3 parser refused. RESP2 replies
   are unchanged.
+
+- **The duplicates an idempotent `XADD … IDMP` dropped are counted again by
+  an AOF replay and on replicas (#655).** `iids-duplicates` in `XINFO
+  STREAM` started over after a restart that replayed the AOF, and a replica
+  never counted any: a duplicate was propagated as nothing. As in Redis, it
+  is now propagated, under the ID of the entry it duplicates, and a replica
+  or a replay counts it and adds nothing.
 
 - **A consumer created by an `XREADGROUP … BLOCK` that timed out is kept by
   the AOF and by replicas (#654).** The consumer was created when the read
