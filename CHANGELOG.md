@@ -130,9 +130,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refuses on a replica, for a slot this node owns, imports or migrates,
   while a slot migration or handover of the slot is under way, and unless
   the slot's owner is another master this node sees as up. As this node's
-  slot table can be out of date, it also asks each owner directly, and
-  refuses unless the owner says it owns the slot, is not moving it, and
-  holds keys of it.
+  slot table can be out of date and a key here can be its only copy, it
+  asks each owner directly whether it owns the slot and is not moving it,
+  then, batch by batch, which of the keys it has, and deletes only those;
+  the others are kept and reported (`CLUSTER DROPORPHANS STATUS`).
 - **A master refuses its vote to a replica that claims slots it knows a
   newer owner of (#524).** A replica that had not heard that its master
   handed slots over in an atomic slot migration, or lost them in a

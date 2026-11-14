@@ -931,7 +931,7 @@
         ]
     },
     "CLUSTER DROPORPHANS": {
-        "summary": "Deletes, in the background, the keys a master holds of slots another master owns.",
+        "summary": "Deletes, in the background, the keys a master holds of slots another master owns, those the owner says it has; or reports how the last run went.",
         "complexity": "O(N), N being the number of keys in the node.",
         "group": "cluster",
         "since": "",
@@ -962,6 +962,11 @@
                                 "type": "integer"
                             }
                         ]
+                    },
+                    {
+                        "name": "status",
+                        "type": "pure-token",
+                        "token": "STATUS"
                     }
                 ]
             }

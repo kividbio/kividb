@@ -174,7 +174,9 @@ fn cluster_help() -> Vec<u8> {
         "    counts and owners: [start, end, keys, owner-id] (KiviDB).",
         "DROPORPHANS [SLOT <slot> [<slot> ...] | SLOTSRANGE <start slot> <end slot> [...]]",
         "    Delete, in the background, the keys this master holds of slots another master",
-        "    owns: those ORPHANSLOTS lists, or the slots given (KiviDB).",
+        "    owns and has the keys of: those ORPHANSLOTS lists, or the slots given (KiviDB).",
+        "DROPORPHANS STATUS",
+        "    How the last DROPORPHANS went: [state, slots, deleted, kept, reason] (KiviDB).",
         "MIGRATION IMPORT <start-slot end-slot [start-slot end-slot ...]> |",
         "          STATUS [ID <task-id> | ALL] | CANCEL [ID <task-id> | ALL]",
         "    Start, monitor and cancel slot migration.",
@@ -346,6 +348,9 @@ fn cmd_droporphans(ctx: &Ctx) -> Vec<u8> {
     let args = &ctx.cmd[2..];
     let wanted = match args.first().map(|a| a.to_ascii_uppercase()) {
         None => None,
+        Some(form) if form == b"STATUS" && args.len() == 1 => {
+            return droporphans_status(ctx);
+        }
         Some(form) if form == b"SLOT" && args.len() > 1 => {
             let mut slots = Vec::with_capacity(args.len() - 1);
             for arg in &args[1..] {
@@ -375,17 +380,38 @@ fn cmd_droporphans(ctx: &Ctx) -> Vec<u8> {
         Some(_) => {
             return resp_error(
                 "ERR syntax error: CLUSTER DROPORPHANS [SLOT slot [slot ...] | SLOTSRANGE \
-                 start-slot end-slot [start-slot end-slot ...]]",
+                 start-slot end-slot [start-slot end-slot ...] | STATUS]",
             );
         }
     };
+    // Nothing here waits on another node: the owners are asked on the
+    // deletion's own thread.
     let env = crate::cluster::migration::Env::from_ctx(ctx);
-    match crate::cluster::migration::off_the_runtime(|| {
-        crate::cluster::orphans::drop_orphans(&env, wanted)
-    }) {
+    match crate::cluster::orphans::drop_orphans(&env, wanted) {
         Ok(keys) => resp_integer(keys as i64),
         Err(e) => resp_error(&format!("ERR {e}")),
     }
+}
+
+/// `CLUSTER DROPORPHANS STATUS`: `[state, slots, deleted, kept, reason]` of
+/// the last run, as name-value pairs; an empty array if none has run.
+fn droporphans_status(ctx: &Ctx) -> Vec<u8> {
+    let status = ctx.cluster.orphans.drop_status.lock().clone();
+    let Some(status) = status else {
+        return resp_array(Vec::new());
+    };
+    resp_array(vec![
+        resp_bulk_str("state"),
+        resp_bulk_str(status.state),
+        resp_bulk_str("slots"),
+        resp_integer(status.slots as i64),
+        resp_bulk_str("deleted"),
+        resp_integer(status.deleted as i64),
+        resp_bulk_str("kept"),
+        resp_integer(status.kept as i64),
+        resp_bulk_str("reason"),
+        resp_bulk_str(&status.reason),
+    ])
 }
 
 // ── CLUSTER GETKEYSINSLOT ────────────────────────────────────────────────────
@@ -1795,6 +1821,9 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
         // node, the owner another one's slot table names, says of those
         // slots before that one deletes its keys of them (#517).
         "ORPHANCHECK" => {
+            let Some(asker) = crate::cluster::node::parse_node_id(ctx.cmd[3]) else {
+                return resp_error("ERR Invalid node id");
+            };
             let mut slots = Vec::with_capacity(ctx.cmd.len().saturating_sub(4));
             for arg in &ctx.cmd[4..] {
                 match parse_slot_arg(arg) {
@@ -1802,14 +1831,41 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
                     Err(e) => return e,
                 }
             }
-            let answer = crate::cluster::migration::off_the_runtime(|| {
-                crate::cluster::orphans::orphan_check_answer(
-                    ctx.cluster,
-                    ctx.store,
-                    ctx.repl_state,
-                    &slots,
-                )
-            });
+            crate::log_info!(
+                "Cluster: {} asks, before it deletes its keys of {} slot(s) it says are this \
+                 node's, whether they are (CLUSTER DROPORPHANS)",
+                crate::cluster::node_id_str(&asker),
+                slots.len()
+            );
+            let answer = crate::cluster::orphans::orphan_check_answer(
+                ctx.cluster,
+                ctx.store,
+                ctx.repl_state,
+                &slots,
+            );
+            resp_simple(&answer)
+        }
+        // `CLUSTER SYNCSLOTS ORPHANKEYS <asker-id> <key> ...`: which of
+        // those keys this node has, looked at without using them, before
+        // the asker deletes its copies (#517).
+        "ORPHANKEYS" => {
+            let Some(asker) = crate::cluster::node::parse_node_id(ctx.cmd[3]) else {
+                return resp_error("ERR Invalid node id");
+            };
+            if ctx.cmd.len() < 5 {
+                return resp_error("ERR syntax error");
+            }
+            crate::log_verbose!(
+                "Cluster: {} asks which of {} key(s) this node has (CLUSTER DROPORPHANS)",
+                crate::cluster::node_id_str(&asker),
+                ctx.cmd.len() - 4
+            );
+            let answer = crate::cluster::orphans::orphan_keys_answer(
+                ctx.cluster,
+                ctx.store,
+                ctx.repl_state,
+                &ctx.cmd[4..],
+            );
             resp_simple(&answer)
         }
         other => resp_error(&format!(

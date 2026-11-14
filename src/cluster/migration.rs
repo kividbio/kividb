@@ -653,6 +653,39 @@ struct Deleted {
     /// Slots whose keys it stopped deleting, because they came back to
     /// this node meanwhile (see [`SlotDeletions`]).
     came_back: usize,
+    /// Keys a [`Confirm`] did not let it delete, and left.
+    kept: usize,
+    /// Why a [`Confirm`] stopped it, if one did: the keys not reached yet
+    /// are left.
+    halted: Option<String>,
+}
+
+/// Asked of each batch of keys before it is deleted, with no lock held:
+/// which of them may be deleted. `Err` stops the deletion there, with why.
+pub(crate) type Confirm<'a> = &'a mut dyn FnMut(&[crate::store::Key]) -> Result<Vec<bool>, String>;
+
+/// How many keys a batch of a deletion holds at most, and how many bytes
+/// of key names (a batch is also what a [`Confirm`] asks about).
+const BATCH_KEYS: usize = 128;
+const BATCH_KEY_BYTES: usize = 1 << 20;
+
+/// `keys` in batches of [`BATCH_KEYS`] keys or [`BATCH_KEY_BYTES`] bytes of
+/// names, whichever comes first; never an empty one.
+fn batches(keys: &[crate::store::Key]) -> Vec<&[crate::store::Key]> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, key) in keys.iter().enumerate() {
+        let len = key.as_bytes().len();
+        if i > start && (i - start == BATCH_KEYS || bytes + len > BATCH_KEY_BYTES) {
+            out.push(&keys[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += len;
+    }
+    if start < keys.len() {
+        out.push(&keys[start..]);
+    }
+    out
 }
 
 // ── Deleting the keys of slots that left ─────────────────────────────────────
@@ -879,16 +912,36 @@ fn delete_keys(
     hub_tx: &HubTx,
     run: &mut DeleteRun,
     own: OwnDataset,
+    checked: impl FnMut(),
+    between: impl FnMut(),
+) -> Deleted {
+    delete_keys_confirmed(store, repl_state, hub_tx, run, own, checked, between, None)
+}
+
+/// [`delete_keys`], each batch's keys first put to `confirm`, if given,
+/// out of every lock: only those it confirms are deleted, the others are
+/// left (and counted), and its `Err` stops the deletion there.
+#[allow(clippy::too_many_arguments)]
+fn delete_keys_confirmed(
+    store: &crate::store::Store,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    run: &mut DeleteRun,
+    own: OwnDataset,
     mut checked: impl FnMut(),
     mut between: impl FnMut(),
+    mut confirm: Option<Confirm<'_>>,
 ) -> Deleted {
     let deletions = Arc::clone(&run.deletions);
     let mut removed = 0usize;
+    let mut kept = 0usize;
     let Some(db) = store.first() else {
         return Deleted {
             removed,
             stopped: false,
             came_back: run.came_back,
+            kept,
+            halted: None,
         };
     };
     let holds = crate::store::shards_of_slots(db.len(), |slot| run.deletes(slot));
@@ -898,7 +951,22 @@ fn delete_keys(
             .filter(|k| run.deletes(key_hash_slot(k)))
             .map(crate::store::Key::new)
             .collect();
-        for chunk in keys.chunks(128) {
+        for chunk in batches(&keys) {
+            // Asked with nothing held: it may wait on the network.
+            let confirmed = match confirm.as_mut().map(|confirm| confirm(chunk)) {
+                None => None,
+                Some(Ok(confirmed)) if confirmed.len() == chunk.len() => Some(confirmed),
+                Some(Ok(_)) => Some(vec![false; chunk.len()]),
+                Some(Err(why)) => {
+                    return Deleted {
+                        removed,
+                        stopped: false,
+                        came_back: run.came_back,
+                        kept,
+                        halted: Some(why),
+                    };
+                }
+            };
             {
                 // One whole write, as far as a full sync or a backup is
                 // concerned.
@@ -908,6 +976,8 @@ fn delete_keys(
                         removed,
                         stopped: true,
                         came_back: run.came_back,
+                        kept,
+                        halted: None,
                     };
                 }
                 let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
@@ -918,7 +988,16 @@ fn delete_keys(
                 let delete = run.still_to_delete(&mut counts, chunk);
                 checked();
                 let mut del = vec![b"DEL".to_vec()];
-                for (key, _) in chunk.iter().zip(delete).filter(|(_, delete)| *delete) {
+                for (i, (key, _)) in chunk
+                    .iter()
+                    .zip(delete)
+                    .enumerate()
+                    .filter(|(_, (_, delete))| *delete)
+                {
+                    if confirmed.as_ref().is_some_and(|confirmed| !confirmed[i]) {
+                        kept += 1;
+                        continue;
+                    }
                     // A document leaves its indexes with its key
                     // (`ShardMap::remove`).
                     if crate::commands::helpers::delete_key(store, 0, key) {
@@ -937,6 +1016,8 @@ fn delete_keys(
         removed,
         stopped: false,
         came_back: run.came_back,
+        kept,
+        halted: None,
     }
 }
 
@@ -1116,62 +1197,71 @@ fn start_dropping(
     }
 }
 
+/// What a `CLUSTER DROPORPHANS` deletion did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedOrphans {
+    pub deleted: usize,
+    /// Keys their owner did not confirm it has, left here.
+    pub kept: usize,
+    /// Why it stopped part way, if it did: the keys not reached are left.
+    pub halted: Option<String>,
+}
+
 /// `CLUSTER DROPORPHANS`: delete the keys this master holds of `slots`,
-/// which another master owns (`super::orphans::check_droppable` has said
-/// so), as [`drop_lost_slots`] deletes those of a slot it lost: on a thread
-/// of its own, in batches, through the write path (replicas and the AOF are
-/// told), for as long as the dataset is this node's own, and of each slot
-/// for as long as it has not come back to this node. Never begun by
-/// anything but that command (#517). `done` is called once it has ended.
-pub(crate) fn start_dropping_orphans(
+/// which another master owns (`super::orphans` has checked, and asked it),
+/// as [`drop_lost_slots`] deletes those of a slot it lost: in batches,
+/// through the write path (replicas and the AOF are told), for as long as
+/// the dataset is this node's own, and of each slot for as long as it has
+/// not come back to this node. Each batch only the keys `confirm` confirms:
+/// those the owner has (#517). Run on the caller's thread, which is one of
+/// its own: `confirm` waits on the network. Never begun by anything but
+/// that command.
+pub(crate) fn drop_orphans_confirmed(
     cluster: &ClusterState,
     store: &crate::store::Store,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
-    slots: Vec<u16>,
-    done: impl FnOnce() + Send + 'static,
-) -> Result<(), String> {
+    slots: &[u16],
+    confirm: Confirm<'_>,
+) -> Result<DroppedOrphans, String> {
     let own = match OwnDataset::now(repl_state) {
         Some(own) if cluster.my_master_id().is_none() => own,
         _ => return Err(super::orphans::ON_A_REPLICA.into()),
     };
-    // Begun here, before the reply: an import into one of the slots waits
-    // for it from now on, and a slot that came here since the checks is
-    // left out.
+    // An import into one of the slots waits for it from now on, and a slot
+    // that came here since the checks is left out.
     let mut run = DeleteRun::begin(cluster, slots.iter().copied(), None);
     if !run.deletes_any() {
-        done();
-        return Ok(());
+        return Ok(DroppedOrphans::default());
     }
-    let store = Arc::clone(store);
-    let repl_state = Arc::clone(repl_state);
-    let hub_tx = hub_tx.clone();
-    std::thread::Builder::new()
-        .name("kividb-drop-orphans".into())
-        .spawn(move || {
-            let deleted = delete_keys(
-                &store,
-                &repl_state,
-                &hub_tx,
-                &mut run,
-                own,
-                || {},
-                // Out of the write gate and every lock: a test holds the
-                // deletion here, after its first batch.
-                stall_once_for_test("orphan-keys-deleting"),
-            );
-            drop(run);
-            log_deletion("CLUSTER DROPORPHANS", &deleted);
-            log_info!(
-                "Cluster: CLUSTER DROPORPHANS: done with the keys of {} slot(s) owned by \
-                 other masters: {} deleted",
-                slots.len(),
-                deleted.removed
-            );
-            done();
-        })
-        .map(|_| ())
-        .map_err(|e| format!("could not start the thread that deletes the keys: {e}"))
+    let deleted = delete_keys_confirmed(
+        store,
+        repl_state,
+        hub_tx,
+        &mut run,
+        own,
+        || {},
+        // Out of the write gate and every lock: a test holds the deletion
+        // here, after its first batch.
+        stall_once_for_test("orphan-keys-deleting"),
+        Some(confirm),
+    );
+    drop(run);
+    log_deletion("CLUSTER DROPORPHANS", &deleted);
+    let halted = match (&deleted.halted, deleted.stopped) {
+        (Some(why), _) => Some(why.clone()),
+        (None, true) => Some(
+            "this node became a replica, or a master afresh, while it ran: its keys are no \
+             longer the ones it set out to delete"
+                .to_string(),
+        ),
+        (None, false) => None,
+    };
+    Ok(DroppedOrphans {
+        deleted: deleted.removed,
+        kept: deleted.kept,
+        halted,
+    })
 }
 
 /// A key captured at the cut, with a copy of its value of its own: a list,
@@ -3091,30 +3181,55 @@ mod tests {
         assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
         drop(run);
 
-        let drop_them = |lost: &Lost| {
-            let (done, ended) = std::sync::mpsc::channel();
-            start_dropping_orphans(
+        let drop_them = |lost: &Lost, confirm: Confirm<'_>| {
+            drop_orphans_confirmed(
                 &lost.cluster,
                 &lost.store,
                 &lost.repl_state,
                 &lost.hub_tx,
-                vec![LOST],
-                move || {
-                    let _ = done.send(());
-                },
+                &[LOST],
+                confirm,
             )
-            .map(|()| ended)
         };
+        let all = |keys: &[crate::store::Key]| Ok(vec![true; keys.len()]);
         let replica = Lost::new();
         replica.repl_state.become_slave();
         assert!(orphan_counts(&replica.cluster, &replica.store, &replica.repl_state).is_empty());
-        assert!(drop_them(&replica).is_err());
+        assert!(drop_them(&replica, &mut { all }).is_err());
         assert_eq!(replica.old_keys_left(), OLD);
 
-        drop_them(&lost)
-            .unwrap()
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap();
+        // Only the keys the owner confirms: here, those ending in an even
+        // digit. The others are kept, and counted.
+        let even = Lost::new();
+        let dropped = drop_them(&even, &mut |keys: &[crate::store::Key]| {
+            Ok(keys
+                .iter()
+                .map(|k| k.as_bytes().last().is_some_and(|d| d % 2 == 0))
+                .collect())
+        })
+        .unwrap();
+        assert_eq!((dropped.deleted, dropped.kept), (OLD / 2, OLD / 2));
+        assert_eq!(dropped.halted, None);
+        assert_eq!(even.old_keys_left(), OLD / 2);
+
+        // Stopped by the owner part way: the rest stays.
+        let halted = Lost::new();
+        let mut asked = 0;
+        let dropped = drop_them(&halted, &mut |keys: &[crate::store::Key]| {
+            asked += 1;
+            if asked > 1 {
+                Err("the owner went away".to_string())
+            } else {
+                Ok(vec![true; keys.len()])
+            }
+        })
+        .unwrap();
+        assert_eq!(dropped.halted.as_deref(), Some("the owner went away"));
+        assert!(dropped.deleted > 0 && dropped.deleted <= BATCH_KEYS);
+        assert_eq!(halted.old_keys_left(), OLD - dropped.deleted);
+
+        let dropped = drop_them(&lost, &mut { all }).unwrap();
+        assert_eq!((dropped.deleted, dropped.kept), (OLD, 0));
         assert_eq!(lost.old_keys_left(), 0);
         assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
         assert!(

@@ -5389,6 +5389,39 @@ fn signal(node: &Node, signal: &str) {
     assert!(status.success(), "kill {signal} {pid}");
 }
 
+/// How the last `CLUSTER DROPORPHANS` on `node` went, once it has ended:
+/// `(state, deleted, kept, reason)`.
+fn drop_outcome(node: &Node) -> (String, i64, i64, String) {
+    let mut outcome = None;
+    wait_until(
+        "CLUSTER DROPORPHANS to end",
+        Duration::from_secs(60),
+        || {
+            let status = node.conn().cmd(&["CLUSTER", "DROPORPHANS", "STATUS"]);
+            let fields = status.array();
+            let field = |name: &str| {
+                fields
+                    .chunks(2)
+                    .find(|pair| pair[0].text() == name)
+                    .map(|pair| pair[1].clone())
+                    .unwrap_or_else(|| panic!("no {name} in {fields:?}"))
+            };
+            let state = field("state").text();
+            if state == "running" {
+                return false;
+            }
+            outcome = Some((
+                state,
+                field("deleted").int(),
+                field("kept").int(),
+                field("reason").text(),
+            ));
+            true
+        },
+    );
+    outcome.unwrap()
+}
+
 /// The failpoint after the first batch of a `CLUSTER DROPORPHANS`.
 const ORPHANS_HELD: &str = "orphan-keys-deleting";
 
@@ -5593,8 +5626,8 @@ fn a_promoted_replica_reports_the_keys_of_slots_it_does_not_serve_and_drops_them
     });
     assert_eq!(replica.conn().cmd(&["DBSIZE"]).int(), all);
 
-    // Told, it deletes those keys, and those alone. While it does, they are
-    // not dropped again, nor listed.
+    // Told, it deletes those keys, and those alone: the new owner has every
+    // one of them. While it does, they are not dropped again, nor listed.
     let r = c.cmd(&["CLUSTER", "DROPORPHANS"]);
     assert_eq!(r, Resp::Int(n_keys), "{r:?}");
     let held = replica.dir.join(format!("failpoint.{ORPHANS_HELD}.1"));
@@ -5603,24 +5636,25 @@ fn a_promoted_replica_reports_the_keys_of_slots_it_does_not_serve_and_drops_them
         Duration::from_secs(30),
         || held.exists(),
     );
-    let r = c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &first]);
-    assert!(
-        r.err().is_some_and(|e| e.contains("being deleted already")),
-        "{r:?}"
-    );
+    for again in [
+        &["CLUSTER", "DROPORPHANS", "SLOT", first.as_str()][..],
+        &["CLUSTER", "DROPORPHANS"],
+    ] {
+        let r = c.cmd(again);
+        assert!(
+            r.err().is_some_and(|e| e.contains("running already")),
+            "{r:?}"
+        );
+    }
     assert!(orphan_slots(&replica).is_empty());
-    assert_eq!(c.cmd(&["CLUSTER", "DROPORPHANS"]), Resp::Int(0));
     std::fs::remove_file(&held).unwrap();
-    wait_until(
-        "the keys of the slots it does not serve to be deleted",
-        Duration::from_secs(30),
-        || replica.conn().cmd(&["DBSIZE"]).int() == kept.len() as i64,
+    let (state, deleted, kept_back, reason) = drop_outcome(&replica);
+    assert_eq!(
+        (state.as_str(), deleted, kept_back),
+        ("done", n_keys, 0),
+        "{reason}"
     );
-    wait_until("the deletion to end", Duration::from_secs(10), || {
-        replica
-            .log()
-            .contains("CLUSTER DROPORPHANS: done with the keys of")
-    });
+    assert_eq!(replica.conn().cmd(&["DBSIZE"]).int(), kept.len() as i64);
     assert!(orphan_slots(&replica).is_empty());
     assert_eq!(orphans_in_info(&replica), (0, 0));
     let lost = not_as_written(&replica, &kept, "v");
@@ -5775,39 +5809,33 @@ fn droporphans_refuses_when_the_owner_in_its_table_does_not_own_the_slot() {
         "{listed:?}"
     );
 
-    // Refused at once: the source has just migrated them...
+    // Nothing deleted at once: the source has just migrated them...
     let mut c = replica.conn();
     let r = c.cmd(&["CLUSTER", "DROPORPHANS"]);
-    assert!(r.err().is_some(), "{r:?}");
-    // ... and once that has settled, because it says they are not its.
+    assert_eq!(r, Resp::Int(moved.len() as i64), "{r:?}");
+    let (state, deleted, _, _) = drop_outcome(&replica);
+    assert_eq!((state.as_str(), deleted), ("stopped", 0));
+    // ... nor once that has settled, as it says they are not its.
     std::thread::sleep(Duration::from_secs(4));
     let r = c.cmd(&["CLUSTER", "DROPORPHANS"]);
-    assert!(
-        r.err()
-            .is_some_and(|e| e.contains("says it does not own it")),
-        "{r:?}"
-    );
-    let slot = moved_slot_of(&moved).to_string();
-    let r = c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &slot]);
-    assert!(r.err().is_some(), "{r:?}");
-    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(r, Resp::Int(moved.len() as i64), "{r:?}");
+    let (state, deleted, _, reason) = drop_outcome(&replica);
+    assert_eq!((state.as_str(), deleted), ("stopped", 0), "{reason}");
+    assert!(reason.contains("says it does not own it"), "{reason}");
+    std::thread::sleep(Duration::from_secs(1));
     assert_eq!(c.cmd(&["DBSIZE"]).int(), all);
     assert_eq!(all_keys(&replica).len() as i64, all);
 }
 
-/// The slot of the first of `keys`.
-fn moved_slot_of(keys: &[String]) -> u16 {
-    slot_of(&keys[0])
-}
-
 /// The owner a node's slot table names is asked before its keys of a slot
-/// are deleted: it must hold keys of the slot, and not be importing or
-/// migrating it. A slot given up everywhere with `DELSLOTS` (its keys left
-/// on its old owner) and taken by another master, which has none of them,
-/// is not dropped; nor one its owner migrates away, nor one that another
-/// node, which the table names by a stray `SETSLOT NODE`, is importing.
+/// are deleted, and only the keys it has are. A slot given up everywhere
+/// with `DELSLOTS` (its key left on its old owner) and taken by another
+/// master: the key is kept while the owner has none, and still once the
+/// owner has keys of its own, written since (#744 review). Nothing is
+/// deleted while the owner migrates the slot away, nor while a node the
+/// table names by a stray `SETSLOT NODE` is importing it.
 #[test]
-fn droporphans_refuses_unless_the_owner_holds_keys_of_the_slot_and_is_not_moving_it() {
+fn droporphans_keeps_the_keys_the_owner_lacks_and_stops_while_it_moves_the_slot() {
     let (nodes, _) = form_cluster(3);
     let key = key_in(0..=100, "stale");
     let slot = slot_of(&key);
@@ -5828,24 +5856,39 @@ fn droporphans_refuses_unless_the_owner_holds_keys_of_the_slot_and_is_not_moving
     );
     wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
 
-    // The owner holds no keys of the slot: these may be the only copy.
+    // The owner holds no keys of the slot: this one is the only copy, and
+    // is kept.
     let r = c.cmd(&["CLUSTER", "DROPORPHANS"]);
-    assert!(
-        r.err().is_some_and(|e| e.contains("holds no keys of it")),
-        "{r:?}"
-    );
-    // The owner migrates it away.
+    assert_eq!(r, Resp::Int(1), "{r:?}");
+    assert_eq!(drop_outcome(&nodes[0]).0, "done");
+    assert_eq!(drop_outcome(&nodes[0]).1, 0);
+    assert_eq!(drop_outcome(&nodes[0]).2, 1);
+    // Writes on the new owner, the old key still the only copy of its own:
+    // kept, and reported kept.
     let other = key_in(slot..=slot, "fresh");
     assert!(nodes[1].conn().cmd(&["SET", &other, "new"]).is_ok());
+    let r = c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &s]);
+    assert_eq!(r, Resp::Int(1), "{r:?}");
+    let (state, deleted, kept, reason) = drop_outcome(&nodes[0]);
+    assert_eq!((state.as_str(), deleted, kept), ("done", 0, 1), "{reason}");
+    assert_eq!(
+        c.cmd(&["GET", &key]).err().map(|e| e.starts_with("MOVED")),
+        Some(true)
+    );
+    assert_eq!(c.cmd(&["DBSIZE"]).int(), 1);
+    assert_eq!(
+        orphan_slots(&nodes[0]),
+        vec![(slot, slot, 1, Some(id1.clone()))]
+    );
+
+    // The owner migrates it away.
     let mut o = nodes[1].conn();
     let r = o.cmd(&["CLUSTER", "SETSLOT", &s, "MIGRATING", &id2]);
     assert!(r.is_ok(), "{r:?}");
-    let r = c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &s]);
-    assert!(
-        r.err()
-            .is_some_and(|e| e.contains("importing or migrating")),
-        "{r:?}"
-    );
+    assert!(c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &s]) == Resp::Int(1));
+    let (state, deleted, _, reason) = drop_outcome(&nodes[0]);
+    assert_eq!((state.as_str(), deleted), ("stopped", 0), "{reason}");
+    assert!(reason.contains("importing or migrating"), "{reason}");
     let r = o.cmd(&["CLUSTER", "SETSLOT", &s, "STABLE"]);
     assert!(r.is_ok(), "{r:?}");
     // A node this one's table names, by a `SETSLOT NODE` sent here alone,
@@ -5856,16 +5899,98 @@ fn droporphans_refuses_unless_the_owner_holds_keys_of_the_slot_and_is_not_moving
     assert!(r.is_ok(), "{r:?}");
     let r = c.cmd(&["CLUSTER", "SETSLOT", &s, "NODE", &id2]);
     assert!(r.is_ok(), "{r:?}");
-    let r = c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &s]);
-    assert!(
-        r.err()
-            .is_some_and(|e| e.contains("importing or migrating")),
-        "{r:?}"
+    // For a few seconds its table keeps what it was told by hand.
+    assert_eq!(
+        orphan_slots(&nodes[0]),
+        vec![(slot, slot, 1, Some(id2.clone()))]
     );
+    assert!(c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &s]) == Resp::Int(1));
+    let (state, deleted, _, reason) = drop_outcome(&nodes[0]);
+    assert_eq!((state.as_str(), deleted), ("stopped", 0), "{reason}");
+    assert!(reason.contains("importing or migrating"), "{reason}");
     // Nothing was deleted anywhere.
-    std::thread::sleep(Duration::from_secs(1));
     assert_eq!(c.cmd(&["DBSIZE"]).int(), 1);
     assert_eq!(nodes[1].conn().cmd(&["DBSIZE"]).int(), 1);
+}
+
+/// A resharding by `MIGRATE` that stopped part way: half of a slot's keys
+/// copied to the new owner, the other half not, when the slot was given to
+/// it (`DELSLOTS` everywhere, `ADDSLOTS` there: the old owner keeps every
+/// key). `CLUSTER DROPORPHANS` on the old owner deletes the keys the new one
+/// has, and keeps, and reports, those it does not: their only copy.
+#[test]
+fn droporphans_keeps_the_keys_a_resharding_did_not_move() {
+    let (nodes, _) = form_cluster(3);
+    let slot = slot_of(&key_in(0..=100, "k"));
+    let s = slot.to_string();
+    let tag = (0..)
+        .map(|i| format!("t{i}"))
+        .find(|t| slot_of(t) == slot)
+        .unwrap();
+    let keys: Vec<String> = (0..10).map(|i| format!("{{{tag}}}:{i}")).collect();
+    let mut c = nodes[0].conn();
+    set_all(&mut c, &keys, "v");
+    let (id0, id1) = (nodes[0].id(), nodes[1].id());
+    let mut d = nodes[1].conn();
+    assert!(
+        d.cmd(&["CLUSTER", "SETSLOT", &s, "IMPORTING", &id0])
+            .is_ok()
+    );
+    assert!(
+        c.cmd(&["CLUSTER", "SETSLOT", &s, "MIGRATING", &id1])
+            .is_ok()
+    );
+    let port = nodes[1].port.to_string();
+    let mut migrate = vec![
+        "MIGRATE",
+        "127.0.0.1",
+        &port,
+        "",
+        "0",
+        "5000",
+        "COPY",
+        "KEYS",
+    ];
+    migrate.extend(keys[..5].iter().map(String::as_str));
+    let r = c.cmd(&migrate);
+    assert!(r.is_ok(), "{r:?}");
+    // Stopped there: the slot given to the new owner, every key left here.
+    assert!(c.cmd(&["CLUSTER", "SETSLOT", &s, "STABLE"]).is_ok());
+    assert!(d.cmd(&["CLUSTER", "SETSLOT", &s, "STABLE"]).is_ok());
+    for node in &nodes {
+        let r = node.conn().cmd(&["CLUSTER", "DELSLOTS", &s]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    assert!(d.cmd(&["CLUSTER", "ADDSLOTS", &s]).is_ok());
+    wait_until(
+        "the old owner to see the new one own the slot",
+        Duration::from_secs(30),
+        || orphan_slots(&nodes[0]) == vec![(slot, slot, 10, Some(id1.clone()))],
+    );
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
+
+    assert_eq!(c.cmd(&["CLUSTER", "DROPORPHANS"]), Resp::Int(10));
+    let (state, deleted, kept, reason) = drop_outcome(&nodes[0]);
+    assert_eq!((state.as_str(), deleted, kept), ("done", 5, 5), "{reason}");
+    assert_eq!(all_keys(&nodes[0]), {
+        let mut left: Vec<String> = keys[5..].to_vec();
+        left.sort();
+        left
+    });
+    assert_eq!(all_keys(&nodes[1]), {
+        let mut moved: Vec<String> = keys[..5].to_vec();
+        moved.sort();
+        moved
+    });
+    assert_eq!(
+        orphan_slots(&nodes[0]),
+        vec![(slot, slot, 5, Some(id1.clone()))]
+    );
+    assert!(
+        nodes[0].log().contains("CLUSTER DROPORPHANS kept 5 key(s)"),
+        "{}",
+        nodes[0].log()
+    );
 }
 
 // ── A slot back while its old keys are deleted (#353) ─────────────────────────

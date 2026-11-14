@@ -218,8 +218,7 @@ other files:
   `cluster_orphan_keys`) and `CLUSTER ORPHANSLOTS`, and deletes them when
   told with `CLUSTER DROPORPHANS`, which only runs on a master, for slots
   another master that is up owns, with no migration of them under way, and
-  only once that owner, asked directly, says it owns each slot and holds
-  keys of it. Both commands
+  deletes only the keys that owner, asked directly, says it has. Both commands
   are KiviDB's own: Valkey's `CLUSTER FLUSHSLOT` deletes any slot's keys,
   the node's own included, and Redis's `SFLUSH` only those of slots the
   node owns. See [COMMANDS.md](../COMMANDS.md#keys-of-slots-a-master-does-not-serve).
