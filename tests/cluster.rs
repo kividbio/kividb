@@ -5281,6 +5281,183 @@ fn keys_of_a_slot_lost_to_another_master_are_dropped() {
     assert!(loser.is_master());
 }
 
+// ── A replica promoted after its master handed slots over (#517) ──────────────
+
+/// `n` keys of the form `prefix:N` that hash into `range`.
+fn keys_in(range: std::ops::RangeInclusive<u16>, prefix: &str, n: usize) -> Vec<String> {
+    (0..)
+        .map(|i| format!("{prefix}:{i}"))
+        .filter(|k| range.contains(&slot_of(k)))
+        .take(n)
+        .collect()
+}
+
+/// `SET key value` for every key, all acknowledged.
+fn set_all(conn: &mut Conn, keys: &[String], value: &str) {
+    let sets: Vec<Vec<&str>> = keys
+        .iter()
+        .map(|k| vec!["SET", k.as_str(), value])
+        .collect();
+    let replies = conn.pipeline(&sets);
+    assert!(replies.iter().all(Resp::is_ok), "{replies:?}");
+}
+
+/// The keys of `keys` whose value on `node` is not `value`.
+fn not_as_written(node: &Node, keys: &[String], value: &str) -> Vec<String> {
+    let mut c = node.conn();
+    let gets: Vec<Vec<&str>> = keys.iter().map(|k| vec!["GET", k.as_str()]).collect();
+    keys.iter()
+        .zip(c.pipeline(&gets))
+        .filter(|(_, got)| !matches!(got, Resp::Bulk(v) if v == value.as_bytes()))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// A master killed right after a `CLUSTER MIGRATION IMPORT` handed slots
+/// over, before its deletion of their keys reached its replica (held here
+/// at the failpoint `slot-keys-checked`). Its replica, promoted, used to
+/// keep the keys of the slots that had moved away for good: in `DBSIZE`,
+/// `SCAN`, its snapshots and the full syncs of its own replicas (#517). It
+/// remembers now that its master gave those slots away, and drops their
+/// keys once promoted; every other key stays, and so does every write the
+/// new owner acknowledged.
+#[test]
+fn a_replica_promoted_after_its_master_handed_slots_over_drops_their_keys() {
+    let src = Node::start_with_env(&[], &[("KIVIDB_TEST_FAILPOINTS", CHECKED)]);
+    let (mut nodes, ranges) = form_cluster_of(vec![src, Node::start(&[]), Node::start(&[])]);
+    let replica = add_replica(&nodes, &nodes[0]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
+
+    let moved = keys_in(0..=1000, "moved", 400);
+    let kept = keys_in(1001..=ranges[0].1, "kept", 400);
+    let elsewhere = keys_in(ranges[1].0..=ranges[1].1, "dst", 200);
+    let mut s = nodes[0].conn();
+    set_all(&mut s, &moved, "old");
+    set_all(&mut s, &kept, "v");
+    set_all(&mut nodes[1].conn(), &elsewhere, "v");
+    assert_eq!(s.cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(&nodes[1], &task_id);
+    let held = nodes[0].dir.join(format!("failpoint.{CHECKED}.1"));
+    wait_until(
+        "the source's deletion of the moved keys to be held",
+        Duration::from_secs(30),
+        || held.exists(),
+    );
+    // The replica has heard of the new owner, and has every key still.
+    let dst_id = nodes[1].id();
+    wait_until(
+        "the replica to hear of the new owner",
+        Duration::from_secs(20),
+        || {
+            replica
+                .conn()
+                .cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .any(|l| l.starts_with(&dst_id) && l.contains(" 0-1000"))
+        },
+    );
+    assert_eq!(
+        replica.conn().cmd(&["DBSIZE"]).int(),
+        (moved.len() + kept.len()) as i64
+    );
+    // It has written them down, for a restart.
+    wait_until(
+        "the replica to save the slots its master gave away",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(replica.dir.join("nodes.conf"))
+                .unwrap_or_default()
+                .contains("givenAwaySlots 0-1000")
+        },
+    );
+    // The new owner acknowledges writes to the moved keys.
+    set_all(&mut nodes[1].conn(), &moved, "new");
+
+    nodes[0].kill();
+    wait_until(
+        "the replica to be promoted",
+        Duration::from_secs(60),
+        || replica.is_master(),
+    );
+    wait_until(
+        "the promoted replica to drop the moved keys",
+        Duration::from_secs(30),
+        || replica.conn().cmd(&["DBSIZE"]).int() == kept.len() as i64,
+    );
+    let log = replica.log();
+    assert!(
+        log.contains("dropping the keys of 1001 slot(s) the old master gave away"),
+        "{log}"
+    );
+    let lost = not_as_written(&replica, &kept, "v");
+    assert!(
+        lost.is_empty(),
+        "{} kept keys lost: {lost:?}\n{log}",
+        lost.len()
+    );
+    let lost = not_as_written(&nodes[1], &moved, "new");
+    assert!(
+        lost.is_empty(),
+        "{} writes to the new owner lost",
+        lost.len()
+    );
+    let lost = not_as_written(&nodes[1], &elsewhere, "v");
+    assert!(
+        lost.is_empty(),
+        "{} of the new owner's keys lost",
+        lost.len()
+    );
+    // The slots are forgotten once dropped.
+    wait_until("nodes.conf to forget them", Duration::from_secs(10), || {
+        !std::fs::read_to_string(replica.dir.join("nodes.conf"))
+            .unwrap_or_default()
+            .contains("givenAwaySlots")
+    });
+}
+
+/// A replica whose master gave no slot away drops nothing when it is
+/// promoted, even with a handover between two other masters just before.
+#[test]
+fn a_replica_whose_master_gave_nothing_away_drops_nothing_when_promoted() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let replica = add_replica(&nodes, &nodes[0]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
+    let mine = keys_in(ranges[0].0..=ranges[0].1, "mine", 500);
+    let moved = keys_in(ranges[2].0..=ranges[2].0 + 500, "moved", 200);
+    let mut s = nodes[0].conn();
+    set_all(&mut s, &mine, "v");
+    set_all(&mut nodes[2].conn(), &moved, "v");
+    assert_eq!(s.cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    let (from, to) = (ranges[2].0.to_string(), (ranges[2].0 + 500).to_string());
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &from, &to])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(&nodes[1], &task_id);
+    std::thread::sleep(Duration::from_secs(2));
+
+    nodes[0].kill();
+    wait_until(
+        "the replica to be promoted",
+        Duration::from_secs(60),
+        || replica.is_master(),
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(replica.conn().cmd(&["DBSIZE"]).int(), mine.len() as i64);
+    assert!(not_as_written(&replica, &mine, "v").is_empty());
+    assert!(not_as_written(&nodes[1], &moved, "v").is_empty());
+    assert!(!replica.log().contains("the old master gave away"));
+}
+
 // ── A slot back while its old keys are deleted (#353) ─────────────────────────
 
 /// The failpoints at which a node's deletion of the keys of slots it has

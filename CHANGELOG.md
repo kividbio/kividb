@@ -134,6 +134,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shows the new owner in `CLUSTER NODES`. A request from an earlier version
   is decided as before.
 
+- **A replica promoted after its master handed slots over and died drops
+  the keys of those slots (#517).** A master killed right after an atomic
+  slot migration (`CLUSTER MIGRATION IMPORT`) gave its slots to the
+  destination, before its deletion of their keys reached its replica, left
+  them on the replica, and the replica, once promoted, kept them for good:
+  in `DBSIZE`, `SCAN` and `KEYS`, its snapshots and AOF, and the full syncs
+  of its own replicas, beside the destination's newer copy. A replica now
+  remembers the slots another master's claim took from its master, in
+  nodes.conf too, and once promoted deletes their keys in the background,
+  as a master deletes those of a slot it loses. Only those of a slot that
+  another master still claims: one back with its master, or one the taker
+  no longer claims, keeps its keys, and so does every slot the promoted node
+  owns. The replication stream is unchanged, and earlier versions read
+  nodes.conf as before.
+
 - **Consumer-group commands about one consumer no longer walk the whole
   pending list (#637).** `XINFO CONSUMERS` counted each consumer's pending
   entries by reading every pending entry of the group, once per consumer,

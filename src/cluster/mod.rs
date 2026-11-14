@@ -68,6 +68,55 @@ pub struct ElectionState {
     pub deadline_ms: Option<u64>,
 }
 
+/// The slots this node's master gave away while this node was its replica:
+/// claimed by another master at a newer epoch, in an atomic slot migration's
+/// handover, a `SETSLOT NODE`, or a partition the master lost (#517).
+///
+/// The master deletes their keys, and its replica deletes them as the
+/// master's deletions reach it. A master that dies before they do leaves
+/// them on the replica, and a replica promoted then kept them for good, in
+/// slots it does not own: in `DBSIZE`, `SCAN`, its snapshots and AOF, and
+/// the full syncs of its own replicas. So the replica remembers the slots,
+/// and once promoted deletes their keys ([`ClusterState::drop_slots_lost_while_promoting`]).
+/// The replication stream is not changed: a replica learns of the slots
+/// from the claims on the bus, which every version sends.
+///
+/// Only the keys of a slot whose owner, in this node's view, said in its
+/// last heartbeat that it owns it, and that is not this node: a master that
+/// took a slot back (an import) and died before its replica heard its
+/// claim has the only copy of the slot's keys on that replica, and the
+/// node the replica still takes for the owner has stopped claiming it.
+/// Such a slot's keys are kept, as they were before.
+///
+/// A slot leaves the set when its claim by this node's master comes, when
+/// this node is promoted, follows another master or is reset. Saved in
+/// nodes.conf (`vars ... givenAwaySlots`), which earlier versions read past;
+/// after a restart a slot counts again once its owner's heartbeat claims it.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GivenAway {
+    /// Per slot: whether its owner, in this node's view, claimed it in its
+    /// last heartbeat.
+    slots: std::collections::BTreeMap<u16, bool>,
+}
+
+impl GivenAway {
+    /// From nodes.conf: none counted until its owner claims it again.
+    pub(crate) fn loaded(slots: &[u16]) -> Self {
+        GivenAway {
+            slots: slots.iter().map(|&slot| (slot, false)).collect(),
+        }
+    }
+
+    /// The slots, in order, for nodes.conf.
+    pub(crate) fn slots(&self) -> Vec<u16> {
+        self.slots.keys().copied().collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
 /// Why a master holds writes until it has made sure it still owns its
 /// slots. See [`ClusterState::hold_writes_until_confirmed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +348,8 @@ pub struct ClusterState {
     /// replicas are not all granted votes in quick succession, or two of them
     /// could each win an election a moment apart.
     pub last_vote_for: parking_lot::Mutex<AHashMap<NodeId, std::time::Instant>>,
+    /// See [`GivenAway`]. Taken last: nothing is taken while it is held.
+    pub(crate) given_away: parking_lot::Mutex<GivenAway>,
     /// See [`ClusterHooks`].
     pub hooks: std::sync::OnceLock<ClusterHooks>,
     /// Runtime the cluster bus runs on. Command handlers that need to send a
@@ -409,6 +460,7 @@ impl ClusterState {
             by_hand: parking_lot::Mutex::new(AHashMap::new()),
             forgotten: RwLock::new(AHashMap::new()),
             last_vote_for: parking_lot::Mutex::new(AHashMap::new()),
+            given_away: parking_lot::Mutex::new(GivenAway::default()),
             hooks: std::sync::OnceLock::new(),
             bus_runtime: std::sync::OnceLock::new(),
             state_ok: AtomicBool::new(false),
@@ -505,16 +557,20 @@ impl ClusterState {
         };
 
         match persist::load(&path)? {
-            Some(loaded) => Ok(Self::build(
-                true,
-                loaded.myself,
-                loaded.slots,
-                loaded.nodes,
-                loaded.current_epoch,
-                loaded.last_vote_epoch,
-                Some(path),
-                node_timeout_ms,
-            )),
+            Some(loaded) => {
+                let state = Self::build(
+                    true,
+                    loaded.myself,
+                    loaded.slots,
+                    loaded.nodes,
+                    loaded.current_epoch,
+                    loaded.last_vote_epoch,
+                    Some(path),
+                    node_timeout_ms,
+                );
+                *state.given_away.lock() = GivenAway::loaded(&loaded.given_away);
+                Ok(state)
+            }
             None => {
                 let state = Self::new_enabled(Some(path), node_timeout_ms);
                 state.save_to_disk()?;
@@ -1741,17 +1797,50 @@ impl ClusterState {
     /// old master re-point to it, and the old master, if it ever returns,
     /// finds itself replaced and becomes a replica rather than serving a stale
     /// dataset beside the new one.
+    /// A master's heartbeat says which slots it owns: of the slots this
+    /// node's master gave away ([`GivenAway`]) that `owner_id` owns in this
+    /// node's view, note which it still claims. A slot it has stopped
+    /// claiming has moved on without this node hearing where, perhaps back
+    /// to this node's master.
+    fn confirm_given_away(&self, owner_id: NodeId, claims: &[crate::cluster::bus::SlotClaim]) {
+        if self.given_away.lock().is_empty() {
+            return;
+        }
+        let slots = self.slots.read();
+        let mut given_away = self.given_away.lock();
+        for (&slot, claimed) in given_away.slots.iter_mut() {
+            if slots[slot as usize] == Some(owner_id) {
+                *claimed = claims.iter().any(|c| (c.start..=c.end).contains(&slot));
+            }
+        }
+    }
+
+    /// Forget the slots this node's master gave away ([`GivenAway`]): this
+    /// node replicates another master now, or none.
+    fn forget_given_away(&self) {
+        let forgotten = std::mem::take(&mut *self.given_away.lock());
+        if !forgotten.is_empty() {
+            self.save_soon();
+        }
+    }
+
     pub fn apply_peer_slot_claims(
         &self,
         owner_id: NodeId,
         claims: &[crate::cluster::bus::SlotClaim],
     ) {
-        if !self.enabled || claims.is_empty() {
+        if !self.enabled {
             return;
         }
         let me = self.myself();
         // Don't accept claims for ourselves from peers — trust local state.
         if owner_id == me {
+            return;
+        }
+        // Before the early return: a master that claims nothing has stopped
+        // claiming what it had.
+        self.confirm_given_away(owner_id, claims);
+        if claims.is_empty() {
             return;
         }
         // We need each slot's current owner's epoch to compare. Snapshot the
@@ -1777,6 +1866,8 @@ impl ClusterState {
             let mut slots = self.slots.write();
             let migrations = self.migrations.read();
             let by_hand = self.by_hand.lock();
+            let mut given_away = self.given_away.lock();
+            let replica = my_shard_master != me;
             for claim in claims {
                 for slot in claim.start..=claim.end {
                     let i = slot as usize;
@@ -1809,6 +1900,16 @@ impl ClusterState {
                         }
                         if slots[i] == Some(me) {
                             lost.push(slot);
+                        }
+                        // See `GivenAway`: the master this node replicates
+                        // gives the slot away, or has it back. Either way the
+                        // claimant claims it now.
+                        if replica && owner_id == my_shard_master {
+                            given_away.slots.remove(&slot);
+                        } else if replica && slots[i] == Some(my_shard_master) {
+                            given_away.slots.insert(slot, true);
+                        } else if let Some(claimed) = given_away.slots.get_mut(&slot) {
+                            *claimed = true;
                         }
                         slots[i] = Some(owner_id);
                         changed = true;
@@ -1855,6 +1956,8 @@ impl ClusterState {
     /// Become a replica of `new_master` because it now owns the slots this
     /// node's shard used to. See [`Self::apply_peer_slot_claims`].
     fn follow_new_master(&self, new_master: NodeId) {
+        // The resync replaces the dataset with the new master's.
+        self.forget_given_away();
         let me = self.myself();
         let target = {
             let mut nodes = self.nodes.write();
@@ -2253,14 +2356,17 @@ impl ClusterState {
         }
 
         // Step 3: update our own node entry.
-        {
+        let master_changed = {
             let mut nodes = self.nodes.write();
             let me = nodes
                 .get_mut(&self.myself())
                 .ok_or_else(|| "internal: self missing from nodes".to_string())?;
             me.flags.remove(NodeFlags::MASTER);
             me.flags |= NodeFlags::REPLICA;
-            me.master_id = Some(master_id);
+            me.master_id.replace(master_id) != Some(master_id)
+        };
+        if master_changed {
+            self.forget_given_away();
         }
 
         Ok((master_ip, master_port))
@@ -2272,12 +2378,15 @@ impl ClusterState {
         if !self.enabled {
             return;
         }
-        let mut nodes = self.nodes.write();
-        if let Some(me) = nodes.get_mut(&self.myself()) {
-            me.flags.remove(NodeFlags::REPLICA);
-            me.flags |= NodeFlags::MASTER;
-            me.master_id = None;
+        {
+            let mut nodes = self.nodes.write();
+            if let Some(me) = nodes.get_mut(&self.myself()) {
+                me.flags.remove(NodeFlags::REPLICA);
+                me.flags |= NodeFlags::MASTER;
+                me.master_id = None;
+            }
         }
+        self.forget_given_away();
     }
 
     /// Return our master's NodeId if we are configured as a replica.
@@ -2581,11 +2690,57 @@ impl ClusterState {
     /// a master's own dataset); they would have stayed, stale, until a
     /// restart. Keys of a slot removed with `DELSLOTS` are left, as
     /// `DELSLOTS` leaves them.
+    ///
+    /// And the keys of the slots its old master gave away while this node
+    /// was its replica, whose deletion had not reached it ([`GivenAway`],
+    /// #517).
     pub fn drop_slots_lost_while_promoting(&self, claimed: &[u16]) {
-        let lost = self.slots_lost_while_promoting(claimed);
+        let mut lost = self.slots_lost_while_promoting(claimed);
+        lost.extend(self.slots_given_away_before_promoting());
+        lost.sort_unstable();
+        lost.dedup();
         if !lost.is_empty() {
             migration::drop_lost_slots(self, lost);
         }
+    }
+
+    /// The slots of [`GivenAway`] whose keys a promoted node drops: those
+    /// another master owns, in its view, and claimed in its last heartbeat.
+    /// Never one of this node's own. The set is emptied: it was about the
+    /// master this node replicated.
+    fn slots_given_away_before_promoting(&self) -> Vec<u16> {
+        let given_away = std::mem::take(&mut *self.given_away.lock());
+        if given_away.is_empty() {
+            return Vec::new();
+        }
+        let me = self.myself();
+        let mut to_drop = Vec::new();
+        let mut kept = 0usize;
+        {
+            let owners = self.slots.read();
+            for (&slot, &claimed) in &given_away.slots {
+                match owners[slot as usize] {
+                    Some(owner) if owner == me => {}
+                    Some(_) if claimed => to_drop.push(slot),
+                    _ => kept += 1,
+                }
+            }
+        }
+        if !to_drop.is_empty() {
+            log_info!(
+                "Cluster: promoted: dropping the keys of {} slot(s) the old master gave away \
+                 while this node was its replica",
+                to_drop.len()
+            );
+        }
+        if kept > 0 {
+            log_info!(
+                "Cluster: promoted: keeping the keys of {kept} slot(s) the old master gave away: \
+                 the node that took them no longer claims them, and they may have come back"
+            );
+        }
+        self.save_soon();
+        to_drop
     }
 
     // ── Migration state (Step 7c) ─────────────────────────────────────────────
@@ -3144,6 +3299,7 @@ impl ClusterState {
         self.migrations.write().clear();
         self.failure_reports.write().clear();
         *self.election.lock() = None;
+        *self.given_away.lock() = GivenAway::default();
         // Peers are banned and the tables cleared: a heartbeat merged from
         // here on finds the ban. Let go of before `release_held_writes`,
         // which takes `handoff_holds`, a lock that comes before `forgotten`.
@@ -3605,6 +3761,91 @@ mod tests {
             cs.slots_lost_while_promoting(&claimed),
             vec![6000, 6001, 6002]
         );
+    }
+
+    /// A replica remembers the slots its master gave away (#517): those
+    /// another master's claim took from it. Promoted, it drops the keys of
+    /// those the taker still claims, and of none it owns itself; a slot
+    /// back with its master, or no longer claimed by the node that took it,
+    /// is left alone.
+    #[test]
+    fn a_promoted_replica_drops_only_the_slots_its_master_gave_away() {
+        let claim = |start, end, epoch| crate::cluster::bus::SlotClaim { start, end, epoch };
+        let set_epoch = |cs: &ClusterState, id: NodeId, epoch| {
+            cs.nodes.write().get_mut(&id).unwrap().config_epoch = epoch;
+        };
+        let cs = ClusterState::new_enabled(None, 15000);
+        let me = cs.myself();
+        let src = add_master(&cs, 0..=5460);
+        let dst = add_master(&cs, 5461..=10922);
+        let _other = add_master(&cs, 10923..=16383);
+        {
+            let mut nodes = cs.nodes.write();
+            let node = nodes.get_mut(&me).unwrap();
+            node.flags.remove(NodeFlags::MASTER);
+            node.flags |= NodeFlags::REPLICA;
+            node.master_id = Some(src);
+        }
+        // A replica that has seen no slot leave its master drops nothing.
+        assert!(cs.given_away.lock().is_empty());
+
+        // The destination takes 0-99 from the master.
+        cs.apply_peer_slot_claims(dst, &[claim(0, 99, 5), claim(5461, 10922, 5)]);
+        set_epoch(&cs, dst, 5);
+        assert_eq!(cs.given_away.lock().slots(), (0..=99).collect::<Vec<_>>());
+        // The master takes 50-59 back: they are its again.
+        cs.apply_peer_slot_claims(src, &[claim(50, 59, 6), claim(100, 5460, 6)]);
+        set_epoch(&cs, src, 6);
+        let expected: Vec<u16> = (0..=49).chain(60..=99).collect();
+        assert_eq!(cs.given_away.lock().slots(), expected);
+        // The destination's next heartbeat no longer claims 70: it has gone
+        // on somewhere this node has not heard of.
+        cs.apply_peer_slot_claims(
+            dst,
+            &[
+                claim(0, 49, 5),
+                claim(60, 69, 5),
+                claim(71, 99, 5),
+                claim(5461, 10922, 5),
+            ],
+        );
+        // A slot this node will own itself is never dropped.
+        cs.given_away.lock().slots.insert(100, true);
+
+        let claimed = cs.promote_self(src, 1_000);
+        assert!(claimed.contains(&100) && claimed.contains(&55));
+        let dropped = cs.slots_given_away_before_promoting();
+        let expected: Vec<u16> = (0..=49).chain(60..=69).chain(71..=99).collect();
+        assert_eq!(dropped, expected);
+        assert!(cs.given_away.lock().is_empty());
+
+        // After a restart the slots count once their owner claims them.
+        let loaded = GivenAway::loaded(&[1, 2]);
+        assert_eq!(loaded.slots.values().filter(|c| **c).count(), 0);
+    }
+
+    /// The slots a master gave away are forgotten when this node replicates
+    /// another master: the resync replaces its dataset.
+    #[test]
+    fn slots_given_away_are_forgotten_with_the_master() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let src = add_master(&cs, 0..=5460);
+        let dst = add_master(&cs, 5461..=16383);
+        cs.set_replica_of(src).unwrap();
+        assert_eq!(cs.my_master_id(), Some(src));
+        let claim = [crate::cluster::bus::SlotClaim {
+            start: 0,
+            end: 9,
+            epoch: 5,
+        }];
+        cs.apply_peer_slot_claims(dst, &claim);
+        assert_eq!(cs.given_away.lock().slots().len(), 10);
+        // The same master again: kept.
+        cs.set_replica_of(src).unwrap();
+        assert_eq!(cs.given_away.lock().slots().len(), 10);
+        cs.set_replica_of(dst).unwrap();
+        assert!(cs.given_away.lock().is_empty());
+        assert_eq!(cs.my_master_id(), Some(dst));
     }
 
     /// The end of an atomic slot migration hands over only the slots that

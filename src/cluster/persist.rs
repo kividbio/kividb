@@ -38,6 +38,8 @@ pub struct LoadedConfig {
     pub slots: Box<[Option<NodeId>; CLUSTER_SLOTS]>,
     pub current_epoch: u64,
     pub last_vote_epoch: u64,
+    /// See `ClusterState::given_away`.
+    pub given_away: Vec<u16>,
 }
 
 /// Read nodes.conf from disk. Returns Ok(None) if the file does not exist
@@ -53,6 +55,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
     let mut myself: Option<NodeId> = None;
     let mut current_epoch: u64 = 0;
     let mut last_vote_epoch: u64 = 0;
+    let mut given_away: Vec<u16> = Vec::new();
     // Box<[Option<NodeId>; 16384]> via the same dance as in mod.rs
     let mut slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
         .into_boxed_slice()
@@ -73,6 +76,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
                 match k {
                     "currentEpoch" => current_epoch = v.parse().unwrap_or(0),
                     "lastVoteEpoch" => last_vote_epoch = v.parse().unwrap_or(0),
+                    "givenAwaySlots" => given_away = parse_slot_list(v),
                     _ => {}
                 }
             }
@@ -168,6 +172,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
         slots,
         current_epoch,
         last_vote_epoch,
+        given_away,
     }))
 }
 
@@ -180,6 +185,7 @@ pub fn save(
     slots: &[Option<NodeId>; CLUSTER_SLOTS],
     current_epoch: u64,
     last_vote_epoch: u64,
+    given_away: &[u16],
 ) -> std::io::Result<()> {
     let tmp_path = path.with_extension("conf.tmp");
 
@@ -250,13 +256,19 @@ pub fn save(
         out.push(b'\n');
     }
 
-    // Trailing vars line
-    writeln!(
+    // Trailing vars line. Earlier versions read past a var they do not
+    // know, so one written only when there is something to say keeps the
+    // file theirs to read.
+    write!(
         out,
         "vars currentEpoch {} lastVoteEpoch {}",
         current_epoch, last_vote_epoch
     )
     .unwrap();
+    if !given_away.is_empty() {
+        write!(out, " givenAwaySlots {}", format_slot_list(given_away)).unwrap();
+    }
+    out.push(b'\n');
 
     write_atomically(path, &tmp_path, &out)
 }
@@ -336,6 +348,7 @@ fn topology_fingerprint(
     slots: &[Option<NodeId>; CLUSTER_SLOTS],
     current_epoch: u64,
     last_vote_epoch: u64,
+    given_away: &[u16],
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -359,6 +372,7 @@ fn topology_fingerprint(
     slots.hash(&mut h);
     current_epoch.hash(&mut h);
     last_vote_epoch.hash(&mut h);
+    given_away.hash(&mut h);
     h.finish()
 }
 
@@ -417,7 +431,7 @@ fn save_then(
     let asked = std::time::Instant::now();
     let saving = state.save_lock.lock();
     let locked = asked.elapsed().as_millis();
-    let (nodes_snap, slots_snap, epoch, last_vote) = {
+    let (nodes_snap, slots_snap, epoch, last_vote, given_away) = {
         let nodes = state.nodes.read();
         let slots = state.slots.read();
         let epoch = state.current_epoch.load(Ordering::Relaxed);
@@ -431,16 +445,25 @@ fn save_then(
         for &slot in mine {
             slots_copy[slot as usize] = Some(me);
         }
-        (nodes.clone(), slots_copy, epoch, last_vote)
+        // Taken last (see `ClusterState::given_away`).
+        let given_away = state.given_away.lock().slots();
+        (nodes.clone(), slots_copy, epoch, last_vote, given_away)
     };
-    let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote);
+    let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote, &given_away);
     if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint && path.exists() {
         if let Some(publish) = publish {
             publish();
         }
         return Ok(());
     }
-    save(path, &nodes_snap, &slots_snap, epoch, last_vote)?;
+    save(
+        path,
+        &nodes_snap,
+        &slots_snap,
+        epoch,
+        last_vote,
+        &given_away,
+    )?;
     let deferred = DEFER_SYNC.with(|d| d.get());
     // A change to publish waits for the sync, with the lock held, so that a
     // sync that fails publishes nothing. A save with nothing to publish (the
@@ -487,6 +510,49 @@ fn save_then(
 
 fn io_err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
+}
+
+/// `0-1000,2000`: slots in order, as ranges, with no spaces (a value of the
+/// vars line).
+fn format_slot_list(slots: &[u16]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < slots.len() {
+        let start = slots[i];
+        let mut end = start;
+        while i + 1 < slots.len() && slots[i + 1] == end + 1 {
+            i += 1;
+            end = slots[i];
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if start == end {
+            out.push_str(&start.to_string());
+        } else {
+            out.push_str(&format!("{start}-{end}"));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// What [`format_slot_list`] wrote. A part that is not a slot or a range of
+/// them is skipped.
+fn parse_slot_list(s: &str) -> Vec<u16> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        let (Ok(a), Ok(b)) = (a.parse::<u16>(), b.parse::<u16>()) else {
+            continue;
+        };
+        if a <= b && (b as usize) < CLUSTER_SLOTS {
+            out.extend(a..=b);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Parse "ip:port@busport". The cluster bus port is conventionally
@@ -650,7 +716,7 @@ mod tests {
             .unwrap();
 
         let tmp = NamedTempFile::new().unwrap();
-        save(tmp.path(), &nodes, &slots, 7, 0).unwrap();
+        save(tmp.path(), &nodes, &slots, 7, 0, &[]).unwrap();
 
         let loaded = load(tmp.path()).unwrap().unwrap();
         assert_eq!(loaded.myself, me);
@@ -693,7 +759,7 @@ mod tests {
         }
 
         let tmp = NamedTempFile::new().unwrap();
-        save(tmp.path(), &nodes, &slots, 0, 0).unwrap();
+        save(tmp.path(), &nodes, &slots, 0, 0, &[]).unwrap();
 
         let loaded = load(tmp.path()).unwrap().unwrap();
         // All the slots we wrote should still be ours.
@@ -728,5 +794,54 @@ mod tests {
         }
         let ranges = compute_slot_ranges(&slots, me);
         assert_eq!(ranges, vec![(0, 2), (5, 5), (10, 11)]);
+    }
+
+    /// The slots a replica's master gave away (#517) survive a restart, on
+    /// the vars line, and a file without them, as earlier versions write
+    /// it, has none. The line keeps the pairs an earlier version reads.
+    #[test]
+    fn slots_given_away_round_trip() {
+        let me = generate_node_id();
+        let mut nodes = AHashMap::new();
+        nodes.insert(
+            me,
+            ClusterNode {
+                id: me,
+                ip: "127.0.0.1".into(),
+                client_port: 6380,
+                cluster_port: 16380,
+                flags: NodeFlags::MYSELF | NodeFlags::MASTER,
+                master_id: None,
+                config_epoch: 0,
+                ping_sent_ms: 0,
+                pong_received_ms: 0,
+                fail_since_ms: 0,
+                hostname: String::new(),
+                announced_client_port: 0,
+            },
+        );
+        let slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        let given: Vec<u16> = (0..=1000).chain([2000]).chain(16380..=16383).collect();
+        let tmp = NamedTempFile::new().unwrap();
+        save(tmp.path(), &nodes, &slots, 9, 4, &given).unwrap();
+        let text = fs::read_to_string(tmp.path()).unwrap();
+        assert!(
+            text.contains(
+                "vars currentEpoch 9 lastVoteEpoch 4 givenAwaySlots 0-1000,2000,16380-16383"
+            ),
+            "{text}"
+        );
+        let loaded = load(tmp.path()).unwrap().unwrap();
+        assert_eq!(loaded.given_away, given);
+        assert_eq!((loaded.current_epoch, loaded.last_vote_epoch), (9, 4));
+
+        save(tmp.path(), &nodes, &slots, 9, 4, &[]).unwrap();
+        let text = fs::read_to_string(tmp.path()).unwrap();
+        assert!(!text.contains("givenAwaySlots"), "{text}");
+        assert!(load(tmp.path()).unwrap().unwrap().given_away.is_empty());
+        assert_eq!(parse_slot_list("5-3,x,7,16384,1-2"), vec![1, 2, 7]);
     }
 }
