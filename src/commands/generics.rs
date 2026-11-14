@@ -460,30 +460,52 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // the keys that match are copied. Copying every key, and
             // matching the copies, was most of what a `KEYS` over millions
             // of keys cost.
+            //
+            // As `SCAN` does: the pattern is made ready once (`schedule:*`
+            // is a comparison of bytes, not the matcher's walk through the
+            // pattern for each key), a key that matches is told whether it
+            // is past its time from its own entry, and is written straight
+            // into the reply (#789).
+            let glob = super::glob_redis::Glob::new(pattern);
             let walk = || {
-                let mut matching: Vec<crate::store::Key> = Vec::new();
+                let mut found = Vec::new();
+                let mut returned = 0usize;
+                // Keys past their time: expired once the shard is let go of.
+                let mut past: Vec<crate::store::Key> = Vec::new();
                 for shard in db.iter() {
                     let map = read_lock!(shard);
-                    matching.extend(
-                        map.keys()
-                            .filter(|key| crate::commands::helpers::glob_match_bytes(pattern, key))
-                            .map(crate::store::Key::new),
-                    );
+                    for entry in map.entries() {
+                        let key = entry.key();
+                        if !glob.matches(key) {
+                            continue;
+                        }
+                        if entry
+                            .expires()
+                            .is_some_and(crate::commands::helpers::is_past)
+                        {
+                            past.push(crate::store::Key::new(key));
+                            continue;
+                        }
+                        write_bulk(&mut found, key);
+                        returned += 1;
+                    }
                 }
-                // A key past its time is not listed, and goes.
-                matching.retain(|key| !lazy_expire_on_read(ctx.store, *ctx.selected_db, key));
-                matching
+                // A key past its time is not listed, and goes. (A key
+                // written again since its shard was let go of is not: it was
+                // not there all along.)
+                for key in &past {
+                    lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
+                }
+                (found, returned)
             };
-            let matching =
+            let (found, returned) =
                 crate::commands::helpers::long_work(crate::commands::helpers::db_len(db), walk);
 
-            let mut buf = Vec::with_capacity(16 + matching.len() * 24);
+            let mut buf = Vec::with_capacity(found.len() + 16);
             buf.push(b'*');
-            buf.extend_from_slice(matching.len().to_string().as_bytes());
+            buf.extend_from_slice(returned.to_string().as_bytes());
             buf.extend_from_slice(b"\r\n");
-            for k in &matching {
-                write_bulk(&mut buf, k.as_bytes());
-            }
+            buf.extend_from_slice(&found);
             Some(buf)
         }
 

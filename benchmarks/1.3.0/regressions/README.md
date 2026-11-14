@@ -30,6 +30,7 @@ and why.
 | `11-migrate-conns` | #726 / #733 | connections the target of 2,000 `MIGRATE`s receives (a second server of the engine) |
 | `12-search-fanout` | #723 / #725 | 3-master cluster on one VM: connections each other master receives for 2,000 `FT.SEARCH` calls |
 | `13-cluster-reshard` | #294 / #724 | 3-master cluster on one VM, 3M keys: `redis-cli` 7.0.15 `--cluster reshard` of 1,000 slots |
+| `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one; `SDIFFSTORE big small` as a cost guard; worst `SADD` to the small set during `SUNION big small` (Tokio, 1M) |
 
 ## Running it
 
@@ -180,6 +181,7 @@ They are checked against the candidate only.
 | `rel` | within `pct` % of the recorded candidate value, in the worse direction; `abs` adds a slack in the metric's unit (the larger wins); `redis_plus` also allows up to Redis's value this session plus that much | throughput/time: 10 %; memory held: 5 %; RSS after a give-back: 25 % or 5 MiB; worst PING: max(1.5x recorded, Redis + 10 ms); #770 guard rows: 35 % (measured spread up to 28 %) |
 | `ratio` | the gain over v1.2.2 measured this session (v1.2.2/candidate for lower-is-better) is at least `keep` x the recorded gain | every claimed improvement: keep 60 % |
 | `vs_redis` | candidate at most `max_x` times worse than Redis this session | SCAN iterations: 1.3x |
+| `vs_v1_2_2` | candidate at most `max_x` times v1.2.2's value this session (below 1: that much better) | `KEYS user:99*` (04): 0.85x |
 | `bound` | absolute: `eq` (`"recorded"`: equal to the recorded value), `max`, `min` | counts (exact); worst PING on Tokio during a long command: 20 ms |
 | `info` | shown, never gated | call counts, PINGs over 10 ms, probes stalled |
 
@@ -255,6 +257,12 @@ Why a few rows differ from the plan's defaults:
   command holds up every connection. The fix will show up as an improvement.
 - `01-scan-match` `HSCAN`/`SSCAN`/`ZSCAN` (#770) are 10-20x slower than Redis
   today: gated only against getting slower than recorded.
+- `04-long-commands` `keys_cmd_ms`: its recorded value (161 ms, master
+  `2468f226`) was 15 % slower than v1.2.2; #789 made it about 0.6x v1.2.2's
+  time. Rather than re-record, the gate was tightened by hand: besides 10 %
+  over the recorded value, it must stay at most 0.85x v1.2.2's time measured
+  in the same session (0.61x in #789's runs, so the noise of a few % is far
+  from it; losing about half the gain fails).
 - Memory per item (`05`, `06`, `08`, `09`) is deterministic, so 5 % is wide;
   a few bytes of `abs` slack (1-4 B) keep the small values (6.2 B per one-field
   stream entry) from failing on an allocator rounding.
@@ -436,7 +444,7 @@ informational rows are in `baseline.json` and the summaries):
 | 04-long-commands / tokio | del_cmd_ms (ms) | 132.2 | 143.3 | 333.5 | rel 10% |
 | 04-long-commands / tokio | del_worst_ping_max_ms (ms) | 131.2 | 1.22 | 335.7 | max 20 |
 | 04-long-commands / tokio | del_worst_ping_ms (ms) | 131.0 | 0.94 | 332.7 | max 20 |
-| 04-long-commands / tokio | keys_cmd_ms (ms) | 141.1 | 161.3 | 216.5 | rel 10% |
+| 04-long-commands / tokio | keys_cmd_ms (ms) | 141.1 | 161.3 | 216.5 | rel 10%; <= 0.85x v1.2.2 |
 | 04-long-commands / tokio | keys_worst_ping_max_ms (ms) | 132.1 | 8.09 | 205.1 | max 20 |
 | 04-long-commands / tokio | keys_worst_ping_ms (ms) | 129.3 | 5.94 | 203.6 | max 20 |
 | 04-long-commands / tokio | scan_cmd_ms (ms) | 254.3 | 112.5 | 471.7 | rel 10% |
@@ -445,7 +453,7 @@ informational rows are in `baseline.json` and the summaries):
 | 04-long-commands / uring | del_cmd_ms (ms) | 136.4 | 134.3 | - | rel 10% |
 | 04-long-commands / uring | del_least_worst_ping_ms (ms) | 0.21 | 0.41 | - | rel 50% or +10 |
 | 04-long-commands / uring | del_worst_ping_ms (ms) | 135.8 | 132.9 | - | info |
-| 04-long-commands / uring | keys_cmd_ms (ms) | 145.6 | 153.6 | - | rel 10% |
+| 04-long-commands / uring | keys_cmd_ms (ms) | 145.6 | 153.6 | - | rel 10%; <= 0.85x v1.2.2 |
 | 04-long-commands / uring | keys_least_worst_ping_ms (ms) | 0.17 | 0.95 | - | rel 50% or +10 |
 | 04-long-commands / uring | keys_worst_ping_ms (ms) | 134.9 | 142.8 | - | info |
 | 04-long-commands / uring | scan_cmd_ms (ms) | 265.5 | 112.6 | - | rel 10% |
@@ -465,11 +473,52 @@ What this run shows besides the gated gains:
 - `KEYS user:99*` over 2M keys takes 161-164 ms on master against 141-142 ms
   on v1.2.2 on Tokio (about 15 % slower), and 154-163 ms against 146-149 ms on
   io_uring; `KEYS schedule:*` is twice
-  as fast. The gate holds today's value.
+  as fast. Fixed in #789 (below).
 - The incremental table growth (#780) raised the growth load's PING p99 on
   Tokio from 2.0 to 3.0 ms (and 0.7 to 1.5 ms on io_uring with one thread),
   while its worst PING fell from 112 to 9.7 ms.
 - `SCAN 0 MATCH user:99* COUNT 2000000` takes 112 ms instead of 254-265 ms.
+
+### #789: `KEYS` with a selective pattern
+
+`KEYS` matched every key in place through the general glob matcher
+(`glob_redis::match_from`): 136 instructions a key for `user:99*`, 76 % of
+the command. v1.2.2 copied every key and checked each one's time to live as
+well, twice the instructions, and was still faster: matching interleaved
+with the walk over 2M entries costs more time than its instruction count
+says. Since #789 `KEYS` makes the pattern ready once (`glob_redis::Glob`,
+as `SCAN` does), tells most keys by their first or last byte, and writes
+matches straight into the reply. Not related to #757: the loss was the same
+on io_uring, where `long_work` does nothing.
+
+Instructions of one `KEYS` over `DEBUG POPULATE 2000000 user` (callgrind,
+whole server, Tokio):
+
+| pattern | v1.2.2 | master `5809ac61` | #789 |
+|---|---:|---:|---:|
+| `user:99*` (11,111 keys) | 697.9 M | 358.5 M | 184.9 M |
+| `schedule:*` (none) | 491.3 M | 150.1 M | 110.0 M |
+
+Wall time on a D4s_v5, median of 7 (9 for suite 01's keyspace), one engine
+at a time:
+
+| | v1.2.2 | master `5809ac61` | #789 |
+|---|---:|---:|---:|
+| `KEYS user:99*`, Tokio, no other client | 137-139 ms | 143-145 ms | 83-84 ms |
+| same, with suite 04's four PING probes | 137-138 ms | 153-155 ms | 87 ms |
+| same, io_uring, no other client | 136-138 ms | 142-146 ms | 83-84 ms |
+| suite 01's keyspace: `KEYS schedule:*` | 113 ms | 57 ms | 54 ms |
+| suite 01's keyspace: `KEYS user:99*` | 135 ms | 144 ms | 82 ms |
+| suite 01's keyspace: `KEYS *:1999` | 203 ms | 309 ms | 59 ms |
+
+Suites 01 and 04 with the fix (`results/pr789-d4s_v5`, compared with the
+baseline recorded above, the new gate included): every gate passed;
+`keys_cmd_ms` 90.2 ms against v1.2.2's 136.9 on Tokio (0.66x) and 87.0
+against 141.8 on io_uring (0.61x), `keys_schedule_ms` 53.7 ms (recorded
+60.4), and the `SCAN` rows within their recorded values. Two more runs of
+the same build before the gate was added gave 90.0/87.9 ms (0.61x/0.61x)
+and 97.5/94.3 ms (0.72x/0.67x, before the comparison was inlined). The probes' extra 10 ms on master is the PINGs being served
+meanwhile, which is #757's point: v1.2.2 served none.
 
 ## Recorded run, suites 05-13
 
@@ -612,9 +661,59 @@ What these runs show besides the gated gains:
 - `redis-cli --cluster reshard` on master is 3.5-4x slower than on Redis
   (25-27 s against 7 s); #724 says the rest is mostly `MIGRATE` itself.
 
+## Recorded run, suite 14
+
+Recorded 2026-11-14 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C, a
+fresh VM of the same image), `FULL=1 --only 14 --record` with the harness of
+master `6297d818` (host-speed rules); the candidate is commit `219b9656` of
+#798, `cargo build --release`. Runs: `pr759-d4s_v5` (recorded) and
+`pr759-d4s_v5-rerun` (the noise check: every gate passed, host factor
+1.01x). About 6.5 minutes with `FULL=1`, most of it loading 20M members into
+each engine and the `SDIFFSTORE` rows.
+
+Medians of 5 timed runs (ms; `SUNION` 3), recorded run:
+
+| N | command | v1.2.2 | candidate | Redis 8.10.2 | gate |
+|---|---|---:|---:|---:|---|
+| 1M | `SINTER big small` | 95.75 | 2.33 | 2.56 | rel 50% or 2 ms; keep 60% of gain; <= 2x Redis |
+| 1M | `SINTER small big` | 69.5 | 2.09 | 2.30 | same |
+| 1M | `SINTERCARD 2 big small` | 92.7 | 0.18 | 0.46 | rel 50% or 2 ms |
+| 1M | `... LIMIT 100` | 93.2 | 0.055 | 0.063 | rel 50% or 2 ms |
+| 1M | `SINTERSTORE dst big small` | 93.7 | 0.30 | 0.85 | rel 50% or 2 ms |
+| 1M | `SDIFF small big` | 69.9 | 1.95 | 2.57 | as `SINTER` |
+| 1M | `SDIFFSTORE dst big small` | 288.1 | 253.6 | 314.2 | rel 25% (cost guard) |
+| 5M | `SINTER big small` | 535.3 | 2.22 | 3.87 | as above |
+| 5M | `SINTER small big` | 446.3 | 2.06 | 3.52 |  |
+| 5M | `SINTERCARD 2 big small` | 533.3 | 0.22 | 1.56 |  |
+| 5M | `... LIMIT 100` | 533.4 | 0.054 | 0.12 |  |
+| 5M | `SINTERSTORE dst big small` | 533.3 | 0.48 | 2.52 |  |
+| 5M | `SDIFF small big` | 447.2 | 2.03 | 3.94 |  |
+| 5M | `SDIFFSTORE dst big small` | 1,645 | 1,424 | 1,825 |  |
+| 20M | `SINTER big small` | 2,573 | 2.29 | 4.76 |  |
+| 20M | `SINTER small big` | 2,431 | 2.10 | 3.82 |  |
+| 20M | `SINTERCARD 2 big small` | 2,568 | 0.30 | 1.89 |  |
+| 20M | `... LIMIT 100` | 2,571 | 0.057 | 0.13 |  |
+| 20M | `SINTERSTORE dst big small` | 2,573 | 0.38 | 2.84 |  |
+| 20M | `SDIFF small big` | 2,457 | 2.01 | 4.70 |  |
+| 20M | `SDIFFSTORE dst big small` | 7,993 | 6,899 | 8,067 |  |
+| 1M, Tokio | `SUNION big small` | 1,330 | 1,331 | 1,305 | rel 25% |
+| 1M, Tokio | worst `SADD small` during it | 362.7 | 0.48 | 321.9 | max 20 ms (jitter: not scaled) |
+
+The replies (2,097 members at 1M and 20M, 2,098 at 5M; 1,998-1,999 for
+`SDIFF`; the `SDIFFSTORE` and `SUNION` sizes) are the same on all three
+engines and gated exactly. The candidate's spread between the two runs:
+-8 to +4 % on `SINTER`/`SDIFF`, 0 to +3 % on `SDIFFSTORE`, -1 % on
+`SUNION`, and -22 to +4 % on the count-only rows (0.05-0.48 ms: round-trip
+noise, hence no ratio or Redis gate on them); the worst `SADD` was 0.48 and
+0.43 ms. The `SINTER`/`SDIFF` times no longer depend on N: what is left is
+the round trip and redis-py building a Python set of ~2,000 members.
+`SDIFFSTORE big small` and `SUNION` walk all of `big` on every engine; they
+are there so that cost does not grow, and so a writer of the small set is
+not held up by the walk (v1.2.2 and Redis hold it for the whole command).
+
 ## Not covered
 
-Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13).
+Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759, after that table).
 From its costs table, these are not re-measured by this suite:
 
 - Instructions per command from callgrind (`GET`/`SET` within 0.1 % for #724,

@@ -179,6 +179,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A grouped `FT.AGGREGATE` reports how many groups there are (#761).** The
+  first element of the reply (`total_results` under RESP3) was the number of
+  rows on the page, so `GROUPBY 1 @f REDUCE COUNT 0 AS n LIMIT 0 10` over a
+  thousand groups said 10. It now says 1000, as Redis 8.10 does, which is
+  what clients such as redis-py's `AggregateResult.total` page by. It counts
+  the groups the last `GROUPBY` made, before `LIMIT` or `SORTBY ... MAX` cut
+  them down; with `WITHCURSOR` the first page carries it and `FT.CURSOR READ`
+  answers 0 after. A `FILTER` after the `GROUPBY`, and aggregations without a
+  `GROUPBY`, are left as they were.
+
 - **Geo coordinates and distances are written as Redis 8.10 writes them
   (#701).** Under RESP2, `GEOPOS` and `WITHCOORD` give the fewest digits
   that read back as the same coordinate (`13.361389338970184`), not 17
@@ -245,6 +255,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   negative" (Redis 8.10.2 waits for ever on `-1e-343`), and a hexadecimal
   float too small or too large for a double is "not a float" (Redis: 1 ms,
   or "out of range"). Thanks to @francoXwrld for the fix.
+
+- **`KEYS` with a pattern that matches few keys is no longer slower than in
+  1.2.2 (#789).** `KEYS` matched each key in place through the general glob
+  matcher, about 136 instructions a key for `user:99*`, and was 5-15 %
+  slower than 1.2.2 although it no longer copies every key. It now makes
+  the pattern ready once, as `SCAN` does, so `prefix:*`, `*suffix` and
+  `*part*` are told by comparing bytes (most keys by their first or last
+  byte alone), and writes the keys that match straight into the reply.
+  Over 2,000,000 keys, `KEYS user:99*` went from 144 ms (1.2.2: 137 ms) to
+  83 ms on both I/O models, and `KEYS *:1999` from 309 ms to 59 ms.
+  `SCAN`, `HSCAN`, `SSCAN` and `ZSCAN` use the same comparison, now
+  inlined.
 
 - **`Q8` and `BIN` vector sets search and load at full speed on x86-64
   (#793).** The int8 dot product, the Hamming distance and quantizing
@@ -384,6 +406,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own thread (#762). In a build with Lua and `lua-parallel-scripts yes`,
   `KEYS` and `SCAN` still run alone, as before, so as not to see a script
   part-way through.
+
+- **`SINTER` of a big set with a small one costs the small set's size, not
+  the big one's (#759).** `SINTER`, `SINTERSTORE`, `SINTERCARD`, `SDIFF`,
+  `SDIFFSTORE` and `SUNION` copied every set they named out of the store
+  before working on the copies. They now read the sets in place, an
+  intersection walks the smallest set and looks its members up in the
+  others, a difference walks only the first set, and `SINTERCARD` stops at
+  its `LIMIT`. `SINTER` of a 20M-member set with a 4,096-member one went
+  from 2,573 ms to 2.3 ms (Redis 8.10.2: 4.8 ms), and `SINTERCARD` of the
+  two from 2,568 ms to 0.30 ms (Redis: 1.9 ms); at 1M members, 95.8 ms to
+  2.3 ms (Redis: 2.6 ms). `SUNION` reads one set at a time, so an `SADD`
+  to the small set no longer waits for a union with a big one (worst 0.5 ms
+  against 363 ms during `SUNION` of 1M and 4,096 members). Replies are the
+  same as before.
 
 - **A full `SCAN … MATCH` over a large keyspace no longer trails Redis
   (#751).** Each call hashed every key of the shard it was in to find its
