@@ -2000,7 +2000,10 @@ fn test_ft_aggregate_sortby_limit() {
         "3",
     ]);
     let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 3, "LIMIT 3 should return 3 rows");
+    // The total is the number of groups (5), as Redis 8.10 reports it, not
+    // the page; the page is the 3 rows after it.
+    assert_eq!(arr[0].as_int(), 5, "the total is the number of groups");
+    assert_eq!(arr.len() - 1, 3, "LIMIT 3 should return 3 rows");
 
     // Rows should be sorted by category ASC: a, b, c
     let rows: Vec<&[RespValue]> = arr[1..].iter().map(|v| v.as_array()).collect();
