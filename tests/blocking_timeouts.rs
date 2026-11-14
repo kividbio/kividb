@@ -356,3 +356,40 @@ fn rpoplpush_and_lmove_on_an_empty_list_answer_with_a_null_bulk_string() {
         }
     }
 }
+
+#[test]
+fn blocking_timeout_extreme_floats() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut c = server.conn(2);
+
+        // Tiny but real number: rounds to 1ms, returns nil - not an error, not a hang.
+        assert_eq!(
+            c.cmd(&["BLPOP", "n:list", "1e-343"]),
+            "*-1\r\n",
+            "{io} 1e-343"
+        );
+        // Exponent absurdly small: not a float.
+        assert_eq!(
+            c.cmd(&["BLPOP", "n:list", "1e-5000"]),
+            "-ERR timeout is not a float or out of range\r\n",
+            "{io} 1e-5000"
+        );
+        // Infinity / overflow: out of range.
+        assert_eq!(
+            c.cmd(&["BLPOP", "n:list", "inf"]),
+            "-ERR timeout is out of range\r\n",
+            "{io} inf"
+        );
+        assert_eq!(
+            c.cmd(&["BLPOP", "n:list", "2e308"]),
+            "-ERR timeout is out of range\r\n",
+            "{io} 2e308"
+        );
+        assert_eq!(
+            c.cmd(&["BLPOP", "n:list", "1e4000"]),
+            "-ERR timeout is out of range\r\n",
+            "{io} 1e4000"
+        );
+    }
+}

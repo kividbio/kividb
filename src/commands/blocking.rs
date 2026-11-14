@@ -49,6 +49,7 @@
 //! what Redis does: a blocking command inside `MULTI` never blocks, it returns
 //! its empty-handed reply.
 
+use crate::resp::write::resp_error;
 use crate::wait_table::Value;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -224,20 +225,121 @@ pub struct Interrupted {
 /// float (hexadecimal included), not negative, and not so large that the
 /// deadline in milliseconds would overflow.
 pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
-    use crate::resp::write::resp_error;
-    let Some(secs) = crate::commands::zset::parse_score(raw).filter(|t| t.is_finite()) else {
-        return Err(resp_error("ERR timeout is not a float or out of range"));
+    let text = std::str::from_utf8(raw).unwrap_or("");
+    match crate::commands::zset::parse_score(raw) {
+        Some(v) => {
+            // `1e-343` underflows to 0.0 in f64, but as written e no be zero.
+            // Na tiny but real timeout -> 1ms, no be 0.
+            if v == 0.0 && !is_zero_written_timeout(text) {
+                return Ok(0.001);
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if v * 1000.0 + now_ms as f64 >= i64::MAX as f64 {
+                return Err(resp_error("ERR timeout is out of range"));
+            }
+            return Ok(v);
+        }
+        None => {
+            // parse_score refused am. Let Rust f64 parser decide,
+            // no magic -1000 cut-off. If e parse to 0 but no be
+            // written zero, na underflow -> 1ms. If e fail to parse
+            // at all, check exponent: > 308 na overflow.
+            if let Ok(v) = text.parse::<f64>() {
+                if v == 0.0 && !is_zero_written_timeout(text) {
+                    return Ok(0.001);
+                }
+                if !v.is_finite() {
+                    return Err(resp_error("ERR timeout is out of range"));
+                }
+                return Ok(v);
+            }
+            if let Some(exp) = timeout_exponent(text) {
+                if exp > 308 {
+                    return Err(resp_error("ERR timeout is out of range"));
+                }
+                // exp <= 308 but parse still fail, and no be written zero:
+                // na tiny underflow, no be invalid float.
+                if !is_zero_written_timeout(text) {
+                    return Ok(0.001);
+                }
+                return Ok(0.0);
+            }
+            return Err(resp_error("ERR timeout is not a float or out of range"));
+        }
+    }
+}
+
+// Is the number zero as written? e.g. "0", "0.0", "0e10", "-0.00e-5"
+// Full validation: one optional sign, mantissa must be only digits/dot
+// with at least one digit, all digits must be '0', optional valid exponent.
+fn is_zero_written_timeout(text: &str) -> bool {
+    let Some((mantissa, _exp)) = split_timeout_parts(text) else {
+        return false;
     };
-    if secs < 0.0 {
-        return Err(resp_error("ERR timeout is negative"));
+    !mantissa.is_empty()
+        && mantissa.bytes().all(|b| b == b'0' || b == b'.')
+        && mantissa.bytes().any(|b| b.is_ascii_digit())
+}
+
+// Split "[-]mantissa[eE][+/-]exponent" with FULL validation.
+// Returns None if any part get extra 'e', extra sign, empty mantissa,
+// empty exponent, or non-digit for exponent.
+fn split_timeout_parts(text: &str) -> Option<(&str, Option<&str>)> {
+    let s = text.trim();
+    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if s.is_empty() {
+        return None;
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_millis() as f64);
-    if secs * 1000.0 + now_ms >= i64::MAX as f64 {
-        return Err(resp_error("ERR timeout is out of range"));
+    let (mantissa, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (s, None),
+    };
+    if mantissa.is_empty() || mantissa.contains(['e', 'E']) {
+        return None;
     }
-    Ok(secs)
+    let mut dot = false;
+    let mut digit = false;
+    for b in mantissa.bytes() {
+        match b {
+            b'0'..=b'9' => digit = true,
+            b'.' if !dot => dot = true,
+            _ => return None,
+        }
+    }
+    if !digit {
+        return None;
+    }
+    if let Some(e) = exp {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        if e.is_empty() || !e.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some((mantissa, exp))
+}
+
+// Exponent after 'e'/'E', e.g. -343 for "1e-343". None if no exponent
+// or if the whole text no be valid float syntax.
+fn timeout_exponent(text: &str) -> Option<i64> {
+    let (_, exp) = split_timeout_parts(text)?;
+    let exp = exp?;
+    let exp = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+    let mut value: i64 = 0;
+    for b in exp.bytes() {
+        value = value.saturating_mul(10).saturating_add((b - b'0') as i64);
+        if value > 100_000 {
+            value = 100_000;
+        }
+    }
+    let negative = text
+        .trim()
+        .split_once(['e', 'E'])
+        .map(|(_, e)| e.starts_with('-'))
+        .unwrap_or(false);
+    Some(if negative { -value } else { value })
 }
 
 /// Mark an error reply as one a woken client is told even though it says
@@ -605,6 +707,7 @@ pub fn wait_for_keys(
     let outcome = match (reply, remaining) {
         (Some(reply), _) => Ok(reply),
         (None, Some(remaining)) if !timed_out => Err(remaining),
+
         (None, _) => {
             crate::stats::record_miss();
             // A wait that ran out is answered with a null array. A caller
@@ -1112,5 +1215,16 @@ mod gone_resume_tests {
             );
             assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
         });
+    }
+
+    #[test]
+    fn parse_timeout_underflow_is_1ms() {
+        assert_eq!(parse_timeout(b"1e-343").unwrap(), 0.001);
+        assert_eq!(parse_timeout(b"1e-1001").unwrap(), 0.001);
+        assert_eq!(parse_timeout(b"0").unwrap(), 0.0);
+        assert_eq!(parse_timeout(b"0.0e10").unwrap(), 0.0);
+        assert!(parse_timeout(b"1e2e3").is_err());
+        assert!(parse_timeout(b"e999").is_err());
+        assert!(parse_timeout(b"1e309").is_err());
     }
 }
