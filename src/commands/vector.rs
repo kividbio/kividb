@@ -894,7 +894,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // ── Parse and execute pipeline clauses ────────────────────────────────────
     // To the same deadline: GROUPBY, APPLY, FILTER and SORTBY over a large
     // scan cost as much as the scan.
-    let (rows, cut) = crate::commands::aggregate_pipeline::run_within(rows, cmd, 3, deadline);
+    let (rows, cut, groups) =
+        crate::commands::aggregate_pipeline::run_counted(rows, cmd, 3, deadline);
     timed_out |= cut;
     if cut && crate::commands::search::on_timeout_fails() {
         return Some(resp_error("Timeout limit was reached"));
@@ -1022,13 +1023,14 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             count,
             max_idle,
             timed_out,
+            groups,
         ));
     }
+    // A grouped aggregation reports how many groups there were, not how many
+    // are on this page; any other reports the page.
+    let total = groups.unwrap_or(rows_out.len());
     Some(crate::commands::search_tools::rows_reply(
-        ctx.resp,
-        rows_out.len(),
-        &rows_out,
-        timed_out,
+        ctx.resp, total, &rows_out, timed_out,
     ))
 }
 // ── format_f64 ────────────────────────────────────────────────────────────────
