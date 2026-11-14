@@ -1028,19 +1028,21 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
             resp_array(vec![]),
         ],
     );
-    Some(if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
-        resp_map_for(
-            3,
-            vec![
-                resp_bulk_str("Results"),
-                reply,
-                resp_bulk_str("Profile"),
-                profile,
-            ],
-        )
-    } else {
-        resp_array(vec![reply, profile])
-    })
+    Some(
+        if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
+            resp_map_for(
+                3,
+                vec![
+                    resp_bulk_str("Results"),
+                    reply,
+                    resp_bulk_str("Profile"),
+                    profile,
+                ],
+            )
+        } else {
+            resp_array(vec![reply, profile])
+        },
+    )
 }
 
 #[cfg(test)]

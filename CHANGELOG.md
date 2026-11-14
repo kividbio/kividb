@@ -226,7 +226,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FT.PROFILE`, `FT.HYBRID`, `VEMB` and `ARINFO` took the connection's
   protocol, so inside a script they ignored `redis.setresp`. They now follow
   it, as the other commands do: RESP2 shapes by default, RESP3 ones after
-  `redis.setresp(3)`.
+  `redis.setresp(3)`. A script can now read a RESP3 map or set whose key is
+  a status reply, as `FT.SPELLCHECK`'s `results` is (#797): as in Redis, the
+  key is the table `{ok='results'}`. It was an error ("map key must be
+  string or integer").
 
 ### Fixed
 

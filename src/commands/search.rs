@@ -2877,7 +2877,12 @@ fn coordinate(
         return Err("Timeout limit was reached".into());
     }
     Ok(encode_page(
-        search_resp(ctx), &page, total, args, nocontent, timed_out,
+        search_resp(ctx),
+        &page,
+        total,
+        args,
+        nocontent,
+        timed_out,
     ))
 }
 

@@ -2028,6 +2028,7 @@ fn search_replies_inside_a_script_follow_setresp() {
     let aggregate = "redis.call('FT.AGGREGATE','idx439','hello','LOAD','1','@t')";
     let config = "redis.call('FT.CONFIG','GET','*')";
     let info = "redis.call('FT.INFO','idx439')";
+    let spell = "redis.call('FT.SPELLCHECK','idx439','helo')";
     let nil: &[u8] = b"$3\r\nnil\r\n";
     let table: &[u8] = b"$5\r\ntable\r\n";
     let cases: Vec<(String, &[u8])> = vec![
@@ -2047,6 +2048,16 @@ fn search_replies_inside_a_script_follow_setresp() {
         (format!("redis.setresp(3) return type({config}.map)"), table),
         (format!("return type({info}.map)"), nil),
         (format!("redis.setresp(3) return type({info}.map)"), table),
+        // FT.SPELLCHECK's RESP3 map is keyed by the simple string `results`,
+        // which a script sees as the table `{ok='results'}` (#797).
+        (format!("return type({spell}.map)"), nil),
+        (
+            format!(
+                "redis.setresp(3) local r = {spell} \
+                 for k in pairs(r.map) do return k.ok end"
+            ),
+            b"$7\r\nresults\r\n",
+        ),
     ];
     for (script, expected) in &cases {
         for (name, c) in [("RESP2", &mut c2), ("RESP3", &mut c3)] {
