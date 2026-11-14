@@ -40,6 +40,7 @@ pub mod monitor;
 pub mod node_tls;
 pub mod output_limits;
 pub mod pause;
+mod ping;
 pub mod protected_mode;
 mod pubsub;
 pub mod redis_settings;
@@ -295,7 +296,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         |option: &str| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine);
     cfg.bind_explicit =
         matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
-    match cfg.apply_config_file(&from_cli) {
+    let config_file = cfg.apply_config_file(&from_cli);
+    // `--ping` is a client: it needs the ports, TLS files and password the
+    // command line and config file give, and nothing a server does after
+    // this. It prints no warnings about the file: health checks run every few
+    // seconds, and the server has already logged them.
+    if cfg.ping {
+        if let Err(e) = config_file {
+            eprintln!("kividb --ping: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(ping::run(&cfg));
+    }
+    match config_file {
         Ok(warnings) => {
             for w in warnings {
                 log_warn!("{w}");

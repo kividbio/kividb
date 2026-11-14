@@ -382,6 +382,22 @@ volumes:
   kividb-data:
 ```
 
+**Health check.** From 1.3.0 the binary checks itself: `kividb --ping` sends `PING` to the
+server in the container and exits 0 on `PONG`, 1 otherwise, with no shell needed. It reads
+the password from `KIVIDB_PASSWORD`, so pass it to the container's environment too:
+
+```yaml
+    environment:
+      KIVIDB_PASSWORD: "${KIVIDB_PASSWORD:?set KIVIDB_PASSWORD}"
+    healthcheck:
+      test: ["CMD", "kividb", "--ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+```
+
+[CONFIGURATION.md](CONFIGURATION.md#health-checks) has the options.
+
 ### The update check in containers
 
 Each time it starts, KiviDB makes one HTTPS request to GitHub to see whether a newer
@@ -409,9 +425,10 @@ showing up in vulnerability scans, and KiviDB uses none of them. Debug from outs
 - **Look at the data files** through the volume, from another container:
   `docker run --rm -v kividb-data:/data busybox ls -l /data`, or copy one out with
   `docker cp <name>:/home/kividb/dump.kdb .`.
-- **Health checks** can't run `redis-cli` in the container. `["CMD", "kividb", "--version"]`
-  only proves the binary runs. Use a TCP check on the port instead (Kubernetes
-  `tcpSocket`), or have the check run `redis-cli ping` from another container.
+- **Health checks** can't run `redis-cli` in the container. From 1.3.0, use
+  `["CMD", "kividb", "--ping"]` (see [Compose](#compose)); on Kubernetes, an `exec` probe
+  with `command: ["kividb", "--ping"]`. On earlier images, `["CMD", "kividb", "--version"]`
+  only proves the binary runs: use a TCP check on the port instead (Kubernetes `tcpSocket`).
 
 **io_uring in containers:** Docker's default seccomp profile blocks io_uring on recent
 versions, and KiviDB then falls back to Tokio. To allow it on a Linux host, run with

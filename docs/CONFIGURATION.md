@@ -4,6 +4,7 @@
 - [Protected mode](#protected-mode)
 - [Configuration](#configuration)
 - [TLS](#tls)
+- [Health checks](#health-checks)
 - [Logs and errors](#logs-and-errors)
 - [Startup update check](#startup-update-check)
 
@@ -138,6 +139,34 @@ does `tls-port` on a node with `tls-cluster yes`.
 without `--tls`) fails the handshake; at `--loglevel verbose` the server logs
 `TLS: handshake failed from <address>`. For
 memtier_benchmark, add `--tls` (and `--tls-skip-verify` for a self-signed certificate).
+
+## Health checks
+
+`kividb --ping` checks that a server is up, with nothing but the binary: the Docker images
+have no shell and no `redis-cli`, so it is the health check to use there, in exec form.
+
+```yaml
+healthcheck:
+  test: ["CMD", "kividb", "--ping"]
+```
+
+It connects to `127.0.0.1` on the server's port, sends `PING`, prints `PONG` and exits **0**
+if the server answers `PONG`. Anything else (no connection, a refused password, an error
+reply, or no reply within about a second) exits **1**, with the reason on standard error. It starts no server, writes no log and does not touch the data directory.
+
+It reads the same options and config file as the server, so give it what the server was
+started with:
+
+- **Port**: `--port`, or `port` in the config file. With `--port 0` it connects to
+  `--tls-port` over TLS. `--ping-port` picks another port, and `--ping-host` another address
+  (the server must accept clients there).
+- **Password**: `KIVIDB_PASSWORD` in the environment, else `requirepass` from the config file
+  or the command line. Prefer the environment variable or the config file: an argument shows in
+  `ps` and `docker inspect`. A password the server does not need is ignored.
+- **TLS**: on the TLS port it uses TLS. With `--tls-ca-cert-file`, it checks the server's
+  certificate chain against that CA (not the name, as between nodes) and presents
+  `tls-client-cert-file`, or `tls-cert-file`, which `tls-auth-clients yes` asks for. Without a
+  CA file it takes the server's certificate as it is. TLS needs the `tls` or `full` build.
 
 ## Logs and errors
 
