@@ -1372,16 +1372,21 @@ impl ShardMap {
     /// pages are found from the slots alone: two passes over the table
     /// that touch only the entries of the page. It used to hash every key
     /// of the shard, visiting each entry, for every page (#751).
+    ///
+    /// While the table grows, both tables are counted and walked: a key
+    /// still in the one it grows from is at its position as much as one
+    /// already moved, and a move between pages keeps the slot, fragment
+    /// and all, so a key moved mid-scan keeps its position too.
     pub fn scan(&self, from: u64, want: usize, mut visit: impl FnMut(EntryView<'_>)) -> u64 {
         const POSITIONS: usize = SCAN_POSITIONS as usize;
         let Ok(from) = usize::try_from(from) else {
             return 0;
         };
-        if from >= POSITIONS || self.table.is_empty() {
+        if from >= POSITIONS || self.is_empty() {
             return 0;
         }
         let mut at = [0u32; POSITIONS];
-        for slot in self.table.iter() {
+        for slot in self.slots() {
             at[slot.scan_position() & (POSITIONS - 1)] += 1;
         }
         let mut taken = 0usize;
@@ -1392,7 +1397,7 @@ impl ShardMap {
         }
         let next = (end..POSITIONS).find(|&p| at[p] != 0).unwrap_or(0);
         if taken > 0 {
-            for slot in self.table.iter() {
+            for slot in self.slots() {
                 if (from..end).contains(&slot.scan_position()) {
                     visit(EntryView {
                         entry: slot.entry(),
@@ -2766,6 +2771,54 @@ mod tests {
             in_old(&map).into_iter().map(String::into_bytes).collect();
         assert!(picked.iter().any(|k| olds.contains(k)));
         assert!(picked.iter().any(|k| !olds.contains(k)));
+    }
+
+    /// A `SCAN` during a growth sees every key, those still in the table
+    /// grown from as well as those moved, once: a growth that stays where
+    /// it is, and one that moves on between pages until it is done.
+    #[test]
+    fn a_scan_during_a_growth_sees_every_key_once() {
+        let (mut map, n) = growing();
+        let old: Vec<Vec<u8>> = in_old(&map).into_iter().map(String::into_bytes).collect();
+        assert!(old.len() > n / 2);
+        let seen = scan_all(&mut map, 10, |map, _| assert!(map.is_growing()));
+        assert!(map.is_growing(), "the growth stayed partly done");
+        assert_eq!(seen.len(), n);
+        assert!(seen.values().all(|&times| times == 1));
+        assert!(old.iter().all(|key| seen.contains_key(key)));
+        // A page that ends at a position with keys in both tables takes all
+        // of them: the page sizes add up to the keys.
+        let mut from = 0;
+        let mut total = 0;
+        loop {
+            from = map.scan(from, 1, |_| total += 1);
+            if from == 0 {
+                break;
+            }
+        }
+        assert_eq!(total, n);
+
+        // Writes and steps of the growth between pages move keys from the
+        // old table to the new one, each keeping its position: none is
+        // missed or seen twice, through to the end of the growth.
+        let (mut map, n) = growing();
+        let mut added = 0usize;
+        let mut grew_through = 0;
+        let seen = scan_all(&mut map, 10, |map, _| {
+            if map.is_growing() {
+                grew_through += 1;
+            }
+            map.insert(format!("new:{added}"), s("v"));
+            added += 1;
+            map.step_growth(GROWTH_STEP);
+            each_key_once(map);
+        });
+        assert!(!map.is_growing(), "the growth finished mid-scan");
+        assert!(grew_through > 20, "{grew_through} pages while growing");
+        for i in 0..n {
+            assert_eq!(seen.get(format!("g{i}").as_bytes()), Some(&1), "g{i}");
+        }
+        assert!(seen.values().all(|&times| times == 1));
     }
 
     #[test]
