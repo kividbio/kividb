@@ -625,14 +625,22 @@ pub(crate) fn drop_orphans(env: &Env, wanted: Option<Vec<u16>>) -> Result<u64, S
 /// The thread of a `CLUSTER DROPORPHANS`.
 fn run_drop(env: &Env, slots: &[u16], owners: &[(u16, NodeId)]) {
     let cluster = &env.cluster;
+    // A panic below would leave the run `running` for good, and every
+    // later `CLUSTER DROPORPHANS` refused until a restart.
+    let mut unfinished = Unfinished {
+        orphans: &cluster.orphans,
+        done: false,
+    };
     let owner_of: ahash::AHashMap<u16, NodeId> = owners.iter().copied().collect();
+    // One connection per owner for the whole run.
+    let mut asker = migration::NodeAsker::default();
     let outcome = (|| {
-        confirm_with_owners(env, owners)?;
+        confirm_with_owners(env, &mut asker, owners)?;
         // The asking took a moment: the checks here once more.
         check_droppable(cluster, slots)?;
         same_owners(cluster, owners)?;
         let mut confirm = |keys: &[crate::store::Key]| -> Result<Vec<bool>, String> {
-            confirm_keys(env, &owner_of, keys)
+            confirm_keys(env, &mut asker, &owner_of, keys)
         };
         migration::drop_orphans_confirmed(
             cluster,
@@ -677,7 +685,34 @@ fn run_drop(env: &Env, slots: &[u16], owners: &[(u16, NodeId)]) {
             cluster.orphans.finish_drop("stopped", 0, 0, &why);
         }
     }
+    unfinished.done = true;
     cluster.orphans.ask(Some("after CLUSTER DROPORPHANS"));
+}
+
+/// Ends a `CLUSTER DROPORPHANS` that did not get to its end (a panic) as
+/// `stopped`, so that another may run.
+struct Unfinished<'a> {
+    orphans: &'a Orphans,
+    done: bool,
+}
+
+impl Drop for Unfinished<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        log_warn!(
+            "Cluster: CLUSTER DROPORPHANS ended on an internal error; the keys it had not \
+             deleted are left, and CLUSTER ORPHANSLOTS lists them"
+        );
+        self.orphans.finish_drop(
+            "stopped",
+            0,
+            0,
+            "internal error: see the log; the keys left are listed by CLUSTER ORPHANSLOTS",
+        );
+        self.orphans.ask(Some("after CLUSTER DROPORPHANS"));
+    }
 }
 
 /// Whether each slot of `owners` still has that owner in this node's slot
@@ -910,7 +945,11 @@ fn by_owner<T: Copy>(items: impl IntoIterator<Item = (NodeId, T)>) -> Vec<(NodeI
 /// whether it owns the slot in its own table and is not moving it. Any slot
 /// it does not, or an owner that cannot be asked (unreachable, or of a
 /// version without the command), refuses the lot.
-fn confirm_with_owners(env: &Env, owners: &[(u16, NodeId)]) -> Result<(), String> {
+fn confirm_with_owners(
+    env: &Env,
+    asker: &mut migration::NodeAsker,
+    owners: &[(u16, NodeId)],
+) -> Result<(), String> {
     let me = env.cluster.myself();
     for (owner, slots) in by_owner(owners.iter().map(|&(slot, owner)| (owner, slot))) {
         let owner_id = node_id_str(&owner).to_string();
@@ -922,7 +961,7 @@ fn confirm_with_owners(env: &Env, owners: &[(u16, NodeId)]) -> Result<(), String
             &me[..],
         ];
         parts.extend(words.iter().map(|w| w.as_bytes()));
-        let answer = migration::ask_node(env, &owner, &parts).map_err(|e| {
+        let answer = asker.ask(env, &owner, &parts).map_err(|e| {
             format!(
                 "could not ask the owner of slot {}, {owner_id}, whether it owns the slot ({e})",
                 slots[0]
@@ -947,6 +986,7 @@ fn confirm_with_owners(env: &Env, owners: &[(u16, NodeId)]) -> Result<(), String
 /// moving it, or cannot be asked.
 fn confirm_keys(
     env: &Env,
+    asker: &mut migration::NodeAsker,
     owner_of: &ahash::AHashMap<u16, NodeId>,
     keys: &[crate::store::Key],
 ) -> Result<Vec<bool>, String> {
@@ -980,7 +1020,7 @@ fn confirm_keys(
             &me[..],
         ];
         parts.extend(indexes.iter().map(|&i| keys[i].as_bytes()));
-        let answer = migration::ask_node(env, &owner, &parts).map_err(|e| {
+        let answer = asker.ask(env, &owner, &parts).map_err(|e| {
             format!("could not ask {owner_id} which of this node's keys it has ({e})")
         })?;
         let (id, owner_has, bad) = parse_keys_answer(&answer, indexes.len())
@@ -1391,5 +1431,42 @@ mod tests {
         orphans.record(&[], Some("after CLUSTER DROPORPHANS"));
         assert!(orphans.last.lock().logged.is_none());
         assert_eq!(orphans.last_count(), (0, 0));
+    }
+
+    /// A run that panics ends `stopped`: left `running`, it refused every
+    /// later `CLUSTER DROPORPHANS` until a restart (#744 review).
+    #[test]
+    fn a_run_that_panics_ends_stopped() {
+        let orphans = Orphans::default();
+        *orphans.drop_status.lock() = Some(DropStatus {
+            state: "running",
+            slots: 3,
+            deleted: 0,
+            kept: 0,
+            reason: String::new(),
+        });
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _unfinished = Unfinished {
+                orphans: &orphans,
+                done: false,
+            };
+            panic!("a bug");
+        }));
+        assert!(panicked.is_err());
+        let status = orphans.drop_status.lock().clone().unwrap();
+        assert_eq!((status.state, status.slots), ("stopped", 3));
+        assert!(
+            status.reason.contains("internal error"),
+            "{}",
+            status.reason
+        );
+
+        // Not once it has finished.
+        orphans.finish_drop("done", 4, 1, "");
+        drop(Unfinished {
+            orphans: &orphans,
+            done: true,
+        });
+        assert_eq!(orphans.drop_status.lock().clone().unwrap().state, "done");
     }
 }

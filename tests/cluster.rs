@@ -5993,6 +5993,306 @@ fn droporphans_keeps_the_keys_a_resharding_did_not_move() {
     );
 }
 
+/// `n` keys of `slot`, `{tag}:prefix:i`.
+fn keys_of_slot(slot: u16, prefix: &str, n: usize) -> Vec<String> {
+    let tag = (0..)
+        .map(|i| format!("t{i}"))
+        .find(|t| slot_of(t) == slot)
+        .unwrap();
+    (0..n).map(|i| format!("{{{tag}}}:{prefix}:{i}")).collect()
+}
+
+/// Give each slot of `moves` to its node by hand: `DELSLOTS` on every node
+/// of `nodes`, then `ADDSLOTS` there. The keys the old owner had of them
+/// stay where they are.
+fn give_slots(nodes: &[Node], moves: &[(u16, &Node)]) {
+    for node in nodes {
+        for (slot, _) in moves {
+            let r = node.conn().cmd(&["CLUSTER", "DELSLOTS", &slot.to_string()]);
+            assert!(r.is_ok(), "{r:?}");
+        }
+    }
+    for (slot, to) in moves {
+        let r = to.conn().cmd(&["CLUSTER", "ADDSLOTS", &slot.to_string()]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+}
+
+/// Of `keys`, those `node` holds (`KEYS`, which answers for any slot).
+fn held_of(node: &Node, keys: &[String]) -> Vec<String> {
+    let here = all_keys(node);
+    keys.iter()
+        .filter(|k| here.binary_search(k).is_ok())
+        .cloned()
+        .collect()
+}
+
+/// A slot that comes to this node while a `CLUSTER DROPORPHANS` runs keeps
+/// every key this node still has of it, those the owner does not have
+/// above all: they may be the only copy. What gives a node a slot used to
+/// take the run for a deletion of every key of the slot, and delete them
+/// all first (#744 review). Each way: `SETSLOT IMPORTING`, `ADDSLOTS`, and
+/// an atomic import, with the run held after its first batch.
+#[test]
+fn droporphans_leaves_the_keys_of_a_slot_that_comes_here_while_it_runs() {
+    let (nodes, _) = form_cluster_with_env(3, &[("KIVIDB_TEST_FAILPOINTS", ORPHANS_HELD)]);
+    let slots = [10u16, 20, 30];
+    let keys: Vec<Vec<String>> = slots
+        .iter()
+        .map(|&slot| keys_of_slot(slot, "k", 300))
+        .collect();
+    let mut c = nodes[0].conn();
+    for k in &keys {
+        set_all(&mut c, k, "old");
+    }
+    give_slots(
+        &nodes,
+        &slots.iter().map(|&s| (s, &nodes[1])).collect::<Vec<_>>(),
+    );
+    let id1 = nodes[1].id();
+    wait_until(
+        "the old owner to see the new one own the slots",
+        Duration::from_secs(30),
+        || {
+            orphan_slots(&nodes[0])
+                == slots
+                    .iter()
+                    .map(|&s| (s, s, 300, Some(id1.clone())))
+                    .collect::<Vec<_>>()
+        },
+    );
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
+    // The owner has the first 100 keys of each slot: only those may be
+    // deleted here. The other 200 are the only copy.
+    for k in &keys {
+        set_all(&mut nodes[1].conn(), &k[..100], "new");
+    }
+    let held = |hit: usize| nodes[0].dir.join(format!("failpoint.{ORPHANS_HELD}.{hit}"));
+    // Starts a run of `slot`, held after its first batch.
+    let start = |c: &mut Conn, slot: u16, hit: usize| {
+        let r = c.cmd(&["CLUSTER", "DROPORPHANS", "SLOT", &slot.to_string()]);
+        assert_eq!(r, Resp::Int(300), "{r:?}");
+        wait_until(
+            "the run to be held after its first batch",
+            Duration::from_secs(30),
+            || held(hit).exists(),
+        );
+    };
+    // Lets it go on, and checks it left the slot and what it keeps; with
+    // `imported`, the keys the owner had came back over the import.
+    let finish = |hit: usize, slot_keys: &[String], imported: bool| -> i64 {
+        std::fs::remove_file(held(hit)).unwrap();
+        let (state, deleted, _, reason) = drop_outcome(&nodes[0]);
+        assert_eq!(state, "stopped", "{reason}");
+        assert!(reason.contains("came to this node"), "{reason}");
+        assert!(deleted <= 100, "{deleted}");
+        let here = held_of(&nodes[0], slot_keys);
+        let lost: Vec<&String> = slot_keys[100..]
+            .iter()
+            .filter(|k| !here.contains(k))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "{} keys only this node had lost: {lost:?}",
+            lost.len()
+        );
+        let expected = if imported { 300 } else { 300 - deleted };
+        assert_eq!(here.len() as i64, expected, "deleted {deleted}");
+        deleted
+    };
+
+    // SETSLOT IMPORTING.
+    start(&mut c, slots[0], 1);
+    let r = c.cmd(&["CLUSTER", "SETSLOT", "10", "IMPORTING", &id1]);
+    assert!(r.is_ok(), "{r:?}");
+    finish(1, &keys[0], false);
+    assert!(c.cmd(&["CLUSTER", "SETSLOT", "10", "STABLE"]).is_ok());
+
+    // ADDSLOTS, once the owner has given it up.
+    start(&mut c, slots[1], 2);
+    for node in &nodes {
+        let r = node.conn().cmd(&["CLUSTER", "DELSLOTS", "20"]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let r = c.cmd(&["CLUSTER", "ADDSLOTS", "20"]);
+    assert!(r.is_ok(), "{r:?}");
+    let deleted = finish(2, &keys[1], false);
+    // Its own now: the keys it kept are as they were.
+    let changed = not_as_written(&nodes[0], &keys[1][100..], "old");
+    assert!(changed.is_empty(), "{changed:?}");
+    assert_eq!(
+        not_as_written(&nodes[0], &keys[1][..100], "old").len() as i64,
+        deleted
+    );
+
+    // An atomic import from the owner.
+    start(&mut c, slots[2], 3);
+    let task = c
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "30", "30"])
+        .text();
+    assert_eq!(task.len(), 40, "{task}");
+    wait_import_completed(&nodes[0], &task);
+    finish(3, &keys[2], true);
+    // The owner's 100 came over it; the 200 only this node had are as they
+    // were.
+    let changed = not_as_written(&nodes[0], &keys[2][100..], "old");
+    assert!(changed.is_empty(), "{changed:?}");
+    let changed = not_as_written(&nodes[0], &keys[2][..100], "new");
+    assert!(changed.is_empty(), "{changed:?}");
+}
+
+/// The owner of `slot` in `node`'s `CLUSTER NODES`.
+fn owner_seen(node: &Node, slot: u16) -> Option<String> {
+    let nodes = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+    nodes
+        .lines()
+        .find(|row| {
+            row.split(' ').skip(8).any(|range| {
+                let mut ends = range.split('-').map(|n| n.parse::<u16>().ok());
+                match (ends.next().flatten(), ends.next()) {
+                    (Some(start), None) => start == slot,
+                    (Some(start), Some(Some(end))) => (start..=end).contains(&slot),
+                    _ => false,
+                }
+            })
+        })
+        .map(|row| row.split(' ').next().unwrap_or_default().to_string())
+}
+
+/// `CLUSTER DROPORPHANS` asks each owner about its own keys, when a batch
+/// holds keys of slots of two owners (two slots of one shard), and key names
+/// of any bytes come through whole: spaces, CR LF, NUL, UTF-8. Only the keys
+/// each owner has are deleted (#744 review).
+#[test]
+fn droporphans_asks_each_owner_about_its_own_keys_whatever_their_names() {
+    let (nodes, _) = form_cluster(3);
+    // One shard of up to 2048: their keys share batches.
+    let (a, b) = (100u16, 100 + 2048);
+    let named = |slot: u16| -> Vec<String> {
+        let tag = keys_of_slot(slot, "x", 1)[0]
+            .split('}')
+            .next()
+            .unwrap()
+            .to_string()
+            + "}";
+        let mut keys = keys_of_slot(slot, "k", 150);
+        keys.extend((0..10).map(|i| format!("{tag} a b\r\n\0é\t{i}")));
+        keys
+    };
+    let (keys_a, keys_b) = (named(a), named(b));
+    let mut c = nodes[0].conn();
+    set_all(&mut c, &keys_a, "v");
+    set_all(&mut c, &keys_b, "v");
+    give_slots(&nodes, &[(a, &nodes[1]), (b, &nodes[2])]);
+    let (id1, id2) = (nodes[1].id(), nodes[2].id());
+    wait_until(
+        "the old owner to see the new owners",
+        Duration::from_secs(30),
+        || {
+            orphan_slots(&nodes[0])
+                == vec![
+                    (a, a, 160, Some(id1.clone())),
+                    (b, b, 160, Some(id2.clone())),
+                ]
+        },
+    );
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
+    // Each owner has the first 100 plain keys and the even-numbered named
+    // ones.
+    let has = |keys: &[String]| -> Vec<String> {
+        keys.iter()
+            .enumerate()
+            .filter(|(i, _)| *i < 100 || (*i >= 150 && i % 2 == 0))
+            .map(|(_, k)| k.clone())
+            .collect()
+    };
+    set_all(&mut nodes[1].conn(), &has(&keys_a), "w");
+    set_all(&mut nodes[2].conn(), &has(&keys_b), "w");
+
+    assert_eq!(c.cmd(&["CLUSTER", "DROPORPHANS"]), Resp::Int(320));
+    let (state, deleted, kept, reason) = drop_outcome(&nodes[0]);
+    assert_eq!(
+        (state.as_str(), deleted, kept),
+        ("done", 210, 110),
+        "{reason}"
+    );
+    let mut left: Vec<String> = keys_a
+        .iter()
+        .chain(&keys_b)
+        .filter(|k| !has(&keys_a).contains(k) && !has(&keys_b).contains(k))
+        .cloned()
+        .collect();
+    left.sort();
+    assert_eq!(all_keys(&nodes[0]), left);
+    assert_eq!(nodes[1].conn().cmd(&["DBSIZE"]).int(), 105);
+    assert_eq!(nodes[2].conn().cmd(&["DBSIZE"]).int(), 105);
+    assert_eq!(
+        orphan_slots(&nodes[0]),
+        vec![(a, a, 55, Some(id1)), (b, b, 55, Some(id2))]
+    );
+}
+
+/// A master that becomes a replica while its `CLUSTER DROPORPHANS` runs (a
+/// failover by its replica) stops it: its keys are its new master's from
+/// then on. What it had not deleted stays, on both (#744 review).
+#[test]
+fn droporphans_stops_when_the_node_becomes_a_replica() {
+    let (nodes, _) = form_cluster_with_env(2, &[("KIVIDB_TEST_FAILPOINTS", ORPHANS_HELD)]);
+    let replica = add_replica(&nodes, &nodes[0]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &replica], 3);
+    let slot = 10u16;
+    let keys = keys_of_slot(slot, "k", 300);
+    let mut c = nodes[0].conn();
+    set_all(&mut c, &keys, "v");
+    assert_eq!(c.cmd(&["WAIT", "1", "5000"]).int(), 1);
+    // Its replica forgets the slot too: else it keeps it as its master's,
+    // and would claim it on taking over.
+    let r = replica
+        .conn()
+        .cmd(&["CLUSTER", "DELSLOTS", &slot.to_string()]);
+    assert!(r.is_ok(), "{r:?}");
+    give_slots(&nodes, &[(slot, &nodes[1])]);
+    let id1 = nodes[1].id();
+    wait_until(
+        "the old owner to see the new one own the slot",
+        Duration::from_secs(30),
+        || orphan_slots(&nodes[0]) == vec![(slot, slot, 300, Some(id1.clone()))],
+    );
+    // Its replica too: taking over, it must not claim the slot.
+    wait_until(
+        "the replica to see the new owner",
+        Duration::from_secs(30),
+        || owner_seen(&replica, slot).as_deref() == Some(id1.as_str()),
+    );
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &replica], 3);
+    // The owner has them all.
+    set_all(&mut nodes[1].conn(), &keys, "w");
+
+    assert_eq!(c.cmd(&["CLUSTER", "DROPORPHANS"]), Resp::Int(300));
+    let held = nodes[0].dir.join(format!("failpoint.{ORPHANS_HELD}.1"));
+    wait_until(
+        "the run to be held after its first batch",
+        Duration::from_secs(30),
+        || held.exists(),
+    );
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    wait_until("the replica to take over", Duration::from_secs(60), || {
+        replica.is_master() && !nodes[0].is_master()
+    });
+    std::fs::remove_file(&held).unwrap();
+    let (state, deleted, _, reason) = drop_outcome(&nodes[0]);
+    assert_eq!(state, "stopped", "{reason}");
+    assert!(reason.contains("became a replica"), "{reason}");
+    assert!(deleted > 0 && deleted <= 128, "{deleted}");
+    assert_eq!(held_of(&replica, &keys).len() as i64, 300 - deleted);
+    wait_until(
+        "the old master to have its new master's keys",
+        Duration::from_secs(30),
+        || all_keys(&nodes[0]) == all_keys(&replica),
+    );
+}
+
 // ── A slot back while its old keys are deleted (#353) ─────────────────────────
 
 /// The failpoints at which a node's deletion of the keys of slots it has

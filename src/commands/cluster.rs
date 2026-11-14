@@ -1837,12 +1837,15 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
                 crate::cluster::node_id_str(&asker),
                 slots.len()
             );
-            let answer = crate::cluster::orphans::orphan_check_answer(
-                ctx.cluster,
-                ctx.store,
-                ctx.repl_state,
-                &slots,
-            );
+            // Counts the slots' keys: O(N) in them, off the runtime.
+            let answer = migration::off_the_runtime(|| {
+                crate::cluster::orphans::orphan_check_answer(
+                    ctx.cluster,
+                    ctx.store,
+                    ctx.repl_state,
+                    &slots,
+                )
+            });
             resp_simple(&answer)
         }
         // `CLUSTER SYNCSLOTS ORPHANKEYS <asker-id> <key> ...`: which of
