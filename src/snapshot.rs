@@ -763,10 +763,9 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::VectorSet(arc) => {
             let inner = arc.read();
-            // Any f32 set stays readable by 1.2; NOQUANT is lost on reload,
-            // but not in a `DUMP` (`dump_payload`).
-            let legacy = inner.quant == crate::vector::quant::Quant::F32
-                && !(inner.quant_chosen && IN_DUMP.get());
+            // Any f32 set stays readable by 1.2, in a `DUMP` too; NOQUANT is
+            // lost on reload, restore or migration.
+            let legacy = inner.quant == crate::vector::quant::Quant::F32;
             w.write_all(&[if legacy {
                 TAG_VECTORSET
             } else {
@@ -5444,8 +5443,7 @@ const DUMP_VERSION: [u8; 2] = [0x0a, 0x00];
 
 thread_local! {
     /// Set while [`dump_payload`] writes: a time series is written without
-    /// its compaction rules and source, and a vector set made `NOQUANT`
-    /// keeps that choice.
+    /// its compaction rules and source.
     static IN_DUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -5492,10 +5490,9 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     // (#593). Its samples, settings and labels go. An atomic slot migration
     // sends the rules among the keys it moves as `TS.CREATERULE`s.
     //
-    // A vector set that was made `NOQUANT` goes as such (`TAG_VECTORSET_V2`),
-    // so that it keeps refusing other quantizations where it is restored. A
-    // snapshot writes it as 1.2 did, and a 1.2 node refuses this payload
-    // with "Bad data format" rather than load a set that has lost its choice.
+    // A vector set goes as a snapshot writes it: an f32 one as 1.2 wrote
+    // it, so a 1.2 node restores it (a slot migration in a rolling upgrade),
+    // and a `NOQUANT` one loses that choice, as through a reload.
     //
     // These payloads are KiviDB's own: Redis writes vector sets and series
     // as module values, which neither side reads from the other.
@@ -6161,11 +6158,14 @@ mod dump_payload_tests {
         vs
     }
 
+    /// `b` is `a` restored: the same but for an f32 set's choice, which is
+    /// not kept, as through a reload.
     fn assert_same_vset(a: &VectorSetInner, b: &VectorSetInner) {
+        use crate::vector::quant::Quant;
         assert_eq!(a.dim, b.dim);
         assert_eq!(a.metric, b.metric);
         assert_eq!(a.quant, b.quant);
-        assert_eq!(a.quant_chosen, b.quant_chosen);
+        assert_eq!(b.quant_chosen, a.quant != Quant::F32);
         assert_eq!(a.entries.len(), b.entries.len());
         for (name, entry) in &a.entries {
             let other = &b.entries[name];
@@ -6174,8 +6174,8 @@ mod dump_payload_tests {
         }
     }
 
-    /// Every quantization, and whether one was asked for, through `DUMP`
-    /// and `RESTORE`: each element's stored vector bit for bit (#722).
+    /// Every quantization through `DUMP` and `RESTORE`: each element's
+    /// stored vector bit for bit (#722).
     #[test]
     fn a_dump_keeps_every_vector_set_whole() {
         use crate::vector::quant::Quant;
@@ -6197,10 +6197,10 @@ mod dump_payload_tests {
         }
     }
 
-    /// A snapshot still writes a `NOQUANT` set as 1.2 did, so 1.2 loads it;
-    /// only a `DUMP` keeps the choice, in the encoding 1.2 refuses.
+    /// A `DUMP` writes a set as a snapshot does: an f32 one, `NOQUANT`
+    /// too, as 1.2 wrote it, so a 1.2 node restores it.
     #[test]
-    fn only_a_dump_writes_a_noquant_set_as_quantized() {
+    fn a_dump_writes_f32_sets_as_1_2_did() {
         use crate::vector::quant::Quant;
         let tag_of = |vs: VectorSetInner| {
             let value = KiviDBValue::VectorSet(Arc::new(parking_lot::RwLock::new(vs)));
@@ -6216,7 +6216,8 @@ mod dump_payload_tests {
         };
         let (legacy, v2) = (Some(TAG_VECTORSET), Some(TAG_VECTORSET_V2));
         assert_eq!(tag_of(vset(Quant::F32, false)), (legacy, legacy));
-        assert_eq!(tag_of(vset(Quant::F32, true)), (legacy, v2));
+        assert_eq!(tag_of(vset(Quant::F32, true)), (legacy, legacy));
+        assert_eq!(tag_of(vset(Quant::Bin, true)), (v2, v2));
         assert_eq!(tag_of(vset(Quant::Q8, true)), (v2, v2));
     }
 

@@ -2916,7 +2916,8 @@ fn vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) -> Vec<Resp> {
 }
 
 /// After a move: the time to live came along, the series is found by its
-/// label, and sets made with a quantization still refuse another.
+/// label, and the Q8 and BIN sets still refuse another quantization. A
+/// `NOQUANT` set takes one, as after a reload: its choice is not kept.
 fn check_moved(c: &mut Conn, k: &dyn Fn(&str) -> String) {
     let pttl = c.cmd(&["PTTL", &k("vq8")]).int();
     assert!((1..=500_000).contains(&pttl), "PTTL {pttl}");
@@ -2929,7 +2930,7 @@ fn check_moved(c: &mut Conn, k: &dyn Fn(&str) -> String) {
     for (name, opt, refused) in [
         ("vq8", "BIN", true),
         ("vbin", "Q8", true),
-        ("vnoq", "Q8", true),
+        ("vnoq", "Q8", false),
         ("vdef", "Q8", false),
     ] {
         let key = k(name);

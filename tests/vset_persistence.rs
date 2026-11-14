@@ -2012,9 +2012,9 @@ fn dump(c: &mut Conn, key: &str) -> Vec<u8> {
     }
 }
 
-/// `DUMP` and `RESTORE` keep every set whole: its quantization and whether
-/// one was asked for, metric, dimension, every element's stored vector and
-/// attributes (#722).
+/// `DUMP` and `RESTORE` keep every set whole: its quantization, metric,
+/// dimension, every element's stored vector and attributes (#722). A
+/// `NOQUANT` set's choice is not kept, as through a reload.
 #[test]
 fn dump_restore_keeps_each_quantization() {
     let server = Server::start(&[]);
@@ -2030,7 +2030,7 @@ fn dump_restore_keeps_each_quantization() {
     }
     assert_same(&capture(&mut c), &before, "RESTORE");
     check_types(&mut c);
-    check_rules(&mut c);
+    check_rules_with(&mut c, false);
 
     // With a time to live, relative and absolute.
     let q8 = &payloads[0];
@@ -2082,7 +2082,7 @@ fn dump_restore_keeps_each_quantization() {
 }
 
 /// `MIGRATE` between two nodes moves each set whole, with its time to live,
-/// and the sets made with a quantization keep refusing others there (#722).
+/// and the Q8 and BIN sets keep refusing other quantizations there (#722).
 #[test]
 fn migrate_keeps_each_quantization() {
     let source = Server::start(&[]);
@@ -2103,7 +2103,7 @@ fn migrate_keeps_each_quantization() {
     assert!((400_000..=500_000).contains(&pttl), "{pttl}");
     assert_eq!(t.cmd(&["PTTL", "vbin"]).i(), -1);
     check_types(&mut t);
-    check_rules(&mut t);
+    check_rules_with(&mut t, false);
 
     // And back, with COPY and REPLACE: the same on both.
     let port = source.port.to_string();
@@ -2164,12 +2164,12 @@ fn restore_refuses_what_it_cannot_read() {
     assert_same(&capture(&mut c), &before, "refused RESTOREs");
 }
 
-/// A 1.2 node refuses a payload of a quantized or `NOQUANT` set with "Bad
-/// data format", never taking it for a plain f32 set; a default set it
-/// restores as before.
+/// A 1.2 node restores a payload of an f32 set, `NOQUANT` too, so a slot
+/// migration in a rolling upgrade goes through; one of a Q8 or BIN set it
+/// refuses whole, with "Bad data format".
 #[test]
 #[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
-fn a_1_2_node_refuses_dumps_it_cannot_read_whole() {
+fn a_1_2_node_restores_f32_sets_and_refuses_quantized_ones() {
     let new = Server::start(&[]);
     let old = Server::start_bin(old_bin(), tempfile::tempdir().unwrap(), &[]);
     let (mut n, mut o) = (new.conn(), old.conn());
@@ -2177,7 +2177,7 @@ fn a_1_2_node_refuses_dumps_it_cannot_read_whole() {
     for (key, opt, _) in SETS {
         let payload = dump(&mut n, key);
         let r = o.cmd_bytes(&[b"RESTORE", key.as_bytes(), b"0", &payload]);
-        if opt.is_empty() {
+        if opt.is_empty() || opt == "NOQUANT" {
             assert_eq!(r, V::Str("OK".into()), "{key}");
             // 1.2 prints each component with fewer digits: the same f32.
             let as_f32 =
@@ -2192,14 +2192,21 @@ fn a_1_2_node_refuses_dumps_it_cannot_read_whole() {
             assert_eq!(o.cmd(&["EXISTS", key]).i(), 0, "{key}");
         }
     }
-    // MIGRATE to it says so, and keeps the set.
+    // MIGRATE to it moves a NOQUANT set; a Q8 one it refuses, and the set
+    // stays where it was.
     let port = old.port.to_string();
+    assert_eq!(o.cmd(&["DEL", "vnoquant"]).i(), 1);
     let r = n.cmd(&["MIGRATE", "127.0.0.1", &port, "vnoquant", "0", "5000"]);
+    assert_eq!(r, V::Str("OK".into()));
+    assert_eq!(n.cmd(&["EXISTS", "vnoquant"]).i(), 0);
+    assert_eq!(o.cmd(&["VCARD", "vnoquant"]).i(), 20);
+    let r = n.cmd(&["MIGRATE", "127.0.0.1", &port, "vq8", "0", "5000"]);
     assert_eq!(
         r,
         V::Err("ERR Target instance replied with error: ERR Bad data format".into())
     );
-    assert_eq!(n.cmd(&["VCARD", "vnoquant"]).i(), 20);
+    assert_eq!(n.cmd(&["VCARD", "vq8"]).i(), 20);
+    assert_eq!(o.cmd(&["EXISTS", "vq8"]).i(), 0);
 }
 
 /// 1.2 loads every f32 set, NOQUANT too, and refuses Q8 and BIN whole.

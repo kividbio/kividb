@@ -214,14 +214,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **A vector set made `NOQUANT` stays `NOQUANT` through `DUMP`/`RESTORE`,
-  `MIGRATE` and slot migration (#722).** The payload wrote it as a plain
-  f32 set, so on the node it moved to it took a later `VADD ... Q8` instead
-  of refusing it, as it did before the move. `DUMP` now writes it in the
-  quantized sets' encoding, which a 1.2 node refuses with
-  `ERR Bad data format`. Vector sets and time series are moved whole
-  otherwise, as before; these payloads are KiviDB's own, which Redis does
-  not read, nor KiviDB Redis's for these two types.
+- **`DUMP`/`RESTORE`, `MIGRATE` and slot migration of vector sets and time
+  series work between KiviDB nodes, and the docs no longer say they don't
+  (#722).** They are moved whole, every quantization included, as a
+  one-entry snapshot image. Redis can't read these payloads, and KiviDB
+  doesn't read Redis's for these two types. As through a snapshot, a
+  `NOQUANT` set's explicit choice isn't kept, so a 1.2 node still restores
+  it during a rolling upgrade; the set then accepts a `VADD` with any
+  quantization option.
 
 - **`FT.HYBRID` takes `SCORER` and answers as Redis 8.10 does, so RedisVL's
   `HybridQuery` works (#767).** Every `HybridQuery` sends `SCORER BM25STD`
