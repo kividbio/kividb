@@ -481,14 +481,30 @@ fn form_cluster_of(nodes: Vec<Node>) -> (Vec<Node>, Vec<(u16, u16)>) {
 }
 
 /// Wait until every node in `nodes` knows `known` nodes and reports the
-/// cluster as up.
+/// cluster as up. On a timeout, says what each node sees.
 fn wait_cluster_ok(nodes: &[&Node], known: usize) {
-    wait_until("cluster to converge", Duration::from_secs(30), || {
+    let converged = || {
         nodes.iter().all(|n| {
             n.cluster_info("cluster_state") == "ok"
                 && n.cluster_info("cluster_known_nodes") == known.to_string()
         })
-    });
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if converged() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let seen: String = nodes
+        .iter()
+        .map(|n| {
+            let state = n.cluster_info("cluster_state");
+            let nodes = n.conn().cmd(&["CLUSTER", "NODES"]).text();
+            format!("node {} ({state}):\n{nodes}", n.port)
+        })
+        .collect();
+    panic!("timed out after 30s waiting for: cluster to converge\n{seen}");
 }
 
 /// Attach a fresh node as a replica of `master` and wait for it to sync.
@@ -1283,6 +1299,34 @@ fn a_cluster_restarted_whole_does_not_fail_anyone_over() {
     let (mut nodes, _) = form_cluster(3);
     let replica = add_replica(&nodes, &nodes[0]);
     nodes.push(replica);
+    // Killed only once every node has saved the replica, as a replica of
+    // node 0, to its nodes.conf. A node saves it on a thread of its own,
+    // some time after it learns it (the other masters, by gossip, up to a
+    // heartbeat later); killed before that, on a busy machine, the masters
+    // came back without the replica, would not hear from a node they did
+    // not know, and the cluster never converged on 4 nodes. A node does
+    // not join by announcing itself: it would have to be met again.
+    let master_id = nodes[0].id();
+    let replica_id = nodes[3].id();
+    for node in &nodes {
+        let conf = node.dir.join("nodes.conf");
+        wait_until(
+            "every node to save the replica to its nodes.conf",
+            Duration::from_secs(15),
+            || {
+                std::fs::read_to_string(&conf)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| {
+                        let f: Vec<&str> = l.split(' ').collect();
+                        f.len() > 3
+                            && f[0] == replica_id
+                            && f[2].contains("slave")
+                            && f[3] == master_id
+                    })
+            },
+        );
+    }
     for node in &mut nodes {
         node.kill();
     }
