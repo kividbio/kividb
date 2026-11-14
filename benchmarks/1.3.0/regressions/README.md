@@ -150,6 +150,10 @@ and a C compiler).
   from `run-all.sh`; the suite starts its own from the engine's binary
   (`lib/nodes.py`), each in an empty directory on its own port (cluster nodes
   also keep the bus port, port + 10000, below the ephemeral range), forms the
+  a node that fails to start has its directory and log removed before the error is raised, and every node's pid
+  goes to a run-scoped directory (`$REGRESS_PIDDIR`) so that `run-all.sh` kills nodes a SIGKILLed suite left
+  behind, only pids whose `/proc/<pid>/cmdline` still holds the recorded binary; `ctx.client()` on such a
+  configuration raises (use `node.client()`),
   cluster with `CLUSTER ADDSLOTSRANGE` (slots split evenly) and `CLUSTER MEET`,
   waits for `cluster_state:ok` on every node, and stops every node on exit,
   on an error and on `SIGTERM` (the suite timeout). The nodes share the VM's 4
@@ -188,6 +192,8 @@ Why a few rows differ from the plan's defaults:
 - Memory per item (`05`, `06`, `08`, `09`) is deterministic, so 5 % is wide;
   a few bytes of `abs` slack (1-4 B) keep the small values (6.2 B per one-field
   stream entry) from failing on an allocator rounding.
+- `06`'s `xinfo_polls` (XINFO CONSUMERS calls during the second XADD run) is gated `min` 5 (recorded 42, v1.2.2 14);
+  a poller thread that raises fails the suite instead of leaving the XADD rate unpolled.
 - Connection counts (`11`, `12`) and the worst `PING` during a `SAVE` (`07`)
   are absolute bounds, from the PRs' own tests: at most 3 connections for
   2,000 `MIGRATE`s, at most 20 per other master for 2,000 searches (16 kept +
