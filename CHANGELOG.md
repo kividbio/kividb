@@ -133,6 +133,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   slot is given to the node while that cleanup runs, the brought keys it
   has not reached stay, as live data of the slot.
 
+- **A long `KEYS`, `SCAN` or `DEL` of a big value no longer holds up every
+  other connection on the Tokio I/O model (#754).** The Tokio worker that
+  got such a command was often the one waiting on the sockets for everyone,
+  so a `PING` on another connection waited for the whole command (140 ms
+  behind a `KEYS` over 2M keys). That work now runs with the worker's other
+  connections handed to another thread, and `KEYS` and `SCAN` copy only the
+  keys that match. `DEL` now follows `lazyfree-lazy-user-del`: with `yes` it
+  frees a big value in the background as `UNLINK` does, and a config file
+  setting it no longer warns that it has no effect; the default stays `no`.
+  On io_uring, a long command still holds up the connections served by its
+  own thread (#762).
+
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
   master crashed right after a `CLUSTER MIGRATION IMPORT` handover kept the

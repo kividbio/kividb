@@ -220,6 +220,44 @@ fn unlink_frees_a_large_value_in_the_background_and_counts_it() {
     assert_eq!(c.info("lazyfreed_objects"), 0);
 }
 
+/// `lazyfree-lazy-user-del yes` makes `DEL` free a large value as `UNLINK`
+/// does, in the background, and counts it; `no`, the default, frees it before
+/// the reply and counts nothing (#754). Either way the key is gone at once,
+/// and what else the `DEL` names is deleted as it was.
+#[test]
+fn del_frees_in_the_background_under_lazyfree_lazy_user_del() {
+    let _turn = counters();
+    let mut c = start_server();
+    c.ok(&["CONFIG", "RESETSTAT"]);
+
+    c.big_set("big", 1000);
+    assert_eq!(c.cmd(&["DEL", "big"]), V::Int(1));
+    assert_eq!(c.freed_when_done(), 0, "no: freed in place");
+    assert_eq!(c.cmd(&["EXISTS", "big"]), V::Int(0));
+
+    c.ok(&["CONFIG", "SET", "lazyfree-lazy-user-del", "yes"]);
+    c.big_set("big", 1000);
+    c.big_set("small", 10);
+    c.ok(&["SET", "s", "v"]);
+    assert_eq!(c.cmd(&["DEL", "big", "small", "s", "missing"]), V::Int(3));
+    assert_eq!(
+        c.freed_when_done(),
+        1,
+        "yes: the large one in the background"
+    );
+    assert_eq!(c.cmd(&["EXISTS", "big", "small", "s"]), V::Int(0));
+    // The key can be made again at once, and is a new value.
+    c.big_set("big", 5);
+    assert_eq!(c.cmd(&["SCARD", "big"]), V::Int(5));
+    assert_eq!(c.cmd(&["DEL", "big"]), V::Int(1));
+    assert_eq!(c.freed_when_done(), 1, "a small one in place");
+
+    c.ok(&["CONFIG", "SET", "lazyfree-lazy-user-del", "no"]);
+    c.big_set("big", 1000);
+    assert_eq!(c.cmd(&["DEL", "big"]), V::Int(1));
+    assert_eq!(c.freed_when_done(), 1);
+}
+
 #[test]
 fn flushes_count_their_keys_except_in_a_transaction() {
     let _turn = counters();

@@ -153,3 +153,28 @@ pub fn release(value: KiviDBValue) {
         free_later(value, 1);
     }
 }
+
+/// Free a value `DEL` removed, as Redis's `lazyfree-lazy-user-del` says:
+/// with `yes`, as `UNLINK` frees it; with `no`, the default, before the
+/// reply, as Redis does.
+///
+/// Freeing millions of elements takes a while. It takes no lock, but on the
+/// Tokio runtime it used to hold up every other connection's commands for as
+/// long (#754): it runs as other long work does (`helpers::long_work`).
+pub fn release_deleted(value: KiviDBValue) {
+    let effort = effort(&value);
+    if effort <= THRESHOLD {
+        return;
+    }
+    if lazy_user_del() {
+        free_later(value, 1);
+    } else {
+        crate::commands::helpers::long_work(effort as usize, move || drop(value));
+    }
+}
+
+/// `lazyfree-lazy-user-del`. Asked only of a value that is much work to free.
+fn lazy_user_del() -> bool {
+    crate::commands::server::remembered_config("lazyfree-lazy-user-del")
+        .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+}
