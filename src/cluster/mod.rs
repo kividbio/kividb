@@ -23,6 +23,7 @@ pub mod ddl;
 pub(crate) mod migrate_conns;
 pub mod migration;
 pub mod node;
+pub(crate) mod orphans;
 pub mod persist;
 pub mod routing;
 pub mod search;
@@ -286,6 +287,9 @@ pub struct ClusterState {
     /// `migrations`: a deletion begun before then leaves the slot's keys,
     /// which may be acknowledged writes from then on (#353).
     pub slot_deletions: std::sync::Arc<migration::SlotDeletions>,
+    /// The keys this master holds of slots it does not serve, as last
+    /// counted, and the thread that counts them (#517). See `orphans`.
+    pub(crate) orphans: std::sync::Arc<orphans::Orphans>,
     /// Slots assigned with `SETSLOT NODE` or removed with `DELSLOTS` here,
     /// and when: for
     /// [`BY_HAND_GRACE`] a peer's claim does not change them (see
@@ -406,6 +410,7 @@ impl ClusterState {
             migrations: RwLock::new(AHashMap::new()),
             slot_migrations: migration::Registry::default(),
             slot_deletions: Default::default(),
+            orphans: Default::default(),
             by_hand: parking_lot::Mutex::new(AHashMap::new()),
             forgotten: RwLock::new(AHashMap::new()),
             last_vote_for: parking_lot::Mutex::new(AHashMap::new()),
@@ -629,6 +634,9 @@ impl ClusterState {
         // The keys of an import this node was receiving when it went down,
         // which never completed (#108).
         migration::drop_unfinished_imports(self);
+        // Keys of slots this node does not serve are reported, from a
+        // moment after startup on (#517).
+        orphans::start_watching(self);
         self.start_the_clock_on_peers();
         self.start_background_save();
         bus::start(
@@ -2586,6 +2594,9 @@ impl ClusterState {
         if !lost.is_empty() {
             migration::drop_lost_slots(self, lost);
         }
+        // Its old master may have handed slots over that it still has the
+        // keys of (#517): they are reported, never deleted on their own.
+        self.orphans.ask(Some("after its promotion"));
     }
 
     // ── Migration state (Step 7c) ─────────────────────────────────────────────

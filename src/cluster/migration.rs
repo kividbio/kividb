@@ -351,6 +351,13 @@ impl Registry {
         f(&importing)
     }
 
+    /// `f` of every task, running and recently finished, with the tasks
+    /// locked: none begins or ends meanwhile. The tasks come first in the
+    /// order of `ClusterState`'s locks.
+    pub(crate) fn with_tasks<R>(&self, f: impl FnOnce(&[Task]) -> R) -> R {
+        f(&self.tasks.lock())
+    }
+
     /// Ask running tasks to stop: the one with this id, or all of them.
     /// Returns how many were asked.
     pub fn cancel(&self, id: Option<&str>) -> usize {
@@ -574,6 +581,117 @@ impl Peer {
             Err(e) => Err(format!("read from the other node failed: {e}")),
         }
     }
+
+    /// Send one already-encoded command and return its status reply's text.
+    fn ask(&mut self, encoded: &[u8]) -> Result<String, AskFailed> {
+        let stream = self.reader.get_mut();
+        if let Err(e) = stream.write_all(encoded).and_then(|()| stream.flush()) {
+            return Err(AskFailed::NoReply(format!(
+                "write to the other node failed: {e}"
+            )));
+        }
+        let mut line = Vec::new();
+        match self.reader.read_until(b'\n', &mut line) {
+            Ok(0) => Err(AskFailed::NoReply(
+                "the other node closed the connection".into(),
+            )),
+            Err(e) if line.is_empty() => Err(AskFailed::NoReply(format!(
+                "read from the other node failed: {e}"
+            ))),
+            Err(e) => Err(AskFailed::Bad(format!(
+                "read from the other node failed part way through its reply: {e}"
+            ))),
+            Ok(_) => {
+                let Some(line) = line.strip_suffix(b"\r\n") else {
+                    return Err(AskFailed::Bad(
+                        "the other node closed the connection part way through its reply".into(),
+                    ));
+                };
+                let Ok(line) = std::str::from_utf8(line) else {
+                    return Err(AskFailed::Bad("the other node's reply is not text".into()));
+                };
+                match line.as_bytes().first() {
+                    Some(b'+') => Ok(line[1..].to_string()),
+                    Some(b'-') => Err(AskFailed::Refused(line[1..].to_string())),
+                    _ => Err(AskFailed::Bad(format!(
+                        "the other node gave a reply of an unexpected kind: {line}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+/// Why [`Peer::ask`] got no answer.
+#[derive(Debug)]
+enum AskFailed {
+    /// Nothing of a reply came: the connection may have been closed before
+    /// the command reached the other node.
+    NoReply(String),
+    /// Part of a reply, or one that is not a status: the connection is no
+    /// longer in step.
+    Bad(String),
+    /// An error reply, whole: the connection is fine.
+    Refused(String),
+}
+
+/// Node-to-node connections (the ones an atomic slot migration makes:
+/// `tls-cluster`, and the replication credentials), one per node, kept from
+/// one question to the next, for `CLUSTER SYNCSLOTS ORPHANCHECK` and
+/// `ORPHANKEYS` (#517). A `CLUSTER DROPORPHANS` asks once per batch of 128
+/// keys: a connection each time would use up the ports of this node on a
+/// large one.
+#[derive(Default)]
+pub(crate) struct NodeAsker {
+    peers: Vec<(NodeId, Peer)>,
+}
+
+impl NodeAsker {
+    /// Send `parts` to `node`, and return its status reply's text. A kept
+    /// connection that gives no reply at all (closed meanwhile) is replaced
+    /// once, and the command sent again: only for questions, which change
+    /// nothing. A connection that gives part of a reply, or one this node
+    /// cannot read, is dropped.
+    pub(crate) fn ask(
+        &mut self,
+        env: &Env,
+        node: &NodeId,
+        parts: &[&[u8]],
+    ) -> Result<String, String> {
+        let encoded = command(parts);
+        let kept = self
+            .peers
+            .iter()
+            .position(|(id, _)| id == node)
+            .map(|i| self.peers.swap_remove(i).1);
+        let reused = kept.is_some();
+        let mut peer = match kept {
+            Some(peer) => peer,
+            None => Peer::connect(env, node)?,
+        };
+        let mut outcome = peer.ask(&encoded);
+        if reused && matches!(outcome, Err(AskFailed::NoReply(_))) {
+            peer = Peer::connect(env, node)?;
+            outcome = peer.ask(&encoded);
+        }
+        match outcome {
+            Ok(text) => {
+                self.peers.push((*node, peer));
+                Ok(text)
+            }
+            Err(AskFailed::Refused(e)) => {
+                self.peers.push((*node, peer));
+                Err(e)
+            }
+            Err(AskFailed::NoReply(e) | AskFailed::Bad(e)) => Err(e),
+        }
+    }
+
+    /// How many connections it keeps.
+    #[cfg(test)]
+    fn kept(&self) -> usize {
+        self.peers.len()
+    }
 }
 
 // ── Key helpers ──────────────────────────────────────────────────────────────
@@ -616,6 +734,39 @@ struct Deleted {
     /// Slots whose keys it stopped deleting, because they came back to
     /// this node meanwhile (see [`SlotDeletions`]).
     came_back: usize,
+    /// Keys a [`Confirm`] did not let it delete, and left.
+    kept: usize,
+    /// Why a [`Confirm`] stopped it, if one did: the keys not reached yet
+    /// are left.
+    halted: Option<String>,
+}
+
+/// Asked of each batch of keys before it is deleted, with no lock held:
+/// which of them may be deleted. `Err` stops the deletion there, with why.
+pub(crate) type Confirm<'a> = &'a mut dyn FnMut(&[crate::store::Key]) -> Result<Vec<bool>, String>;
+
+/// How many keys a batch of a deletion holds at most, and how many bytes
+/// of key names (a batch is also what a [`Confirm`] asks about).
+const BATCH_KEYS: usize = 128;
+const BATCH_KEY_BYTES: usize = 1 << 20;
+
+/// `keys` in batches of [`BATCH_KEYS`] keys or [`BATCH_KEY_BYTES`] bytes of
+/// names, whichever comes first; never an empty one.
+fn batches(keys: &[crate::store::Key]) -> Vec<&[crate::store::Key]> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, key) in keys.iter().enumerate() {
+        let len = key.as_bytes().len();
+        if i > start && (i - start == BATCH_KEYS || bytes + len > BATCH_KEY_BYTES) {
+            out.push(&keys[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += len;
+    }
+    if start < keys.len() {
+        out.push(&keys[start..]);
+    }
+    out
 }
 
 // ── Deleting the keys of slots that left ─────────────────────────────────────
@@ -651,7 +802,10 @@ struct Deleted {
 /// keys before it does anything else. Left to the deletion, which leaves
 /// the slot once it has come, the keys it had not reached would stay:
 /// beside the keys an import brings, and keys the slot's owner had deleted
-/// meanwhile would be back.
+/// meanwhile would be back. Not those of a `CLUSTER DROPORPHANS`, which
+/// deletes only the keys their owner says it has, and keeps the others:
+/// they may be the only copy (#517). That one leaves the slot once it has
+/// come, as any deletion does, and its keys stay.
 #[derive(Default)]
 pub struct SlotDeletions {
     /// Held by a deletion's batch from its look to its last delete, which
@@ -671,6 +825,11 @@ struct DeletionCounts {
     came: Vec<u32>,
     /// Per slot: how many deletions of its keys are under way.
     running: Vec<u32>,
+    /// Per slot: how many of those are confirmed ones (`CLUSTER
+    /// DROPORPHANS`), which delete only the keys the slot's owner says it
+    /// has. What gives this node a slot leaves their keys: a key the owner
+    /// does not have may be the only copy (#517).
+    confirmed: Vec<u32>,
 }
 
 impl DeletionCounts {
@@ -679,8 +838,17 @@ impl DeletionCounts {
         if self.came.is_empty() {
             self.came = vec![0; super::CLUSTER_SLOTS];
             self.running = vec![0; super::CLUSTER_SLOTS];
+            self.confirmed = vec![0; super::CLUSTER_SLOTS];
         }
         self
+    }
+
+    /// A run of slot `i`'s keys has ended, or left the slot.
+    fn ended(&mut self, i: usize, confirmed: bool) {
+        self.running[i] -= 1;
+        if confirmed {
+            self.confirmed[i] -= 1;
+        }
     }
 }
 
@@ -704,14 +872,26 @@ impl SlotDeletions {
         !counts.running.is_empty() && slots.any(|slot| counts.running[slot as usize] > 0)
     }
 
-    /// Those of `slots` whose keys are being deleted.
+    /// Per slot, whether its keys are being deleted. Taken holding no other
+    /// lock (see the field).
+    pub(crate) fn running_slots(&self) -> Vec<bool> {
+        let counts = self.counts.lock();
+        if counts.running.is_empty() {
+            return vec![false; super::CLUSTER_SLOTS];
+        }
+        counts.running.iter().map(|&n| n > 0).collect()
+    }
+
+    /// Those of `slots` whose keys are being deleted, by a deletion that
+    /// deletes them all: not a confirmed one (`CLUSTER DROPORPHANS`), whose
+    /// keys stay once their slot comes here (#517).
     fn deleting(&self, slots: impl Iterator<Item = u16>) -> Vec<u16> {
         let counts = self.counts.lock();
         if counts.running.is_empty() {
             return Vec::new();
         }
         slots
-            .filter(|&slot| counts.running[slot as usize] > 0)
+            .filter(|&slot| counts.running[slot as usize] > counts.confirmed[slot as usize])
             .collect()
     }
 }
@@ -725,6 +905,9 @@ struct DeleteRun {
     seen: Vec<Option<u32>>,
     /// How many of its slots came back to this node while it ran.
     came_back: usize,
+    /// A confirmed deletion (`CLUSTER DROPORPHANS`): see
+    /// [`DeletionCounts::confirmed`].
+    confirmed: bool,
 }
 
 impl DeleteRun {
@@ -736,6 +919,17 @@ impl DeleteRun {
         cluster: &ClusterState,
         slots: impl IntoIterator<Item = u16>,
         import: Option<&str>,
+    ) -> Self {
+        Self::begin_as(cluster, slots, import, false)
+    }
+
+    /// [`Self::begin`]; `confirmed` for a deletion of only the keys their
+    /// owner says it has, which [`delete_before_coming`] leaves alone.
+    fn begin_as(
+        cluster: &ClusterState,
+        slots: impl IntoIterator<Item = u16>,
+        import: Option<&str>,
+        confirmed: bool,
     ) -> Self {
         let me = cluster.myself();
         let deletions = Arc::clone(&cluster.slot_deletions);
@@ -761,12 +955,31 @@ impl DeleteRun {
                 }
                 seen[i] = Some(counts.came[i]);
                 counts.running[i] += 1;
+                if confirmed {
+                    counts.confirmed[i] += 1;
+                }
             }
         });
         DeleteRun {
             deletions,
             seen,
             came_back: 0,
+            confirmed,
+        }
+    }
+
+    /// Leave the slots that have come to this node since it began, as
+    /// [`Self::still_to_delete`] does for the keys of a batch. Holding no
+    /// other lock (see [`SlotDeletions::counts`]).
+    fn leave_come_back(&mut self) {
+        let mut counts = self.deletions.counts.lock();
+        let counts = counts.sized();
+        for (i, seen) in self.seen.iter_mut().enumerate() {
+            if seen.is_some_and(|at| counts.came[i] != at) {
+                *seen = None;
+                counts.ended(i, self.confirmed);
+                self.came_back += 1;
+            }
         }
     }
 
@@ -796,7 +1009,7 @@ impl DeleteRun {
                 Some(at) if counts.came[i] == at => true,
                 Some(_) => {
                     self.seen[i] = None;
-                    counts.running[i] -= 1;
+                    counts.ended(i, self.confirmed);
                     self.came_back += 1;
                     false
                 }
@@ -813,7 +1026,7 @@ impl Drop for DeleteRun {
         let counts = counts.sized();
         for (i, seen) in self.seen.iter().enumerate() {
             if seen.is_some() {
-                counts.running[i] -= 1;
+                counts.ended(i, self.confirmed);
             }
         }
     }
@@ -832,16 +1045,36 @@ fn delete_keys(
     hub_tx: &HubTx,
     run: &mut DeleteRun,
     own: OwnDataset,
+    checked: impl FnMut(),
+    between: impl FnMut(),
+) -> Deleted {
+    delete_keys_confirmed(store, repl_state, hub_tx, run, own, checked, between, None)
+}
+
+/// [`delete_keys`], each batch's keys first put to `confirm`, if given,
+/// out of every lock: only those it confirms are deleted, the others are
+/// left (and counted), and its `Err` stops the deletion there.
+#[allow(clippy::too_many_arguments)]
+fn delete_keys_confirmed(
+    store: &crate::store::Store,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    run: &mut DeleteRun,
+    own: OwnDataset,
     mut checked: impl FnMut(),
     mut between: impl FnMut(),
+    mut confirm: Option<Confirm<'_>>,
 ) -> Deleted {
     let deletions = Arc::clone(&run.deletions);
     let mut removed = 0usize;
+    let mut kept = 0usize;
     let Some(db) = store.first() else {
         return Deleted {
             removed,
             stopped: false,
             came_back: run.came_back,
+            kept,
+            halted: None,
         };
     };
     let holds = crate::store::shards_of_slots(db.len(), |slot| run.deletes(slot));
@@ -851,7 +1084,33 @@ fn delete_keys(
             .filter(|k| run.deletes(key_hash_slot(k)))
             .map(crate::store::Key::new)
             .collect();
-        for chunk in keys.chunks(128) {
+        for chunk in batches(&keys) {
+            if confirm.is_some() {
+                // A slot that has come here is not asked about: its owner
+                // is this node, or is handing it over.
+                run.leave_come_back();
+                if !chunk
+                    .iter()
+                    .any(|k| run.deletes(key_hash_slot(k.as_bytes())))
+                {
+                    continue;
+                }
+            }
+            // Asked with nothing held: it may wait on the network.
+            let confirmed = match confirm.as_mut().map(|confirm| confirm(chunk)) {
+                None => None,
+                Some(Ok(confirmed)) if confirmed.len() == chunk.len() => Some(confirmed),
+                Some(Ok(_)) => Some(vec![false; chunk.len()]),
+                Some(Err(why)) => {
+                    return Deleted {
+                        removed,
+                        stopped: false,
+                        came_back: run.came_back,
+                        kept,
+                        halted: Some(why),
+                    };
+                }
+            };
             {
                 // One whole write, as far as a full sync or a backup is
                 // concerned.
@@ -861,6 +1120,8 @@ fn delete_keys(
                         removed,
                         stopped: true,
                         came_back: run.came_back,
+                        kept,
+                        halted: None,
                     };
                 }
                 let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
@@ -871,7 +1132,16 @@ fn delete_keys(
                 let delete = run.still_to_delete(&mut counts, chunk);
                 checked();
                 let mut del = vec![b"DEL".to_vec()];
-                for (key, _) in chunk.iter().zip(delete).filter(|(_, delete)| *delete) {
+                for (i, (key, _)) in chunk
+                    .iter()
+                    .zip(delete)
+                    .enumerate()
+                    .filter(|(_, (_, delete))| *delete)
+                {
+                    if confirmed.as_ref().is_some_and(|confirmed| !confirmed[i]) {
+                        kept += 1;
+                        continue;
+                    }
                     // A document leaves its indexes with its key
                     // (`ShardMap::remove`).
                     if crate::commands::helpers::delete_key(store, 0, key) {
@@ -890,6 +1160,8 @@ fn delete_keys(
         removed,
         stopped: false,
         came_back: run.came_back,
+        kept,
+        halted: None,
     }
 }
 
@@ -913,7 +1185,10 @@ fn stall_once_for_test(name: &'static str) -> impl FnMut() {
 /// (#353). Left to that deletion, which leaves a slot once it has come, the
 /// keys it had not reached would stay: beside the keys an import brings
 /// (`MIGRATE` without `REPLACE` refuses them, `BUSYKEY`), and keys the
-/// slot's owner had deleted meanwhile would be back.
+/// slot's owner had deleted meanwhile would be back. The keys of a `CLUSTER
+/// DROPORPHANS` are left: it deletes only those their owner says it has,
+/// and the others may be the only copy (#517). It leaves the slot once it
+/// has come, and they stay.
 ///
 /// One pass over the keyspace, as the deletion makes, without waiting for
 /// the deletion's other slots. Not inside a transaction, which holds every
@@ -1068,6 +1343,84 @@ fn start_dropping(
         }
     }
 }
+
+/// What a `CLUSTER DROPORPHANS` deletion did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedOrphans {
+    pub deleted: usize,
+    /// Keys their owner did not confirm it has, left here.
+    pub kept: usize,
+    /// Why it stopped part way, if it did: the keys not reached are left.
+    pub halted: Option<String>,
+}
+
+/// `CLUSTER DROPORPHANS`: delete the keys this master holds of `slots`,
+/// which another master owns (`super::orphans` has checked, and asked it),
+/// as [`drop_lost_slots`] deletes those of a slot it lost: in batches,
+/// through the write path (replicas and the AOF are told), for as long as
+/// the dataset is this node's own, and of each slot for as long as it has
+/// not come back to this node. Each batch only the keys `confirm` confirms:
+/// those the owner has (#517). Run on the caller's thread, which is one of
+/// its own: `confirm` waits on the network. Never begun by anything but
+/// that command.
+pub(crate) fn drop_orphans_confirmed(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    slots: &[u16],
+    confirm: Confirm<'_>,
+) -> Result<DroppedOrphans, String> {
+    let own = match OwnDataset::now(repl_state) {
+        Some(own) if cluster.my_master_id().is_none() => own,
+        _ => return Err(super::orphans::ON_A_REPLICA.into()),
+    };
+    // An import into one of the slots waits for it from now on, and a slot
+    // that came here since the checks is left out.
+    // Confirmed: what gives this node one of the slots meanwhile leaves its
+    // keys, which the run then leaves too.
+    let mut run = DeleteRun::begin_as(cluster, slots.iter().copied(), None, true);
+    if !run.deletes_any() {
+        return Ok(DroppedOrphans {
+            halted: Some(CAME_BACK.to_string()),
+            ..Default::default()
+        });
+    }
+    let deleted = delete_keys_confirmed(
+        store,
+        repl_state,
+        hub_tx,
+        &mut run,
+        own,
+        || {},
+        // Out of the write gate and every lock: a test holds the deletion
+        // here, after its first batch.
+        stall_once_for_test("orphan-keys-deleting"),
+        Some(confirm),
+    );
+    drop(run);
+    log_deletion("CLUSTER DROPORPHANS", &deleted);
+    let halted = match (&deleted.halted, deleted.stopped) {
+        (Some(why), _) => Some(why.clone()),
+        (None, true) => Some(
+            "this node became a replica, or a master afresh, while it ran: its keys are no \
+             longer the ones it set out to delete"
+                .to_string(),
+        ),
+        (None, false) if deleted.came_back > 0 => Some(CAME_BACK.to_string()),
+        (None, false) => None,
+    };
+    Ok(DroppedOrphans {
+        deleted: deleted.removed,
+        kept: deleted.kept,
+        halted,
+    })
+}
+
+/// Why a `CLUSTER DROPORPHANS` left keys it had not reached of a slot that
+/// came to this node while it ran.
+const CAME_BACK: &str = "a slot came to this node while it ran (assigned, imported or taken \
+                         over): none of its keys not deleted by then were deleted";
 
 /// A key captured at the cut, with a copy of its value of its own: a list,
 /// hash or set can be changed in place once writes go on, and the copy is
@@ -2614,6 +2967,37 @@ mod tests {
         assert_eq!(source_failed(&cs, "b", "x", &[], None), Ok(()));
     }
 
+    /// `CLUSTER DROPORPHANS` leaves the keys of a slot in an atomic slot
+    /// migration here, running or ended a moment ago, and of one whose keys
+    /// are being deleted already (#517).
+    #[test]
+    fn orphans_of_a_slot_migrating_or_being_deleted_are_left() {
+        use super::super::orphans::check_droppable;
+        let cs = ClusterState::new_enabled(None, 15000);
+        let other = super::super::generate_node_id();
+        let mut node = super::super::ClusterNode::new(other, "10.0.0.1".into(), 7000, 17000);
+        node.flags |= super::super::NodeFlags::MASTER;
+        cs.nodes.write().insert(other, node);
+        for slot in 0..100 {
+            cs.slots.write()[slot] = Some(other);
+        }
+        assert_eq!(check_droppable(&cs, &[15, 40]), Ok(()));
+
+        cs.slot_migrations.add(task("a", vec![(10, 20)])).unwrap();
+        let refused = check_droppable(&cs, &[15]).unwrap_err();
+        assert!(refused.contains("is in progress"), "{refused}");
+        cs.slot_migrations.finish("a", TaskState::Completed, None);
+        let refused = check_droppable(&cs, &[15]).unwrap_err();
+        assert!(refused.contains("ended"), "{refused}");
+        assert_eq!(check_droppable(&cs, &[40]), Ok(()));
+
+        let run = DeleteRun::begin(&cs, [40], None);
+        let refused = check_droppable(&cs, &[40]).unwrap_err();
+        assert!(refused.contains("being deleted already"), "{refused}");
+        drop(run);
+        assert_eq!(check_droppable(&cs, &[40]), Ok(()));
+    }
+
     #[test]
     fn cancel_targets_running_tasks() {
         let registry = Registry::default();
@@ -2934,6 +3318,218 @@ mod tests {
         assert_eq!((deleted.removed, deleted.stopped), (OLD, false));
         assert_eq!(lost.old_keys_left(), 0);
         assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+    }
+
+    /// The keys of a slot another master owns are counted as orphans on a
+    /// master, but for those being deleted already, and on a replica not
+    /// at all; `CLUSTER DROPORPHANS`' deletion takes them on a master only,
+    /// and those alone (#517).
+    #[test]
+    fn orphans_are_counted_and_dropped_on_a_master_only() {
+        use super::super::orphans::orphan_counts;
+        let lost = Lost::new();
+        let mine = "kept";
+        set(&lost.store, mine, "v");
+        assert_eq!(
+            orphan_counts(&lost.cluster, &lost.store, &lost.repl_state),
+            vec![(LOST, OLD as u64)]
+        );
+        // Not while a deletion of them runs.
+        let run = DeleteRun::begin(&lost.cluster, [LOST], None);
+        assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
+        drop(run);
+
+        let drop_them = |lost: &Lost, confirm: Confirm<'_>| {
+            drop_orphans_confirmed(
+                &lost.cluster,
+                &lost.store,
+                &lost.repl_state,
+                &lost.hub_tx,
+                &[LOST],
+                confirm,
+            )
+        };
+        let all = |keys: &[crate::store::Key]| Ok(vec![true; keys.len()]);
+        let replica = Lost::new();
+        replica.repl_state.become_slave();
+        assert!(orphan_counts(&replica.cluster, &replica.store, &replica.repl_state).is_empty());
+        assert!(drop_them(&replica, &mut { all }).is_err());
+        assert_eq!(replica.old_keys_left(), OLD);
+
+        // Only the keys the owner confirms: here, those ending in an even
+        // digit. The others are kept, and counted.
+        let even = Lost::new();
+        let dropped = drop_them(&even, &mut |keys: &[crate::store::Key]| {
+            Ok(keys
+                .iter()
+                .map(|k| k.as_bytes().last().is_some_and(|d| d % 2 == 0))
+                .collect())
+        })
+        .unwrap();
+        assert_eq!((dropped.deleted, dropped.kept), (OLD / 2, OLD / 2));
+        assert_eq!(dropped.halted, None);
+        assert_eq!(even.old_keys_left(), OLD / 2);
+
+        // Stopped by the owner part way: the rest stays.
+        let halted = Lost::new();
+        let mut asked = 0;
+        let dropped = drop_them(&halted, &mut |keys: &[crate::store::Key]| {
+            asked += 1;
+            if asked > 1 {
+                Err("the owner went away".to_string())
+            } else {
+                Ok(vec![true; keys.len()])
+            }
+        })
+        .unwrap();
+        assert_eq!(dropped.halted.as_deref(), Some("the owner went away"));
+        assert!(dropped.deleted > 0 && dropped.deleted <= BATCH_KEYS);
+        assert_eq!(halted.old_keys_left(), OLD - dropped.deleted);
+
+        let dropped = drop_them(&lost, &mut { all }).unwrap();
+        assert_eq!((dropped.deleted, dropped.kept), (OLD, 0));
+        assert_eq!(lost.old_keys_left(), 0);
+        assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
+        assert!(
+            crate::store::get_shard(&lost.store[0], mine)
+                .read()
+                .contains_key(mine)
+        );
+    }
+
+    /// A slot that comes to this node while a `CLUSTER DROPORPHANS` runs
+    /// (`ADDSLOTS`, `SETSLOT IMPORTING` or `NODE`, an atomic import) keeps
+    /// its keys. Taking the run for a deletion of every key of the slot,
+    /// what gives the slot used to delete them all first, those the owner
+    /// does not have too: maybe their only copy (#744 review). The run
+    /// leaves the slot from then on, and says so. A deletion of every key
+    /// (a lost slot's) is still finished first.
+    #[test]
+    fn a_slot_coming_here_keeps_the_keys_of_a_droporphans_run() {
+        let lost = Lost::new();
+        let mut came = false;
+        let dropped = drop_orphans_confirmed(
+            &lost.cluster,
+            &lost.store,
+            &lost.repl_state,
+            &lost.hub_tx,
+            &[LOST],
+            &mut |keys: &[crate::store::Key]| {
+                if !std::mem::replace(&mut came, true) {
+                    assert!(
+                        lost.cluster
+                            .slot_deletions
+                            .deleting([LOST].into_iter())
+                            .is_empty()
+                    );
+                    delete_before_coming(&lost.env(), &[LOST], "ADDSLOTS", None).unwrap();
+                    assert_eq!(lost.old_keys_left(), OLD);
+                    lost.cluster.slot_deletions.came_here([LOST]);
+                }
+                Ok(vec![true; keys.len()])
+            },
+        )
+        .unwrap();
+        assert!(came);
+        assert_eq!((dropped.deleted, dropped.kept), (0, 0));
+        assert!(
+            dropped
+                .halted
+                .as_deref()
+                .is_some_and(|why| why.contains("came to this node")),
+            "{dropped:?}"
+        );
+        assert_eq!(lost.old_keys_left(), OLD);
+        assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+
+        let run = DeleteRun::begin(&lost.cluster, [LOST], None);
+        assert_eq!(
+            lost.cluster.slot_deletions.deleting([LOST].into_iter()),
+            vec![LOST]
+        );
+        let confirmed = DeleteRun::begin_as(&lost.cluster, [LOST], None, true);
+        assert_eq!(
+            lost.cluster.slot_deletions.deleting([LOST].into_iter()),
+            vec![LOST]
+        );
+        drop(run);
+        assert!(
+            lost.cluster
+                .slot_deletions
+                .deleting([LOST].into_iter())
+                .is_empty()
+        );
+        drop(confirmed);
+        assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+    }
+
+    /// A `CLUSTER DROPORPHANS` asks the owner over one connection for the
+    /// whole run, not one per batch, which used up this node's ports on a
+    /// large one (#744 review). A kept connection closed meanwhile is
+    /// replaced once and the question sent again; one that gives part of a
+    /// reply is dropped, and the next question makes a new one.
+    #[test]
+    fn questions_to_a_node_share_one_connection() {
+        use std::io::{BufRead, Write};
+        let lost = Lost::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        {
+            let mut nodes = lost.cluster.nodes.write();
+            let node = nodes.get_mut(&lost.other).unwrap();
+            node.ip = "127.0.0.1".into();
+            node.client_port = port;
+        }
+        // Per connection the other node accepts: how many questions it
+        // answers, and whether it then gives half an answer before it
+        // closes it (or closes it at once).
+        let script = [(2, false), (1, true), (usize::MAX, false)];
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            for (answers, half) in script {
+                let (sock, _) = listener.accept().unwrap();
+                accepted += 1;
+                let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+                let mut writer = sock;
+                let mut answered = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let parts: usize = line.trim_end()[1..].parse().unwrap();
+                    for _ in 0..2 * parts {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                    }
+                    if answered == answers {
+                        if half {
+                            writer.write_all(b"+ye").unwrap();
+                        }
+                        break;
+                    }
+                    writer.write_all(b"+yes\r\n").unwrap();
+                    answered += 1;
+                }
+            }
+            accepted
+        });
+        let env = lost.env();
+        let mut asker = NodeAsker::default();
+        let mut ask = || asker.ask(&env, &lost.other, &[b"PING"]);
+        // The first connection: two answers.
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        // Closed with no answer: asked again on a second one.
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        // Half an answer: an error, and the connection dropped.
+        assert!(ask().is_err());
+        // A third.
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        assert_eq!(asker.kept(), 1);
+        drop(asker);
+        assert_eq!(server.join().unwrap(), 3);
     }
 
     /// The keys of an import that did not complete are not deleted on a

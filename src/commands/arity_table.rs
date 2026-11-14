@@ -70,6 +70,7 @@ pub(super) const TABLE: &[(&str, i16)] = &[
     ("CLUSTER|COUNTKEYSINSLOT", 3),
     ("CLUSTER|DELSLOTS", -3),
     ("CLUSTER|DELSLOTSRANGE", -4),
+    ("CLUSTER|DROPORPHANS", -2), // KiviDB's own
     ("CLUSTER|FAILOVER", -2),
     ("CLUSTER|FLUSHSLOTS", 2),
     ("CLUSTER|FORGET", 3),
@@ -82,6 +83,7 @@ pub(super) const TABLE: &[(&str, i16)] = &[
     ("CLUSTER|MYID", 2),
     ("CLUSTER|MYSHARDID", 2),
     ("CLUSTER|NODES", 2),
+    ("CLUSTER|ORPHANSLOTS", 2), // KiviDB's own
     ("CLUSTER|REPLICAS", 3),
     ("CLUSTER|REPLICATE", 3), // KiviDB's own
     ("CLUSTER|RESET", -2),

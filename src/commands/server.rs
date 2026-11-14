@@ -2874,12 +2874,14 @@ const ADMIN_COMMANDS: &[&str] = &[
     "CLUSTER|COUNT-FAILURE-REPORTS",
     "CLUSTER|DELSLOTS",
     "CLUSTER|DELSLOTSRANGE",
+    "CLUSTER|DROPORPHANS",
     "CLUSTER|FAILOVER",
     "CLUSTER|FLUSHSLOTS",
     "CLUSTER|FORGET",
     "CLUSTER|LINKS",
     "CLUSTER|MEET",
     "CLUSTER|MIGRATION",
+    "CLUSTER|ORPHANSLOTS",
     "CLUSTER|REPLICAS",
     "CLUSTER|REPLICATE",
     "CLUSTER|RESET",
@@ -4404,9 +4406,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // standalone server.
                 out.push_str("# Cluster\r\n");
                 out.push_str(&format!(
-                    "cluster_enabled:{}\r\n\r\n",
+                    "cluster_enabled:{}\r\n",
                     u8::from(ctx.config.cluster_enabled)
                 ));
+                // KiviDB's own: the slots this master holds keys of but
+                // does not serve, and those keys, as last counted (#517).
+                if ctx.config.cluster_enabled {
+                    let (slots, keys) = ctx.cluster.orphans.last_count();
+                    out.push_str(&format!(
+                        "cluster_orphan_slots:{slots}\r\ncluster_orphan_keys:{keys}\r\n"
+                    ));
+                }
+                out.push_str("\r\n");
             }
 
             if want("keyspace") {

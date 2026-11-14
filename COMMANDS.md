@@ -1259,6 +1259,50 @@ deletes the keys it holds for that slot, as Redis does.
 |---|---|---|
 | `CLUSTER SLOT-STATS` | `CLUSTER SLOT-STATS SLOTSRANGE start end` or `CLUSTER SLOT-STATS ORDERBY metric [LIMIT n] [ASC \| DESC]` | Per-slot stats. Only `key-count` carries real data; `cpu-usec` / `network-bytes-in` / `network-bytes-out` are reported as 0 (no per-slot instrumentation yet). `ORDERBY` only accepts `key-count`, and sorts descending (the busiest slots first) unless `ASC` is given, as in Redis. |
 
+### Keys of slots a master does not serve
+
+A master can be left holding keys of slots it does not serve: slots another
+master owns, that are not being imported into it or migrating away from it.
+The case that leaves them: a master crashes right after it hands slots over
+in an atomic slot migration (`CLUSTER MIGRATION IMPORT`), before its
+deletion of their keys has reached its replica; the replica, promoted, has
+every key of the slots that moved away (#517). No client is served them
+(every command for them gets `-MOVED`), but they take memory, count in
+`DBSIZE`, `SCAN`, `KEYS`, `RANDOMKEY` and `INFO keyspace`, and are saved and
+replicated to the node's replicas.
+
+KiviDB never deletes them on its own. Deciding automatically that the keys
+are stale, from what the cluster bus says, could not be made safe: there
+are ways (`SETSLOT`/`MIGRATE` resharding, late heartbeats, restarts part way
+through a handover) in which they are the only copy of the slot's data. So
+the node reports them, and an operator deletes them:
+
+- A master logs a warning when it finds any. It counts them in full at
+  startup and after it is promoted, and after the slots it serves change it
+  counts only the slots that became orphans (once the change has settled,
+  and not more often than every few seconds). The line names the slots and
+  the count of keys, and is repeated only when they change, or after ten
+  minutes.
+- `INFO cluster` reports `cluster_orphan_slots` and `cluster_orphan_keys`,
+  as last counted. A replica reports 0: its keys are its master's.
+- `CLUSTER ORPHANSLOTS` lists them, counted afresh, with their owners as
+  this node's slot table names them.
+- `CLUSTER DROPORPHANS` deletes those of them the owner has, and only
+  those. This node's slot table can be out of date (a destination that
+  crashed before its claim reached this node, a resharding left half done,
+  a restart before the table was saved), and a key here can be the only
+  copy of its data (written after the owner took the slot, or one a
+  resharding never moved). So it asks each owner its table names, over a
+  node-to-node connection: first whether it owns the slot in its own table
+  and is not importing or migrating it, then, batch by batch, which of
+  these keys it has. Keys it does not have are kept, counted, and still
+  listed by `CLUSTER ORPHANSLOTS`; they are not this command's to delete.
+
+| Command | Syntax | Notes |
+|---|---|---|
+| `CLUSTER ORPHANSLOTS` | `CLUSTER ORPHANSLOTS` | KiviDB's own. An array with one entry per run of consecutive slots this master holds keys of, does not serve, and that have the same owner: `[start-slot, end-slot, key-count, owner-id]`, the owner `nil` for an unassigned slot (the owner as this node's slot table names it: `CLUSTER DROPORPHANS` asks the owner itself). Slots whose keys are already being deleted (a slot that left this node, an atomic migration's handover) are not listed. Empty on a replica. O(N) in the node's keys: the slots a master does not serve have keys in every shard; it walks them a few thousand buckets per hold of a shard's lock. In `@admin`, `@dangerous` and `@slow`; refused in scripts. |
+| `CLUSTER DROPORPHANS` | `CLUSTER DROPORPHANS [SLOT slot [slot ...] \| SLOTSRANGE start end [start end ...]]` or `CLUSTER DROPORPHANS STATUS` | KiviDB's own. Deletes this master's keys of the slots given, or, without arguments, of every slot `CLUSTER ORPHANSLOTS` lists, that their owner says it has. Replies with the number of keys it is to look at, and does the rest on a thread of its own (no network wait on the command's thread, an I/O thread under io_uring): it asks each owner, then deletes in batches of up to 128 keys (and 1 MiB of key names), each batch's keys first put to their owner (`CLUSTER SYNCSLOTS ORPHANKEYS`, which looks at the keys without using them: no expiry, LRU or keyspace event), and only those it has deleted, through the write path, so the `DEL`s reach its replicas and its AOF. It stops, keeping the keys not reached, if an owner can no longer be asked, answers as another node, stops owning a slot or starts moving it, or is no longer the slot's owner in this node's table. `CLUSTER DROPORPHANS STATUS` gives `state` (`running`, `done`, `stopped`), `slots`, `deleted`, `kept` (keys their owner does not have) and `reason`; the log says the same. One run at a time. Before it starts, all the slots or none: it refuses, naming the slot and why, on a replica; for a slot this node owns, imports or migrates (`CLUSTER SETSLOT`); for a slot in an atomic slot migration here, running or ended in the last few seconds, or whose keys are already being deleted; while an atomic migration away from this node is handing slots over, or ended in the last few seconds; while this node does not know yet whether a replica of it took its slots over; unless the slot's owner is another master that this node sees as up (not `fail` or `fail?`, not in a handshake, and heard from since this node started); and the run stops before it deletes anything unless that owner, asked directly (`CLUSTER SYNCSLOTS ORPHANCHECK`, over the connection and with the credentials an atomic slot migration uses), answers as itself and says it owns the slot in its own table and is not importing or migrating it (`SETSLOT`, or an atomic slot migration running or ended in the last few seconds). An owner that cannot be asked, or runs a version without these subcommands, stops it too. There is no option to skip any of this. A slot that comes to this node while it runs (`CLUSTER ADDSLOTS`, `CLUSTER SETSLOT IMPORTING` or `NODE`, an atomic slot migration into it, a failover) keeps every key it still has: the run leaves that slot from then on, and ends `stopped`, saying so; what gives this node the slot does not delete them first, as it does the keys of a slot that left this node. The questions to each owner go over one connection per owner for the whole run. While it runs, `CLUSTER ORPHANSLOTS` and `INFO cluster` leave its slots out, kept keys included; they are counted again when it ends, and the kept keys are listed again. `STATUS` is kept in memory only: it is empty before the first run and after a restart, so a run cut short by a restart shows as no run at all; `CLUSTER ORPHANSLOTS` then lists the keys it had not deleted. In `@admin`, `@dangerous` and `@slow`; refused in scripts. Never run on its own. |
+
 ### Configuration flags
 
 | Flag | Default | Purpose |
