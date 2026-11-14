@@ -3811,19 +3811,14 @@ fn keysize_count(bins: &mut KeysizeBins, value: crate::store::ValueRef<'_>) {
 ///
 /// A shard nobody writes to meanwhile is counted exactly. Under writes the
 /// count is approximate, as a `SCAN` is: a key written or deleted
-/// meanwhile is counted or not, and keys move between buckets when the
-/// table is rehashed. A resize changes how many buckets there are, and the
-/// shard is then counted again (in one hold after a few tries); a rehash
-/// in place, at the same size, which the table does when deleted keys
-/// have used up its room to grow, cannot be seen from here, and in the
-/// part not yet counted a key may then be counted twice or not at all.
+/// meanwhile is counted or not. Keys move between buckets when the table
+/// grows, rehashes in place, shrinks or takes a step of a growth, and each
+/// of those changes `ShardMap::layout`: the shard is then counted again
+/// (in one hold after a few tries).
 ///
 /// One hold for the whole shard would be exact: about 20 ms for a shard
 /// of a million keys (21 ns a key measured, 5 million keys on 8 vCPUs), a
-/// wait for every write to it, every 10 s while `INFO all` is asked. A
-/// count of rehashes kept by the table would let the walk start again on
-/// one too, but needs a check on every insert, the `SET` path. For a
-/// distribution refreshed every 10 seconds neither is worth it.
+/// wait for every write to it, every 10 s while `INFO all` is asked.
 ///
 /// `between` is called with no lock held after each part (for tests).
 fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> KeysizeBins {
@@ -3835,7 +3830,9 @@ fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> 
         loop {
             let map = read_lock!(shard);
             let buckets = map.buckets();
-            if *size.get_or_insert(buckets) != buckets {
+            // A growth's steps move keys without a change of size.
+            let layout = (buckets, map.layout());
+            if *size.get_or_insert(layout) != layout {
                 tries += 1;
                 if tries < 3 {
                     continue 'shard;

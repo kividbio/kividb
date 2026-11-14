@@ -309,6 +309,18 @@ pub const SCAN_POSITIONS: u64 = 4096;
 /// an entry holding a key and its value (`entry`).
 pub struct ShardMap {
     table: HashTable<Slot>,
+    /// While the table grows, the one it grows from: its keys are moved
+    /// into `table` a few at a time, by every write and by the expiry
+    /// thread (`ShardMap::step_growth`), and every look that misses in
+    /// `table` looks here too. Empty, without an allocation, the rest of
+    /// the time. See [`ShardMap::make_room`].
+    old: HashTable<Slot>,
+    /// The bucket of `old` the next step of moving starts at.
+    moving_at: usize,
+    /// Changes whenever entries change buckets (a growth begun, a step of
+    /// one, a shrink): what a walk over the buckets that lets go of the
+    /// lock between parts compares ([`ShardMap::layout`]).
+    layout: u64,
     hash: ahash::RandomState,
     /// Every entry whose key has a time to live, each knowing where it is
     /// here (`Entry::pos`), in two parts: those that may come due soon, and
@@ -447,18 +459,15 @@ impl Drop for ShardMap {
 
 impl ShardMap {
     pub fn new() -> Self {
-        ShardMap {
-            table: HashTable::new(),
-            hash: ahash::RandomState::new(),
-            ttl: TtlList::new(),
-            now: AtomicU64::new(UNPINNED),
-            left: Vec::new(),
-        }
+        Self::with_capacity(0)
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         ShardMap {
             table: HashTable::with_capacity(capacity),
+            old: HashTable::new(),
+            moving_at: 0,
+            layout: 0,
             hash: ahash::RandomState::new(),
             ttl: TtlList::new(),
             now: AtomicU64::new(UNPINNED),
@@ -474,9 +483,212 @@ impl ShardMap {
     /// The slot of `key`, hashed `hash`.
     #[inline(always)]
     fn find(&self, hash: u64, key: &[u8]) -> Option<Slot> {
-        self.table
+        match self
+            .table
+            .find(hash, |s| s.may_be(hash) && s.entry().has_key(key))
+        {
+            Some(s) => Some(*s),
+            None if self.is_growing() => self.find_old(hash, key),
+            None => None,
+        }
+    }
+
+    /// The slot of `key` in the table being grown from, if it is still
+    /// there.
+    #[cold]
+    #[inline(never)]
+    fn find_old(&self, hash: u64, key: &[u8]) -> Option<Slot> {
+        self.old
             .find(hash, |s| s.may_be(hash) && s.entry().has_key(key))
             .copied()
+    }
+
+    /// The keys still to be moved from the table being grown from: none
+    /// when the table is not growing.
+    #[inline]
+    pub fn growth_left(&self) -> usize {
+        self.old.len()
+    }
+
+    /// Whether the table is growing: keys are still to be moved from the
+    /// table it grows from.
+    #[inline(always)]
+    pub fn is_growing(&self) -> bool {
+        !self.old.is_empty()
+    }
+
+    /// What changes whenever entries change buckets: a walk over
+    /// [`ShardMap::bucket`]s in parts, the lock let go of in between, that
+    /// finds it changed may have looked at some keys twice and missed
+    /// others.
+    #[inline]
+    pub fn layout(&self) -> u64 {
+        self.layout
+    }
+
+    /// Before a write that may add `key`, hashed `hash`: room in the table
+    /// for one more key, and the key in `table` if it was still in `old`.
+    #[inline(always)]
+    fn make_room_for(&mut self, hash: u64, key: &[u8]) {
+        if self.table.len() == self.table.capacity() || self.is_growing() {
+            self.make_room(hash, key);
+        }
+    }
+
+    /// Before a write that changes or takes out `key`, hashed `hash`: the
+    /// key in `table` if it was still in `old`.
+    #[inline(always)]
+    fn settle(&mut self, hash: u64, key: &[u8]) {
+        if self.is_growing() {
+            self.make_room(hash, key);
+        }
+    }
+
+    /// A full table grows, without stopping the shard for as long as it
+    /// takes to move all its keys.
+    ///
+    /// hashbrown grows a table in one step: a table twice the size, every
+    /// key hashed again and put in it. A key's hash is not kept (the slot
+    /// keeps 12 bits of it), so that is a visit to every entry, wherever in
+    /// memory it is: about 75 ns a key, 18 ms for a shard of 230,000 keys
+    /// and 34 ms for 460,000, with the shard locked for writing. Keys
+    /// spread evenly over the shards, so the shards fill, and grow, at
+    /// about the same time: while 8 million keys were written, a pipeline
+    /// of 2,000 `SET`s met up to eight growths, and a `PING` from another
+    /// client waited up to 150 ms (#752).
+    ///
+    /// Here a large table grows as Redis's do: into a new table twice the
+    /// size, which takes every new key, while the keys of the old one move
+    /// over a few at a time ([`GROWTH_STEP`] for each write to the shard,
+    /// and the rest from the expiry thread, `ShardLock::step_growth`). A
+    /// look that misses in the new table looks in the old one, and a write
+    /// to a key still in the old one moves that key first, so every key is
+    /// in exactly one of them. A slot moves as it is, the fragment of its
+    /// key's hash with it. Both tables are there until the old one is
+    /// empty, as both were while hashbrown moved the keys: the new one is
+    /// twice the old one, so at most half as much again.
+    ///
+    /// The growth, if the table is full, comes first, and the written key
+    /// is moved after it: a growth begun here puts every key in the old
+    /// table, the written one too, and the write that follows looks in the
+    /// new table only. Moved the other way round, a key written over by the
+    /// write that began a growth was left in the old table and the write
+    /// added it again to the new one: two entries for one key.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self, hash: u64, key: &[u8]) {
+        if self.table.len() == self.table.capacity() {
+            // Each write moves GROWTH_STEP keys and adds one at most, so
+            // the old table is empty long before the new one is full.
+            // Should it not be, its keys move now.
+            while !self.step_growth(usize::MAX) {}
+            self.grow();
+        }
+        if self.is_growing() {
+            if let Ok(at) = self
+                .old
+                .find_entry(hash, |s| s.may_be(hash) && s.entry().has_key(key))
+            {
+                let slot = at.remove().0;
+                self.insert_moved(hash, slot);
+            }
+            self.step_growth(GROWTH_STEP);
+        }
+        debug_assert!(
+            self.find_old(hash, key).is_none(),
+            "a key about to be written is still in the old table"
+        );
+    }
+
+    /// Grow the full table: in one step if it is small, else by moving to
+    /// a new table twice its size (see [`ShardMap::make_room`]).
+    fn grow(&mut self) {
+        debug_assert!(!self.is_growing());
+        self.layout = self.layout.wrapping_add(1);
+        let keys = self.table.len();
+        if keys < GROW_IN_STEPS_FROM {
+            let hasher = &self.hash;
+            self.table.reserve(1, |s| hasher.hash_one(s.entry().key()));
+            return;
+        }
+        // Twice the buckets of a table full to hashbrown's 7/8; as many,
+        // sweeping away what removals left, if it is half full or less.
+        let new = HashTable::with_capacity(keys * 2);
+        self.old = std::mem::replace(&mut self.table, new);
+        self.moving_at = 0;
+        self.step_growth(GROWTH_STEP);
+    }
+
+    /// Put `slot`, moved from `old`, its key hashed `hash`, in `table`.
+    #[inline(always)]
+    fn insert_moved(&mut self, hash: u64, slot: Slot) {
+        let hasher = &self.hash;
+        // Never full while the old table has keys (`make_room`); were it
+        // full, it would grow here in one step, which is correct too.
+        self.table
+            .insert_unique(hash, slot, |s| hasher.hash_one(s.entry().key()));
+    }
+
+    /// Move up to `keys` keys from the table being grown from into the new
+    /// one, looking at no more than ten buckets for each. Once the old
+    /// table is empty its memory is given back. Returns whether the table
+    /// has stopped growing.
+    pub fn step_growth(&mut self, keys: usize) -> bool {
+        const BATCH: usize = 16;
+        if !self.is_growing() {
+            // Its last key may have been moved by a write of it.
+            self.old = HashTable::new();
+            self.moving_at = 0;
+            return true;
+        }
+        self.layout = self.layout.wrapping_add(1);
+        let buckets = self.old.num_buckets();
+        let mut left = keys;
+        let mut visits = keys.saturating_mul(10);
+        while left > 0 && visits > 0 && self.moving_at < buckets && self.is_growing() {
+            // A batch of slots, their entries' first lines asked for
+            // together: hashing a key reads it from its entry, a miss each.
+            let mut batch = [(0usize, None::<Slot>); BATCH];
+            let mut n = 0;
+            while n < BATCH.min(left) && visits > 0 && self.moving_at < buckets {
+                let at = self.moving_at;
+                self.moving_at += 1;
+                visits -= 1;
+                if let Some(&slot) = self.old.get_bucket(at) {
+                    slot.prefetch_header();
+                    batch[n] = (at, Some(slot));
+                    n += 1;
+                }
+            }
+            for &(at, slot) in &batch[..n] {
+                let Some(slot) = slot else { continue };
+                let hash = self.hash.hash_one(slot.entry().key());
+                if let Ok(entry) = self.old.get_bucket_entry(at) {
+                    entry.remove();
+                }
+                self.insert_moved(hash, slot);
+            }
+            left -= n;
+        }
+        if self.is_growing() {
+            if self.moving_at >= buckets {
+                // Every bucket was passed and a key is still there. Nothing
+                // puts a key in the old table once it is there, so this
+                // cannot happen; should it, start over rather than let go
+                // of the key.
+                if cfg!(debug_assertions) {
+                    unreachable!(
+                        "{} keys left in the old table after every bucket was passed",
+                        self.old.len()
+                    );
+                }
+                self.moving_at = 0;
+            }
+            return false;
+        }
+        self.old = HashTable::new();
+        self.moving_at = 0;
+        true
     }
 
     /// The slot of `key`, unless the key is past its time.
@@ -692,6 +904,7 @@ impl ShardMap {
         make: impl FnOnce(&[u8], Option<u64>) -> Entry,
     ) -> Written {
         let hash = self.hash_of(key);
+        self.make_room_for(hash, key);
         let now = &self.now;
         let map = self.id();
         let hasher = &self.hash;
@@ -918,6 +1131,7 @@ impl ShardMap {
     pub fn set_expires(&mut self, key: &(impl AsRef<[u8]> + ?Sized), expires: u64) -> bool {
         let key = key.as_ref();
         let hash = self.hash_of(key);
+        self.settle(hash, key);
         let map = self.id();
         let Some(slot) = self
             .table
@@ -952,6 +1166,7 @@ impl ShardMap {
     pub fn persist(&mut self, key: &(impl AsRef<[u8]> + ?Sized)) -> bool {
         let key = key.as_ref();
         let hash = self.hash_of(key);
+        self.settle(hash, key);
         let map = self.id();
         let Some(slot) = self
             .table
@@ -1041,6 +1256,7 @@ impl ShardMap {
     pub fn remove(&mut self, key: &(impl AsRef<[u8]> + ?Sized)) -> Option<Taken> {
         let key = key.as_ref();
         let hash = self.hash_of(key);
+        self.settle(hash, key);
         match self
             .table
             .find_entry(hash, |s| s.may_be(hash) && s.entry().has_key(key))
@@ -1076,6 +1292,7 @@ impl ShardMap {
     ) -> Removal {
         let key = key.as_ref();
         let hash = self.hash_of(key);
+        self.settle(hash, key);
         let map = self.id();
         match self
             .table
@@ -1110,6 +1327,7 @@ impl ShardMap {
     /// and `taken` is given back instead.
     pub fn put_back(&mut self, taken: Taken) -> Result<Option<Taken>, Taken> {
         let hash = self.hash_of(taken.key());
+        self.make_room_for(hash, taken.key());
         let now = &self.now;
         let hasher = &self.hash;
         let list = &mut self.ttl;
@@ -1155,8 +1373,14 @@ impl ShardMap {
         self.get(key).expect("a key just put in")
     }
 
+    /// Every slot: the table's, then those of the table it grows from.
+    #[inline]
+    fn slots(&self) -> impl Iterator<Item = &Slot> {
+        self.table.iter().chain(self.old.iter())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], ValueRef<'_>)> {
-        self.table.iter().map(|s| {
+        self.slots().map(|s| {
             let e = s.entry();
             (e.key(), e.value())
         })
@@ -1172,16 +1396,21 @@ impl ShardMap {
     /// pages are found from the slots alone: two passes over the table
     /// that touch only the entries of the page. It used to hash every key
     /// of the shard, visiting each entry, for every page (#751).
+    ///
+    /// While the table grows, both tables are counted and walked: a key
+    /// still in the one it grows from is at its position as much as one
+    /// already moved, and a move between pages keeps the slot, fragment
+    /// and all, so a key moved mid-scan keeps its position too.
     pub fn scan(&self, from: u64, want: usize, mut visit: impl FnMut(EntryView<'_>)) -> u64 {
         const POSITIONS: usize = SCAN_POSITIONS as usize;
         let Ok(from) = usize::try_from(from) else {
             return 0;
         };
-        if from >= POSITIONS || self.table.is_empty() {
+        if from >= POSITIONS || self.is_empty() {
             return 0;
         }
         let mut at = [0u32; POSITIONS];
-        for slot in self.table.iter() {
+        for slot in self.slots() {
             at[slot.scan_position() & (POSITIONS - 1)] += 1;
         }
         let mut taken = 0usize;
@@ -1192,7 +1421,7 @@ impl ShardMap {
         }
         let next = (end..POSITIONS).find(|&p| at[p] != 0).unwrap_or(0);
         if taken > 0 {
-            for slot in self.table.iter() {
+            for slot in self.slots() {
                 if (from..end).contains(&slot.scan_position()) {
                     visit(EntryView {
                         entry: slot.entry(),
@@ -1205,16 +1434,16 @@ impl ShardMap {
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
-        self.table.iter().map(|s| s.entry().key())
+        self.slots().map(|s| s.entry().key())
     }
 
     pub fn values(&self) -> impl Iterator<Item = ValueRef<'_>> {
-        self.table.iter().map(|s| s.entry().value())
+        self.slots().map(|s| s.entry().value())
     }
 
     /// Every entry, each as a key, a value and the means to hold it.
     pub fn entries(&self) -> impl Iterator<Item = EntryView<'_>> {
-        self.table.iter().map(|s| EntryView {
+        self.slots().map(|s| EntryView {
             entry: s.entry(),
             _map: std::marker::PhantomData,
         })
@@ -1222,12 +1451,12 @@ impl ShardMap {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.table.len()
+        self.table.len() + self.old.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.table.is_empty()
+        self.table.is_empty() && self.old.is_empty()
     }
 
     /// What `key` takes in this shard besides its value (`MEMORY USAGE`):
@@ -1252,8 +1481,8 @@ impl ShardMap {
         // allocation. (The key is in the table, so it has at least one key,
         // and a time to live puts it on the list.)
         let half_room = |len: usize, room: usize| len.max(room / 2).max(1);
-        let table = self.table.allocation_size()
-            / half_room(self.table.len(), self.table.num_buckets() / 8 * 7);
+        let table = (self.table.allocation_size() + self.old.allocation_size())
+            / half_room(self.len(), self.table.num_buckets() / 8 * 7);
         let ttl = if entry.has_ttl() {
             self.ttl.capacity() * std::mem::size_of::<Entry>()
                 / half_room(self.ttl.len(), self.ttl.capacity())
@@ -1263,7 +1492,8 @@ impl ShardMap {
         Some(entry.block_bytes() + table + ttl)
     }
 
-    /// Keys the table has room for before it grows.
+    /// Keys the table has room for before it grows (while it grows, the
+    /// new table's room).
     #[inline]
     pub fn capacity(&self) -> usize {
         self.table.capacity()
@@ -1272,39 +1502,76 @@ impl ShardMap {
     /// Take every key out, keeping the table's room.
     pub fn clear(&mut self) {
         self.ttl.clear();
-        for slot in self.table.drain() {
+        for slot in self.table.drain().chain(self.old.drain()) {
             // SAFETY: the table's hold, given up.
             unsafe { slot.entry().let_go() };
         }
+        self.old = HashTable::new();
+        self.moving_at = 0;
+        self.layout = self.layout.wrapping_add(1);
     }
 
     /// Shrink the table to room for `keys`, and the list of keys with a
-    /// time to live, if it is sparse, to its keys and an eighth more.
+    /// time to live, if it is sparse, to its keys and an eighth more. A
+    /// table that is growing is left as it is until it is done.
     pub fn shrink_to(&mut self, keys: usize) {
-        let hasher = &self.hash;
-        self.table
-            .shrink_to(keys, |s| hasher.hash_one(s.entry().key()));
+        if !self.is_growing() {
+            let hasher = &self.hash;
+            let buckets = self.table.num_buckets();
+            self.table
+                .shrink_to(keys, |s| hasher.hash_one(s.entry().key()));
+            if self.table.num_buckets() != buckets {
+                self.layout = self.layout.wrapping_add(1);
+            }
+        }
         self.ttl.shrink_if(sparse);
     }
 
     /// Whether the table, or the list of keys with a time to live, has room
     /// for many more keys than it holds (see `store::shrink_if_sparse`).
     pub fn is_sparse(&self) -> bool {
-        sparse(self.len(), self.capacity()) || self.ttl.is_sparse(sparse)
+        (!self.is_growing() && sparse(self.len(), self.capacity())) || self.ttl.is_sparse(sparse)
     }
 
-    /// How many buckets the table has: the positions [`ShardMap::bucket`]
-    /// takes. They stay where they are while keys come and go, until the
-    /// table grows or shrinks.
+    /// How many buckets there are: the positions [`ShardMap::bucket`]
+    /// takes, the table's and then, while it grows, those of the table it
+    /// grows from. An entry stays where it is while keys come and go, until
+    /// the table grows or shrinks, or a step of a growth moves it: a walk
+    /// that lets go of the lock between parts compares
+    /// [`ShardMap::layout`].
     #[inline]
     pub fn buckets(&self) -> usize {
-        self.table.num_buckets()
+        self.table.num_buckets() + self.old_buckets()
+    }
+
+    /// The buckets of the table being grown from: none when the table is
+    /// not growing (an empty hashbrown table says it has one).
+    #[inline]
+    fn old_buckets(&self) -> usize {
+        if self.is_growing() {
+            self.old.num_buckets()
+        } else {
+            0
+        }
+    }
+
+    /// The slot in bucket `index` of [`ShardMap::buckets`].
+    #[inline]
+    fn slot_at(&self, index: usize) -> Option<&Slot> {
+        let new = self.table.num_buckets();
+        if index < new {
+            self.table.get_bucket(index)
+        } else if index - new < self.old_buckets() {
+            self.old.get_bucket(index - new)
+        } else {
+            None
+        }
     }
 
     /// The key and value in bucket `index`, if it holds one.
     #[inline]
     pub fn bucket(&self, index: usize) -> Option<(&[u8], ValueRef<'_>)> {
-        self.table.get_bucket(index).map(|s| {
+        self.slot_at(index).map(|s| {
             let e = s.entry();
             (e.key(), e.value())
         })
@@ -1315,7 +1582,7 @@ impl ShardMap {
     /// with every key as likely as any other (see `eviction`).
     #[inline]
     pub fn entry_at(&self, index: usize) -> Option<EntryView<'_>> {
-        self.table.get_bucket(index).map(|s| EntryView {
+        self.slot_at(index).map(|s| EntryView {
             entry: s.entry(),
             _map: std::marker::PhantomData,
         })
@@ -1331,12 +1598,10 @@ impl ShardMap {
         let start = if buckets == 0 { 0 } else { start % buckets };
         (0..buckets)
             .filter_map(move |step| {
-                self.table
-                    .get_bucket((start + step) % buckets)
-                    .map(|s| EntryView {
-                        entry: s.entry(),
-                        _map: std::marker::PhantomData,
-                    })
+                self.slot_at((start + step) % buckets).map(|s| EntryView {
+                    entry: s.entry(),
+                    _map: std::marker::PhantomData,
+                })
             })
             .take(if self.is_empty() { 0 } else { count })
     }
@@ -1364,7 +1629,7 @@ impl ShardMap {
     /// slab compaction is emptying (`regions` is
     /// `value_slab::regions_snapshot`).
     pub fn evacuating_at(&self, index: usize, regions: &[usize]) -> bool {
-        let Some(slot) = self.table.get_bucket(index) else {
+        let Some(slot) = self.slot_at(index) else {
             return false;
         };
         let entry = slot.entry();
@@ -1386,14 +1651,14 @@ impl ShardMap {
         const AHEAD: usize = 8;
         let to = to.min(self.buckets());
         for index in from..(from + AHEAD).min(to) {
-            if let Some(slot) = self.table.get_bucket(index) {
+            if let Some(slot) = self.slot_at(index) {
                 slot.prefetch_header();
             }
         }
         let mut found = Vec::new();
         for index in from..to {
             if index + AHEAD < to
-                && let Some(slot) = self.table.get_bucket(index + AHEAD)
+                && let Some(slot) = self.slot_at(index + AHEAD)
             {
                 slot.prefetch_header();
             }
@@ -1408,7 +1673,7 @@ impl ShardMap {
     /// one: compaction's next copy.
     #[inline]
     pub fn prefetch_bucket(&self, index: usize) {
-        if let Some(slot) = self.table.get_bucket(index) {
+        if let Some(slot) = self.slot_at(index) {
             slot.prefetch();
         }
     }
@@ -1416,7 +1681,15 @@ impl ShardMap {
     /// Move the entry in bucket `index`, or its string's bytes, out of a
     /// slab compaction is emptying, if the table's is its only hold.
     pub fn relocate_at(&mut self, index: usize, regions: &[usize]) -> Relocated {
-        let Some(slot) = self.table.get_bucket_mut(index) else {
+        let new = self.table.num_buckets();
+        let found = if index < new {
+            self.table.get_bucket_mut(index)
+        } else if index - new < self.old_buckets() {
+            self.old.get_bucket_mut(index - new)
+        } else {
+            None
+        };
+        let Some(slot) = found else {
             return Relocated::Stays;
         };
         let entry = slot.entry();
@@ -1468,6 +1741,15 @@ fn fail_point(at: u8) {
 #[cfg(not(test))]
 #[inline(always)]
 fn fail_point(_: u8) {}
+
+/// Keys moved from the table being grown from by each write to the shard
+/// while it grows (see [`ShardMap::make_room`]). Any number from two up
+/// empties the old table before the new one, twice its size, is full.
+const GROWTH_STEP: usize = 16;
+
+/// A table with fewer keys than this grows in one step, as hashbrown grows
+/// it: under 0.2 ms.
+const GROW_IN_STEPS_FROM: usize = 2048;
 
 /// Tables and lists with room for fewer keys than this are left as they
 /// are: what shrinking one would give back is not worth it.
@@ -2328,5 +2610,409 @@ mod tests {
         assert_eq!(map.due(now + 6_000, usize::MAX).0.len(), 100);
         assert_eq!(map.expires(&long(0)), Some(late));
         assert_eq!(map.due(late + 1, usize::MAX).0.len(), 201);
+    }
+
+    /// A map in the middle of a growth in steps: keys `g0`, `g1`, ... with
+    /// their numbers as values, written until one began, and how many.
+    fn growing() -> (ShardMap, usize) {
+        let mut map = ShardMap::new();
+        let mut n = 0;
+        while !map.is_growing() {
+            map.insert(format!("g{n}"), s(&n.to_string()));
+            n += 1;
+        }
+        assert!(n > GROW_IN_STEPS_FROM);
+        (map, n)
+    }
+
+    /// The keys still in the table being grown from.
+    fn in_old(map: &ShardMap) -> Vec<String> {
+        map.old
+            .iter()
+            .map(|s| String::from_utf8(s.entry().key().to_vec()).unwrap())
+            .collect()
+    }
+
+    /// Every key is in exactly one of the two tables.
+    fn each_key_once(map: &ShardMap) {
+        for slot in map.slots() {
+            let key = slot.entry().key();
+            let hash = map.hash_of(key);
+            let new = map.table.find(hash, |s| s.entry().has_key(key)).is_some();
+            let old = map.old.find(hash, |s| s.entry().has_key(key)).is_some();
+            assert!(new != old, "{key:?} in both tables or neither");
+        }
+    }
+
+    #[test]
+    fn small_tables_grow_in_one_step() {
+        let mut map = ShardMap::new();
+        for i in 0..GROW_IN_STEPS_FROM {
+            map.insert(format!("k{i}"), s("v"));
+            assert!(!map.is_growing());
+        }
+    }
+
+    #[test]
+    fn a_large_table_grows_a_few_keys_at_a_time() {
+        let (mut map, n) = growing();
+        // Only the first step was taken: most keys are still to move.
+        let left = map.old.len();
+        assert!(left > n / 2, "{left} of {n} left");
+        assert_eq!(map.table.len() + left, n);
+        assert_eq!(map.len(), n);
+        // Twice the buckets.
+        assert_eq!(map.table.num_buckets(), 2 * map.old.num_buckets());
+        each_key_once(&map);
+        for i in 0..n {
+            assert_eq!(
+                text(map.get(&format!("g{i}"))),
+                Some(i.to_string().into_bytes())
+            );
+        }
+        // Each write moves GROWTH_STEP keys on.
+        let mut writes = 0;
+        while map.is_growing() {
+            let left = map.old.len();
+            map.insert(format!("more{writes}"), s("m"));
+            writes += 1;
+            assert!(map.old.len() + GROWTH_STEP <= left || !map.is_growing());
+        }
+        assert!(writes <= n / GROWTH_STEP + 1, "{writes} writes");
+        // The old table's memory is given back.
+        assert_eq!(map.old.allocation_size(), 0);
+        assert_eq!(map.len(), n + writes);
+        for i in 0..n {
+            assert_eq!(
+                text(map.get(&format!("g{i}"))),
+                Some(i.to_string().into_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn a_growth_keeps_each_slot_as_it_was() {
+        let slot_of = |map: &ShardMap, key: &str| {
+            let hash = map.hash_of(key.as_bytes());
+            map.find(hash, key.as_bytes()).unwrap().raw()
+        };
+        let mut map = ShardMap::new();
+        let mut kept = std::collections::HashMap::new();
+        // Across several growths, each in steps, and the steps between.
+        for n in 0..6 * GROW_IN_STEPS_FROM {
+            let key = format!("k{n}");
+            map.insert(&key, s("v"));
+            kept.insert(key.clone(), slot_of(&map, &key));
+        }
+        while !map.step_growth(1) {}
+        for (key, slot) in &kept {
+            // The fragment of its hash (what `SCAN` goes by), its size hint
+            // and its address: the slot is the same.
+            assert_eq!(slot_of(&map, key), *slot, "{key}");
+        }
+    }
+
+    #[test]
+    fn writes_during_a_growth_find_keys_in_either_table() {
+        let (mut map, n) = growing();
+        let old = in_old(&map);
+        assert!(old.len() > 100);
+        let mut len = n;
+        // Written over: in place if it can be, and with a new entry.
+        map.set_str(&old[0], "a");
+        let long = "a value too long to be written in place over the one it had";
+        map.insert(&old[1], s(long));
+        assert_eq!(text(map.get(&old[0])), Some(b"a".to_vec()));
+        assert_eq!(text(map.get(&old[1])), Some(long.as_bytes().to_vec()));
+        // Taken out, two ways, and one put back.
+        let taken = map.remove(&old[2]).unwrap();
+        len -= 1;
+        assert!(map.get(&old[2]).is_none());
+        assert!(matches!(map.remove_if(&old[3], |_| false), Removal::Kept));
+        assert!(matches!(
+            map.remove_if(&old[3], |_| true),
+            Removal::Taken(_)
+        ));
+        len -= 1;
+        assert!(matches!(map.put_back(taken), Ok(None)));
+        len += 1;
+        assert!(map.contains_key(&old[2]));
+        // A time to live given, and taken away.
+        assert!(map.set_expires(&old[4], u64::MAX / 2));
+        assert_eq!(map.expires(&old[4]), Some(u64::MAX / 2));
+        assert_eq!(map.ttl_len(), 1);
+        assert!(map.persist(&old[4]));
+        assert_eq!(map.expires(&old[4]), None);
+        assert_eq!(map.ttl_len(), 0);
+        // A new key with one.
+        map.insert_expiring("new", s("n"), Some(u64::MAX / 2));
+        len += 1;
+        assert_eq!(map.ttl_len(), 1);
+        assert_eq!(map.len(), len);
+        each_key_once(&map);
+        // A key that is in neither table.
+        assert!(map.get("nowhere").is_none());
+        assert!(map.remove("nowhere").is_none());
+        while !map.step_growth(GROWTH_STEP) {}
+        assert_eq!(map.len(), len);
+        assert_eq!(map.keys().count(), len);
+        assert_eq!(text(map.get(&old[0])), Some(b"a".to_vec()));
+        assert!(map.get(&old[3]).is_none());
+        assert_eq!(map.expires("new"), Some(u64::MAX / 2));
+    }
+
+    #[test]
+    fn walks_during_a_growth_see_every_key_once() {
+        let (map, n) = growing();
+        let mut seen: Vec<Vec<u8>> = map.keys().map(<[u8]>::to_vec).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert_eq!(map.entries().count(), n);
+        let mut seen: Vec<Vec<u8>> = (0..map.buckets())
+            .filter_map(|i| map.bucket(i).map(|(k, _)| k.to_vec()))
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert!(map.bucket(map.buckets()).is_none());
+        assert_eq!(map.sample_from(17, n + 10).count(), n);
+        // A random key, from either table.
+        let mut x = 1usize;
+        let mut picked = std::collections::HashSet::new();
+        for _ in 0..2_000 {
+            let (key, _) = map
+                .random_entry(|| {
+                    x = x
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    x >> 16
+                })
+                .unwrap();
+            picked.insert(key.to_vec());
+        }
+        let olds: std::collections::HashSet<Vec<u8>> =
+            in_old(&map).into_iter().map(String::into_bytes).collect();
+        assert!(picked.iter().any(|k| olds.contains(k)));
+        assert!(picked.iter().any(|k| !olds.contains(k)));
+    }
+
+    /// A `SCAN` during a growth sees every key, those still in the table
+    /// grown from as well as those moved, once: a growth that stays where
+    /// it is, and one that moves on between pages until it is done.
+    #[test]
+    fn a_scan_during_a_growth_sees_every_key_once() {
+        let (mut map, n) = growing();
+        let old: Vec<Vec<u8>> = in_old(&map).into_iter().map(String::into_bytes).collect();
+        assert!(old.len() > n / 2);
+        let seen = scan_all(&mut map, 10, |map, _| assert!(map.is_growing()));
+        assert!(map.is_growing(), "the growth stayed partly done");
+        assert_eq!(seen.len(), n);
+        assert!(seen.values().all(|&times| times == 1));
+        assert!(old.iter().all(|key| seen.contains_key(key)));
+        // A page that ends at a position with keys in both tables takes all
+        // of them: the page sizes add up to the keys.
+        let mut from = 0;
+        let mut total = 0;
+        loop {
+            from = map.scan(from, 1, |_| total += 1);
+            if from == 0 {
+                break;
+            }
+        }
+        assert_eq!(total, n);
+
+        // Writes and steps of the growth between pages move keys from the
+        // old table to the new one, each keeping its position: none is
+        // missed or seen twice, through to the end of the growth.
+        let (mut map, n) = growing();
+        let mut added = 0usize;
+        let mut grew_through = 0;
+        let seen = scan_all(&mut map, 10, |map, _| {
+            if map.is_growing() {
+                grew_through += 1;
+            }
+            map.insert(format!("new:{added}"), s("v"));
+            added += 1;
+            map.step_growth(GROWTH_STEP);
+            each_key_once(map);
+        });
+        assert!(!map.is_growing(), "the growth finished mid-scan");
+        assert!(grew_through > 20, "{grew_through} pages while growing");
+        for i in 0..n {
+            assert_eq!(seen.get(format!("g{i}").as_bytes()), Some(&1), "g{i}");
+        }
+        assert!(seen.values().all(|&times| times == 1));
+    }
+
+    /// A full table of keys `g0`, `g1`, ... with their numbers as values,
+    /// large enough to grow in steps: the next write begins a growth.
+    fn full() -> (ShardMap, usize) {
+        let mut map = ShardMap::new();
+        let mut n = 0;
+        while map.len() < GROW_IN_STEPS_FROM || map.len() != map.capacity() {
+            map.insert(format!("g{n}"), s(&n.to_string()));
+            n += 1;
+        }
+        assert!(!map.is_growing());
+        (map, n)
+    }
+
+    /// After a write that may have begun a growth, of a key that was there:
+    /// one entry for each of the `n` keys, `key` holding `value`, through
+    /// the end of the growth, and nothing left once it is taken out.
+    fn written_over_once(mut map: ShardMap, n: usize, key: &str, value: &str) {
+        assert_eq!(map.len(), n);
+        each_key_once(&map);
+        assert_eq!(text(map.get(key)), Some(value.as_bytes().to_vec()));
+        while !map.step_growth(GROWTH_STEP) {}
+        assert_eq!(map.len(), n);
+        assert_eq!(map.keys().count(), n);
+        assert_eq!(text(map.get(key)), Some(value.as_bytes().to_vec()));
+        assert!(map.remove(key).is_some());
+        assert!(map.get(key).is_none());
+        assert!(!map.keys().any(|k| k == key.as_bytes()));
+        assert_eq!(map.len(), n - 1);
+        assert_eq!(map.ttl_len(), 0);
+        assert_eq!(map.ttl.iter().count(), 0);
+    }
+
+    /// The write that begins a growth writes over a key that is there: the
+    /// growth moves every key to the old table, and the write must find it
+    /// there, not add it again to the new one (#780 review).
+    #[test]
+    fn a_write_over_a_key_that_begins_a_growth_keeps_one_entry() {
+        // A new value, in a new entry.
+        let (mut map, n) = full();
+        let long = "a value too long to be written in place over the one it had";
+        assert!(map.insert("g5", s(long)).is_some());
+        assert!(map.is_growing());
+        written_over_once(map, n, "g5", long);
+
+        // Written in place.
+        let (mut map, n) = full();
+        assert!(matches!(map.set_str("g6", "7"), Written::InPlace));
+        assert!(map.is_growing());
+        written_over_once(map, n, "g6", "7");
+
+        // A key with a time to live given a new one: one place on the list.
+        let (mut map, n) = full();
+        assert!(map.set_expires("g7", u64::MAX / 4));
+        assert!(!map.is_growing());
+        assert!(
+            map.insert_expiring("g7", s("x"), Some(u64::MAX / 2))
+                .is_some()
+        );
+        assert!(map.is_growing());
+        assert_eq!(map.ttl_len(), 1);
+        assert_eq!(map.expires("g7"), Some(u64::MAX / 2));
+        written_over_once(map, n, "g7", "x");
+
+        // An entry put back under a live key: refused, the key as it was.
+        let (mut map, n) = full();
+        let mut other = ShardMap::new();
+        other.insert("g8", s("elsewhere"));
+        let taken = other.remove("g8").unwrap();
+        assert!(map.put_back(taken).is_err());
+        written_over_once(map, n, "g8", "8");
+
+        // Put back over a key past its time: written over, once.
+        let (mut map, n) = full();
+        assert!(map.set_expires("g9", 1));
+        let mut other = ShardMap::new();
+        other.insert("g9", s("back"));
+        let taken = other.remove("g9").unwrap();
+        assert!(matches!(map.put_back(taken), Ok(Some(_))));
+        assert_eq!(map.ttl_len(), 0);
+        written_over_once(map, n, "g9", "back");
+
+        // `INCR`'s way: read, then written over.
+        let (mut map, n) = full();
+        let was = text(map.get("g10")).unwrap();
+        assert_eq!(was, b"10");
+        assert!(!matches!(map.set_str("g10", "11"), Written::New));
+        written_over_once(map, n, "g10", "11");
+    }
+
+    /// A table that is growing, and full (or one key short of it), with
+    /// keys `f0`... in the new table and `g0`... still in the old one.
+    fn growing_and_full(spare: usize) -> (ShardMap, Vec<String>, usize) {
+        let (mut from, _) = growing();
+        let mut map = ShardMap::new();
+        map.hash = from.hash.clone();
+        let mut n = 0;
+        while map.len() < GROW_IN_STEPS_FROM || map.len() + spare != map.capacity() {
+            map.insert(format!("f{n}"), s("f"));
+            n += 1;
+        }
+        map.old = std::mem::take(&mut from.old);
+        map.moving_at = 0;
+        let old = in_old(&map);
+        assert!(map.is_growing());
+        let len = map.len();
+        (map, old, len)
+    }
+
+    /// A table that fills while it grows finishes that growth and begins
+    /// another: a key written over then is still found, once.
+    #[test]
+    fn a_write_over_a_key_while_a_full_table_grows_keeps_one_entry() {
+        for spare in [0, 1] {
+            // A key still in the old table, and one in the new.
+            for key in [None, Some("f3")] {
+                let (mut map, old, n) = growing_and_full(spare);
+                let key = key.map_or(old[0].clone(), str::to_string);
+                assert!(map.insert(&key, s("again")).is_some());
+                written_over_once(map, n, &key, "again");
+            }
+            // A new key: one more.
+            let (mut map, _, n) = growing_and_full(spare);
+            assert!(map.insert("brand new", s("n")).is_none());
+            written_over_once(map, n + 1, "brand new", "n");
+        }
+    }
+
+    #[test]
+    fn the_layout_changes_when_keys_move() {
+        let (mut map, _) = growing();
+        let before = map.layout();
+        map.insert("one more", s("v"));
+        assert_ne!(map.layout(), before);
+        while !map.step_growth(GROWTH_STEP) {}
+        let done = map.layout();
+        map.insert("and another", s("v"));
+        assert!(map.remove("one more").is_some());
+        assert_eq!(map.layout(), done);
+    }
+
+    #[test]
+    fn a_growing_table_is_not_shrunk_and_can_be_cleared() {
+        let (mut map, n) = growing();
+        let buckets = map.buckets();
+        for i in 0..n - 10 {
+            assert!(map.remove(&format!("g{i}")).is_some());
+            if map.is_growing() {
+                assert!(!map.is_sparse());
+                map.shrink_to(20);
+                assert_eq!(map.buckets(), buckets);
+            }
+        }
+        while !map.step_growth(GROWTH_STEP) {}
+        assert!(map.is_sparse());
+        map.shrink_to(20);
+        assert!(map.buckets() < buckets);
+        assert_eq!(map.len(), 10);
+
+        let (mut map, _) = growing();
+        map.clear();
+        assert!(map.is_empty());
+        assert!(!map.is_growing());
+        assert!(map.get("g0").is_none());
+        map.insert("g0", s("again"));
+        assert_eq!(text(map.get("g0")), Some(b"again".to_vec()));
+        // Dropped in the middle of a growth: every entry let go of once.
+        let (map, _) = growing();
+        assert!(map.is_growing());
+        drop(map);
     }
 }

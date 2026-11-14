@@ -244,6 +244,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `INFO memory` has `allocator_trims` and `allocator_trims_skipped_busy`;
   `allocator-give-back no` turns it off. Linux builds on glibc only.
 
+- **A shard's table grows without holding up other clients (#752).** A
+  full table grew in one step, every key hashed again with the shard
+  locked: 18 ms for a shard of 230,000 keys, 37 ms for 460,000, and the
+  shards, filling evenly, grew at about the same time. While 8 million keys
+  were written, a `PING` on another connection waited up to 141 ms on the
+  Tokio I/O model (Redis 8.10.2: 17 ms), and 160 ms at 17.5 million keys
+  with a time to live. A large table now grows as Redis's do: a new table
+  twice the size takes the new keys, each write to the shard moves 16 of
+  the old one's over, and the expiry thread finishes a growth that writes
+  have stopped moving on. The expiry thread's sweep of the keys with a time
+  to live, every 20 s, now hands the shard to a waiting writer between its
+  turns instead of taking it back first. The longest `PING` is now 21 ms
+  at 8 million keys and 20-24 ms at 17.5 million (Redis: 17-18 ms).
+
 - **An atomic slot import that does not complete keeps the keys the node
   held of those slots before it (#745).** A canceled, failed or timed-out
   `CLUSTER MIGRATION IMPORT` deleted every key of its slots on the
