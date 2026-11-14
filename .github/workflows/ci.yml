@@ -8,6 +8,7 @@ on:
       - 'tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.config/nextest.toml'
       - 'scripts/redis_compat*'
       - '.github/workflows/ci.yml'
   # By hand, from the Actions tab: the full build and test of a branch, e.g.
@@ -59,6 +60,7 @@ jobs:
               - 'tests/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.config/nextest.toml'
               - 'scripts/redis_compat*'
 
   # -- What `rust` used to do in one 41-minute job, as parallel jobs ---------

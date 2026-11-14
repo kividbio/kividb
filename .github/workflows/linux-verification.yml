@@ -39,6 +39,7 @@ on:
       - "smoke/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".config/nextest.toml"
       - ".github/workflows/linux-verification.yml"
   workflow_dispatch:
 
