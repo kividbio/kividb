@@ -62,6 +62,8 @@ jobs:
               - 'Cargo.lock'
               - '.config/nextest.toml'
               - 'scripts/redis_compat*'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/linux-verification.yml'
 
   # -- What `rust` used to do in one 41-minute job, as parallel jobs ---------
   # `cargo test` compiled and ran 75 test binaries one after the other. Now the
@@ -134,6 +136,10 @@ jobs:
 
   test:
     needs: build-tests
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-tests is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     name: test (${{ matrix.shard }}/6)
@@ -165,6 +171,10 @@ jobs:
   # Mixed-version tests need the 1.2.2 release binary, pinned by digest.
   mixed-version:
     needs: build-tests
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-tests is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -231,15 +241,19 @@ jobs:
   # only if everything above did. Skipped, like them, when no source changed.
   rust:
     needs: [detect-changes, lint, build-tests, test, mixed-version, build-release]
+    # Also when detect-changes itself failed: the jobs above were skipped, and
+    # a skipped check would count as passed. It runs, and fails below.
     if: >-
-      always() && needs.detect-changes.result != 'failure' &&
-      (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.run_ci == 'true')
+      always() && (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.result == 'failure' ||
+      needs.detect-changes.outputs.run_ci == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Gate
         env:
           RESULTS: >-
+            detect-changes=${{ needs.detect-changes.result == 'failure' && 'failure' || 'success' }}
             lint=${{ needs.lint.result }}
             build-tests=${{ needs.build-tests.result }}
             test=${{ needs.test.result }}
@@ -257,6 +271,10 @@ jobs:
     # beside the tests instead of after them. `rust` still fails the PR if
     # the tests do.
     needs: build-release
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-release is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-release.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -315,6 +333,10 @@ jobs:
     # beside the tests instead of after them. `rust` still fails the PR if
     # the tests do.
     needs: build-release
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-release is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-release.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
