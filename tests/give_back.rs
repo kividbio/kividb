@@ -6,7 +6,9 @@
 // A binary of its own: RSS is the process's, and nothing else here
 // allocates.
 // Run with: cargo test --test give_back
-#![cfg(target_os = "linux")]
+// Not on the mimalloc builds (lua, full): glibc is not their allocator there,
+// so the give-back thread is not started.
+#![cfg(all(target_os = "linux", not(feature = "mimalloc")))]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
