@@ -32,7 +32,7 @@ summary page, and keeps every unit's log as an artifact.
 It is a gate on what fails. `scripts/redis_compat_known_failures.txt` lists
 the tests KiviDB is known to fail, by unit and name. A unit with any other
 failure, or that ends early (an exception, a test that never finishes, the
-server gone), is run once more, and fails the job if it fails again: a
+unit's time running out, the server gone), is run once more, and fails the job if it fails again: a
 regression fails twice, a flake once. A listed test that passes is printed
 as a notice, to be taken off the list. `scripts/redis_compat_check.sh`
 decides; `scripts/redis_compat_check_test.sh` tests it.

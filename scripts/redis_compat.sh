@@ -110,6 +110,8 @@ run_unit() {
   timeout "$UNIT_TIMEOUT" ./runtest \
     --host 127.0.0.1 --port "$PORT" --singledb --ignore-encoding \
     --timeout "$TEST_TIMEOUT" --single "$1" "${TAGS[@]}" > "$2" 2>&1
+  # Killed by `timeout`, the suite says nothing: its log just stops.
+  [ $? -ne 124 ] || echo "[unit timed out]" >> "$2"
   kill -0 "$server_pid" 2>/dev/null || echo "[server died]" >> "$2"
   stop_server
 }
@@ -130,9 +132,9 @@ for unit in $UNITS; do
   ok=$(count '^\[ok\]' "$log")
   err=$(count '^\[err\]' "$log")
   # A unit that ends early — on an exception in the test code, a test that
-  # never finished, or the server gone — has tests after that point that
-  # were not run.
-  aborted=$(( $(count '^\[exception\]' "$log") + $(count '^\[TIMEOUT\]' "$log") + $(count '^\[server ' "$log") ))
+  # never finished, its time running out, or the server gone — has tests
+  # after that point that were not run.
+  aborted=$(( $(count '^\[exception\]' "$log") + $(count '^\[TIMEOUT\]' "$log") + $(count '^\[unit timed out\]' "$log") + $(count '^\[server ' "$log") ))
 
   total_ok=$((total_ok + ok))
   total_err=$((total_err + err))

@@ -14,6 +14,7 @@ cat > "$DIR/known" <<'EOF'
 unit/alpha | Listed test
 unit/alpha | Listed test: now passing
 unit/alpha | Listed test in two modes
+unit/alpha | Listed test on io_uring | io_uring
 EOF
 
 log() { # name, lines of the log after its header
@@ -65,6 +66,19 @@ sock5b455f9ec430 => (IN PROGRESS) The test that hung
 EOF
 want 1 "The test that hung" timeout
 
+log in-progress <<'EOF'
+[ok]: Some test (1 ms)
+sock5b455f9ec430 => (IN PROGRESS) The test that hung
+EOF
+want 1 "The test that hung" in-progress
+
+# Killed by redis_compat.sh's limit on the whole unit: the log just stops.
+log unit-timed-out <<'EOF'
+[ok]: Some test (1 ms)
+[unit timed out]
+EOF
+want 1 "[unit timed out]" unit-timed-out
+
 log exception <<'EOF'
 [ok]: Some test (1 ms)
 [exception]: Executing test client: I/O error reading reply.
@@ -84,6 +98,12 @@ log listed-passes <<'EOF'
 [ok]: Listed test: now passing (12 ms)
 EOF
 want 0 '::notice::unit/alpha: "Listed test: now passing" passes now' listed-passes
+
+# Fails on io_uring only: passing on Tokio says nothing.
+log listed-passes-io-uring <<'EOF'
+[ok]: Listed test on io_uring (12 ms)
+EOF
+want 0 '"Listed test on io_uring" passes now; it is listed as failing on io_uring only' listed-passes-io-uring
 
 # Run once per mode (EVAL and FCALL, RESP2 and RESP3): passing in one of them
 # is not passing.
