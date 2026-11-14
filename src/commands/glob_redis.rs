@@ -20,6 +20,122 @@ pub(crate) fn matches(pattern: &[u8], text: &[u8]) -> bool {
     match_from(pattern, text, &mut skip_longer, 0)
 }
 
+/// A pattern made ready to match many texts: what a scan of the keyspace
+/// matches every key it looks at against.
+///
+/// Most patterns given are a run of plain bytes with a `*` after it
+/// (`schedule:*`), before it, or on both sides: those are told by comparing
+/// bytes, without going through the pattern a byte at a time for each key.
+/// Any other pattern is matched as [`matches`] does. Either way the answer
+/// is the one [`matches`] gives.
+pub(crate) struct Glob {
+    pattern: Vec<u8>,
+    shape: Shape,
+}
+
+enum Shape {
+    /// `*`: anything.
+    All,
+    /// No `*`, `?` or `[`: these bytes and nothing else.
+    Exact(Vec<u8>),
+    /// `a*`
+    Prefix(Vec<u8>),
+    /// `*b`
+    Suffix(Vec<u8>),
+    /// `a*b`
+    Both(Vec<u8>, Vec<u8>),
+    /// `*a*`
+    Contains(Box<memchr::memmem::Finder<'static>>),
+    /// Anything else.
+    General,
+}
+
+impl Glob {
+    pub(crate) fn new(pattern: &[u8]) -> Glob {
+        let shape = match literal_parts(pattern) {
+            None => Shape::General,
+            Some(mut parts) => match parts.len() {
+                1 => Shape::Exact(parts.pop().unwrap_or_default()),
+                2 => {
+                    let back = parts.pop().unwrap_or_default();
+                    let front = parts.pop().unwrap_or_default();
+                    match (front.is_empty(), back.is_empty()) {
+                        (true, true) => Shape::All,
+                        (false, true) => Shape::Prefix(front),
+                        (true, false) => Shape::Suffix(back),
+                        (false, false) => Shape::Both(front, back),
+                    }
+                }
+                3 if parts[0].is_empty() && parts[2].is_empty() && !parts[1].is_empty() => {
+                    Shape::Contains(Box::new(
+                        memchr::memmem::Finder::new(&parts[1]).into_owned(),
+                    ))
+                }
+                _ => Shape::General,
+            },
+        };
+        Glob {
+            pattern: pattern.to_vec(),
+            shape,
+        }
+    }
+
+    /// Whether `text` matches: what [`matches`] says.
+    #[inline]
+    pub(crate) fn matches(&self, text: &[u8]) -> bool {
+        // An empty text is the one place the matcher's trailing `*`s are
+        // not simply "anything": it says what it says.
+        if text.is_empty() {
+            return matches(&self.pattern, text);
+        }
+        match &self.shape {
+            Shape::All => true,
+            Shape::Exact(bytes) => text == &bytes[..],
+            Shape::Prefix(front) => text.starts_with(front),
+            Shape::Suffix(back) => text.ends_with(back),
+            Shape::Both(front, back) => {
+                text.len() >= front.len() + back.len()
+                    && text.starts_with(front)
+                    && text.ends_with(back)
+            }
+            Shape::Contains(finder) => finder.find(text).is_some(),
+            Shape::General => matches(&self.pattern, text),
+        }
+    }
+}
+
+/// The plain bytes of `pattern` between its `*`s (a run of them as one),
+/// escapes taken out: `None` if it has a `?` or a `[`.
+fn literal_parts(pattern: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut parts = vec![Vec::new()];
+    let mut after_star = false;
+    let mut i = 0;
+    while i < pattern.len() {
+        match pattern[i] {
+            b'*' => {
+                if !after_star {
+                    parts.push(Vec::new());
+                }
+                after_star = true;
+                i += 1;
+                continue;
+            }
+            b'?' | b'[' => return None,
+            // `\x` is `x`; a `\` the pattern ends with is itself.
+            b'\\' if i + 1 < pattern.len() => {
+                parts.last_mut()?.push(pattern[i + 1]);
+                i += 2;
+            }
+            byte => {
+                parts.last_mut()?.push(byte);
+                i += 1;
+            }
+        }
+        after_star = false;
+    }
+    Some(parts)
+}
+
 fn match_from(mut pattern: &[u8], mut text: &[u8], skip_longer: &mut bool, nesting: usize) -> bool {
     if nesting > MAX_NESTING {
         return false;
@@ -155,5 +271,95 @@ mod tests {
         // another are no trouble.
         assert!(m(&"*".repeat(5000), "abc"));
         assert!(!m(&format!("{}b", "a*".repeat(30)), &"a".repeat(200)));
+    }
+
+    fn shape(pattern: &[u8]) -> &'static str {
+        match super::Glob::new(pattern).shape {
+            super::Shape::All => "all",
+            super::Shape::Exact(_) => "exact",
+            super::Shape::Prefix(_) => "prefix",
+            super::Shape::Suffix(_) => "suffix",
+            super::Shape::Both(..) => "both",
+            super::Shape::Contains(_) => "contains",
+            super::Shape::General => "general",
+        }
+    }
+
+    #[test]
+    fn plain_patterns_are_told_by_their_bytes() {
+        assert_eq!(shape(b"*"), "all");
+        assert_eq!(shape(b"***"), "all");
+        assert_eq!(shape(b"schedule:*"), "prefix");
+        assert_eq!(shape(b"schedule:**"), "prefix");
+        assert_eq!(shape(b"*:1"), "suffix");
+        assert_eq!(shape(b"*:1*"), "contains");
+        assert_eq!(shape(b"a*b"), "both");
+        assert_eq!(shape(b"abc"), "exact");
+        assert_eq!(shape(b""), "exact");
+        // An escaped `*`, `?` or `[` is a plain byte.
+        assert_eq!(shape(b"a\\*b*"), "prefix");
+        assert_eq!(shape(b"a\\?*"), "prefix");
+        assert_eq!(shape(b"a\\[*"), "prefix");
+        assert_eq!(shape(b"foo\\"), "exact");
+        // Anything else is gone through as the matcher goes through it.
+        assert_eq!(shape(b"a?*"), "general");
+        assert_eq!(shape(b"a[bc]*"), "general");
+        assert_eq!(shape(b"a*b*c"), "general");
+        assert_eq!(shape(b"**"), "all");
+
+        let glob = super::Glob::new(b"schedule:*");
+        assert!(glob.matches(b"schedule:1"));
+        assert!(glob.matches(b"schedule:"));
+        assert!(!glob.matches(b"user:1"));
+        assert!(!glob.matches(b"schedule"));
+        let glob = super::Glob::new(b"a\\*b*");
+        assert!(glob.matches(b"a*bc"));
+        assert!(!glob.matches(b"aXbc"));
+        let glob = super::Glob::new(b"ab*ba");
+        assert!(!glob.matches(b"aba"), "the two ends do not overlap");
+        assert!(glob.matches(b"abba"));
+        // Binary keys.
+        let glob = super::Glob::new(b"\xff\x00*");
+        assert!(glob.matches(b"\xff\x00\x01"));
+        assert!(!glob.matches(b"\xff\x01"));
+        assert!(super::Glob::new(b"*\x00*").matches(b"a\x00b"));
+    }
+
+    /// Every pattern of up to four bytes from `a`, `b`, `*`, `?`, `[` and
+    /// `\`, against every text of up to three bytes: the made-ready pattern
+    /// answers as the matcher does.
+    #[test]
+    fn a_made_ready_pattern_answers_as_the_matcher_does() {
+        fn all(alphabet: &[u8], longest: usize) -> Vec<Vec<u8>> {
+            let mut out = vec![Vec::new()];
+            let mut last = vec![Vec::new()];
+            for _ in 0..longest {
+                let mut next = Vec::new();
+                for word in &last {
+                    for &byte in alphabet {
+                        let mut longer = word.clone();
+                        longer.push(byte);
+                        next.push(longer);
+                    }
+                }
+                out.extend(next.iter().cloned());
+                last = next;
+            }
+            out
+        }
+        let patterns = all(b"ab*?[\\", 4);
+        let texts = all(b"ab*\\\xff", 3);
+        for pattern in &patterns {
+            let glob = super::Glob::new(pattern);
+            for text in &texts {
+                assert_eq!(
+                    glob.matches(text),
+                    matches(pattern, text),
+                    "{:?} against {:?}",
+                    String::from_utf8_lossy(pattern),
+                    String::from_utf8_lossy(text)
+                );
+            }
+        }
     }
 }

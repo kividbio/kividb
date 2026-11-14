@@ -821,13 +821,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         inner.len(),
                         1024,
                     );
+                    let pattern = options
+                        .pattern
+                        .as_deref()
+                        .map(crate::commands::glob_redis::Glob::new);
                     let items: Vec<Vec<u8>> = page
                         .into_iter()
-                        .filter(|m| {
-                            options.pattern.as_deref().is_none_or(|pat| {
-                                crate::commands::helpers::glob_match_bytes(pat, m)
-                            })
-                        })
+                        .filter(|m| pattern.as_ref().is_none_or(|glob| glob.matches(m)))
                         .map(|m| resp_bulk(m))
                         .collect();
 

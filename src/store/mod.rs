@@ -13,8 +13,8 @@ mod ttl_list;
 pub use access::AccessScope;
 #[allow(unused_imports)] // Not every item is named outside the store yet.
 pub use shard_map::{
-    EntryRef, EntryView, Leftover, Lookup, Relocated, Removal, ShardMap, StrRef, Taken, ValueRef,
-    Written,
+    EntryRef, EntryView, Leftover, Lookup, Relocated, Removal, SCAN_POSITIONS, ShardMap, StrRef,
+    Taken, ValueRef, Written,
 };
 
 /// Which shard `key` is in, of `shards` (a power of two).

@@ -991,6 +991,15 @@ impl Slot {
         (self.0 >> 52) << 32
     }
 
+    /// Where this slot's key comes in a scan of its table: the fragment of
+    /// its hash, below `SCAN_POSITIONS`. Read from the slot alone, without
+    /// a visit to the entry, and the key's for as long as it is in the
+    /// table: the table growing or shrinking moves the slot, not this.
+    #[inline(always)]
+    pub(super) fn scan_position(self) -> usize {
+        (self.0 >> 52) as usize
+    }
+
     #[inline(always)]
     pub(super) fn entry(self) -> Entry {
         // SAFETY: made from an entry's address, never zero.

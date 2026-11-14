@@ -299,6 +299,12 @@ fn used(entry: Entry, hash: u64, map: u64) {
     }
 }
 
+/// How many positions a `SCAN` goes through a shard's keys in
+/// ([`ShardMap::scan`]): one for each value of the 12-bit fragment of a
+/// key's hash a slot keeps. A key keeps its position for as long as it is
+/// in the table, whatever the table does to make room or give it back.
+pub const SCAN_POSITIONS: u64 = 4096;
+
 /// One shard's keys and values: a table of [`Slot`]s, each the address of
 /// an entry holding a key and its value (`entry`).
 pub struct ShardMap {
@@ -1156,6 +1162,48 @@ impl ShardMap {
         })
     }
 
+    /// One page of a `SCAN` of this shard: each entry at a position from
+    /// `from` on (see [`SCAN_POSITIONS`]), up to the position that brings
+    /// the page to `want` entries, given to `visit`. A position is never
+    /// split between two pages. Returns the position to go on from: zero
+    /// when no entry is at a position past the page.
+    ///
+    /// A key's position is the fragment of its hash its slot keeps, so the
+    /// pages are found from the slots alone: two passes over the table
+    /// that touch only the entries of the page. It used to hash every key
+    /// of the shard, visiting each entry, for every page (#751).
+    pub fn scan(&self, from: u64, want: usize, mut visit: impl FnMut(EntryView<'_>)) -> u64 {
+        const POSITIONS: usize = SCAN_POSITIONS as usize;
+        let Ok(from) = usize::try_from(from) else {
+            return 0;
+        };
+        if from >= POSITIONS || self.table.is_empty() {
+            return 0;
+        }
+        let mut at = [0u32; POSITIONS];
+        for slot in self.table.iter() {
+            at[slot.scan_position() & (POSITIONS - 1)] += 1;
+        }
+        let mut taken = 0usize;
+        let mut end = from;
+        while end < POSITIONS && taken < want.max(1) {
+            taken += at[end] as usize;
+            end += 1;
+        }
+        let next = (end..POSITIONS).find(|&p| at[p] != 0).unwrap_or(0);
+        if taken > 0 {
+            for slot in self.table.iter() {
+                if (from..end).contains(&slot.scan_position()) {
+                    visit(EntryView {
+                        entry: slot.entry(),
+                        _map: std::marker::PhantomData,
+                    });
+                }
+            }
+        }
+        next as u64
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
         self.table.iter().map(|s| s.entry().key())
     }
@@ -1611,6 +1659,101 @@ mod tests {
     #[test]
     fn a_panic_moving_a_key_with_no_ttl_frees_only_the_copy() {
         relocation_unwinds_at(1, false, Then::Remove);
+    }
+
+    /// A whole scan of `map` in pages of `want`, `change` run on it after
+    /// each page: every key seen, as often as it was.
+    fn scan_all(
+        map: &mut ShardMap,
+        want: usize,
+        mut change: impl FnMut(&mut ShardMap, usize),
+    ) -> std::collections::HashMap<Vec<u8>, usize> {
+        let mut seen = std::collections::HashMap::new();
+        let mut from = 0;
+        let mut pages = 0;
+        loop {
+            let next = map.scan(from, want, |entry| {
+                *seen.entry(entry.key().to_vec()).or_insert(0) += 1;
+            });
+            pages += 1;
+            assert!(pages <= SCAN_POSITIONS as usize + 1, "a scan ends");
+            if next == 0 {
+                return seen;
+            }
+            assert!(next > from, "a scan goes forward");
+            from = next;
+            change(map, pages);
+        }
+    }
+
+    #[test]
+    fn a_scan_sees_every_key_once_when_nothing_changes() {
+        let mut map = ShardMap::new();
+        for i in 0..20_000 {
+            map.insert_str(format!("k:{i}").as_bytes(), "v");
+        }
+        let seen = scan_all(&mut map, 100, |_, _| {});
+        assert_eq!(seen.len(), 20_000);
+        assert!(seen.values().all(|&n| n == 1));
+        // Pages of about the size asked for.
+        let mut pages = 0;
+        let mut from = 0;
+        loop {
+            let mut n = 0;
+            from = map.scan(from, 1000, |_| n += 1);
+            assert!((1000..1100).contains(&n) || from == 0, "a page of {n}");
+            pages += 1;
+            if from == 0 {
+                break;
+            }
+        }
+        assert!((18..=21).contains(&pages), "{pages} pages");
+        assert_eq!(ShardMap::new().scan(0, 10, |_| panic!("empty")), 0);
+        assert_eq!(map.scan(SCAN_POSITIONS, 10, |_| panic!("past the end")), 0);
+    }
+
+    /// Keys there all along are seen while the table grows many times over,
+    /// loses keys, and is shrunk.
+    #[test]
+    fn a_scan_sees_every_lasting_key_while_the_table_grows_and_shrinks() {
+        let mut map = ShardMap::new();
+        for i in 0..500 {
+            map.insert_str(format!("lasting:{i}").as_bytes(), "v");
+            map.insert_str(format!("doomed:{i}").as_bytes(), "v");
+        }
+        let capacity = map.capacity();
+        let mut most = capacity;
+        let mut shrunk = false;
+        let mut added = 0usize;
+        let seen = scan_all(&mut map, 10, |map, page| {
+            most = most.max(map.capacity());
+            for _ in 0..200 {
+                map.insert_str(format!("new:{added}").as_bytes(), "v");
+                added += 1;
+            }
+            if page <= 50 {
+                for i in (page - 1) * 10..page * 10 {
+                    assert!(map.remove(format!("doomed:{i}").as_str()).is_some());
+                }
+            }
+            if page % 40 == 0 {
+                // Take most of the new keys out, and give the room back.
+                for i in added.saturating_sub(5000)..added {
+                    map.remove(format!("new:{i}").as_str());
+                }
+                let before = map.capacity();
+                map.shrink_to(map.len());
+                shrunk |= map.capacity() < before;
+            }
+        });
+        assert!(most > 4 * capacity, "the table grew");
+        assert!(shrunk, "the table shrank");
+        for i in 0..500 {
+            assert!(
+                seen.contains_key(format!("lasting:{i}").as_bytes()),
+                "lasting:{i} was missed"
+            );
+        }
     }
 
     #[test]
