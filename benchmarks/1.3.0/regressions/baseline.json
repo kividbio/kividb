@@ -621,6 +621,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -644,6 +645,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -797,6 +799,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         },
@@ -824,6 +827,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -977,6 +981,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         },
@@ -1004,6 +1009,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "redis_plus": 10
         }
@@ -1736,6 +1742,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1758,6 +1765,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1845,6 +1853,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1867,6 +1876,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1953,6 +1963,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -1975,6 +1986,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -2041,6 +2053,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "abs": 10
         }
@@ -2106,7 +2119,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "info",
+          "speed": false
         }
       ]
     },
@@ -2150,6 +2164,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "abs": 10
         }
@@ -2215,7 +2230,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "info",
+          "speed": false
         }
       ]
     },
@@ -2259,6 +2275,7 @@
       "gate": [
         {
           "kind": "rel",
+          "speed": false,
           "pct": 50,
           "abs": 10
         }
@@ -2323,7 +2340,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "info",
+          "speed": false
         }
       ]
     },
@@ -2790,7 +2808,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "bound",
+          "min": 5
         }
       ]
     },
@@ -2893,6 +2912,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -2915,6 +2935,7 @@
       "gate": [
         {
           "kind": "bound",
+          "speed": false,
           "max": 20
         }
       ]
@@ -3076,6 +3097,7 @@
       "gate": [
         {
           "kind": "rel",
+          "anchor": false,
           "pct": 20
         }
       ]
@@ -3821,7 +3843,7 @@
         "redis": 1000000.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3838,12 +3860,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 69.7005,
-        "candidate": 1.9511,
-        "redis": 2.5627,
+        "v1_2_2": 71.2186,
+        "candidate": 1.942,
+        "redis": 2.5702,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3874,7 +3896,51 @@
         "redis": 1999.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sdiffstore_big_small_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sdiffstore_big_small_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 290.5072,
+        "candidate": 259.7301,
+        "redis": 320.8611,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sdiffstore_big_small_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sdiffstore_big_small_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 997903.0,
+        "candidate": 997903.0,
+        "redis": 997903.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3891,12 +3957,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 94.6175,
-        "candidate": 2.1805,
-        "redis": 2.581,
+        "v1_2_2": 101.8765,
+        "candidate": 2.2311,
+        "redis": 2.771,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3927,7 +3993,7 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3944,12 +4010,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 70.2455,
-        "candidate": 2.1206,
-        "redis": 2.3049,
+        "v1_2_2": 71.2124,
+        "candidate": 2.0872,
+        "redis": 2.4596,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3980,7 +4046,7 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -3997,12 +4063,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 91.5745,
-        "candidate": 0.056,
-        "redis": 0.0593,
+        "v1_2_2": 100.5459,
+        "candidate": 0.0573,
+        "redis": 0.0883,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4025,7 +4091,7 @@
         "redis": 100.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4042,12 +4108,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 93.0237,
-        "candidate": 0.1899,
-        "redis": 0.4639,
+        "v1_2_2": 99.3772,
+        "candidate": 0.1938,
+        "redis": 0.5574,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4070,7 +4136,7 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4087,12 +4153,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 92.6891,
-        "candidate": 0.3024,
-        "redis": 0.8662,
+        "v1_2_2": 99.7248,
+        "candidate": 0.3095,
+        "redis": 0.9436,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4115,7 +4181,7 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4137,7 +4203,7 @@
         "redis": 5000000.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4154,12 +4220,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 449.1262,
-        "candidate": 2.1201,
-        "redis": 3.8524,
+        "v1_2_2": 452.4885,
+        "candidate": 2.0373,
+        "redis": 3.9827,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4190,7 +4256,51 @@
         "redis": 1998.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sdiffstore_big_small_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sdiffstore_big_small_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1638.7029,
+        "candidate": 1441.868,
+        "redis": 1815.2296,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sdiffstore_big_small_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sdiffstore_big_small_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 4997902.0,
+        "candidate": 4997902.0,
+        "redis": 4997902.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4207,12 +4317,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 534.2741,
-        "candidate": 2.2695,
-        "redis": 3.4766,
+        "v1_2_2": 554.6359,
+        "candidate": 2.3312,
+        "redis": 3.6909,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4243,7 +4353,7 @@
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4260,12 +4370,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 450.6496,
-        "candidate": 2.109,
-        "redis": 3.3654,
+        "v1_2_2": 450.7933,
+        "candidate": 2.0625,
+        "redis": 3.4128,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4296,7 +4406,7 @@
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4313,12 +4423,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 532.271,
-        "candidate": 0.0566,
-        "redis": 0.1103,
+        "v1_2_2": 548.8004,
+        "candidate": 0.0537,
+        "redis": 0.125,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4341,7 +4451,7 @@
         "redis": 100.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4358,12 +4468,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 529.6741,
-        "candidate": 0.238,
-        "redis": 1.5466,
+        "v1_2_2": 549.4704,
+        "candidate": 0.2474,
+        "redis": 1.5861,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4386,7 +4496,7 @@
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4403,12 +4513,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 532.2221,
-        "candidate": 0.349,
-        "redis": 2.1531,
+        "v1_2_2": 550.5818,
+        "candidate": 0.3846,
+        "redis": 2.5314,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4431,7 +4541,7 @@
         "redis": 2098.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4453,7 +4563,7 @@
         "redis": 20000000.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4470,12 +4580,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2447.9039,
-        "candidate": 1.9823,
-        "redis": 4.999,
+        "v1_2_2": 2349.5761,
+        "candidate": 2.0502,
+        "redis": 4.7721,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4506,7 +4616,51 @@
         "redis": 1999.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sdiffstore_big_small_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sdiffstore_big_small_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 7800.9543,
+        "candidate": 6642.3059,
+        "redis": 8186.1949,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sdiffstore_big_small_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sdiffstore_big_small_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 19997903.0,
+        "candidate": 19997903.0,
+        "redis": 19997903.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4523,12 +4677,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2554.522,
-        "candidate": 2.2803,
-        "redis": 4.6897,
+        "v1_2_2": 2512.2337,
+        "candidate": 2.3226,
+        "redis": 4.0858,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4559,7 +4713,7 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4576,12 +4730,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2431.1903,
-        "candidate": 2.0816,
-        "redis": 4.3672,
+        "v1_2_2": 2354.8261,
+        "candidate": 2.1452,
+        "redis": 3.7744,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4612,7 +4766,7 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4629,12 +4783,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2531.279,
-        "candidate": 0.0561,
-        "redis": 0.1246,
+        "v1_2_2": 2515.4358,
+        "candidate": 0.0892,
+        "redis": 0.1245,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4657,7 +4811,7 @@
         "redis": 100.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4674,12 +4828,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2532.665,
-        "candidate": 0.2584,
-        "redis": 1.9124,
+        "v1_2_2": 2505.2097,
+        "candidate": 0.2997,
+        "redis": 1.8298,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4702,7 +4856,7 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4719,12 +4873,12 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2535.0056,
-        "candidate": 0.3693,
-        "redis": 3.1017,
+        "v1_2_2": 2510.2784,
+        "candidate": 0.4274,
+        "redis": 2.9392,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
@@ -4747,13 +4901,79 @@
         "redis": 2097.0,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "a2cc71d5",
+        "commit": "9ca8ce62",
         "label": "pr759-d4s_v5"
       },
       "gate": [
         {
           "kind": "bound",
           "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/sunion/sunion_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "sunion",
+      "metric": "sunion_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1330.1216,
+        "candidate": 1325.2326,
+        "redis": 1310.5159,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "14-sinter-big-small/sunion/sunion_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "sunion",
+      "metric": "sunion_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1001999.0,
+        "candidate": 1001999.0,
+        "redis": 1001999.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/sunion/sunion_worst_sadd_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "sunion",
+      "metric": "sunion_worst_sadd_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 358.2401,
+        "candidate": 0.7335,
+        "redis": 319.5877,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "9ca8ce62",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
         }
       ]
     }

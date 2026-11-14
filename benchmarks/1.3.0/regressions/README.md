@@ -30,7 +30,7 @@ and why.
 | `11-migrate-conns` | #726 / #733 | connections the target of 2,000 `MIGRATE`s receives (a second server of the engine) |
 | `12-search-fanout` | #723 / #725 | 3-master cluster on one VM: connections each other master receives for 2,000 `FT.SEARCH` calls |
 | `13-cluster-reshard` | #294 / #724 | 3-master cluster on one VM, 3M keys: `redis-cli` 7.0.15 `--cluster reshard` of 1,000 slots |
-| `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one |
+| `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one; `SDIFFSTORE big small` as a cost guard; worst `SADD` to the small set during `SUNION big small` (Tokio, 1M) |
 
 ## Running it
 
@@ -528,46 +528,56 @@ What these runs show besides the gated gains:
 
 ## Recorded run, suite 14
 
-Recorded 2026-11-15 on the same VM size (Azure Standard_D4s_v5, a fresh VM
-of the same image), `FULL=1 --only 14 --record`; the candidate is the fix's
-commit `a2cc71d5`, `cargo build --release`. Runs: `pr759-d4s_v5` (recorded)
-and `pr759-d4s_v5-rerun` (the noise check, every gate passed). About 3.5
-minutes with `FULL=1`, most of it loading 20M members into each engine.
+Recorded 2026-11-14 on an Azure Standard_D4s_v5 (a fresh VM of the same
+image), `FULL=1 --only 14 --record`; the candidate is commit `9ca8ce62` of
+#798, `cargo build --release`. Runs: `pr759-d4s_v5` (recorded) and
+`pr759-d4s_v5-rerun` (the noise check, every gate passed). About 6.5 minutes
+with `FULL=1`, most of it loading 20M members into each engine and the
+`SDIFFSTORE` rows.
 
-Medians of 5 timed runs (ms), recorded run:
+Medians of 5 timed runs (ms; `SUNION` 3), recorded run:
 
 | N | command | v1.2.2 | candidate | Redis 8.10.2 | gate |
 |---|---|---:|---:|---:|---|
-| 1M | `SINTER big small` | 94.6 | 2.18 | 2.58 | rel 50% or 2 ms; keep 60% of gain; <= 2x Redis |
-| 1M | `SINTER small big` | 70.3 | 2.12 | 2.30 | same |
-| 1M | `SINTERCARD 2 big small` | 93.0 | 0.19 | 0.46 | rel 50% or 2 ms |
-| 1M | `... LIMIT 100` | 91.6 | 0.056 | 0.059 | rel 50% or 2 ms |
-| 1M | `SINTERSTORE dst big small` | 92.7 | 0.30 | 0.87 | rel 50% or 2 ms |
-| 1M | `SDIFF small big` | 69.7 | 1.95 | 2.56 | as `SINTER` |
-| 5M | `SINTER big small` | 534.3 | 2.27 | 3.48 | as above |
-| 5M | `SINTER small big` | 450.6 | 2.11 | 3.37 | |
-| 5M | `SINTERCARD 2 big small` | 529.7 | 0.24 | 1.55 | |
-| 5M | `... LIMIT 100` | 532.3 | 0.057 | 0.11 | |
-| 5M | `SINTERSTORE dst big small` | 532.2 | 0.35 | 2.15 | |
-| 5M | `SDIFF small big` | 449.1 | 2.12 | 3.85 | |
-| 20M | `SINTER big small` | 2,555 | 2.28 | 4.69 | |
-| 20M | `SINTER small big` | 2,431 | 2.08 | 4.37 | |
-| 20M | `SINTERCARD 2 big small` | 2,533 | 0.26 | 1.91 | |
-| 20M | `... LIMIT 100` | 2,531 | 0.056 | 0.13 | |
-| 20M | `SINTERSTORE dst big small` | 2,535 | 0.37 | 3.10 | |
-| 20M | `SDIFF small big` | 2,448 | 1.98 | 5.00 | |
+| 1M | `SINTER big small` | 101.9 | 2.23 | 2.77 | rel 50% or 2 ms; keep 60% of gain; <= 2x Redis |
+| 1M | `SINTER small big` | 71.2 | 2.09 | 2.46 | same |
+| 1M | `SINTERCARD 2 big small` | 99.4 | 0.19 | 0.56 | rel 50% or 2 ms |
+| 1M | `... LIMIT 100` | 100.5 | 0.057 | 0.088 | rel 50% or 2 ms |
+| 1M | `SINTERSTORE dst big small` | 99.7 | 0.31 | 0.94 | rel 50% or 2 ms |
+| 1M | `SDIFF small big` | 71.2 | 1.94 | 2.57 | as `SINTER` |
+| 1M | `SDIFFSTORE dst big small` | 290.5 | 259.7 | 320.9 | rel 25% (cost guard) |
+| 5M | `SINTER big small` | 554.6 | 2.33 | 3.69 | as above |
+| 5M | `SINTER small big` | 450.8 | 2.06 | 3.41 | |
+| 5M | `SINTERCARD 2 big small` | 549.5 | 0.25 | 1.59 | |
+| 5M | `... LIMIT 100` | 548.8 | 0.054 | 0.13 | |
+| 5M | `SINTERSTORE dst big small` | 550.6 | 0.39 | 2.53 | |
+| 5M | `SDIFF small big` | 452.5 | 2.04 | 3.98 | |
+| 5M | `SDIFFSTORE dst big small` | 1,639 | 1,442 | 1,815 | |
+| 20M | `SINTER big small` | 2,512 | 2.32 | 4.09 | |
+| 20M | `SINTER small big` | 2,355 | 2.15 | 3.77 | |
+| 20M | `SINTERCARD 2 big small` | 2,505 | 0.30 | 1.83 | |
+| 20M | `... LIMIT 100` | 2,515 | 0.089 | 0.12 | |
+| 20M | `SINTERSTORE dst big small` | 2,510 | 0.43 | 2.94 | |
+| 20M | `SDIFF small big` | 2,350 | 2.05 | 4.77 | |
+| 20M | `SDIFFSTORE dst big small` | 7,801 | 6,642 | 8,186 | |
+| 1M, Tokio | `SUNION big small` | 1,330 | 1,325 | 1,311 | rel 25% |
+| 1M, Tokio | worst `SADD small` during it | 358.2 | 0.73 | 319.6 | max 20 ms |
 
 The replies (2,097 members at 1M and 20M, 2,098 at 5M; 1,998-1,999 for
-`SDIFF`) are the same on all three engines and gated exactly. The
-candidate's run-to-run spread between the two runs was -4 to +35 % on
-the count-only rows (0.05-0.37 ms: round-trip noise, hence no ratio or Redis
-gate on them) and -5 to +8 % on the rest. The time no longer depends on N:
-what is left is the round trip and redis-py building a Python set of ~2,000
-members.
+`SDIFF`; the `SDIFFSTORE` and `SUNION` sizes) are the same on all three
+engines and gated exactly. The candidate's spread between the two runs:
+-3 to +5 % on `SINTER`/`SDIFF`, -1 to +1.4 % on `SDIFFSTORE`, 0 % on
+`SUNION`, and -8 to +32 % on the count-only rows (0.05-0.43 ms: round-trip
+noise, hence no ratio or Redis gate on them); the worst `SADD` was 0.73 and
+3.9 ms. The `SINTER`/`SDIFF` times no longer depend on N: what is left is
+the round trip and redis-py building a Python set of ~2,000 members.
+`SDIFFSTORE big small` and `SUNION` walk all of `big` on every engine; they
+are there so that cost does not grow, and so a writer of the small set is
+not held up by the walk (v1.2.2 and Redis hold it for the whole command).
 
 ## Not covered
 
-Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13).
+Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759, after that table).
 From its costs table, these are not re-measured by this suite:
 
 - Instructions per command from callgrind (`GET`/`SET` within 0.1 % for #724,
