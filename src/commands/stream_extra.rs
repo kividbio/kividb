@@ -152,19 +152,20 @@ pub(super) fn idmp_lookup(
 /// Whether an `XADD … IDMP` a replica or an AOF replay applies with the ID
 /// `id` is a duplicate its master found: `(producer, iid)` already produced
 /// that very entry. Counted as the master counted it (#655). A new entry
-/// cannot be one: its ID is past every entry already there.
+/// cannot be one: its ID is past the stream's last ID.
 pub(super) fn idmp_applied_duplicate(
     stream: &mut StreamInner,
     producer: &[u8],
     iid: &[u8],
     id: &StreamId,
 ) -> bool {
-    let known = stream
-        .idmp
-        .producers
-        .get(producer)
-        .and_then(|p| p.by_iid.get(iid))
-        .is_some_and(|recorded| recorded == id);
+    let known = *id <= stream.last_id
+        && stream
+            .idmp
+            .producers
+            .get(producer)
+            .and_then(|p| p.by_iid.get(iid))
+            .is_some_and(|recorded| recorded == id);
     if known {
         stream.idmp.iids_duplicates += 1;
     }

@@ -605,21 +605,30 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
     // The duplicate is propagated all the same, as Redis propagates it, so
     // that replicas and an AOF replay count it in `iids-duplicates` too
     // (#655): under the entry's own ID, which a replica or a replay takes
-    // for the duplicate it is rather than for a new entry.
+    // for the duplicate it is rather than for a new entry. Only while that
+    // ID is not past the stream's last ID: after `XTRIM … MAXLEN 0` and an
+    // `XSETID` below it, a build that does not know duplicates would take
+    // it for a new entry, so then nothing is propagated, as before.
     if let Some((producer, iid)) = &idmp {
         if !ctx.apply_replication && !ctx.bypass_cluster_check {
             if let Some(existing) =
                 stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
             {
-                let existing = existing.to_string();
-                let mut parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
-                parts[id_index] = existing.clone().into_bytes();
-                effect(parts);
-                return resp_bulk_str(&existing);
+                let reply = existing.to_string();
+                if existing <= inner.last_id {
+                    let mut parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
+                    parts[id_index] = reply.clone().into_bytes();
+                    effect(parts);
+                }
+                return resp_bulk_str(&reply);
             }
         } else if let NewId::Explicit(id) = &new_id
             && stream_extra::idmp_applied_duplicate(&mut inner, producer, iid, id)
         {
+            // Into a replica's own AOF and to a backup tap, as it came: a
+            // replica restarted from its AOF, or promoted, keeps the count.
+            // An AOF replay records nothing.
+            effect(ctx.cmd.iter().map(|b| b.to_vec()).collect());
             return resp_bulk_str(&id.to_string());
         }
     }
