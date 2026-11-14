@@ -143,7 +143,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   frees a big value in the background as `UNLINK` does, and a config file
   setting it no longer warns that it has no effect; the default stays `no`.
   On io_uring, a long command still holds up the connections served by its
-  own thread (#762).
+  own thread (#762). In a build with Lua and `lua-parallel-scripts yes`,
+  `KEYS` and `SCAN` still run alone, as before, so as not to see a script
+  part-way through.
 
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its

@@ -152,6 +152,14 @@ fn free_port() -> u16 {
     }
 }
 
+/// A server on the Tokio I/O model, the one this fixes. On io_uring a long
+/// command still holds up the connections of its own thread (#762).
+///
+/// Without `lua-parallel-scripts`: with it (a build with Lua), `KEYS` and
+/// `SCAN` take the command gate alone, so as not to see a script that runs
+/// beside others part-way through (`tag_locks::sees_the_whole_keyspace`),
+/// and every other command waits for them, by design. Switched on, it stays
+/// on for the whole test process.
 fn start_server() -> u16 {
     let port = free_port();
     thread::spawn(move || {
@@ -163,12 +171,33 @@ fn start_server() -> u16 {
             databases: 16,
             loglevel: "error".to_string(),
             io_model: kividb::config::IoModel::Tokio,
+            lua_parallel_scripts: false,
             configfile: "./kividb.conf".to_string(),
             ..Default::default()
         };
         kividb::run_for_test(config);
     });
+    assert_on_tokio(port);
     port
+}
+
+/// The server at `port` serves its clients with Tokio, not io_uring, and
+/// runs every script alone: what the tests here measure.
+fn assert_on_tokio(port: u16) {
+    let mut c = Conn::connect(port);
+    let V::Bulk(info) = c.cmd(&["INFO", "server"]) else {
+        panic!("INFO is a bulk string");
+    };
+    let info = String::from_utf8(info).unwrap();
+    let api = info
+        .lines()
+        .find_map(|line| line.strip_prefix("multiplexing_api:"))
+        .expect("multiplexing_api in INFO server");
+    assert_ne!(api.trim(), "io_uring", "the server under test is on io_uring");
+    let on = V::Bulk(b"yes".to_vec());
+    let parallel = c.cmd(&["CONFIG", "GET", "lua-parallel-scripts"]);
+    let parallel_on = matches!(&parallel, V::Array(kv) if kv.get(1) == Some(&on));
+    assert!(!parallel_on, "lua-parallel-scripts is on: {parallel:?}");
 }
 
 /// Run `heavy` on its own connection `runs` times while a second one sends
