@@ -120,6 +120,9 @@ class Ctx:
     def client(self, **kw):
         import redis
         kw.setdefault("socket_timeout", 600)
+        if self.port is None and "port" not in kw:
+            raise RuntimeError("ctx.client() on self-hosted config %r has no server port: "
+                               "start nodes with lib/nodes.py and use node.client()" % self.config.name)
         kw.setdefault("port", self.port)
         return redis.Redis(host="127.0.0.1", **kw)
 

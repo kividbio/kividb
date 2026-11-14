@@ -13,6 +13,9 @@ starts no server and passes the engine's binary as ctx.bin.
     redis_tool("redis-benchmark")           # next to $REGRESS_REDIS_SERVER
     redis_cli_7()                           # a redis-cli 7.0.x (see its docstring)
 
+Each node's pid is also written to $REGRESS_PIDDIR/<pid> (the engine binary's
+path inside), which run-all.sh uses to kill what a SIGKILLed suite left behind.
+
 Node ports are picked below the ephemeral range, and for cluster nodes the bus
 port (port + 10000) too.
 """
@@ -166,9 +169,24 @@ class Node:
         e = dict(os.environ, KIVIDB_NO_UPDATE_CHECK="1")
         e.update(env or {})
         self.log = open(self.log_path, "wb")
-        self.proc = subprocess.Popen(cmd, cwd=self.dir, stdin=subprocess.DEVNULL, stdout=self.log,
-                                     stderr=subprocess.STDOUT, env=e)
+        self.proc = None
+        self._pidfile = None
+        try:
+            self.proc = subprocess.Popen(cmd, cwd=self.dir, stdin=subprocess.DEVNULL, stdout=self.log,
+                                         stderr=subprocess.STDOUT, env=e)
+        except BaseException:
+            self.log.close()
+            shutil.rmtree(self.dir, ignore_errors=True)
+            raise
         self.pid = self.proc.pid
+        piddir = os.environ.get("REGRESS_PIDDIR")
+        if piddir:
+            try:
+                self._pidfile = os.path.join(piddir, str(self.pid))
+                with open(self._pidfile, "w") as f:
+                    f.write(bin)
+            except OSError:
+                self._pidfile = None
         _LIVE.append(self)
         deadline = time.time() + 60
         while time.time() < deadline:
@@ -178,7 +196,7 @@ class Node:
                 return
             time.sleep(0.1)
         tail = self.log_tail(2000)
-        self.stop()
+        self.cleanup()  # stops it, closes the log, removes the directory
         raise RuntimeError("%s on port %d did not answer PING: %s" % (kind, self.port, tail))
 
     def _ping(self):
@@ -226,6 +244,12 @@ class Node:
                     self.proc.wait()
         if self in _LIVE:
             _LIVE.remove(self)
+        if self._pidfile:
+            try:
+                os.unlink(self._pidfile)
+            except OSError:
+                pass
+            self._pidfile = None
         try:
             self.log.close()
         except Exception:

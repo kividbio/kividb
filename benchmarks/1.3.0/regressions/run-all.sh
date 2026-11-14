@@ -93,7 +93,30 @@ rm -f "$OUT/results.jsonl"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/kividb-regress-run.XXXXXX")
 mkdir -p "$WORK/raw/logs"
 CHILD=
-trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; engine_stop; rm -rf "$WORK"' EXIT
+# Self-hosted suites record each node's pid here (lib/nodes.py). If a suite is
+# SIGKILLed its nodes are left running; reap_nodes kills those, and only those
+# whose /proc/<pid>/cmdline still holds the binary the file names (a recycled
+# pid is not touched). Never by process name.
+export REGRESS_PIDDIR=$WORK/pids
+mkdir -p "$REGRESS_PIDDIR"
+reap_nodes() {
+  local f pid bin
+  for f in "$REGRESS_PIDDIR"/*; do
+    [ -f "$f" ] || continue
+    pid=${f##*/}
+    bin=$(cat "$f" 2>/dev/null) || bin=
+    if [ -n "$bin" ] && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF -- "$bin"; then
+      echo "reaping leftover node $pid ($bin)" >&2
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF -- "$bin"; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$f"
+  done
+}
+trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; reap_nodes; engine_stop; rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
 FAILURES=$WORK/failures.txt EXPECTED=$WORK/expected.jsonl
@@ -146,6 +169,7 @@ for f in "${SUITES[@]}"; do
       rc=0
       wait "$CHILD" || rc=$?
       CHILD=
+      reap_nodes
       [ $rc -eq 0 ] || fail "$suite $name $e: suite exited $rc"
       tail -c 65536 "$ENGINE_LOG" >"$WORK/raw/logs/$suite-$name-$e.log" 2>/dev/null || true
       engine_stop

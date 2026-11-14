@@ -2790,7 +2790,8 @@
       },
       "gate": [
         {
-          "kind": "info"
+          "kind": "bound",
+          "min": 5
         }
       ]
     },
