@@ -332,8 +332,8 @@ impl Server {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Some(status);
             }
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                self.wait_up();
+            // Not a bare connect: a killed server's listener can linger.
+            if answers_ping(self.port) {
                 return None;
             }
             assert!(Instant::now() < deadline, "neither started nor exited");
@@ -361,6 +361,18 @@ impl Server {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Whether a server on `port` answers `PING` within half a second.
+fn answers_ping(port: u16) -> bool {
+    let pong = TcpStream::connect(("127.0.0.1", port)).and_then(|mut s| {
+        s.set_read_timeout(Some(Duration::from_millis(500)))?;
+        s.write_all(b"*1\r\n$4\r\nPING\r\n")?;
+        let mut reply = [0u8; 7];
+        s.read_exact(&mut reply)?;
+        Ok(&reply == b"+PONG\r\n")
+    });
+    pong.unwrap_or(false)
 }
 
 impl Drop for Server {
@@ -1832,6 +1844,15 @@ fn snapshot_with_a_wrong_length_element_is_refused() {
     let mut server = Server::start_in(tmp, &[]);
     assert_eq!(server.conn().cmd(&["VCARD", "legacy"]).i(), 3);
     server.kill();
+    // Held as io_uring holds a killed server's listener: never answering.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let silent = loop {
+        match std::net::TcpListener::bind(("127.0.0.1", server.port)) {
+            Ok(listener) => break listener,
+            Err(e) => assert!(Instant::now() < deadline, "{e}"),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let dump = server.dir.join("dump.kdb");
     for len in [2, 4] {
         let bad = with_length(&good, b'a', len);
@@ -1845,6 +1866,7 @@ fn snapshot_with_a_wrong_length_element_is_refused() {
         assert_eq!(std::fs::read(&dump).unwrap(), bad, "the file was changed");
     }
     // Whole again, it loads as before.
+    drop(silent);
     std::fs::write(&dump, &good).unwrap();
     server.restart();
     let mut c = server.conn();
