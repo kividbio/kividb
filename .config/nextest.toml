@@ -24,6 +24,14 @@ test-group = 'one-at-a-time'
 filter = 'binary(=cluster) | binary(=memory_usage_accuracy) | binary(=memory_usage_zset) | binary(=search_postings)'
 threads-required = 2
 
+# These start real servers, kill them with SIGTERM or SHUTDOWN under load and
+# read back what the next one loaded. Two of them failed once each (the
+# restarted server was empty) when they ran beside the heaviest tests on a
+# loaded runner, and passed on a rerun: give them the whole runner.
+[[profile.default.overrides]]
+filter = 'binary(=shutdown) | test(=sigterm_waits_for_the_final_snapshot)'
+threads-required = 'num-cpus'
+
 [profile.ci]
 # Report every failing test of the run, as `cargo test --no-fail-fast` did.
 fail-fast = false
