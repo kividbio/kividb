@@ -236,11 +236,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,
   then, for a while, was refused. Like Redis, which reads a `long double`,
-  every blocking list and sorted-set command now treats a number too small for
-  a double as the shortest wait; a text no `long double` holds (`1e-5000`) is
-  "not a float or out of range", `inf` and `2e308` are "out of range", and a
-  negative timeout of any size is "negative". `0` still waits for ever. Thanks
-  to @francoXwrld for the fix.
+  every blocking list and sorted-set command now waits 1 ms on a positive
+  decimal timeout that is too small for a double but not for a `long double`
+  (down to about `1.8e-4951`); a decimal text no `long double` holds
+  (`1e-5000`, `1e5000`) is "not a float or out of range", `inf` and `2e308`
+  are "out of range", and `0` still waits for ever. Two deliberate
+  differences: a negative timeout of any size is refused with "timeout is
+  negative" (Redis 8.10.2 waits for ever on `-1e-343`), and a hexadecimal
+  float too small or too large for a double is "not a float" (Redis: 1 ms,
+  or "out of range"). Thanks to @francoXwrld for the fix.
 
 - **`Q8` and `BIN` vector sets search and load at full speed on x86-64
   (#793).** The int8 dot product, the Hamming distance and quantizing

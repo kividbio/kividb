@@ -368,7 +368,10 @@ const NIL: &str = "*-1\r\n";
 /// smallest subnormal (about 1.8226e-4951) or above the largest value
 /// (about 1.1897e4932) is not a float. The one deliberate difference:
 /// Redis 8.10.2 waits forever on a negative timeout that is under half a
-/// millisecond (`-1e-343`); KiviDB refuses every negative one.
+/// millisecond (`-1e-343`); KiviDB refuses every negative one. Another: a
+/// hexadecimal float too small for a double (`0x1p-5000`) is a 1 ms wait in
+/// Redis and too large a one (`0x1p+5000`) "out of range"; here both are
+/// "not a float".
 const TIMEOUTS: &[(&str, &str)] = &[
     ("1e-343", NIL),
     ("1e-400", NIL),
@@ -381,6 +384,12 @@ const TIMEOUTS: &[(&str, &str)] = &[
     ("2e-4951", NIL),
     ("3e-4951", NIL),
     ("4e-4951", NIL),
+    ("1e-330", NIL),
+    ("1e-325", NIL),
+    ("2e-324", NIL),
+    ("0.000001e-320", NIL),
+    ("1e-320", NIL),
+    ("3e-324", NIL),
     ("1e-4951", NOT_A_FLOAT),
     ("1.8e-4951", NOT_A_FLOAT),
     ("1.82e-4951", NOT_A_FLOAT),
@@ -411,10 +420,12 @@ const TIMEOUTS: &[(&str, &str)] = &[
     ("1e4000", OUT_OF_RANGE),
     ("1e4932", OUT_OF_RANGE),
     ("1.1e4932", OUT_OF_RANGE),
+    ("1.18973149535723176503e4932", OUT_OF_RANGE),
     ("-1", NEGATIVE),
     ("-inf", NEGATIVE),
     ("-2e308", NEGATIVE),
     ("-1e-343", NEGATIVE),
+    ("-1e-330", NEGATIVE),
     ("-1e-4950", NEGATIVE),
 ];
 

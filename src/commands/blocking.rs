@@ -231,8 +231,12 @@ pub struct Interrupted {
 /// (`1e-5000`, `1e5000`) is "not a float". `parse_score` refuses such texts
 /// and [`parse_rounded_away_timeout`] sorts them out.
 pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
-    let Some(secs) = crate::commands::zset::parse_score(raw) else {
-        return parse_rounded_away_timeout(raw);
+    let parsed = crate::commands::zset::parse_score(raw);
+    // `parse_score` reads `1e-330` as 0.0 (as `fast_float` does), which is
+    // no zero as written: such a text goes the same way as one it refuses.
+    let secs = match parsed {
+        Some(secs) if secs != 0.0 => secs,
+        _ => return parse_rounded_away_timeout(raw, parsed),
     };
     if secs < 0.0 {
         return Err(resp_error("ERR timeout is negative"));
@@ -246,24 +250,28 @@ pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
     Ok(secs)
 }
 
-/// The smallest and the largest magnitude a `long double` keeps, as a power
-/// of ten and the first 22 digits: half the smallest subnormal (2^-16446,
-/// that rounds to 0 and so is no number), and the largest value (2^16384 -
-/// 2^16320).
+/// The cut-offs of a `long double`, as a power of ten and the first 22
+/// digits: half the smallest subnormal (2^-16446, below which a text rounds
+/// to 0 and is no number) and the value where `strtold` overflows (2^16384 -
+/// 2^16319). Texts are compared with these to 22 significant digits, not
+/// exactly: a text that differs only past the 22nd digit may land on the
+/// wrong side.
 const LONG_DOUBLE_TINY: (i64, &[u8; DIGITS]) = (-4951, b"1822599765941237301264");
-const LONG_DOUBLE_HUGE: (i64, &[u8; DIGITS]) = (4932, b"1189731495357231765021");
+const LONG_DOUBLE_HUGE: (i64, &[u8; DIGITS]) = (4932, b"1189731495357231765053");
 const DIGITS: usize = 22;
 
 /// The power of ten of a number's first non-zero digit, and its digits.
 type Magnitude = (i64, [u8; DIGITS]);
 
-/// A timeout that `parse_score` did not take: one that an `f64` rounds to 0
-/// or to infinity, or that is no number at all.
-fn parse_rounded_away_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
+/// A timeout that `parse_score` did not take or read as 0.0: one that an
+/// `f64` rounds to 0 or to infinity, or that is no number at all. `parsed` is
+/// what `parse_score` made of it.
+fn parse_rounded_away_timeout(raw: &[u8], parsed: Option<f64>) -> Result<f64, Vec<u8>> {
     let not_a_float = || resp_error("ERR timeout is not a float or out of range");
     let Some((negative, magnitude)) = std::str::from_utf8(raw).ok().and_then(split_timeout_parts)
     else {
-        return Err(not_a_float());
+        // A hexadecimal zero (`0x0`) is a zero all the same.
+        return if parsed.is_some() { Ok(0.0) } else { Err(not_a_float()) };
     };
     // A zero as written is a timeout that never ends, and `parse_score`
     // has read it already.
@@ -273,7 +281,7 @@ fn parse_rounded_away_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
     // Redis tells these apart from a number of any size before it looks at
     // the sign: `-1e-5000` is not a float, but `-1e-343` is negative.
     if magnitude <= (LONG_DOUBLE_TINY.0, *LONG_DOUBLE_TINY.1)
-        || magnitude > (LONG_DOUBLE_HUGE.0, *LONG_DOUBLE_HUGE.1)
+        || magnitude >= (LONG_DOUBLE_HUGE.0, *LONG_DOUBLE_HUGE.1)
     {
         return Err(not_a_float());
     }
@@ -1227,11 +1235,15 @@ mod gone_resume_tests {
             "1000e-4953",
             "1.83e-4951",
             "3e-4951",
+            "1e-330",
+            "1e-325",
+            "2e-324",
+            "0.000001e-320",
         ] {
             assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.001, "{raw}");
         }
         // Zero in any spelling never ends.
-        for raw in ["0", "0.0", "0e10", "-0", "-0.0", "-0e10"] {
+        for raw in ["0", "0.0", "0e10", "-0", "-0.0", "-0e10", "0x0"] {
             assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.0, "{raw}");
         }
         for raw in [
@@ -1258,13 +1270,25 @@ mod gone_resume_tests {
             "--1",
             "nan",
         ] {
-            assert!(err(raw.as_bytes()).contains("not a float"), "{raw}");
+            assert_eq!(
+                err(raw.as_bytes()),
+                "-ERR timeout is not a float or out of range\r\n",
+                "{raw}"
+            );
         }
-        for raw in ["inf", "+inf", "2e308", "1e309", "1e4000", "1.1e4932"] {
-            assert!(err(raw.as_bytes()).contains("out of range"), "{raw}");
+        for raw in [
+            "inf",
+            "+inf",
+            "2e308",
+            "1e309",
+            "1e4000",
+            "1.1e4932",
+            "1.18973149535723176503e4932",
+        ] {
+            assert_eq!(err(raw.as_bytes()), "-ERR timeout is out of range\r\n", "{raw}");
         }
-        for raw in ["-1", "-inf", "-2e308", "-1e-343", "-1e-4950"] {
-            assert!(err(raw.as_bytes()).contains("negative"), "{raw}");
+        for raw in ["-1", "-inf", "-2e308", "-1e-343", "-1e-4950", "-1e-330"] {
+            assert_eq!(err(raw.as_bytes()), "-ERR timeout is negative\r\n", "{raw}");
         }
     }
 }
