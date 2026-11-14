@@ -110,3 +110,65 @@ From `cargo test --release --lib vector::quant::tests::kernel_timings -- --ignor
 - **VADD:** within run-to-run noise of master. Quantizing costs up to 3.4 µs, against ~100 µs per call.
 - **Against Redis:** the gap in VSIM q/s at 50K (Q8 455 vs HNSW 11,286 at 1536-d) is the search algorithm,
   not the storage. Against Redis's exact scan of Q8, KiviDB is faster at 10K (1.3-2.2x) and 0.68-1.14x at 50K.
+
+## x86-64 (#793)
+
+The run above was on arm64, where the int8 loop compiles to NEON. On x86-64 the default target has no SSE4.1 and no
+POPCNT, so the int8 dot product compiled to an SSE2 loop of 8 elements at a time (unpack, shift, `pmullw`), `BIN`'s
+`count_ones` to a dozen shifts and adds a word, and quantizing called libm's `roundf` once per component. The
+release regression suite (suite 09) measured `Q8` `VSIM` about 12% slower than f32 on Azure D4s_v5. `perf` put
+92% of a Q8 `VSIM` in `StoredVector::distance` (the inlined int8 loop) and half of a Q8 `VADD`'s server time in
+`quantize` and `roundf`; the f32 path already picked AVX-512 at run time.
+
+The fix picks kernels at run time, once (`simd::int_level`): AVX-512BW, else AVX2, for the int8 dot product
+(i8 widened to i16, `madd` into i32 lanes); POPCNT for the Hamming distance; and the unchanged quantizing code
+compiled for AVX2. Release binaries still run on any x86-64. Integer sums do not depend on order and Rust does not
+fuse or reorder float operations for a target feature, so stored vectors, distances and scores are the same bits
+as before; the unit tests compare every level with the portable one.
+
+`x86-kernels.sh` runs the shape of suite 09 (768 dimensions, 10,000 vectors, `VSIM ... COUNT 10` from 8 clients for
+8 s), three times per row on a fresh server, and prints medians:
+
+```
+V122=/path/kividb-1.2.2 BEFORE=/path/kividb-master AFTER=target/release/kividb \
+  REDIS=/opt/redis-8.10.2/src/redis-server PYTHON=python3 ./x86-kernels.sh
+```
+
+Azure Standard_D4s_v5 (Xeon Platinum 8370C, AVX-512), client and server on the same 4 vCPUs, 2026-11-14.
+Before is master `5809ac61`; Redis 8.10.2 searches with its HNSW graph. Raw rows:
+[`results/x86-kernels-d4s_v5.jsonl`](results/x86-kernels-d4s_v5.jsonl).
+
+| config | VSIM q/s | VSIM p50 ms | VADD/s | recall@10 |
+|---|---:|---:|---:|---:|
+| v1.2.2 (f32) | 686 | 3.05 | 69,226 | 1.000 |
+| before, f32 | 693 | 3.07 | 61,580 | 1.000 |
+| after, f32 | 699 | 3.10 | 69,770 | 1.000 |
+| before, Q8 | 910 | 2.25 | 51,634 | 0.972 |
+| **after, Q8** | **2,621** | **0.84** | **61,448** | 0.972 |
+| before, BIN | 3,704 | 0.59 | 50,940 | 0.230 |
+| **after, BIN** | **4,963** | **0.42** | 50,976 | 0.230 |
+| Redis 8.10.2 f32 (HNSW) | 5,464 | 0.46 | 1,896 | 1.000 |
+| Redis 8.10.2 Q8 (HNSW) | 6,960 | 0.36 | 3,699 | 0.972 |
+| Redis 8.10.2 BIN (HNSW) | 7,666 | 0.30 | 5,658 | 0.230 |
+
+The f32 rows run the same code before and after; their VADD/s spread (61-70k) is run-to-run noise. Absolute q/s
+on this VM moves between runs (suite 09 recorded ~1,100 q/s for f32 on another D4s_v5); compare rows of one run.
+
+Kernels, from `cargo test --release --lib simd::tests::int_timing -- --ignored --nocapture` and
+`quant::tests::kernel_timings`, ns per call on the same VM:
+
+| dim | int8 dot portable / AVX2 / AVX-512BW | Hamming portable / POPCNT | quantize Q8 portable / AVX2 | quantize BIN portable / AVX2 |
+|---:|---:|---:|---:|---:|
+| 128 | 34.4 / 8.9 / 7.4 | 4.2 / 3.0 | 789 / 534 | 450 / 457 |
+| 768 | 154.6 / 34.8 / 30.2 | 11.8 / 6.4 | 4,556 / 2,915 | 2,521 / 2,628 |
+| 1536 | 306.3 / 67.7 / 59.0 | 21.9 / 11.2 | 9,112 / 5,731 | 4,880 / 5,084 |
+| 4096 | 882.6 / 199.8 / 178.1 | 56.6 / 28.6 | | |
+
+- **Q8 search** is now 3.8x f32 on x86-64 (2.9x what it was); the kernel is 5x faster, and the rest of a `VSIM` is
+  walking the set's hash map and selecting the top 10. Redis's HNSW is still 2.7x ahead at 10K: that is the search
+  algorithm (#710, #760), not the kernel.
+- **VADD Q8** is back to the f32 rate. What is left of quantizing, in Q8 and BIN alike, is the f64 norm: summed
+  in order so it is the same bits on every CPU (a sequential chain of 768 additions), then one f64 division per
+  component. Summing in lanes would be faster but would change the last bit of stored norms and values.
+- **Regression gate** (for suite 09 once it carries one): `q8_768_10k` `vsim_qps` at least 2x `f32_768_10k`'s in
+  the same run (measured 3.8x), so a lost kernel shows however the VM's absolute speed moves.
