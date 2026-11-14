@@ -2005,6 +2005,203 @@ fn migrate_reports_a_wrong_length_element() {
     assert_eq!(floats(&t.cmd(&["VEMB", "good", "c"])), [7.0, 8.0, 9.0]);
 }
 
+fn dump(c: &mut Conn, key: &str) -> Vec<u8> {
+    match c.cmd(&["DUMP", key]) {
+        V::Bulk(payload) => payload,
+        other => panic!("DUMP {key}: {other:?}"),
+    }
+}
+
+/// `DUMP` and `RESTORE` keep every set whole: its quantization and whether
+/// one was asked for, metric, dimension, every element's stored vector and
+/// attributes (#722).
+#[test]
+fn dump_restore_keeps_each_quantization() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    populate(&mut c);
+    let before = capture(&mut c);
+    let payloads: Vec<Vec<u8>> = SETS.iter().map(|(key, _, _)| dump(&mut c, key)).collect();
+    for ((key, _, _), payload) in SETS.iter().zip(&payloads) {
+        assert_eq!(c.cmd(&["DEL", key]).i(), 1);
+        let r = c.cmd_bytes(&[b"RESTORE", key.as_bytes(), b"0", payload]);
+        assert_eq!(r, V::Str("OK".into()), "{key}");
+        assert_eq!(c.cmd(&["PTTL", key]).i(), -1, "{key}");
+    }
+    assert_same(&capture(&mut c), &before, "RESTORE");
+    check_types(&mut c);
+    check_rules(&mut c);
+
+    // With a time to live, relative and absolute.
+    let q8 = &payloads[0];
+    let r = c.cmd_bytes(&[b"RESTORE", b"ttl", b"100000", q8]);
+    assert_eq!(r, V::Str("OK".into()));
+    let pttl = c.cmd(&["PTTL", "ttl"]).i();
+    assert!((90_000..=100_000).contains(&pttl), "{pttl}");
+    let at = (std::time::SystemTime::now() + Duration::from_secs(300))
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    let r = c.cmd_bytes(&[b"RESTORE", b"abs", at.as_bytes(), q8, b"ABSTTL"]);
+    assert_eq!(r, V::Str("OK".into()));
+    assert_eq!(c.cmd(&["PEXPIRETIME", "abs"]).i().to_string(), at);
+    // An absolute time already past: nothing is left.
+    let r = c.cmd_bytes(&[b"RESTORE", b"past", b"1", q8, b"ABSTTL"]);
+    assert_eq!(r, V::Str("OK".into()));
+    assert_eq!(c.cmd(&["EXISTS", "past"]).i(), 0);
+    // IDLETIME and FREQ are taken.
+    for (option, value) in [("IDLETIME", "1000"), ("FREQ", "5")] {
+        let args: [&[u8]; 7] = [
+            b"RESTORE",
+            b"opt",
+            b"0",
+            q8,
+            b"REPLACE",
+            option.as_bytes(),
+            value.as_bytes(),
+        ];
+        let opts = (option, value);
+        assert_eq!(c.cmd_bytes(&args), V::Str("OK".into()), "{opts:?}");
+        assert_eq!(quant_type(&mut c, "opt"), "int8");
+    }
+
+    // Over another key: refused, then replaced with REPLACE.
+    c.cmd(&["SET", "taken", "x"]);
+    let bin = &payloads[1];
+    let r = c.cmd_bytes(&[b"RESTORE", b"taken", b"0", bin]);
+    assert!(r.s().starts_with("BUSYKEY"), "{r:?}");
+    assert_eq!(c.cmd(&["GET", "taken"]).s(), "x");
+    let r = c.cmd_bytes(&[b"RESTORE", b"taken", b"0", bin, b"REPLACE"]);
+    assert_eq!(r, V::Str("OK".into()));
+    assert_eq!(quant_type(&mut c, "taken"), "bin");
+    assert_eq!(
+        c.cmd(&["VEMB", "taken", "e5", "RAW"]),
+        c.cmd(&["VEMB", "vbin", "e5", "RAW"])
+    );
+}
+
+/// `MIGRATE` between two nodes moves each set whole, with its time to live,
+/// and the sets made with a quantization keep refusing others there (#722).
+#[test]
+fn migrate_keeps_each_quantization() {
+    let source = Server::start(&[]);
+    let target = Server::start(&[]);
+    let (mut s, mut t) = (source.conn(), target.conn());
+    populate(&mut s);
+    assert_eq!(s.cmd(&["PEXPIRE", "vq8", "500000"]).i(), 1);
+    let before = capture(&mut s);
+    let port = target.port.to_string();
+    let mut args = vec!["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"];
+    args.extend(SETS.iter().map(|(key, _, _)| *key));
+    assert_eq!(s.cmd(&args), V::Str("OK".into()));
+    for (key, _, _) in SETS {
+        assert_eq!(s.cmd(&["EXISTS", key]).i(), 0, "{key}");
+    }
+    assert_same(&capture(&mut t), &before, "MIGRATE");
+    let pttl = t.cmd(&["PTTL", "vq8"]).i();
+    assert!((400_000..=500_000).contains(&pttl), "{pttl}");
+    assert_eq!(t.cmd(&["PTTL", "vbin"]).i(), -1);
+    check_types(&mut t);
+    check_rules(&mut t);
+
+    // And back, with COPY and REPLACE: the same on both.
+    let port = source.port.to_string();
+    let mut args = vec![
+        "MIGRATE",
+        "127.0.0.1",
+        &port,
+        "",
+        "0",
+        "5000",
+        "COPY",
+        "REPLACE",
+        "KEYS",
+    ];
+    args.extend(SETS.iter().map(|(key, _, _)| *key));
+    assert_eq!(t.cmd(&args), V::Str("OK".into()));
+    assert_same(&capture(&mut s), &before, "MIGRATE back");
+    assert_same(&capture(&mut t), &before, "MIGRATE COPY");
+}
+
+/// A payload this version cannot read is refused whole, and leaves the key
+/// it was to replace as it was: a set of a quantization from a newer
+/// version, a value of a type from one, and a payload cut short.
+#[test]
+fn restore_refuses_what_it_cannot_read() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    populate(&mut c);
+    let payload = dump(&mut c, "vq8");
+    // The set's tag, dimension (768), metric and quantization.
+    let at = payload
+        .windows(7)
+        .position(|w| w == [16, 0, 3, 0, 0, 0, 1])
+        .expect("the Q8 set's header");
+    let reseal = |edit: &dyn Fn(&mut Vec<u8>)| {
+        let mut data = payload[..payload.len() - 10].to_vec();
+        edit(&mut data);
+        let crc = kividb::snapshot::crc64_digest(&data);
+        data.extend_from_slice(&payload[payload.len() - 10..payload.len() - 8]);
+        data.extend_from_slice(&crc.to_le_bytes());
+        data
+    };
+    let bad_data = V::Err("ERR Bad data format".into());
+    let checksum = V::Err("ERR DUMP payload version or checksum are wrong".into());
+    let before = capture(&mut c);
+    for (what, bad, says) in [
+        ("quantization", reseal(&|d| d[at + 6] = 9), &bad_data),
+        ("type", reseal(&|d| d[at] = 0xee), &bad_data),
+        ("cut", reseal(&|d| d.truncate(d.len() / 2)), &bad_data),
+        ("trailer", payload[..payload.len() - 3].to_vec(), &checksum),
+    ] {
+        let r = c.cmd_bytes(&[b"RESTORE", b"new", b"0", &bad]);
+        assert_eq!(&r, says, "{what}");
+        assert_eq!(c.cmd(&["EXISTS", "new"]).i(), 0, "{what}");
+        let r = c.cmd_bytes(&[b"RESTORE", b"vq8", b"0", &bad, b"REPLACE"]);
+        assert_eq!(&r, says, "{what} over a set");
+    }
+    assert_same(&capture(&mut c), &before, "refused RESTOREs");
+}
+
+/// A 1.2 node refuses a payload of a quantized or `NOQUANT` set with "Bad
+/// data format", never taking it for a plain f32 set; a default set it
+/// restores as before.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn a_1_2_node_refuses_dumps_it_cannot_read_whole() {
+    let new = Server::start(&[]);
+    let old = Server::start_bin(old_bin(), tempfile::tempdir().unwrap(), &[]);
+    let (mut n, mut o) = (new.conn(), old.conn());
+    populate(&mut n);
+    for (key, opt, _) in SETS {
+        let payload = dump(&mut n, key);
+        let r = o.cmd_bytes(&[b"RESTORE", key.as_bytes(), b"0", &payload]);
+        if opt.is_empty() {
+            assert_eq!(r, V::Str("OK".into()), "{key}");
+            // 1.2 prints each component with fewer digits: the same f32.
+            let as_f32 =
+                |reply: &V| -> Vec<f32> { floats(reply).into_iter().map(|x| x as f32).collect() };
+            assert_eq!(
+                as_f32(&o.cmd(&["VEMB", key, "e4"])),
+                as_f32(&n.cmd(&["VEMB", key, "e4"]))
+            );
+            assert_eq!(o.cmd(&["VCARD", key]).i(), 20);
+        } else {
+            assert_eq!(r, V::Err("ERR Bad data format".into()), "{key}");
+            assert_eq!(o.cmd(&["EXISTS", key]).i(), 0, "{key}");
+        }
+    }
+    // MIGRATE to it says so, and keeps the set.
+    let port = old.port.to_string();
+    let r = n.cmd(&["MIGRATE", "127.0.0.1", &port, "vnoquant", "0", "5000"]);
+    assert_eq!(
+        r,
+        V::Err("ERR Target instance replied with error: ERR Bad data format".into())
+    );
+    assert_eq!(n.cmd(&["VCARD", "vnoquant"]).i(), 20);
+}
+
 /// 1.2 loads every f32 set, NOQUANT too, and refuses Q8 and BIN whole.
 #[test]
 #[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]

@@ -713,7 +713,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
         ValueRef::TimeSeries(arc) => {
             let inner = arc.read();
             // Its links to other series, but in a `DUMP` (`dump_payload`).
-            let links = !WITHOUT_LINKS.get();
+            let links = !IN_DUMP.get();
             let rules: &[crate::types::CompactionRule] = if links { &inner.rules } else { &[] };
             let source = if links { inner.source.as_ref() } else { None };
             // The duplicate policy and the compaction rules were not saved at
@@ -763,8 +763,10 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::VectorSet(arc) => {
             let inner = arc.read();
-            // Any f32 set stays readable by 1.2; NOQUANT is lost on reload.
-            let legacy = inner.quant == crate::vector::quant::Quant::F32;
+            // Any f32 set stays readable by 1.2; NOQUANT is lost on reload,
+            // but not in a `DUMP` (`dump_payload`).
+            let legacy = inner.quant == crate::vector::quant::Quant::F32
+                && !(inner.quant_chosen && IN_DUMP.get());
             w.write_all(&[if legacy {
                 TAG_VECTORSET
             } else {
@@ -5442,22 +5444,23 @@ const DUMP_VERSION: [u8; 2] = [0x0a, 0x00];
 
 thread_local! {
     /// Set while [`dump_payload`] writes: a time series is written without
-    /// its compaction rules and source.
-    static WITHOUT_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// its compaction rules and source, and a vector set made `NOQUANT`
+    /// keeps that choice.
+    static IN_DUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// [`WITHOUT_LINKS`], while this lives.
-struct WithoutLinks(bool);
+/// [`IN_DUMP`], while this lives.
+struct InDump(bool);
 
-impl WithoutLinks {
+impl InDump {
     fn begin() -> Self {
-        WithoutLinks(WITHOUT_LINKS.replace(true))
+        InDump(IN_DUMP.replace(true))
     }
 }
 
-impl Drop for WithoutLinks {
+impl Drop for InDump {
     fn drop(&mut self) {
-        WITHOUT_LINKS.set(self.0);
+        IN_DUMP.set(self.0);
     }
 }
 
@@ -5488,7 +5491,15 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     // with them, a series fed a compaction that had a source of its own
     // (#593). Its samples, settings and labels go. An atomic slot migration
     // sends the rules among the keys it moves as `TS.CREATERULE`s.
-    let _without = WithoutLinks::begin();
+    //
+    // A vector set that was made `NOQUANT` goes as such (`TAG_VECTORSET_V2`),
+    // so that it keeps refusing other quantizations where it is restored. A
+    // snapshot writes it as 1.2 did, and a 1.2 node refuses this payload
+    // with "Bad data format" rather than load a set that has lost its choice.
+    //
+    // These payloads are KiviDB's own: Redis writes vector sets and series
+    // as module values, which neither side reads from the other.
+    let _in_dump = InDump::begin();
     let mut out = Vec::new();
     if serialize_value(value, &mut out).is_err() {
         out.clear();
@@ -5703,12 +5714,12 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             let s = arc.read().to_string();
             write_bytes_vec(out, s.as_bytes())?;
         }
+        // No compact encoding: `dump_payload` writes these as a one-entry
+        // KDB image, in the snapshot's encoding.
         KiviDBValue::TimeSeries(_) | KiviDBValue::VectorSet(_) => {
-            // TimeSeries and VectorSet are not portable across instances —
-            // return an error so DUMP clearly signals this.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "DUMP not supported for TimeSeries and VectorSet keys",
+                "time series and vector sets have no compact encoding",
             ));
         }
         // `dump_payload` writes these itself, in Redis's format.
@@ -5719,9 +5730,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             ));
         }
         KiviDBValue::Array(arc) => {
-            // Unlike TimeSeries/VectorSet above, an array has no instance-local
-            // state (no index handles, no label registry) — it's a plain sparse
-            // map plus two scalars, so it round-trips through DUMP/RESTORE.
+            // A plain sparse map plus two scalars.
             out.write_all(&[TAG_ARRAY])?;
             let inner = arc.read();
             out.write_all(&(inner.entries.len() as u32).to_le_bytes())?;
@@ -6127,6 +6136,191 @@ mod dump_payload_tests {
                 assert_eq!(ts.labels.get("k").map(String::as_str), Some("v"));
             }
             _ => panic!("expected a time series"),
+        }
+    }
+
+    /// A set of `quant` with a few elements, one with attributes.
+    fn vset(quant: crate::vector::quant::Quant, chosen: bool) -> VectorSetInner {
+        use crate::vector::quant::StoredVector;
+        let dim = 70;
+        let mut vs = VectorSetInner::with_metric(dim, crate::vector::DistanceMetric::L2);
+        vs.quant = quant;
+        vs.quant_chosen = chosen;
+        for n in 0..5u8 {
+            let v: Vec<f32> = (0..dim)
+                .map(|i| ((i * 7 + n as usize * 13) % 11) as f32 - 5.0)
+                .collect();
+            vs.entries.insert(
+                crate::key_bytes::KeyBytes::from(&[b'e', n, 0xff][..]),
+                VSetEntry {
+                    vector: StoredVector::quantize(quant, v).unwrap(),
+                    attrs: (n == 3).then(|| r#"{"n":3}"#.into()),
+                },
+            );
+        }
+        vs
+    }
+
+    fn assert_same_vset(a: &VectorSetInner, b: &VectorSetInner) {
+        assert_eq!(a.dim, b.dim);
+        assert_eq!(a.metric, b.metric);
+        assert_eq!(a.quant, b.quant);
+        assert_eq!(a.quant_chosen, b.quant_chosen);
+        assert_eq!(a.entries.len(), b.entries.len());
+        for (name, entry) in &a.entries {
+            let other = &b.entries[name];
+            assert_eq!(entry.vector, other.vector, "{name:?}");
+            assert_eq!(entry.attrs, other.attrs, "{name:?}");
+        }
+    }
+
+    /// Every quantization, and whether one was asked for, through `DUMP`
+    /// and `RESTORE`: each element's stored vector bit for bit (#722).
+    #[test]
+    fn a_dump_keeps_every_vector_set_whole() {
+        use crate::vector::quant::Quant;
+        for (quant, chosen) in [
+            (Quant::F32, false),
+            (Quant::F32, true),
+            (Quant::Q8, true),
+            (Quant::Bin, true),
+        ] {
+            let want = vset(quant, chosen);
+            let payload = dump_payload(&KiviDBValue::VectorSet(Arc::new(
+                parking_lot::RwLock::new(want.clone()),
+            )))
+            .unwrap();
+            match restore_payload_checked(&payload) {
+                Ok(KiviDBValue::VectorSet(arc)) => assert_same_vset(&want, &arc.read()),
+                other => panic!("{quant:?}: {:?}", other.map(|v| v.type_name())),
+            }
+        }
+    }
+
+    /// A snapshot still writes a `NOQUANT` set as 1.2 did, so 1.2 loads it;
+    /// only a `DUMP` keeps the choice, in the encoding 1.2 refuses.
+    #[test]
+    fn only_a_dump_writes_a_noquant_set_as_quantized() {
+        use crate::vector::quant::Quant;
+        let tag_of = |vs: VectorSetInner| {
+            let value = KiviDBValue::VectorSet(Arc::new(parking_lot::RwLock::new(vs)));
+            let image = image(&value);
+            let dumped = dump_payload(&value).unwrap();
+            let at = |bytes: &[u8]| {
+                bytes
+                    .windows(5)
+                    .position(|w| w[1..] == 70u32.to_le_bytes())
+                    .map(|i| bytes[i])
+            };
+            (at(&image), at(&dumped))
+        };
+        let (legacy, v2) = (Some(TAG_VECTORSET), Some(TAG_VECTORSET_V2));
+        assert_eq!(tag_of(vset(Quant::F32, false)), (legacy, legacy));
+        assert_eq!(tag_of(vset(Quant::F32, true)), (legacy, v2));
+        assert_eq!(tag_of(vset(Quant::Q8, true)), (v2, v2));
+    }
+
+    /// A series' samples and settings through `DUMP` and `RESTORE`, field by
+    /// field; its links to other series are left out (#593).
+    #[test]
+    fn a_dump_keeps_a_series_whole_but_its_links() {
+        let mut want = TsInner::new();
+        for (at, value) in [(1000, 21.5), (2000, -3.25), (3000, f64::MAX)] {
+            want.samples.insert(at, value);
+        }
+        want.last_ts = Some(3000);
+        want.retention = 86_400_000;
+        want.chunk_size = 256;
+        want.duplicate_policy = crate::types::DuplicatePolicy::Min;
+        want.labels.insert("room".into(), "kitchen".into());
+        want.labels.insert("floor".into(), "2".into());
+        let mut linked = want.clone();
+        linked.rules.push(crate::types::CompactionRule {
+            dest_key: "d".into(),
+            aggregation: crate::types::TsAggregation::Avg,
+            bucket_duration: 60_000,
+            align_timestamp: 5,
+        });
+        linked.source = Some("s".into());
+        let payload = dump_payload(&KiviDBValue::TimeSeries(Arc::new(
+            parking_lot::RwLock::new(linked),
+        )))
+        .unwrap();
+        let Ok(KiviDBValue::TimeSeries(arc)) = restore_payload_checked(&payload) else {
+            panic!("expected a time series");
+        };
+        let got = arc.read();
+        assert_eq!(got.samples, want.samples);
+        assert_eq!(got.last_ts, want.last_ts);
+        assert_eq!(got.retention, want.retention);
+        assert_eq!(got.chunk_size, want.chunk_size);
+        assert_eq!(got.duplicate_policy, want.duplicate_policy);
+        assert_eq!(got.labels, want.labels);
+        assert!(got.rules.is_empty());
+        assert_eq!(got.source, None);
+    }
+
+    /// `payload`'s value with `edit` applied, sealed again.
+    fn resealed(payload: &[u8], edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut data = payload[..payload.len() - 10].to_vec();
+        edit(&mut data);
+        let crc = crc64_digest(&data);
+        data.extend_from_slice(&DUMP_VERSION);
+        data.extend_from_slice(&crc.to_le_bytes());
+        data
+    }
+
+    /// A payload this version cannot read — a type or quantization from a
+    /// newer one, or one cut short — is refused as bad data, never read in
+    /// part; one whose checksum fails, as such.
+    #[test]
+    fn a_payload_from_a_newer_version_or_cut_short_is_refused() {
+        use crate::vector::quant::Quant;
+        let value =
+            KiviDBValue::VectorSet(Arc::new(parking_lot::RwLock::new(vset(Quant::Q8, true))));
+        let payload = dump_payload(&value).unwrap();
+        // The set's tag, then its dimension, metric and quantization.
+        let tag = payload
+            .windows(7)
+            .position(|w| w[0] == TAG_VECTORSET_V2 && w[1..5] == 70u32.to_le_bytes())
+            .unwrap();
+        let unknown_type = resealed(&payload, |d| d[tag] = 0xee);
+        let unknown_quant = resealed(&payload, |d| d[tag + 6] = 0xee);
+        let cut = resealed(&payload, |d| d.truncate(d.len() - 20));
+        let extended = resealed(&payload, |d| d.push(0));
+        for (what, bad) in [
+            ("type", unknown_type),
+            ("quantization", unknown_quant),
+            ("cut", cut),
+            ("extended", extended),
+        ] {
+            assert_eq!(
+                restore_payload_checked(&bad).err(),
+                Some(RestoreError::BadData),
+                "{what}"
+            );
+        }
+        let mut flipped = payload.clone();
+        flipped[tag + 10] ^= 1;
+        assert_eq!(
+            restore_payload_checked(&flipped).err(),
+            Some(RestoreError::VersionOrChecksum)
+        );
+        let short = &payload[..payload.len() - 1];
+        assert_eq!(
+            restore_payload_checked(short).err(),
+            Some(RestoreError::VersionOrChecksum)
+        );
+    }
+
+    /// A series' payload cut anywhere is refused.
+    #[test]
+    fn a_series_payload_cut_anywhere_is_refused() {
+        let payload = dump_payload(&linked_series()).unwrap();
+        let data_len = payload.len() - 10;
+        for keep in 0..data_len {
+            let bad = resealed(&payload, |d| d.truncate(keep));
+            assert!(restore_payload_checked(&bad).is_err(), "cut at {keep}");
         }
     }
 
