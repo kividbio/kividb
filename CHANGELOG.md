@@ -159,6 +159,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KEYS` and `SCAN` still run alone, as before, so as not to see a script
   part-way through.
 
+- **A full `SCAN … MATCH` over a large keyspace no longer trails Redis
+  (#751).** Each call hashed every key of the shard it was in to find its
+  page, visiting each key's entry, and matched each key byte by byte
+  through the general glob matcher. A call now finds its page from the hash
+  fragment each table slot already keeps, and reads only the entries of
+  that page; patterns such as `prefix:*`, `*suffix` and `*part*` are
+  matched by comparing bytes. A full `SCAN 0 MATCH schedule:* COUNT 1000`
+  over 2,002,000 keys went from 1.31 s to 0.48 s (Redis 8.10.2:
+  0.53 s), and one without `MATCH` from 2.98 s to 1.93 s (Redis: 2.04 s).
+  `HSCAN`, `SSCAN` and `ZSCAN` match patterns the same way. A `SCAN`
+  cursor is now valid only on the server that gave it, until it restarts,
+  as in Redis: one from before a restart, a failover or another replica
+  ends the iteration or skips keys, rather than resuming it.
+
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
   master crashed right after a `CLUSTER MIGRATION IMPORT` handover kept the
