@@ -75,7 +75,14 @@ jobs:
       # Details and how to produce the result: docs/RELEASING.md, "Before
       # tagging". Locally: scripts/release/check-regression-results.sh vX.Y.Z
       - name: Regression suite result is committed for this code
-        run: bash scripts/release/check-regression-results.sh "${RELEASE_TAG}" --ref HEAD
+        run: |
+          # An older tag re-run by hand has no script in its tree: it
+          # predates the gate and is not blocked by it.
+          if [ -f scripts/release/check-regression-results.sh ]; then
+            bash scripts/release/check-regression-results.sh "${RELEASE_TAG}" --ref HEAD
+          else
+            echo "::notice::${RELEASE_TAG} predates the regression gate"
+          fi
 
   # ── Linux x86_64 ─────────────────────────────────────────────────────────
   # Built INSIDE an amazonlinux:2023 container, not natively on the runner:

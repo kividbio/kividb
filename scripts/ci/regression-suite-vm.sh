@@ -11,16 +11,18 @@
 # $HOME/harness/$SUITE_DIR/results/$LABEL.
 set -uo pipefail
 
-: "${SUITE_DIR:?}" "${LABEL:?}" "${CAND_COMMIT:?}"
 cd "$HOME"
 rc=1
 finish() { echo "$rc" >"$HOME/run.exit"; }
 trap finish EXIT
+: "${SUITE_DIR:?}" "${LABEL:?}" "${CAND_COMMIT:?}"
 
 export DEBIAN_FRONTEND=noninteractive
 echo "=== packages"
-sudo apt-get update -q
-sudo apt-get install -y -q build-essential git curl pkg-config libssl-dev python3-venv xz-utils || exit 1
+# First boot: cloud-init and unattended upgrades may hold the apt lock.
+cloud-init status --wait >/dev/null 2>&1 || true
+sudo apt-get -o DPkg::Lock::Timeout=600 update -q
+sudo apt-get -o DPkg::Lock::Timeout=600 install -y -q build-essential git curl pkg-config libssl-dev python3-venv xz-utils || exit 1
 
 echo "=== unpack"
 rm -rf cand harness
@@ -61,4 +63,23 @@ export FULL=${FULL:-0}
 "$HERE/run-all.sh" "${args[@]}"
 rc=$?
 echo "=== run-all.sh exit $rc"
+
+# What the machine was made of, next to the numbers: baselines are tied to it.
+# (After run-all.sh, so only env.json is touched, not the verdict.)
+ENV_JSON=$HERE/results/$LABEL/env.json
+if [ -f "$ENV_JSON" ]; then
+  IMDS=$(curl -fs -m 5 -H Metadata:true \
+    "http://169.254.169.254/metadata/instance/compute/storageProfile/imageReference?api-version=2021-02-01&format=json" || echo '{}')
+  python3 - "$ENV_JSON" "$IMDS" "$(uname -r)" "$(ldd --version | head -1)" "$(. /etc/os-release && echo "$PRETTY_NAME")" <<'PY' || true
+import json, sys
+path, imds, kernel, glibc, osname = sys.argv[1:6]
+try:
+    ref = json.loads(imds)
+except ValueError:
+    ref = {}
+env = json.load(open(path))
+env["ci_image"] = {"image_reference": ref, "os": osname, "kernel": kernel, "glibc": glibc}
+json.dump(env, open(path, "w"), indent=1)
+PY
+fi
 exit "$rc"

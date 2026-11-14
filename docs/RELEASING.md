@@ -24,7 +24,7 @@ seconds and nothing is built or published.
    `master`; the Azure sign-in trusts `master` runs only). `ref` is the
    release candidate's tag or commit (`v1.3.0-rc4`), `label` names the run
    (`v1.3.0-rc4-d4s_v5`), and `only` stays empty. Tick `full` for the long
-   configurations: do it for a release. The workflow makes one
+   configurations: leave it ticked (it is the default), the gate requires a FULL run. The workflow makes one
    `Standard_D4s_v5` (the size `baseline.json` was recorded on), builds the
    candidate on it, runs `run-all.sh`, uploads `results/<label>/` as an
    artifact and deletes the machine whatever happens. It fails when
@@ -56,12 +56,21 @@ seconds and nothing is built or published.
    why each committed run does not count, or `OK`.
 
 The gate counts a run only when its verdict is `ok`, with no failed gate, at
-full scale (no `SCALE`, no `only`), with all suites and all three engines, and
-with a candidate commit that exists. A minor release with no
+full scale (no `SCALE`, no `only`), with `FULL=1`, no metric "not run", all suites
+and all three engines, the `scale`, `only`, `engines_selected` and `full` keys
+present in `env.json` (a run from an older `run-all.sh` is refused), and with a
+candidate commit that exists. A minor release with no
 `benchmarks/X.Y.0/regressions/` directory (every release before 1.3.0, and
 their patch releases) is not checked; release candidates are never checked. A
 patch release of a minor that has a suite needs a fresh run, because it changes
 `src/`.
+
+The baselines are tied to the machine they were recorded on: `Standard_D4s_v5`
+and Ubuntu 24.04 (kernel, glibc). The workflow's `image` input defaults to the
+latest Ubuntu 24.04 image; the version it resolved, the kernel and glibc are
+written to `env.json` as `ci_image`. If a new image moves the numbers, compare
+`ci_image` with the recorded run before blaming the candidate, and re-record
+(below) on the new image if it is the cause.
 
 ### Re-recording the baselines
 

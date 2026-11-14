@@ -17,8 +17,9 @@
 #
 #   - has summary.json verdict "ok" (not REGRESSED, INVALID or SMOKE), no failed
 #     gate and no failure in env.json;
-#   - is a full-scale run of every suite in suites/ and every engine (no SCALE,
-#     no --only, no --engines subset);
+#   - is a FULL=1, full-scale run of every suite in suites/ and every engine
+#     (no SCALE, no --only, no --engines subset, no metric "not run"), and
+#     env.json has the scale, only, engines_selected and full keys;
 #   - names a candidate commit that exists, is an ancestor of the commit being
 #     judged, and left src/, Cargo.toml, Cargo.lock and rust-toolchain.toml
 #     alone since (the package version line aside: the release bumps it after
@@ -153,15 +154,24 @@ def judge(run):
         why.append("verdict is %r, not 'ok'" % summ.get("verdict"))
     if summ.get("failed") or summ.get("problems"):
         why.append("summary lists failed gates or problems")
+    if summ.get("not_run"):
+        why.append("%d recorded metrics were not run (a run without FULL=1 or with --only)" % len(summ["not_run"]))
     if env.get("run_failed") or env.get("failures"):
         why.append("env.json records failures")
-    if str(env.get("scale", "1")) not in ("1", "1.0"):
-        why.append("SCALE=%s: a smoke run" % env.get("scale"))
-    if env.get("only"):
-        why.append("--only %s: a partial run" % env.get("only"))
-    eng = env.get("engines_selected")
-    if eng is not None and not {"v1_2_2", "candidate", "redis"} <= set(eng):
-        why.append("not all three engines ran (%s)" % ",".join(eng))
+    # Absent is a refusal, not a default: a run from an older run-all.sh
+    # cannot show it was a full run.
+    missing = [k for k in ("scale", "only", "engines_selected", "full") if k not in env]
+    if missing:
+        why.append("env.json lacks %s (run it again with the current run-all.sh)" % ", ".join(missing))
+    else:
+        if str(env["scale"]) not in ("1", "1.0"):
+            why.append("SCALE=%s: a smoke run" % env["scale"])
+        if env["only"]:
+            why.append("--only %s: a partial run" % env["only"])
+        if not {"v1_2_2", "candidate", "redis"} <= set(env["engines_selected"]):
+            why.append("not all three engines ran (%s)" % ",".join(env["engines_selected"]))
+        if str(env["full"]) not in ("1", "true"):
+            why.append("FULL=%s: the long configurations were not run" % env["full"])
     ran = set((env.get("suite_seconds") or {}).keys())
     if not set(suites) <= ran:
         why.append("suites not run: %s" % ", ".join(sorted(set(suites) - ran)))
