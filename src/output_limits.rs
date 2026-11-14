@@ -14,8 +14,12 @@
 //! - `slave` (or `replica`): the write stream queued for a replica that is
 //!   streaming. Its hard limit is `repl-replica-max-backlog-bytes`, one
 //!   setting under two names; during a full sync the replica is held to
-//!   `repl-replica-sync-max-backlog-bytes` instead, and not to the soft
-//!   limit. 256 MB, or 64 MB for 60 seconds, by default.
+//!   `repl-replica-sync-max-backlog-bytes` instead. The soft limit holds
+//!   only once the replica's queue has been under it, after a full sync or
+//!   a partial resync: a replica draining what queued up meanwhile is not
+//!   dropped for it. 256 MB, and no soft limit, by default: unlike Redis
+//!   (`256mb 64mb 60`), so that a burst a replica used to come through does
+//!   not become a full resync.
 //!
 //! What counts is the bytes waiting, not the allocator's rounding of them:
 //! Redis counts a 31 MB message as 32 MB (jemalloc's size class) and drops
@@ -102,10 +106,11 @@ impl Limit {
     }
 }
 
-/// Redis's defaults, by [`Class`].
+/// The defaults, by [`Class`]: Redis's, but for a replica's soft limit,
+/// which is off (see the module's documentation).
 pub const DEFAULTS: [Limit; 3] = [
     Limit::new(0, 0, 0),
-    Limit::new(256 << 20, 64 << 20, 60),
+    Limit::new(256 << 20, 0, 0),
     Limit::new(32 << 20, 8 << 20, 60),
 ];
 
@@ -128,8 +133,8 @@ impl Limits {
         self.0[class as usize] = limit;
     }
 
-    /// As `CONFIG GET` gives it: `normal 0 0 0 slave 268435456 67108864 60
-    /// pubsub 33554432 8388608 60`.
+    /// As `CONFIG GET` gives it: `normal 0 0 0 slave 268435456 0 0 pubsub
+    /// 33554432 8388608 60` by default.
     pub fn to_config_string(&self) -> String {
         Class::ALL
             .iter()
@@ -148,7 +153,7 @@ impl Limits {
     }
 
     /// The lines of a rewritten configuration file: one for each class that
-    /// is not at Redis's default, with sizes in Redis's units.
+    /// is not at its default, with sizes in Redis's units.
     pub fn rewrite_lines(&self) -> String {
         let mut out = String::new();
         for class in Class::ALL {
@@ -192,7 +197,10 @@ pub const INVALID_VALUE: &str =
 /// as there are classes to set; a class named twice takes the last. Words
 /// are split at each space, as Redis splits them, so a doubled space is an
 /// empty word. An empty value sets nothing. Nothing is set unless all of it
-/// can be read.
+/// can be read. Groups are checked one by one, the class and then the
+/// numbers, as Redis checks them, with Redis's messages; the numbers are
+/// read more strictly than Redis reads them (see [`parse_memory`] and
+/// [`parse_seconds`]).
 pub fn parse(value: &str) -> Result<Vec<(Class, Limit)>, &'static str> {
     if value.is_empty() {
         return Ok(Vec::new());
@@ -201,15 +209,10 @@ pub fn parse(value: &str) -> Result<Vec<(Class, Limit)>, &'static str> {
     if !words.len().is_multiple_of(4) {
         return Err(WRONG_NUMBER);
     }
-    // Every group's class first, then the numbers, as Redis checks them.
-    let classes = words
+    words
         .chunks(4)
-        .map(|group| Class::parse(group[0]).ok_or(INVALID_CLASS))
-        .collect::<Result<Vec<Class>, _>>()?;
-    classes
-        .into_iter()
-        .zip(words.chunks(4))
-        .map(|(class, group)| {
+        .map(|group| {
+            let class = Class::parse(group[0]).ok_or(INVALID_CLASS)?;
             match (
                 parse_memory(group[1]),
                 parse_memory(group[2]),
@@ -229,8 +232,10 @@ pub fn parse(value: &str) -> Result<Vec<(Class, Limit)>, &'static str> {
         .collect()
 }
 
-/// A size as Redis reads one: digits, then nothing, `b`, `k`, `kb`, `m`,
-/// `mb`, `g` or `gb`, in any case.
+/// A size: digits, then nothing, `b`, `k`, `kb`, `m`, `mb`, `g` or `gb`, in
+/// any case. Stricter than Redis's `memtoull`, which takes an empty word or
+/// a unit alone as 0 and does not refuse every overflow: those are refused
+/// here.
 fn parse_memory(word: &str) -> Option<u64> {
     let lower = word.to_ascii_lowercase();
     let digits = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -252,7 +257,8 @@ fn parse_memory(word: &str) -> Option<u64> {
 
 /// The seconds as Redis keeps them, in a C `int`: a number past it wraps,
 /// and is refused if that makes it negative (`4294967296` is 0, and
-/// `2147483648` is refused).
+/// `2147483648` is refused). Digits with an optional `+` only: stricter than
+/// Redis's `strtoll`, which also takes `-0` and leading spaces.
 fn parse_seconds(word: &str) -> Option<u64> {
     let digits = word.strip_prefix('+').unwrap_or(word);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -408,7 +414,7 @@ mod tests {
     fn defaults_read_back_as_in_redis() {
         assert_eq!(
             Limits::default().to_config_string(),
-            "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"
+            "normal 0 0 0 slave 268435456 0 0 pubsub 33554432 8388608 60"
         );
         assert_eq!(Limits::default().rewrite_lines(), "");
     }
@@ -430,7 +436,12 @@ mod tests {
         assert_eq!(parse("normal 0 0 0 "), Err(WRONG_NUMBER));
         assert_eq!(parse("foo 1 2 3"), Err(INVALID_CLASS));
         assert_eq!(parse("master 1 2 3"), Err(INVALID_CLASS));
-        assert_eq!(parse("normal  1   2  5"), Err(INVALID_CLASS));
+        // Group by group: the first group's empty words are refused before
+        // the second's class is looked at. (Redis reads an empty number as
+        // 0, and refuses the second group's class instead.)
+        assert_eq!(parse("normal  1   2  5"), Err(INVALID_VALUE));
+        assert_eq!(parse("normal 1 2 3 foo x y z"), Err(INVALID_CLASS));
+        assert_eq!(parse("normal x 2 3 foo 1 2 3"), Err(INVALID_VALUE));
         assert_eq!(parse("normal  1 0 0"), Err(WRONG_NUMBER));
         for bad in [
             "normal x 2 3",

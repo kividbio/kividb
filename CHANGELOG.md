@@ -206,8 +206,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   limit, as Redis does, `CLIENT LIST` shows what waits for a client as
   `omem`, and `INFO` has `client_output_buffer_limit_disconnections`. A
   replica's hard limit is `repl-replica-max-backlog-bytes` under another
-  name, and its soft limit (64 MB for 60 seconds by default) applies once
-  its full sync is over.
+  name, which now takes 0 for no limit (that lifts
+  `repl-replica-sync-max-backlog-bytes` too). Unlike Redis, a replica has
+  no soft limit by default (`slave 268435456 0 0`, where Redis has 64 MB
+  for 60 seconds), so that a burst a replica came through before does not
+  become a full resync; one that is set holds only once the replica's queue
+  has been under it after a full sync or partial resync. A redis.conf line
+  `client-output-buffer-limit replica 256mb 64mb 60` now takes effect: it
+  sets the hard limit back to 256 MB if `repl-replica-max-backlog-bytes`
+  was raised earlier in the file (the last line wins), and turns that soft
+  limit on.
 
 - **`string.format('%d', x)` in a script takes an `x` with a fraction, as
   Redis does (#747).** Scripts run on Lua 5.4, which failed with "number has

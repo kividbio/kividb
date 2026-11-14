@@ -393,10 +393,11 @@ pub struct Config {
     pub notify_keyspace_events: String,
 
     /// Max bytes a master will queue for a single replica that isn't keeping up
-    /// (analogous to Redis's `client-output-buffer-limit slave <hard-limit>`).
-    /// Once exceeded the replica is disconnected — it must full-resync to catch
-    /// back up — rather than letting the queue grow without bound. Settable at
-    /// runtime.
+    /// (Redis's `client-output-buffer-limit slave <hard-limit>`, which sets
+    /// it too). Once exceeded the replica is disconnected — it must
+    /// full-resync to catch back up — rather than letting the queue grow
+    /// without bound. 0 is no limit, and lifts
+    /// `repl-replica-sync-max-backlog-bytes` too. Settable at runtime.
     #[arg(long, default_value_t = 268_435_456)]
     pub repl_replica_max_backlog_bytes: u64,
 

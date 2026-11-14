@@ -66,7 +66,7 @@ The ones that behave differently:
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
 | `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
-| `client-output-buffer-limit` | As in Redis. A replica's hard limit is the same setting as `repl-replica-max-backlog-bytes`; during a full sync a replica is held to `repl-replica-sync-max-backlog-bytes` instead. |
+| `client-output-buffer-limit` | As in Redis, but a replica has no soft limit by default. A replica's hard limit is the same setting as `repl-replica-max-backlog-bytes`, and the last line that sets it wins; during a full sync a replica is held to `repl-replica-sync-max-backlog-bytes` instead. A carried-over `client-output-buffer-limit replica 256mb 64mb 60` takes effect: it turns the 64 MB soft limit on and puts the hard limit at 256 MB. Leave it out to keep KiviDB's defaults. |
 | `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets and Bloom filters (`BF.*`) are built in. |
 | Sentinel | No Sentinel. Use replication with your own failover, or cluster mode (`--cluster-enabled yes`), which fails over by itself. |
 

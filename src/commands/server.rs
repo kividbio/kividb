@@ -820,10 +820,14 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 )),
             },
             // Read for each write the hub queues: a change applies to the
-            // replicas already attached (#305).
+            // replicas already attached (#305). 0 is no limit, as
+            // `client-output-buffer-limit replica 0 0 0` sets it; and any
+            // value that sets, this takes back, so that `CONFIG GET` reads
+            // back through `CONFIG SET` (and a failed `CONFIG SET` of several
+            // settings puts it back) (#774).
             "repl-replica-max-backlog-bytes" | "repl-replica-sync-max-backlog-bytes" => {
                 match memory_size(value) {
-                    Some(bytes) if bytes > 0 && bytes <= i64::MAX as usize => {
+                    Some(bytes) => {
                         let limit = if param == "repl-replica-max-backlog-bytes" {
                             &ctx.repl_state.replica_max_backlog_bytes
                         } else {
@@ -832,9 +836,9 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         limit.store(bytes as u64, Ordering::Relaxed);
                         Some(resp_simple("OK"))
                     }
-                    _ => Some(resp_error(&format!(
+                    None => Some(resp_error(&format!(
                         "ERR CONFIG SET failed (possibly related to argument '{param}') - \
-                         argument must be a memory value of at least 1 byte"
+                         argument must be a memory value"
                     ))),
                 }
             }

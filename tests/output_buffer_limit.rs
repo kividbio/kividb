@@ -210,10 +210,23 @@ impl Server {
         if let Some(text) = config {
             std::fs::write(dir.join("kividb.conf"), text).unwrap();
         }
-        Self::start_in(dir, io_model, config.is_some())
+        Self::start_in(dir, io_model, config.is_some(), &[])
     }
 
-    fn start_in(dir: std::path::PathBuf, io_model: &str, with_config: bool) -> Self {
+    /// A replica of `master`.
+    #[cfg(target_os = "linux")]
+    fn start_replica(master: &Server) -> Self {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let port = master.port.to_string();
+        Self::start_in(dir, "tokio", false, &["--replicaof", "127.0.0.1", &port])
+    }
+
+    fn start_in(
+        dir: std::path::PathBuf,
+        io_model: &str,
+        with_config: bool,
+        extra: &[&str],
+    ) -> Self {
         let port = free_port();
         let log = std::fs::OpenOptions::new()
             .create(true)
@@ -234,6 +247,7 @@ impl Server {
         if with_config {
             command.args(["--configfile", "kividb.conf"]);
         }
+        command.args(extra);
         let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -281,7 +295,15 @@ impl Server {
         let _ = self.child.wait();
         let dir = std::mem::take(&mut self.dir);
         std::mem::forget(self);
-        Self::start_in(dir, io_model, true)
+        Self::start_in(dir, io_model, true, &[])
+    }
+
+    /// `CONFIG GET` of one name: its value.
+    fn get(&self, name: &str) -> String {
+        match self.conn().cmd(&["CONFIG", "GET", name]) {
+            V::Arr(items) if items.len() == 2 => items[1].text(),
+            other => panic!("CONFIG GET {name}: {other:?}"),
+        }
     }
 }
 
@@ -293,7 +315,9 @@ impl Drop for Server {
     }
 }
 
-const REDIS_DEFAULT: &str = "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60";
+/// Redis's defaults, but for a replica's soft limit, which is off (Redis:
+/// `slave 268435456 67108864 60`).
+const DEFAULT: &str = "normal 0 0 0 slave 268435456 0 0 pubsub 33554432 8388608 60";
 
 /// A subscriber on `channel`, with the reply to its SUBSCRIBE read.
 fn subscriber(server: &Server, channel: &str) -> Conn {
@@ -318,7 +342,7 @@ fn subscriber(server: &Server, channel: &str) -> Conn {
 fn config_get_gives_redis_defaults() {
     let _turn = serial();
     let server = Server::start("tokio");
-    assert_eq!(server.config_get(), REDIS_DEFAULT);
+    assert_eq!(server.config_get(), DEFAULT);
     assert_eq!(
         server.info_field("client_output_buffer_limit_disconnections"),
         "0"
@@ -338,7 +362,7 @@ fn config_set_takes_what_redis_takes() {
     assert!(set(&mut c, "pubsub 0 0 0").ok());
     assert_eq!(
         server.config_get(),
-        "normal 0 0 0 slave 268435456 67108864 60 pubsub 0 0 0"
+        "normal 0 0 0 slave 268435456 0 0 pubsub 0 0 0"
     );
     // Several, with units, any case, and `replica` for `slave`.
     assert!(set(&mut c, "NORMAL 1mb 2gb 5 replica 1g 64m 10").ok());
@@ -402,6 +426,55 @@ fn config_set_takes_what_redis_takes() {
     );
 }
 
+/// Every value `CONFIG GET` gives, of either name of a replica's hard
+/// limit, `CONFIG SET` takes back: 0 (no limit) too, which
+/// `client-output-buffer-limit replica 0 0 0` sets. So a `CONFIG SET` of
+/// several settings that fails part-way puts the limit back as it was; it
+/// used to fail to, and leave the new value.
+#[test]
+fn every_value_reads_back_and_a_failed_config_set_puts_it_back() {
+    let _turn = serial();
+    let server = Server::start("tokio");
+    let mut c = server.conn();
+    for value in [
+        "replica 0 0 0",
+        "replica 18446744073709551615 0 0",
+        "replica 1mb 2mb 3",
+    ] {
+        server.config_set(value);
+        let all = server.config_get();
+        assert!(
+            c.cmd(&["CONFIG", "SET", "client-output-buffer-limit", &all])
+                .ok(),
+            "{all}"
+        );
+        assert_eq!(server.config_get(), all);
+        for name in [
+            "repl-replica-max-backlog-bytes",
+            "repl-replica-sync-max-backlog-bytes",
+        ] {
+            let current = server.get(name);
+            assert!(c.cmd(&["CONFIG", "SET", name, &current]).ok(), "{name} {current}");
+            assert_eq!(server.get(name), current);
+        }
+    }
+
+    server.config_set("replica 0 0 0");
+    for (name, value) in [
+        ("repl-replica-max-backlog-bytes", "1mb"),
+        ("client-output-buffer-limit", "replica 1mb 0 0"),
+    ] {
+        let reply = c.cmd(&["CONFIG", "SET", name, value, "maxclients", "-5"]);
+        assert!(matches!(reply, V::Err(_)), "{reply:?}");
+        assert_eq!(server.get("repl-replica-max-backlog-bytes"), "0", "{name}");
+        assert_eq!(
+            server.config_get(),
+            "normal 0 0 0 slave 0 0 0 pubsub 33554432 8388608 60",
+            "{name}"
+        );
+    }
+}
+
 /// From the configuration file, back out through `CONFIG REWRITE`, and in
 /// again after a restart: one line for each class not at its default, as
 /// Redis writes them.
@@ -414,7 +487,7 @@ fn the_config_file_and_rewrite_round_trip() {
     );
     assert_eq!(
         server.config_get(),
-        "normal 0 0 0 slave 268435456 67108864 60 pubsub 67108864 16777216 30"
+        "normal 0 0 0 slave 268435456 0 0 pubsub 67108864 16777216 30"
     );
     server.config_set("normal 100mb 0 0 replica 0 0 0 pubsub 1gb 1000 0");
     assert!(server.conn().cmd(&["CONFIG", "REWRITE"]).ok());
@@ -625,5 +698,101 @@ fn a_normal_client_over_the_soft_limit_too_long_is_disconnected() {
             "{io_model}: the whole reply came, {got} bytes"
         );
         server.config_set("normal 0 0 0");
+    }
+}
+
+// ── Replicas ──────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn info_number(server: &Server, name: &str) -> u64 {
+    server.info_field(name).parse().unwrap()
+}
+
+/// Writes 4 KB values to `port` until `stop`, about 20 MB a second.
+#[cfg(target_os = "linux")]
+fn writer(
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut c = Conn::connect(port);
+        let value = "w".repeat(4096);
+        let mut i = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut batch = Vec::new();
+            for _ in 0..100 {
+                let key = format!("w:{}", i % 20_000);
+                i += 1;
+                batch.extend_from_slice(
+                    format!(
+                        "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n${}\r\n{value}\r\n",
+                        key.len(),
+                        value.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+            c.writer.write_all(&batch).unwrap();
+            for _ in 0..100 {
+                c.read().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+}
+
+/// A replica's soft limit, with its hard limit raised (and with none): a
+/// replica that comes out of a full sync with a stream written meanwhile to
+/// drain is not dropped for it (that would start the sync again, and
+/// again); one that then stays over the soft limit, stopped here, is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_replica_drains_after_its_sync_and_is_dropped_only_when_it_stays_over() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _turn = serial();
+    for hard in ["2gb", "0"] {
+        let master = Server::start("tokio");
+        master.config_set(&format!("replica {hard} 1mb 1"));
+        assert!(
+            master
+                .conn()
+                .cmd(&["DEBUG", "POPULATE", "50000", "key", "1000"])
+                .ok()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let writing = writer(master.port, Arc::clone(&stop));
+        let replica = Server::start_replica(&master);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !replica
+            .conn()
+            .cmd(&["INFO", "replication"])
+            .text()
+            .contains("master_link_status:up")
+        {
+            assert!(Instant::now() < deadline, "{hard}: the replica never synced");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Streaming, with the writes go on.
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(info_number(&master, "connected_slaves"), 1, "{hard}");
+        assert_eq!(info_number(&master, "sync_full"), 1, "{hard}: synced again");
+        assert_eq!(
+            info_number(&master, "client_output_buffer_limit_disconnections"),
+            0,
+            "{hard}"
+        );
+
+        // Stopped, it falls behind and stays over the soft limit.
+        let pid = replica.child.id().to_string();
+        assert!(Command::new("kill").args(["-STOP", &pid]).status().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while info_number(&master, "client_output_buffer_limit_disconnections") == 0 {
+            assert!(Instant::now() < deadline, "{hard}: a stopped replica was kept");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = Command::new("kill").args(["-CONT", &pid]).status();
+        stop.store(true, Ordering::Relaxed);
+        writing.join().unwrap();
     }
 }
