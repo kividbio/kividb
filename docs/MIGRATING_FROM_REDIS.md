@@ -57,7 +57,7 @@ The ones that behave differently:
 | `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
 | `client-output-buffer-limit` | Not supported: remove it. Pub/Sub subscribers get Redis's default limits. |
-| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`) and vector sets are built in. |
+| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets and Bloom filters (`BF.*`) are built in. |
 | Sentinel | No Sentinel. Use replication with your own failover, or cluster mode (`--cluster-enabled yes`), which fails over by itself. |
 
 Run `kividb --help` for the command-line flags.
@@ -97,9 +97,21 @@ What the RDB reader takes from Redis:
 - **Search index definitions and dictionaries are not loaded.** KiviDB keeps
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;
   `FT.CREATE` indexes the keys that are already there.
-- **Other module data** (time series, vector sets, Bloom filters, and so on)
-  is refused, and so is the whole file: KiviDB won't load part of a
-  snapshot. Move those keys with `MIGRATE` instead, or recreate them.
+- **Bloom filters** load, and answer as they did on Redis: those of
+  RedisBloom 2.4 and later (tested with RDB files of Redis Stack 6.2, 7.2
+  and 7.4, and Redis 8.10). So do `RESTORE` and `MIGRATE` of them,
+  and `BF.SCANDUMP` chunks taken on Redis can be loaded with `BF.LOADCHUNK`.
+  The `bf-*` settings carry over in the config file. Loading is not held
+  to `bloom-max-filter-bytes`; `BF.LOADCHUNK` of a filter over 512 MiB
+  needs it raised first (Redis has no such limit). A filter Redis grew past
+  KiviDB's size limits for clients (65,536 hashes in all its layers, as a
+  filter with `EXPANSION 1` and a small capacity can reach) loads from an
+  RDB file, a full sync or `RESTORE`, and answers; KiviDB's commands add
+  to its layers but do not grow it further.
+- **Other module data** (time series, vector sets, Cuckoo filters,
+  Count-min sketches, Top-K, t-digests) is refused, and so is the whole
+  file: KiviDB won't load part of a snapshot. Move those keys with `MIGRATE`
+  instead, or recreate them.
 - **Dragonfly and KeyDB.** Their RDB files (Dragonfly: `SAVE RDB`) and
   `DUMP` payloads load, including hash field TTLs (Dragonfly's `HSETEX` and
   `FIELDEXPIRE`, KeyDB's `EXPIREMEMBER` on a hash) and Dragonfly's JSON

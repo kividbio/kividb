@@ -87,7 +87,7 @@ fn stream_digest(h: &mut Xxh3, stream: &crate::types::StreamInner) {
         g.update(&(group.pel.len() as u64).to_le_bytes());
         for (id, pending) in group.pel.iter() {
             id_digest(&mut g, id);
-            bytes_digest(&mut g, pending.consumer.as_bytes());
+            bytes_digest(&mut g, pending.consumer().as_bytes());
             g.update(&pending.delivered_at.to_le_bytes());
             g.update(&pending.delivery_count.to_le_bytes());
         }
@@ -188,6 +188,26 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
         ValueRef::Stream(stream) => {
             h.update(b"x");
             stream_digest(h, &stream.read());
+        }
+        // A probabilistic value as a snapshot lays it out, fed to the hash as
+        // it is written rather than gathered first: a filter can be large.
+        // From a copy that shares its bytes, so that no guard is held.
+        ValueRef::Sketch(sketch) => {
+            struct Feed<'h>(&'h mut Xxh3);
+            impl std::io::Write for Feed<'_> {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.update(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let copy = sketch.read().clone();
+            h.update(b"o");
+            h.update(&0u32.to_le_bytes());
+            h.update(&[crate::sketch::TAG_SKETCH]);
+            let _ = crate::sketch::write_kdb(&mut Feed(h), &copy);
         }
         // The rest as they are laid out in a snapshot. Where that depends on
         // a node's own order, the fingerprints differ and the replica is
@@ -380,15 +400,15 @@ mod tests {
     /// entries, groups, pending entries and consumer names are part of it.
     #[test]
     fn a_streams_digest_leaves_out_its_consumers_times_and_its_order() {
-        use crate::types::{ConsumerGroup, PelEntry, StreamEntry, StreamId, StreamInner};
+        use crate::types::{ConsumerGroup, StreamId, StreamInner};
         use std::sync::Arc;
         let store = crate::store::new_store(1);
         let make = |names: &[&str], seen: u64, delivered: u64| {
             let mut s = StreamInner::new();
             for ms in 1..=5u64 {
-                let fields = vec![(Arc::from(&b"f"[..]), Arc::from(ms.to_string().as_bytes()))];
+                let value = ms.to_string();
                 s.entries
-                    .insert_loaded(StreamId::new(ms, 0), StreamEntry { fields });
+                    .push_tail(StreamId::new(ms, 0), &[(&b"f"[..], value.as_bytes())]);
             }
             s.last_id = StreamId::new(5, 0);
             s.entries_added = 5;
@@ -406,11 +426,9 @@ mod tests {
                 }
                 g.pel.insert(
                     StreamId::new(1, 0),
-                    PelEntry {
-                        consumer: format!("c-{}", names[0]).as_str().into(),
-                        delivered_at: delivered,
-                        delivery_count: 1,
-                    },
+                    format!("c-{}", names[0]).as_bytes(),
+                    delivered,
+                    1,
                 );
                 s.groups.insert((*name).into(), g);
             }

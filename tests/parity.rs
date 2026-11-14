@@ -305,6 +305,18 @@ fn info_reports_the_release_it_follows() {
         info(&mut c, "server", "kividb_version").as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
+    // Which build: the `kividb` and `kividb-full` packages install the same
+    // binary path (#732).
+    let variant = match (cfg!(feature = "lua"), cfg!(feature = "tls")) {
+        (true, true) => "full",
+        (true, false) => "lua",
+        (false, true) => "tls",
+        (false, false) => "default",
+    };
+    assert_eq!(
+        info(&mut c, "server", "kividb_variant").as_deref(),
+        Some(variant)
+    );
 }
 
 /// `HELLO` reports the Redis release this server follows, as `INFO`'s

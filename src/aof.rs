@@ -1747,6 +1747,12 @@ fn sync_for_replies() {
     }
     match file {
         Some(Ok(file)) => {
+            // A test holds the sync for these replies here: only here, not
+            // in the second's sync (`do_fsync`), which answers no reply. Held
+            // there too, a tick that came first took the hit the test
+            // waited for, and the replies' sync then waited at the next one,
+            // which the test never let go of (#515).
+            failpoint("aof-fsync-before-reply");
             sync_before_reply(&file);
             AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
         }
@@ -1763,7 +1769,6 @@ fn sync_for_replies() {
 /// new log whose name may not be. A sync that fails ends the server, as in
 /// Redis: it can neither reply nor keep the promise.
 fn sync_before_reply(file: &std::fs::File) {
-    failpoint("aof-fsync-before-reply");
     let synced = (|| {
         if OLD_LOG_UNSYNCED.load(Ordering::Acquire) != 0 {
             sync_old_log()?;
@@ -2960,6 +2965,12 @@ fn classify_tail(rest: &[u8]) -> Tail {
 /// KiviDB.
 pub(crate) fn fatal_persistence(what: &str) -> ! {
     log_fatal!("{what}");
+    // Keys outside database 0 of a cluster node: the file is fine, the
+    // node cannot serve them (#484).
+    if what.contains(crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0) {
+        log_fatal!("{}.", crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+        std::process::exit(1);
+    }
     log_fatal!(
         "Refusing to start with an empty dataset in place of one that could not be \
          loaded. Fix the file (or its permissions), or move it out of the working directory \
@@ -3587,9 +3598,10 @@ pub fn recover_local(
                     repl_state,
                     dump_loaded,
                 );
-                if recovery.index_names.is_empty() {
-                    recovery.index_names = names;
-                }
+                // Every index there is now, not the snapshot's alone: one
+                // created since the dump is in the log, and its documents
+                // are indexed by the walk after this as well.
+                recovery.index_names = names;
                 // Delta writes are not in the snapshot's HNSW graph: the
                 // backfill after this brings it up to date with the keys.
                 if dump_loaded {
@@ -3733,7 +3745,7 @@ fn preload(
         }
         // An index created during the backup window is in the replayed
         // commands, not in the base snapshot.
-        index_names = index_store.read().keys().cloned().collect();
+        index_names = crate::vector::index_names(index_store);
     }
     Ok(index_names)
 }
@@ -3841,7 +3853,7 @@ pub fn recover_from_aof(
         Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be loaded: {e}")),
     }
 
-    index_store.read().keys().cloned().collect()
+    crate::vector::index_names(index_store)
 }
 
 // ── Test hooks ───────────────────────────────────────────────────────────────
@@ -3905,6 +3917,12 @@ fn failpoint_named(name: &str) -> bool {
 /// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
 /// [`failpoint`] is: whether it is to fail.
 fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// What a node did before, that a test has it do again, named in
+/// `KIVIDB_TEST_FAILPOINTS` as a [`failpoint`] is: whether it is to.
+pub(crate) fn test_behaves_as_before(name: &str) -> bool {
     failpoint_named(name)
 }
 

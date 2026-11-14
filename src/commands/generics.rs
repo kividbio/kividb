@@ -879,6 +879,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 match opt.as_str() {
                     "DB" => {
                         i += 1;
+                        // A cluster node has database 0 alone (#484): any
+                        // other is out of range, as in Redis 8, where it is
+                        // the one database a cluster node has.
+                        if ctx.cluster.enabled
+                            && parse_utf8(cmd.get(i).copied().unwrap_or(b""))
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .is_some_and(|n| n != 0)
+                        {
+                            return Some(resp_error("ERR DB index is out of range"));
+                        }
                         dst_db = match parse_utf8(cmd.get(i).copied().unwrap_or(b""))
                             .and_then(|s| s.parse().ok())
                         {
@@ -1009,6 +1019,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'move' command",
                 ));
             }
+            // A cluster node has database 0 alone: a key moved to another
+            // would be out of every client's reach, and would stop the node
+            // from starting again (#484). A test has it moved as before, to
+            // give a replica a master holding keys there.
+            if ctx.cluster.enabled && !crate::aof::test_behaves_as_before("cluster-move") {
+                return Some(resp_error("ERR MOVE is not allowed in cluster mode"));
+            }
             let key: Vec<u8> = cmd[1].to_vec();
             let target_db: usize = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
@@ -1063,6 +1080,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'swapdb' command",
                 ));
             }
+            // As `MOVE`: it would put the dataset in a database a cluster
+            // node does not serve (#484).
+            if ctx.cluster.enabled {
+                return Some(resp_error("ERR SWAPDB is not allowed in cluster mode"));
+            }
             let db1: usize = match parse_utf8(cmd[1]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR invalid DB index")),
@@ -1095,11 +1117,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "RANDOMKEY" => {
-            // A key picked at random: from a shard picked at random, and,
-            // if that one is empty, from the ones after it. A key whose
-            // time has run out is not a key: it is removed, and another
-            // picked, for as long as it takes, as in Redis (#566): each
-            // pick that removes one leaves one fewer to pick.
+            // A key picked at random: from a shard picked at random in
+            // proportion to its keys, so that every key is as likely as any
+            // other (in cluster mode one busy hash tag fills one shard, and
+            // picked evenly its keys came up far less often than the rest,
+            // #294), and, if that one is empty by now, from the ones after
+            // it. A key whose time has run out is not a key: it is removed,
+            // and another picked, for as long as it takes, as in Redis
+            // (#566): each pick that removes one leaves one fewer to pick.
             //
             // An expired key that stays (on a replica, while writes are
             // paused, or while loading) could be picked again and again:
@@ -1119,7 +1144,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             let mut kept_expired = 0;
             loop {
-                let start = rand::random::<usize>() % shards.max(1);
+                let mut weights = Vec::with_capacity(shards);
+                crate::store::shard_weights(&ctx.store[db], false, &mut weights);
+                let start = crate::store::pick_weighted(&weights, rand::random::<usize>())
+                    .unwrap_or_else(|| rand::random::<usize>() % shards.max(1));
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
                     map.random_entry(rand::random::<usize>)

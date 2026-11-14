@@ -47,6 +47,7 @@ pub mod script_clock;
 pub mod server;
 pub mod shared_bytes;
 pub mod shutdown;
+pub mod sketch;
 pub mod slowlog;
 pub mod snapshot;
 pub mod stats;
@@ -122,6 +123,11 @@ async fn server_tokio(
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
+    // Never `store::shard_by_slot()` here, even with `cluster_enabled`: the
+    // switch is the whole process's, and the in-process servers of one test
+    // binary would place keys differently from each other's, and change
+    // under servers already holding keys. Cluster tests spawn the binary,
+    // whose `main` sets it (#294).
     let store = store::new_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));

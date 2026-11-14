@@ -626,6 +626,17 @@ impl ReplState {
         }
     }
 
+    /// [`note_local_write`](Self::note_local_write) for the command `name`
+    /// a client sent, which is propagated: not for a `SELECT` or a `SCRIPT`,
+    /// which change no data (`writes_the_dataset`). Looked at only when
+    /// there is a point to lose.
+    #[inline]
+    pub fn note_local_write_of(&self, name: &str) {
+        if self.has_resync_point.load(Ordering::Relaxed) && !matches!(name, "SELECT" | "SCRIPT") {
+            self.set_resync_point(None);
+        }
+    }
+
     /// The replica's row for `replica_id`, if it is registered.
     pub fn replica(&self, replica_id: u64) -> Option<Arc<ReplicaProgress>> {
         self.replica_progress.lock().get(&replica_id).cloned()
@@ -4042,6 +4053,7 @@ pub fn is_write_command(name: &str) -> bool {
         6 => matches!(
             name,
             "APPEND"
+                | "BF.ADD"
                 | "ARMSET"
                 | "ARRING"
                 | "ARSEEK"
@@ -4078,7 +4090,8 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         7 => matches!(
             name,
-            "FLUSHDB"
+            "BF.MADD"
+                | "FLUSHDB"
                 | "HEXPIRE"
                 | "HGETDEL"
                 | "HINCRBY"
@@ -4117,7 +4130,8 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         9 => matches!(
             name,
-            "FT.CREATE"
+            "BF.INSERT"
+                | "FT.CREATE"
                 | "HEXPIREAT"
                 | "JSON.MSET"
                 | "PEXPIREAT"
@@ -4129,6 +4143,7 @@ pub fn is_write_command(name: &str) -> bool {
         10 => matches!(
             name,
             "ARDELRANGE"
+                | "BF.RESERVE"
                 | "BRPOPLPUSH"
                 | "FT.DICTADD"
                 | "FT.DICTDEL"
@@ -4158,7 +4173,7 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         12 => matches!(
             name,
-            "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
+            "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
         13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
         14 => matches!(
@@ -4191,6 +4206,11 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "ARRING",
     "ARSEEK",
     "ARSET",
+    "BF.ADD",
+    "BF.INSERT",
+    "BF.LOADCHUNK",
+    "BF.MADD",
+    "BF.RESERVE",
     "BITFIELD",
     "BITOP",
     "BLMOVE",
@@ -4348,6 +4368,8 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
 fn is_write_command_reference(name: &str) -> bool {
     matches!(
         name,
+        // Bloom filters
+        "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |
@@ -4591,16 +4613,12 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         "MIGRATE" => true,
         // Only HIMPORT SET writes; PREPARE / DISCARD are session state.
         "HIMPORT" => crate::commands::hash_import::is_write(cmd),
-        "SCRIPT" if cmd.len() >= 2 => {
-            let sub = cmd[1];
-            matches!(
-                std::str::from_utf8(sub)
-                    .ok()
-                    .map(|s| s.to_ascii_uppercase())
-                    .as_deref(),
-                Some("LOAD") | Some("FLUSH") | Some("RESET")
-            )
-        }
+        // The script cache is not the dataset, and a replica's is its own:
+        // clients load their scripts on a replica before they run them there
+        // by their SHA. Redis runs `SCRIPT LOAD` and `SCRIPT FLUSH` on a
+        // read-only replica (they are not flagged writes), and so does
+        // KiviDB now (#527). `FUNCTION LOAD` and the rest are writes there.
+        "SCRIPT" => false,
         "FUNCTION" if cmd.len() >= 2 => {
             matches!(
                 std::str::from_utf8(cmd[1])
@@ -4702,6 +4720,17 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
 /// them without good replicas.
 #[inline]
 pub fn refused_without_replicas(name: &str, cmd: &[&[u8]]) -> bool {
+    writes_the_dataset(name, cmd)
+}
+
+/// Whether a command changes the dataset: one that is propagated
+/// ([`command_mutates_for_replication`]) other than `SELECT`, which changes
+/// the connection's database, and `SCRIPT`, which changes the script cache.
+/// Neither is flagged a write in Redis. What a script has written, and
+/// whether a node's dataset is still a position in its master's stream, go
+/// by this (#424).
+#[inline]
+pub fn writes_the_dataset(name: &str, cmd: &[&[u8]]) -> bool {
     !matches!(name, "SELECT" | "SCRIPT") && command_mutates_for_replication(name, cmd)
 }
 
@@ -4710,6 +4739,9 @@ pub fn refused_without_replicas(name: &str, cmd: &[&[u8]]) -> bool {
 pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bool {
     match name {
         "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO" => true,
+        // Changes the script's database, not the dataset: a read-only script
+        // may, as in Redis (#424).
+        "SELECT" => false,
         // Not writes to the dataset, but to the replication stream — or,
         // `PFCOUNT`, possibly to its key: not what a script that has said it
         // writes nothing may do.

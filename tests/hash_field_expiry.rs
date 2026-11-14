@@ -889,3 +889,538 @@ fn writes_after_field_deadlines_come_back_after_a_rewrite_and_a_kill() {
     let mut c = server.conn();
     assert_eq!(snapshot_of(&mut c, &keys), before);
 }
+
+// ── Search over fields past their deadline, not yet removed ──────────────────
+//
+// A field past its deadline that has not been removed yet (the master's
+// sweep paused, or a replica waiting for the master's HDEL) is hidden from
+// HGET. A query leaves it out the same way, and removes nothing.
+
+fn ft_create(c: &mut Conn, spec: &str) {
+    let mut args = vec!["FT.CREATE"];
+    args.extend(spec.split_whitespace());
+    assert_eq!(c.cmd(&args).s(), "OK", "FT.CREATE {spec}");
+}
+
+fn search_hits(c: &mut Conn, index: &str, query: &str) -> i64 {
+    c.cmd(&["FT.SEARCH", index, query, "NOCONTENT"]).arr()[0].i()
+}
+
+fn shows(reply: &V, field: &str) -> bool {
+    let field = V::Str(field.into());
+    reply.arr()[1..]
+        .iter()
+        .any(|v| matches!(v, V::Arr(a) if a.contains(&field)))
+}
+
+const DOCS: &str = "idx ON HASH PREFIX 1 d: SCHEMA n NUMERIC SORTABLE t TAG o NUMERIC";
+
+/// Paused expiry, and `d:1` whose `n` and `t` are due and still stored. No
+/// hash command reads `d:1` afterwards: on a master it would remove them.
+fn master_with_due_indexed_fields(extra: &[&str]) -> (Server, Conn) {
+    let master = Server::start(extra);
+    let mut m = master.conn();
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    ft_create(&mut m, DOCS);
+    m.cmd(&["HSET", "d:1", "n", "7", "t", "red", "o", "1"]);
+    m.cmd(&["HPEXPIRE", "d:1", "50", "FIELDS", "2", "n", "t"]);
+    std::thread::sleep(Duration::from_millis(300));
+    (master, m)
+}
+
+#[test]
+fn ft_queries_leave_out_a_due_field_on_a_master() {
+    let (_master, mut m) = master_with_due_indexed_fields(&[]);
+    assert_eq!(search_hits(&mut m, "idx", "@n:[0 10]"), 0, "numeric");
+    assert_eq!(search_hits(&mut m, "idx", "@t:{red}"), 0, "tag");
+    assert_eq!(search_hits(&mut m, "idx", "@o:[0 5]"), 1, "a live field");
+    let found = m.cmd(&["FT.SEARCH", "idx", "@o:[0 5]", "RETURN", "1", "n"]);
+    assert!(!shows(&found, "n"), "RETURN: {found:?}");
+    let rows = m.cmd(&["FT.AGGREGATE", "idx", "@o:[0 5]", "LOAD", "1", "@n"]);
+    assert!(!shows(&rows, "n"), "LOAD: {rows:?}");
+    ft_create(&mut m, "idx2 ON HASH PREFIX 1 d: SCHEMA n NUMERIC");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(search_hits(&mut m, "idx2", "@n:[0 10]"), 0, "backfill");
+    assert_eq!(m.cmd(&["FT.DEBUG", "POSTINGS", "idx", "OFF"]).s(), "OK");
+    assert_eq!(search_hits(&mut m, "idx", "@n:[0 10]"), 0, "scan");
+}
+
+/// Control: the hash read removes the fields, and the index follows.
+#[test]
+fn hash_reads_hide_a_due_field_on_a_master_with_expiry_paused() {
+    let (_master, mut m) = master_with_due_indexed_fields(&[]);
+    assert_eq!(m.cmd(&["HGET", "d:1", "n"]), V::Nil);
+    assert_eq!(
+        search_hits(&mut m, "idx", "@n:[0 10]"),
+        0,
+        "after a hash read"
+    );
+}
+
+/// Queries remove nothing and log nothing: the removal stays the master's,
+/// and reaches the AOF as an HDEL when a hash read makes it.
+#[test]
+fn ft_queries_leave_a_due_field_for_the_master_to_remove() {
+    let (server, mut m) = master_with_due_indexed_fields(&["--aof"]);
+    m.cmd(&["CONFIG", "SET", "appendfsync", "always"]);
+    for _ in 0..3 {
+        assert_eq!(search_hits(&mut m, "idx", "@n:[0 10]"), 0);
+        m.cmd(&["FT.SEARCH", "idx", "@o:[0 5]", "RETURN", "1", "n"]);
+        m.cmd(&["FT.AGGREGATE", "idx", "@o:[0 5]", "LOAD", "1", "@n"]);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        count(&server.aof(), b"HDEL"),
+        0,
+        "a query removed the field"
+    );
+    assert_eq!(m.cmd(&["HGET", "d:1", "n"]), V::Nil);
+    wait_until("the read's HDEL to reach the AOF", 10, || {
+        count(&server.aof(), b"HDEL") == 1
+    });
+}
+
+/// Twenty documents, `d:0` every field due and `d:1` only `n`.
+fn twenty_docs_one_wholly_due(m: &mut Conn) {
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    ft_create(m, DOCS);
+    for i in 0..20 {
+        m.cmd(&["HSET", &format!("d:{i}"), "n", "1", "t", "a", "o", "1"]);
+    }
+    m.cmd(&["HPEXPIRE", "d:0", "50", "FIELDS", "3", "n", "t", "o"]);
+    m.cmd(&["HPEXPIRE", "d:1", "50", "FIELDS", "1", "n"]);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// The keys `query` finds: FT.SEARCH's total and keys, with and without
+/// content, FT.AGGREGATE's keys, and its count.
+fn found_by(c: &mut Conn, query: &str) -> (i64, Vec<String>, Vec<String>, Vec<String>, String) {
+    let bare = c.cmd(&["FT.SEARCH", "idx", query, "NOCONTENT", "LIMIT", "0", "100"]);
+    let bare_keys = bare.arr()[1..].iter().map(|k| k.s().to_string()).collect();
+    let full = c.cmd(&["FT.SEARCH", "idx", query, "LIMIT", "0", "100"]);
+    let full_keys = full.arr()[1..]
+        .iter()
+        .step_by(2)
+        .map(|k| k.s().to_string())
+        .collect();
+    let rows = c.cmd(&[
+        "FT.AGGREGATE",
+        "idx",
+        query,
+        "LOAD",
+        "1",
+        "@__key",
+        "LIMIT",
+        "0",
+        "100",
+    ]);
+    let agg_keys = rows.arr()[1..]
+        .iter()
+        .filter_map(|row| {
+            row.arr()
+                .chunks(2)
+                .find(|kv| kv[0].s() == "__key")
+                .map(|kv| kv[1].s().to_string())
+        })
+        .collect();
+    let count = c.cmd(&[
+        "FT.AGGREGATE",
+        "idx",
+        query,
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "c",
+    ]);
+    let count = count.arr()[1].arr()[1].s().to_string();
+    (bare.arr()[0].i(), bare_keys, full_keys, agg_keys, count)
+}
+
+fn assert_wholly_due_left_out(c: &mut Conn, what: &str) {
+    let d0 = "d:0".to_string();
+    for query in ["*", "@o:[0 5]"] {
+        let (total, bare, full, agg, count) = found_by(c, query);
+        assert_eq!(total, 19, "{what} {query}: FT.SEARCH total");
+        assert_eq!(count, "19", "{what} {query}: FT.AGGREGATE count");
+        for keys in [&bare, &full, &agg] {
+            assert_eq!(keys.len(), 19, "{what} {query}: {keys:?}");
+            assert!(!keys.contains(&d0), "{what} {query}: d:0 in {keys:?}");
+            assert!(
+                keys.contains(&"d:1".to_string()),
+                "{what} {query}: partly due d:1"
+            );
+        }
+    }
+    // d:1: its live `t` still matches, its due `n` does not.
+    let (_, tagged, ..) = found_by(c, "@t:{a}");
+    assert!(
+        tagged.contains(&"d:1".to_string()) && !tagged.contains(&d0),
+        "{what}: {tagged:?}"
+    );
+    let (_, numbered, ..) = found_by(c, "@n:[0 5]");
+    assert_eq!(numbered.len(), 18, "{what}: {numbered:?}");
+    assert!(
+        !numbered.contains(&"d:1".to_string()) && !numbered.contains(&d0),
+        "{what}"
+    );
+}
+
+/// A hash whose fields are all due is no document, as HGETALL shows it as
+/// empty: `*` neither finds nor counts it. One with a field still live is.
+#[test]
+fn ft_queries_leave_out_a_hash_whose_fields_are_all_due() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    twenty_docs_one_wholly_due(&mut m);
+    assert_wholly_due_left_out(&mut m, "postings");
+    assert_eq!(m.cmd(&["FT.DEBUG", "POSTINGS", "idx", "OFF"]).s(), "OK");
+    assert_wholly_due_left_out(&mut m, "scan");
+    assert_eq!(m.cmd(&["DBSIZE"]).i(), 20, "a query removed a key");
+    assert_eq!(m.cmd(&["HGETALL", "d:0"]).arr().len(), 0);
+    assert_wholly_due_left_out(&mut m, "after HGETALL");
+}
+
+#[test]
+fn ft_queries_on_a_replica_leave_out_a_hash_whose_fields_are_all_due() {
+    let master = Server::start(&[]);
+    let (replica, _proxy) = replica_behind(&master, Duration::ZERO);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    twenty_docs_one_wholly_due(&mut m);
+    wait_caught_up(&mut m, &mut r);
+    assert_wholly_due_left_out(&mut r, "replica");
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 20, "the replica removed a key");
+}
+
+/// With the sweep running: just past the deadline and after the sweep.
+#[test]
+fn ft_search_does_not_match_a_due_field_on_a_master_with_expiry_running() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    ft_create(&mut m, DOCS);
+    for i in 0..20 {
+        let key = format!("d:{i}");
+        m.cmd(&["HSET", &key, "n", "7", "o", "1"]);
+        m.cmd(&["HPEXPIRE", &key, "50", "FIELDS", "1", "n"]);
+    }
+    std::thread::sleep(Duration::from_millis(55));
+    assert_eq!(
+        search_hits(&mut m, "idx", "@n:[0 10]"),
+        0,
+        "before the sweep"
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        search_hits(&mut m, "idx", "@n:[0 10]"),
+        0,
+        "after the sweep"
+    );
+    assert_eq!(search_hits(&mut m, "idx", "@o:[0 5]"), 20);
+}
+
+/// A replica waiting for the master's HDEL hides the field from queries as
+/// from HGET, and agrees with the master once the HDEL arrives.
+#[test]
+fn ft_queries_on_a_replica_leave_out_a_due_field_until_the_hdel() {
+    let master = Server::start(&[]);
+    let (replica, _proxy) = replica_behind(&master, Duration::ZERO);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    ft_create(&mut m, DOCS);
+    m.cmd(&["HSET", "d:1", "n", "7", "o", "1"]);
+    m.cmd(&["HPEXPIRE", "d:1", "50", "FIELDS", "1", "n"]);
+    wait_caught_up(&mut m, &mut r);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(r.cmd(&["HGET", "d:1", "n"]), V::Nil);
+    assert_eq!(
+        search_hits(&mut r, "idx", "@n:[0 10]"),
+        0,
+        "hidden on the replica"
+    );
+    assert_eq!(search_hits(&mut r, "idx", "@o:[0 5]"), 1);
+    let found = r.cmd(&["FT.SEARCH", "idx", "@o:[0 5]", "RETURN", "1", "n"]);
+    assert!(!shows(&found, "n"), "RETURN on the replica: {found:?}");
+    assert_eq!(
+        r.cmd(&["HLEN", "d:1"]).i(),
+        1,
+        "the replica removed nothing"
+    );
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
+    wait_until("the replica to apply the HDEL", 10, || {
+        r.cmd(&["HLEN", "d:1"]).i() == 1 && m.cmd(&["HLEN", "d:1"]).i() == 1
+    });
+    wait_caught_up(&mut m, &mut r);
+    for c in [&mut m, &mut r] {
+        assert_eq!(search_hits(c, "idx", "@n:[0 10]"), 0);
+        assert_eq!(search_hits(c, "idx", "@o:[0 5]"), 1);
+    }
+}
+
+// ── Nearest neighbours and FT.HYBRID over fields past their deadline ─────────
+//
+// A vector index keeps a vector until the removal of its field reindexes the
+// hash. A query leaves a due vector out, and the answers are those the same
+// query gives once the field is gone.
+
+/// A command with binary arguments (vectors).
+fn cmd_bytes(c: &mut Conn, args: &[&[u8]]) -> V {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a);
+        buf.extend_from_slice(b"\r\n");
+    }
+    c.writer.write_all(&buf).unwrap();
+    c.read()
+}
+
+fn vec2(x: f32, y: f32) -> Vec<u8> {
+    [x.to_le_bytes(), y.to_le_bytes()].concat()
+}
+
+/// The keys of a KNN `query` on `index` around the origin, nearest first.
+fn knn(c: &mut Conn, index: &str, query: &str) -> Vec<String> {
+    let origin = vec2(0.0, 0.0);
+    let q: [&[u8]; 12] = [
+        b"FT.SEARCH",
+        index.as_bytes(),
+        query.as_bytes(),
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"NOCONTENT",
+        b"LIMIT",
+        b"0",
+        b"100",
+        b"DIALECT",
+    ];
+    let mut args = q.to_vec();
+    args.push(b"2");
+    cmd_bytes(c, &args).arr()[1..]
+        .iter()
+        .map(|k| k.s().to_string())
+        .collect()
+}
+
+/// `count` documents `<prefix><i>` at `(i, 0)`, red, with a word and the
+/// number `i`, in index `name` of `algo`. The vectors of the first `due`
+/// are past their deadline, and so are `<prefix>1`'s tag and number when
+/// `tag_too`. Stored still, or removed by the sweep when `active`.
+#[allow(clippy::too_many_arguments)]
+fn vectors(
+    c: &mut Conn,
+    name: &str,
+    algo: &str,
+    count: usize,
+    due: usize,
+    tag_too: bool,
+    active: bool,
+) {
+    let paused = if active { "1" } else { "0" };
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", paused]).s(), "OK");
+    ft_create(
+        c,
+        &format!(
+            "{name} ON HASH PREFIX 1 {name}: SCHEMA vec VECTOR {algo} 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2 t TAG n NUMERIC body TEXT"
+        ),
+    );
+    for i in 0..count {
+        let (key, n) = (format!("{name}:{i}"), i.to_string());
+        let v = vec2(i as f32, 0.0);
+        let hset: [&[u8]; 10] = [
+            b"HSET",
+            key.as_bytes(),
+            b"vec",
+            &v,
+            b"t",
+            b"red",
+            b"n",
+            n.as_bytes(),
+            b"body",
+            b"hello",
+        ];
+        cmd_bytes(c, &hset);
+    }
+    for i in 0..due {
+        c.cmd(&[
+            "HPEXPIRE",
+            &format!("{name}:{i}"),
+            "50",
+            "FIELDS",
+            "1",
+            "vec",
+        ]);
+    }
+    if tag_too {
+        c.cmd(&[
+            "HPEXPIRE",
+            &format!("{name}:1"),
+            "50",
+            "FIELDS",
+            "2",
+            "t",
+            "n",
+        ]);
+    }
+    std::thread::sleep(Duration::from_millis(400));
+}
+
+fn keys(name: &str, range: std::ops::Range<usize>) -> Vec<String> {
+    range.map(|i| format!("{name}:{i}")).collect()
+}
+
+const KNN_QUERIES: [&str; 4] = [
+    "*=>[KNN 2 @vec $q]",
+    "(@t:{red})=>[KNN 2 @vec $q]",
+    "(@n:[0 10])=>[KNN 2 @vec $q]",
+    "@vec:[VECTOR_RANGE 1.5 $q]",
+];
+
+#[test]
+fn ft_knn_leaves_out_a_due_vector_as_its_removal_would() {
+    for algo in ["FLAT", "HNSW"] {
+        let removed = Server::start(&[]);
+        let mut r = removed.conn();
+        vectors(&mut r, "v", algo, 4, 1, true, true);
+        wait_until("the sweep to remove the fields", 10, || {
+            r.cmd(&["HLEN", "v:0"]).i() == 3 && r.cmd(&["HLEN", "v:1"]).i() == 2
+        });
+        let want: Vec<_> = KNN_QUERIES.iter().map(|q| knn(&mut r, "v", q)).collect();
+        assert_eq!(want[0], ["v:1", "v:2"], "{algo}: after removal");
+
+        let paused = Server::start(&[]);
+        let mut p = paused.conn();
+        vectors(&mut p, "v", algo, 4, 1, true, false);
+        let got: Vec<_> = KNN_QUERIES.iter().map(|q| knn(&mut p, "v", q)).collect();
+        assert_eq!(got, want, "{algo}: due and still stored");
+    }
+}
+
+#[test]
+fn ft_knn_on_a_replica_leaves_out_a_due_vector() {
+    let master = Server::start(&[]);
+    let (replica, _proxy) = replica_behind(&master, Duration::ZERO);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    vectors(&mut m, "v", "HNSW", 4, 1, true, false);
+    wait_caught_up(&mut m, &mut r);
+    assert_eq!(knn(&mut r, "v", KNN_QUERIES[0]), ["v:1", "v:2"]);
+    assert_eq!(knn(&mut r, "v", KNN_QUERIES[1]), ["v:2", "v:3"]);
+}
+
+/// The hundred nearest vectors due: the search asks for more until it has
+/// `k` it may show, from a 3,000-node graph as from a FLAT index,
+/// unfiltered, filtered by postings and filtered by a scan.
+#[test]
+fn ft_knn_refills_past_many_due_nearest_vectors() {
+    for algo in ["FLAT", "HNSW"] {
+        let server = Server::start(&[]);
+        let mut c = server.conn();
+        vectors(&mut c, "e", algo, 3000, 100, false, false);
+        let want = keys("e", 100..110);
+        assert_eq!(knn(&mut c, "e", "*=>[KNN 10 @vec $q]"), want, "{algo}");
+        let filtered = "(@t:{red})=>[KNN 10 @vec $q]";
+        assert_eq!(knn(&mut c, "e", filtered), want, "{algo}: postings");
+        assert_eq!(c.cmd(&["FT.DEBUG", "POSTINGS", "e", "OFF"]).s(), "OK");
+        assert_eq!(knn(&mut c, "e", filtered), want, "{algo}: scan");
+    }
+}
+
+/// Every vector due: nothing to show, and the search ends. More asked for
+/// than there are to show: each of them once.
+#[test]
+fn ft_knn_with_few_or_no_vectors_to_show() {
+    for algo in ["FLAT", "HNSW"] {
+        let server = Server::start(&[]);
+        let mut c = server.conn();
+        vectors(&mut c, "a", algo, 5, 5, false, false);
+        vectors(&mut c, "s", algo, 5, 2, false, false);
+        for query in ["*=>[KNN 10 @vec $q]", "(@t:{red})=>[KNN 10 @vec $q]"] {
+            assert!(knn(&mut c, "a", query).is_empty(), "{algo} {query}");
+            assert_eq!(knn(&mut c, "s", query), keys("s", 2..5), "{algo} {query}");
+        }
+    }
+}
+
+/// Each result of an FT.HYBRID over index `v`, by key, with its fields.
+fn hybrid(c: &mut Conn, search: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let origin = vec2(0.0, 0.0);
+    let args: [&[u8]; 18] = [
+        b"FT.HYBRID",
+        b"v",
+        b"SEARCH",
+        search.as_bytes(),
+        b"VSIM",
+        b"@vec",
+        b"$q",
+        b"KNN",
+        b"2",
+        b"K",
+        b"3",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"LOAD",
+        b"2",
+        b"@t",
+    ];
+    let mut args = args.to_vec();
+    args.push(b"@n");
+    let reply = cmd_bytes(c, &args);
+    reply.arr()[1..]
+        .chunks(2)
+        .map(|pair| {
+            let fields = pair[1].arr().chunks(2);
+            let fields = fields.map(|kv| (kv[0].s().to_string(), kv[1].s().to_string()));
+            (pair[0].s().to_string(), fields.collect())
+        })
+        .collect()
+}
+
+fn field<'a>(row: &'a (String, Vec<(String, String)>), name: &str) -> Option<&'a str> {
+    row.1
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+#[test]
+fn ft_hybrid_leaves_out_due_numeric_tag_and_vector_fields() {
+    let removed = Server::start(&[]);
+    let mut r = removed.conn();
+    vectors(&mut r, "v", "HNSW", 4, 1, true, true);
+    wait_until("the sweep to remove the fields", 10, || {
+        r.cmd(&["HLEN", "v:0"]).i() == 3 && r.cmd(&["HLEN", "v:1"]).i() == 2
+    });
+    let paused = Server::start(&[]);
+    let mut p = paused.conn();
+    vectors(&mut p, "v", "HNSW", 4, 1, true, false);
+
+    for search in ["hello", "@t:{red}", "@n:[0 10]"] {
+        let (want, got) = (hybrid(&mut r, search), hybrid(&mut p, search));
+        // The vector side does not rank v:0, whose vector is due: on the
+        // word every document has, the nearest vector it ranks comes first.
+        if search == "hello" {
+            assert_eq!(got[0].0, "v:1", "{search}: {got:?}");
+        }
+        assert_eq!(got.len(), want.len(), "{search}");
+        for row in &got {
+            let other = want.iter().find(|w| w.0 == row.0).expect("same documents");
+            // LOAD and the text side see what is left after the removal.
+            assert_eq!(field(row, "n"), field(other, "n"), "{search} {}: n", row.0);
+            assert_eq!(field(row, "t"), field(other, "t"), "{search} {}: t", row.0);
+        }
+        let v1 = got.iter().find(|row| row.0 == "v:1").unwrap();
+        if search != "hello" {
+            assert_eq!(
+                field(v1, "text_score"),
+                Some("0.000000"),
+                "{search}: {v1:?}"
+            );
+        }
+    }
+}

@@ -46,8 +46,23 @@ mod imp {
     static REPLICATION_SET: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
+    /// How many times `SETTINGS` has been set: a connection kept open is
+    /// one made with the settings of the generation it was made in.
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn settings() -> Option<Arc<Settings>> {
         SETTINGS.read().clone()
+    }
+
+    fn set_settings(settings: Option<Settings>) {
+        let mut slot = SETTINGS.write();
+        *slot = settings.map(Arc::new);
+        GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Changes whenever TLS between nodes is set up again (#723).
+    pub fn generation() -> u64 {
+        GENERATION.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Checks the chain against the CA, and not the name: see the module.
@@ -119,7 +134,11 @@ mod imp {
             config.tls_replication || config.tls_cluster,
         )?;
         // The first server of the process sets it up.
-        SETTINGS.write().get_or_insert(Arc::new(built));
+        let mut slot = SETTINGS.write();
+        if slot.is_none() {
+            *slot = Some(Arc::new(built));
+            GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         Ok(())
     }
 
@@ -135,7 +154,7 @@ mod imp {
             return Ok(());
         };
         let built = build(files, now.cluster, now.replication)?;
-        *SETTINGS.write() = Some(Arc::new(built));
+        set_settings(Some(built));
         Ok(())
     }
 
@@ -146,10 +165,10 @@ mod imp {
     pub fn set_replication(on: bool, files: crate::tls::acceptor::Files) -> Result<(), String> {
         let cluster = cluster();
         if !on && !cluster {
-            *SETTINGS.write() = None;
+            set_settings(None);
         } else {
             let built = build(files, cluster, on || cluster)?;
-            *SETTINGS.write() = Some(Arc::new(built));
+            set_settings(Some(built));
         }
         REPLICATION_SET.store(on, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -255,9 +274,14 @@ mod imp {
 
 #[cfg(feature = "tls")]
 pub use imp::{
-    accept_bus, cluster, connect_async, connect_sync, files, init, reload, replication,
+    accept_bus, cluster, connect_async, connect_sync, files, generation, init, reload, replication,
     replication_set, set_replication,
 };
+
+#[cfg(not(feature = "tls"))]
+pub fn generation() -> u64 {
+    0
+}
 
 #[cfg(not(feature = "tls"))]
 pub fn init(config: &crate::config::Config) -> Result<(), String> {
@@ -315,8 +339,29 @@ pub fn connect_node(
     Ok((Box::new(tcp), handle))
 }
 
-pub trait ReadWrite: std::io::Read + std::io::Write + Send {}
-impl<T: std::io::Read + std::io::Write + Send> ReadWrite for T {}
+/// A blocking stream to another node: a plain socket, or TLS over one.
+pub trait ReadWrite: std::io::Read + std::io::Write + Send {
+    /// Whether bytes already taken off the socket wait in the stream itself
+    /// to be read: with TLS, plaintext rustls has decrypted, or records it
+    /// has received and not yet processed. Also when the peer has closed
+    /// the TLS session, or what it sent cannot be processed. A connection
+    /// kept for reuse must have none (`cluster::migrate_conns`).
+    fn holds_unread(&mut self) -> bool {
+        false
+    }
+}
+
+impl ReadWrite for std::net::TcpStream {}
+
+#[cfg(feature = "tls")]
+impl ReadWrite for imp::SyncTls {
+    fn holds_unread(&mut self) -> bool {
+        match self.conn.process_new_packets() {
+            Ok(state) => state.plaintext_bytes_to_read() > 0 || state.peer_has_closed(),
+            Err(_) => true,
+        }
+    }
+}
 
 /// An async stream to another node: the bus, or a replica's link.
 pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}

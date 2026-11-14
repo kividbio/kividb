@@ -54,28 +54,15 @@ impl StreamId {
     }
 }
 
+mod pel;
 mod stream_entries;
-pub use stream_entries::{EntryRef, StreamEntries};
+pub use pel::{Pel, PelEntry};
+pub use stream_entries::{EntryRef, LoadedEntries, StreamEntries};
 
 pub type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
-/// A single entry in a stream.
-#[derive(Debug, Clone)]
-pub struct StreamEntry {
-    /// Field-value pairs in insertion order.
-    /// Vec<(field, value)> preserves order, which Redis guarantees.
-    pub fields: FieldsType,
-}
 
 /// The name of a consumer group or of a consumer: any bytes, as in Redis.
 pub type StreamName = crate::key_bytes::KeyBytes;
-
-/// Pending Entry List entry — tracks unacknowledged messages per consumer.
-#[derive(Debug, Clone)]
-pub struct PelEntry {
-    pub consumer: StreamName,
-    pub delivered_at: u64, // unix ms
-    pub delivery_count: u64,
-}
 
 /// A consumer group.
 #[derive(Debug, Clone)]
@@ -86,8 +73,8 @@ pub struct ConsumerGroup {
     /// How many of the entries ever added to the stream this group has been
     /// delivered — or [`ConsumerGroup::NO_COUNT`] when that is not known.
     pub entries_read: u64,
-    /// Pending Entry List: id → PelEntry
-    pub pel: BTreeMap<StreamId, PelEntry>,
+    /// Pending Entry List, by ID and by consumer.
+    pub pel: Pel,
     /// Consumers: name → last-seen ms
     pub consumers: AHashMap<StreamName, u64>,
     /// Consumers that have been handed entries: name → when they last were,
@@ -258,7 +245,13 @@ impl SortedSetInner {
 
     /// Insert or update a member. Returns true if the member is new.
     /// This is the ONLY place both maps should be written — keeps the invariant.
+    ///
+    /// A score of -0 is kept as 0, as Redis keeps it in the listpack that
+    /// holds a sorted set of up to 128 members: `ZADD z -0 m` then
+    /// `ZSCORE z m` is `0` (#422).
     pub fn insert(&mut self, member: ZMember, score: f64) -> bool {
+        // -0 + 0 is 0; any other score is itself.
+        let score = score + 0.0;
         if let Some(&old_score) = self.members.get(&member) {
             // Member exists — remove old position in the score index first
             self.by_score
@@ -976,6 +969,29 @@ impl HashInner {
             .collect()
     }
 
+    /// The fields a reader is shown at `now`: those due left out, unless
+    /// this thread keeps them (`field_expiry::policy` is `Keep`). Nothing is
+    /// removed, and the fields are copied only when one is due.
+    #[inline]
+    pub fn shown(&self, now: FieldDeadline) -> std::borrow::Cow<'_, HashFields> {
+        if self.has_due(now) && !crate::field_expiry::due_fields_kept() {
+            std::borrow::Cow::Owned(self.live_fields(now))
+        } else {
+            std::borrow::Cow::Borrowed(&self.fields)
+        }
+    }
+
+    /// Whether [`Self::shown`] leaves `field` out at `now`.
+    #[inline]
+    pub fn hides(&self, field: &str, now: FieldDeadline) -> bool {
+        self.has_due(now)
+            && !crate::field_expiry::due_fields_kept()
+            && self
+                .expiries
+                .get(field)
+                .is_some_and(|at| field_due(*at, now))
+    }
+
     /// Remove a field's value AND its expiry entry. Returns the removed
     /// value if the field existed.
     pub fn evict_field(&mut self, field: &str) -> Option<std::sync::Arc<[u8]>> {
@@ -1385,6 +1401,8 @@ pub enum KiviDBValue {
     TimeSeries(Arc<RwLock<TsInner>>),
     HashEx(Arc<RwLock<HashInner>>),
     Array(Arc<RwLock<ArrayInner>>),
+    /// The probabilistic types (`BF.*`; see [`crate::sketch`]).
+    Sketch(Arc<RwLock<crate::sketch::Sketch>>),
 }
 
 impl KiviDBValue {
@@ -1417,6 +1435,11 @@ impl KiviDBValue {
                 })))
             }
             KiviDBValue::Array(array) => KiviDBValue::Array(fresh(array)),
+            // A filter of its own whose layers share their bytes with the
+            // original's until either is written to, which then copies the
+            // layer it writes, with memory asked for, not assumed: a copy of
+            // a large filter costs nothing here, and cannot abort.
+            KiviDBValue::Sketch(sketch) => KiviDBValue::Sketch(fresh(sketch)),
         }
     }
 
@@ -1436,7 +1459,8 @@ impl KiviDBValue {
             | KiviDBValue::Json(_)
             | KiviDBValue::Stream(_)
             | KiviDBValue::TimeSeries(_)
-            | KiviDBValue::Array(_) => false,
+            | KiviDBValue::Array(_)
+            | KiviDBValue::Sketch(_) => false,
         }
     }
 
@@ -1456,6 +1480,7 @@ impl KiviDBValue {
             (TimeSeries(a), TimeSeries(b)) => Arc::ptr_eq(a, b),
             (HashEx(a), HashEx(b)) => Arc::ptr_eq(a, b),
             (Array(a), Array(b)) => Arc::ptr_eq(a, b),
+            (Sketch(a), Sketch(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -1473,6 +1498,7 @@ impl KiviDBValue {
             KiviDBValue::TimeSeries(_) => "TSDB-TYPE",
             KiviDBValue::HashEx(_) => "hash",
             KiviDBValue::Array(_) => "array",
+            KiviDBValue::Sketch(sketch) => sketch.read().type_name(),
         }
     }
 }

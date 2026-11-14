@@ -18,8 +18,7 @@
 use ahash::AHashMap;
 use kividb::snapshot::{load_redis_rdb, load_snapshot, write_snapshot};
 use kividb::types::{
-    KiviDBValue, SortedSetInner, StreamEntry, StreamId, StreamInner, TsInner, VSetEntry,
-    VectorSetInner,
+    KiviDBValue, SortedSetInner, StreamId, StreamInner, TsInner, VSetEntry, VectorSetInner,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
@@ -393,24 +392,20 @@ fn kdb_stream_basic() {
     stream.last_id = StreamId::new(1000, 5);
     stream.entries.push_tail(
         StreamId::new(1000, 1),
-        StreamEntry {
-            fields: vec![
-                (
-                    Arc::from(b"name".as_slice()),
-                    Arc::from(b"alice".as_slice()),
-                ),
-                (
-                    Arc::from(b"action".as_slice()),
-                    Arc::from(b"login".as_slice()),
-                ),
-            ],
-        },
+        &[
+            (
+                Arc::from(b"name".as_slice()),
+                Arc::from(b"alice".as_slice()),
+            ),
+            (
+                Arc::from(b"action".as_slice()),
+                Arc::from(b"login".as_slice()),
+            ),
+        ],
     );
     stream.entries.push_tail(
         StreamId::new(1000, 2),
-        StreamEntry {
-            fields: vec![(Arc::from(b"name".as_slice()), Arc::from(b"bob".as_slice()))],
-        },
+        &[(Arc::from(b"name".as_slice()), Arc::from(b"bob".as_slice()))],
     );
 
     let v = roundtrip_one("stream", KiviDBValue::Stream(Arc::new(RwLock::new(stream))));
@@ -449,14 +444,12 @@ fn kdb_stream_entry_order() {
     let mut stream = StreamInner::new();
     stream.last_id = StreamId::new(9999, 0);
     for seq in [5u64, 1, 3, 2, 4] {
-        stream.entries.insert_loaded(
+        stream.entries.push_tail(
             StreamId::new(1000, seq),
-            StreamEntry {
-                fields: vec![(
-                    Arc::from(b"seq".as_slice()),
-                    Arc::from(seq.to_string().as_bytes()),
-                )],
-            },
+            &[(
+                Arc::from(b"seq".as_slice()),
+                Arc::from(seq.to_string().as_bytes()),
+            )],
         );
     }
 
@@ -476,7 +469,7 @@ fn kdb_stream_entry_order() {
 
 #[test]
 fn kdb_stream_consumer_groups_and_meta() {
-    use kividb::types::{ConsumerGroup, PelEntry};
+    use kividb::types::{ConsumerGroup, Pel};
 
     let mut stream = StreamInner::new();
     stream.last_id = StreamId::new(1000, 2);
@@ -485,25 +478,14 @@ fn kdb_stream_consumer_groups_and_meta() {
     stream.max_entries = Some(100);
     stream.entries.push_tail(
         StreamId::new(1000, 1),
-        StreamEntry {
-            fields: vec![(Arc::from(b"f".as_slice()), Arc::from(b"v0".as_slice()))],
-        },
+        &[(Arc::from(b"f".as_slice()), Arc::from(b"v0".as_slice()))],
     );
     stream.entries.push_tail(
         StreamId::new(1000, 2),
-        StreamEntry {
-            fields: vec![(Arc::from(b"f".as_slice()), Arc::from(b"v1".as_slice()))],
-        },
+        &[(Arc::from(b"f".as_slice()), Arc::from(b"v1".as_slice()))],
     );
-    let mut pel = std::collections::BTreeMap::new();
-    pel.insert(
-        StreamId::new(1000, 1),
-        PelEntry {
-            consumer: "c1".into(),
-            delivered_at: 1_700_000_000_000,
-            delivery_count: 2,
-        },
-    );
+    let mut pel = Pel::new();
+    pel.insert(StreamId::new(1000, 1), b"c1", 1_700_000_000_000, 2);
     let mut consumers = AHashMap::new();
     consumers.insert("c1".into(), 1_700_000_000_100);
     stream.groups.insert(
@@ -532,7 +514,9 @@ fn kdb_stream_consumer_groups_and_meta() {
             assert_eq!(g.entries_read, 1);
             assert_eq!(g.pel.len(), 1);
             let pel = g.pel.get(&StreamId::new(1000, 1)).unwrap();
-            assert_eq!(pel.consumer, "c1");
+            assert_eq!(*pel.consumer(), "c1");
+            assert_eq!(g.pel.consumer_len(b"c1"), 1);
+            g.pel.check().unwrap();
             assert_eq!(pel.delivery_count, 2);
             assert_eq!(g.consumers.get(&b"c1"[..]), Some(&1_700_000_000_100));
         }
@@ -1129,9 +1113,7 @@ fn kdb_all_types_together() {
     stream.last_id = StreamId::new(1, 0);
     stream.entries.push_tail(
         StreamId::new(1, 0),
-        StreamEntry {
-            fields: vec![(Arc::from(b"k".as_slice()), Arc::from(b"v".as_slice()))],
-        },
+        &[(Arc::from(b"k".as_slice()), Arc::from(b"v".as_slice()))],
     );
     map.insert(
         "stream".to_string(),
@@ -1905,7 +1887,9 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
     assert_eq!((first.ms, first.seq), (1, 1));
     let group = &st.groups[&b"g"[..]];
     assert_eq!(group.pel.len(), 1);
-    assert_eq!(group.pel.values().next().unwrap().consumer, "alice");
+    assert_eq!(*group.pel.values().next().unwrap().consumer(), "alice");
+    assert_eq!(group.pel.consumer_len(b"alice"), 1);
+    group.pel.check().unwrap();
     assert!(group.consumers.contains_key(&b"alice"[..]));
 
     let KiviDBValue::Stream(st2) = &db["st2"] else {

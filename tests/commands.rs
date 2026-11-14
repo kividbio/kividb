@@ -227,6 +227,38 @@ fn debug_refuses_unknown_subcommands() {
 }
 
 #[test]
+fn debug_sleep_argument_errors() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let error = |reply: RespValue| match reply {
+        RespValue::Error(e) => e,
+        other => panic!("not an error: {other:?}"),
+    };
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP", "abc"])),
+        "ERR value is not a valid float"
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP"])),
+        "ERR unknown subcommand or wrong number of arguments for 'SLEEP'. Try DEBUG HELP."
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "sleep"])),
+        "ERR unknown subcommand or wrong number of arguments for 'sleep'. Try DEBUG HELP."
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP", "0", "1"])),
+        "ERR unknown subcommand or wrong number of arguments for 'SLEEP'. Try DEBUG HELP."
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP", "-1"])),
+        "ERR value is out of range"
+    );
+    assert!(c.cmds(&["DEBUG", "SLEEP", "0"]).is_ok());
+}
+
+#[test]
 fn debug_object_describes_the_key() {
     let port = free_port();
     start_server(port);
@@ -1085,7 +1117,10 @@ fn test_command_list_filterby_module_built_in() {
     assert!(names(&mut c, "timeseries").contains(&"ts.add".to_string()));
     let vset = names(&mut c, "vectorset");
     assert!(vset.contains(&"vadd".to_string()) && vset.contains(&"vsim".to_string()));
-    assert!(names(&mut c, "bf").is_empty());
+    // Redis 8's `bf` module: the probabilistic types.
+    let bf = names(&mut c, "bf");
+    assert!(bf.contains(&"bf.add".to_string()), "{bf:?}");
+    assert!(bf.iter().all(|n| n.starts_with("bf.")), "{bf:?}");
 }
 
 // COMMAND LIST FILTERBY ACLCAT returns commands in that category.

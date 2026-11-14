@@ -182,6 +182,7 @@ pub fn commands_for_propagation(
         "INCREX" => effects_take(),
         "RESTORE" => restore_feed(ctx, cmd),
         "INCRBYFLOAT" => incrbyfloat_feed(cmd, resp),
+        "HINCRBYFLOAT" => hincrbyfloat_feed(cmd, resp),
         "XADD" => xadd_feed(cmd, resp),
         // A `~` trim is sent as what it removed; see `exact_trim_args`.
         "XTRIM" if cmd.get(3).is_some_and(|mark| *mark == b"~") => effects_take(),
@@ -202,6 +203,9 @@ pub fn commands_for_propagation(
         "MIGRATE" => Vec::new(),
         "LMOVEM" | "BLMOVEM" => lmovem_feed(name, cmd, resp),
         "TS.ADD" => ts_add_feed(cmd, resp),
+        // Sent naming the filter's parameters when it made the filter with
+        // a setting of this node's: see `commands::bf`.
+        "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.RESERVE" => crate::commands::bf::propagation(cmd),
         "TS.MADD" => ts_madd_feed(cmd, resp),
         "TS.INCRBY" | "TS.DECRBY" => ts_incrby_feed(cmd, resp),
         // The fieldset lives in the client's session, which no replica (and no
@@ -735,6 +739,28 @@ fn incrbyfloat_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     ]]
 }
 
+/// `HINCRBYFLOAT key field by` as the value it left, as Redis 8.10 sends
+/// it: `HSETEX key KEEPTTL FIELDS 1 field <value>`. Run again, the
+/// increment would be added twice (an AOF replayed over a snapshot that
+/// has it), and the field keeps whatever time to live it had.
+fn hincrbyfloat_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    if cmd.len() != 4 {
+        return Vec::new();
+    }
+    let Some((_, Some(val))) = parse_bulk(resp) else {
+        return Vec::new();
+    };
+    vec![vec![
+        b"HSETEX".to_vec(),
+        cmd[1].to_vec(),
+        b"KEEPTTL".to_vec(),
+        b"FIELDS".to_vec(),
+        b"1".to_vec(),
+        cmd[2].to_vec(),
+        val,
+    ]]
+}
+
 fn parse_bulk(resp: &[u8]) -> Option<(usize, Option<Vec<u8>>)> {
     if resp.first()? != &b'$' {
         return None;
@@ -1180,6 +1206,16 @@ mod tests {
             incrbyfloat_feed(&refs(&cmd(&["INCRBYFLOAT", "f", "1.5"])), b",2.5\r\n"),
             vec![cmd(&["SET", "f", "2.5", "KEEPTTL"])]
         );
+    }
+
+    #[test]
+    fn hincrbyfloat_is_sent_as_the_value_it_left() {
+        let owned = cmd(&["HINCRBYFLOAT", "h", "f", "1.5"]);
+        assert_eq!(
+            hincrbyfloat_feed(&refs(&owned), b"$3\r\n2.5\r\n"),
+            vec![cmd(&["HSETEX", "h", "KEEPTTL", "FIELDS", "1", "f", "2.5"])]
+        );
+        assert!(hincrbyfloat_feed(&refs(&owned), b"-ERR x\r\n").is_empty());
     }
 
     #[test]

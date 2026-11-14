@@ -6,7 +6,7 @@ use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{HashFields, HashInner, SortedSetInner, ZMember};
+use crate::types::{HashFields, HashInner, SortedSetInner, StreamInner, ZMember};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
@@ -185,22 +185,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::Stream(arc) => {
             let inner = arc.read();
-            let len = inner.entries.len();
-            let avg = if len == 0 {
-                0
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let total: usize = inner
-                    .entries
-                    .iter()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|(_, e)| e.fields().map(|(k, v)| k.len() + v.len()).sum::<usize>())
-                    .sum();
-                total / sample_n.max(1)
-            };
-            key_overhead + avg * len + 200
+            // Its entries are counted exactly: a few blocks of packed
+            // entries. Its groups are not counted.
+            entry() + layout::arc_of::<RwLock<StreamInner>>() + inner.entries.heap_bytes()
         }
 
         ValueRef::Json(arc) => {
@@ -253,6 +240,14 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             };
             // Per entry: 8-byte index key + value bytes + BTreeMap node share.
             key_overhead + len * (8 + avg + 32) + 100
+        }
+
+        // What it takes: its structures and its bytes, all of them.
+        ValueRef::Sketch(arc) => {
+            key_overhead
+                + 16
+                + std::mem::size_of::<parking_lot::RwLock<crate::sketch::Sketch>>()
+                + arc.read().memory_bytes()
         }
         ValueRef::HashEx(arc) => {
             let inner = arc.read();

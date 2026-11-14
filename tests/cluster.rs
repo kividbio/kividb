@@ -528,6 +528,235 @@ fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -
 
 // ── Formation and routing ─────────────────────────────────────────────────────
 
+/// A cluster node serves database 0 alone. Started on a dataset with keys
+/// in another, from a snapshot or from its AOF, it refuses to start, as
+/// Redis does. It used to load them where no client could reach them, and
+/// slot accounting and migration never saw them (#484). The refusal says
+/// how to recover, and leaves the data on disk as it was: started again
+/// without `cluster-enabled`, the node has every key, in both databases.
+#[test]
+fn a_cluster_node_refuses_to_start_with_keys_outside_database_0() {
+    for aof in [false, true] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let persistence: &[&str] = if aof {
+            &["--aof", "--appendfsync", "always"]
+        } else {
+            &[]
+        };
+        let start_plain = |port: u16| {
+            Command::new(env!("CARGO_BIN_EXE_kividb"))
+                .current_dir(&dir)
+                .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+                .args(persistence)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let port = cluster_port();
+        let mut plain = start_plain(port);
+        let mut c = Conn::connect(port);
+        assert!(c.cmd(&["SET", "in0", "v"]).is_ok());
+        assert!(c.cmd(&["SELECT", "1"]).is_ok());
+        assert!(c.cmd(&["SET", "in1", "v"]).is_ok());
+        if !aof {
+            assert!(c.cmd(&["SAVE"]).is_ok());
+        }
+        drop(c);
+        let _ = plain.kill();
+        let _ = plain.wait();
+
+        let log = dir.join("cluster.log");
+        let mut node = Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(&dir)
+            .args(["--bind", "127.0.0.1", "--port", &cluster_port().to_string()])
+            .args(["--cluster-enabled", "yes"])
+            .args(persistence)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = node.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = node.kill();
+                let _ = node.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "aof {aof}: the cluster node started on keys in database 1:\n{log}"
+        );
+        assert!(
+            log.contains("can't have keys in a DB different than DB 0 when in Cluster mode"),
+            "aof {aof}: {log}"
+        );
+        assert!(
+            log.contains("start this node once without cluster-enabled"),
+            "aof {aof}: the refusal does not say how to recover:\n{log}"
+        );
+
+        // Nothing was lost: without cluster-enabled, every key is back.
+        let port = cluster_port();
+        let mut plain = start_plain(port);
+        let mut c = Conn::connect(port);
+        wait_until(
+            "the plain server to load its data again",
+            Duration::from_secs(30),
+            || c.cmd(&["GET", "in0"]) == Resp::Bulk(b"v".to_vec()),
+        );
+        assert!(c.cmd(&["SELECT", "1"]).is_ok());
+        assert_eq!(
+            c.cmd(&["GET", "in1"]),
+            Resp::Bulk(b"v".to_vec()),
+            "aof {aof}: the key in database 1 was lost"
+        );
+        assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(1), "aof {aof}");
+        assert!(c.cmd(&["SELECT", "0"]).is_ok());
+        assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(1), "aof {aof}");
+        drop(c);
+        let _ = plain.kill();
+        let _ = plain.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A cluster node has database 0 alone, and nothing puts a key in another:
+/// `MOVE` and `SWAPDB` are refused, and `COPY ... DB n` to any database
+/// but 0 is out of range, with Redis 8.10.2's errors. They used to put keys
+/// where no client could reach them, and the node would then refuse to
+/// start (#484).
+#[test]
+fn move_swapdb_and_copy_to_another_database_are_refused_in_cluster_mode() {
+    let (nodes, _) = form_cluster(1);
+    let mut c = nodes[0].conn();
+    assert!(c.cmd(&["SET", "{k}a", "v"]).is_ok());
+    let refused = |c: &mut Conn, args: &[&str], error: &str| {
+        assert_eq!(c.cmd(args), Resp::Error(error.to_string()), "{args:?}");
+    };
+    for args in [
+        &["MOVE", "{k}a", "1"][..],
+        &["MOVE", "{k}a", "0"],
+        &["MOVE", "{k}missing", "1"],
+        &["MOVE", "{k}a", "x"],
+    ] {
+        refused(&mut c, args, "ERR MOVE is not allowed in cluster mode");
+    }
+    for args in [
+        &["SWAPDB", "0", "1"][..],
+        &["SWAPDB", "0", "0"],
+        &["SWAPDB", "x", "1"],
+    ] {
+        refused(&mut c, args, "ERR SWAPDB is not allowed in cluster mode");
+    }
+    for args in [
+        &["COPY", "{k}a", "{k}b", "DB", "1"][..],
+        &["COPY", "{k}a", "{k}b", "DB", "15", "REPLACE"],
+        &["COPY", "{k}a", "{k}b", "DB", "99"],
+        &["COPY", "{k}a", "{k}b", "DB", "-1"],
+        &["COPY", "{k}a", "{k}b", "DB", "1", "BOGUS"],
+    ] {
+        refused(&mut c, args, "ERR DB index is out of range");
+    }
+    // A key's slot is checked first, as in Redis.
+    assert!(
+        c.cmd(&["COPY", "{k}a", "{j}b", "DB", "1"])
+            .err()
+            .is_some_and(|e| e.starts_with("CROSSSLOT")),
+    );
+    // In database 0 it copies.
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}b", "DB", "0"]), Resp::Int(1));
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}c"]), Resp::Int(1));
+    // In a transaction, each is refused as it runs.
+    assert!(c.cmd(&["MULTI"]).is_ok());
+    assert_eq!(c.cmd(&["MOVE", "{k}a", "1"]).text(), "QUEUED");
+    assert_eq!(c.cmd(&["SWAPDB", "0", "1"]).text(), "QUEUED");
+    assert_eq!(c.cmd(&["COPY", "{k}a", "{k}d", "DB", "1"]).text(), "QUEUED");
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        Resp::Array(vec![
+            Resp::Error("ERR MOVE is not allowed in cluster mode".into()),
+            Resp::Error("ERR SWAPDB is not allowed in cluster mode".into()),
+            Resp::Error("ERR DB index is out of range".into()),
+        ])
+    );
+    // Every key is still in database 0.
+    assert_eq!(c.cmd(&["GET", "{k}a"]), Resp::Bulk(b"v".to_vec()));
+    assert_eq!(c.cmd(&["DBSIZE"]), Resp::Int(3));
+}
+
+/// A cluster replica whose master sends a full sync with keys outside
+/// database 0 refuses it before it touches its own dataset, and says why
+/// and what to do. The master here is one that let `MOVE` put a key in
+/// database 1, as KiviDB did before #484 (`KIVIDB_TEST_FAILPOINTS`).
+#[test]
+fn a_cluster_replica_refuses_a_full_sync_with_keys_outside_database_0() {
+    let (nodes, _) = form_cluster_with_env(1, &[("KIVIDB_TEST_FAILPOINTS", "cluster-move")]);
+    let master = &nodes[0];
+    let mut m = master.conn();
+    assert!(m.cmd(&["SET", "{k}kept", "v"]).is_ok());
+    assert!(m.cmd(&["SET", "{k}moved", "v"]).is_ok());
+    assert_eq!(m.cmd(&["MOVE", "{k}moved", "1"]), Resp::Int(1));
+
+    // A node with keys of its own, and no slots, to be the replica: the
+    // refusal must leave its keys where they are.
+    let replica = Node::start(&[]);
+    let mut r = replica.conn();
+    assert!(r.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]).is_ok());
+    wait_cluster_ok(&[&replica], 1);
+    for key in ["{r}1", "{r}2", "{r}3"] {
+        assert!(r.cmd(&["SET", key, "local"]).is_ok());
+    }
+    assert!(r.cmd(&["CLUSTER", "DELSLOTSRANGE", "0", "16383"]).is_ok());
+    assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3));
+
+    let meet = m.cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
+    assert!(meet.is_ok(), "MEET: {meet:?}");
+    let master_id = master.id();
+    wait_until(
+        "replica to learn of its master",
+        Duration::from_secs(15),
+        || {
+            r.cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .any(|l| l.starts_with(&master_id))
+        },
+    );
+    let rep = r.cmd(&["CLUSTER", "REPLICATE", &master_id]);
+    assert!(rep.is_ok(), "REPLICATE: {rep:?}");
+    wait_until(
+        "the replica to refuse the full sync",
+        Duration::from_secs(30),
+        || {
+            replica
+                .repl_info("replica_last_sync_refusal")
+                .is_some_and(|why| {
+                    why.contains("can't have keys in a DB different than DB 0 when in Cluster mode")
+                })
+        },
+    );
+    let why = replica.repl_info("replica_last_sync_refusal").unwrap();
+    assert!(
+        why.contains("Move them into database 0 on the master"),
+        "the refusal does not say what to do: {why}"
+    );
+    assert_ne!(
+        replica.repl_info("master_link_status").as_deref(),
+        Some("up")
+    );
+    // Its own keys are untouched, and none of the master's came in.
+    assert_eq!(r.cmd(&["DBSIZE"]), Resp::Int(3), "{}", replica.log());
+}
+
 /// `cluster-port` sets the port the bus listens on, from a config file (as
 /// LiteLLM's tests start a node) or the command line, in place of `port` +
 /// 10000; `CONFIG GET` and `CLUSTER NODES` say it. A config file with it
@@ -538,9 +767,12 @@ fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -
 fn cluster_port_sets_the_bus_port() {
     let dir = tempfile::tempdir().unwrap().keep();
     let port = cluster_port();
-    // A port of its own, not `port` + 10000.
-    let bus = (port + 1..20_000)
-        .find(|p| port_is_free(*p) && *p != port + 10_000)
+    // A port of its own, not `port` + 10000, and outside 10000-29999, where
+    // the other tests' nodes and their buses are: `port + 1` was often the
+    // next node's port, which then could not start. Below Linux's ephemeral
+    // range (32768 and up), so no client's own port can take it.
+    let bus = (30_000 + port % 2_000..32_768)
+        .find(|p| port_is_free(*p))
         .unwrap();
     let conf = [
         "bind 127.0.0.1".to_string(),
@@ -3932,6 +4164,210 @@ fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write(
     );
 }
 
+/// The keys of `prefix:N` that hash into `range`, `n` of them, set on
+/// `node` to `value`; and a check that they all have it on another.
+struct Written {
+    keys: Vec<String>,
+    value: &'static str,
+}
+
+impl Written {
+    fn on(node: &Node, range: std::ops::RangeInclusive<u16>, prefix: &str, n: usize) -> Self {
+        let keys: Vec<String> = (0..)
+            .map(|i| format!("{prefix}:{i}"))
+            .filter(|k| range.contains(&slot_of(k)))
+            .take(n)
+            .collect();
+        let value = "v";
+        let sets: Vec<Vec<&str>> = keys
+            .iter()
+            .map(|k| vec!["SET", k.as_str(), value])
+            .collect();
+        let replies = node.conn().pipeline(&sets);
+        assert!(replies.iter().all(Resp::is_ok), "{replies:?}");
+        Written { keys, value }
+    }
+
+    /// The keys not as written on `node`.
+    fn missing_on(&self, node: &Node) -> Vec<String> {
+        let gets: Vec<Vec<&str>> = self.keys.iter().map(|k| vec!["GET", k.as_str()]).collect();
+        self.keys
+            .iter()
+            .zip(node.conn().pipeline(&gets))
+            .filter(|(_, got)| !matches!(got, Resp::Bulk(v) if v == self.value.as_bytes()))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+/// The node that owns `slot` in `node`'s `CLUSTER NODES`.
+fn owner_in_view_of(node: &Node, slot: u16) -> Option<String> {
+    let nodes = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+    nodes.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let owns = fields.iter().skip(8).any(|range| {
+            let (a, b) = range.split_once('-').unwrap_or((range, range));
+            matches!((a.parse::<u16>(), b.parse::<u16>()), (Ok(a), Ok(b)) if a <= slot && slot <= b)
+        });
+        owns.then(|| fields[0].to_string())
+    })
+}
+
+/// A replica whose master handed slots over to another master, and that has
+/// not heard of it, is refused votes when it stands for election (#524).
+/// Five masters, so the three that are neither the source nor the
+/// destination make a quorum without either. The replica takes in none of
+/// the destination's claims (`KIVIDB_TEST_IGNORE_CLAIMS`); the source is
+/// killed once the handover is done. The replica's request says which slots
+/// it would take over, the moved ones among them, at its master's old epoch,
+/// and every master knows a newer owner of those. It used to be elected,
+/// and claimed them at the election's epoch, newer than the destination's:
+/// the destination's acknowledged writes to them were lost. Once it hears
+/// the destination's claim, it is elected, to the slots its master still
+/// had.
+#[test]
+fn a_replica_that_has_not_heard_its_master_gave_slots_away_is_refused_votes() {
+    let (mut nodes, ranges) = form_cluster(5);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[0],
+        &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")],
+    );
+    let all = |nodes: &[Node]| -> Vec<String> {
+        nodes
+            .iter()
+            .chain(std::iter::once(&replica))
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect()
+    };
+    {
+        let both: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&both, 6);
+    }
+    let replica_id = replica.id();
+    let dst_id = nodes[1].id();
+    std::fs::write(replica.dir.join("ignore-claims"), &dst_id).unwrap();
+    assert!(
+        replica
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-replica-validity-factor", "0"])
+            .is_ok()
+    );
+    let kept = Written::on(&nodes[0], 101..=ranges[0].1, "kept", 300);
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(&nodes[1], &task_id);
+    wait_until(
+        "every master to hear of the new owner",
+        Duration::from_secs(20),
+        || {
+            nodes[1..]
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    let src_id = nodes[0].id();
+    assert_eq!(owner_in_view_of(&replica, 50), Some(src_id.clone()));
+    // Acknowledged by the new owner.
+    let moved = Written::on(&nodes[1], 0..=100, "moved", 300);
+
+    nodes[0].kill();
+    let refused = format!("Not voting for {replica_id} to take over from {src_id}: it claims slot");
+    wait_until(
+        "the masters to refuse the replica their votes, or to elect it",
+        Duration::from_secs(60),
+        || {
+            replica.is_master()
+                || nodes[1..]
+                    .iter()
+                    .filter(|n| n.log().contains(&refused))
+                    .count()
+                    >= 3
+        },
+    );
+    assert!(
+        !replica.is_master(),
+        "elected with a claim of the moved slots; slot 50 is now {:?}'s in its view\n{}",
+        owner_in_view_of(&replica, 50),
+        all(&nodes).join("\n")
+    );
+    assert!(
+        nodes[1..]
+            .iter()
+            .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str())),
+        "{}",
+        all(&nodes).join("\n")
+    );
+
+    // It hears of the new owner, and is elected to the rest.
+    std::fs::remove_file(replica.dir.join("ignore-claims")).unwrap();
+    wait_until("the replica to be elected", Duration::from_secs(60), || {
+        replica.is_master()
+    });
+    wait_until(
+        "the cluster to be up again",
+        Duration::from_secs(30),
+        || {
+            nodes[1..]
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_state") == "ok")
+        },
+    );
+    for n in nodes[1..].iter().chain(std::iter::once(&replica)) {
+        assert_eq!(owner_in_view_of(n, 50).as_deref(), Some(dst_id.as_str()));
+        assert_eq!(
+            owner_in_view_of(n, 101).as_deref(),
+            Some(replica_id.as_str())
+        );
+    }
+    let lost = moved.missing_on(&nodes[1]);
+    assert!(lost.is_empty(), "{} acknowledged writes lost", lost.len());
+    let lost = kept.missing_on(&replica);
+    assert!(
+        lost.is_empty(),
+        "{} keys lost on the new master",
+        lost.len()
+    );
+}
+
+/// A replica that asks for votes as an earlier version does, without its
+/// claims (`KIVIDB_TEST_AUTH_REQUEST_WITHOUT_CLAIMS`), is elected as before
+/// (#524): this version's voters decide such a request as they did.
+#[test]
+fn a_replica_that_sends_no_claims_is_elected_as_before() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[0],
+        &[("KIVIDB_TEST_AUTH_REQUEST_WITHOUT_CLAIMS", "1")],
+    );
+    {
+        let both: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&both, 4);
+    }
+    let kept = Written::on(&nodes[0], ranges[0].0..=ranges[0].1, "kept", 200);
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    nodes[0].kill();
+    wait_until(
+        "the replica to be promoted",
+        Duration::from_secs(60),
+        || replica.is_master(),
+    );
+    let replica_id = replica.id();
+    for n in [&nodes[1], &nodes[2], &replica] {
+        wait_until("the new owner to be known", Duration::from_secs(20), || {
+            owner_in_view_of(n, ranges[0].0).as_deref() == Some(replica_id.as_str())
+        });
+    }
+    assert!(kept.missing_on(&replica).is_empty());
+}
+
 /// A write routed here before an atomic slot migration handed its slot
 /// over, and held up before the write gate until the handoff had let writes
 /// go again, is sent on with `-MOVED`. It used to run here, on a slot the
@@ -5498,6 +5934,41 @@ fn a_cluster_runs_over_tls_between_its_nodes() {
             .is_some_and(|t| task_field(t, "state").text() == "completed")
     });
 
+    // MIGRATE over TLS, one key per call, keeps one connection to the
+    // destination (#726), and every key arrives.
+    let tag = key_in(200..=5460, "mig");
+    let slot = slot_of(&tag).to_string();
+    let r = d.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &nodes[0].id()]);
+    assert!(r.is_ok(), "{r:?}");
+    let row = nodes[1].my_row();
+    let tls_port = row[1]
+        .split('@')
+        .next()
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap();
+    let received = |c: &mut Conn| {
+        let info = c.cmd(&["INFO", "stats"]).text();
+        info.lines()
+            .find_map(|l| l.strip_prefix("total_connections_received:"))
+            .unwrap()
+            .trim()
+            .parse::<i64>()
+            .unwrap()
+    };
+    let before = received(&mut d);
+    let mut s = nodes[0].conn();
+    for i in 0..20 {
+        let key = format!("{{{tag}}}:{i}");
+        assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+        let r = s.cmd(&["MIGRATE", "127.0.0.1", tls_port, &key, "0", "5000"]);
+        assert!(r.is_ok(), "MIGRATE over TLS: {r:?}");
+    }
+    let opened = received(&mut d) - before;
+    assert!(opened <= 3, "{opened} connections for 20 MIGRATEs over TLS");
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 20);
+
     // A node on a plain bus is not let in.
     let plain = Node::start(&[]);
     assert!(
@@ -5765,6 +6236,125 @@ fn searches_are_answered_from_every_master() {
             .is_some_and(|e| e.contains("could not be answered")),
         "{down:?}"
     );
+}
+
+/// The ids of the clients a node has under `name`, by `CLIENT LIST`.
+fn clients_named(node: &Node, name: &str) -> Vec<String> {
+    let list = node.conn().cmd(&["CLIENT", "LIST"]).text();
+    let name = format!(" name={name} ");
+    list.lines()
+        .filter(|l| l.contains(&name))
+        .filter_map(|l| {
+            l.split(' ')
+                .find_map(|f| f.strip_prefix("id="))
+                .map(String::from)
+        })
+        .collect()
+}
+
+fn connections_received(node: &Node) -> u64 {
+    info_field(
+        &node.conn().cmd(&["INFO", "stats"]).text(),
+        "total_connections_received",
+    )
+    .unwrap()
+    .parse()
+    .unwrap()
+}
+
+/// The coordinator of a search asks the other masters over connections it
+/// keeps, not a new one per search: 2,000 searches, eight at a time, open
+/// a handful on each master where they used to open 2,000 and leave as
+/// many sockets in TIME_WAIT on the coordinator, which ran out of ports
+/// (#723). Kept connections the other masters close, by `CLIENT KILL` or a
+/// restart, are replaced without the search failing.
+#[test]
+fn a_coordinator_keeps_its_connections_to_the_other_masters() {
+    const SEARCH_NAME: &str = "kividb-cluster-search";
+    // The most kept to one master: the node's command threads (`--threads
+    // 2` here), or `search::POOL_IDLE_MAX` (16) if that is more.
+    const KEPT_MAX: u64 = 16;
+    let (mut nodes, _) = form_cluster(3);
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "docs",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "doc:",
+        "SCHEMA",
+        "t",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let mut on = [0; 3];
+    for i in 0..30 {
+        let key = format!("doc:{i}");
+        let at = (0..3)
+            .find(|&n| {
+                let r = nodes[n].conn().cmd(&["HSET", &key, "t", "hello"]);
+                r.err().is_none_or(|e| !e.starts_with("MOVED"))
+            })
+            .unwrap();
+        on[at] += 1;
+    }
+    assert!(on.iter().all(|n| *n > 0), "{on:?}");
+    let all = |reply: &Resp| {
+        assert_eq!(reply.array().first(), Some(&Resp::Int(30)), "{reply:?}");
+    };
+    all(&nodes[0]
+        .conn()
+        .cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT"]));
+
+    let before: Vec<u64> = nodes[1..].iter().map(connections_received).collect();
+    let port = nodes[0].port;
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                for _ in 0..250 {
+                    let r = c.cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT", "LIMIT", "0", "0"]);
+                    assert_eq!(r.array().first(), Some(&Resp::Int(30)), "{r:?}");
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    for (node, before) in nodes[1..].iter().zip(&before) {
+        // This test's own connections, to read the figure, count too.
+        let grew = connections_received(node) - before;
+        assert!(
+            grew <= KEPT_MAX + 4,
+            "{grew} connections for 2,000 searches"
+        );
+        let kept = clients_named(node, SEARCH_NAME).len() as u64;
+        assert!((1..=KEPT_MAX).contains(&kept), "{kept} kept");
+    }
+
+    // The other masters close every connection kept to them: the next
+    // searches are sent again on new ones, and answered.
+    for node in &nodes[1..] {
+        for id in clients_named(node, SEARCH_NAME) {
+            node.conn().cmd(&["CLIENT", "KILL", "ID", &id]);
+        }
+        wait_until("kept connections closed", Duration::from_secs(10), || {
+            clients_named(node, SEARCH_NAME).is_empty()
+        });
+    }
+    let mut c = nodes[0].conn();
+    for _ in 0..20 {
+        let r = c.cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT", "LIMIT", "0", "0"]);
+        assert_eq!(r.array().first(), Some(&Resp::Int(30)), "{r:?}");
+    }
+
+    // One restarts: the search reaches it on a new connection.
+    nodes[2].restart();
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
+    let r = c.cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT", "LIMIT", "0", "0"]);
+    assert!(r.err().is_none(), "{r:?}");
 }
 
 /// A master added after an index was created gets it: from the first
@@ -6112,6 +6702,76 @@ fn nodes_talk_to_each_other_as_masteruser_with_default_limited() {
     );
     let found = admin(&nodes[3]).cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT"]);
     assert_eq!(found.array()[0].int(), 3, "{found:?}");
+}
+
+/// `FT.INFO`'s `num_docs` is read off the documents each master's index
+/// holds, those in the slots it serves (#590). Slots that move to another
+/// master take their documents out of one index and into the other, so the
+/// count of every master together stays what it was; and so again when the
+/// slots move back. An index of vectors alone, which kept no list of its
+/// documents.
+#[test]
+fn num_docs_follows_slots_that_move_out_and_back() {
+    const DOCS: i64 = 60;
+    let (nodes, ranges) = form_cluster(3);
+    let owner = |key: &str| {
+        let slot = slot_of(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let create = "FT.CREATE vecs ON HASH PREFIX 1 item: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 \
+                  DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    let r = nodes[0].conn().cmd(&create);
+    assert!(r.is_ok(), "{r:?}");
+    // The half of the first master's slots that moves, and how many of the
+    // documents are in it.
+    let (from, to) = (ranges[0].0, ranges[0].0 + (ranges[0].1 - ranges[0].0) / 2);
+    let mut moving = 0;
+    for i in 0..DOCS {
+        let key = format!("item:{i}");
+        moving += usize::from((from..=to).contains(&slot_of(&key)));
+        let blob: Vec<u8> = [i as f32, 0.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let r = nodes[owner(&key)]
+            .conn()
+            .cmd_bytes(&[b"HSET", key.as_bytes(), b"vec", &blob]);
+        assert!(matches!(r, Resp::Int(1)), "{r:?}");
+    }
+    assert!(moving > 0, "no document in slots {from}-{to}");
+    let num_docs = |node: &Node| {
+        let info = node.conn().cmd(&["FT.INFO", "vecs"]);
+        let at = info
+            .array()
+            .iter()
+            .position(|i| matches!(i, Resp::Bulk(b) if b == b"num_docs"))
+            .unwrap_or_else(|| panic!("no num_docs: {info:?}"));
+        info.array()[at + 1].int()
+    };
+    let everywhere = |when: &str| {
+        // The keys of a slot that left are deleted a moment after it did.
+        wait_until(when, Duration::from_secs(30), || {
+            nodes.iter().all(|node| num_docs(node) == DOCS)
+        });
+    };
+    everywhere("every document counted");
+
+    let (from, to) = (from.to_string(), to.to_string());
+    for (taker, when) in [
+        (1, "every document counted once the slots moved out"),
+        (0, "every document counted once the slots moved back"),
+    ] {
+        let id = nodes[taker]
+            .conn()
+            .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &from, &to])
+            .text();
+        wait_import_completed(&nodes[taker], &id);
+        everywhere(when);
+    }
 }
 
 /// A shard that runs out of time tells the coordinator, which applies
@@ -6861,4 +7521,515 @@ fn cluster_searches_give_back_keys_of_any_bytes() {
         keys.sort();
         assert_eq!(keys, want, "FT.AGGREGATE on port {}", node.port);
     }
+}
+
+/// `CONFIG SET` changes `cluster-announce-ip`, `-port`, `-bus-port` and
+/// `cluster-require-full-coverage` while the node runs, as Redis 8 allows:
+/// testcontainers-style harnesses learn a node's address only once it runs
+/// (#391). `CONFIG GET` and `CONFIG REWRITE` give the value set, the node's
+/// own address follows, and nodes.conf is saved with it.
+/// `cluster-node-timeout` stays fixed at startup, and says so.
+#[test]
+fn announce_settings_and_full_coverage_change_at_runtime() {
+    let node = Node::start(&[]);
+    let mut c = node.conn();
+    let get = |c: &mut Conn, name: &str| c.cmd(&["CONFIG", "GET", name]).array()[1].text();
+    for (name, value) in [
+        ("cluster-announce-ip", "172.17.0.9"),
+        ("cluster-announce-port", "6379"),
+        ("cluster-announce-bus-port", "16379"),
+        ("cluster-require-full-coverage", "no"),
+    ] {
+        let r = c.cmd(&["CONFIG", "SET", name, value]);
+        assert!(r.is_ok(), "CONFIG SET {name} {value}: {r:?}");
+        assert_eq!(get(&mut c, name), value);
+    }
+    assert_eq!(
+        node.my_row()[1].split(',').next().unwrap(),
+        "172.17.0.9:6379@16379"
+    );
+    let saved = std::fs::read_to_string(node.dir.join("nodes.conf")).unwrap();
+    assert!(
+        saved
+            .lines()
+            .any(|l| l.contains("myself") && l.contains("172.17.0.9:6379@16379")),
+        "{saved}"
+    );
+    assert!(c.cmd(&["CONFIG", "REWRITE"]).is_ok());
+    let conf = std::fs::read_to_string(node.dir.join("kividb.conf")).unwrap();
+    for line in [
+        "cluster-announce-ip 172.17.0.9",
+        "cluster-announce-port 6379",
+        "cluster-announce-bus-port 16379",
+        "cluster-require-full-coverage no",
+    ] {
+        assert!(conf.lines().any(|l| l == line), "no '{line}' in:\n{conf}");
+    }
+    // Unset again: an empty address is not left at the one set before.
+    assert!(c.cmd(&["CONFIG", "SET", "cluster-announce-ip", ""]).is_ok());
+    assert_eq!(get(&mut c, "cluster-announce-ip"), "");
+    assert!(c.cmd(&["CONFIG", "REWRITE"]).is_ok());
+    let conf = std::fs::read_to_string(node.dir.join("kividb.conf")).unwrap();
+    assert!(!conf.contains("cluster-announce-ip"), "{conf}");
+
+    // Refused as Redis refuses them.
+    let long = "x".repeat(46);
+    for (name, value, why) in [
+        (
+            "cluster-announce-ip",
+            "a_b",
+            "Hostnames may only contain alphanumeric characters, hyphens or dots",
+        ),
+        (
+            "cluster-announce-ip",
+            long.as_str(),
+            "Hostnames for cluster-announce-ip must be less than 46 characters",
+        ),
+        (
+            "cluster-announce-port",
+            "70000",
+            "argument must be between 0 and 65535 inclusive",
+        ),
+        (
+            "cluster-announce-bus-port",
+            "abc",
+            "argument couldn't be parsed into an integer",
+        ),
+        (
+            "cluster-require-full-coverage",
+            "maybe",
+            "argument must be 'yes' or 'no'",
+        ),
+    ] {
+        let r = c.cmd(&["CONFIG", "SET", name, value]);
+        assert_eq!(
+            r.err(),
+            Some(
+                format!("ERR CONFIG SET failed (possibly related to argument '{name}') - {why}")
+                    .as_str()
+            ),
+            "CONFIG SET {name} {value}"
+        );
+    }
+
+    let timeout = NODE_TIMEOUT_MS.to_string();
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-node-timeout", &timeout])
+            .is_ok()
+    );
+    let r = c.cmd(&["CONFIG", "SET", "cluster-node-timeout", "6000"]);
+    let err = r.err().unwrap_or_else(|| panic!("{r:?}"));
+    assert!(err.contains("only at startup"), "{err}");
+    assert_eq!(get(&mut c, "cluster-node-timeout"), timeout);
+}
+
+/// A node's address changed with `CONFIG SET` reaches its peers from its
+/// own heartbeats, and the cluster goes on with it (#391).
+#[test]
+fn peers_learn_an_announce_address_changed_at_runtime() {
+    let (nodes, _) = form_cluster(3);
+    let id = nodes[1].id();
+    let row_of = |node: &Node| {
+        let text = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+        text.lines()
+            .find(|l| l.starts_with(&id))
+            .unwrap_or_else(|| panic!("no row for {id} in:\n{text}"))
+            .split(' ')
+            .nth(1)
+            .and_then(|address| address.split(',').next())
+            .unwrap()
+            .to_string()
+    };
+    let port = nodes[1].port;
+    let original = format!("127.0.0.1:{port}@{}", port + 10_000);
+    assert_eq!(row_of(&nodes[0]), original);
+
+    // An address nobody listens on: the peers still take it from node 1.
+    let mut c = nodes[1].conn();
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-port", "1"])
+            .is_ok()
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-bus-port", "2"])
+            .is_ok()
+    );
+    wait_until(
+        "the peers to learn node 1's new address",
+        Duration::from_secs(15),
+        || {
+            [&nodes[0], &nodes[2]]
+                .iter()
+                .all(|n| row_of(n) == "127.0.0.1:1@2")
+        },
+    );
+
+    // And back: the cluster is whole again.
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-port", "0"])
+            .is_ok()
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "cluster-announce-bus-port", "0"])
+            .is_ok()
+    );
+    wait_until(
+        "the peers to learn node 1's own address again",
+        Duration::from_secs(15),
+        || [&nodes[0], &nodes[2]].iter().all(|n| row_of(n) == original),
+    );
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 3);
+}
+
+// ── Keys of a slot (#294) ────────────────────────────────────────────────────
+
+/// The slot of `key` as a cluster sees it: of its hash tag, if it has one.
+fn tagged_slot_of(key: &str) -> u16 {
+    let tag = key.find('{').and_then(|open| {
+        let rest = &key[open + 1..];
+        rest.find('}')
+            .filter(|&len| len > 0)
+            .map(|len| &rest[..len])
+    });
+    slot_of(tag.unwrap_or(key))
+}
+
+/// Every key the node is expected to hold, by slot.
+type KeysBySlot = std::collections::BTreeMap<u16, std::collections::BTreeSet<String>>;
+
+/// Writes keys of every kind on `c`, some of them under hash tags (a slot
+/// with many keys), some with a time to live, and returns them by slot.
+/// `DEBUG POPULATE` writes `key:0` to `key:{populate - 1}`.
+fn fill_slots(c: &mut Conn, populate: usize) -> KeysBySlot {
+    let mut keys: Vec<String> = (0..populate).map(|i| format!("key:{i}")).collect();
+    assert!(c.cmd(&["DEBUG", "POPULATE", &populate.to_string()]).is_ok());
+    let mut writes: Vec<Vec<String>> = Vec::new();
+    for i in 0..300 {
+        let key = format!("{{busy}}:{i}");
+        writes.push(vec![
+            "SET".into(),
+            key.clone(),
+            "v".into(),
+            "EX".into(),
+            "100000".into(),
+        ]);
+        keys.push(key);
+    }
+    for i in 0..200 {
+        let (h, l, z, s) = (
+            format!("h:{i}"),
+            format!("{{list}}:{i}"),
+            format!("z:{i}"),
+            format!("s:{{{i}}}"),
+        );
+        writes.push(vec!["HSET".into(), h.clone(), "f".into(), "v".into()]);
+        writes.push(vec!["RPUSH".into(), l.clone(), "a".into(), "b".into()]);
+        writes.push(vec!["ZADD".into(), z.clone(), "1".into(), "m".into()]);
+        writes.push(vec!["SADD".into(), s.clone(), "m".into()]);
+        keys.extend([h, l, z, s]);
+    }
+    for chunk in writes.chunks(500) {
+        let chunk: Vec<Vec<&str>> = chunk
+            .iter()
+            .map(|w| w.iter().map(String::as_str).collect())
+            .collect();
+        for reply in c.pipeline(&chunk) {
+            assert!(reply.err().is_none(), "{reply:?}");
+        }
+    }
+    let mut by_slot = KeysBySlot::new();
+    for key in keys {
+        by_slot.entry(tagged_slot_of(&key)).or_default().insert(key);
+    }
+    by_slot
+}
+
+/// `commands` sent in pipelines of a thousand, their replies in order.
+fn pipelined(c: &mut Conn, commands: &[Vec<String>]) -> Vec<Resp> {
+    let mut replies = Vec::with_capacity(commands.len());
+    for chunk in commands.chunks(1000) {
+        let chunk: Vec<Vec<&str>> = chunk
+            .iter()
+            .map(|args| args.iter().map(String::as_str).collect())
+            .collect();
+        replies.extend(c.pipeline(&chunk));
+    }
+    replies
+}
+
+/// `COUNTKEYSINSLOT` and `GETKEYSINSLOT` give exactly the keys of `want` for
+/// every slot, every key is found by a read, and there are no others.
+fn assert_slots_hold(c: &mut Conn, want: &KeysBySlot, what: &str) {
+    let total: usize = want.values().map(|k| k.len()).sum();
+    assert_eq!(c.cmd(&["DBSIZE"]).int(), total as i64, "{what}: DBSIZE");
+    let counts = pipelined(
+        c,
+        &(0..16384u16)
+            .map(|s| vec!["CLUSTER".into(), "COUNTKEYSINSLOT".into(), s.to_string()])
+            .collect::<Vec<_>>(),
+    );
+    for (slot, count) in counts.iter().enumerate() {
+        let expected = want.get(&(slot as u16)).map_or(0, |k| k.len());
+        assert_eq!(
+            count.int(),
+            expected as i64,
+            "{what}: COUNTKEYSINSLOT {slot}"
+        );
+    }
+    let lists = pipelined(
+        c,
+        &want
+            .keys()
+            .map(|s| {
+                vec![
+                    "CLUSTER".into(),
+                    "GETKEYSINSLOT".into(),
+                    s.to_string(),
+                    "100000".into(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
+    for ((slot, keys), got) in want.iter().zip(&lists) {
+        let got: std::collections::BTreeSet<String> = got.array().iter().map(Resp::text).collect();
+        assert_eq!(&got, keys, "{what}: GETKEYSINSLOT {slot}");
+    }
+    // Found by key, too: each where a read looks for it.
+    let all: Vec<&String> = want.values().flatten().collect();
+    let found = pipelined(
+        c,
+        &all.iter()
+            .map(|k| vec!["EXISTS".into(), k.to_string()])
+            .collect::<Vec<_>>(),
+    );
+    for (key, found) in all.iter().zip(&found) {
+        assert_eq!(found.int(), 1, "{what}: EXISTS {key}");
+    }
+}
+
+/// `CLUSTER COUNTKEYSINSLOT` and `GETKEYSINSLOT` look at the one store
+/// shard that holds a slot's keys, not at every key of the node (#294:
+/// `redis-cli --cluster reshard` asks for each batch of keys it moves, and
+/// on a node of millions of keys each call took a third of a second). For
+/// that a cluster node places each key in the shard of its slot. This holds
+/// the counts and lists to every key, for keys written, deleted, loaded
+/// from a snapshot (the node's own, and one written by a server not in
+/// cluster mode), from the AOF, and sent to a replica in a full sync.
+#[test]
+fn keys_in_slot_are_found_wherever_they_came_from() {
+    let (mut nodes, _) = form_cluster(1);
+    // A cluster node places keys by slot: what the rest of this checks.
+    let log = nodes[0].log();
+    assert!(log.contains("Keys placed by : cluster slot"), "{log}");
+    let mut want = {
+        let mut c = nodes[0].conn();
+        let mut want = fill_slots(&mut c, 20_000);
+        assert_slots_hold(&mut c, &want, "written");
+
+        // Deleted: from the counts and the lists as well.
+        for i in (0..20_000).step_by(7) {
+            let key = format!("key:{i}");
+            assert_eq!(c.cmd(&["DEL", &key]).int(), 1);
+            let slot = tagged_slot_of(&key);
+            let keys = want.get_mut(&slot).unwrap();
+            keys.remove(&key);
+            if keys.is_empty() {
+                want.remove(&slot);
+            }
+        }
+        assert_slots_hold(&mut c, &want, "after deletes");
+        assert!(c.cmd(&["SAVE"]).is_ok());
+        want
+    };
+
+    // The node's own snapshot.
+    nodes[0].restart();
+    wait_cluster_ok(&[&nodes[0]], 1);
+    assert_slots_hold(&mut nodes[0].conn(), &want, "loaded from the snapshot");
+
+    // A replica's full sync.
+    let replica = add_replica(&nodes, &nodes[0]);
+    let mut r = replica.conn();
+    assert!(r.cmd(&["READONLY"]).is_ok());
+    wait_until(
+        "the replica to have every key",
+        Duration::from_secs(20),
+        || r.cmd(&["DBSIZE"]).int() == nodes[0].conn().cmd(&["DBSIZE"]).int(),
+    );
+    assert_slots_hold(&mut r, &want, "on the replica");
+    drop(r);
+    drop(replica);
+
+    // The AOF: the snapshot it starts from, and the writes in it after.
+    {
+        let mut c = nodes[0].conn();
+        assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).is_ok());
+        assert!(c.cmd(&["CONFIG", "REWRITE"]).is_ok());
+        // Done once a rewrite has finished: this process had none before
+        // (`aof_last_rewrite_time_ms:-1`), so `aof_rewrite_in_progress:0`
+        // alone could be read before the one asked for had begun.
+        wait_until("the AOF's first rewrite", Duration::from_secs(20), || {
+            let info = c.cmd(&["INFO", "persistence"]).text();
+            info.contains("aof_rewrite_in_progress:0")
+                && !info.contains("aof_last_rewrite_time_ms:-1")
+                && info.contains("aof_last_bgrewrite_status:ok")
+        });
+        let writes: Vec<Vec<String>> = (0..2000)
+            .map(|i| vec!["SET".into(), format!("aof:{i}"), "v".into()])
+            .chain(
+                (0..20_000)
+                    .step_by(11)
+                    .map(|i| vec!["DEL".into(), format!("key:{i}")]),
+            )
+            .collect();
+        for reply in pipelined(&mut c, &writes) {
+            assert!(reply.err().is_none(), "{reply:?}");
+        }
+        for i in 0..2000 {
+            let key = format!("aof:{i}");
+            want.entry(tagged_slot_of(&key)).or_default().insert(key);
+        }
+        for i in (0..20_000).step_by(11) {
+            let key = format!("key:{i}");
+            let slot = tagged_slot_of(&key);
+            if let Some(keys) = want.get_mut(&slot) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    want.remove(&slot);
+                }
+            }
+        }
+        // Long enough for the AOF to have them on disk (fsync every second).
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    nodes[0].restart();
+    // The replica, gone, is still in its table.
+    wait_until("the node to be up", Duration::from_secs(30), || {
+        nodes[0].cluster_info("cluster_state") == "ok"
+    });
+    assert_slots_hold(&mut nodes[0].conn(), &want, "loaded from the AOF");
+}
+
+/// A snapshot written by a server not in cluster mode, where keys are
+/// placed by another hash, is loaded by a cluster node into the shards of
+/// their slots (#294).
+#[test]
+fn a_standalone_snapshot_loads_into_the_shards_of_its_slots() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = cluster_port();
+    let mut plain = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(&dir)
+        .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let want = {
+        let mut c = Conn::connect(port);
+        let want = fill_slots(&mut c, 20_000);
+        assert!(c.cmd(&["SAVE"]).is_ok());
+        want
+    };
+    let _ = plain.kill();
+    let _ = plain.wait();
+
+    let mut node = Node::start(&[]);
+    node.kill();
+    std::fs::copy(dir.join("dump.kdb"), node.dir.join("dump.kdb")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    node.spawn();
+    let (nodes, _) = form_cluster_of(vec![node]);
+    assert_slots_hold(&mut nodes[0].conn(), &want, "a standalone snapshot");
+}
+
+/// A write of several keys of one hash tag is one step, as it is in Redis:
+/// a reader never finds some of a `DEL`'s keys gone and others not, nor a
+/// `RENAME`'s source gone and its destination not there yet (#159). A
+/// cluster client's multi-key writes are all of this kind, and a write of
+/// keys that share a store shard takes the command gate alone as one of
+/// keys of several shards does.
+#[test]
+fn readers_never_see_a_write_of_one_hash_tag_half_done() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let (nodes, _) = form_cluster(1);
+    let port = nodes[0].port;
+    let keys: Vec<String> = (0..200).map(|i| format!("{{t}}d{i}")).collect();
+    let (from, to) = ("{t}from", "{t}to");
+    let mut w = nodes[0].conn();
+    assert!(w.cmd(&["SET", from, "x"]).is_ok());
+    let stop = Arc::new(AtomicBool::new(false));
+    let torn = Arc::new(AtomicU64::new(0));
+    // Several readers, and many rounds: the window is a few microseconds.
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (stop, torn, keys) = (Arc::clone(&stop), Arc::clone(&torn), keys.clone());
+            std::thread::spawn(move || {
+                let mut r = Conn::connect(port);
+                let mut args = vec!["MGET"];
+                args.extend(keys.iter().map(String::as_str));
+                while !stop.load(Ordering::Relaxed) {
+                    let got = r.cmd(&args);
+                    let present = got.array().iter().filter(|v| **v != Resp::Nil).count();
+                    if present != 0 && present != keys.len() {
+                        torn.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let renamed = r.cmd(&["MGET", from, to]);
+                    if renamed.array().iter().all(|v| *v == Resp::Nil) {
+                        torn.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for _ in 0..1500 {
+        let mut mset = vec!["MSET"];
+        for k in &keys {
+            mset.push(k);
+            mset.push("v");
+        }
+        assert!(w.cmd(&mset).is_ok());
+        let mut del = vec!["DEL"];
+        del.extend(keys.iter().map(String::as_str));
+        assert_eq!(w.cmd(&del).int(), keys.len() as i64);
+        assert!(w.cmd(&["RENAME", from, to]).is_ok());
+        assert!(w.cmd(&["RENAME", to, from]).is_ok());
+    }
+    stop.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(
+        torn.load(Ordering::Relaxed),
+        0,
+        "a reader saw a write half done"
+    );
+}
+
+/// `RANDOMKEY` picks every key as often as any other, however its keys fill
+/// the store's shards: on a cluster node, where keys are placed by slot,
+/// the keys of one hash tag fill one shard, and picking a shard evenly gave
+/// them 3% of the picks for half of the keys (#294).
+#[test]
+fn randomkey_is_even_over_a_busy_hash_tag() {
+    let (nodes, _) = form_cluster(1);
+    let mut c = nodes[0].conn();
+    let writes: Vec<Vec<String>> = (0..2_000)
+        .flat_map(|i| {
+            [
+                vec!["SET".into(), format!("{{a}}k{i}"), "v".into()],
+                vec!["SET".into(), format!("k{i}"), "v".into()],
+            ]
+        })
+        .collect();
+    for reply in pipelined(&mut c, &writes) {
+        assert!(reply.is_ok(), "{reply:?}");
+    }
+    let picks = pipelined(&mut c, &vec![vec!["RANDOMKEY".to_string()]; 4_000]);
+    let tagged = picks.iter().filter(|k| k.text().starts_with("{a}")).count();
+    // Half; about 0.008 either way.
+    let share = tagged as f64 / picks.len() as f64;
+    assert!((0.44..0.56).contains(&share), "tagged share {share}");
 }

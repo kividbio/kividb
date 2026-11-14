@@ -648,6 +648,64 @@ fn writes_after_field_deadlines_replay_as_made_after_a_kill() {
     assert_eq!(after, before, "{keys:?}");
 }
 
+/// `HINCRBYFLOAT` goes to the AOF and to a replica as the value it left,
+/// `HSETEX … KEEPTTL FIELDS 1 f <value>`, as in Redis 8.10.2: it was sent
+/// as typed, and run again (an AOF replayed over a snapshot that already
+/// had it) it added twice. The field keeps its time to live, on the
+/// replica and after the AOF is replayed.
+#[test]
+fn hincrbyfloat_is_sent_as_the_value_it_left() {
+    let master = start_with_conf(&["--aof"], "appendfsync always\n");
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    assert_eq!(m.cmd(&["HSET", "h", "f", "1", "g", "2"]).i(), 2);
+    assert_eq!(
+        m.cmd(&["HEXPIRE", "h", "1000", "FIELDS", "1", "f"]),
+        V::Arr(vec![V::Int(1)])
+    );
+    assert_eq!(m.cmd(&["HINCRBYFLOAT", "h", "f", "0.5"]).s(), "1.5");
+    assert_eq!(m.cmd(&["HINCRBYFLOAT", "h", "g", "0.25"]).s(), "2.25");
+    assert_eq!(m.cmd(&["HINCRBYFLOAT", "new", "n", "3"]).s(), "3");
+    assert_eq!(m.cmd(&["SET", "last", "1"]).s(), "OK");
+    let keys = ["h", "new"];
+    let before: Vec<String> = keys.iter().map(|key| state(&mut m, key)).collect();
+    assert_eq!(before[0], r#"hash [("f", "1.5", 1), ("g", "2.25", -1)]"#);
+    wait_caught_up(&mut m, &mut r);
+    for key in keys {
+        assert_eq!(
+            state(&mut r, key),
+            state(&mut m, key),
+            "{key} on the replica"
+        );
+    }
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&master.aof(), b"$4\r\nlast\r\n") == 1
+    });
+    let aof = master.aof();
+    assert_eq!(
+        count(&aof, b"HINCRBYFLOAT"),
+        0,
+        "{}",
+        String::from_utf8_lossy(&aof)
+    );
+    for (key, field, value) in [("h", "f", "1.5"), ("h", "g", "2.25"), ("new", "n", "3")] {
+        let sent = format!(
+            "*7\r\n$6\r\nHSETEX\r\n${}\r\n{key}\r\n$7\r\nKEEPTTL\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$1\r\n{field}\r\n${}\r\n{value}\r\n",
+            key.len(),
+            value.len()
+        );
+        assert_eq!(count(&aof, sent.as_bytes()), 1, "{sent:?} in the AOF");
+    }
+    let mut master = master;
+    master.kill();
+    master.restart();
+    let mut c = master.conn();
+    let after: Vec<String> = keys.iter().map(|key| state(&mut c, key)).collect();
+    assert_eq!(after, before);
+}
+
 // ── SORT BY / GET of hash fields (#415 review) ───────────────────────────────
 
 /// `ids` = [1, 2, 3] and `obj:{id}` = { w } with w 30, 40, 20; `obj:2`'s `w`

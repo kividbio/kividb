@@ -426,6 +426,104 @@ fn test_incrbyfloat() {
     assert!((r3 - 3.15).abs() < 1e-9, "got {r3}");
 }
 
+/// `INCRBYFLOAT` and `HINCRBYFLOAT` add in `long double`, as Redis on
+/// x86-64 does, and write 17 places (#387). What Redis 8.10.2 replied.
+#[test]
+fn incrbyfloat_adds_as_redis_does() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (stored, by, sum) in [
+        ("0.1", "0.2", "0.3"),
+        ("0.3", "1e-17", "0.30000000000000001"),
+        ("1.1", "2.2", "3.3"),
+        ("0.3", "-0.1", "0.2"),
+        ("0", "1e-20", "0"),
+        ("12345678901234567890", "1", "12345678901234567891"),
+        (
+            "1234567.1234567",
+            "7654321.7654321",
+            "8888888.8888888000001316",
+        ),
+        ("0", "0x1p-3", "0.125"),
+        ("99999999999999999", "0.5", "99999999999999999.5"),
+    ] {
+        c.cmds(&["SET", "k", stored]);
+        assert_eq!(
+            c.cmds(&["INCRBYFLOAT", "k", by]).as_str(),
+            sum,
+            "{stored} + {by}"
+        );
+        assert_eq!(c.cmds(&["GET", "k"]).as_str(), sum);
+        c.cmds(&["HSET", "h", "f", stored]);
+        assert_eq!(
+            c.cmds(&["HINCRBYFLOAT", "h", "f", by]).as_str(),
+            sum,
+            "{stored} + {by}"
+        );
+        assert_eq!(c.cmds(&["HGET", "h", "f"]).as_str(), sum);
+    }
+
+    // Ten times 0.1 is 1.
+    c.cmds(&["DEL", "k"]);
+    for _ in 0..10 {
+        c.cmds(&["INCRBYFLOAT", "k", "0.1"]);
+    }
+    assert_eq!(c.cmds(&["GET", "k"]).as_str(), "1");
+
+    // A number too large for a double is one `long double` holds.
+    c.cmds(&["SET", "big", "1e400"]);
+    let sum = c.cmds(&["INCRBYFLOAT", "big", "1"]);
+    assert_eq!(sum.as_str().len(), 401);
+    assert!(
+        sum.as_str()
+            .starts_with("10000000000000000000281880683947586514586")
+    );
+
+    for (stored, by, error) in [
+        ("1e5000", "1", "ERR value is not a valid float"),
+        ("1", "1e-5000", "ERR value is not a valid float"),
+        ("1", "nan", "ERR value is not a valid float"),
+        ("1", " 1", "ERR value is not a valid float"),
+        ("1", "inf", "ERR increment would produce NaN or Infinity"),
+        ("inf", "1", "ERR increment would produce NaN or Infinity"),
+    ] {
+        c.cmds(&["SET", "k", stored]);
+        assert_eq!(
+            c.cmds(&["INCRBYFLOAT", "k", by]).error_str(),
+            error,
+            "{stored} + {by}"
+        );
+    }
+    c.cmds(&["HSET", "h", "f", "1"]);
+    assert_eq!(
+        c.cmds(&["HINCRBYFLOAT", "h", "f", "inf"]).error_str(),
+        "ERR value is NaN or Infinity"
+    );
+    assert_eq!(
+        c.cmds(&["HINCRBYFLOAT", "h", "f", "nan"]).error_str(),
+        "ERR value is not a valid float"
+    );
+    // Which error comes first, as in Redis 8.10.2: for `INCRBYFLOAT` the
+    // key's type, then the increment; for `HINCRBYFLOAT` the increment.
+    c.cmds(&["RPUSH", "l", "a"]);
+    for by in ["xyz", "inf"] {
+        assert_eq!(
+            c.cmds(&["INCRBYFLOAT", "l", by]).error_str(),
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        );
+    }
+    assert_eq!(
+        c.cmds(&["HINCRBYFLOAT", "l", "f", "xyz"]).error_str(),
+        "ERR value is not a valid float"
+    );
+    assert_eq!(
+        c.cmds(&["HINCRBYFLOAT", "l", "f", "inf"]).error_str(),
+        "ERR value is NaN or Infinity"
+    );
+}
+
 // Manual test scenario:
 //   SET k "Hello, World!"
 //   GETRANGE k 0 4           → "Hello"

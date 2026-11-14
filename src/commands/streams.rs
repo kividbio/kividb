@@ -13,12 +13,11 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::{
-    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner,
+    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntries, StreamId, StreamInner,
 };
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -519,13 +518,17 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         if (cmd.len() - i) < 2 || !(cmd.len() - i).is_multiple_of(2) {
             return resp_error("ERR wrong number of arguments: field-value pairs required");
         }
-        type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
-        let fields: FieldsType = cmd[i..]
+        // Borrowed from the command's arguments, which outlive `ctx`'s
+        // borrows below: the stream copies the bytes it keeps.
+        let fields: Vec<(&[u8], &[u8])> = cmd[i..]
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|chunk| (Arc::from(chunk[0]), Arc::from(chunk[1])))
+            .map(|&[field, value]| (field, value))
             .collect();
+        if !StreamEntries::fits(&fields) {
+            return resp_error("ERR Elements are too large to be stored");
+        }
 
         // Owned (producer, idempotent ID): the borrow of `ctx.cmd` ends here.
         let idmp: Option<(Vec<u8>, Arc<[u8]>)> =
@@ -642,9 +645,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
 
     let id_str_out = entry_id.to_string();
     stream_extra::record_append(&mut inner, &fields);
-    inner
-        .entries
-        .push_tail(entry_id.clone(), StreamEntry { fields });
+    inner.entries.push_tail(entry_id.clone(), &fields);
     inner.last_id = entry_id.clone();
     inner.entries_added += 1;
 
@@ -1417,7 +1418,7 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
             name: group,
             last_id,
             entries_read,
-            pel: BTreeMap::new(),
+            pel: Default::default(),
             consumers: AHashMap::new(),
             active: AHashMap::new(),
         },
@@ -1600,10 +1601,7 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
                     }
                     g.active.remove(&consumer);
                     // Remove all PEL entries for this consumer
-                    let pending: i64 =
-                        g.pel.values().filter(|p| p.consumer == consumer).count() as i64;
-                    g.pel.retain(|_, p| p.consumer != consumer);
-                    resp_integer(pending)
+                    resp_integer(g.pel.remove_consumer(&consumer) as i64)
                 }
             }
         }
@@ -2075,7 +2073,7 @@ fn run_xreadgroup_delivery(
                     let Some(entry) = entries.get(&id) else {
                         continue;
                     };
-                    let Some(pending) = g.pel.get_mut(&id) else {
+                    let Some(pending) = g.pel.get(&id) else {
                         continue;
                     };
                     let idle = if pending.delivered_at < stream_extra::NACKED_BELOW {
@@ -2087,7 +2085,9 @@ fn run_xreadgroup_delivery(
                     if !budget.admit(item.len()) {
                         break;
                     }
-                    pending.consumer = crate::types::StreamName::from(spec.consumer);
+                    let Some(pending) = g.pel.assign(&id, spec.consumer) else {
+                        continue;
+                    };
                     pending.delivered_at = now;
                     pending.delivery_count = pending.delivery_count.saturating_add(1);
                     effect(claim_effect(
@@ -2123,14 +2123,7 @@ fn run_xreadgroup_delivery(
                     break;
                 }
                 if !spec.noack {
-                    g.pel.insert(
-                        id.clone(),
-                        PelEntry {
-                            consumer: crate::types::StreamName::from(spec.consumer),
-                            delivered_at: now,
-                            delivery_count: 1,
-                        },
-                    );
+                    g.pel.insert(id.clone(), spec.consumer, now, 1);
                     effect(claim_effect(key, spec.group, spec.consumer, &id, now, 1));
                 }
                 shape.deliver(g, &id);
@@ -2148,10 +2141,10 @@ fn run_xreadgroup_delivery(
             } else {
                 Bound::Excluded(from)
             };
+            // Only this consumer's entries are walked, not the group's (#637).
             let pending_ids: Vec<StreamId> = g
                 .pel
-                .range((after, Bound::Unbounded))
-                .filter(|(_, p)| p.consumer == spec.consumer)
+                .consumer_range(spec.consumer, (after, Bound::Unbounded))
                 .take(spec.count)
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -2269,23 +2262,20 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                 let count = g.pel.len() as i64;
                 let min_id = g
                     .pel
-                    .keys()
-                    .next()
+                    .first_id()
                     .map(|id| id.to_string())
                     .unwrap_or_default();
-                let max_id = g
-                    .pel
-                    .keys()
-                    .next_back()
-                    .map(|id| id.to_string())
-                    .unwrap_or_default();
+                let max_id = g.pel.last_id().map(|id| id.to_string()).unwrap_or_default();
 
-                // Consumer → pending count
-                // By name, as Redis lists them (#564).
-                let mut per_consumer: BTreeMap<&[u8], i64> = BTreeMap::new();
-                for pel in g.pel.values() {
-                    *per_consumer.entry(pel.consumer.as_bytes()).or_insert(0) += 1;
-                }
+                // Consumer → pending count, from the per-consumer index
+                // rather than a walk of the list (#637). By name, as Redis
+                // lists them (#564).
+                let mut per_consumer: Vec<(&[u8], usize)> = g
+                    .pel
+                    .owners()
+                    .map(|(name, count)| (name.as_bytes(), count))
+                    .collect();
+                per_consumer.sort_unstable();
                 let consumer_list: Vec<Vec<u8>> = per_consumer
                     .iter()
                     .map(|(name, cnt)| {
@@ -2334,8 +2324,7 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                     .and_then(|b| std::str::from_utf8(b).ok())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(10);
-                let filter_consumer: Option<&str> =
-                    cmd.get(i + 3).and_then(|b| std::str::from_utf8(b).ok());
+                let filter_consumer: Option<&[u8]> = cmd.get(i + 3).copied();
 
                 let (lo, hi, count) = match id_interval(start_str, end_str) {
                     Ok(Some((lo, hi))) => (lo, hi, count),
@@ -2344,16 +2333,13 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                 };
                 let now = now_ms();
 
-                let items: Vec<Vec<u8>> = g
-                    .pel
-                    .range(lo..=hi)
-                    .filter(|(_, p)| {
-                        if let Some(fc) = filter_consumer {
-                            p.consumer == fc
-                        } else {
-                            true
-                        }
-                    })
+                // With a consumer, only its own entries are walked (#637).
+                let in_range: Box<dyn Iterator<Item = (&StreamId, &PelEntry)>> =
+                    match filter_consumer {
+                        Some(consumer) => Box::new(g.pel.consumer_range(consumer, lo..=hi)),
+                        None => Box::new(g.pel.range(lo..=hi)),
+                    };
+                let items: Vec<Vec<u8>> = in_range
                     .filter(|(_, p)| {
                         if let Some(idle) = min_idle {
                             now.saturating_sub(p.delivered_at) >= idle
@@ -2374,7 +2360,7 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                         };
                         resp_array(vec![
                             resp_bulk_str(&id.to_string()),
-                            resp_bulk(&p.consumer),
+                            resp_bulk(p.consumer()),
                             resp_integer(idle),
                             resp_integer(p.delivery_count as i64),
                         ])
@@ -2560,12 +2546,11 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
 
                 // An entry FORCE makes starts as one delivery, as Redis's
                 // `streamCreateNACK` makes it (JUSTID then leaves it at 1).
-                let pending = g.pel.entry(id.clone()).or_insert(PelEntry {
-                    consumer: new_consumer.clone(),
-                    delivered_at,
-                    delivery_count: 1,
-                });
-                pending.consumer = new_consumer.clone();
+                let pending = if g.pel.contains_key(id) {
+                    g.pel.assign(id, &new_consumer).expect("pending")
+                } else {
+                    g.pel.insert(id.clone(), &new_consumer, delivered_at, 1)
+                };
                 pending.delivered_at = delivered_at;
                 pending.delivery_count = match retry_count {
                     Some(n) => n,
@@ -2719,10 +2704,9 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
                 if now.saturating_sub(last_delivered) < min_idle {
                     continue;
                 }
-                let Some(pending) = g.pel.get_mut(&id) else {
+                let Some(pending) = g.pel.assign(&id, &new_consumer) else {
                     continue;
                 };
-                pending.consumer = new_consumer.clone();
                 pending.delivered_at = now;
                 if !justid {
                     pending.delivery_count = pending.delivery_count.saturating_add(1);
@@ -2839,14 +2823,12 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
             }
             let first_entry = inner
                 .entries
-                .iter()
-                .next()
+                .first()
                 .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
             let last_entry = inner
                 .entries
-                .range_rev(..)
-                .next()
+                .last()
                 .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
 
@@ -2971,7 +2953,7 @@ fn xinfo_stream_full(
                 .map(|(id, p)| {
                     resp_array(vec![
                         resp_bulk_str(&id.to_string()),
-                        resp_bulk(&p.consumer),
+                        resp_bulk(p.consumer()),
                         resp_integer(shown_delivery_time(p.delivered_at)),
                         resp_integer(p.delivery_count as i64),
                     ])
@@ -2980,8 +2962,9 @@ fn xinfo_stream_full(
             let consumers: Vec<Vec<u8>> = consumers_in_order(g)
                 .into_iter()
                 .map(|(name, seen)| {
-                    let own = || g.pel.iter().filter(|(_, p)| p.consumer == *name);
-                    let pel: Vec<Vec<u8>> = own()
+                    let pel: Vec<Vec<u8>> = g
+                        .pel
+                        .consumer_range(name, ..)
                         .take(count)
                         .map(|(id, p)| {
                             resp_array(vec![
@@ -3001,7 +2984,7 @@ fn xinfo_stream_full(
                             resp_bulk_str("active-time"),
                             resp_integer(g.active.get(name).map_or(-1, |at| *at as i64)),
                             resp_bulk_str("pel-count"),
-                            resp_integer(own().count() as i64),
+                            resp_integer(g.pel.consumer_len(name) as i64),
                             resp_bulk_str("pending"),
                             resp_array(pel),
                         ],
@@ -3023,7 +3006,7 @@ fn xinfo_stream_full(
                     resp_integer(g.pel.len() as i64),
                     // Entries `XNACK` released: pending, and no one's.
                     resp_bulk_str("nacked-count"),
-                    resp_integer(g.pel.values().filter(|p| p.consumer.is_empty()).count() as i64),
+                    resp_integer(g.pel.consumer_len(b"") as i64),
                     // Redis 8.10's name for the pending entries, here and
                     // for each consumer (it was `pel`).
                     resp_bulk_str("pending"),
@@ -3144,7 +3127,8 @@ fn xinfo_consumers(ctx: &mut Ctx) -> Vec<u8> {
             let consumers: Vec<Vec<u8>> = consumers_in_order(g)
                 .into_iter()
                 .map(|(name, last_seen)| {
-                    let pending = g.pel.values().filter(|p| p.consumer == *name).count() as i64;
+                    // From the per-consumer index: no walk of the list (#637).
+                    let pending = g.pel.consumer_len(name) as i64;
                     let idle = now.saturating_sub(last_seen);
                     // Since it was last handed entries; -1 if it never was.
                     let inactive = g
@@ -3672,7 +3656,9 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
 
             let mut released = 0i64;
             for (pos, id) in ids.iter().enumerate() {
-                match g.pel.get_mut(id) {
+                // Unowned, and immediately claimable, after what was
+                // released before it.
+                match g.pel.assign(id, b"") {
                     Some(entry) => {
                         entry.delivery_count = match retrycount {
                             // RETRYCOUNT overrides the mode-based adjustment.
@@ -3686,9 +3672,6 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                                 Mode::Fatal => i64::MAX as u64,
                             },
                         };
-                        // Unowned, and immediately claimable, after what
-                        // was released before it.
-                        entry.consumer = crate::types::StreamName::default();
                         entry.delivered_at = stream_extra::nack_time();
                         released += 1;
                     }
@@ -3703,14 +3686,8 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                             (None, Mode::Fatal) => i64::MAX as u64,
                             (None, _) => 0,
                         };
-                        g.pel.insert(
-                            id.clone(),
-                            PelEntry {
-                                consumer: crate::types::StreamName::default(),
-                                delivered_at: stream_extra::nack_time(),
-                                delivery_count,
-                            },
-                        );
+                        g.pel
+                            .insert(id.clone(), b"", stream_extra::nack_time(), delivery_count);
                         released += 1;
                     }
                     // Not pending and no FORCE — ignored, not counted.

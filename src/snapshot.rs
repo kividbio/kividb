@@ -3,8 +3,7 @@ use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::SharedBytes;
 use crate::types::{
-    ConsumerGroup, KiviDBValue, PelEntry, SortedSetInner, StreamEntry, StreamId, StreamInner,
-    TsInner,
+    ConsumerGroup, KiviDBValue, Pel, SortedSetInner, StreamId, StreamInner, TsInner,
 };
 use crate::types::{VSetEntry, VectorSetInner};
 use crate::vector::{DistanceMetric, FieldType, IndexOn, IndexSchema, SchemaField, VectorAlgo};
@@ -446,7 +445,7 @@ fn write_stream_groups(w: &mut impl Write, inner: &StreamInner) -> io::Result<()
         w.write_all(&(g.pel.len() as u32).to_le_bytes())?;
         for (id, pel) in g.pel.iter() {
             write_stream_id(w, id)?;
-            write_bytes(w, pel.consumer.as_bytes())?;
+            write_bytes(w, pel.consumer().as_bytes())?;
             w.write_all(&pel.delivered_at.to_le_bytes())?;
             w.write_all(&pel.delivery_count.to_le_bytes())?;
         }
@@ -524,6 +523,7 @@ fn read_stream_idmp(r: &mut impl Read, stream: &mut StreamInner) -> io::Result<(
 fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
     let count = read_u32_le(r)? as usize;
     let mut stream = StreamInner::new();
+    let mut entries = crate::types::LoadedEntries::new();
     for _ in 0..count {
         let id = read_stream_id(r)?;
         let fcount = read_u32_le(r)? as usize;
@@ -531,10 +531,17 @@ fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
         for _ in 0..fcount {
             let f = read_bytes(r)?;
             let v = read_bytes(r)?;
-            fields.push((Arc::from(f.as_slice()), Arc::from(v.as_slice())));
+            fields.push((f, v));
         }
-        stream.entries.insert_loaded(id, StreamEntry { fields });
+        if !crate::types::StreamEntries::fits(&fields) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream entry's field names are too large",
+            ));
+        }
+        entries.insert(id, &fields);
     }
+    stream.entries = entries.finish();
     stream.last_id = read_stream_id(r)?;
     Ok(stream)
 }
@@ -556,20 +563,15 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
         let last_id = read_stream_id(r)?;
         let entries_read = read_u64_le(r)?;
         let pel_count = read_u32_le(r)? as usize;
-        let mut pel = std::collections::BTreeMap::new();
+        // Inserting each entry builds the per-consumer index, which is not
+        // saved.
+        let mut pel = Pel::new();
         for _ in 0..pel_count {
             let id = read_stream_id(r)?;
-            let consumer = crate::types::StreamName::from(read_bytes(r)?);
+            let consumer = read_bytes(r)?;
             let delivered_at = read_u64_le(r)?;
             let delivery_count = read_u64_le(r)?;
-            pel.insert(
-                id,
-                PelEntry {
-                    consumer,
-                    delivered_at,
-                    delivery_count,
-                },
-            );
+            pel.insert(id, &consumer, delivered_at, delivery_count);
         }
         let ccount = read_u32_le(r)? as usize;
         let mut consumers = AHashMap::with_capacity(hint(ccount));
@@ -873,6 +875,12 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             w.write_all(&inner.next_insert.to_le_bytes())?;
             w.write_all(&inner.ring_size.unwrap_or(0).to_le_bytes())?;
         }
+
+        // The probabilistic types: their tag, then `sketch::write_kdb`.
+        ValueRef::Sketch(arc) => {
+            w.write_all(&[crate::sketch::TAG_SKETCH])?;
+            crate::sketch::write_kdb(w, &arc.read())?;
+        }
     }
     Ok(())
 }
@@ -1133,13 +1141,61 @@ fn read_language_section(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::
 }
 
 /// The libraries loaded now, as a `FUNCTION DUMP` payload: `None` when there
-/// is none, or in a build without Lua, which cannot load any.
-fn function_libraries() -> Option<Vec<u8>> {
+/// is none. In a build without Lua, the libraries of the image it loaded,
+/// kept as they were ([`KEPT_FUNCTIONS`]): shared, not copied, by every save.
+fn function_libraries() -> Option<std::sync::Arc<[u8]>> {
     #[cfg(feature = "lua")]
-    let libraries = crate::commands::library_snapshot();
+    let libraries = crate::commands::library_snapshot().map(std::sync::Arc::from);
     #[cfg(not(feature = "lua"))]
-    let libraries = None;
+    let libraries = KEPT_FUNCTIONS.get();
     libraries
+}
+
+/// The function libraries a build without Lua was given (by a snapshot, an
+/// AOF's preamble, a Redis RDB file or a master's full sync), as the payload
+/// they came in. It cannot run them, but it writes them back unchanged into
+/// every image it makes, so that going from the `full` or `lua` build to the
+/// default one and back (the `kividb-full` and `kividb` packages, #732)
+/// leaves them where they were. Replaced, like loaded libraries, by the next
+/// image loaded, and emptied by `FUNCTION FLUSH` ([`flush_kept_functions`]).
+/// A replica keeps the libraries of its last full sync: the `FUNCTION`
+/// commands its master sends after it are refused here, and logged.
+#[cfg(not(feature = "lua"))]
+static KEPT_FUNCTIONS: KeptFunctions = KeptFunctions::new();
+
+/// A payload held as it came: see [`KEPT_FUNCTIONS`].
+#[cfg(not(feature = "lua"))]
+struct KeptFunctions(std::sync::Mutex<Option<std::sync::Arc<[u8]>>>);
+
+#[cfg(not(feature = "lua"))]
+impl KeptFunctions {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    fn get(&self) -> Option<std::sync::Arc<[u8]>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set(&self, payload: Option<std::sync::Arc<[u8]>>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = payload;
+    }
+}
+
+/// Whether a build without Lua holds function libraries it cannot run
+/// ([`KEPT_FUNCTIONS`]). Unused by the binary; the tests read it.
+#[cfg(not(feature = "lua"))]
+#[allow(dead_code)]
+pub fn holds_kept_functions() -> bool {
+    KEPT_FUNCTIONS.get().is_some()
+}
+
+/// `FUNCTION FLUSH` in a build without Lua: the libraries it kept are
+/// dropped, and its next snapshot has none. Propagated like any write, so
+/// the AOF and the replicas drop theirs too.
+#[cfg(not(feature = "lua"))]
+pub fn flush_kept_functions() {
+    KEPT_FUNCTIONS.set(None);
 }
 
 /// The function libraries' section, which closes a KDB image. Absent when
@@ -1156,8 +1212,8 @@ fn write_kdb_functions_section(w: &mut impl Write, libraries: Option<&[u8]>) -> 
 /// in place of those loaded, as Redis does with the ones in an RDB file: an
 /// image without any leaves none.
 ///
-/// A build without Lua cannot load them, and says so: they are not in its
-/// next snapshot.
+/// A build without Lua cannot load them, and says so. It keeps them as they
+/// came and writes them back into its next snapshot ([`KEPT_FUNCTIONS`]).
 pub fn restore_functions(functions: Option<Vec<u8>>) -> io::Result<()> {
     #[cfg(feature = "lua")]
     crate::commands::restore_library_snapshot(functions.as_deref()).map_err(|e| {
@@ -1167,15 +1223,25 @@ pub fn restore_functions(functions: Option<Vec<u8>>) -> io::Result<()> {
         )
     })?;
     #[cfg(not(feature = "lua"))]
-    if let Some(payload) = functions {
-        let names = function_library_names(&payload)
-            .map(|names| format!(" {}", names.join(", ")))
-            .unwrap_or_default();
+    KEPT_FUNCTIONS.set(functions.and_then(|payload| {
+        // Only libraries it can read the names of: a payload of any other
+        // shape would be handed on to a build with Lua, which refuses to
+        // start on a snapshot whose libraries it cannot load.
+        let Some(names) = function_library_names(&payload) else {
+            log_warn!(
+                "the snapshot's function libraries are not loaded and not kept: this build \
+                 was made without Lua, and their payload cannot be read"
+            );
+            return None;
+        };
         log_warn!(
-            "the snapshot's function libraries{names} are not loaded: this build was made \
-             without Lua, and they are not in its next snapshot"
+            "the snapshot's function libraries {} are not loaded: this build was made \
+             without Lua, so FUNCTION and FCALL are refused. They are kept as they are, \
+             and saved again in this server's snapshots, for a build with Lua",
+            names.join(", ")
         );
-    }
+        Some(std::sync::Arc::from(payload))
+    }));
     Ok(())
 }
 
@@ -1679,9 +1745,14 @@ pub fn load_snapshot_from(r: impl Read) -> io::Result<LoadedSnapshot> {
     read_image(r, true, &[], &mut Vec::new(), server_databases()).map(|(loaded, _)| loaded)
 }
 
-/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]).
+/// The databases a snapshot may have keys in (see [`SNAPSHOT_DATABASES`]):
+/// database 0 alone on a cluster node ([`SNAPSHOT_CLUSTER`]).
 fn server_databases() -> usize {
-    SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
+    if SNAPSHOT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// [`load_snapshot_from`] for an image in memory, read again as
@@ -2559,6 +2630,9 @@ fn read_image(
                     arr.ring_size = if ring == 0 { None } else { Some(ring) };
                     KiviDBValue::Array(Arc::new(parking_lot::RwLock::new(arr)))
                 }
+                crate::sketch::TAG_SKETCH => KiviDBValue::Sketch(Arc::new(
+                    parking_lot::RwLock::new(crate::sketch::read_kdb(&mut r)?),
+                )),
                 unknown => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -3156,7 +3230,7 @@ fn rdb_read_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
     }
 }
 
-fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
+pub(crate) fn rdb_read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let (len, is_encoded) = rdb_read_length(r)?;
 
     if is_encoded {
@@ -3228,6 +3302,39 @@ fn too_long() -> io::Error {
 pub static SNAPSHOT_DATABASES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(16);
 
+/// The server is a cluster node, set as it starts: a snapshot may have keys
+/// in database 0 only, the one database a cluster serves (`SELECT` is
+/// refused there). Keys in the others were loaded where no client could
+/// reach them, and slot accounting and migration never saw them (#484).
+/// Redis refuses to start with them; so does KiviDB, and a replica refuses
+/// such a full sync before it touches its dataset.
+pub static SNAPSHOT_CLUSTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// What refuses a dataset with keys outside database 0 on a cluster node,
+/// as Redis words it.
+pub const CLUSTER_KEYS_OUTSIDE_DB0: &str =
+    "can't have keys in a DB different than DB 0 when in Cluster mode";
+
+/// How a node that refused to start for [`CLUSTER_KEYS_OUTSIDE_DB0`] is
+/// brought back with its keys, which it left on disk.
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_START: &str = concat!(
+    "The data on disk is kept. To recover it: start this node once without ",
+    "cluster-enabled, in the same directory and with the same persistence settings; in each ",
+    "database other than 0, move its keys into database 0 (SELECT n, then MOVE key 0) or ",
+    "delete them (FLUSHDB); then SAVE, or BGREWRITEAOF if the AOF is on, stop it, and start ",
+    "it as a cluster node again",
+);
+
+/// What a cluster replica that refused a full sync for
+/// [`CLUSTER_KEYS_OUTSIDE_DB0`] asks of its master's operator.
+pub const CLUSTER_KEYS_OUTSIDE_DB0_AT_SYNC: &str = concat!(
+    "the master holds keys outside database 0, which a cluster node cannot serve (an older ",
+    "KiviDB let MOVE, SWAPDB and COPY ... DB put them there). Move them into database 0 on ",
+    "the master, or delete them: restarted once without cluster-enabled, it can reach them ",
+    "(SELECT n, then MOVE key 0, or FLUSHDB). This replica syncs again on its next try",
+);
+
 /// The largest number of databases the refusal of a snapshot advises
 /// starting with. A database number past it is more likely a damaged file
 /// than a server to configure.
@@ -3238,6 +3345,9 @@ const DATABASES_ADVISED_MAX: u64 = 1 << 16;
 fn database_of_snapshot(db: u64, databases: usize, what: &str) -> Result<usize, String> {
     match usize::try_from(db) {
         Ok(index) if index < databases => Ok(index),
+        _ if SNAPSHOT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) => Err(format!(
+            "{CLUSTER_KEYS_OUTSIDE_DB0}: the file has {what} in database {db}"
+        )),
         _ if db < DATABASES_ADVISED_MAX => Err(format!(
             "the file has {what} in database {db}, and this server has {databases} databases: \
              start it with databases {} or more",
@@ -3264,7 +3374,7 @@ impl std::fmt::Display for PastDatabases {
 
 impl std::error::Error for PastDatabases {}
 
-fn is_past_databases(e: &io::Error) -> bool {
+pub(crate) fn is_past_databases(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<PastDatabases>())
 }
 
@@ -3387,7 +3497,7 @@ pub fn load_redis_rdb_from(r: impl Read) -> io::Result<RedisRdb> {
             0xFE => {
                 // Database selector
                 let (db_num, _) = rdb_read_length(&mut r)?;
-                let databases = SNAPSHOT_DATABASES.load(std::sync::atomic::Ordering::Relaxed);
+                let databases = server_databases();
                 current_db =
                     database_of_snapshot(db_num, databases, "keys").map_err(rdb_invalid)?;
                 if current_db >= result.len() {
@@ -3932,7 +4042,7 @@ fn rdb_invalid(what: impl std::fmt::Display) -> io::Error {
 }
 
 /// A length as an RDB writes one, not an integer encoding.
-fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
+pub(crate) fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
     match rdb_read_length(r)? {
         (n, false) => Ok(n),
         (_, true) => Err(rdb_invalid("an encoded integer where a length belongs")),
@@ -4016,13 +4126,12 @@ impl<'a> LpCursor<'a> {
 /// Type 26 on ends with idempotent production: duration, size, and for each
 /// producer its idempotent IDs and the entries they made, then two counters.
 fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
-    use crate::types::{
-        ConsumerGroup, IdmpRecord, PelEntry, ProducerIdmp, StreamEntry, StreamInner,
-    };
+    use crate::types::{ConsumerGroup, IdmpRecord, ProducerIdmp, StreamInner};
     const DELETED: i64 = 1;
     const SAMEFIELDS: i64 = 2;
 
     let mut stream = StreamInner::new();
+    let mut entries = crate::types::LoadedEntries::new();
     for _ in 0..rdb_read_plain_length(r)? {
         let master = raw_stream_id(&rdb_read_string(r)?)
             .ok_or_else(|| rdb_invalid("stream node key is not a stream ID"))?;
@@ -4030,8 +4139,8 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
         let mut lp = LpCursor(elements.iter());
         let live = lp.count()?;
         let deleted = lp.count()?;
-        let master_fields: Vec<Arc<[u8]>> = (0..lp.count()?)
-            .map(|_| lp.bytes().map(Arc::from))
+        let master_fields: Vec<&[u8]> = (0..lp.count()?)
+            .map(|_| lp.bytes())
             .collect::<io::Result<_>>()?;
         if lp.int()? != 0 {
             return Err(rdb_invalid("stream master entry is not closed by 0"));
@@ -4048,14 +4157,14 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             let (Some(ms), Some(seq)) = (ms, seq) else {
                 return Err(rdb_invalid("stream entry ID out of range"));
             };
-            let fields: crate::types::FieldsType = if flags & SAMEFIELDS != 0 {
+            let fields: Vec<(&[u8], &[u8])> = if flags & SAMEFIELDS != 0 {
                 master_fields
                     .iter()
-                    .map(|field| Ok((Arc::clone(field), Arc::from(lp.bytes()?))))
+                    .map(|&field| Ok((field, lp.bytes()?)))
                     .collect::<io::Result<_>>()?
             } else {
                 (0..lp.count()?)
-                    .map(|_| Ok((Arc::from(lp.bytes()?), Arc::from(lp.bytes()?))))
+                    .map(|_| Ok((lp.bytes()?, lp.bytes()?)))
                     .collect::<io::Result<_>>()?
             };
             lp.int()?; // how many elements the entry took
@@ -4063,9 +4172,10 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
                 seen_deleted += 1;
             } else {
                 seen_live += 1;
-                stream
-                    .entries
-                    .insert_loaded(crate::types::StreamId { ms, seq }, StreamEntry { fields });
+                if !crate::types::StreamEntries::fits(&fields) {
+                    return Err(rdb_invalid("stream entry's field names are too large"));
+                }
+                entries.insert(crate::types::StreamId { ms, seq }, &fields);
             }
         }
         if (seen_live, seen_deleted) != (live, deleted) {
@@ -4074,6 +4184,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             ));
         }
     }
+    stream.entries = entries.finish();
 
     let length = rdb_read_plain_length(r)?;
     stream.last_id = rdb_read_stream_id(r)?;
@@ -4112,15 +4223,11 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             let id = rdb_read_raw_stream_id(r)?;
             let delivered_at = rdb_read_millisecond_time(r)?.max(0) as u64;
             let delivery_count = rdb_read_plain_length(r)?;
-            // Owned by no one until a consumer below claims it.
-            let entry = PelEntry {
-                consumer: crate::types::StreamName::default(),
-                delivered_at,
-                delivery_count,
-            };
-            if group.pel.insert(id, entry).is_some() {
+            if group.pel.contains_key(&id) {
                 return Err(rdb_invalid("a pending entry is listed twice"));
             }
+            // Owned by no one until a consumer below claims it.
+            group.pel.insert(id, b"", delivered_at, delivery_count);
         }
         for _ in 0..rdb_read_plain_length(r)? {
             let consumer = crate::types::StreamName::from(rdb_read_string(r)?);
@@ -4137,8 +4244,10 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             }
             for _ in 0..rdb_read_plain_length(r)? {
                 let id = rdb_read_raw_stream_id(r)?;
-                match group.pel.get_mut(&id) {
-                    Some(entry) if entry.consumer.is_empty() => entry.consumer = consumer.clone(),
+                match group.pel.get(&id) {
+                    Some(entry) if entry.consumer().is_empty() => {
+                        group.pel.assign(&id, &consumer);
+                    }
                     _ => return Err(rdb_invalid("a consumer owns an entry the group does not")),
                 }
             }
@@ -4147,7 +4256,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             for _ in 0..rdb_read_plain_length(r)? {
                 let id = rdb_read_raw_stream_id(r)?;
                 match group.pel.get_mut(&id) {
-                    Some(entry) if entry.consumer.is_empty() => entry.delivered_at = 0,
+                    Some(entry) if entry.consumer().is_empty() => entry.delivered_at = 0,
                     _ => return Err(rdb_invalid("a released entry is owned or not pending")),
                 }
             }
@@ -4293,6 +4402,12 @@ fn module_type_name(id: u64) -> (String, u64) {
 /// are refused.
 fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
     let (name, encoding_version) = module_type_name(rdb_read_plain_length(r)?);
+    // The probabilistic types (Bloom filters, ...).
+    if let Some(sketch) = crate::sketch::redis_module::read(&name, encoding_version, r)? {
+        return Ok(KiviDBValue::Sketch(Arc::new(parking_lot::RwLock::new(
+            sketch,
+        ))));
+    }
     if name != "ReJSON-RL" {
         return Err(rdb_extensions::unrepresentable(format!(
             "values of module type {name} are not supported"
@@ -4958,7 +5073,7 @@ pub struct FrozenDataset {
     index_section: Vec<u8>,
     alias_section: Vec<u8>,
     /// The function libraries at the same instant.
-    functions: Option<Vec<u8>>,
+    functions: Option<std::sync::Arc<[u8]>>,
     /// The indexes' languages (see [`write_kdb_language_section`]).
     language_section: Vec<u8>,
     /// The indexes' scores (see [`write_kdb_score_section`]).
@@ -4972,8 +5087,14 @@ pub struct FrozenDataset {
 
 /// What one thread of the capture took: a hold on each string's entry
 /// (its key, bytes and time to live, which do not change while held),
-/// everything else laid out, and the times to live of everything else.
-type FrozenPart = (Vec<store::EntryRef>, Vec<u8>, Vec<(Key, u64)>);
+/// everything else laid out but the probabilistic values, copies of those
+/// (see [`FrozenDb::sketches`]), and the times to live of everything else.
+type FrozenPart = (
+    Vec<store::EntryRef>,
+    Vec<u8>,
+    Vec<(Key, crate::sketch::Sketch)>,
+    Vec<(Key, u64)>,
+);
 
 #[derive(Default)]
 struct FrozenDb {
@@ -4981,6 +5102,11 @@ struct FrozenDb {
     strings: Vec<Vec<store::EntryRef>>,
     /// Complete KDB entries for every non-string key, likewise.
     encoded: Vec<Vec<u8>>,
+    /// The probabilistic values, as copies that share their bytes with the
+    /// store's (`sketch::bloom::LayerBytes`): taken in no time while writes
+    /// are held, and laid out once they go on again. A write meanwhile
+    /// copies the layer it writes to, not the capture.
+    sketches: Vec<Vec<(Key, crate::sketch::Sketch)>>,
     /// The non-string keys with a time to live, and when it ends (Unix
     /// milliseconds), likewise.
     timed: Vec<Vec<(Key, u64)>>,
@@ -5046,6 +5172,7 @@ fn freeze(
                     scope.spawn(move || {
                         let mut strings = Vec::new();
                         let mut encoded = Vec::new();
+                        let mut sketches = Vec::new();
                         let mut timed = Vec::new();
                         for shard in run {
                             let map = read_lock!(shard);
@@ -5056,6 +5183,13 @@ fn freeze(
                                     // the key, nor of the bytes, nor of
                                     // its time to live.
                                     ValueRef::String(_) => strings.push(entry.hold()),
+                                    ValueRef::Sketch(sketch) => {
+                                        let copy = sketch.read().clone();
+                                        sketches.push((Key::from(entry.key()), copy));
+                                        if let Some(at) = entry.expires() {
+                                            timed.push((Key::from(entry.key()), at));
+                                        }
+                                    }
                                     other => {
                                         write_kdb_entry(&mut encoded, entry.key(), other)?;
                                         if let Some(at) = entry.expires() {
@@ -5065,7 +5199,7 @@ fn freeze(
                                 }
                             }
                         }
-                        Ok((strings, encoded, timed))
+                        Ok((strings, encoded, sketches, timed))
                     })
                 })
                 .collect();
@@ -5079,9 +5213,10 @@ fn freeze(
         });
         let mut frozen = FrozenDb::default();
         for part in parts {
-            let (strings, encoded, timed) = part?;
+            let (strings, encoded, sketches, timed) = part?;
             frozen.strings.push(strings);
             frozen.encoded.push(encoded);
+            frozen.sketches.push(sketches);
             frozen.timed.push(timed);
         }
         dbs.push(frozen);
@@ -5106,7 +5241,7 @@ fn freeze(
         + index_section.capacity()
         + alias_section.capacity()
         + language_section.capacity()
-        + functions.as_ref().map_or(0, Vec::capacity)
+        + functions.as_ref().map_or(0, |f| f.len())
         + score_section.capacity();
 
     Ok(FrozenDataset {
@@ -5151,9 +5286,24 @@ impl FrozenDataset {
             .flat_map(|db| db.encoded.iter())
             .map(Vec::len)
             .sum();
-        let mut out = Vec::with_capacity(
-            16 + strings_bytes + encoded_bytes + self.index_section.len() + 4 * self.dbs.len(),
-        );
+        let sketch_bytes: u64 = self
+            .dbs
+            .iter()
+            .flat_map(|db| db.sketches.iter().flatten())
+            .map(|(key, sketch)| 4 + key.len() as u64 + 1 + sketch.kdb_len())
+            .sum();
+        // Asked for, not assumed: the image of a large dataset may not be
+        // had, and then the full sync or backup fails, not the process.
+        let want = (16 + strings_bytes + encoded_bytes + self.index_section.len())
+            .saturating_add(4 * self.dbs.len())
+            .saturating_add(usize::try_from(sketch_bytes).unwrap_or(usize::MAX));
+        let mut out = Vec::new();
+        out.try_reserve_exact(want).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("not enough memory for a snapshot image of {want} bytes"),
+            )
+        })?;
         let mut not_counted = crate::memory_use::NotCounted::new(out.capacity());
         let before = out.capacity();
         self.write_to(&mut out)?;
@@ -5198,6 +5348,15 @@ impl FrozenDataset {
             timed_strings.push(timed);
             for encoded in &db.encoded {
                 out.write_all(encoded)?;
+            }
+            // Each copy goes as soon as it is written, as each string's
+            // hold does.
+            for part in std::mem::take(&mut db.sketches) {
+                for (key, sketch) in part {
+                    write_key(out, key.as_bytes())?;
+                    out.write_all(&[crate::sketch::TAG_SKETCH])?;
+                    crate::sketch::write_kdb(out, &sketch)?;
+                }
             }
             write_kdb_db_end(out)?;
         }
@@ -5308,6 +5467,14 @@ const DUMP_IMAGE_KEY: &str = "v";
 /// so every type can be dumped, restored and migrated. `RESTORE` tells the two
 /// forms apart by the image's magic.
 pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
+    // The probabilistic types are dumped as Redis dumps them, so that Redis
+    // can restore them too; `RESTORE` here reads both.
+    // A copy (its layers shared, so no bytes are copied), and no guard held
+    // while the payload is laid out and its CRC taken.
+    if let KiviDBValue::Sketch(sketch) = value {
+        let copy = sketch.read().clone();
+        return crate::sketch::redis_module::dump_payload(&copy);
+    }
     // A time series goes without its links to other series, its compaction
     // rules and the series it is a compaction of, as RedisTimeSeries leaves
     // them out of a `DUMP`: they name keys, which the payload may be
@@ -5536,6 +5703,13 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "DUMP not supported for TimeSeries and VectorSet keys",
+            ));
+        }
+        // `dump_payload` writes these itself, in Redis's format.
+        KiviDBValue::Sketch(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "probabilistic values have no compact encoding",
             ));
         }
         KiviDBValue::Array(arc) => {
@@ -6667,7 +6841,7 @@ mod field_option_tests {
         let mut frozen = freeze_dataset_for_disk(&db, Some(&store)).unwrap();
         // Include the function section even in a build without Lua, so the
         // ordering covers every section an image can carry.
-        frozen.functions = Some(b"KVFN payload".to_vec());
+        frozen.functions = Some(std::sync::Arc::from(&b"KVFN payload"[..]));
         frozen.into_payload().unwrap()
     }
 
@@ -6991,11 +7165,19 @@ mod function_section_tests {
         }
     }
 
-    /// A build without Lua loads such an image, and leaves the libraries out.
+    /// A build without Lua holds the libraries it was given as they came,
+    /// and lets them go when it is given none. On a holder of its own: the
+    /// server's one is process-global, and every other test here writes
+    /// images (tests/functions_without_lua.rs has the server's own).
     #[cfg(not(feature = "lua"))]
     #[test]
-    fn a_build_without_lua_loads_an_image_with_libraries() {
-        assert!(restore_functions(Some(b"KVFN payload".to_vec())).is_ok());
+    fn a_build_without_lua_keeps_the_libraries_it_was_given() {
+        let kept = KeptFunctions::new();
+        assert_eq!(kept.get(), None);
+        kept.set(Some(std::sync::Arc::from(&b"KVFN payload"[..])));
+        assert_eq!(kept.get().as_deref(), Some(&b"KVFN payload"[..]));
+        kept.set(None);
+        assert_eq!(kept.get(), None);
     }
 }
 

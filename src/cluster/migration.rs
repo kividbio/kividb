@@ -844,7 +844,8 @@ fn delete_keys(
             came_back: run.came_back,
         };
     };
-    for shard in db.iter() {
+    let holds = crate::store::shards_of_slots(db.len(), |slot| run.deletes(slot));
+    for (shard, _) in db.iter().zip(holds).filter(|(_, holds)| *holds) {
         let keys: Vec<crate::store::Key> = crate::read_lock!(shard)
             .keys()
             .filter(|k| run.deletes(key_hash_slot(k)))
@@ -1157,7 +1158,8 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
     let Some(db) = env.store.first() else {
         return Ok(out);
     };
-    for shard in db.iter() {
+    let holds = crate::store::shards_of_slots(db.len(), |slot| in_ranges(ranges, slot));
+    for (shard, _) in db.iter().zip(holds).filter(|(_, holds)| *holds) {
         let map = crate::read_lock!(shard);
         for entry in map.entries() {
             let key = entry.key();

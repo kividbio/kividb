@@ -133,8 +133,42 @@ fn parse_json(text: Option<&str>) -> Result<Value, Vec<u8>> {
         .ok_or_else(|| resp_error("ERR invalid JSON value"))
 }
 
-fn json_text(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
+/// JSON as RedisJSON writes it: serde_json's text, with no `+` in an
+/// exponent: `1e21` and `1.8446744073709552e19`, as RedisJSON's serde_json
+/// (with `ryu`) writes them, not `1e+21` (#473).
+struct RedisJsonFormatter;
+
+impl serde_json::ser::Formatter for RedisJsonFormatter {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        let mut text = Vec::with_capacity(32);
+        serde_json::ser::CompactFormatter.write_f64(&mut text, value)?;
+        match memchr::memchr(b'+', &text) {
+            Some(at) => {
+                writer.write_all(&text[..at])?;
+                writer.write_all(&text[at + 1..])
+            }
+            None => writer.write_all(&text),
+        }
+    }
+}
+
+/// `value` as JSON text, as `JSON.GET` returns it.
+pub(crate) fn json_text<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    String::from_utf8(json_bytes(value)).unwrap_or_default()
+}
+
+/// [`json_text`] as bytes.
+pub(crate) fn json_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, RedisJsonFormatter);
+    if value.serialize(&mut serializer).is_err() {
+        return Vec::new();
+    }
+    out
 }
 
 fn type_name(value: &Value) -> &'static str {
@@ -634,10 +668,13 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
         Ok(query) => query,
         Err(e) => return e,
     };
-    write_doc(ctx, key, resp_null_bulk(), |root| {
+    let missing = resp_error("ERR could not perform this operation on a key that doesn't exist");
+    write_doc(ctx, key, missing, |root| {
         if !query.selects() {
             return resp_error(NOT_A_SELECTION);
         }
+        // A legacy path changes every number it matches too, as in RedisJSON
+        // (`..x` adds to every `x`); only the reply differs (#471).
         let locations = query.locations(root);
         // Work everything out before changing anything, so a result that is
         // out of range fails the command and leaves the document alone.
@@ -651,19 +688,17 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
                 _ => results.push(None),
             }
         }
-        if query.is_legacy() {
-            results.truncate(1);
-        }
         for (location, result) in locations.iter().zip(&results) {
             if let (Some(node), Some(next)) = (json_path::get_mut(root, location), result) {
                 *node = Value::Number(next.clone());
             }
         }
-        if query.is_legacy() {
-            return match results.first() {
-                Some(Some(next)) => resp_bulk_str(&next.to_string()),
-                Some(None) => resp_error("ERR path is not a number"),
-                None => resp_null_bulk(),
+        // RESP2: the last new value, alone. RESP3: every match, as for a
+        // JSONPath.
+        if query.is_legacy() && resp < 3 {
+            return match results.iter().rev().flatten().next() {
+                Some(next) => resp_bulk_str(&json_text(&Value::Number(next.clone()))),
+                None => resp_error("ERR Path does not exist or does not contains a number"),
             };
         }
         if resp >= 3 {
@@ -693,16 +728,18 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
 // ── JSON.RESP ────────────────────────────────────────────────────────────────
 
 /// A JSON value in RESP: null as nil, booleans as `true`/`false`, integers as
-/// integers, other numbers and strings as bulk strings, an array as `[`
-/// followed by its elements, an object as `{` followed by its members as
-/// alternating names and values.
+/// integers, other numbers as doubles (a RESP3 double, in RESP2 its text:
+/// `1`, `-0`, `1e+21`), strings as bulk strings, an array as `[` followed by
+/// its elements, an object as `{` followed by its members as alternating
+/// names and values.
 fn as_resp(resp: u8, value: &Value) -> Vec<u8> {
     match value {
         Value::Null => resp_null_for(resp),
         Value::Bool(b) => resp_simple(if *b { "true" } else { "false" }),
         Value::Number(n) => match n.as_i64() {
             Some(i) => resp_integer(i),
-            None => resp_bulk_str(&n.to_string()),
+            // A `u64` past `i64::MAX` too, as in RedisJSON.
+            None => resp_double_for(resp, n.as_f64().unwrap_or(0.0)),
         },
         Value::String(s) => resp_bulk_str(s),
         Value::Array(items) => {
@@ -981,7 +1018,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                     } else {
                         let all: Vec<&Value> = values.iter().map(|v| v.as_ref()).collect();
-                        resp_bulk_str(&serde_json::to_string(&all).unwrap_or_default())
+                        resp_bulk_str(&json_text(&all))
                     }
                 })
                 .collect();
@@ -1027,11 +1064,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
-            read_doc(ctx, key, resp_null_bulk(), |root| {
+            let reply = read_doc(ctx, key, resp_null_bulk(), |root| {
                 each_value(resp, &query, root, LEGACY_NIL, |value| {
                     Some(resp_bulk_str(type_name(value)))
                 })
-            })
+            });
+            // In RESP3 RedisJSON wraps the reply, whatever the path, in an
+            // array of one: `[number]` for a legacy path, `[[number]]` for a
+            // JSONPath, `[nil]` for a key that is not there (#471).
+            if resp >= 3 && !reply.starts_with(b"-") {
+                resp_array(vec![resp3_normalize_null(reply)])
+            } else {
+                reply
+            }
         }
 
         // ── JSON.STRLEN / JSON.OBJLEN / JSON.ARRLEN key [path] ───────────────

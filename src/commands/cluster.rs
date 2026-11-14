@@ -270,7 +270,7 @@ fn cmd_countkeysinslot(ctx: &Ctx) -> Vec<u8> {
 
     let db = &ctx.store[*ctx.selected_db];
     let mut count: i64 = 0;
-    for shard in db.iter() {
+    for shard in shards_of_slot(db, slot) {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
             if key_hash_slot(k) == slot {
@@ -310,7 +310,7 @@ fn cmd_getkeysinslot(ctx: &Ctx) -> Vec<u8> {
     if count == 0 {
         return resp_array(out);
     }
-    'outer: for shard in db.iter() {
+    'outer: for shard in shards_of_slot(db, slot) {
         let map = crate::read_lock!(shard);
         for k in map.keys() {
             if key_hash_slot(k) == slot {
@@ -1747,9 +1747,21 @@ fn syncslots_apply(ctx: &mut Ctx, task_id: &str) -> Vec<u8> {
     }
 }
 
+/// The shards of `db` that can hold keys of `slot`: in cluster mode, where a
+/// key's shard is chosen by its slot, the one shard of the slot; else all of
+/// them.
+fn shards_of_slot(db: &crate::store::Db, slot: u16) -> impl Iterator<Item = &crate::store::Shard> {
+    let (skip, take) = if crate::store::sharded_by_slot() {
+        (crate::store::shard_of_slot(db.len(), slot), 1)
+    } else {
+        (0, db.len())
+    };
+    db.iter().skip(skip).take(take)
+}
+
 /// Whether any key in the selected database hashes to `slot`.
 fn slot_has_keys(ctx: &Ctx, slot: u16) -> bool {
-    ctx.store[*ctx.selected_db].iter().any(|shard| {
+    shards_of_slot(&ctx.store[*ctx.selected_db], slot).any(|shard| {
         crate::read_lock!(shard)
             .keys()
             .any(|k| key_hash_slot(k) == slot)
@@ -1824,7 +1836,9 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     let mut copy = false;
     let mut replace = false;
     let mut auth: Option<Vec<Vec<u8>>> = None;
-    let mut keys: Vec<&[u8]> = Vec::new();
+    // The key argument, or with `KEYS` what follows it: an empty key
+    // argument names the empty key unless `KEYS` follows, as in Redis (#458).
+    let mut keys: Vec<&[u8]> = vec![cmd[3]];
     let mut i = 6;
     while i < cmd.len() {
         let option = cmd[i].to_ascii_uppercase();
@@ -1853,18 +1867,13 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
                     );
                 }
                 // KEYS is the last option: everything after it is a key.
+                // None at all is a migration of nothing (`NOKEY`).
                 keys = cmd[i + 1..].to_vec();
                 break;
             }
             _ => return resp_error("ERR syntax error"),
         }
         i += 1;
-    }
-    if keys.is_empty() {
-        if cmd[3].is_empty() {
-            return resp_error("ERR syntax error");
-        }
-        keys.push(cmd[3]);
     }
 
     let db = *ctx.selected_db;
@@ -1947,31 +1956,47 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
 
     // ── Send ─────────────────────────────────────────────────────────────
     let addr = format!("{host}:{port}");
-    let Some(socket_addr) = addr.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
-        return resp_error(&format!("IOERR could not resolve {addr}"));
-    };
-    // TLS with `tls-cluster`, as every connection between nodes.
-    let mut sock = match crate::node_tls::connect_node(host, &socket_addr, timeout) {
-        Ok((stream, _)) => stream,
-        Err(e) => {
-            return resp_error(&format!(
-                "IOERR error or timeout connecting to the client: {e}"
-            ));
+    // A connection kept from an earlier call to the same target, opened
+    // with the same `AUTH` and TLS setup, and still open; else a new one
+    // (#726). See `cluster::migrate_conns`: nothing written on it has been
+    // sent before, and nothing is sent again.
+    let conn_key = crate::cluster::migrate_conns::Key::new(host, port, auth.as_deref());
+    let mut conn = match crate::cluster::migrate_conns::take(&conn_key) {
+        Some(conn) => conn,
+        None => {
+            let Some(socket_addr) = addr.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+                return resp_error(&format!("IOERR could not resolve {addr}"));
+            };
+            // TLS with `tls-cluster`, as every connection between nodes.
+            match crate::node_tls::connect_node(host, &socket_addr, timeout) {
+                Ok((stream, socket)) => crate::cluster::migrate_conns::Conn::new(stream, socket),
+                Err(e) => {
+                    return resp_error(&format!(
+                        "IOERR error or timeout connecting to the client: {e}"
+                    ));
+                }
+            }
         }
     };
+    conn.set_timeout(timeout);
 
     let mut pipeline = Vec::new();
     // Replies that precede the per-key ones and must each be +OK.
     let mut preamble: Vec<&str> = Vec::new();
+    // Every time, as Redis sends it: a password the target no longer takes
+    // fails the call on a kept connection too.
     if let Some(auth) = &auth {
         pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(auth));
         preamble.push("AUTH");
     }
-    pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(&[
-        b"SELECT".to_vec(),
-        dest_db.to_string().into_bytes(),
-    ]));
-    preamble.push("SELECT");
+    // Only when the connection is not in that database already.
+    if conn.db != Some(dest_db) {
+        pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(&[
+            b"SELECT".to_vec(),
+            dest_db.to_string().into_bytes(),
+        ]));
+        preamble.push("SELECT");
+    }
     for item in &outgoing {
         // ASKING is single-shot and must immediately precede the RESTORE: the
         // destination is still only *importing* the slot, and would answer a
@@ -1995,16 +2020,20 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
         }
         pipeline.extend_from_slice(&crate::resp::write::encode_resp_command(&restore));
     }
-    if let Err(e) = sock.write_all(&pipeline).and_then(|()| sock.flush()) {
-        return resp_error(&format!(
-            "IOERR error or timeout writing to target instance: {e}"
-        ));
+    // On any failure from here on, `conn` is dropped, closing the
+    // connection, and nothing is sent again: some of it may have run.
+    {
+        let sock = conn.reader.get_mut();
+        if let Err(e) = sock.write_all(&pipeline).and_then(|()| sock.flush()) {
+            return resp_error(&format!(
+                "IOERR error or timeout writing to target instance: {e}"
+            ));
+        }
     }
 
     // ── Read the replies ─────────────────────────────────────────────────
-    let mut reader = std::io::BufReader::new(sock);
     for what in preamble {
-        match read_status_reply(&mut reader) {
+        match read_status_reply(&mut conn.reader) {
             Ok(Ok(())) => {}
             Ok(Err(reply)) => {
                 return resp_error(&format!(
@@ -2018,20 +2047,28 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
             }
         }
     }
+    conn.db = Some(dest_db);
     let mut moved: Vec<&Outgoing> = Vec::with_capacity(outgoing.len());
     let mut failure: Option<String> = None;
+    // Whether every reply came whole, so that the connection can be kept.
+    // An error reply is a whole reply; one saying the connection is not
+    // logged in is not kept for all that.
+    let mut reusable = true;
     for item in &outgoing {
         // ASKING's reply does not matter; RESTORE's does. A destination that
         // is not in cluster mode answers ASKING with an error and still
         // performs the RESTORE.
-        let asking = read_status_reply(&mut reader);
+        let asking = read_status_reply(&mut conn.reader);
         let restore = match asking {
             Err(e) => Err(e),
-            Ok(_) => read_status_reply(&mut reader),
+            Ok(_) => read_status_reply(&mut conn.reader),
         };
         match restore {
             Ok(Ok(())) => moved.push(item),
             Ok(Err(reply)) => {
+                if reply.starts_with("NOAUTH") || reply.starts_with("WRONGPASS") {
+                    reusable = false;
+                }
                 failure.get_or_insert(format!("ERR Target instance replied with error: {reply}"));
             }
             Err(e) => {
@@ -2039,12 +2076,21 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
                 failure.get_or_insert(format!(
                     "IOERR error or timeout reading to target instance: {e}"
                 ));
+                reusable = false;
                 break;
             }
         }
     }
+    // Kept for the next call only with every reply read whole, and nothing
+    // left unread on it, in its buffer or, with TLS, in rustls's.
+    let keep = |mut conn: crate::cluster::migrate_conns::Conn, reusable: bool| {
+        if reusable && conn.drained() {
+            crate::cluster::migrate_conns::put(conn_key.clone(), conn);
+        }
+    };
 
     if copy || moved.is_empty() {
+        keep(conn, reusable);
         return match failure {
             None => resp_simple("OK"),
             Some(error) => resp_error(&error),
@@ -2056,9 +2102,9 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     let not_deleted = delete_moved(ctx, db, &moved, _holding.is_some());
     // The copies sent of the keys kept here are older than they are: they
     // are taken back, so that the newest, here, is the only one (#295).
-    let taken_back = !not_deleted.kept.is_empty()
-        && only_here(ctx, &not_deleted.kept)
-        && take_back_copies(&mut reader, &not_deleted.kept);
+    let take_back = !not_deleted.kept.is_empty() && only_here(ctx, &not_deleted.kept);
+    let taken_back = take_back && take_back_copies(&mut conn.reader, &not_deleted.kept);
+    keep(conn, reusable && (taken_back || !take_back));
     let written: Vec<&[u8]> = not_deleted
         .kept
         .iter()
@@ -2363,8 +2409,11 @@ fn written_while_moving(keys: &[&[u8]], addr: &str, taken_back: bool) -> String 
 }
 
 /// Read one reply that is expected to be a status. `Ok(Ok(()))` for any `+`
-/// reply, `Ok(Err(text))` for an error reply (or anything else), `Err` when
-/// the connection fails or times out.
+/// reply, `Ok(Err(text))` for an error reply (or an integer), `Err` when
+/// the connection fails or times out, or the reply is cut short or is of
+/// another kind: a reply of more than one line would leave the rest of it
+/// to be read as the next reply, and the connection is not used again
+/// (`cluster::migrate_conns`).
 fn read_status_reply(
     reader: &mut std::io::BufReader<Box<dyn crate::node_tls::ReadWrite>>,
 ) -> std::io::Result<Result<(), String>> {
@@ -2374,6 +2423,18 @@ fn read_status_reply(
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "connection closed by target instance",
+        ));
+    }
+    if !line.ends_with("\r\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "reply cut short by target instance",
+        ));
+    }
+    if !line.starts_with(['+', '-', ':']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected reply from target instance: {}", line.trim_end()),
         ));
     }
     let line = line.trim_end_matches(['\r', '\n']);

@@ -59,11 +59,27 @@ pub enum IoModel {
     Tokio, // always use tokio
 }
 
+/// What `kividb --version` prints after the name: the version, and which of
+/// the release's builds this is (`update_check::variant`), since the
+/// `kividb` and `kividb-full` packages install the same `/usr/bin/kividb`
+/// (#732).
+#[cfg(all(feature = "lua", feature = "tls"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (full build: Lua, TLS)");
+#[cfg(all(feature = "lua", not(feature = "tls")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (lua build: Lua, no TLS)");
+#[cfg(all(not(feature = "lua"), feature = "tls"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (tls build: TLS, no Lua)");
+#[cfg(all(not(feature = "lua"), not(feature = "tls")))]
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (default build: no Lua, no TLS)"
+);
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "kividb",
     about = "Fast Redis-compatible store",
-    version = env!("CARGO_PKG_VERSION"),
+    version = VERSION,
     author = env!("CARGO_PKG_AUTHORS")
 )]
 pub struct Config {
@@ -282,6 +298,14 @@ pub struct Config {
     /// server on the host) loaded it, `replicaof` and all (#442).
     #[arg(skip)]
     pub configfile_loaded: bool,
+
+    /// Whether `--configfile` was given on the command line. A server that
+    /// read `/etc/kividb/kividb.conf` only because it is the default path
+    /// refuses `CONFIG REWRITE`: on a host with the package installed, every
+    /// server started without `--configfile` reads that file, and any one of
+    /// them would overwrite it with its own port and `replicaof` (#475).
+    #[arg(skip)]
+    pub configfile_named: bool,
 
     /// Port to accept TLS connections on. 0 = TLS disabled.
     /// Separate from `port` so the uring hot-path on `port` is untouched.
@@ -662,6 +686,7 @@ impl Default for Config {
             protected_mode: true,
             bind_explicit: false,
             configfile_loaded: false,
+            configfile_named: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -788,6 +813,7 @@ impl Config {
             protected_mode: true,
             bind_explicit: false,
             configfile_loaded: false,
+            configfile_named: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -1044,6 +1070,13 @@ impl Config {
             }
             let args: Vec<String> = value.split_whitespace().map(String::from).collect();
             if args.is_empty() {
+                // Set to empty at runtime: unset, not left at what the
+                // server started with.
+                match name.to_ascii_lowercase().as_str() {
+                    "cluster-announce-ip" => config.cluster_announce_ip.clear(),
+                    "cluster-announce-hostname" => config.cluster_announce_hostname.clear(),
+                    _ => {}
+                }
                 continue;
             }
             let _ = config.apply_directive(&name.to_ascii_lowercase(), &args, &|_| false);
@@ -1063,6 +1096,9 @@ impl Config {
     pub fn rewrite_to_disk(&self) -> Result<(), RewriteError> {
         if !self.configfile_loaded {
             return Err(RewriteError::NoConfigFile);
+        }
+        if !self.configfile_named {
+            return Err(RewriteError::DefaultConfigFile(self.configfile.clone()));
         }
         let path = std::path::Path::new(&self.configfile);
 
@@ -1387,15 +1423,23 @@ impl Config {
             }
         };
         self.configfile_loaded = true;
+        self.configfile_named = from_cli("configfile");
         let file = self.configfile.clone();
-        self.apply_config_text(&contents, from_cli)
-            .map(|warnings| {
-                warnings
-                    .into_iter()
-                    .map(|w| format!("{file}: {w}"))
-                    .collect()
-            })
-            .map_err(|e| format!("{file}: {e}"))
+        let mut warnings: Vec<String> = self
+            .apply_config_text(&contents, from_cli)
+            .map_err(|e| format!("{file}: {e}"))?
+            .into_iter()
+            .map(|w| format!("{file}: {w}"))
+            .collect();
+        if !self.configfile_named {
+            warnings.push(format!(
+                "Read the config file '{file}' only because it is the default path. \
+                 A future release will read a config file only when one is named: \
+                 start the server with '--configfile {file}' to keep using it. \
+                 Until then CONFIG REWRITE is refused"
+            ));
+        }
+        Ok(warnings)
     }
 
     /// [`Config::apply_config_file`], given the text of the file.
@@ -2042,6 +2086,10 @@ pub enum RewriteError {
     /// The server was not started from a config file: there is none to
     /// rewrite.
     NoConfigFile,
+    /// The server read this file only because it is the default path, not
+    /// because `--configfile` named it; the file may be another server's
+    /// (#475).
+    DefaultConfigFile(String),
     Io(std::io::Error),
 }
 
@@ -2402,6 +2450,66 @@ mod config_file_tests {
             })
             .unwrap();
         assert_eq!(asked.get(), everything.lines().count());
+    }
+
+    /// A server that read its config file only because it is the default
+    /// path warns at startup and refuses `CONFIG REWRITE`, leaving the file
+    /// as it was: on a packaged host that file is the packaged server's
+    /// (#475). Named with `--configfile`, the same file is rewritten.
+    #[test]
+    fn config_file_found_by_default_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kividb.conf");
+        let original = "port 7001\n";
+        std::fs::write(&path, original).unwrap();
+        let start = |named: bool| {
+            let mut config = Config {
+                configfile: path.to_string_lossy().into_owned(),
+                ..Config::default()
+            };
+            let warnings = config
+                .apply_config_file(&|option| named && option == "configfile")
+                .unwrap();
+            (config, warnings)
+        };
+
+        let (config, warnings) = start(false);
+        assert!(config.configfile_loaded);
+        assert!(!config.configfile_named);
+        assert_eq!(config.port, 7001);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("default path") && w.contains("--configfile")),
+            "{warnings:?}"
+        );
+        let refused = Config {
+            port: 7002,
+            ..config
+        }
+        .rewrite_to_disk();
+        assert!(
+            matches!(&refused, Err(RewriteError::DefaultConfigFile(p)) if *p == path.to_string_lossy()),
+            "rewrite of a default-path config file was not refused"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let (config, warnings) = start(true);
+        assert!(config.configfile_named);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            Config {
+                port: 7002,
+                ..config
+            }
+            .rewrite_to_disk()
+            .is_ok()
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("port 7002\n")
+        );
     }
 }
 

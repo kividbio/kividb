@@ -25,6 +25,33 @@ fn avg_ttl_ms(expires: usize, deadlines: u128, now: u64) -> i64 {
     mean.saturating_sub(u128::from(now)).min(i64::MAX as u128) as i64
 }
 
+/// Why `CONFIG SET cluster-announce-ip` refuses `value`, if it does. As in
+/// Redis: shorter than 46 characters (an IPv6 address's longest text), and
+/// only letters, digits, '-', '.' and ':'. Empty unsets it.
+fn announce_ip_error(value: &str) -> Option<&'static str> {
+    if value.len() >= 46 {
+        Some("Hostnames for cluster-announce-ip must be less than 46 characters")
+    } else if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':'))
+    {
+        Some("Hostnames may only contain alphanumeric characters, hyphens or dots")
+    } else {
+        None
+    }
+}
+
+/// The reply to a `CONFIG SET` of an announce setting: it is in effect
+/// either way, but nodes.conf may not have been saved.
+fn announce_reply(saved: std::io::Result<()>) -> Option<Vec<u8>> {
+    match saved {
+        Ok(()) => Some(resp_simple("OK")),
+        Err(e) => Some(resp_error(&format!(
+            "ERR CONFIG SET applied, but saving the cluster config file failed: {e}"
+        ))),
+    }
+}
+
 /// Replication, cluster and slowlog settings as `CONFIG GET` reports them.
 ///
 /// Runtime-settable ones are read from where `CONFIG SET` writes them, so a
@@ -49,6 +76,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     // ever moved again. The cluster bus writes `nodes` on every heartbeat,
     // and a `CONFIG GET` that met one stopped the node for good, every
     // command that reads the topology queued behind it.
+    let (announce_ip, announce_port, announce_bus_port) = ctx.cluster.announce();
     let (announce_hostname, announce_client_port) = {
         let nodes = ctx.cluster.nodes.read();
         let me = nodes.get(&ctx.cluster.myself());
@@ -120,10 +148,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             "cluster-node-timeout",
             ctx.config.cluster_node_timeout.to_string(),
         ),
-        (
-            "cluster-announce-ip",
-            ctx.config.cluster_announce_ip.clone(),
-        ),
+        ("cluster-announce-ip", announce_ip),
         ("cluster-announce-hostname", announce_hostname),
         (
             "cluster-preferred-endpoint-type",
@@ -133,18 +158,12 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
                 ctx.config.cluster_preferred_endpoint_type.clone()
             },
         ),
-        (
-            "cluster-announce-port",
-            ctx.config.cluster_announce_port.to_string(),
-        ),
+        ("cluster-announce-port", announce_port.to_string()),
         (
             "cluster-announce-client-port",
             announce_client_port.to_string(),
         ),
-        (
-            "cluster-announce-bus-port",
-            ctx.config.cluster_announce_bus_port.to_string(),
-        ),
+        ("cluster-announce-bus-port", announce_bus_port.to_string()),
         ("cluster-port", ctx.config.cluster_port.to_string()),
         (
             "cluster-bus-port-protected-mode",
@@ -167,7 +186,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
         ),
         (
             "cluster-require-full-coverage",
-            yes_no(ctx.config.cluster_require_full_coverage),
+            yes_no(ctx.cluster.require_full_coverage()),
         ),
         (
             "cluster-slot-migration-handoff-max-lag-bytes",
@@ -238,6 +257,9 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
     ]
+    .into_iter()
+    .chain(crate::commands::bf::config_rows())
+    .collect()
 }
 
 /// `CONFIG SET` of the array settings, as Redis checks them: the slice size
@@ -300,10 +322,60 @@ pub(crate) const REDIS_VERSION: &str = "8.10.0";
 #[cfg(not(feature = "lua"))]
 const NO_LUA: &str = concat!(
     "ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the ",
-    "lua or full variant (Docker image kividb/kividb:v",
+    "lua or full variant (the kividb-full apt/dnf package, Docker image kividb/kividb:v",
     env!("CARGO_PKG_VERSION"),
     "-lua, or a kividb-lua release file)"
 );
+
+/// `FUNCTION` in a build without Lua. `FUNCTION FLUSH` drops the libraries
+/// it kept from the data it loaded (`snapshot::flush_kept_functions`), so
+/// they can be got rid of here too, from a client, the master or the AOF;
+/// every other subcommand is refused. One refused from the master or the
+/// AOF leaves this server with other libraries than the master had, so it
+/// is logged, once for each: a replica without Lua keeps those of its last
+/// full sync.
+#[cfg(not(feature = "lua"))]
+fn function_without_lua(ctx: &Ctx) -> Vec<u8> {
+    use std::sync::atomic::AtomicBool;
+    let sub = ctx.cmd.get(1).copied().unwrap_or_default();
+    if sub.eq_ignore_ascii_case(b"FLUSH") {
+        // As Redis answers these.
+        match ctx.cmd.len() {
+            2 => {}
+            3 if ctx.cmd[2].eq_ignore_ascii_case(b"SYNC")
+                || ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC") => {}
+            3 => return resp_error("ERR FUNCTION FLUSH only supports SYNC|ASYNC option"),
+            _ => {
+                return resp_error(
+                    "ERR unknown subcommand or wrong number of arguments for 'flush'. Try \
+                     FUNCTION HELP.",
+                );
+            }
+        }
+        crate::snapshot::flush_kept_functions();
+        return resp_simple("OK");
+    }
+    if ctx.apply_replication {
+        static FROM_MASTER: AtomicBool = AtomicBool::new(false);
+        static FROM_AOF: AtomicBool = AtomicBool::new(false);
+        // The AOF is replayed with the dataset counted as loading; the
+        // master's stream is applied once it is loaded.
+        let (source, warned) = if crate::expiry::loading() {
+            ("the AOF", &FROM_AOF)
+        } else {
+            ("the master", &FROM_MASTER)
+        };
+        if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log_warn!(
+                "FUNCTION {} from {source} was refused: this build has no Lua, so its function \
+                 libraries are not those the master has (those of the data it loaded, if any). \
+                 Run the lua or full build on replicas of a master that uses them",
+                String::from_utf8_lossy(sub).to_ascii_uppercase()
+            );
+        }
+    }
+    resp_error(NO_LUA)
+}
 
 /// A setting's own name, for one Redis also takes under an older one.
 fn config_name(name: &str) -> &str {
@@ -408,7 +480,9 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     crate::eviction::limit_changed();
                     // A limit below what is in use is enforced
                     // now, not at the next write.
-                    if v != 0 {
+                    // Not while writes are paused: eviction waits then
+                    // (#424).
+                    if v != 0 && !crate::pause::expiry_deferred() {
                         // Off the runtime, as `SAVE` (#605): it may evict a
                         // great many keys.
                         crate::cluster::migration::off_the_runtime(|| {
@@ -838,26 +912,72 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument couldn't be parsed into an integer",
                 )),
             },
+            // As in Redis, this node's address may change while it runs:
+            // peers take the new one from its next heartbeat, and
+            // nodes.conf is saved (#391).
+            "cluster-announce-ip" => match announce_ip_error(value) {
+                Some(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'cluster-announce-ip') - {why}"
+                ))),
+                None => announce_reply(ctx.cluster.set_announce(Some(value), None, None)),
+            },
+            "cluster-announce-port" | "cluster-announce-bus-port" => {
+                let port = match value.parse::<i64>() {
+                    Ok(port) => u16::try_from(port)
+                        .map_err(|_| "argument must be between 0 and 65535 inclusive"),
+                    Err(_) => Err("argument couldn't be parsed into an integer"),
+                };
+                match port {
+                    Ok(port) if param == "cluster-announce-port" => {
+                        announce_reply(ctx.cluster.set_announce(None, Some(port), None))
+                    }
+                    Ok(port) => announce_reply(ctx.cluster.set_announce(None, None, Some(port))),
+                    Err(why) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument '{param}') - {why}"
+                    ))),
+                }
+            }
+            "cluster-require-full-coverage" => match value.to_ascii_lowercase().as_str() {
+                "yes" => {
+                    ctx.cluster.set_require_full_coverage(true);
+                    Some(resp_simple("OK"))
+                }
+                "no" => {
+                    ctx.cluster.set_require_full_coverage(false);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'cluster-require-full-coverage') - argument must be 'yes' or 'no'",
+                )),
+            },
             // Fixed at startup: changing them under a running
             // cluster would desynchronise this node from what its
             // peers and its own nodes.conf already say.
+            // `cluster-node-timeout` too, unlike in Redis: the failure
+            // detector, elections and the bus's timers take it once,
+            // at startup (docs/COMPATIBILITY.md).
             "cluster-enabled"
             | "cluster-config-file"
-            | "cluster-announce-ip"
-            | "cluster-announce-port"
-            | "cluster-announce-bus-port"
             | "cluster-port"
             | "cluster-bus-port-protected-mode"
             | "cluster-bus-secret"
             | "tls-cluster"
-            | "cluster-node-timeout"
-            | "cluster-require-full-coverage" => {
+            | "cluster-node-timeout" => {
                 // To what it already is, is no change.
                 let unchanged = config_rows(ctx)
                     .iter()
                     .any(|(name, current)| *name == param && current == value);
                 if unchanged {
                     Some(resp_simple("OK"))
+                } else if param == "cluster-node-timeout" {
+                    Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         'cluster-node-timeout') - can't set immutable config: \
+                         KiviDB reads cluster-node-timeout only at startup; set it in \
+                         the config file or with --cluster-node-timeout and restart",
+                    ))
                 } else {
                     Some(resp_error(&format!(
                         "ERR CONFIG SET failed (possibly related to argument \
@@ -1162,6 +1282,10 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             "array-slice-size" | "array-sparse-kmax" | "array-sparse-kmin" => {
                 Some(config_set_array(&param, value))
             }
+            "bf-error-rate"
+            | "bf-initial-size"
+            | "bf-expansion-factor"
+            | "bloom-max-filter-bytes" => Some(crate::commands::bf::config_set(&param, value)),
             "stream-node-max-entries" => match value.parse::<i64>() {
                 Ok(v) if v >= 0 => {
                     crate::commands::stream_extra::NODE_MAX_ENTRIES
@@ -2320,6 +2444,18 @@ const ALL_COMMANDS: &[&str] = &[
     "ARSEEK",
     "ARSET",
     "AUTH",
+    // Bloom filters
+    "BF.ADD",
+    "BF.CARD",
+    "BF.DEBUG",
+    "BF.EXISTS",
+    "BF.INFO",
+    "BF.INSERT",
+    "BF.LOADCHUNK",
+    "BF.MADD",
+    "BF.MEXISTS",
+    "BF.RESERVE",
+    "BF.SCANDUMP",
     "BGSAVE",
     "BGREWRITEAOF",
     "BITCOUNT",
@@ -2783,6 +2919,9 @@ const FAST_COMMANDS: &[&str] = &[
     "APPEND",
     "ASKING",
     "AUTH",
+    "BF.CARD",
+    "BF.INFO",
+    "BF.RESERVE",
     "DBSIZE",
     "DECR",
     "DECRBY",
@@ -2892,6 +3031,7 @@ pub(crate) const ACL_CATEGORIES: &[&str] = &[
     "array",
     "bitmap",
     "blocking",
+    "bloom",
     "cluster",
     "connection",
     "dangerous",
@@ -2971,6 +3111,7 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             // One of Redis's commands has Redis's arity. The guess above is
             // for the rest.
             let arity = crate::commands::arity::of(name)
+                .or_else(|| crate::commands::bf::arity(name))
                 .or_else(|| module_arity(name))
                 .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
@@ -3383,6 +3524,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         // The module families, taken from the command table by prefix so a new
         // command joins its category by being registered.
         "json" => commands_with_prefix("JSON."),
+        "bloom" => commands_with_prefix("BF."),
         "search" => commands_with_prefix("FT."),
         "timeseries" => commands_with_prefix("TS."),
         "vector" => vec![
@@ -3478,6 +3620,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
                 "sortedset",
                 "hash",
                 "bitmap",
+                "bloom",
                 "hyperloglog",
                 "geo",
                 "stream",
@@ -3513,11 +3656,12 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
 /// to connect without `search`), so `MODULE LIST`, `HELLO` and
 /// `COMMAND LIST FILTERBY MODULE` report them as Redis reports its own
 /// built-in `vectorset`: an empty path and no args.
-const BUILT_IN_MODULES: [(&str, i64); 4] = [
+const BUILT_IN_MODULES: [(&str, i64); 5] = [
     ("search", 81001),
     ("ReJSON", 81000),
     ("timeseries", 81001),
     ("vectorset", 1),
+    ("bf", 81001),
 ];
 
 /// One entry per built-in module family, as `MODULE LIST` and `HELLO`'s
@@ -3552,6 +3696,10 @@ fn in_module(module: &str, name: &str) -> bool {
         "search" => name.starts_with("ft.") || name.starts_with("_ft."),
         "rejson" => name.starts_with("json."),
         "timeseries" => name.starts_with("ts."),
+        // The probabilistic types: Redis 8's `bf` module.
+        "bf" => ["bf.", "cf.", "cms.", "topk.", "tdigest."]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)),
         // The vector set commands are the only ones that begin with `v`.
         "vectorset" => name.starts_with('v'),
         _ => false,
@@ -4155,6 +4303,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
                 out.push_str(&format!("arch_bits:{}\r\n", usize::BITS));
                 out.push_str(&format!("kividb_version:{}\r\n", env!("CARGO_PKG_VERSION")));
+                // Which of the release's builds: default, lua, tls or full
+                // (the `kividb` and `kividb-full` packages, #732).
+                out.push_str(&format!(
+                    "kividb_variant:{}\r\n",
+                    crate::update_check::variant()
+                ));
                 // That a replica of this server need not expire keys
                 // itself: each one expired here is sent to it as a `DEL`
                 // (`replication::expiry_propagated_by`).
@@ -5112,6 +5266,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Err(RewriteError::NoConfigFile) => Some(resp_error(
                             "ERR The server is running without a config file",
                         )),
+                        Err(RewriteError::DefaultConfigFile(path)) => Some(resp_error(&format!(
+                            "ERR The server read '{path}' only because it is the default \
+                             config file, and will not rewrite it. Start the server with \
+                             '--configfile {path}' to allow CONFIG REWRITE"
+                        ))),
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }
@@ -6308,7 +6467,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             #[cfg(not(feature = "lua"))]
             {
-                Some(resp_error(NO_LUA))
+                Some(function_without_lua(ctx))
             }
         }
 

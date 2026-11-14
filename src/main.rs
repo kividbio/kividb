@@ -47,6 +47,7 @@ mod script_clock;
 mod server;
 mod shared_bytes;
 pub mod shutdown;
+mod sketch;
 pub mod slowlog;
 mod snapshot;
 mod stats;
@@ -351,6 +352,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eviction::configure(&config);
     compaction::configure(&config);
     snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
+    snapshot::SNAPSHOT_CLUSTER.store(config.cluster_enabled, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -731,6 +733,10 @@ async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 #[cfg(target_os = "linux")]
 fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
     stats::IO_URING.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Before the store holds a key: from here on a key's shard is its slot's.
+    if config.cluster_enabled {
+        store::shard_by_slot();
+    }
     let store: store::Store = store::new_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));
@@ -853,6 +859,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -1609,6 +1616,10 @@ async fn async_main_tokio(
     log_info!("Shards per DB  : {}", store::num_shards());
     log_info!("Bind address   : {}", config.addr());
 
+    // Before the store holds a key: from here on a key's shard is its slot's.
+    if config.cluster_enabled {
+        store::shard_by_slot();
+    }
     let store: store::Store = store::new_store(config.databases);
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
@@ -1709,6 +1720,7 @@ async fn async_main_tokio(
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -2284,4 +2296,26 @@ async fn async_main_tokio(
     unsafe { libc::_exit(0) };
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// A cluster node serves database 0 alone: keys loaded into another, from
+/// the AOF (a snapshot with them is refused as it is read, see
+/// `snapshot::SNAPSHOT_CLUSTER`), are where no client can reach them, and
+/// slot accounting and migration never see them. Redis refuses to start;
+/// so does KiviDB (#484).
+fn refuse_keys_outside_db0(store: &store::Store) {
+    for (db, shards) in store.iter().enumerate().skip(1) {
+        let keys: usize = shards
+            .iter()
+            .map(|shard| crate::read_lock!(shard).len())
+            .sum();
+        if keys > 0 {
+            log_fatal!(
+                "{}: {keys} keys were loaded into database {db}",
+                snapshot::CLUSTER_KEYS_OUTSIDE_DB0
+            );
+            log_fatal!("{}.", snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+            std::process::exit(1);
+        }
+    }
 }

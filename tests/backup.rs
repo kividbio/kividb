@@ -834,6 +834,89 @@ fn appendfsync_always_replies_only_once_the_write_is_synced() {
     }
 }
 
+/// The test hold of the sync for replies under `appendfsync always` is
+/// reached by that sync only, not by the second's sync, which answers no
+/// reply (#515). The second's sync took it too: when it ran first, with a
+/// write's record in the file, it took the hit a test waited for, and the
+/// write's own sync then waited at the next hit, which the test above never
+/// lets go of. Here the second's sync is held (at `fsync`) with a record
+/// unsynced while the setting turns to `always`, and a write is sent: the
+/// first hold of the reply's sync is the write's, and its reply comes once
+/// that is let go.
+#[test]
+fn the_reply_sync_failpoint_is_the_replys_not_the_seconds_sync() {
+    const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nw\r\n";
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let child = kividb(&dir, port, &["--aof"])
+        .env("KIVIDB_TEST_FAILPOINTS", "fsync,aof-fsync-before-reply")
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir, child };
+    let wait_for = |path: &std::path::Path, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "{what} was never reached");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let mut c = server.conn();
+    // A record written and not yet synced, under `everysec`.
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    // The second's sync, asked for, holds the writer with that record
+    // unsynced.
+    let mut waiter = server.conn();
+    waiter
+        .writer
+        .write_all(b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$1\r\n0\r\n")
+        .unwrap();
+    let fsync = server.dir.join("failpoint.fsync.1");
+    wait_for(&fsync, "the second's sync");
+    // Any later second's sync goes on at once.
+    let done = Arc::new(AtomicBool::new(false));
+    let releaser = {
+        let (dir, done) = (server.dir.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut next = 2;
+            while !done.load(Ordering::Relaxed) {
+                if std::fs::remove_file(dir.join(format!("failpoint.fsync.{next}"))).is_ok() {
+                    next += 1;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    // Now every reply to a write waits for its sync, and one is sent.
+    assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+    c.writer.write_all(SET).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::remove_file(&fsync).unwrap();
+    // The first hold of a reply's sync is the write's.
+    let held = server.dir.join("failpoint.aof-fsync-before-reply.1");
+    wait_for(&held, "the reply's sync");
+    std::fs::remove_file(&held).unwrap();
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = String::new();
+    let replied = c.reader.read_line(&mut line);
+    assert!(
+        replied.is_ok() && line == "+OK\r\n",
+        "no reply once the reply's sync was let go ({replied:?}, {line:?}); held again: {}",
+        server
+            .dir
+            .join("failpoint.aof-fsync-before-reply.2")
+            .exists()
+    );
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "w");
+    done.store(true, Ordering::Relaxed);
+    releaser.join().unwrap();
+}
+
 /// Under `appendfsync always`, a sync of the AOF that fails stops the
 /// server (#514's review). The checkpoint's sync of the old log used to be
 /// logged and passed over, its mark cleared: Linux reports a failed
@@ -2247,6 +2330,184 @@ fn the_empty_key_can_be_migrated() {
     assert!(reply.ok(), "MIGRATE: {reply:?}");
     assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
     assert_eq!(to.conn().cmd(&["HGET", "", ""]).s(), "v");
+
+    // Without `KEYS`, the empty key argument is the empty key, as in Redis:
+    // it was a syntax error (#458). `KEYS` and nothing after it moves
+    // nothing.
+    assert!(c.cmd(&["SET", "", "plain"]).ok());
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "REPLACE"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
+    assert_eq!(to.conn().cmd(&["GET", ""]).s(), "plain");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000"]);
+    assert_eq!(reply.s(), "NOKEY");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]);
+    assert_eq!(reply.s(), "NOKEY");
+}
+
+// ── MIGRATE's connections ─────────────────────────────────────────────────────
+//
+// MIGRATE keeps its connection to a target for the next call, as Redis does,
+// rather than dialling one per call and leaving a socket in TIME_WAIT per
+// call on the source (#726).
+
+/// The connections `server` has accepted so far.
+fn connections_received(c: &mut Conn) -> i64 {
+    let info = c.cmd(&["INFO", "stats"]);
+    info.s()
+        .lines()
+        .find_map(|l| l.strip_prefix("total_connections_received:"))
+        .expect("total_connections_received")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `MIGRATE` of `key` from `c` to the server on `port`, with `extra` after
+/// the timeout.
+fn migrate(c: &mut Conn, port: &str, key: &str, db: &str, extra: &[&str]) -> V {
+    let mut args = vec!["MIGRATE", "127.0.0.1", port, key, db, "5000"];
+    args.extend_from_slice(extra);
+    c.cmd(&args)
+}
+
+/// Two thousand `MIGRATE`s of one key each to one target go over one
+/// connection: they each opened one. Going from one database to another
+/// selects the other on it, and every key lands where it was sent.
+#[test]
+fn many_migrates_to_one_target_go_over_one_connection() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    let before = connections_received(&mut t);
+    for i in 0..2000 {
+        let key = format!("k{i}");
+        assert!(c.cmd(&["SET", &key, "v"]).ok());
+        let reply = migrate(&mut c, &port, &key, "0", &[]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    let opened = connections_received(&mut t) - before;
+    assert!(opened <= 3, "{opened} connections for 2000 MIGRATEs");
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 0);
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 2000);
+
+    // Database 3, then 0 again, on the same connection.
+    for (key, db) in [("in3", "3"), ("also3", "3"), ("in0", "0")] {
+        assert!(c.cmd(&["SET", key, db]).ok());
+        let reply = migrate(&mut c, &port, key, db, &[]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(connections_received(&mut t) - before, opened);
+    assert_eq!(t.cmd(&["GET", "in0"]).s(), "0");
+    assert!(t.cmd(&["SELECT", "3"]).ok());
+    assert_eq!(t.cmd(&["GET", "in3"]).s(), "3");
+    assert_eq!(t.cmd(&["GET", "also3"]).s(), "3");
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 2);
+}
+
+/// A kept connection the target has closed since (`CLIENT KILL`) is not
+/// used: the next `MIGRATE` dials a new one, and goes through.
+#[test]
+fn a_migrate_after_the_target_killed_its_connection_goes_through() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    assert!(c.cmd(&["SET", "first", "1"]).ok());
+    assert!(migrate(&mut c, &port, "first", "0", &[]).ok());
+    let killed = t.cmd(&["CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes"]);
+    assert!(killed.i() >= 1, "the MIGRATE connection: {killed:?}");
+    std::thread::sleep(Duration::from_millis(100));
+    let before = connections_received(&mut t);
+    assert!(c.cmd(&["SET", "second", "2"]).ok());
+    let reply = migrate(&mut c, &port, "second", "0", &[]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(connections_received(&mut t) - before, 1);
+    assert_eq!(t.cmd(&["GET", "second"]).s(), "2");
+    assert_eq!(c.cmd(&["EXISTS", "second"]).i(), 0);
+}
+
+/// A connection is kept for the `AUTH` or `AUTH2` it was opened with: other
+/// credentials open another. A wrong password fails the call, and keeps
+/// the key here.
+#[test]
+fn migrate_keeps_a_connection_per_login() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    assert!(t.cmd(&["CONFIG", "SET", "requirepass", "pw"]).ok());
+    assert!(t.cmd(&["AUTH", "pw"]).ok());
+    let port = to.port.to_string();
+    let before = connections_received(&mut t);
+    let opened = |t: &mut Conn| connections_received(t) - before;
+
+    for key in ["a", "b"] {
+        assert!(c.cmd(&["SET", key, "v"]).ok());
+        let reply = migrate(&mut c, &port, key, "0", &["AUTH", "pw"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(opened(&mut t), 1);
+    for key in ["c", "d"] {
+        assert!(c.cmd(&["SET", key, "v"]).ok());
+        let reply = migrate(&mut c, &port, key, "0", &["AUTH2", "default", "pw"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(opened(&mut t), 2);
+
+    assert!(c.cmd(&["SET", "e", "v"]).ok());
+    let reply = migrate(&mut c, &port, "e", "0", &["AUTH", "wrong"]);
+    assert!(
+        reply.is_err() && reply.s().contains("AUTH"),
+        "MIGRATE: {reply:?}"
+    );
+    assert_eq!(c.cmd(&["GET", "e"]).s(), "v");
+    assert_eq!(opened(&mut t), 3);
+    // Without credentials: refused by the target, on a new connection.
+    let reply = migrate(&mut c, &port, "e", "0", &[]);
+    assert!(reply.is_err(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["GET", "e"]).s(), "v");
+    assert_eq!(opened(&mut t), 4);
+    // The first login's connection is still kept.
+    let reply = migrate(&mut c, &port, "e", "0", &["AUTH", "pw"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(opened(&mut t), 4);
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 5);
+}
+
+/// A `RESTORE` refused by the target (`BUSYKEY`, without `REPLACE`) fails
+/// the call and keeps the key here, as before. Its reply was whole, so the
+/// connection is kept, and the next call goes over it.
+#[test]
+fn a_migrate_whose_restore_fails_keeps_its_key() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    assert!(t.cmd(&["SET", "busy", "there"]).ok());
+    assert!(c.cmd(&["SET", "busy", "here"]).ok());
+    assert!(c.cmd(&["SET", "free", "here"]).ok());
+    let before = connections_received(&mut t);
+
+    let reply = migrate(&mut c, &port, "busy", "0", &[]);
+    assert!(
+        reply.is_err() && reply.s().contains("BUSYKEY"),
+        "MIGRATE: {reply:?}"
+    );
+    assert_eq!(c.cmd(&["GET", "busy"]).s(), "here");
+    assert_eq!(t.cmd(&["GET", "busy"]).s(), "there");
+
+    let reply = migrate(&mut c, &port, "free", "0", &[]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    let reply = migrate(&mut c, &port, "busy", "0", &["REPLACE"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(t.cmd(&["GET", "busy"]).s(), "here");
+    assert_eq!(c.cmd(&["EXISTS", "busy", "free"]).i(), 0);
+    assert_eq!(connections_received(&mut t) - before, 1);
 }
 
 /// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
@@ -2354,4 +2615,104 @@ fn the_empty_key_in_an_aof_preamble_loads() {
     assert_eq!(c.cmd(&["GET", ""]).s(), "x");
     assert_eq!(c.cmd(&["GET", "k"]).s(), "1");
     assert_eq!(c.cmd(&["GET", "tail"]).s(), "2");
+}
+
+/// A `SELECT` changes no data: a script that has only selected a database
+/// can still be killed, as in Redis (#424). Its `SELECT` used to count as a
+/// write, and `SCRIPT KILL` was answered UNKILLABLE.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_has_only_selected_a_database_can_be_killed() {
+    let server = Server::start(&[]);
+    let port = server.port;
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "lua-time-limit", "200"]).ok());
+
+    let runner = std::thread::spawn(move || {
+        let mut r = Conn::connect(port);
+        r.cmd(&["EVAL", "redis.call('SELECT', 1) while true do end", "0"])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = c.cmd(&["PING"]);
+        if reply.is_err() && reply.s().starts_with("BUSY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script never got busy: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reply = c.cmd(&["SCRIPT", "KILL"]);
+    assert!(reply.ok(), "{reply:?}");
+    assert!(runner.join().unwrap().is_err());
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+}
+
+/// What a script may do with `SELECT`, as Redis 8.10.2 lets it: a read-only
+/// script may select another database (#424), and on a cluster node no
+/// script may select one other than 0, as no client may (#428).
+#[cfg(feature = "lua")]
+#[test]
+fn scripts_select_databases_as_redis_lets_them() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert!(c.cmd(&["SET", "x", "one"]).ok());
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    let read = "redis.call('SELECT', 1) return redis.call('GET', 'x')";
+    assert_eq!(c.cmd(&["EVAL_RO", read, "0"]).s(), "one");
+    let no_writes = format!("#!lua flags=no-writes\n{read}");
+    assert_eq!(c.cmd(&["EVAL", &no_writes, "0"]).s(), "one");
+
+    let node = Server::start(&["--cluster-enabled", "yes"]);
+    let mut n = node.conn();
+    let reply = n.cmd(&["EVAL", "return redis.call('SELECT', 3)", "0"]);
+    assert!(
+        reply.is_err()
+            && reply
+                .s()
+                .starts_with("ERR SELECT is not allowed in cluster mode"),
+        "{reply:?}"
+    );
+    assert!(n.cmd(&["EVAL", "return redis.call('SELECT', 0)", "0"]).ok());
+}
+
+/// A read-only replica loads and flushes scripts, as Redis does: its script
+/// cache is its own, and a client loads a script there before it runs it by
+/// its SHA (#527). What changes data is still refused.
+#[cfg(feature = "lua")]
+#[test]
+fn a_read_only_replica_loads_and_flushes_scripts() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !r
+        .cmd(&["INFO", "replication"])
+        .s()
+        .contains("master_link_status:up")
+    {
+        assert!(Instant::now() < deadline, "the replica never linked up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let sha = r.cmd(&["SCRIPT", "LOAD", "return 1"]).s().to_string();
+    assert_eq!(sha.len(), 40, "{sha}");
+    assert_eq!(r.cmd(&["EVALSHA", &sha, "0"]).i(), 1);
+    assert!(r.cmd(&["SCRIPT", "FLUSH"]).ok());
+    let reply = r.cmd(&["EVALSHA", &sha, "0"]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("NOSCRIPT"),
+        "{reply:?}"
+    );
+    for refused in [&["FUNCTION", "FLUSH"][..], &["SET", "k", "v"]] {
+        let reply = r.cmd(refused);
+        assert!(
+            reply.is_err() && reply.s().starts_with("READONLY"),
+            "{refused:?}: {reply:?}"
+        );
+    }
 }

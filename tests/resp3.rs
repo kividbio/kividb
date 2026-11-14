@@ -939,6 +939,7 @@ fn module_list_names_the_built_in_families_in_both_protocols() {
         ("ReJSON", 81000),
         ("timeseries", 81001),
         ("vectorset", 1),
+        ("bf", 81001),
     ];
     let expected = |header: &str| {
         let mut out = format!("*{}\r\n", modules.len());
@@ -1535,25 +1536,14 @@ fn function_stats_follows_the_clients_protocol() {
     let port = free_port();
     start_server(port);
     let (mut c2, mut c3) = lua_conns(port);
-    let cases: [(&mut RawConn, &str, &[u8], &[u8], &[u8], &[u8]); 2] = [
-        (
-            &mut c2,
-            "RESP2",
-            b"*4\r\n$14\r\nrunning_script\r\n",
-            b"$-1\r\n",
-            b"*6\r\n",
-            b"$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n$15\r\nlibraries_count\r\n:",
-        ),
-        (
-            &mut c3,
-            "RESP3",
-            b"%2\r\n$14\r\nrunning_script\r\n",
-            b"_\r\n",
-            b"%3\r\n",
-            b"$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n%2\r\n$15\r\nlibraries_count\r\n:",
-        ),
-    ];
-    for (c, protocol, head, idle, running, engines) in cases {
+    fn check(
+        c: &mut RawConn,
+        protocol: &str,
+        head: &[u8],
+        idle: &[u8],
+        running: &[u8],
+        engines: &[u8],
+    ) {
         let stats = c.raw(&["FUNCTION", "STATS"]);
         let rest = stats
             .strip_prefix(head)
@@ -1567,6 +1557,178 @@ fn function_stats_follows_the_clients_protocol() {
             stats.windows(engines.len()).any(|w| w == engines),
             "{protocol} engines: {}",
             s(&stats)
+        );
+    }
+    check(
+        &mut c2,
+        "RESP2",
+        b"*4\r\n$14\r\nrunning_script\r\n",
+        b"$-1\r\n",
+        b"*6\r\n",
+        b"$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n$15\r\nlibraries_count\r\n:",
+    );
+    check(
+        &mut c3,
+        "RESP3",
+        b"%2\r\n$14\r\nrunning_script\r\n",
+        b"_\r\n",
+        b"%3\r\n",
+        b"$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n%2\r\n$15\r\nlibraries_count\r\n:",
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Doubles and JSON replies as Redis 8.10.2 (with RedisJSON 8.10) writes them
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Each command's reply to a RESP2 and a RESP3 client, byte for byte as
+/// Redis 8.10.2 sent it (#471, #472, #473).
+#[test]
+fn doubles_and_json_replies_are_written_as_redis_writes_them() {
+    let port = free_port();
+    start_server(port);
+    let mut c2 = RawConn::connect(port);
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+
+    c2.raw(&[
+        "JSON.SET",
+        "d",
+        "$",
+        r#"{"a":1.0,"b":-0.0,"c":100000.0,"d":123456789.12345678,"e":1e300,"f":1e21,"g":1.5e-7,"i":18446744073709551616,"j":1e16,"n":5}"#,
+    ]);
+    c2.raw(&[
+        "ZADD",
+        "z",
+        "1e16",
+        "a",
+        "100000000",
+        "b",
+        "1e21",
+        "c",
+        "1.5e-7",
+        "d",
+    ]);
+
+    let both: &[(&[&str], &[u8], &[u8])] = &[
+        // JSON text: an exponent has no `+`.
+        (
+            &["JSON.GET", "d"],
+            b"$125\r\n{\"a\":1.0,\"b\":-0.0,\"c\":100000.0,\"d\":123456789.12345678,\"e\":1e300,\"f\":1e21,\"g\":1.5e-7,\"i\":1.8446744073709552e19,\"j\":1e16,\"n\":5}\r\n",
+            b"$125\r\n{\"a\":1.0,\"b\":-0.0,\"c\":100000.0,\"d\":123456789.12345678,\"e\":1e300,\"f\":1e21,\"g\":1.5e-7,\"i\":1.8446744073709552e19,\"j\":1e16,\"n\":5}\r\n",
+        ),
+        (&["JSON.GET", "d", "$.f"], b"$6\r\n[1e21]\r\n", b"$6\r\n[1e21]\r\n"),
+        (
+            &["JSON.MGET", "d", ".i"],
+            b"*1\r\n$21\r\n1.8446744073709552e19\r\n",
+            b"*1\r\n$21\r\n1.8446744073709552e19\r\n",
+        ),
+        // JSON.RESP: a number that is not an integer is a double.
+        (&["JSON.RESP", "d", ".a"], b"$1\r\n1\r\n", b",1\r\n"),
+        (&["JSON.RESP", "d", ".b"], b"$2\r\n-0\r\n", b",-0\r\n"),
+        (&["JSON.RESP", "d", ".c"], b"$6\r\n100000\r\n", b",100000\r\n"),
+        (
+            &["JSON.RESP", "d", ".d"],
+            b"$21\r\n1.2345678912345678e+8\r\n",
+            b",1.2345678912345678e+8\r\n",
+        ),
+        (&["JSON.RESP", "d", ".e"], b"$6\r\n1e+300\r\n", b",1e+300\r\n"),
+        (&["JSON.RESP", "d", ".g"], b"$6\r\n1.5e-7\r\n", b",1.5e-7\r\n"),
+        (
+            &["JSON.RESP", "d", ".i"],
+            b"$20\r\n18446744073709552000\r\n",
+            b",18446744073709552000\r\n",
+        ),
+        (
+            &["JSON.RESP", "d", ".j"],
+            b"$17\r\n10000000000000000\r\n",
+            b",10000000000000000\r\n",
+        ),
+        (&["JSON.RESP", "d", ".n"], b":5\r\n", b":5\r\n"),
+        // JSON.TYPE: in RESP3, always in an array of one.
+        (&["JSON.TYPE", "d"], b"$6\r\nobject\r\n", b"*1\r\n$6\r\nobject\r\n"),
+        (&["JSON.TYPE", "d", ".n"], b"$7\r\ninteger\r\n", b"*1\r\n$7\r\ninteger\r\n"),
+        (
+            &["JSON.TYPE", "d", "$.a"],
+            b"*1\r\n$6\r\nnumber\r\n",
+            b"*1\r\n*1\r\n$6\r\nnumber\r\n",
+        ),
+        (&["JSON.TYPE", "d", "$.nope"], b"*0\r\n", b"*1\r\n*0\r\n"),
+        (&["JSON.TYPE", "d", ".nope"], b"$-1\r\n", b"*1\r\n_\r\n"),
+        (&["JSON.TYPE", "nokey"], b"$-1\r\n", b"*1\r\n_\r\n"),
+        (&["JSON.TYPE", "nokey", "$"], b"$-1\r\n", b"*1\r\n_\r\n"),
+        // Scores: whole numbers up to 2^62 as integers.
+        (
+            &["ZSCORE", "z", "a"],
+            b"$17\r\n10000000000000000\r\n",
+            b",10000000000000000\r\n",
+        ),
+        (&["ZSCORE", "z", "b"], b"$9\r\n100000000\r\n", b",100000000\r\n"),
+        (&["ZSCORE", "z", "c"], b"$5\r\n1e+21\r\n", b",1e+21\r\n"),
+        (&["ZSCORE", "z", "d"], b"$6\r\n1.5e-7\r\n", b",1.5e-7\r\n"),
+        // A key that is not there.
+        (
+            &["JSON.NUMINCRBY", "nokey", ".n", "1"],
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+        ),
+        (
+            &["JSON.NUMINCRBY", "nokey", "$.n", "1"],
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+            b"-ERR could not perform this operation on a key that doesn't exist\r\n",
+        ),
+    ];
+    for (args, resp2, resp3) in both {
+        assert_wire!(c2.raw(args), *resp2, format!("RESP2 {args:?}"));
+        assert_wire!(c3.raw(args), *resp3, format!("RESP3 {args:?}"));
+    }
+
+    // A legacy path adds to every number it matches. RESP2 replies with the
+    // last new value, RESP3 with all of them.
+    let doc = r#"{"a":{"x":1},"b":{"x":2.5},"c":{"x":"s"}}"#;
+    let changed = b"$41\r\n{\"a\":{\"x\":2},\"b\":{\"x\":3.5},\"c\":{\"x\":\"s\"}}\r\n";
+    c2.raw(&["JSON.SET", "n2", "$", doc]);
+    assert_wire!(
+        c2.raw(&["JSON.NUMINCRBY", "n2", "..x", "1"]),
+        b"$3\r\n3.5\r\n",
+        "RESP2 legacy NUMINCRBY"
+    );
+    assert_wire!(
+        c2.raw(&["JSON.GET", "n2"]),
+        changed,
+        "after RESP2 NUMINCRBY"
+    );
+    c3.raw(&["JSON.SET", "n3", "$", doc]);
+    assert_wire!(
+        c3.raw(&["JSON.NUMINCRBY", "n3", "..x", "1"]),
+        b"*3\r\n:2\r\n,3.5\r\n_\r\n",
+        "RESP3 legacy NUMINCRBY"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.GET", "n3"]),
+        changed,
+        "after RESP3 NUMINCRBY"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.NUMMULTBY", "n3", ".b.x", "2"]),
+        b"*1\r\n,7\r\n",
+        "RESP3 legacy NUMMULTBY"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.NUMINCRBY", "n3", ".c.x", "1"]),
+        b"*1\r\n_\r\n",
+        "RESP3 legacy NUMINCRBY of a string"
+    );
+    assert_wire!(
+        c3.raw(&["JSON.NUMINCRBY", "n3", ".nope", "1"]),
+        b"*0\r\n",
+        "RESP3 legacy NUMINCRBY of nothing"
+    );
+    for path in [".c.x", ".nope"] {
+        assert_wire!(
+            c2.raw(&["JSON.NUMINCRBY", "n2", path, "1"]),
+            b"-ERR Path does not exist or does not contains a number\r\n",
+            format!("RESP2 legacy NUMINCRBY {path}")
         );
     }
 }

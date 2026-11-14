@@ -3,6 +3,7 @@ mod aggregate_pipeline;
 pub(crate) mod arity;
 mod array;
 pub(crate) mod backup;
+pub(crate) mod bf;
 mod bitmap;
 pub mod blocking;
 pub(crate) mod cluster;
@@ -31,6 +32,7 @@ pub mod latency;
 mod list_move;
 mod lists;
 pub(crate) mod login;
+pub(crate) mod long_double;
 #[cfg(feature = "lua")]
 mod lua;
 #[cfg(feature = "lua")]

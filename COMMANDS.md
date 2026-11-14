@@ -367,7 +367,7 @@ KiviDB implements the RediSearch RESP command surface for vector similarity sear
 | `FT.CREATE` | `FT.CREATE index ON HASH\|JSON PREFIX n prefix [...] [LANGUAGE lang] [LANGUAGE_FIELD field] [STOPWORDS n word …] SCHEMA field [AS name] type [options ...]` | Create a search index; supported field types: `TEXT`, `TAG`, `NUMERIC`, `VECTOR`; backfills existing keys on creation. TEXT words are indexed with their stems, as in Redis, in the index's `LANGUAGE` (English by default) or the one a document names in its `LANGUAGE_FIELD` (hashes); `NOSTEM` turns that off for a field, and words shorter than `MINSTEMLEN` (`search-min-stem-len`, 4) are not stemmed. Snowball stemmers for Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil and Turkish; Redis's other languages are accepted and not stemmed. `ON HASH` indexes hashes (including ones with field TTLs) by field name. `ON JSON` indexes JSON documents by JSONPath (`$.title AS title TEXT`): a string is a TEXT or TAG value, an array of strings is several tags or words, a boolean is the tag `true` / `false`, a number a NUMERIC value, an array of numbers a vector. `FT.SEARCH` returns a JSON document whole under `$`, and `RETURN` takes schema names or paths |
 | `FT.DROPINDEX` | `FT.DROPINDEX index` | Delete an index definition; does not delete the underlying data keys |
 | `FT.ALTER` | `FT.ALTER index [SKIPINITIALSCAN] SCHEMA ADD field type [options ...]` | Add new fields to an existing index schema. TEXT/TAG/NUMERIC fields take effect immediately. VECTOR fields have a fresh live index provisioned and are backfilled from existing keys unless SKIPINITIALSCAN is given. Multiple VECTOR fields per index are supported; each is queryable by `@field_name` in KNN clauses |
-| `FT.INFO` | `FT.INFO index` | Return index metadata: name, type, prefixes, field schemas, field count. For indexes with HNSW fields, additionally returns `hnsw_live_count` / `hnsw_tombstone_count` / `hnsw_tombstone_ratio` / `hnsw_compaction_in_progress` (mirroring the first HNSW field for backwards compatibility) plus an `hnsw_indexes` nested array with per-field stats. With a TEXT field, `num_terms` (words seen), `num_records` (word, field and document triples) and what the TEXT index holds in bytes: `text_terms_bytes`, `text_postings_bytes`, `text_docs_bytes` |
+| `FT.INFO` | `FT.INFO index` | Return index metadata: name, type, prefixes, field schemas, field count. For indexes with HNSW fields, additionally returns `hnsw_live_count` / `hnsw_tombstone_count` / `hnsw_tombstone_ratio` / `hnsw_compaction_in_progress` (mirroring the first HNSW field for backwards compatibility) plus an `hnsw_indexes` nested array with per-field stats. With a TEXT field, `num_terms` (words seen), `num_records` (word, field and document triples) and what the TEXT index holds in bytes: `text_terms_bytes`, `text_postings_bytes`, `text_docs_bytes`. `num_docs` is the documents the index holds (in a cluster, those in the slots the node serves). An index created with `SKIPINITIALSCAN` holds the documents written since it was created; `SKIPINITIALSCAN` is not saved with the index, so after a restart, and on a replica after a full resync, it holds every document under its prefixes, and `num_docs` there can be higher than on the master |
 | `FT._LIST` | `FT._LIST` | Return the names of the selected database's indexes |
 | `FT.ALIASLIST` | `FT.ALIASLIST index` | The aliases that point to `index` (Redis 8.10) |
 | `FT.ALIASADD` | `FT.ALIASADD alias index` | Create an alias pointing to an existing index; AOF-logged |
@@ -731,6 +731,69 @@ Used by `TS.QUERYINDEX`, `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`:
 
 ---
 
+## Bloom filter commands (BF.*)
+
+Scalable Bloom filters, as Redis 8 has them built in (formerly RedisBloom).
+Replies and errors are Redis 8.10's, in RESP2 and RESP3. A filter is laid out
+as Redis lays it out, so one moved from Redis (an RDB file, a full sync from a
+Redis master, `RESTORE`/`MIGRATE`, `BF.LOADCHUNK`) answers as it did there, and
+`BF.SCANDUMP` and `DUMP` give what Redis can load. `TYPE` is `MBbloom--`.
+
+| Command | Syntax | Notes |
+|---------|--------|-------|
+| `BF.RESERVE` | `BF.RESERVE key error_rate capacity [EXPANSION expansion] [NONSCALING]` | Make an empty filter. Error rate in (0, 1), taken as 0.25 when above it; capacity 1 to 2^30; expansion 0 to 32768, where 0 makes a filter that does not scale |
+| `BF.ADD` | `BF.ADD key item` | `1` if the item was new, `0` if it may have been there (`#t`/`#f` in RESP3). Makes the filter with the `bf-*` settings if the key is missing |
+| `BF.MADD` | `BF.MADD key item [item ...]` | One reply per item. At an item a full non-scaling filter cannot take, the reply ends with that item's error |
+| `BF.INSERT` | `BF.INSERT key [CAPACITY capacity] [ERROR error] [EXPANSION expansion] [NOCREATE] [NONSCALING] ITEMS item [item ...]` | `BF.MADD` that makes the filter with these parameters; `NOCREATE` refuses a missing key (`ERR not found`) |
+| `BF.EXISTS` | `BF.EXISTS key item` | `0` for a missing key, and for a key of another type, as in Redis |
+| `BF.MEXISTS` | `BF.MEXISTS key item [item ...]` | One reply per item |
+| `BF.INFO` | `BF.INFO key [CAPACITY \| SIZE \| FILTERS \| ITEMS \| EXPANSION]` | `Size` is Redis's reckoning of a filter's size; `MEMORY USAGE` gives what it takes here |
+| `BF.CARD` | `BF.CARD key` | Items added; `0` for a missing key |
+| `BF.SCANDUMP` | `BF.SCANDUMP key iterator` | Iterator 0 gives the header, then chunks of at most 16 MB; `[0, ""]` is the end |
+| `BF.LOADCHUNK` | `BF.LOADCHUNK key iterator data` | Restore, in order, the chunks `BF.SCANDUMP` gave (from KiviDB or Redis) |
+| `BF.DEBUG` | `BF.DEBUG key` | Each layer's bytes, bits, hashes, capacity, items and error rate |
+
+Settings (`CONFIG SET`, the config file): `bf-error-rate` (0.01),
+`bf-initial-size` (100) and `bf-expansion-factor` (2) are what `BF.ADD`,
+`BF.MADD` and `BF.INSERT` make a missing filter with, and `bf-expansion-factor`
+what `BF.RESERVE` takes without `EXPANSION`. Such a filter is sent to replicas
+and the AOF naming what it took, so a replica or a replay with other settings
+makes the same filter. `bloom-max-filter-bytes` (512 MiB; KiviDB's own, with
+units as `maxmemory` takes them) is the most one filter a client's commands
+make or grow may take; replication, the AOF and loads are not held to it.
+
+### Differences from Redis
+
+- `COPY` copies a filter; Redis refuses it.
+- A filter made before RedisBloom 2.0 (32-bit hashes) is not loaded.
+- Size limits: a client's command does not make or grow a filter over
+  `bloom-max-filter-bytes` (512 MiB unless raised) or 65,536 hashes in all
+  its layers (`ERR filter is too large`); it still answers from, and adds
+  to the layers of, a filter loaded past them. No filter of more than 2048
+  layers or 600,000 hashes in all is made, grown or loaded. Redis has no
+  such limit, and grows none past these. Nor is one the system will not
+  allocate. Replication, the AOF, snapshots, RDB files and `RESTORE` are
+  held only to the fixed limits, so a replica or a restart with a lower
+  `bloom-max-filter-bytes` keeps every filter, and a filter Redis made
+  loads.
+- Per-command limit: `BF.MADD`, `BF.INSERT` and `BF.MEXISTS` stop at the item
+  that would take the command past it, and the reply ends with `ERR command
+  reached the per-command limit for Bloom filters; send fewer items per
+  command` for that item. A write sends replicas and the AOF only the items
+  it took. Commands of ordinary size are not affected.
+- Under `maxmemory`, a client's command that would allocate more than is left
+  evicts first under the policy, and is refused with `OOM ...` only if that is
+  not enough. A command from a master or the AOF is not refused.
+- A scaling filter that cannot grow any more (its error rate too small for
+  another layer) answers `ERR problem inserting into filter`, as Redis does.
+- `BF.LOADCHUNK`, `RESTORE` and the loaders check what they are given: a
+  layer Redis could not have made (no capacity, a hash count that does not
+  follow from its bits per item, flags of no known layout) is refused.
+- `DUMP` payloads carry RDB version 9, so that every Redis since 6.0 can
+  `RESTORE` them; the value is as Redis 8.10 writes it.
+
+---
+
 ## Pub/Sub commands
 
 KiviDB implements the full Redis Pub/Sub command surface including regular channels, glob-pattern subscriptions, and Redis 7.0 shard channels. Every subscribed connection has one queue: a publish appends to the queue of each subscriber, and the connection's own task writes it out. A subscriber therefore sees messages in the order they were published, across all of its channels and patterns, and none is ever dropped from the middle — a subscriber that falls more than 32 MB behind, or stays more than 8 MB behind for 60 seconds, is disconnected instead (Redis's `client-output-buffer-limit pubsub 32mb 8mb 60`). A publish with no subscribers takes no lock.
@@ -819,7 +882,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss`, `maxmemory_policy`, the slabs of string values (`value_slab_bytes`, and `value_slab_live_bytes` in them) and active defrag's `active_defrag_running`, `active_defrag_hits` (values moved), `active_defrag_misses` (left, being held), `active_defrag_panics` (passes that panicked: each panic is caught and logged at `ERROR` with its file and line, the slabs the pass was emptying are put back in use, and the next pass comes 1, 2, 4, then 8 seconds later) and `active_defrag_disabled_by_panics` (1 once 5 passes in a row have panicked with none ending between them: active defrag has then turned itself off, `CONFIG GET activedefrag` says `no`, and `CONFIG SET activedefrag yes` sent while it is off turns it back on and sets this to 0; sent while it is on, it changes nothing. It is not kept across a restart: after a `CONFIG REWRITE`, which writes `activedefrag no` then, the server starts with active defrag off and this at 0, and the `ERROR` line "active defrag turned itself off" in the log says why); `INFO stats` reports `evicted_keys` |
 | `CONFIG GET` | `CONFIG GET parameter [parameter ...]` | Get a configuration parameter; supports `*` for all |
 | `CONFIG SET` | `CONFIG SET param value [param value ...]` | All or nothing: an unknown parameter, a value out of range, a parameter that cannot change at run time or one named twice is an error naming it, and none of the pairs is applied. `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time`, `activedefrag`, `active-defrag-ignore-bytes`, `active-defrag-threshold-lower`, `active-defrag-cycle-max`, `appendonly`, `loglevel`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-load`, `repl-replica-max-backlog-bytes`, `repl-replica-sync-max-backlog-bytes`, `shutdown-timeout` all apply immediately at runtime without restart |
-| `CONFIG REWRITE` | `CONFIG REWRITE` | Persist the current runtime config to the file the server was started with (default `/etc/kividb/kividb.conf`). A server started without one (the file was not there at startup) replies `ERR The server is running without a config file` and writes nothing, as Redis does. Atomic write via tmpfile-rename. Keeps the file's mode, and its owner when run as root; a new file is `0600`. Redis resets the mode to `0644` less the umask instead |
+| `CONFIG REWRITE` | `CONFIG REWRITE` | Persist the current runtime config to the file the server was started with (default `/etc/kividb/kividb.conf`). A server started without one (the file was not there at startup) replies `ERR The server is running without a config file` and writes nothing, as Redis does. A server that read `/etc/kividb/kividb.conf` only because it is the default path, without `--configfile` naming it, refuses too, and says to start it with `--configfile`. Atomic write via tmpfile-rename. Keeps the file's mode, and its owner when run as root; a new file is `0600`. Redis resets the mode to `0644` less the umask instead |
 | `CONFIG RESETSTAT` | `CONFIG RESETSTAT` | Reset the statistics INFO reports, among them `active_defrag_hits`, `active_defrag_misses` and `active_defrag_panics` (not `active_defrag_disabled_by_panics`, which is a state). Returns OK |
 | `OBJECT ENCODING` | `OBJECT ENCODING key` | The encoding Redis would use for the value, from its size and the `*-max-listpack-*` / `set-max-intset-entries` settings: `int`, `embstr` or `raw` for strings; `listpack` or `quicklist` for lists; `listpack`, `intset` or `hashtable` for sets; `listpack` or `hashtable` for hashes; `listpack` or `skiplist` for sorted sets; `stream`. KiviDB stores each type one way internally; the name is for clients and tests that look at it |
 | `OBJECT IDLETIME` | `OBJECT IDLETIME key` | Seconds since the key was last read or written, while an LRU or LRM `maxmemory-policy` is selected; an error under an LFU policy, as in Redis. `0` under the policies that do not go by use (`noeviction`, the random ones, `volatile-ttl`): keys are not watched then |

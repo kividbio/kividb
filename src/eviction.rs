@@ -652,21 +652,31 @@ fn sample_shard<'m>(
     count
 }
 
-/// Up to `count` keys of one database, from a random shard and as many after
-/// it as it takes, each handed to `found` with its shard and place: of all
-/// its keys, or (`volatile`) of those with a time to live. Shards with none,
-/// as far as is known without a lock, are passed over unlocked.
+/// Up to `count` keys of one database, from a shard picked at random in
+/// proportion to its keys (`weights`, the running totals of
+/// `store::shard_weights`; evenly when they are empty or weigh nothing) and
+/// as many after it as it takes, each handed to `found` with its shard and
+/// place: of all its keys, or (`volatile`) of those with a time to live.
+/// Shards with none, as far as is known without a lock, are passed over
+/// unlocked. Within a shard the keys are sampled evenly ([`sample_shard`]),
+/// so a key is as likely to be looked at as any other of the database
+/// however unevenly the shards are filled: in cluster mode a busy hash tag
+/// fills one shard, and picked evenly that shard came up as often as one of
+/// a few keys (#294).
 fn sample_db(
     shards: &[crate::store::Shard],
     volatile: bool,
     count: usize,
+    weights: &[usize],
     rng: &mut impl Rng,
     mut found: impl FnMut(usize, usize, crate::store::EntryView<'_>),
 ) {
     if shards.is_empty() {
         return;
     }
-    let first = rng.gen_range(0..shards.len());
+    let first = crate::store::pick_weighted(weights, rng.r#gen())
+        .filter(|&i| i < shards.len())
+        .unwrap_or_else(|| rng.gen_range(0..shards.len()));
     let mut got = 0;
     for step in 0..shards.len() {
         let index = (first + step) % shards.len();
@@ -789,6 +799,7 @@ fn choose(
     ctx: &Ctx,
     policy: Policy,
     dbs: &[usize],
+    weights: &[Vec<usize>],
     rng: &mut impl Rng,
 ) -> Option<(usize, crate::store::Key)> {
     let now = clock();
@@ -825,17 +836,25 @@ fn choose(
         }
     }
     for &db in dbs {
-        sample_db(&ctx.store[db], volatile, count, rng, |shard, place, e| {
-            let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
-            let spot = Spot {
-                db,
-                shard,
-                place,
-                id: e.id(),
-                unwanted,
-            };
-            choice.offer(spot, e.key());
-        });
+        let weights = weights.get(db).map_or(&[][..], Vec::as_slice);
+        sample_db(
+            &ctx.store[db],
+            volatile,
+            count,
+            weights,
+            rng,
+            |shard, place, e| {
+                let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
+                let spot = Spot {
+                    db,
+                    shard,
+                    place,
+                    id: e.id(),
+                    unwanted,
+                };
+                choice.offer(spot, e.key());
+            },
+        );
     }
     choice.decide()
 }
@@ -855,13 +874,17 @@ struct Dbs {
     volatile: bool,
     found: Option<Instant>,
     list: Vec<usize>,
+    /// For each database, the running totals of its shards' keys (or keys
+    /// with a time to live), as found with the list: what a shard weighs
+    /// when one is picked to sample (`store::pick_weighted`).
+    weights: Vec<Vec<usize>>,
 }
 
 impl Dbs {
     const TRUSTED: std::time::Duration = std::time::Duration::from_millis(10);
 
     /// The list, found again if it is not to be trusted (`fresh`: it is not).
-    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> &[usize] {
+    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> (&[usize], &[Vec<usize>]) {
         let store = Arc::as_ptr(ctx.store) as *const () as usize;
         let now = Instant::now();
         if fresh
@@ -875,17 +898,15 @@ impl Dbs {
             self.volatile = volatile;
             self.found = Some(now);
             self.list.clear();
-            self.list.extend((0..ctx.store.len()).filter(|&db| {
-                ctx.store[db].iter().any(|shard| {
-                    if volatile {
-                        !shard.holds_no_ttl()
-                    } else {
-                        !shard.holds_no_keys()
-                    }
-                })
-            }));
+            self.weights.resize_with(ctx.store.len(), Vec::new);
+            for (db, weights) in self.weights.iter_mut().enumerate() {
+                crate::store::shard_weights(&ctx.store[db], volatile, weights);
+                if weights.last().is_some_and(|&total| total > 0) {
+                    self.list.push(db);
+                }
+            }
         }
-        &self.list
+        (&self.list, &self.weights)
     }
 }
 
@@ -1023,7 +1044,8 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             );
             return false;
         }
-        let Some((db, key)) = choose(ctx, policy, dbs.get(ctx, volatile, fresh), &mut rng) else {
+        let (list, weights) = dbs.get(ctx, volatile, fresh);
+        let Some((db, key)) = choose(ctx, policy, list, weights, &mut rng) else {
             if fresh {
                 return false;
             }
@@ -1160,7 +1182,7 @@ mod tests {
         rng: &mut impl Rng,
     ) -> Vec<Sampled> {
         let mut found = Vec::new();
-        sample_db(shards, volatile, count, rng, |_, _, e| {
+        sample_db(shards, volatile, count, &[], rng, |_, _, e| {
             let expires = if volatile { e.expires() } else { None };
             found.push((
                 crate::key_bytes::text_of(e.key()).into_owned(),
@@ -1169,6 +1191,37 @@ mod tests {
             ))
         });
         found
+    }
+
+    /// Shards filled unevenly, as one busy hash tag fills one in cluster
+    /// mode: picked in proportion to their keys, a key of the full shard is
+    /// as likely to be looked at as a key of the others (#294). (Picked
+    /// evenly, the full shard's 7,000 keys came up an eighth of the time.)
+    #[test]
+    fn a_full_shard_is_sampled_as_often_as_its_keys_say() {
+        let shards: Vec<crate::store::Shard> = (0..8)
+            .map(|_| Arc::new(crate::store::ShardLock::default()))
+            .collect();
+        for i in 0..7_000 {
+            shards[0].write().insert_str(format!("big{i}"), b"v");
+        }
+        for i in 0..1_000 {
+            shards[1 + i % 7].write().insert_str(format!("k{i}"), b"v");
+        }
+        let mut weights = Vec::new();
+        crate::store::shard_weights(&shards, false, &mut weights);
+        assert_eq!(weights.last(), Some(&8_000));
+        let mut rng = rand::thread_rng();
+        let (mut big, mut all) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            sample_db(&shards, false, 5, &weights, &mut rng, |shard, _, _| {
+                all += 1;
+                big += u32::from(shard == 0);
+            });
+        }
+        // 7/8 of the keys; about 0.002 either way.
+        let share = f64::from(big) / f64::from(all);
+        assert!((0.85..0.90).contains(&share), "{share}");
     }
 
     /// Every key is as likely to be sampled as any other, wherever it is in

@@ -20,6 +20,7 @@
 
 pub mod bus;
 pub mod ddl;
+pub(crate) mod migrate_conns;
 pub mod migration;
 pub mod node;
 pub mod persist;
@@ -203,6 +204,23 @@ pub struct LostDataset {
     empty_replicas: parking_lot::Mutex<ahash::AHashSet<(String, u16)>>,
 }
 
+/// This node's announce settings, and what an unset one falls back to.
+#[derive(Default)]
+struct Announce {
+    /// `cluster-announce-ip`; empty: unset.
+    ip: String,
+    /// `cluster-announce-port`; 0: unset.
+    port: u16,
+    /// `cluster-announce-bus-port`; 0: unset.
+    bus_port: u16,
+    /// `bind`, fixed at startup.
+    bind: String,
+    /// The port clients reach this node on, fixed at startup.
+    client_port: u16,
+    /// The bus port this node listens on, fixed at startup.
+    listen_bus_port: u16,
+}
+
 /// The locks below are `parking_lot` locks: a reader queues behind a waiting
 /// writer, so a thread must never take a lock it already holds, read or
 /// write, and a guard must not be kept across an `.await`. Where one thread
@@ -322,6 +340,9 @@ pub struct ClusterState {
     marked_failed: AtomicBool,
     /// `cluster-require-full-coverage`.
     require_full_coverage: AtomicBool,
+    /// `cluster-announce-ip`, `-port` and `-bus-port`, as configured at
+    /// startup or since by `CONFIG SET`. See [`Self::set_announce`].
+    announce: parking_lot::Mutex<Announce>,
     /// `cluster-replica-validity-factor`: how stale a replica's data may be
     /// for it to stand for election, in node timeouts; 0 = always stand.
     replica_validity_factor: AtomicU64,
@@ -351,6 +372,9 @@ pub struct ClusterState {
     /// The connection each peer is pinged over, by `ip:bus_port`, kept open
     /// between heartbeats. See `bus::dialer::send_ping`.
     pub(crate) ping_links: parking_lot::Mutex<AHashMap<String, bus::dialer::PingLink>>,
+    /// The connections a search is sent on to the other masters, kept open
+    /// between searches. See `search::Pool`.
+    pub(crate) search_pool: search::Pool,
 }
 
 impl ClusterState {
@@ -398,6 +422,7 @@ impl ClusterState {
             last_failover_began: parking_lot::Mutex::new(None),
             marked_failed: AtomicBool::new(false),
             require_full_coverage: AtomicBool::new(true),
+            announce: parking_lot::Mutex::new(Announce::default()),
             replica_validity_factor: AtomicU64::new(10),
             self_ip_is_guess: AtomicBool::new(false),
             bus_secret: std::sync::OnceLock::new(),
@@ -410,6 +435,7 @@ impl ClusterState {
             stats_bus_connects: AtomicU64::new(0),
             links: parking_lot::Mutex::new(AHashMap::new()),
             ping_links: parking_lot::Mutex::new(AHashMap::new()),
+            search_pool: search::Pool::default(),
         };
         state.refresh_state();
         state
@@ -508,7 +534,14 @@ impl ClusterState {
     /// after logging one line.
     pub fn from_config(config: &crate::config::Config) -> std::io::Result<Self> {
         if !config.cluster_enabled {
-            return Ok(Self::new_disabled());
+            // Kept for `CONFIG GET`, `SET` and `REWRITE`, as Redis keeps
+            // them outside cluster mode too.
+            let state = Self::new_disabled();
+            state.configure_announce(config);
+            state
+                .require_full_coverage
+                .store(config.cluster_require_full_coverage, Ordering::Relaxed);
+            return Ok(state);
         }
         if !valid_hostname(&config.cluster_announce_hostname) {
             return Err(std::io::Error::new(
@@ -546,27 +579,12 @@ impl ClusterState {
         // for clients and for the other nodes alike (see `node_tls`); the bus
         // stays where it is. A node with no plaintext port (port 0) has
         // `tls-cluster`: see `Config::validate`.
-        let client_port = if config.tls_cluster || config.port == 0 {
-            config.tls_port
-        } else {
-            config.port
-        };
-        let bus_port = if config.cluster_announce_bus_port != 0 {
-            config.cluster_announce_bus_port
-        } else {
-            config.cluster_bus_port()
-        };
-        state.configure_self_address(
-            &config.bind,
-            client_port,
-            &config.cluster_announce_ip,
-            config.cluster_announce_port,
-            bus_port,
-        );
+        state.configure_announce(config);
         state.set_require_full_coverage(config.cluster_require_full_coverage);
         state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
         state.set_my_announced_client_port(config.cluster_announce_client_port);
+        state.search_pool.size_for(config.resolve_threads());
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
                 .bus_secret
@@ -770,6 +788,100 @@ impl ClusterState {
             me.client_port = announced_client;
             me.cluster_port = announced_bus;
         }
+    }
+
+    /// Take this node's announce settings from its configuration, and set
+    /// its own address from them.
+    pub fn configure_announce(&self, config: &crate::config::Config) {
+        // With `tls-cluster` the port to reach this node on is its TLS port,
+        // for clients and for the other nodes alike (see `node_tls`); the bus
+        // stays where it is. A node with no plaintext port (port 0) has
+        // `tls-cluster`: see `Config::validate`.
+        let client_port = if config.tls_cluster || config.port == 0 {
+            config.tls_port
+        } else {
+            config.port
+        };
+        let mut announce = self.announce.lock();
+        *announce = Announce {
+            ip: config.cluster_announce_ip.clone(),
+            port: config.cluster_announce_port,
+            bus_port: config.cluster_announce_bus_port,
+            bind: config.bind.clone(),
+            client_port,
+            listen_bus_port: config.cluster_bus_port(),
+        };
+        self.apply_announce(&announce);
+    }
+
+    fn apply_announce(&self, announce: &Announce) {
+        let bus_port = if announce.bus_port != 0 {
+            announce.bus_port
+        } else {
+            announce.listen_bus_port
+        };
+        self.configure_self_address(
+            &announce.bind,
+            announce.client_port,
+            &announce.ip,
+            announce.port,
+            bus_port,
+        );
+    }
+
+    /// `cluster-announce-ip`, `cluster-announce-port` and
+    /// `cluster-announce-bus-port` as they are set now (empty or 0: unset).
+    pub fn announce(&self) -> (String, u16, u16) {
+        let announce = self.announce.lock();
+        (announce.ip.clone(), announce.port, announce.bus_port)
+    }
+
+    /// Change `cluster-announce-ip`, `-port` or `-bus-port` while the node
+    /// runs (`CONFIG SET`), as Redis allows (#391). This node's own address
+    /// follows, and nodes.conf is saved when it changed. Peers take the new
+    /// address from this node's next heartbeat, as they would after a
+    /// restart with the new settings.
+    pub fn set_announce(
+        &self,
+        ip: Option<&str>,
+        port: Option<u16>,
+        bus_port: Option<u16>,
+    ) -> std::io::Result<()> {
+        let address = || {
+            self.nodes
+                .read()
+                .get(&self.myself())
+                .map(|me| (me.ip.clone(), me.client_port, me.cluster_port))
+        };
+        let before = address();
+        {
+            let mut announce = self.announce.lock();
+            if let Some(ip) = ip {
+                announce.ip = ip.to_string();
+            }
+            if let Some(port) = port {
+                announce.port = port;
+            }
+            if let Some(bus_port) = bus_port {
+                announce.bus_port = bus_port;
+            }
+            if self.enabled {
+                self.apply_announce(&announce);
+            }
+        }
+        if self.enabled && address() != before {
+            let (ip, port, bus_port) = self.announce();
+            log_info!(
+                "Cluster: announce settings changed (ip '{ip}', port {port}, bus port {bus_port})"
+            );
+            self.save_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// `cluster-require-full-coverage`.
+    pub fn require_full_coverage(&self) -> bool {
+        self.require_full_coverage.load(Ordering::Relaxed)
     }
 
     /// Set this node's `cluster-announce-hostname` (empty: none). Peers
@@ -1567,21 +1679,26 @@ impl ClusterState {
     /// our current config_epoch. Used by the heartbeat task to populate
     /// outgoing PING/PONG messages.
     pub fn my_slot_claims(&self) -> Vec<crate::cluster::bus::SlotClaim> {
+        self.slot_claims_of(self.myself())
+    }
+
+    /// The slots `owner` owns in this node's view, as contiguous ranges,
+    /// paired with its config epoch in this node's view: this node's own
+    /// claims ([`Self::my_slot_claims`]), or what a replica standing for
+    /// election claims for its master (#524, [`Self::cast_vote`]).
+    pub fn slot_claims_of(&self, owner: NodeId) -> Vec<crate::cluster::bus::SlotClaim> {
         if !self.enabled {
             return vec![];
         }
         let my_epoch = {
             let nodes = self.nodes.read();
-            nodes
-                .get(&self.myself())
-                .map(|n| n.config_epoch)
-                .unwrap_or(0)
+            nodes.get(&owner).map(|n| n.config_epoch).unwrap_or(0)
         };
         let slots = self.slots.read();
         let mut out = Vec::new();
         let mut start: Option<usize> = None;
         for i in 0..CLUSTER_SLOTS {
-            let owned = matches!(slots[i], Some(o) if o == self.myself());
+            let owned = matches!(slots[i], Some(o) if o == owner);
             match (start, owned) {
                 (None, true) => start = Some(i),
                 (Some(s), false) => {
@@ -2184,13 +2301,22 @@ impl ClusterState {
     /// * the epoch is not behind the cluster's, and we have not voted in it —
     ///   one vote per epoch is what makes two winners impossible;
     /// * we have not voted for another replica of the same master within the
-    ///   last two node timeouts.
+    ///   last two node timeouts;
+    /// * none of the slots the candidate `claims` for its master, if the
+    ///   request says (an automatic failover's, from this version on), has
+    ///   an owner here other than that master at a newer config epoch than
+    ///   the claim's, as in Redis (#524). A replica that has not heard that
+    ///   its master gave a slot away, in a slot handover or a failover,
+    ///   would claim it at the election's epoch once promoted, newer than
+    ///   the owner's, and the owner's acknowledged writes to it would be
+    ///   lost.
     pub fn cast_vote(
         &self,
         candidate: NodeId,
         master_id: NodeId,
         request_epoch: u64,
         force: bool,
+        claims: Option<&[crate::cluster::bus::SlotClaim]>,
     ) -> bool {
         if !self.enabled {
             return false;
@@ -2221,6 +2347,16 @@ impl ClusterState {
             return false;
         }
         if request_epoch < self.current_epoch.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(claims) = claims
+            && let Some(why) = self.newer_owner_of_claimed(master_id, claims)
+        {
+            log_info!(
+                "Cluster: Not voting for {} to take over from {}: {why}",
+                node_id_str(&candidate),
+                node_id_str(&master_id)
+            );
             return false;
         }
         // Taken before `handoff_holds` and the tasks of `slot_migrations`
@@ -2274,6 +2410,38 @@ impl ClusterState {
                 return true;
             }
         }
+    }
+
+    /// Of the slots a candidate `claims` for `master_id`, the first that
+    /// another node owns here at a newer config epoch than the claim's, and
+    /// why it is refused: see [`Self::cast_vote`].
+    fn newer_owner_of_claimed(
+        &self,
+        master_id: NodeId,
+        claims: &[crate::cluster::bus::SlotClaim],
+    ) -> Option<String> {
+        let epochs: AHashMap<NodeId, u64> = {
+            let nodes = self.nodes.read();
+            nodes.iter().map(|(id, n)| (*id, n.config_epoch)).collect()
+        };
+        let slots = self.slots.read();
+        for claim in claims {
+            let end = claim.end.min((CLUSTER_SLOTS - 1) as u16);
+            for slot in claim.start..=end {
+                if let Some(owner) = slots[slot as usize]
+                    && owner != master_id
+                    && let Some(&epoch) = epochs.get(&owner)
+                    && epoch > claim.epoch
+                {
+                    return Some(format!(
+                        "it claims slot {slot} at epoch {}, and {} owns it at epoch {epoch}",
+                        claim.epoch,
+                        node_id_str(&owner)
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Begin an election to replace `master_id`. Returns the new epoch. Bumps
@@ -3814,8 +3982,76 @@ mod tests {
         let (cs, a, _b) = three_master_cluster();
         let replica = add_replica(&cs, a);
 
-        assert!(!cs.cast_vote(replica, a, 5, false), "master is healthy");
-        assert!(cs.cast_vote(replica, a, 5, true), "manual failover");
+        assert!(
+            !cs.cast_vote(replica, a, 5, false, None),
+            "master is healthy"
+        );
+        assert!(cs.cast_vote(replica, a, 5, true, None), "manual failover");
+    }
+
+    /// A vote is refused to a candidate that claims, in an automatic
+    /// failover's request, a slot this node knows a newer owner of: a slot
+    /// its master gave away, in a handover or a failover it has not heard of
+    /// (#524). Promoted, it would claim the slot at the election's epoch,
+    /// newer than the owner's, and the owner's acknowledged writes to it
+    /// would be lost. A claim at the owner's epoch or newer, of its
+    /// master's own slots or of slots no one owns, is not refused; nor is a
+    /// request without claims, as an earlier version sends it.
+    #[test]
+    fn no_vote_for_a_candidate_claiming_a_slot_with_a_newer_owner() {
+        let claim = |start, end, epoch| crate::cluster::bus::SlotClaim { start, end, epoch };
+        let (cs, a, b) = three_master_cluster();
+        let me = cs.myself();
+        let replica = add_replica(&cs, a);
+        {
+            let mut nodes = cs.nodes.write();
+            nodes.get_mut(&a).unwrap().mark_failed(now_ms());
+            nodes.get_mut(&a).unwrap().config_epoch = 3;
+            nodes.get_mut(&b).unwrap().config_epoch = 7;
+            nodes.get_mut(&me).unwrap().config_epoch = 5;
+        }
+        // `b` has taken 5461-5500 from `a`, in this node's view.
+        {
+            let mut slots = cs.slots.write();
+            for slot in 5461..=5500 {
+                slots[slot] = Some(b);
+            }
+        }
+        let stale = [claim(5461, 10922, 3)];
+        assert!(!cs.cast_vote(replica, a, 10, false, Some(&stale)));
+        // One of this node's own.
+        assert!(!cs.cast_vote(replica, a, 11, false, Some(&[claim(100, 100, 3)])));
+        // Refused, the vote is not spent: the same candidate, its claims
+        // now current, has it. So would a slot no one owns, or one of `b`'s
+        // claimed at `b`'s epoch.
+        let current = [claim(5501, 10922, 3), claim(5461, 5461, 7)];
+        assert!(cs.cast_vote(replica, a, 12, false, Some(&current)));
+
+        // A request without claims is decided as before.
+        let (cs, a, b) = three_master_cluster();
+        let replica = add_replica(&cs, a);
+        {
+            let mut nodes = cs.nodes.write();
+            nodes.get_mut(&a).unwrap().mark_failed(now_ms());
+            nodes.get_mut(&b).unwrap().config_epoch = 7;
+        }
+        cs.slots.write()[5461] = Some(b);
+        assert!(cs.cast_vote(replica, a, 10, false, None));
+    }
+
+    /// The claims a candidate sends: its master's slots in its view, as
+    /// ranges, at the master's config epoch.
+    #[test]
+    fn slot_claims_of_a_master_are_its_ranges_at_its_epoch() {
+        let (cs, a, _b) = three_master_cluster();
+        cs.nodes.write().get_mut(&a).unwrap().config_epoch = 4;
+        cs.slots.write()[6000] = None;
+        let claims: Vec<(u16, u16, u64)> = cs
+            .slot_claims_of(a)
+            .iter()
+            .map(|c| (c.start, c.end, c.epoch))
+            .collect();
+        assert_eq!(claims, vec![(5461, 5999, 4), (6001, 10922, 4)]);
     }
 
     #[test]
@@ -3825,13 +4061,16 @@ mod tests {
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
         cs.nodes.write().get_mut(&b).unwrap().mark_failed(now_ms());
 
-        assert!(cs.cast_vote(ra, a, 5, false));
-        assert!(!cs.cast_vote(rb, b, 5, false), "already voted in epoch 5");
+        assert!(cs.cast_vote(ra, a, 5, false, None));
         assert!(
-            !cs.cast_vote(rb, b, 4, false),
+            !cs.cast_vote(rb, b, 5, false, None),
+            "already voted in epoch 5"
+        );
+        assert!(
+            !cs.cast_vote(rb, b, 4, false, None),
             "epoch 4 is behind the cluster"
         );
-        assert!(cs.cast_vote(rb, b, 6, false));
+        assert!(cs.cast_vote(rb, b, 6, false, None));
         assert_eq!(cs.current_epoch(), 6);
     }
 
@@ -3842,8 +4081,8 @@ mod tests {
         let (r1, r2) = (add_replica(&cs, a), add_replica(&cs, a));
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
 
-        assert!(cs.cast_vote(r1, a, 5, false));
-        assert!(!cs.cast_vote(r2, a, 6, false));
+        assert!(cs.cast_vote(r1, a, 5, false, None));
+        assert!(!cs.cast_vote(r2, a, 6, false, None));
     }
 
     #[test]
@@ -3852,7 +4091,7 @@ mod tests {
         let a = add_master(&cs, 0..=16383);
         let replica = add_replica(&cs, a);
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
-        assert!(!cs.cast_vote(replica, a, 5, false));
+        assert!(!cs.cast_vote(replica, a, 5, false, None));
     }
 
     #[test]
@@ -3860,7 +4099,7 @@ mod tests {
         let (cs, a, b) = three_master_cluster();
         let replica_of_b = add_replica(&cs, b);
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
-        assert!(!cs.cast_vote(replica_of_b, a, 5, false));
+        assert!(!cs.cast_vote(replica_of_b, a, 5, false, None));
     }
 
     // ── FORGET, RESET ────────────────────────────────────────────────────

@@ -639,6 +639,9 @@ impl ClientInfo {
         if self.subscriptions.iter().any(|n| *n > 0) {
             flags.push('P');
         }
+        if self.activity.tx().0 >= 0 {
+            flags.push('x');
+        }
         if self.blocked {
             flags.push('b');
         }
