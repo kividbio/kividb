@@ -180,6 +180,7 @@ They are checked against the candidate only.
 | `rel` | within `pct` % of the recorded candidate value, in the worse direction; `abs` adds a slack in the metric's unit (the larger wins); `redis_plus` also allows up to Redis's value this session plus that much | throughput/time: 10 %; memory held: 5 %; RSS after a give-back: 25 % or 5 MiB; worst PING: max(1.5x recorded, Redis + 10 ms); #770 guard rows: 35 % (measured spread up to 28 %) |
 | `ratio` | the gain over v1.2.2 measured this session (v1.2.2/candidate for lower-is-better) is at least `keep` x the recorded gain | every claimed improvement: keep 60 % |
 | `vs_redis` | candidate at most `max_x` times worse than Redis this session | SCAN iterations: 1.3x |
+| `vs_v1_2_2` | candidate at most `max_x` times v1.2.2's value this session (below 1: that much better) | `KEYS user:99*` (04): 0.85x |
 | `bound` | absolute: `eq` (`"recorded"`: equal to the recorded value), `max`, `min` | counts (exact); worst PING on Tokio during a long command: 20 ms |
 | `info` | shown, never gated | call counts, PINGs over 10 ms, probes stalled |
 
@@ -255,6 +256,12 @@ Why a few rows differ from the plan's defaults:
   command holds up every connection. The fix will show up as an improvement.
 - `01-scan-match` `HSCAN`/`SSCAN`/`ZSCAN` (#770) are 10-20x slower than Redis
   today: gated only against getting slower than recorded.
+- `04-long-commands` `keys_cmd_ms`: its recorded value (161 ms, master
+  `2468f226`) was 15 % slower than v1.2.2; #789 made it about 0.6x v1.2.2's
+  time. Rather than re-record, the gate was tightened by hand: besides 10 %
+  over the recorded value, it must stay at most 0.85x v1.2.2's time measured
+  in the same session (0.61x in #789's runs, so the noise of a few % is far
+  from it; losing about half the gain fails).
 - Memory per item (`05`, `06`, `08`, `09`) is deterministic, so 5 % is wide;
   a few bytes of `abs` slack (1-4 B) keep the small values (6.2 B per one-field
   stream entry) from failing on an allocator rounding.
@@ -436,7 +443,7 @@ informational rows are in `baseline.json` and the summaries):
 | 04-long-commands / tokio | del_cmd_ms (ms) | 132.2 | 143.3 | 333.5 | rel 10% |
 | 04-long-commands / tokio | del_worst_ping_max_ms (ms) | 131.2 | 1.22 | 335.7 | max 20 |
 | 04-long-commands / tokio | del_worst_ping_ms (ms) | 131.0 | 0.94 | 332.7 | max 20 |
-| 04-long-commands / tokio | keys_cmd_ms (ms) | 141.1 | 161.3 | 216.5 | rel 10% |
+| 04-long-commands / tokio | keys_cmd_ms (ms) | 141.1 | 161.3 | 216.5 | rel 10%; <= 0.85x v1.2.2 |
 | 04-long-commands / tokio | keys_worst_ping_max_ms (ms) | 132.1 | 8.09 | 205.1 | max 20 |
 | 04-long-commands / tokio | keys_worst_ping_ms (ms) | 129.3 | 5.94 | 203.6 | max 20 |
 | 04-long-commands / tokio | scan_cmd_ms (ms) | 254.3 | 112.5 | 471.7 | rel 10% |
@@ -445,7 +452,7 @@ informational rows are in `baseline.json` and the summaries):
 | 04-long-commands / uring | del_cmd_ms (ms) | 136.4 | 134.3 | - | rel 10% |
 | 04-long-commands / uring | del_least_worst_ping_ms (ms) | 0.21 | 0.41 | - | rel 50% or +10 |
 | 04-long-commands / uring | del_worst_ping_ms (ms) | 135.8 | 132.9 | - | info |
-| 04-long-commands / uring | keys_cmd_ms (ms) | 145.6 | 153.6 | - | rel 10% |
+| 04-long-commands / uring | keys_cmd_ms (ms) | 145.6 | 153.6 | - | rel 10%; <= 0.85x v1.2.2 |
 | 04-long-commands / uring | keys_least_worst_ping_ms (ms) | 0.17 | 0.95 | - | rel 50% or +10 |
 | 04-long-commands / uring | keys_worst_ping_ms (ms) | 134.9 | 142.8 | - | info |
 | 04-long-commands / uring | scan_cmd_ms (ms) | 265.5 | 112.6 | - | rel 10% |
@@ -465,11 +472,52 @@ What this run shows besides the gated gains:
 - `KEYS user:99*` over 2M keys takes 161-164 ms on master against 141-142 ms
   on v1.2.2 on Tokio (about 15 % slower), and 154-163 ms against 146-149 ms on
   io_uring; `KEYS schedule:*` is twice
-  as fast. The gate holds today's value.
+  as fast. Fixed in #789 (below).
 - The incremental table growth (#780) raised the growth load's PING p99 on
   Tokio from 2.0 to 3.0 ms (and 0.7 to 1.5 ms on io_uring with one thread),
   while its worst PING fell from 112 to 9.7 ms.
 - `SCAN 0 MATCH user:99* COUNT 2000000` takes 112 ms instead of 254-265 ms.
+
+### #789: `KEYS` with a selective pattern
+
+`KEYS` matched every key in place through the general glob matcher
+(`glob_redis::match_from`): 136 instructions a key for `user:99*`, 76 % of
+the command. v1.2.2 copied every key and checked each one's time to live as
+well, twice the instructions, and was still faster: matching interleaved
+with the walk over 2M entries costs more time than its instruction count
+says. Since #789 `KEYS` makes the pattern ready once (`glob_redis::Glob`,
+as `SCAN` does), tells most keys by their first or last byte, and writes
+matches straight into the reply. Not related to #757: the loss was the same
+on io_uring, where `long_work` does nothing.
+
+Instructions of one `KEYS` over `DEBUG POPULATE 2000000 user` (callgrind,
+whole server, Tokio):
+
+| pattern | v1.2.2 | master `5809ac61` | #789 |
+|---|---:|---:|---:|
+| `user:99*` (11,111 keys) | 697.9 M | 358.5 M | 184.9 M |
+| `schedule:*` (none) | 491.3 M | 150.1 M | 110.0 M |
+
+Wall time on a D4s_v5, median of 7 (9 for suite 01's keyspace), one engine
+at a time:
+
+| | v1.2.2 | master `5809ac61` | #789 |
+|---|---:|---:|---:|
+| `KEYS user:99*`, Tokio, no other client | 137-139 ms | 143-145 ms | 83-84 ms |
+| same, with suite 04's four PING probes | 137-138 ms | 153-155 ms | 87 ms |
+| same, io_uring, no other client | 136-138 ms | 142-146 ms | 83-84 ms |
+| suite 01's keyspace: `KEYS schedule:*` | 113 ms | 57 ms | 54 ms |
+| suite 01's keyspace: `KEYS user:99*` | 135 ms | 144 ms | 82 ms |
+| suite 01's keyspace: `KEYS *:1999` | 203 ms | 309 ms | 59 ms |
+
+Suites 01 and 04 with the fix (`results/pr789-d4s_v5`, compared with the
+baseline recorded above, the new gate included): every gate passed;
+`keys_cmd_ms` 90.2 ms against v1.2.2's 136.9 on Tokio (0.66x) and 87.0
+against 141.8 on io_uring (0.61x), `keys_schedule_ms` 53.7 ms (recorded
+60.4), and the `SCAN` rows within their recorded values. Two more runs of
+the same build before the gate was added gave 90.0/87.9 ms (0.61x/0.61x)
+and 97.5/94.3 ms (0.72x/0.67x, before the comparison was inlined). The probes' extra 10 ms on master is the PINGs being served
+meanwhile, which is #757's point: v1.2.2 served none.
 
 ## Recorded run, suites 05-13
 

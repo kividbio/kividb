@@ -233,6 +233,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`KEYS` with a pattern that matches few keys is no longer slower than in
+  1.2.2 (#789).** `KEYS` matched each key in place through the general glob
+  matcher, about 136 instructions a key for `user:99*`, and was 5-15 %
+  slower than 1.2.2 although it no longer copies every key. It now makes
+  the pattern ready once, as `SCAN` does, so `prefix:*`, `*suffix` and
+  `*part*` are told by comparing bytes (most keys by their first or last
+  byte alone), and writes the keys that match straight into the reply.
+  Over 2,000,000 keys, `KEYS user:99*` went from 144 ms (1.2.2: 137 ms) to
+  83 ms on both I/O models, and `KEYS *:1999` from 309 ms to 59 ms.
+  `SCAN`, `HSCAN`, `SSCAN` and `ZSCAN` use the same comparison, now
+  inlined.
+
 - **`Q8` and `BIN` vector sets search and load at full speed on x86-64
   (#793).** The int8 dot product, the Hamming distance and quantizing
   compiled for the baseline x86-64 target, which has no SSE4.1 or POPCNT, so

@@ -208,6 +208,12 @@ def check_gate(g, m, rec, host=None):
             return "skip", "vs_redis: Redis not measured this run"
         x = cand / red if better == "lower" else red / cand if cand > 0 else float("inf")
         return ("pass" if x <= g["max_x"] else "FAIL"), "%.2fx Redis <= %gx" % (x, g["max_x"])
+    if kind == "vs_v1_2_2":
+        old = now.get("v1_2_2")
+        if old is None or old <= 0:
+            return "skip", "vs_v1_2_2: v1.2.2 not measured this run"
+        x = cand / old if better == "lower" else old / cand if cand > 0 else float("inf")
+        return ("pass" if x <= g["max_x"] else "FAIL"), "%.2fx v1.2.2 <= %gx" % (x, g["max_x"])
     if kind == "bound":
         texts, ok = [], True
         if "eq" in g:
