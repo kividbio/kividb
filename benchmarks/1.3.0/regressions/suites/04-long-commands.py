@@ -29,7 +29,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, THROUGHPUT, EXACT, rel, bound, info, median, scaled)  # noqa: E402
+from suite import (Suite, Config, THROUGHPUT, EXACT, rel, bound, info, vs_v1_2_2, median, scaled)  # noqa: E402
 from probe import Probe  # noqa: E402
 
 RUNS = 3
@@ -104,7 +104,10 @@ def run(ctx):
         ctx.raw["runs"][case] = runs
         cmd = [r["cmd_ms"] for r in runs]
         worst = [r["worst_ms"] for r in runs]
-        ctx.emit(case + "_cmd_ms", median(cmd), "ms", "lower", gate=THROUGHPUT, samples=cmd)
+        # KEYS was 15 % slower than v1.2.2 before #789 and is about a third faster since:
+        # it must stay at least 1/0.85 times faster than v1.2.2 measured in the same session.
+        gate = [THROUGHPUT, vs_v1_2_2(0.85)] if case == "keys" else THROUGHPUT
+        ctx.emit(case + "_cmd_ms", median(cmd), "ms", "lower", gate=gate, samples=cmd)
         if tokio:
             # Off the driver: no PING may wait more than 20 ms (the command takes 130-300 ms).
             ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=bound(max=20), samples=worst)

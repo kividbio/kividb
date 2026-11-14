@@ -6,7 +6,7 @@ function that measures one engine in one configuration and emits metrics.
 run-all.sh starts and stops the servers; a suite only talks to the port it is
 given. See README.md, "Adding a suite".
 
-    from suite import Suite, Config, rel, ratio, vs_redis, bound, info
+    from suite import Suite, Config, rel, ratio, vs_redis, vs_v1_2_2, bound, info
 
     S = Suite("05-example", [
         Config("tokio", io="tokio"),
@@ -35,6 +35,9 @@ Gates (one, or a list, per metric; compare.py explains each in summary.md):
         keep x the recorded improvement.
     vs_redis(x)
         candidate is at most x times worse than Redis this session.
+    vs_v1_2_2(x)
+        candidate is at most x times v1.2.2's value this session (x < 1: at
+        least 1/x times better).
     bound(eq=, max=, min=)
         absolute; eq="recorded" means equal to the recorded candidate value.
     info()
@@ -65,6 +68,10 @@ def ratio(keep=0.6):
 
 def vs_redis(x):
     return {"kind": "vs_redis", "max_x": x}
+
+
+def vs_v1_2_2(x):
+    return {"kind": "vs_v1_2_2", "max_x": x}
 
 
 def bound(eq=None, max=None, min=None):
