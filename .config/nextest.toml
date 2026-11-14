@@ -1,0 +1,42 @@
+# cargo-nextest settings. CI builds the tests once (`cargo nextest archive`)
+# and runs them in shards from that archive: see .github/workflows/ci.yml and
+# linux-verification.yml. Locally, `cargo nextest run` works too, and plain
+# `cargo test` still does.
+#
+# nextest runs every test in a process of its own. Several test files kept
+# one server per process and took turns through a static Mutex because the
+# server's settings (maxmemory, the bf-* limits, the command gate) are
+# process-wide; per process they no longer share any of that, which is safe.
+# The files below still take turns with each other, as they did before:
+# they time what the command gate or a spawned server does, and several of
+# them at once on a 4-core runner would measure the neighbours.
+
+[test-groups]
+one-at-a-time = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(=bloom) | binary(=entry_table) | binary(=exec_clock) | binary(=index-persistence)'
+test-group = 'one-at-a-time'
+
+# Many processes or a lot of CPU each: count them as two tests, so they get
+# room beside the rest.
+[[profile.default.overrides]]
+filter = 'binary(=cluster) | binary(=memory_usage_accuracy) | binary(=memory_usage_zset) | binary(=search_postings)'
+threads-required = 2
+
+# These start real servers, kill them with SIGTERM or SHUTDOWN under load and
+# read back what the next one loaded. Two of them failed once each (the
+# restarted server was empty) when they ran beside the heaviest tests on a
+# loaded runner, and passed on a rerun: give them the whole runner.
+[[profile.default.overrides]]
+filter = 'binary(=shutdown) | test(=sigterm_waits_for_the_final_snapshot)'
+threads-required = 'num-cpus'
+
+[profile.ci]
+# Report every failing test of the run, as `cargo test --no-fail-fast` did.
+fail-fast = false
+# The slowest test of the suite takes minutes. One that runs for half an hour
+# is hung: stop it instead of holding the runner until the job's own limit.
+slow-timeout = { period = "120s", terminate-after = 15 }
+status-level = "slow"
+failure-output = "immediate-final"
