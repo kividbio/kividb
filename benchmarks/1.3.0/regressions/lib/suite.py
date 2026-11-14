@@ -92,19 +92,27 @@ EXACT = bound(eq="recorded")                    # counts
 
 
 class Config:
-    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False):
+    """One configuration: a fresh server per engine, started by run-all.sh.
+
+    self_hosted=True: run-all.sh starts no server; the suite starts its own
+    from ctx.bin (several nodes, a cluster: lib/nodes.py), and ctx.port and
+    ctx.pid are None."""
+
+    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False, self_hosted=False):
         self.name, self.io, self.threads = name, io, threads
         self.engines, self.full_only = tuple(engines), full_only
+        self.self_hosted = self_hosted
 
     def as_dict(self):
         return {"name": self.name, "io": self.io, "threads": self.threads,
-                "engines": list(self.engines), "full_only": self.full_only}
+                "engines": list(self.engines), "full_only": self.full_only,
+                "self_hosted": self.self_hosted}
 
 
 class Ctx:
-    def __init__(self, suite, config, engine, kind, port, pid, out):
+    def __init__(self, suite, config, engine, kind, port, pid, out, bin=None):
         self.suite, self.config, self.engine, self.kind = suite, config, engine, kind
-        self.port, self.pid, self.out = port, pid, out
+        self.port, self.pid, self.out, self.bin = port, pid, out, bin
         self.raw = {}
         self.metrics = []
         self.t_start = time.time()
@@ -112,7 +120,8 @@ class Ctx:
     def client(self, **kw):
         import redis
         kw.setdefault("socket_timeout", 600)
-        return redis.Redis(host="127.0.0.1", port=self.port, **kw)
+        kw.setdefault("port", self.port)
+        return redis.Redis(host="127.0.0.1", **kw)
 
     def log(self, msg):
         print("[%s %s %s] %s" % (self.suite, self.config.name, self.engine, msg), flush=True)
@@ -131,9 +140,12 @@ class Ctx:
         self.log("%s = %s %s%s" % (metric, rec["value"], unit,
                                    "  (%s)" % " / ".join("%g" % s for s in rec.get("samples", [])) if samples else ""))
 
-    def server_info(self):
+    def server_info(self, port=None):
+        port = port or self.port
+        if port is None:
+            return {}
         try:
-            i = self.client().info("server")
+            i = self.client(port=port).info("server")
             keep = ("redis_version", "kividb_version", "multiplexing_api", "io_threads_active",
                     "process_id", "arch_bits", "gcc_version")
             return {k: i[k] for k in i if k in keep or "version" in k or "multiplexing" in k}
@@ -161,6 +173,7 @@ class Suite:
         ap.add_argument("--kind", choices=("kividb", "redis"))
         ap.add_argument("--port", type=int)
         ap.add_argument("--pid", type=int)
+        ap.add_argument("--bin", help="the engine's server binary (for suites that start their own)")
         ap.add_argument("--out", help="results directory (results.jsonl and raw/)")
         a = ap.parse_args(argv)
         if a.configs:
@@ -170,7 +183,7 @@ class Suite:
         cfg = next((c for c in self.configs if c.name == a.config), None)
         if cfg is None:
             ap.error("unknown config %r" % a.config)
-        ctx = Ctx(self.name, cfg, a.engine, a.kind, a.port, a.pid, a.out)
+        ctx = Ctx(self.name, cfg, a.engine, a.kind, a.port, a.pid, a.out, a.bin)
         ctx.raw["server"] = ctx.server_info()
         status = 0
         try:
