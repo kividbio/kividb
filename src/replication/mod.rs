@@ -5141,8 +5141,10 @@ mod replication_invariants_tests {
             rx.try_recv().unwrap();
         }
         pending.taken(800, 16 * ReplicaQueue::held_for(50));
-        // Streaming again (220 bytes, under a quarter of 1000), over the soft
-        // limit, and for longer than its seconds: still there.
+        // Streaming again from this write (220 bytes, under a quarter of
+        // 1000), over the soft limit from the next, and for longer than its
+        // seconds: still there.
+        propagate(&hub, vec![0u8; 20]);
         propagate(&hub, vec![0u8; 20]);
         barrier(&hub).await;
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
