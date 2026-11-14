@@ -1,0 +1,2331 @@
+{
+  "_about": "Recorded values and gates of benchmarks/1.3.0/regressions (see README.md). One entry per metric, keyed suite/config/metric. Written by lib/compare.py --record; gates may be tuned by hand and survive a re-record.",
+  "pins": {
+    "_comment": "SHA-256 of the binaries the recorded values were measured with. compare.py marks a run INVALID when v1.2.2's differs (it never should: it is the release tarball's binary), or when redis-server's differs and REGRESS_REDIS_SHA256 does not name the new one (a deliberate Redis bump, after which --record stores it).",
+    "v1_2_2_sha256": "38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e",
+    "redis_sha256": "b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c"
+  },
+  "metrics": {
+    "01-scan-match/default/dbsize": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "dbsize",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2002003.0,
+        "candidate": 2002003.0,
+        "redis": 2002003.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/hscan_match_c1000_calls": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "hscan_match_c1000_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 201.0,
+        "candidate": 201.0,
+        "redis": 201.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "01-scan-match/default/hscan_match_c1000_distinct": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "hscan_match_c1000_distinct",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 200.0,
+        "candidate": 200.0,
+        "redis": 200.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/hscan_match_c1000_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "hscan_match_c1000_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 443.7123,
+        "candidate": 427.9508,
+        "redis": 41.3729,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 35
+        }
+      ]
+    },
+    "01-scan-match/default/keys_schedule_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "keys_schedule_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 116.8544,
+        "candidate": 60.436,
+        "redis": 130.64,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "01-scan-match/default/keys_schedule_returned": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "keys_schedule_returned",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2000.0,
+        "candidate": 2000.0,
+        "redis": 2000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_all_c1000_calls": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_all_c1000_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 513.0,
+        "candidate": 512.0,
+        "redis": 2002.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_all_c1000_distinct": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_all_c1000_distinct",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2002003.0,
+        "candidate": 2002003.0,
+        "redis": 2002003.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_all_c1000_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_all_c1000_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3616.253,
+        "candidate": 2180.1093,
+        "redis": 2212.9816,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.3
+        }
+      ]
+    },
+    "01-scan-match/default/scan_infix_c1000_calls": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_infix_c1000_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 513.0,
+        "candidate": 512.0,
+        "redis": 2002.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_infix_c1000_distinct": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_infix_c1000_distinct",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1112222.0,
+        "candidate": 1112222.0,
+        "redis": 1112222.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_infix_c1000_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_infix_c1000_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2695.8751,
+        "candidate": 1494.3898,
+        "redis": 1801.1705,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.3
+        }
+      ]
+    },
+    "01-scan-match/default/scan_match_c10000_calls": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_match_c10000_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 193.0,
+        "candidate": 193.0,
+        "redis": 201.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_match_c10000_distinct": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_match_c10000_distinct",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2000.0,
+        "candidate": 2000.0,
+        "redis": 2000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_match_c10000_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_match_c10000_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 823.2621,
+        "candidate": 238.8798,
+        "redis": 390.699,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.3
+        }
+      ]
+    },
+    "01-scan-match/default/scan_match_c1000_calls": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_match_c1000_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 513.0,
+        "candidate": 512.0,
+        "redis": 2002.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_match_c1000_distinct": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_match_c1000_distinct",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2000.0,
+        "candidate": 2000.0,
+        "redis": 2000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/scan_match_c1000_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "scan_match_c1000_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1672.4468,
+        "candidate": 406.2031,
+        "redis": 570.5406,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.3
+        }
+      ]
+    },
+    "01-scan-match/default/sscan_match_c1000_calls": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "sscan_match_c1000_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 201.0,
+        "candidate": 201.0,
+        "redis": 201.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "01-scan-match/default/sscan_match_c1000_distinct": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "sscan_match_c1000_distinct",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 200.0,
+        "candidate": 200.0,
+        "redis": 200.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/sscan_match_c1000_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "sscan_match_c1000_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 943.4918,
+        "candidate": 1093.2235,
+        "redis": 38.8596,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 35
+        }
+      ]
+    },
+    "01-scan-match/default/zscan_match_c1000_calls": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "zscan_match_c1000_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 201.0,
+        "candidate": 201.0,
+        "redis": 201.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "01-scan-match/default/zscan_match_c1000_distinct": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "zscan_match_c1000_distinct",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 200.0,
+        "candidate": 200.0,
+        "redis": 200.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "01-scan-match/default/zscan_match_c1000_ms": {
+      "suite": "01-scan-match",
+      "config": "default",
+      "metric": "zscan_match_c1000_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 799.4917,
+        "candidate": 829.5413,
+        "redis": 50.4183,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 35
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/dbsize": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "dbsize",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 17500000.0,
+        "candidate": 17500000.0,
+        "redis": 17500000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/load_s": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 145.4587,
+        "candidate": 143.1832,
+        "redis": 149.0569,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/ping_max_ms": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "ping_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 160.5056,
+        "candidate": 17.0176,
+        "redis": 12.1558,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/ping_p99_ms": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "ping_p99_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.3634,
+        "candidate": 3.6431,
+        "redis": 1.9094,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/pings": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "pings",
+      "unit": "pings",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 122998.0,
+        "candidate": 120736.0,
+        "redis": 133811.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/pings_over_10ms": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "pings_over_10ms",
+      "unit": "pings",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 71.0,
+        "candidate": 14.0,
+        "redis": 1.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/rss_loaded_mib": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "rss_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1505.6797,
+        "candidate": 1507.4805,
+        "redis": 2083.5703,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "02-growth-ping/ex17m/used_memory_mib": {
+      "suite": "02-growth-ping",
+      "config": "ex17m",
+      "metric": "used_memory_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1613.1387,
+        "candidate": 1613.1637,
+        "redis": 2027.3982,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "02-growth-ping/tokio/dbsize": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "dbsize",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 8000000.0,
+        "candidate": 8000000.0,
+        "redis": 8000000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "02-growth-ping/tokio/load_s": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 51.2775,
+        "candidate": 50.8364,
+        "redis": 52.2302,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "02-growth-ping/tokio/ping_max_ms": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "ping_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 112.0991,
+        "candidate": 9.6577,
+        "redis": 8.1904,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "02-growth-ping/tokio/ping_p99_ms": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "ping_p99_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.977,
+        "candidate": 3.0342,
+        "redis": 1.3757,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10
+        }
+      ]
+    },
+    "02-growth-ping/tokio/pings": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "pings",
+      "unit": "pings",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 45838.0,
+        "candidate": 44740.0,
+        "redis": 48711.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "02-growth-ping/tokio/pings_over_10ms": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "pings_over_10ms",
+      "unit": "pings",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 25.0,
+        "candidate": 0.0,
+        "redis": 0.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "02-growth-ping/tokio/rss_loaded_mib": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "rss_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 524.2383,
+        "candidate": 525.043,
+        "redis": 551.9688,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "02-growth-ping/tokio/used_memory_mib": {
+      "suite": "02-growth-ping",
+      "config": "tokio",
+      "metric": "used_memory_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 511.3811,
+        "candidate": 511.4062,
+        "redis": 534.747,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "02-growth-ping/uring1/dbsize": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "dbsize",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 8000000.0,
+        "candidate": 8000000.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "02-growth-ping/uring1/load_s": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 53.2517,
+        "candidate": 55.6032,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "02-growth-ping/uring1/ping_max_ms": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "ping_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 72.7061,
+        "candidate": 20.8324,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "02-growth-ping/uring1/ping_p99_ms": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "ping_p99_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.712,
+        "candidate": 1.5442,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10
+        }
+      ]
+    },
+    "02-growth-ping/uring1/pings": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "pings",
+      "unit": "pings",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 49298.0,
+        "candidate": 51940.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "02-growth-ping/uring1/pings_over_10ms": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "pings_over_10ms",
+      "unit": "pings",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 29.0,
+        "candidate": 2.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "02-growth-ping/uring1/rss_loaded_mib": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "rss_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 524.3984,
+        "candidate": 524.4961,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "02-growth-ping/uring1/used_memory_mib": {
+      "suite": "02-growth-ping",
+      "config": "uring1",
+      "metric": "used_memory_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 511.5482,
+        "candidate": 511.5733,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "03-give-back/churn/delete_ms": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "delete_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1533.5442,
+        "candidate": 1538.2251,
+        "redis": 1523.1776,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/churn/rss_after_15s_mib": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "rss_after_15s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 483.5,
+        "candidate": 429.4,
+        "redis": 616.5,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        }
+      ]
+    },
+    "03-give-back/churn/rss_after_1_5s_mib": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "rss_after_1_5s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 483.5,
+        "candidate": 429.4,
+        "redis": 737.1,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        }
+      ]
+    },
+    "03-give-back/churn/rss_after_5s_mib": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "rss_after_5s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 483.5,
+        "candidate": 429.4,
+        "redis": 670.2,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        }
+      ]
+    },
+    "03-give-back/churn/rss_loaded_mib": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "rss_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 788.6055,
+        "candidate": 789.3086,
+        "redis": 746.2539,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "03-give-back/churn/rss_start_mib": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "rss_start_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 12.4453,
+        "candidate": 12.7305,
+        "redis": 12.5703,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/churn/used_after_mib": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "used_after_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 372.0744,
+        "candidate": 372.0905,
+        "redis": 361.83,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/churn/used_loaded_mib": {
+      "suite": "03-give-back",
+      "config": "churn",
+      "metric": "used_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 742.5347,
+        "candidate": 742.5598,
+        "redis": 719.1427,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "03-give-back/hashdel/delete_ms": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "delete_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 130.985,
+        "candidate": 134.3524,
+        "redis": 310.2226,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/hashdel/rss_after_15s_mib": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "rss_after_15s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 196.4,
+        "candidate": 13.6,
+        "redis": 19.5,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        }
+      ]
+    },
+    "03-give-back/hashdel/rss_after_1_5s_mib": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "rss_after_1_5s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 196.4,
+        "candidate": 13.6,
+        "redis": 75.8,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "03-give-back/hashdel/rss_after_5s_mib": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "rss_after_5s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 196.4,
+        "candidate": 13.6,
+        "redis": 56.2,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        }
+      ]
+    },
+    "03-give-back/hashdel/rss_loaded_mib": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "rss_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 369.5625,
+        "candidate": 369.9102,
+        "redis": 124.5352,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "03-give-back/hashdel/rss_start_mib": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "rss_start_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 12.8359,
+        "candidate": 13.2812,
+        "redis": 12.668,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/hashdel/used_after_mib": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "used_after_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.3627,
+        "candidate": 1.3884,
+        "redis": 0.8461,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/hashdel/used_loaded_mib": {
+      "suite": "03-give-back",
+      "config": "hashdel",
+      "metric": "used_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 295.8557,
+        "candidate": 295.881,
+        "redis": 109.2466,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "03-give-back/hdel/delete_ms": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "delete_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1342.7529,
+        "candidate": 1343.7943,
+        "redis": 1216.9471,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/hdel/rss_after_15s_mib": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "rss_after_15s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 74.1,
+        "candidate": 13.6,
+        "redis": 13.6,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        }
+      ]
+    },
+    "03-give-back/hdel/rss_after_1_5s_mib": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "rss_after_1_5s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 74.1,
+        "candidate": 13.6,
+        "redis": 39.3,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "03-give-back/hdel/rss_after_5s_mib": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "rss_after_5s_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 74.1,
+        "candidate": 13.6,
+        "redis": 24.5,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 5
+        }
+      ]
+    },
+    "03-give-back/hdel/rss_loaded_mib": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "rss_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 137.7148,
+        "candidate": 138.1875,
+        "redis": 47.2773,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "03-give-back/hdel/rss_start_mib": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "rss_start_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 12.6992,
+        "candidate": 13.1797,
+        "redis": 12.5547,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/hdel/used_after_mib": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "used_after_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.3635,
+        "candidate": 1.388,
+        "redis": 0.8459,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "03-give-back/hdel/used_loaded_mib": {
+      "suite": "03-give-back",
+      "config": "hdel",
+      "metric": "used_loaded_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 132.8207,
+        "candidate": 132.8456,
+        "redis": 29.5006,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "04-long-commands/tokio/dbsize": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "dbsize",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2000000.0,
+        "candidate": 2000000.0,
+        "redis": 2000000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "04-long-commands/tokio/del_cmd_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "del_cmd_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 132.1977,
+        "candidate": 143.3404,
+        "redis": 333.4692,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "04-long-commands/tokio/del_probes_stalled": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "del_probes_stalled",
+      "unit": "probes",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4.0,
+        "candidate": 0.0,
+        "redis": 4.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/tokio/del_reply": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "del_reply",
+      "unit": "items",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 1.0,
+        "redis": 1.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "04-long-commands/tokio/del_worst_ping_max_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "del_worst_ping_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 131.1597,
+        "candidate": 1.2194,
+        "redis": 335.7167,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "04-long-commands/tokio/del_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "del_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 131.0182,
+        "candidate": 0.9419,
+        "redis": 332.6996,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "04-long-commands/tokio/keys_cmd_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "keys_cmd_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 141.0809,
+        "candidate": 161.3251,
+        "redis": 216.4636,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "04-long-commands/tokio/keys_probes_stalled": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "keys_probes_stalled",
+      "unit": "probes",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4.0,
+        "candidate": 0.0,
+        "redis": 4.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/tokio/keys_reply": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "keys_reply",
+      "unit": "items",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 11111.0,
+        "candidate": 11111.0,
+        "redis": 11111.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "04-long-commands/tokio/keys_worst_ping_max_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "keys_worst_ping_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 132.054,
+        "candidate": 8.0871,
+        "redis": 205.0833,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "04-long-commands/tokio/keys_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "keys_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 129.2769,
+        "candidate": 5.9365,
+        "redis": 203.6208,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "04-long-commands/tokio/scan_cmd_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "scan_cmd_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 254.2533,
+        "candidate": 112.5086,
+        "redis": 471.6916,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "04-long-commands/tokio/scan_probes_stalled": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "scan_probes_stalled",
+      "unit": "probes",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4.0,
+        "candidate": 0.0,
+        "redis": 4.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/tokio/scan_reply": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "scan_reply",
+      "unit": "items",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 11111.0,
+        "candidate": 11111.0,
+        "redis": 11111.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/tokio/scan_worst_ping_max_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "scan_worst_ping_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 243.3984,
+        "candidate": 5.1908,
+        "redis": 467.2424,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "04-long-commands/tokio/scan_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "tokio",
+      "metric": "scan_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 240.9598,
+        "candidate": 0.4493,
+        "redis": 461.2278,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "04-long-commands/uring/dbsize": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "dbsize",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2000000.0,
+        "candidate": 2000000.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "04-long-commands/uring/del_cmd_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "del_cmd_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 136.3651,
+        "candidate": 134.3066,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "04-long-commands/uring/del_least_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "del_least_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.21,
+        "candidate": 0.41,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 10
+        }
+      ]
+    },
+    "04-long-commands/uring/del_probes_stalled": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "del_probes_stalled",
+      "unit": "probes",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 1.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/uring/del_reply": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "del_reply",
+      "unit": "items",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 1.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "04-long-commands/uring/del_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "del_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 135.8392,
+        "candidate": 132.9266,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/uring/keys_cmd_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "keys_cmd_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 145.6327,
+        "candidate": 153.5941,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "04-long-commands/uring/keys_least_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "keys_least_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.17,
+        "candidate": 0.95,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 10
+        }
+      ]
+    },
+    "04-long-commands/uring/keys_probes_stalled": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "keys_probes_stalled",
+      "unit": "probes",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/uring/keys_reply": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "keys_reply",
+      "unit": "items",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 11111.0,
+        "candidate": 11111.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "04-long-commands/uring/keys_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "keys_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 134.9107,
+        "candidate": 142.7559,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/uring/scan_cmd_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "scan_cmd_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 265.4506,
+        "candidate": 112.6482,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "04-long-commands/uring/scan_least_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "scan_least_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.57,
+        "candidate": 0.13,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 10
+        }
+      ]
+    },
+    "04-long-commands/uring/scan_probes_stalled": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "scan_probes_stalled",
+      "unit": "probes",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 1.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/uring/scan_reply": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "scan_reply",
+      "unit": "items",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 11111.0,
+        "candidate": 11111.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "04-long-commands/uring/scan_worst_ping_ms": {
+      "suite": "04-long-commands",
+      "config": "uring",
+      "metric": "scan_worst_ping_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 254.9108,
+        "candidate": 101.5788,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "2468f226",
+        "label": "master-2468f226-d4s_v5-04"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    }
+  }
+}
