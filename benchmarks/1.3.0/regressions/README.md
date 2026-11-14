@@ -30,6 +30,7 @@ and why.
 | `11-migrate-conns` | #726 / #733 | connections the target of 2,000 `MIGRATE`s receives (a second server of the engine) |
 | `12-search-fanout` | #723 / #725 | 3-master cluster on one VM: connections each other master receives for 2,000 `FT.SEARCH` calls |
 | `13-cluster-reshard` | #294 / #724 | 3-master cluster on one VM, 3M keys: `redis-cli` 7.0.15 `--cluster reshard` of 1,000 slots |
+| `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one; `SDIFFSTORE big small` as a cost guard; worst `SADD` to the small set during `SUNION big small` (Tokio, 1M) |
 
 ## Running it
 
@@ -612,9 +613,59 @@ What these runs show besides the gated gains:
 - `redis-cli --cluster reshard` on master is 3.5-4x slower than on Redis
   (25-27 s against 7 s); #724 says the rest is mostly `MIGRATE` itself.
 
+## Recorded run, suite 14
+
+Recorded 2026-11-14 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C, a
+fresh VM of the same image), `FULL=1 --only 14 --record` with the harness of
+master `6297d818` (host-speed rules); the candidate is commit `219b9656` of
+#798, `cargo build --release`. Runs: `pr759-d4s_v5` (recorded) and
+`pr759-d4s_v5-rerun` (the noise check: every gate passed, host factor
+1.01x). About 6.5 minutes with `FULL=1`, most of it loading 20M members into
+each engine and the `SDIFFSTORE` rows.
+
+Medians of 5 timed runs (ms; `SUNION` 3), recorded run:
+
+| N | command | v1.2.2 | candidate | Redis 8.10.2 | gate |
+|---|---|---:|---:|---:|---|
+| 1M | `SINTER big small` | 95.75 | 2.33 | 2.56 | rel 50% or 2 ms; keep 60% of gain; <= 2x Redis |
+| 1M | `SINTER small big` | 69.5 | 2.09 | 2.30 | same |
+| 1M | `SINTERCARD 2 big small` | 92.7 | 0.18 | 0.46 | rel 50% or 2 ms |
+| 1M | `... LIMIT 100` | 93.2 | 0.055 | 0.063 | rel 50% or 2 ms |
+| 1M | `SINTERSTORE dst big small` | 93.7 | 0.30 | 0.85 | rel 50% or 2 ms |
+| 1M | `SDIFF small big` | 69.9 | 1.95 | 2.57 | as `SINTER` |
+| 1M | `SDIFFSTORE dst big small` | 288.1 | 253.6 | 314.2 | rel 25% (cost guard) |
+| 5M | `SINTER big small` | 535.3 | 2.22 | 3.87 | as above |
+| 5M | `SINTER small big` | 446.3 | 2.06 | 3.52 |  |
+| 5M | `SINTERCARD 2 big small` | 533.3 | 0.22 | 1.56 |  |
+| 5M | `... LIMIT 100` | 533.4 | 0.054 | 0.12 |  |
+| 5M | `SINTERSTORE dst big small` | 533.3 | 0.48 | 2.52 |  |
+| 5M | `SDIFF small big` | 447.2 | 2.03 | 3.94 |  |
+| 5M | `SDIFFSTORE dst big small` | 1,645 | 1,424 | 1,825 |  |
+| 20M | `SINTER big small` | 2,573 | 2.29 | 4.76 |  |
+| 20M | `SINTER small big` | 2,431 | 2.10 | 3.82 |  |
+| 20M | `SINTERCARD 2 big small` | 2,568 | 0.30 | 1.89 |  |
+| 20M | `... LIMIT 100` | 2,571 | 0.057 | 0.13 |  |
+| 20M | `SINTERSTORE dst big small` | 2,573 | 0.38 | 2.84 |  |
+| 20M | `SDIFF small big` | 2,457 | 2.01 | 4.70 |  |
+| 20M | `SDIFFSTORE dst big small` | 7,993 | 6,899 | 8,067 |  |
+| 1M, Tokio | `SUNION big small` | 1,330 | 1,331 | 1,305 | rel 25% |
+| 1M, Tokio | worst `SADD small` during it | 362.7 | 0.48 | 321.9 | max 20 ms (jitter: not scaled) |
+
+The replies (2,097 members at 1M and 20M, 2,098 at 5M; 1,998-1,999 for
+`SDIFF`; the `SDIFFSTORE` and `SUNION` sizes) are the same on all three
+engines and gated exactly. The candidate's spread between the two runs:
+-8 to +4 % on `SINTER`/`SDIFF`, 0 to +3 % on `SDIFFSTORE`, -1 % on
+`SUNION`, and -22 to +4 % on the count-only rows (0.05-0.48 ms: round-trip
+noise, hence no ratio or Redis gate on them); the worst `SADD` was 0.48 and
+0.43 ms. The `SINTER`/`SDIFF` times no longer depend on N: what is left is
+the round trip and redis-py building a Python set of ~2,000 members.
+`SDIFFSTORE big small` and `SUNION` walk all of `big` on every engine; they
+are there so that cost does not grow, and so a writer of the small set is
+not held up by the walk (v1.2.2 and Redis hold it for the whole command).
+
 ## Not covered
 
-Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13).
+Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759, after that table).
 From its costs table, these are not re-measured by this suite:
 
 - Instructions per command from callgrind (`GET`/`SET` within 0.1 % for #724,
