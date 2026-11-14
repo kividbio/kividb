@@ -124,11 +124,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   owner's acknowledged writes to them were lost. An automatic failover's
   vote request now carries the slots the candidate would take over, at its
   master's config epoch, and a master that knows a newer owner of one
-  refuses, as Redis does. The claims travel in the request's fifth field,
-  which earlier versions accept and read past, so votes go on working
-  through a rolling upgrade; a request from an earlier version, and a
-  manual failover's (`CLUSTER FAILOVER`, with or without `FORCE`), are
-  decided as before.
+  refuses, as Redis does for automatic failovers. The claims travel in the
+  request's fifth field, which earlier versions accept and read past, so
+  votes go on working through a rolling upgrade, and only upgraded masters
+  refuse. Unlike Redis, a manual failover (`CLUSTER FAILOVER`, with or
+  without `FORCE`) is not checked: its request carries no claims, so a
+  manual failover of a replica that has not yet heard of a handover (about
+  one heartbeat) can still take the moved slots. Run it once the replica
+  shows the new owner in `CLUSTER NODES`. A request from an earlier version
+  is decided as before.
 
 - **Consumer-group commands about one consumer no longer walk the whole
   pending list (#637).** `XINFO CONSUMERS` counted each consumer's pending
