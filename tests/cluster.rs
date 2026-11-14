@@ -5458,6 +5458,151 @@ fn a_replica_whose_master_gave_nothing_away_drops_nothing_when_promoted() {
     assert!(!replica.log().contains("the old master gave away"));
 }
 
+/// Slots 0-20 given away by the source (to the second master) and taken
+/// back by it, with atomic imports, and the new values of their keys
+/// written on the source and acknowledged. The source's replica has heard
+/// of the first move (it is in its nodes.conf). Returns the cluster, the
+/// replica, and the keys, whose value is now `v3`.
+fn slots_given_away_and_back() -> (Vec<Node>, Node, Vec<String>) {
+    let (nodes, _) = form_cluster(3);
+    let replica = add_replica(&nodes, &nodes[0]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
+    let keys = keys_in(0..=20, "rt", 200);
+    set_all(&mut nodes[0].conn(), &keys, "v1");
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    let away = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "20"])
+        .text();
+    wait_import_completed(&nodes[1], &away);
+    wait_until(
+        "the replica to note the slots its master gave away",
+        Duration::from_secs(20),
+        || {
+            std::fs::read_to_string(replica.dir.join("nodes.conf"))
+                .unwrap_or_default()
+                .contains("givenAwaySlots 0-20")
+        },
+    );
+    set_all(&mut nodes[1].conn(), &keys, "v2");
+
+    let back = nodes[0]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "20"])
+        .text();
+    wait_import_completed(&nodes[0], &back);
+    set_all(&mut nodes[0].conn(), &keys, "v3");
+    (nodes, replica, keys)
+}
+
+/// The keys of `keys` on `node` whose value is not `value`, once `node`
+/// owns their slots: taken here by hand where it does not.
+fn not_as_written_once_owned(node: &Node, keys: &[String], value: &str) -> Vec<String> {
+    let id = node.id();
+    let mut slots: Vec<u16> = keys.iter().map(|k| slot_of(k)).collect();
+    slots.sort_unstable();
+    slots.dedup();
+    let mut c = node.conn();
+    for slot in slots {
+        let r = c.cmd(&["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &id]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    not_as_written(node, keys, value)
+}
+
+/// A slot given away and taken back, and the source's replica made master
+/// with `CLUSTER FAILOVER` at once (#517). The source refuses it a while,
+/// as it does after a handover away, until its replica has heard its claim
+/// of the slot; the replica, made master then, owns the slot and has every
+/// acknowledged write to it. A replica promoted before it heard, still
+/// taking the slot for the second master's, used to drop its keys, the only
+/// copy once the source followed it.
+#[test]
+fn a_slot_given_away_and_back_keeps_its_keys_through_a_manual_failover() {
+    let (nodes, replica, keys) = slots_given_away_and_back();
+    let first = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    let mut asked = Instant::now();
+    wait_until("the replica to take over", Duration::from_secs(60), || {
+        if replica.is_master() {
+            return true;
+        }
+        // Asked again while the source holds it back.
+        if asked.elapsed() > Duration::from_secs(6) {
+            let _ = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+            asked = Instant::now();
+        }
+        false
+    });
+    let refused = nodes[0].log();
+    assert!(
+        refused.contains("took its slots over") || first.err().is_some(),
+        "the first failover was not held back: {first:?}\n{refused}"
+    );
+    // Long past the time a promoted replica waits before it drops a slot
+    // its old master gave away (a heartbeat and a TAKEOVER's answer).
+    std::thread::sleep(Duration::from_secs(14));
+    let replica_id = replica.id();
+    for n in [&nodes[1], &nodes[2], &replica] {
+        wait_until("the slot's owner to be agreed", Duration::from_secs(20), || {
+            n.conn()
+                .cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .any(|l| l.starts_with(&replica_id) && l.contains(" 0-"))
+        });
+    }
+    let lost = not_as_written(&replica, &keys, "v3");
+    assert!(
+        lost.is_empty(),
+        "{} of {} acknowledged writes lost\n{}",
+        lost.len(),
+        keys.len(),
+        replica.log()
+    );
+}
+
+/// A slot given away and taken back, the source killed at once, and its
+/// replica made master with `CLUSTER FAILOVER TAKEOVER` (#517). Whether or
+/// not it heard the source's claim first, it keeps the slot's keys, the
+/// only copy, with every acknowledged write: the second master, which it
+/// may still take for the owner, no longer claims the slot.
+#[test]
+fn a_slot_given_away_and_back_keeps_its_keys_through_a_takeover() {
+    let (mut nodes, replica, keys) = slots_given_away_and_back();
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    nodes[0].kill();
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    wait_until("the replica to take over", Duration::from_secs(10), || {
+        replica.is_master()
+    });
+    // Long past the time a promoted replica waits before it drops a slot
+    // its old master gave away.
+    std::thread::sleep(Duration::from_secs(14));
+    let count: i64 = keys
+        .iter()
+        .map(|k| slot_of(k))
+        .collect::<std::collections::BTreeSet<u16>>()
+        .iter()
+        .map(|slot| {
+            replica
+                .conn()
+                .cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot.to_string()])
+                .int()
+        })
+        .sum();
+    assert_eq!(count, keys.len() as i64, "{}", replica.log());
+    let lost = not_as_written_once_owned(&replica, &keys, "v3");
+    assert!(
+        lost.is_empty(),
+        "{} of {} acknowledged writes lost\n{}",
+        lost.len(),
+        keys.len(),
+        replica.log()
+    );
+}
+
 // ── A slot back while its old keys are deleted (#353) ─────────────────────────
 
 /// The failpoints at which a node's deletion of the keys of slots it has

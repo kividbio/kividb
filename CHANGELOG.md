@@ -143,11 +143,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of its own replicas, beside the destination's newer copy. A replica now
   remembers the slots another master's claim took from its master, in
   nodes.conf too, and once promoted deletes their keys in the background,
-  as a master deletes those of a slot it loses. Only those of a slot that
-  another master still claims: one back with its master, or one the taker
-  no longer claims, keeps its keys, and so does every slot the promoted node
-  owns. The replication stream is unchanged, and earlier versions read
-  nodes.conf as before.
+  as a master deletes those of a slot it loses: once the slot's owner has
+  claimed it in a heartbeat taken in well after the old master's last word
+  (a heartbeat and the `TAKEOVER` answer timeout later). A slot that may
+  have come back to the old master unheard of keeps its keys: one the taker
+  stops claiming, or one only claimed before then; so does every slot the
+  promoted node owns. A master also refuses a failover to its replica for
+  3 s after an atomic import into it took its slots over, as it already
+  did after a handover away, so the replica hears its claim first. The
+  replication stream is unchanged, and earlier versions read nodes.conf as
+  before.
 
 - **Consumer-group commands about one consumer no longer walk the whole
   pending list (#637).** `XINFO CONSUMERS` counted each consumer's pending

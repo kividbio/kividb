@@ -68,6 +68,29 @@ pub fn write_pause_timeout_ms(config: &crate::config::Config) -> u64 {
     }
 }
 
+/// `cluster-slot-migration-write-pause-timeout` as the server started with
+/// it: see [`takeover_answer_wait_ms`].
+static CONFIGURED_WRITE_PAUSE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
+
+/// Note the server's `cluster-slot-migration-write-pause-timeout`, at start.
+pub(crate) fn note_configured_write_pause_timeout(config: &crate::config::Config) {
+    CONFIGURED_WRITE_PAUSE_TIMEOUT_MS.store(
+        config.cluster_slot_migration_write_pause_timeout,
+        Ordering::Relaxed,
+    );
+}
+
+/// How long the source of a handover waits for the destination's answer to
+/// its `TAKEOVER`: the write pause timeout, as it is now. Until it knows
+/// whether the destination took the slots, it keeps claiming them, and
+/// keeps their keys (#517, `ClusterState::given_away`).
+pub(crate) fn takeover_answer_wait_ms() -> u64 {
+    match WRITE_PAUSE_TIMEOUT_MS.load(Ordering::Relaxed) {
+        UNSET => CONFIGURED_WRITE_PAUSE_TIMEOUT_MS.load(Ordering::Relaxed),
+        v => v,
+    }
+}
+
 /// `CONFIG SET cluster-slot-migration-handoff-max-lag-bytes`.
 pub fn set_handoff_max_lag_bytes(bytes: u64) {
     HANDOFF_MAX_LAG_BYTES.store(bytes.min(UNSET - 1), Ordering::Relaxed);
