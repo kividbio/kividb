@@ -1,0 +1,276 @@
+name: Regression suite
+
+# Runs benchmarks/<suite>/regressions on one fresh Azure VM and fails when a
+# gate fails or the run is INVALID. A stable release needs a committed passing
+# run of it on its final release candidate (docs/RELEASING.md, "Before
+# tagging"; scripts/release/check-regression-results.sh, called by
+# release.yml). This workflow never records baselines and never commits.
+#
+# Run by hand only, from master: the Azure sign-in trusts master runs only
+# (infra/benchmark-azure/README.md, "How CI signs in"); pick the build to
+# measure with `ref`. It starts one paid Azure machine, a Standard_D4s_v5, the
+# size baseline.json was recorded on (a gate against recorded values is
+# meaningful only on that size; run-all.sh marks a run on another size INVALID).
+#
+# Azure parts are the vector benchmark's: OIDC sign-in (azure/login with the
+# repository variables, no stored Azure secret), the kividb-benchmark resource
+# group, infra/benchmark-azure/create.sh with BOOTSTRAP=false, the same SSH key
+# secret, work over SSH from GitHub-hosted runners, and the shared teardown
+# (_benchmark-destroy.yml, which runs whatever happened). No self-hosted runner
+# is registered, so GH_RUNNER_PAT is not used.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Candidate to measure: tag, branch or commit (the final release candidate, e.g. v1.3.0-rc4)"
+        required: true
+      label:
+        description: "Name of the results directory (empty: <ref>-d4s_v5)"
+        required: false
+        default: ""
+      only:
+        description: "Only these suites, comma separated (e.g. 01,04). A partial run is never accepted by the release gate."
+        required: false
+        default: ""
+      full:
+        description: "Also the long configurations (FULL=1, about 8 minutes more). Do it for a release."
+        type: boolean
+        default: false
+      suite:
+        description: "Which minor's suite to run: benchmarks/<suite>/regressions"
+        required: false
+        default: "1.3.0"
+      location:
+        description: "Azure region (the VM family's quota must be there)"
+        required: false
+        default: "centralindia"
+
+# One machine at a time: the measurement must not share the region's cores
+# with another run of itself.
+concurrency:
+  group: regression-suite
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # Fixed on purpose, as in _benchmark-create.yml: every job that SSHes writes
+  # the same secret to this same path.
+  SSH_KEY_PATH: /tmp/kividb_benchmark_ssh_key
+  VM_SIZE: Standard_D4s_v5
+  VM_IMAGE: Canonical:ubuntu-24_04-lts:server:latest
+
+jobs:
+  # ── The machine (Azure, infra/benchmark-azure) ─────────────────────────────
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      host: ${{ steps.create.outputs.server_public_ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Write SSH private key and derive its public half
+        id: ssh
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BENCHMARK_SSH_PRIVATE_KEY" ]]; then
+            echo "::error::secrets.BENCHMARK_SSH_PRIVATE_KEY is not set."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+          echo "public_key=$(ssh-keygen -y -f "$SSH_KEY_PATH")" >> "$GITHUB_OUTPUT"
+
+      - name: Create the machine
+        id: create
+        env:
+          # The attempt number keeps a re-run's machine apart from what an
+          # earlier attempt may have left; destroy clears every attempt.
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          SSH_PUBLIC_KEY: ${{ steps.ssh.outputs.public_key }}
+          LOCATION: ${{ inputs.location }}
+          SERVER_SIZE: ${{ env.VM_SIZE }}
+          IMAGE: ${{ env.VM_IMAGE }}
+          CREATE_CLIENT: "false"
+          BOOTSTRAP: "false"
+          USE_PROXIMITY_GROUP: "false"
+        run: bash infra/benchmark-azure/create.sh
+
+      - name: Wait for SSH
+        env:
+          HOST: ${{ steps.create.outputs.server_public_ip }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 ubuntu@"$HOST" 'echo ready' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::SSH never came up on $HOST"
+          exit 1
+
+  # ── Build the candidate on it and run the suite ────────────────────────────
+  run:
+    needs: create
+    runs-on: ubuntu-latest
+    # Build (fat LTO on 4 vCPUs) + about 13 minutes of suites, 21 with `full`.
+    timeout-minutes: 180
+    env:
+      HOST: ${{ needs.create.outputs.host }}
+      SSH_OPTS: -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10
+    steps:
+      # The candidate: what is built and measured.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          path: cand
+
+      # The harness: the suite as it is on the branch this was dispatched from.
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+
+      - name: Write SSH private key
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BENCHMARK_SSH_PRIVATE_KEY" ]]; then
+            echo "::error::secrets.BENCHMARK_SSH_PRIVATE_KEY is not set."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+
+      # Inputs reach the shell as environment variables, never as text of the
+      # script, and are checked before they reach the machine.
+      - name: Resolve what to run
+        id: what
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_LABEL: ${{ inputs.label }}
+          INPUT_ONLY: ${{ inputs.only }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_FULL: ${{ inputs.full }}
+        run: |
+          set -euo pipefail
+          commit="$(git -C cand rev-parse --short=8 HEAD)"
+          label="$INPUT_LABEL"
+          if [[ -z "$label" ]]; then
+            label="$(printf '%s' "$INPUT_REF" | tr -c 'A-Za-z0-9._-' '-')-d4s_v5"
+          fi
+          [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::label may hold letters, digits, . _ - only"; exit 1; }
+          [[ "$INPUT_ONLY" =~ ^[0-9a-z,-]*$ ]] || { echo "::error::only may hold digits, letters, - and commas only"; exit 1; }
+          [[ "$INPUT_SUITE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::suite must look like 1.3.0"; exit 1; }
+          dir="benchmarks/$INPUT_SUITE/regressions"
+          [[ -f "harness/$dir/run-all.sh" ]] || { echo "::error::$dir/run-all.sh is not on this branch"; exit 1; }
+          full=0; [[ "$INPUT_FULL" == "true" ]] && full=1
+          {
+            echo "commit=$commit"
+            echo "label=$label"
+            echo "dir=$dir"
+            echo "full=$full"
+          } >> "$GITHUB_OUTPUT"
+          echo "Candidate $INPUT_REF is commit $commit; label $label; suite $dir; FULL=$full; only='$INPUT_ONLY'"
+
+      - name: Ship the candidate and the suite
+        env:
+          DIR: ${{ steps.what.outputs.dir }}
+        run: |
+          set -euo pipefail
+          git -C cand -c core.autocrlf=false archive --format=tar HEAD > cand.tar
+          tar -C harness -cf harness.tar "$DIR"
+          scp -i "$SSH_KEY_PATH" $SSH_OPTS cand.tar harness.tar \
+            harness/scripts/ci/regression-suite-vm.sh ubuntu@"$HOST":/home/ubuntu/
+
+      # Under nohup, polled with short SSH calls: a dropped connection must not
+      # end the run. The poll is bounded; the job's own timeout is the backstop.
+      - name: Build and run on the machine
+        id: remote
+        env:
+          DIR: ${{ steps.what.outputs.dir }}
+          LABEL: ${{ steps.what.outputs.label }}
+          COMMIT: ${{ steps.what.outputs.commit }}
+          FULL: ${{ steps.what.outputs.full }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -uo pipefail
+          SSH="ssh -i $SSH_KEY_PATH $SSH_OPTS ubuntu@$HOST"
+          $SSH "rm -f run.exit run.log; SUITE_DIR='$DIR' LABEL='$LABEL' CAND_COMMIT='$COMMIT' FULL='$FULL' ONLY='$ONLY' nohup bash /home/ubuntu/regression-suite-vm.sh > /home/ubuntu/run.log 2>&1 < /dev/null &"
+          code=""
+          for i in $(seq 1 170); do
+            sleep 60
+            out="$($SSH 'if [ -f run.exit ]; then echo "DONE $(cat run.exit)"; else tail -n 3 run.log | cut -c1-200; fi' 2>/dev/null)" || out="(ssh failed)"
+            if [[ "$out" == DONE\ * ]]; then code="${out#DONE }"; break; fi
+            echo "[$i] $out"
+          done
+          if [[ -z "$code" ]]; then
+            echo "::error::The run did not finish in time (or the machine was unreachable)."
+            code=124
+          fi
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "run-all.sh exit status: $code"
+          $SSH 'tail -n 60 run.log' || true
+          exit 0
+
+      # Whatever the outcome: INVALID and REGRESSED runs have a summary worth
+      # reading, and a run that never started has a log.
+      - name: Fetch results
+        if: always()
+        env:
+          DIR: ${{ steps.what.outputs.dir }}
+          LABEL: ${{ steps.what.outputs.label }}
+        run: |
+          mkdir -p out
+          [[ -n "${LABEL:-}" ]] || { echo "nothing to fetch"; exit 0; }
+          scp -i "$SSH_KEY_PATH" $SSH_OPTS -r "ubuntu@$HOST:/home/ubuntu/harness/$DIR/results/$LABEL" out/ || echo "no results directory on the machine"
+          scp -i "$SSH_KEY_PATH" $SSH_OPTS "ubuntu@$HOST:/home/ubuntu/run.log" out/run.log || true
+          if [[ -f "out/$LABEL/summary.md" ]]; then
+            { echo "## Regression suite: $LABEL"; echo; cat "out/$LABEL/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          ls -la out out/"$LABEL" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-results-${{ steps.what.outputs.label || github.run_id }}
+          path: out
+          if-no-files-found: warn
+
+      # The job's verdict is run-all.sh's: 0 ok, 1 REGRESSED or INVALID, 2 bad
+      # arguments, 124 the run never finished.
+      - name: Fail when the suite failed
+        if: always()
+        env:
+          CODE: ${{ steps.remote.outputs.exit_code }}
+        run: |
+          if [[ "${CODE:-missing}" != "0" ]]; then
+            echo "::error::The regression suite did not pass (exit status ${CODE:-missing}). See the summary and the artifact."
+            exit 1
+          fi
+
+  # ── Delete the machine, whatever happened ───────────────────────────────────
+  destroy:
+    needs: [create, run]
+    if: always()
+    uses: ./.github/workflows/_benchmark-destroy.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write

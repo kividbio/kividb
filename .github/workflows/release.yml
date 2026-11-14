@@ -51,6 +51,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
+          # The regression gate below walks history (is the measured commit an
+          # ancestor of the tag).
+          fetch-depth: 0
       - name: Cargo.toml version equals the release tag
         run: |
           set -euo pipefail
@@ -63,6 +66,16 @@ jobs:
             echo "::error::Cargo.toml version '${have}' does not match release tag '${RELEASE_TAG}'. Bump Cargo.toml (and Cargo.lock) before tagging -- the engine reports this string as kividb_version."
             exit 1
           fi
+
+      # A stable tag needs a committed regression-suite result for the code it
+      # ships: a passing run of benchmarks/X.Y.0/regressions on the final
+      # release candidate, with src/ unchanged since. Release candidates are
+      # not checked, and neither is a minor release that has no suite. Runs
+      # here, before any build job, so a missing result fails in seconds.
+      # Details and how to produce the result: docs/RELEASING.md, "Before
+      # tagging". Locally: scripts/release/check-regression-results.sh vX.Y.Z
+      - name: Regression suite result is committed for this code
+        run: bash scripts/release/check-regression-results.sh "${RELEASE_TAG}" --ref HEAD
 
   # ── Linux x86_64 ─────────────────────────────────────────────────────────
   # Built INSIDE an amazonlinux:2023 container, not natively on the runner:

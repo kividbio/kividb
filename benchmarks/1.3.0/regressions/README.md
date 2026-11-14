@@ -176,7 +176,13 @@ re-record that hides a regression defeats the suite.
    release, or an intended change that is explained in the release PR, after
    which the baseline is re-recorded.
 3. Commit `results/<label>/` with the release PR, so the release's numbers
-   stay next to the harness that produced them.
+   stay next to the harness that produced them. The release workflow
+   refuses a stable tag without it (`scripts/release/check-regression-results.sh`:
+   a full run with verdict `ok` whose candidate commit is an ancestor of the tag,
+   with `src/`, `Cargo.toml` and `Cargo.lock` unchanged since).
+   The Actions workflow "Regression suite" (`.github/workflows/regression-suite.yml`)
+   makes the VM, builds the candidate, runs the suite and uploads
+   `results/<label>/` as an artifact; docs/RELEASING.md has the steps.
 4. For a new improvement in the release, its suite and its first recorded
    values land with the fix's PR (or right after it), not at release time.
 
