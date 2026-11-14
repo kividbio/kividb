@@ -216,7 +216,9 @@ fn start_verified(mut spawn: impl FnMut(u16) -> Child, port: u16) -> (Child, Con
         };
         match answered {
             Some((pid, c)) if pid.is_none_or(|pid| pid == child.id()) => return (child, c, port),
-            Some((pid, _)) => eprintln!("port {port} is answered by {pid:?}, not by the server started on it"),
+            Some((pid, _)) => {
+                eprintln!("port {port} is answered by {pid:?}, not by the server started on it")
+            }
             None => eprintln!("the server could not take port {port}"),
         }
         let _ = child.kill();
@@ -410,7 +412,9 @@ impl Relay {
                     let _ = client.shutdown(Shutdown::Both);
                     continue;
                 }
-                let Ok(upstream) = TcpStream::connect(("127.0.0.1", target_bg.load(Ordering::SeqCst))) else {
+                let Ok(upstream) =
+                    TcpStream::connect(("127.0.0.1", target_bg.load(Ordering::SeqCst)))
+                else {
                     continue;
                 };
                 let mut live = live_bg.lock().unwrap();
@@ -874,7 +878,7 @@ fn a_master_stopped_under_writes_with_keys_expiring_continues_its_replica() {
 fn a_shutdown_waits_for_a_silent_replica_no_longer_than_shutdown_timeout() {
     let mut master = Server::start(&["--aof"]);
     let relay = Relay::to(master.port);
-    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     assert_eq!(
         m.cmd(&["CONFIG", "GET", "shutdown-timeout"]).arr()[1].s(),
@@ -1740,7 +1744,12 @@ fn sigterm_waits_for_the_final_snapshot() {
 
     // And what it saved is everything, as the restarted server says.
     let (mut child, mut c, _) = start_verified(|port| spawn(&dir, port), port);
-    assert_eq!(c.cmd(&["DBSIZE"]).i(), total as i64, "{}", std::fs::read_to_string(dir.join("server.log")).unwrap());
+    assert_eq!(
+        c.cmd(&["DBSIZE"]).i(),
+        total as i64,
+        "{}",
+        std::fs::read_to_string(dir.join("server.log")).unwrap()
+    );
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);

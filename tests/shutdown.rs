@@ -95,10 +95,7 @@ fn free_port() -> u16 {
 
 /// One command, and its reply: a bulk string's body, `(nil)` for a null
 /// one, and any other reply's line as it came.
-fn resp_cmd(
-    conn: &mut std::io::BufReader<TcpStream>,
-    args: &[&str],
-) -> std::io::Result<String> {
+fn resp_cmd(conn: &mut std::io::BufReader<TcpStream>, args: &[&str]) -> std::io::Result<String> {
     use std::io::BufRead;
     let mut req = format!("*{}\r\n", args.len());
     for a in args {
