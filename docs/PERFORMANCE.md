@@ -8,6 +8,7 @@
 
 - [Bare metal](#bare-metal)
 - [The full suite, on Azure VMs](#the-full-suite-on-azure-vms)
+- [What 1.3.0 changed](#what-130-changed)
 - [Earlier runs](#earlier-runs)
 - [Independent reviews](#independent-reviews)
 
@@ -100,6 +101,65 @@ cloud VMs, so absolute numbers are lower than on the [bare metal](#bare-metal) a
   <source media="(prefers-color-scheme: dark)" srcset="../assets/benchmarks/1.2.0/vector-ingest-dark.png">
   <img src="../assets/benchmarks/1.2.0/vector-ingest-light.png" alt="Vector ingest and index build" width="720">
 </picture>
+
+## What 1.3.0 changed
+
+Every gain in 1.3.0 that was measured, with the numbers its pull request recorded. Each row
+was measured on the machine named, against the master build of the day without the change
+(the "1.2.2" column, which behaves as 1.2.2 on that path), and against Redis 8.10 where the
+PR ran it beside KiviDB. "Not measured" means no number exists yet; nothing here is
+estimated.
+
+These are the PRs' own measurements, on different machines. Before 1.3.0 is released,
+the release regression suite (`benchmarks/1.3.0/regressions/`, coming in a separate pull
+request) re-records every row on one VM, 1.2.2 against 1.3.0, and adds the command that
+reproduces each one. Until then, only the vector-set rows have a script in the repository:
+[benchmarks/1.3.0/vector-sets/](../benchmarks/1.3.0/vector-sets/).
+
+| What was measured | 1.2.2 | 1.3.0 | Redis 8.10 | Machine | PR |
+|---|---:|---:|---:|---|---|
+| `redis-cli` 7.0.15 `--cluster reshard` of 1,000 slots (about 176,000 keys; 3 masters of about 1M keys) | 272.2 s | 23.6 s | not measured | Azure D4s_v5 | [#724](https://github.com/kividbio/kividb/pull/724) (#294) |
+| Connections each other master received for 2,000 `FT.SEARCH` calls (3-master cluster) | 2,001 | at most 20 (1-16 kept) | n/a | Azure D4s_v5 | [#725](https://github.com/kividbio/kividb/pull/725) (#723) |
+| Connections the target received for 2,000 `MIGRATE`s | 2,000 | 1 | 1 (8.10.2) | Azure D4s_v5 | [#733](https://github.com/kividbio/kividb/pull/733) (#726) |
+| Stream memory, one field `f`=`v`, 1M entries (`used_memory` a entry) | 158.4 B | 6.1 B | not measured | Azure D32s_v5 | [#683](https://github.com/kividbio/kividb/pull/683) (via #713) |
+| Stream memory, five fields with shared names, 200,000 entries | 478.5 B | 51.2 B | not measured | Azure D32s_v5 | #683 |
+| Stream memory, five fields with unique names | 498.6 B | 101.1 B | not measured | Azure D32s_v5 | #683 |
+| Stream memory, one field with a 200-byte value | 350.9 B | 215.8 B | not measured | Azure D32s_v5 | #683 |
+| Process RSS, 1M one-field stream entries | 207 MB | 22 MB | not measured | Azure D32s_v5 | #683 |
+| `XINFO CONSUMERS`, 200,000 pending over 50 consumers (average) | 82.5 ms | 0.059 ms | not measured | Azure D4s_v5 | [#736](https://github.com/kividbio/kividb/pull/736) (#637) |
+| `XADD` to a stream whose `XINFO CONSUMERS` is polled every 50 ms | 38,820/s | 104,384/s | not measured | Azure D4s_v5 | #736 |
+| Full `SCAN 0 MATCH schedule:* COUNT 1000`, 2,002,000 keys | 1,328 ms | 479 ms | 531 ms (8.10.2) | Azure D4s_v5 | [#769](https://github.com/kividbio/kividb/pull/769) (#751) |
+| Full `SCAN 0 COUNT 1000`, same keys | 3,087 ms | 1,935 ms | 2,041 ms (8.10.2) | Azure D4s_v5 | #769 |
+| Longest `PING` on another connection while 8M keys are loaded (Tokio) | 141.0 ms | 21.1 ms | 17.1 ms (8.10.2) | Azure D4s_v5 | [#780](https://github.com/kividbio/kividb/pull/780) (#752) |
+| Longest `PING` while 17.5M keys with `EX` are loaded (Tokio) | 160.2 ms | 20.5-24.4 ms | 17.8 ms (8.10.2) | Azure D4s_v5 | #780 |
+| Longest `PING` on another connection during `KEYS user:99*` over 2M keys (Tokio) | 134 ms | 0.1 ms | 202-213 ms (8.10.2) | Azure D4s_v5 | [#757](https://github.com/kividbio/kividb/pull/757) (#754) |
+| Longest `PING` during `SCAN 0 MATCH user:99* COUNT 2000000` (Tokio) | 247-256 ms | 0.1 ms | 467-471 ms (8.10.2) | Azure D4s_v5 | #757 |
+| Longest `PING` during `DEL` of a 3M-field hash (Tokio) | 129-137 ms | 0.1 ms | 337-349 ms (8.10.2) | Azure D4s_v5 | #757 |
+| Another client's `PING` during a `SAVE` of 1.5M keys (Tokio, `--threads 1`) | 532 ms | answered at once (not timed) | not measured | Azure D16s_v5 | [#696](https://github.com/kividbio/kividb/pull/696) (#605) |
+| RSS once idle after `DEL` of a 3M-field hash | 199.6 MiB, stays | 16.9 MiB after 1.5 s | 62.7 MiB after about 10 s (8.10.2) | Azure D4s_v5 | [#763](https://github.com/kividbio/kividb/pull/763) (#753) |
+| RSS once idle after `HDEL` of 1M fields | 77.9 MiB, stays | 16.8 MiB after 1.5 s | 13.5 MiB after about 7 s (8.10.2) | Azure D4s_v5 | #763 |
+| `FT.INFO` of a 1,000-document index beside 5.4M other keys (p50) | 53 ms | 0.06 ms | not measured | Apple M2 laptop | [#727](https://github.com/kividbio/kividb/pull/727) (#590) |
+| `SET`s a second beside 4 clients polling `FT.INFO` | 15,000-20,000 | 50,000-65,000 | not measured | Apple M2 laptop | #727 |
+| Vector set memory, 768 dimensions, 50,000 vectors, `Q8` (bytes a vector) | 3,168 (stored f32) | 864 | 1,526 (with its HNSW graph) | Apple M3 Pro | [#730](https://github.com/kividbio/kividb/pull/730) (#697) |
+| The same, `BIN` | 3,168 (stored f32) | 192 | 854 (with its HNSW graph) | Apple M3 Pro | #730 |
+| `VSIM` queries a second, 768 dimensions, 10,000 vectors, `Q8`, 8 clients | 1,637 (f32) | 12,635 | 5,822 exact scan, 23,625 HNSW (8.10.3) | Apple M3 Pro | #730 |
+| RedisVL 0.32.0 checks passed | 59 of 67 | 67 of 67 | 67 of 67 (8.10.3) | Linux VM | [#779](https://github.com/kividbio/kividb/pull/779) (#767) |
+
+What these gains cost, as measured in the same PRs:
+
+| Cost | 1.2.2 | 1.3.0 | Machine | PR |
+|---|---:|---:|---|---|
+| Stream reads, instructions a command (callgrind): `XDEL`, `XRANGE … COUNT 1`, `XRANGE … COUNT 10` with one and five fields, `XREAD COUNT 10` | | +3.7%, +3.4%, +5.7%, +7.4%, +5.8% | Linux aarch64 (contributor's machine) | #683 |
+| Stream `XADD` of five fields, instructions a command | | about -21% | Linux aarch64 | #683 |
+| Load of 3.2 million out-of-order stream entries (a crafted payload) | 0.82 s | 2.0 s | Apple Silicon laptop | #683 |
+| Memory per pending stream entry (`used_memory` / RSS) | 122 / 144 B | 129 / 154 B | Azure D4s_v5 | #736 |
+| Instructions per `string.format` call in a script | | +201 to +368 | Azure D4s_v5 | [#768](https://github.com/kividbio/kividb/pull/768) (#747) |
+| `EVALSHA` of a script of 20 `string.format` calls (`redis-benchmark -c 50`) | 60.0k/s | 57.4k/s (-4.4%) | Azure D4s_v5 | #768 |
+| Memory per document of an index of vectors alone | | +31 B | Apple M2 laptop | #727 |
+| `HSET` of a new document into an index of vectors alone (DIM 2) | | about 5% slower | Apple M2 laptop | #727 |
+| `GET`/`SET` instructions a command on a standalone server (callgrind) | | within 0.1% | Azure D4s_v5 | #724 |
+
+"n/a": Redis has no cluster-wide search to compare with.
 
 ## Earlier runs
 

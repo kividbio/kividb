@@ -10,8 +10,11 @@ are involved.
   python redisvl_kividb_compat.py --url redis://127.0.0.1:6380 --label kividb
   python redisvl_kividb_compat.py --url redis://127.0.0.1:6399 --label redis8
 
-Writes results-<label>.json next to the script. Run the same command against stock Redis
-(for example the `redis:8.10` image) with a different --label to get a comparison.
+Writes results-<label>.json next to the script (--json PATH puts it elsewhere). Run the
+same command against stock Redis (for example the `redis:8.10` image) with a different
+--label to get a comparison. --junitxml PATH also writes the checks as JUnit XML, one
+<testcase> per check, which is what benchmarks/ci/compare.py reads in the compat workflow
+(ci.sh).
 
 What it covers, from redisvl itself:
   * SearchIndex: create, load, and query a hash index (FLAT and HNSW) and a JSON index.
@@ -47,6 +50,7 @@ import re
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from importlib.metadata import version
 
 import redis
@@ -558,13 +562,47 @@ def semantic_router(url):
             pass
 
 
+def write_junit(path, seconds):
+    """The checks as JUnit XML. A check named "Group: what" is classname "redisvl.Group" and
+    name "what", so the same check has the same name against every server."""
+    failed = sum(1 for row in results if row["status"] != "PASS")
+    root = ET.Element("testsuites")
+    suite = ET.SubElement(root, "testsuite", {
+        "name": "redisvl-compat",
+        "tests": str(len(results)),
+        "failures": str(failed),
+        "errors": "0",
+        "skipped": "0",
+        "time": f"{seconds:.3f}",
+    })
+    for row in results:
+        group, sep, name = row["check"].partition(": ")
+        if not sep:
+            group, name = "", group
+        case = ET.SubElement(suite, "testcase", {
+            "classname": f"redisvl.{group}" if group else "redisvl",
+            "name": name,
+            "time": f"{row['ms'] / 1000:.3f}",
+        })
+        if row["status"] != "PASS":
+            failure = ET.SubElement(case, "failure", {"message": str(row["detail"])[:400]})
+            failure.text = str(row["detail"])
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
 # ---------------------------------------------------------------- main
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default="redis://127.0.0.1:6380")
     parser.add_argument("--label", default="kividb")
+    parser.add_argument("--json", metavar="PATH",
+                        help="where to write the JSON results (default: results-<label>.json "
+                             "next to this script)")
+    parser.add_argument("--junitxml", metavar="PATH",
+                        help="also write the checks as JUnit XML, for benchmarks/ci/compare.py")
     args = parser.parse_args()
+    started = time.time()
 
     client = redis.Redis.from_url(args.url)
     server_version = client.info("server").get("redis_version", "?")
@@ -598,7 +636,8 @@ def main():
     else:
         print("lua commands seen: none")
 
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results-{args.label}.json")
+    out = args.json or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), f"results-{args.label}.json")
     with open(out, "w") as fh:
         json.dump({
             "label": args.label,
@@ -615,6 +654,9 @@ def main():
         }, fh, indent=2)
         fh.write("\n")
     print(f"wrote {out}")
+    if args.junitxml:
+        write_junit(args.junitxml, time.time() - started)
+        print(f"wrote {args.junitxml}")
     return 1 if counts["FAIL"] else 0
 
 

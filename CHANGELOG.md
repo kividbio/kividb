@@ -106,7 +106,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
   bit per component, as Redis 8 does: about 3.6-3.8x and 15-22x less memory
-  than f32 at 768-1536 dimensions. Quantization, dequantization and scores
+  than f32 at 768-1536 dimensions, and `VSIM` over `Q8` answers 1.6 to 7.7
+  times the queries a second that f32 does (Apple M3 Pro, 10,000 and 50,000
+  vectors; `benchmarks/1.3.0/vector-sets/` has the script and every row,
+  Redis 8.10.3's included). Quantization, dequantization and scores
   follow Redis 8.10.3's formulas, and the Q8 distance is clamped to [0, 2]
   as in Redis. The norm is computed in f64, so a stored component, norm or
   range can differ from Redis's in the last bit (Redis's own bytes differ
@@ -178,6 +181,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     snapshots 1.2 refuses. **Upgrade replicas before masters.**
 
 ### Changed
+
+- **Streams take 10 to 25 times less memory (#683).** An entry was a tree
+  node of its own, with each field and value allocated apart; entries are
+  now packed into blocks that share their field names, with delta-encoded
+  IDs. `used_memory` per entry, before and after, on an Azure D32s_v5
+  (Linux x86-64, one thread): one field `f`=`v`, a million entries in one
+  stream, 158.4 to 6.1 bytes (RSS 192.0 to 6.6); one field with an 8-byte
+  value, 158.4 to 13.2; one field over 1,000 streams of 1,000 entries,
+  159.0 to 14.0; five fields with the same names, 200,000 entries, 478.5 to
+  51.2; five fields under four sets of names in turn, 478.5 to 70.4; five
+  fields with names of their own, 498.6 to 101.1; one field with a 200-byte
+  value, 350.9 to 215.8. A million one-field entries take 22 MB of process
+  RSS, down from 207 MB. (These were measured with an anchor every 16
+  entries; the released layout has one every 8, which adds about 0.13 bytes
+  an entry.) Reading costs more instructions, since entries are decoded as
+  they are returned: under callgrind on Linux aarch64, `XDEL` +3.7%,
+  `XRANGE … COUNT 1` +3.4%, `XRANGE … COUNT 10` +5.7% with one field and
+  +7.4% with five, `XREAD COUNT 10` +5.8%, while a five-field `XADD` takes
+  about 21% fewer. In throughput on an Apple Silicon laptop, commands moved
+  between -5% (`XREADGROUP` of a consumer's history) and +15% (`XRANGE` of
+  one ID). A payload whose entries are out of order (a crafted `RESTORE` or
+  RDB file) is sorted once at the end of its load: 2.0 s for 3.2 million
+  shuffled entries, where 1.2 took 0.82 s; entries in order load in 85 ms
+  instead of 271 ms. Snapshots, `DUMP` payloads, replication and the AOF
+  keep their formats, in both directions.
 
 - **`MEMORY USAGE` of a stream is what its entries take, and reads
   differently (#683).** Stream entries are now packed into blocks, and
@@ -263,7 +291,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with 14 significant digits and `10 / 2` as `5`, and `cmsgpack` packs `10 / 2` as
   an integer and `1.5` as a 32-bit float. The docs now say scripts run on
   Lua 5.4 and list what differs from Redis, with workarounds
-  ([SCRIPTS.md](docs/SCRIPTS.md)).
+  ([SCRIPTS.md](docs/SCRIPTS.md)). The check costs 201 to 368 more
+  instructions per `string.format` call (callgrind, 200,000 calls in one
+  `EVAL`): `EVALSHA` of a script of 20 `string.format` calls went from
+  60.0k to 57.4k requests a second (-4.4%, `redis-benchmark -c 50`, Azure
+  D4s_v5). A script with no `string.format` call measured 84k and 80k a
+  second, within that VM's run-to-run noise.
 
 - **Memory freed by a large delete goes back to the system once the server
   is idle (#753).** Deleting a hash of 3M fields left `used_memory` at
@@ -276,6 +309,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tens of milliseconds: `MEMORY PURGE` gives the memory back on demand.
   `INFO memory` has `allocator_trims` and `allocator_trims_skipped_busy`;
   `allocator-give-back no` turns it off. Linux builds on glibc only.
+  Measured on an Azure D4s_v5 (glibc 2.39), with the server idle after the
+  delete: RSS is at 16.9 MiB 1.5 s after the 3M-field `DEL` and 16.8 MiB
+  after the `HDEL`s. Redis 8.10.2 on the same VM went from 75.8 to
+  62.7 MiB over about 10 s, and from 39.1 to 13.5 MiB over about 7 s.
 
 - **A shard's table grows without holding up other clients (#752).** A
   full table grew in one step, every key hashed again with the shard
@@ -290,6 +327,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to live, every 20 s, now hands the shard to a waiting writer between its
   turns instead of taking it back first. The longest `PING` is now 21 ms
   at 8 million keys and 20-24 ms at 17.5 million (Redis: 17-18 ms).
+  Measured on an Azure D4s_v5 with the issue's harness: pipelines of 2,000
+  `SET`s of 16-byte values from redis-py, and a `PING` every millisecond on
+  another connection. Loading took as long as before.
 
 - **An atomic slot import that does not complete keeps the keys the node
   held of those slots before it (#745).** A canceled, failed or timed-out
@@ -306,8 +346,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A long `KEYS`, `SCAN` or `DEL` of a big value no longer holds up every
   other connection on the Tokio I/O model (#754).** The Tokio worker that
   got such a command was often the one waiting on the sockets for everyone,
-  so a `PING` on another connection waited for the whole command (140 ms
-  behind a `KEYS` over 2M keys). That work now runs with the worker's other
+  so a `PING` on another connection waited for the whole command: up to
+  134 ms behind a `KEYS` over 2M keys, 256 ms behind a `SCAN … COUNT
+  2000000` and 137 ms behind the `DEL` of a 3M-field hash, on an Azure
+  D4s_v5. It now waits 0.1 ms; the commands take as long as before. (Redis
+  8.10.2, on one thread, held every connection for 202 to 471 ms in the same
+  runs.) That work now runs with the worker's other
   connections handed to another thread, and `KEYS` and `SCAN` copy only the
   keys that match. `DEL` now follows `lazyfree-lazy-user-del`: with `yes` it
   frees a big value in the background as `UNLINK` does, and a config file
@@ -324,8 +368,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fragment each table slot already keeps, and reads only the entries of
   that page; patterns such as `prefix:*`, `*suffix` and `*part*` are
   matched by comparing bytes. A full `SCAN 0 MATCH schedule:* COUNT 1000`
-  over 2,002,000 keys went from 1.31 s to 0.48 s (Redis 8.10.2:
-  0.53 s), and one without `MATCH` from 2.98 s to 1.93 s (Redis: 2.04 s).
+  over 2,002,000 keys went from 1.33 s to 0.48 s (Redis 8.10.2:
+  0.53 s), and one without `MATCH` from 3.09 s to 1.93 s (Redis: 2.04 s),
+  on an Azure D4s_v5 with redis-py on the same VM, median of three full
+  iterations.
   `HSCAN`, `SSCAN` and `ZSCAN` match patterns the same way. A `SCAN`
   cursor is now valid only on the server that gave it, until it restarts,
   as in Redis: one from before a restart, a failover or another replica
@@ -378,9 +424,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entries pending across 50 consumers, `XINFO CONSUMERS` took 82 ms and
   stalled every other client on its thread meanwhile. A group now also keeps
   each consumer's pending IDs, so these answer from that consumer's entries
-  alone, in well under a millisecond. The index is rebuilt as a group is
-  loaded, so the snapshot format is unchanged, and it adds about 5 bytes per
-  pending entry. `XPENDING` for a consumer whose name is not UTF-8 now lists
+  alone, in well under a millisecond: `XINFO CONSUMERS` in 0.059 ms instead
+  of 82 ms, and `XADD`s to a stream whose consumers were polled every
+  50 ms went from 38,820 to 104,384 a second (Azure D4s_v5, the server on
+  two cores). The index is rebuilt as a group is loaded, so the snapshot
+  format is unchanged, and it adds 7 bytes of `used_memory` per pending
+  entry (122 to 129) and 10 of RSS (144 to 154). `XPENDING` for a consumer whose name is not UTF-8 now lists
   only that consumer's entries; it used to list everyone's.
 
 - **`redis-cli --cluster reshard` no longer walks every key of a node for
@@ -389,8 +438,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   node to find one slot's, so on a node of millions of keys each call took
   hundreds of milliseconds and resharding moved a few slots a minute. A
   cluster node now keeps each key in the store shard of its slot, and these
-  commands look at that shard alone. Servers not in cluster mode place keys
-  as before, and pay nothing for it. Eviction and `RANDOMKEY` now pick a
+  commands look at that shard alone. With three masters of about 1M keys
+  each on one Azure D4s_v5, `redis-cli` 7.0.15 `--cluster reshard` of 1,000
+  slots (about 176,000 keys) took 272.2 s before and takes 23.6 s; what is
+  left is mostly `MIGRATE` itself. (redis-cli 8.10 moves slots with
+  `CLUSTER MIGRATION IMPORT` and does not use these commands.) Servers not
+  in cluster mode place keys as before; they pay one predicted branch per
+  key lookup, within 0.1% of the instructions of a `GET` or `SET`. Eviction and `RANDOMKEY` now pick a
   shard in proportion to its keys, so the keys of one busy hash tag, all in
   one shard, are as likely to be evicted or returned as any others. Writes
   to the keys of one hash tag on a cluster node now share one shard lock,
@@ -415,7 +469,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is ever sent on it twice. A kept connection stays with the address its
   host name had when it was opened: if DNS moves the target during a
   resharding, `MIGRATE`s keep going to the old address until the connection
-  has been idle for 10 seconds, as in Redis.
+  has been idle for 10 seconds, as in Redis. 2,000 `MIGRATE`s to one
+  target opened 2,000 connections to it, and now open 1, as on Redis 8.10.2
+  (Azure D4s_v5).
 
 - **An index created since the last dump is whole after a restart that
   replays the AOF (#590).** The walk that indexes the documents once the
@@ -437,7 +493,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `masterauth` or the TLS files change. When a master's own password
   changes, the connections kept to it stay logged in as before until they
   close, as any long-lived client does, and searches fail with the login
-  error once they are replaced.
+  error once they are replaced. 2,000 `FT.SEARCH` calls to one node of a
+  three-master cluster opened 2,001 connections to each other master; they
+  now open at most 20 (the test's bound), of which 1 to 16 are kept (Azure
+  D4s_v5).
 
 - **`DEBUG SLEEP` returns Redis's errors for non-numeric and wrong-arity arguments (#657).**
   A non-numeric argument (`DEBUG SLEEP abc`) was reported as a wrong number
@@ -643,6 +702,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   could leave the sockets unpolled, so no client was accepted or read until
   they were done. They now run off the runtime, as `CONFIG SET appendonly
   yes` and `MIGRATE` do. `SAVE` still blocks its own client, as in Redis.
+  With 1.5M keys and `--threads 1` on an Azure D16s_v5, another client's
+  `PING` waited 532 ms of a 582 ms `SAVE`; it is now answered at once.
 
 - **Three tests that failed now and then under load no longer do (#420,
   #515, #681).** The two tests of the allocation counter measure the whole
