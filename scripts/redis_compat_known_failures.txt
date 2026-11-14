@@ -1,0 +1,19 @@
+# The tests of Redis's suite KiviDB is known to fail, as "<unit> | <test
+# name>". scripts/redis_compat.sh fails CI on any other failure, and prints
+# a notice when one of these passes: take it off the list then.
+
+# KiviDB writes every HyperLogLog dense (12304 bytes); the test corrupts a
+# sparse one.
+unit/hyperloglog | Corrupted dense HyperLogLogs are detected: Wrong length
+
+# #21: TTL, TYPE and EXISTS reset a key's idle time.
+unit/introspection-2 | TTL, TYPE and EXISTS do not alter the last access time of a key
+
+# io_uring only: no timer shrinks an idle client's query buffer
+# (docs/REDIS_TEST_SUITE.md). The second fails because the first did.
+unit/querybuf | query buffer resized correctly
+unit/querybuf | query buffer resized correctly with fat argv
+
+# A known 1.x issue: Lua 5.4 holds more memory than Redis's 5.1 after
+# loading, and used_memory_vm_functions ends just over the test's limit.
+unit/scripting | Verify Lua performs GC correctly after script loading

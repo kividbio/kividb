@@ -8,6 +8,7 @@ on:
       - 'tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/redis_compat*'
       - '.github/workflows/ci.yml'
   # By hand, from the Actions tab: the full build and test of a branch, e.g.
   # master before a release tag. Skips the change detection below.
@@ -57,6 +58,7 @@ jobs:
               - 'tests/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'scripts/redis_compat*'
 
   rust:
     needs: detect-changes
@@ -158,10 +160,11 @@ jobs:
     # As `rust`: on a manual run detect-changes is skipped, and a job that
     # needs a job that needs it is skipped too unless it says otherwise.
     if: always() && needs.rust.result == 'success'
-    # Never marks the PR as failed — it's a signal, not a gate
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Test the gate
+        run: bash scripts/redis_compat_check_test.sh
 
       - name: Install Tcl
         timeout-minutes: 10
