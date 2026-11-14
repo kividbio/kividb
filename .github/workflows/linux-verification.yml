@@ -45,9 +45,11 @@ on:
 permissions:
   contents: read
 
+# Pull requests only: a manual run is never cancelled, and each has a group of
+# its own.
 concurrency:
-  group: linux-verification-${{ github.ref }}
-  cancel-in-progress: true
+  group: linux-verification-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ── Compile + lint the Linux-only code a Windows dev loop never sees ────────
@@ -70,28 +72,103 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
 
-  # ── Full Rust test suite on Linux ───────────────────────────────────────────
-  test-linux:
+  # -- Full Rust test suite on Linux, with the default features ------------
+  # (`ci.yml` runs the same suite with `lua,tls`.) Built ONCE into a nextest
+  # archive and run in shards from it; `test-linux` at the end is the check
+  # the branch ruleset requires, and it fails if any of these did.
+  build-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    env:
+      # No debug info in the test binaries: every shard downloads them.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
-        # --test-threads is capped: several suites bind ports and measure
-        # elapsed time, and full parallelism on a 2-core hosted runner makes
-        # the timing-sensitive ones flap.
-        run: cargo test --no-fail-fast -- --test-threads=4
+      # Pinned by commit, as setup-uv is in smoke-test.yml.
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest@0.9.150
+      - name: Build the tests (once, for every shard)
+        run: cargo nextest archive --archive-file nextest-archive.tar.zst
+      # nextest does not run doctests. There are none today; this keeps it so.
+      - name: Doctests
+        run: cargo test --doc
+      - name: Upload the test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          # Already compressed.
+          compression-level: 0
+
+  test-shard:
+    needs: build-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: test-shard (${{ matrix.shard }}/6)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      # The tests read tests/fixtures, and the archive's binaries were built
+      # at this path: check out where the build did.
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest@0.9.150
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+      # Four tests at a time on the 4-core runner, as `--test-threads=4` was:
+      # several suites bind ports and measure elapsed time, and more than the
+      # cores makes the timing-sensitive ones flap (.config/nextest.toml).
+      - name: Run shard ${{ matrix.shard }} of 6
+        run: >-
+          cargo-nextest nextest run --profile ci --test-threads 4
+          --archive-file nextest-archive.tar.zst
+          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
+          --workspace-remap "$GITHUB_WORKSPACE"
+          --partition hash:${{ matrix.shard }}/6
+
+  # Ignored by the shards: it starts 24 server processes, too many to share
+  # the runner with other suites, so it runs alone, in a job of its own. In
+  # release: 24 idle debug builds alone saturate a hosted runner's CPUs, and
+  # starved nodes fall behind on heartbeats and gossip.
+  cluster-24-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: cargo test (24-node cluster)
-        # Ignored by the run above: it starts 24 server processes, too many to
-        # share the runner with other suites, so it runs alone. In release:
-        # 24 idle debug builds alone saturate a hosted runner's CPUs, and
-        # starved nodes fall behind on heartbeats and gossip.
         run: >-
           cargo test --release --test cluster
           a_24_node_cluster_fails_over_and_the_old_master_rejoins
           -- --ignored --exact --test-threads=1
+
+  test-linux:
+    needs: [build-tests, test-shard, cluster-24-node]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Gate
+        env:
+          RESULTS: >-
+            build-tests=${{ needs.build-tests.result }}
+            test-shard=${{ needs.test-shard.result }}
+            cluster-24-node=${{ needs.cluster-24-node.result }}
+        run: |
+          echo "$RESULTS" | tr ' ' '\n'
+          for r in $RESULTS; do
+            [ "${r#*=}" = success ] || { echo "::error::${r%%=*} did not succeed (${r#*=})"; exit 1; }
+          done
 
   # ── Drive real traffic through BOTH I/O models ──────────────────────────────
   io-model-matrix:
