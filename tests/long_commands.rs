@@ -193,7 +193,11 @@ fn assert_on_tokio(port: u16) {
         .lines()
         .find_map(|line| line.strip_prefix("multiplexing_api:"))
         .expect("multiplexing_api in INFO server");
-    assert_ne!(api.trim(), "io_uring", "the server under test is on io_uring");
+    assert_ne!(
+        api.trim(),
+        "io_uring",
+        "the server under test is on io_uring"
+    );
     let on = V::Bulk(b"yes".to_vec());
     let parallel = c.cmd(&["CONFIG", "GET", "lua-parallel-scripts"]);
     let parallel_on = matches!(&parallel, V::Array(kv) if kv.get(1) == Some(&on));
