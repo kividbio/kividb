@@ -2607,19 +2607,17 @@ impl ClusterState {
 
     /// `CLUSTER SETSLOT <slot> ...`: `f`, the change it makes, unless an
     /// atomic slot migration of `slot` to or from this node is under way
-    /// (`migration::Registry::setslot_refusal`, #755). `legacy` for
-    /// `IMPORTING` and `MIGRATING`. Done with the migration tasks locked: no
-    /// atomic one begins in between, as one does not begin on a slot in a
-    /// legacy migration. `f` takes no lock that comes before them (see
-    /// [`ClusterState`]).
+    /// (`migration::Registry::setslot_refusal`, #755). Done with the
+    /// migration tasks locked: no atomic one begins in between, as one does
+    /// not begin on a slot in a legacy migration. `f` takes no lock that
+    /// comes before them (see [`ClusterState`]).
     pub fn setslot_unless_migrating<R>(
         &self,
         slot: u16,
-        legacy: bool,
         f: impl FnOnce() -> Result<R, String>,
     ) -> Result<R, String> {
         self.slot_migrations.with_tasks(|tasks| {
-            if let Some(why) = migration::Registry::setslot_refusal(tasks, slot, legacy) {
+            if let Some(why) = migration::Registry::setslot_refusal(tasks, slot) {
                 return Err(why);
             }
             f()

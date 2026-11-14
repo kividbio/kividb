@@ -1510,13 +1510,11 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
     // Not on a slot an atomic slot migration to or from this node is moving
     // (#755), whatever the form, as Redis: first, before anything is looked
     // at or deleted; and again, with the tasks locked, as the change is made.
-    let legacy = matches!(action.as_str(), "IMPORTING" | "MIGRATING");
-    let known = legacy || matches!(action.as_str(), "STABLE" | "NODE");
-    if known
-        && let Err(e) = ctx
-            .cluster
-            .setslot_unless_migrating(slot, legacy, || Ok(()))
-    {
+    let known = matches!(
+        action.as_str(),
+        "IMPORTING" | "MIGRATING" | "STABLE" | "NODE"
+    );
+    if known && let Err(e) = ctx.cluster.setslot_unless_migrating(slot, || Ok(())) {
         return resp_error(&format!("ERR {e}"));
     }
 
@@ -1533,7 +1531,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             };
             if let Err(e) = ctx
                 .cluster
-                .setslot_unless_migrating(slot, true, || ctx.cluster.set_migrating(slot, dest))
+                .setslot_unless_migrating(slot, || ctx.cluster.set_migrating(slot, dest))
             {
                 return resp_error(&format!("ERR {e}"));
             }
@@ -1562,7 +1560,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             }
             if let Err(e) = ctx
                 .cluster
-                .setslot_unless_migrating(slot, true, || ctx.cluster.set_importing(slot, src))
+                .setslot_unless_migrating(slot, || ctx.cluster.set_importing(slot, src))
             {
                 return resp_error(&format!("ERR {e}"));
             }
@@ -1576,7 +1574,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                     "ERR wrong number of arguments for 'cluster|setslot|stable' command",
                 );
             }
-            let cleared = ctx.cluster.setslot_unless_migrating(slot, false, || {
+            let cleared = ctx.cluster.setslot_unless_migrating(slot, || {
                 ctx.cluster.clear_migration(slot);
                 Ok(())
             });
@@ -1640,9 +1638,10 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             {
                 return refused;
             }
-            if let Err(e) = ctx.cluster.setslot_unless_migrating(slot, false, || {
-                ctx.cluster.finalize_slot(slot, new_owner)
-            }) {
+            if let Err(e) = ctx
+                .cluster
+                .setslot_unless_migrating(slot, || ctx.cluster.finalize_slot(slot, new_owner))
+            {
                 return resp_error(&format!("ERR {e}"));
             }
             slot_changed_state();

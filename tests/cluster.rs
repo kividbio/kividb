@@ -5222,6 +5222,9 @@ fn slot_migration_refuses_what_it_cannot_do() {
     assert_eq!(nodes[0].cluster_info("cluster_state"), "ok");
 }
 
+/// Redis's reply to an atomic slot migration of a slot in a legacy one.
+const NOT_STABLE: &str = "all slot states must be STABLE to start a slot migration task.";
+
 /// An atomic slot import (`CLUSTER MIGRATION IMPORT`) and a legacy one
 /// (`CLUSTER SETSLOT IMPORTING` / `MIGRATING` and `MIGRATE`) refuse each
 /// other's slots (#755). The import counted the keys a `MIGRATE` or an
@@ -5251,11 +5254,11 @@ fn an_atomic_import_is_refused_on_a_slot_in_a_legacy_migration() {
             .is_ok()
     );
     for (a, b) in [(&slot_s, &slot_s), (&ranges[0].0.to_string(), &wider)] {
+        // Redis's reply, byte for byte.
         let refused = d.cmd(&["CLUSTER", "MIGRATION", "IMPORT", a, b]);
-        assert!(
-            refused
-                .err()
-                .is_some_and(|e| e.contains(&format!("slot {slot} is in IMPORTING state"))),
+        assert_eq!(
+            refused.err(),
+            Some(&*format!("ERR {NOT_STABLE}")),
             "{refused:?}"
         );
     }
@@ -5282,11 +5285,10 @@ fn an_atomic_import_is_refused_on_a_slot_in_a_legacy_migration() {
         Duration::from_secs(30),
         || {
             let status = d.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
-            status.array().first().is_some_and(|task| {
-                task_field(task, "last_error")
-                    .text()
-                    .contains(&format!("slot {slot} is in MIGRATING state"))
-            })
+            status
+                .array()
+                .first()
+                .is_some_and(|task| task_field(task, "last_error").text().contains(NOT_STABLE))
         },
     );
     // The source has no task, still owns the slot, and serves the key.
@@ -5421,7 +5423,7 @@ fn a_canceled_atomic_import_lets_a_legacy_migration_of_its_slots_begin() {
     // And no atomic import of the slot meanwhile.
     let again = d.cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s]);
     assert!(
-        again.err().is_some_and(|e| e.contains("IMPORTING state")),
+        again.err().is_some_and(|e| e.contains(NOT_STABLE)),
         "{again:?}"
     );
     let port = dst.port.to_string();

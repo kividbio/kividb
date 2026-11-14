@@ -222,8 +222,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   maybe the only copy. Now, as in Redis, an atomic migration refuses a slot
   in a legacy migration on either side (`all slot states must be STABLE`),
   and every form of `SETSLOT` refuses a slot an atomic migration to or from
-  this node is moving until it ends or is canceled (`IMPORTING` and
-  `MIGRATING` also for a few seconds after it hands the slot over).
+  this node is moving until it has ended (a canceled one once it has
+  cleaned up).
 
 - **`FT.HYBRID` takes `SCORER` and answers as Redis 8.10 does, so RedisVL's
   `HybridQuery` works (#767).** Every `HybridQuery` sends `SCORER BM25STD`

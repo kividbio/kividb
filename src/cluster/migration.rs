@@ -478,35 +478,20 @@ impl Registry {
     /// and deletes them if it does not complete: keys moved in meanwhile by
     /// `MIGRATE`, or written by `ASKING` clients, would go with them, and
     /// may be the only copy. As Redis refuses it, every form of `SETSLOT`.
-    /// With `legacy` (`IMPORTING`, `MIGRATING`), also for
-    /// [`super::HANDOVER_FAILOVER_GRACE`] after one handed the slot over:
-    /// the other nodes may not have heard yet where it went.
-    pub(crate) fn setslot_refusal(tasks: &[Task], slot: u16, legacy: bool) -> Option<String> {
-        let covers = |t: &&Task| in_ranges(&t.ranges, slot);
-        if tasks
+    /// Only while the task runs, as in Redis: one that has ended holds
+    /// nothing up, so `redis-cli --cluster reshard` can move a slot on as
+    /// soon as an atomic migration has brought it.
+    pub(crate) fn setslot_refusal(tasks: &[Task], slot: u16) -> Option<String> {
+        tasks
             .iter()
-            .filter(covers)
-            .any(|t| t.state == TaskState::InProgress)
-        {
-            return Some(format!(
-                "Slot {slot} is currently in an active atomic slot migration. CLUSTER SETSLOT \
-                 cannot be used at this time. To perform a legacy slot migration instead, \
-                 first cancel the ongoing task with CLUSTER MIGRATION CANCEL"
-            ));
-        }
-        if !legacy {
-            return None;
-        }
-        tasks.iter().filter(covers).find_map(|t| {
-            let ago = t.ended_at?.elapsed();
-            (t.state == TaskState::Completed && ago < super::HANDOVER_FAILOVER_GRACE).then(|| {
+            .any(|t| in_ranges(&t.ranges, slot) && t.state == TaskState::InProgress)
+            .then(|| {
                 format!(
-                    "Slot {slot} was handed over by an atomic slot migration {} ms ago, and the \
-                     cluster may not have heard of it yet; ask again in a few seconds",
-                    ago.as_millis()
+                    "Slot {slot} is currently in an active atomic slot migration. CLUSTER \
+                     SETSLOT cannot be used at this time. To perform a legacy slot migration \
+                     instead, first cancel the ongoing task with CLUSTER MIGRATION CANCEL"
                 )
             })
-        })
     }
 
     /// Ask running tasks to stop: the one with this id, or all of them.
@@ -2398,23 +2383,32 @@ fn single_owner(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<NodeId,
 /// or `ASKING` clients write meanwhile would go too, and may be the only
 /// copy. Redis refuses it too, on either side. Asked with the tasks locked
 /// ([`Registry::add_unless`]): `SETSLOT` changes no slot's state meanwhile.
+/// The reply is Redis's, word for word; which slot, and its state, go to
+/// the log.
 fn no_legacy_migration(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<(), String> {
-    let migrations = cluster.migrations.read();
-    let Some((slot, state)) = slots_of(ranges).find_map(|slot| {
-        let state = match migrations.get(&slot)? {
-            MigrationState::Importing { .. } => "IMPORTING",
-            MigrationState::Migrating { .. } => "MIGRATING",
-        };
-        Some((slot, state))
-    }) else {
+    let found = {
+        let migrations = cluster.migrations.read();
+        slots_of(ranges).find_map(|slot| {
+            let state = match migrations.get(&slot)? {
+                MigrationState::Importing { .. } => "IMPORTING",
+                MigrationState::Migrating { .. } => "MIGRATING",
+            };
+            Some((slot, state))
+        })
+    };
+    let Some((slot, state)) = found else {
         return Ok(());
     };
-    Err(format!(
-        "slot {slot} is in {state} state (CLUSTER SETSLOT): all slot states must be STABLE to \
-         start a slot migration task. Finish the legacy migration, or clear it with CLUSTER \
-         SETSLOT {slot} STABLE, first"
-    ))
+    log_warn!(
+        "Cluster: atomic slot migration refused: slot {slot} is in {state} state (CLUSTER SETSLOT); \
+         finish that migration, or clear it with CLUSTER SETSLOT {slot} STABLE"
+    );
+    Err(LEGACY_MIGRATION_REFUSED.into())
 }
+
+/// Redis's reply to an atomic slot migration of a slot in a legacy one.
+const LEGACY_MIGRATION_REFUSED: &str =
+    "all slot states must be STABLE to start a slot migration task.";
 
 // ── Imports under way, on disk ───────────────────────────────────────────────
 //
@@ -3196,29 +3190,23 @@ mod tests {
         let other = super::super::generate_node_id();
         let registry = &cs.slot_migrations;
         registry.add(task("a", vec![(10, 20)])).unwrap();
-        let setslot =
-            |slot: u16, legacy: bool| cs.setslot_unless_migrating(slot, legacy, || Ok(()));
-        for legacy in [false, true] {
-            let refused = setslot(10, legacy).unwrap_err();
-            assert!(
-                refused.contains("active atomic slot migration"),
-                "{refused}"
-            );
-            assert!(setslot(21, legacy).is_ok());
-        }
+        let setslot = |slot: u16| cs.setslot_unless_migrating(slot, || Ok(()));
+        let refused = setslot(10).unwrap_err();
+        assert!(
+            refused.contains("active atomic slot migration"),
+            "{refused}"
+        );
+        assert!(setslot(21).is_ok());
         // A canceled one, still cleaning up, too.
         registry.cancel(Some("a"));
-        assert!(setslot(20, true).is_err());
-        // Once one has handed the slots over, IMPORTING and MIGRATING wait
-        // a few seconds; STABLE and NODE do not, as in Redis.
+        assert!(setslot(20).is_err());
+        // Once one has ended, nothing waits, as in Redis: `redis-cli
+        // --cluster reshard` may move the slot on at once.
         registry.finish("a", TaskState::Completed, None);
-        let refused = setslot(15, true).unwrap_err();
-        assert!(refused.contains("handed over"), "{refused}");
-        assert!(setslot(15, false).is_ok());
-        // One that did not complete cleaned up before it ended.
+        assert!(setslot(15).is_ok());
         registry.add(task("b", vec![(30, 40)])).unwrap();
         registry.finish("b", TaskState::Canceled, None);
-        assert!(setslot(35, true).is_ok());
+        assert!(setslot(35).is_ok());
 
         // The other way: no atomic migration of a slot in a legacy one.
         cs.migrations
@@ -3232,18 +3220,10 @@ mod tests {
                 no_legacy_migration(&cs, &ranges)
             })
         };
-        let refused = start(vec![(45, 55)]).unwrap_err();
-        assert!(
-            refused.contains("slot 50 is in IMPORTING state"),
-            "{refused}"
-        );
-        // An error reply is one line.
-        assert!(!refused.contains(['\r', '\n']), "{refused:?}");
-        let refused = start(vec![(60, 60)]).unwrap_err();
-        assert!(
-            refused.contains("slot 60 is in MIGRATING state"),
-            "{refused}"
-        );
+        // Redis's reply, word for word, on either side.
+        let redis = "all slot states must be STABLE to start a slot migration task.";
+        assert_eq!(start(vec![(45, 55)]).unwrap_err(), redis);
+        assert_eq!(start(vec![(60, 60)]).unwrap_err(), redis);
         assert!(registry.get("c").is_none());
         start(vec![(51, 59)]).unwrap();
     }
