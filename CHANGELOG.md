@@ -195,6 +195,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`FT.HYBRID` takes `SCORER` and answers as Redis 8.10 does, so RedisVL's
+  `HybridQuery` works (#767).** Every `HybridQuery` sends `SCORER BM25STD`
+  in the `SEARCH` clause, and KiviDB refused it (`unknown FT.HYBRID token
+  'SCORER'`); its reply, a count then keys and fields, was not Redis's
+  either, so redis-py could not have read it. The scorer now ranks the text
+  side as it does in `FT.SEARCH` (an unknown name, or one not in capitals:
+  `No such scorer`), and the reply is Redis's: `total_results`, `results`
+  (`__key` and `__score`, or the fields `LOAD`ed, with the
+  `YIELD_SCORE_AS` names), `warnings` and `execution_time`, a map under
+  RESP3. `FILTER` in the `VSIM` clause now limits the vector side, `RANGE`,
+  `TIMEOUT` and `FORMAT` are taken, `LINEAR` fuses the scores themselves
+  (defaults `ALPHA 0.3 BETA 0.7`) where it fused them min-max scaled, and
+  errors carry Redis's codes. The RedisVL harness passes 67 of 67 checks.
+
 - **`string.format('%d', x)` in a script takes an `x` with a fraction, as
   Redis does (#747).** Scripts run on Lua 5.4, which failed with "number has
   no integer representation" where Redis's Lua 5.1 cuts the number toward

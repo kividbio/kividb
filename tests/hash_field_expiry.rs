@@ -1348,11 +1348,13 @@ fn ft_knn_with_few_or_no_vectors_to_show() {
 /// Each result of an FT.HYBRID over index `v`, by key, with its fields.
 fn hybrid(c: &mut Conn, search: &str) -> Vec<(String, Vec<(String, String)>)> {
     let origin = vec2(0.0, 0.0);
-    let args: [&[u8]; 18] = [
+    let args: [&[u8]; 22] = [
         b"FT.HYBRID",
         b"v",
         b"SEARCH",
         search.as_bytes(),
+        b"YIELD_SCORE_AS",
+        b"text_score",
         b"VSIM",
         b"@vec",
         b"$q",
@@ -1365,18 +1367,24 @@ fn hybrid(c: &mut Conn, search: &str) -> Vec<(String, Vec<(String, String)>)> {
         b"q",
         &origin,
         b"LOAD",
-        b"2",
+        b"3",
+        b"@__key",
         b"@t",
+        b"@n",
     ];
-    let mut args = args.to_vec();
-    args.push(b"@n");
+    // `total_results N results [row ...] ...`, a row naming its key.
     let reply = cmd_bytes(c, &args);
-    reply.arr()[1..]
-        .chunks(2)
-        .map(|pair| {
-            let fields = pair[1].arr().chunks(2);
-            let fields = fields.map(|kv| (kv[0].s().to_string(), kv[1].s().to_string()));
-            (pair[0].s().to_string(), fields.collect())
+    reply.arr()[3]
+        .arr()
+        .iter()
+        .map(|row| {
+            let fields: Vec<(String, String)> = row
+                .arr()
+                .chunks(2)
+                .map(|kv| (kv[0].s().to_string(), kv[1].s().to_string()))
+                .collect();
+            let key = fields.iter().find(|(k, _)| k == "__key").unwrap().1.clone();
+            (key, fields)
         })
         .collect()
 }
@@ -1414,13 +1422,11 @@ fn ft_hybrid_leaves_out_due_numeric_tag_and_vector_fields() {
             assert_eq!(field(row, "n"), field(other, "n"), "{search} {}: n", row.0);
             assert_eq!(field(row, "t"), field(other, "t"), "{search} {}: t", row.0);
         }
+        // v:1 has lost the fields these match on: the text side leaves it
+        // out, and the row has no text score.
         let v1 = got.iter().find(|row| row.0 == "v:1").unwrap();
         if search != "hello" {
-            assert_eq!(
-                field(v1, "text_score"),
-                Some("0.000000"),
-                "{search}: {v1:?}"
-            );
+            assert_eq!(field(v1, "text_score"), None, "{search}: {v1:?}");
         }
     }
 }

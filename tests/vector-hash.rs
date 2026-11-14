@@ -10,8 +10,6 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-use ordered_float::Float;
-
 // ── Minimal RESP client ───────────────────────────────────────────────────────
 
 struct Conn {
@@ -2735,13 +2733,63 @@ fn test_ft_spellcheck_terms_include() {
     }
 }
 
-#[test]
-fn test_ft_hybrid_rrf_default() {
-    let port = free_port();
-    start_server(port);
-    let mut c = Conn::connect(port);
+// ── FT.HYBRID ─────────────────────────────────────────────────────────────────
+//
+// The reply is Redis 8.10's: `total_results N results [row ...] warnings [...]
+// execution_time ms`, each row a flat list of names and values.
 
-    c.cmds(&[
+/// `total_results` and the rows of an FT.HYBRID reply.
+fn hybrid_rows(reply: &RespValue) -> (i64, Vec<Vec<(String, String)>>) {
+    let top = reply.as_array();
+    assert_eq!(top.len(), 8, "{reply:?}");
+    assert_eq!(top[0].as_str(), "total_results");
+    assert_eq!(top[2].as_str(), "results");
+    assert_eq!(top[4].as_str(), "warnings");
+    assert_eq!(top[6].as_str(), "execution_time");
+    assert!(top[7].as_str().parse::<f64>().is_ok(), "{reply:?}");
+    let rows = top[3]
+        .as_array()
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .chunks(2)
+                .map(|kv| {
+                    let value = match &kv[1] {
+                        RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+                        other => other.as_str().to_string(),
+                    };
+                    (kv[0].as_str().to_string(), value)
+                })
+                .collect()
+        })
+        .collect();
+    (top[1].as_int(), rows)
+}
+
+fn row_get<'a>(row: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    row.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+fn row_names(row: &[(String, String)]) -> Vec<&str> {
+    row.iter().map(|(k, _)| k.as_str()).collect()
+}
+
+fn hybrid_keys(rows: &[Vec<(String, String)>]) -> Vec<&str> {
+    rows.iter()
+        .map(|row| row_get(row, "__key").unwrap())
+        .collect()
+}
+
+fn error_text(reply: &RespValue) -> &str {
+    match reply {
+        RespValue::Error(e) => e.trim_start_matches('-'),
+        other => panic!("not an error: {other:?}"),
+    }
+}
+
+/// An index `idx` on `d:` with a TEXT `title` and a 4-dimensional L2 `v`.
+fn hybrid_index(c: &mut Conn, extra: &[&str]) {
+    let mut args = vec![
         "FT.CREATE",
         "idx",
         "ON",
@@ -2750,8 +2798,10 @@ fn test_ft_hybrid_rrf_default() {
         "1",
         "d:",
         "SCHEMA",
-        "title",
-        "TEXT",
+    ];
+    args.extend_from_slice(&["title", "TEXT"]);
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
         "v",
         "VECTOR",
         "FLAT",
@@ -2763,10 +2813,25 @@ fn test_ft_hybrid_rrf_default() {
         "DISTANCE_METRIC",
         "L2",
     ]);
+    assert!(c.cmds(&args).is_ok());
+}
 
+/// `FT.HYBRID` with `words`, then the vector `q` as `PARAMS 2 q`.
+fn hybrid(c: &mut Conn, words: &[&str], q: &[f32]) -> RespValue {
+    let q = pack_f32(q);
+    let mut args: Vec<&[u8]> = words.iter().map(|w| w.as_bytes()).collect();
+    args.extend_from_slice(&[b"PARAMS", b"2", b"q", &q]);
+    c.cmd(&args)
+}
+
+#[test]
+fn test_ft_hybrid_rrf_default() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
     let v_match = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     let v_far = pack_f32(&[0.0, 0.0, 1.0, 0.0]);
-
     c.cmd(&[
         b"HSET",
         b"d:1",
@@ -2778,31 +2843,31 @@ fn test_ft_hybrid_rrf_default() {
     c.cmd(&[b"HSET", b"d:2", b"title", b"python tutorial", b"v", &v_far]);
     c.cmd(&[b"HSET", b"d:3", b"title", b"rust deep dive", b"v", &v_match]);
 
-    // Hybrid: text "rust" + vector near [1,0,0,0]
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    let count = arr[0].as_int();
-    assert!(count >= 2, "should rank at least the two matching docs");
-
-    // The two top results must be d:1 and d:3 (matched text AND vector).
-    let top1 = arr[1].as_str();
-    let top2 = arr[3].as_str();
-    let mut tops = vec![top1, top2];
-    tops.sort();
-    assert_eq!(tops, vec!["d:1", "d:3"], "top two should be d:1 and d:3");
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 3);
+    // Without LOAD a row is the key and the fused score.
+    assert_eq!(row_names(&rows[0]), ["__key", "__score"]);
+    let mut top = hybrid_keys(&rows)[..2].to_vec();
+    top.sort();
+    assert_eq!(
+        top,
+        ["d:1", "d:3"],
+        "matched by text and by vector: {rows:?}"
+    );
+    assert_eq!(hybrid_keys(&rows)[2], "d:2");
 }
 
 #[test]
@@ -2810,33 +2875,9 @@ fn test_ft_hybrid_linear_alpha_text_heavy() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &[]);
     let v_close = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     let v_medium = pack_f32(&[0.7, 0.7, 0.0, 0.0]);
-
     c.cmd(&[
         b"HSET",
         b"d:text",
@@ -2853,68 +2894,34 @@ fn test_ft_hybrid_linear_alpha_text_heavy() {
         b"v",
         &v_close,
     ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // alpha=0.9 → text dominates → d:text wins despite worse vector match
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"COMBINE",
-        b"LINEAR",
-        b"4",
-        b"ALPHA",
-        b"0.9",
-        b"BETA",
-        b"0.1",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(
-        arr[1].as_str(),
-        "d:text",
-        "with ALPHA=0.9 the text-matching doc should rank first"
-    );
-
-    // alpha=0.1 → vector dominates → d:vec wins despite worse text match.
-    // Note: d:vec doesn't match the SEARCH filter so it actually shouldn't
-    // appear at all — text_search filters first, vsim filters by KNN top-k.
-    // This is the right semantics: hybrid is a fusion of two SETS, not
-    // a re-ranking of a single set. Either side can produce a doc.
-    let r2 = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"COMBINE",
-        b"LINEAR",
-        b"4",
-        b"ALPHA",
-        b"0.1",
-        b"BETA",
-        b"0.9",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr2 = r2.as_array();
-    assert_eq!(
-        arr2[1].as_str(),
-        "d:vec",
-        "with BETA=0.9 the vector-closer doc should rank first"
-    );
+    let q = [1.0, 0.0, 0.0, 0.0];
+    let linear = |c: &mut Conn, alpha: &str, beta: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                "LINEAR",
+                "4",
+                "ALPHA",
+                alpha,
+                "BETA",
+                beta,
+            ],
+            &q,
+        );
+        hybrid_rows(&r).1
+    };
+    // The text weighs most: the text match first, for all its far vector.
+    assert_eq!(hybrid_keys(&linear(&mut c, "0.9", "0.1"))[0], "d:text");
+    // The vector weighs most: the closer vector first.
+    assert_eq!(hybrid_keys(&linear(&mut c, "0.1", "0.9"))[0], "d:vec");
 }
 
 #[test]
@@ -2922,78 +2929,532 @@ fn test_ft_hybrid_errors() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
+    let v = [1.0, 0.0, 0.0, 0.0];
 
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    let r = hybrid(
+        &mut c,
+        &["FT.HYBRID", "nosuch", "SEARCH", "x", "VSIM", "@v", "$q"],
+        &v,
+    );
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_INDEX_NOT_FOUND Index not found: nosuch"
+    );
+    assert!(c.cmds(&["FT.HYBRID", "idx", "SEARCH", "x"]).is_error());
     assert!(
         c.cmds(&[
             "FT.HYBRID",
-            "nosuch",
+            "idx",
+            "VSIM",
+            "@v",
+            "$q",
+            "PARAMS",
+            "2",
+            "q",
+            "x"
+        ])
+        .is_error()
+    );
+    let r = c.cmds(&[
+        "FT.HYBRID",
+        "idx",
+        "SEARCH",
+        "@title:x",
+        "VSIM",
+        "@v",
+        "$q",
+        "PARAMS",
+        "0",
+    ]);
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_PARAM_NOT_FOUND Parameter not found `q`"
+    );
+    let r = hybrid(
+        &mut c,
+        &["FT.HYBRID", "idx", "SEARCH", "x", "VSIM", "@title", "$q"],
+        &v,
+    );
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_SYNTAX Expected a VECTOR field `title`"
+    );
+    let r = c.cmds(&[
+        "FT.HYBRID",
+        "idx",
+        "SEARCH",
+        "x",
+        "VSIM",
+        "@v",
+        "$q",
+        "PARAMS",
+        "2",
+        "q",
+        "abc",
+    ]);
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_QUERY_BAD Error parsing vector similarity query: query vector blob size (3) does not match index's expected size (16)."
+    );
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
             "SEARCH",
             "x",
             "VSIM",
             "@v",
             "$q",
-            "PARAMS",
+            "KNN",
+            "4",
+            "K",
             "2",
-            "q",
-            "x"
-        ])
-        .is_error()
+            "EF_RUNTIME",
+            "10",
+        ],
+        &v,
     );
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)"
+    );
+}
 
-    assert!(c.cmds(&["FT.HYBRID", "idx", "SEARCH", "x"]).is_error());
+/// #767: `SCORER` in the `SEARCH` clause, as every RedisVL `HybridQuery`
+/// sends it. An unknown scorer, or one not in capitals, is refused with
+/// Redis's error.
+#[test]
+fn test_ft_hybrid_scorer_unknown() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
+    let v = [1.0, 0.0, 0.0, 0.0];
+    for name in ["NOPE", "tfidf"] {
+        let r = hybrid(
+            &mut c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "SCORER",
+                name,
+                "VSIM",
+                "@v",
+                "$q",
+            ],
+            &v,
+        );
+        assert_eq!(
+            error_text(&r),
+            format!("SEARCH_QUERY_BAD No such scorer {name}")
+        );
+    }
+}
 
-    assert!(
-        c.cmds(&[
-            "FT.HYBRID",
+/// The five documents of the Redis 8.10.2 comparison, as a hash or a JSON
+/// document, under an index `idx` on `d:` with `title`, `tag`, `n` and `v`.
+fn scorer_corpus(c: &mut Conn, json: bool) {
+    let docs: [(&str, &str, &str, &str, [f32; 4]); 5] = [
+        (
+            "1",
+            "rust programming rust",
+            "tech",
+            "1",
+            [1.0, 0.0, 0.0, 0.0],
+        ),
+        ("2", "python tutorial", "tech", "2", [0.0, 0.0, 1.0, 0.0]),
+        (
+            "3",
+            "rust deep dive into the rust compiler internals",
+            "tech",
+            "3",
+            [0.9, 0.1, 0.0, 0.0],
+        ),
+        (
+            "4",
+            "cooking with rust pans",
+            "food",
+            "4",
+            [0.0, 1.0, 0.0, 0.0],
+        ),
+        ("5", "compiler design", "tech", "5", [0.5, 0.5, 0.0, 0.0]),
+    ];
+    let schema: &[&str] = if json {
+        &[
+            "FT.CREATE",
             "idx",
-            "VSIM",
-            "@v",
-            "$q",
-            "PARAMS",
-            "2",
-            "q",
-            "x"
-        ])
-        .is_error()
-    );
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "d:",
+            "SCHEMA",
+            "$.title",
+            "AS",
+            "title",
+            "TEXT",
+            "$.tag",
+            "AS",
+            "tag",
+            "TAG",
+            "$.n",
+            "AS",
+            "n",
+            "NUMERIC",
+            "$.v",
+            "AS",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ]
+    } else {
+        &[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "d:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "tag",
+            "TAG",
+            "n",
+            "NUMERIC",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ]
+    };
+    assert!(c.cmds(schema).is_ok());
+    for (id, title, tag, n, v) in docs {
+        let key = format!("d:{id}");
+        if json {
+            let doc = format!(
+                r#"{{"title":"{title}","tag":"{tag}","n":{n},"v":[{},{},{},{}]}}"#,
+                v[0], v[1], v[2], v[3]
+            );
+            assert!(c.cmds(&["JSON.SET", &key, "$", &doc]).is_ok());
+        } else {
+            let packed = pack_f32(&v);
+            c.cmd(&[
+                b"HSET",
+                key.as_bytes(),
+                b"title",
+                title.as_bytes(),
+                b"tag",
+                tag.as_bytes(),
+                b"n",
+                n.as_bytes(),
+                b"v",
+                &packed,
+            ]);
+        }
+    }
+}
 
-    assert!(
-        c.cmds(&[
+/// (key, text score, vector score, fused score) of each row, as yielded.
+fn scored(rows: &[Vec<(String, String)>]) -> Vec<(String, Option<String>, Option<String>, String)> {
+    rows.iter()
+        .map(|row| {
+            let get = |name| row_get(row, name).map(str::to_string);
+            (
+                get("__key").unwrap(),
+                get("ts"),
+                get("vs"),
+                get("hs").unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn s(v: &str) -> Option<String> {
+    Some(v.to_string())
+}
+
+/// #767: the scorer `SCORER` names scores the text side, and that score is
+/// the one LINEAR fuses. Keys, order and scores as Redis 8.10.2 gives them.
+#[test]
+fn test_ft_hybrid_scorer_linear_matches_redis() {
+    for json in [false, true] {
+        scorer_linear_matches_redis(json);
+    }
+}
+
+fn scorer_linear_matches_redis(json: bool) {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    scorer_corpus(&mut c, json);
+    let linear = |c: &mut Conn, scorer: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:(rust|compiler)",
+                "SCORER",
+                scorer,
+                "YIELD_SCORE_AS",
+                "ts",
+                "VSIM",
+                "@v",
+                "$q",
+                "YIELD_SCORE_AS",
+                "vs",
+                "COMBINE",
+                "LINEAR",
+                "6",
+                "ALPHA",
+                "0.7",
+                "BETA",
+                "0.3",
+                "YIELD_SCORE_AS",
+                "hs",
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        let (total, rows) = hybrid_rows(&r);
+        assert_eq!(total, 5);
+        scored(&rows)
+    };
+    let row = |k: &str, ts: Option<String>, vs: &str, hs: &str| {
+        (k.to_string(), ts, s(vs), hs.to_string())
+    };
+    assert_eq!(
+        linear(&mut c, "BM25STD"),
+        [
+            row("d:5", s("2.0682214534"), "0.666666666667", "1.64775501738"),
+            row("d:3", s("1.88414804122"), "0.980392151921", "1.61302127443"),
+            row("d:1", s("0.754380793747"), "1", "0.828066555623"),
+            row(
+                "d:4",
+                s("0.55313926632"),
+                "0.333333333333",
+                "0.487197486424"
+            ),
+            row("d:2", None, "0.333333333333", "0.1"),
+        ]
+    );
+    assert_eq!(
+        linear(&mut c, "TFIDF"),
+        [
+            row("d:5", s("4"), "0.666666666667", "3"),
+            row("d:3", s("3"), "0.980392151921", "2.39411764558"),
+            row("d:1", s("1"), "1", "1"),
+            row("d:4", s("1"), "0.333333333333", "0.8"),
+            row("d:2", None, "0.333333333333", "0.1"),
+        ]
+    );
+    // Another scorer, another order: BM25 ranks d:3 first.
+    assert_eq!(linear(&mut c, "BM25")[0].0, "d:3");
+    assert_eq!(linear(&mut c, "DISMAX")[0].0, "d:1");
+}
+
+/// #767: RRF ranks the text side by the chosen scorer.
+#[test]
+fn test_ft_hybrid_scorer_rrf_matches_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    scorer_corpus(&mut c, false);
+    let rrf = |c: &mut Conn, scorer: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:(rust|compiler)",
+                "SCORER",
+                scorer,
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                "RRF",
+                "4",
+                "WINDOW",
+                "20",
+                "CONSTANT",
+                "60",
+                "LOAD",
+                "2",
+                "@__key",
+                "@__score",
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        let (_, rows) = hybrid_rows(&r);
+        rows.iter()
+            .map(|row| {
+                (
+                    row_get(row, "__key").unwrap().to_string(),
+                    row_get(row, "__score").unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let got = rrf(&mut c, "TFIDF");
+    let keys: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["d:1", "d:5", "d:3", "d:4", "d:2"]);
+    assert_eq!(got[0].1, "0.032266458496");
+    assert_eq!(got[2].1, "0.0322580645161");
+    assert_eq!(got[4].1, "0.015625");
+    let keys: Vec<String> = rrf(&mut c, "BM25STD").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, ["d:1", "d:5", "d:3", "d:4", "d:2"]);
+}
+
+/// #767: `FILTER` in the `VSIM` clause limits the vector side only, as
+/// RedisVL's filtered `HybridQuery` sends it.
+#[test]
+fn test_ft_hybrid_vsim_filter_matches_redis() {
+    for json in [false, true] {
+        let port = free_port();
+        start_server(port);
+        let mut c = Conn::connect(port);
+        scorer_corpus(&mut c, json);
+        let r = hybrid(
+            &mut c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "SCORER",
+                "BM25STD",
+                "VSIM",
+                "@v",
+                "$q",
+                "FILTER",
+                "@tag:{food}",
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        let (total, rows) = hybrid_rows(&r);
+        assert_eq!(total, 3, "json {json}");
+        assert_eq!(hybrid_keys(&rows), ["d:4", "d:1", "d:3"], "json {json}");
+        let scores: Vec<&str> = rows
+            .iter()
+            .map(|r| row_get(r, "__score").unwrap())
+            .collect();
+        assert_eq!(
+            scores,
+            ["0.032266458496", "0.016393442623", "0.0161290322581"]
+        );
+
+        // Both sides filtered, as RedisVL sends a filter: one document.
+        let r = hybrid(
+            &mut c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "(~@title:(compiler) (@tag:{tech}))",
+                "SCORER",
+                "TFIDF",
+                "VSIM",
+                "@v",
+                "$q",
+                "FILTER",
+                "@tag:{food}",
+                "COMBINE",
+                "RRF",
+                "4",
+                "WINDOW",
+                "20",
+                "CONSTANT",
+                "60",
+                "LOAD",
+                "2",
+                "@title",
+                "@tag",
+                "LIMIT",
+                "0",
+                "4",
+            ],
+            &[0.0, 1.0, 0.0, 0.0],
+        );
+        let (total, rows) = hybrid_rows(&r);
+        assert_eq!(total, 5, "json {json}: {rows:?}");
+        // LOAD shows what it names, without the key or the score.
+        assert_eq!(row_names(&rows[0]), ["title", "tag"], "json {json}");
+        // The first three as Redis ranks them. (The fourth is one of the two
+        // documents only `~` admits, which FT.SEARCH scores otherwise.)
+        let titles: Vec<&str> = rows.iter().map(|r| row_get(r, "title").unwrap()).collect();
+        assert_eq!(
+            titles[..3],
+            [
+                "cooking with rust pans",
+                "compiler design",
+                "rust deep dive into the rust compiler internals",
+            ],
+            "json {json}"
+        );
+    }
+}
+
+/// #767 on a JSON index: the same scorer, the same order as on a hash.
+#[test]
+fn test_ft_hybrid_scorer_on_json() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    scorer_corpus(&mut c, true);
+    for (scorer, method, first) in [
+        ("TFIDF", "LINEAR", "compiler design"),
+        ("BM25STD", "LINEAR", "compiler design"),
+        ("TFIDF", "RRF", "rust programming rust"),
+    ] {
+        let mut words = vec![
             "FT.HYBRID",
             "idx",
             "SEARCH",
-            "@title:x",
+            "@title:(rust|compiler)",
+            "SCORER",
+            scorer,
             "VSIM",
             "@v",
             "$q",
-            "PARAMS",
-            "0"
-        ])
-        .is_error()
-    );
+            "COMBINE",
+            method,
+        ];
+        if method == "LINEAR" {
+            words.extend_from_slice(&["4", "ALPHA", "0.7", "BETA", "0.3"]);
+        } else {
+            words.push("0");
+        }
+        words.extend_from_slice(&["LOAD", "2", "@title", "@tag"]);
+        let (total, rows) = hybrid_rows(&hybrid(&mut c, &words, &[1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(total, 5, "{scorer} {method}");
+        assert_eq!(
+            row_get(&rows[0], "title"),
+            Some(first),
+            "{scorer} {method}: {rows:?}"
+        );
+        assert_eq!(row_get(&rows[4], "title"), Some("python tutorial"));
+    }
 }
 
 #[test]
@@ -3001,68 +3462,41 @@ fn test_ft_hybrid_yield_score_as() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &[]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     c.cmd(&[b"HSET", b"d:1", b"title", b"rust", b"v", &v]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"YIELD_SCORE_AS",
-        b"my_text",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"YIELD_SCORE_AS",
-        b"my_vec",
-        b"COMBINE",
-        b"RRF",
-        b"2",
-        b"YIELD_SCORE_AS",
-        b"my_hybrid",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 1);
-    let row = arr[2].as_array();
-
-    // Field-name presence test — order-agnostic.
-    // The row is a flat array of alternating field/value pairs; collect
-    // the names at even indices and assert each alias is among them.
-    let names: Vec<&str> = (0..row.len()).step_by(2).map(|i| row[i].as_str()).collect();
-    assert!(
-        names.contains(&"my_hybrid"),
-        "my_hybrid missing in {names:?}"
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "YIELD_SCORE_AS",
+            "my_text",
+            "VSIM",
+            "@v",
+            "$q",
+            "YIELD_SCORE_AS",
+            "my_vec",
+            "COMBINE",
+            "RRF",
+            "2",
+            "CONSTANT",
+            "60",
+            "YIELD_SCORE_AS",
+            "my_hybrid",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
     );
-    assert!(names.contains(&"my_text"), "my_text missing in {names:?}");
-    assert!(names.contains(&"my_vec"), "my_vec missing in {names:?}");
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1);
+    // The fused score goes by its name instead of `__score`.
+    assert_eq!(
+        row_names(&rows[0]),
+        ["my_text", "__key", "my_vec", "my_hybrid"]
+    );
+    assert_eq!(row_get(&rows[0], "my_vec"), Some("1"));
 }
 
 #[test]
@@ -3070,87 +3504,39 @@ fn test_ft_hybrid_sortby_text_score() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &[]);
     let v_close = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     let v_far = pack_f32(&[0.0, 0.0, 1.0, 0.0]);
-
     // d:a — strong text match, far vector. d:b — weak text, close vector.
     c.cmd(&[b"HSET", b"d:a", b"title", b"rust rust rust", b"v", &v_far]);
     c.cmd(&[b"HSET", b"d:b", b"title", b"rust", b"v", &v_close]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // SORTBY text_score DESC → d:a first
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"SORTBY",
-        b"2",
-        b"text_score",
-        b"DESC",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(
-        arr[1].as_str(),
-        "d:a",
-        "SORTBY text_score DESC should put d:a first"
-    );
-
-    // SORTBY vsim_score ASC (lower distance = better) → d:b first
-    let r2 = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"SORTBY",
-        b"2",
-        b"vsim_score",
-        b"ASC",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr2 = r2.as_array();
-    assert_eq!(
-        arr2[1].as_str(),
-        "d:b",
-        "SORTBY vsim_score ASC should put d:b first"
-    );
+    let sorted = |c: &mut Conn, by: &str, order: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "YIELD_SCORE_AS",
+                "ts",
+                "VSIM",
+                "@v",
+                "$q",
+                "YIELD_SCORE_AS",
+                "vs",
+                "SORTBY",
+                "2",
+                by,
+                order,
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        hybrid_rows(&r).1
+    };
+    assert_eq!(hybrid_keys(&sorted(&mut c, "@ts", "DESC"))[0], "d:a");
+    // The vector score is a similarity: higher is closer.
+    assert_eq!(hybrid_keys(&sorted(&mut c, "@vs", "DESC"))[0], "d:b");
 }
 
 #[test]
@@ -3158,68 +3544,43 @@ fn test_ft_hybrid_sortby_loaded_field() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &["price", "NUMERIC"]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[
-        b"HSET", b"d:1", b"title", b"rust", b"price", b"100", b"v", &v,
-    ]);
-    c.cmd(&[
-        b"HSET", b"d:2", b"title", b"rust", b"price", b"200", b"v", &v,
-    ]);
-    c.cmd(&[
-        b"HSET", b"d:3", b"title", b"rust", b"price", b"50", b"v", &v,
-    ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // SORTBY price DESC — d:2 (200), d:1 (100), d:3 (50)
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"SORTBY",
-        b"2",
-        b"price",
-        b"DESC",
-        b"LOAD",
-        b"1",
-        b"@price",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[1].as_str(), "d:2");
-    assert_eq!(arr[3].as_str(), "d:1");
-    assert_eq!(arr[5].as_str(), "d:3");
+    for (key, price) in [("d:1", "100"), ("d:2", "200"), ("d:3", "50")] {
+        c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"title",
+            b"rust",
+            b"price",
+            price.as_bytes(),
+            b"v",
+            &v,
+        ]);
+    }
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+            "SORTBY",
+            "2",
+            "@price",
+            "DESC",
+            "LOAD",
+            "2",
+            "@__key",
+            "@price",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (_, rows) = hybrid_rows(&r);
+    assert_eq!(hybrid_keys(&rows), ["d:2", "d:1", "d:3"]);
 }
 
 #[test]
@@ -3227,66 +3588,30 @@ fn test_ft_hybrid_load_star_returns_all_fields() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &[]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     c.cmd(&[
         b"HSET", b"d:1", b"title", b"rust", b"author", b"Steve", b"v", &v,
     ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"*",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 1);
-    let row = arr[2].as_array();
-    // Scores first (6 elements), then loaded fields. Find "title" and "author".
-    let mut found_title = false;
-    let mut found_author = false;
-    let mut i = 0;
-    while i + 1 < row.len() {
-        match row[i].as_str() {
-            "title" => found_title = row[i + 1].as_str() == "rust",
-            "author" => found_author = row[i + 1].as_str() == "Steve",
-            _ => {}
-        }
-        i += 2;
-    }
-    assert!(found_title, "LOAD * should include title");
-    assert!(found_author, "LOAD * should include author");
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "*",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1);
+    assert_eq!(row_get(&rows[0], "title"), Some("rust"));
+    assert_eq!(row_get(&rows[0], "author"), Some("Steve"));
 }
 
 #[test]
@@ -3294,58 +3619,30 @@ fn test_ft_hybrid_load_specific_fields() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &[]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     c.cmd(&[
         b"HSET", b"d:1", b"title", b"rust", b"author", b"Steve", b"secret", b"shh", b"v", &v,
     ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"2",
-        b"@title",
-        b"@author",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    let row = arr[2].as_array();
-
-    let names: Vec<&str> = (0..row.len()).step_by(2).map(|i| row[i].as_str()).collect();
-    assert!(names.contains(&"title"));
-    assert!(names.contains(&"author"));
-    assert!(!names.contains(&"secret"), "secret should not be loaded");
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "2",
+            "@title",
+            "@author",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (_, rows) = hybrid_rows(&r);
+    assert_eq!(row_names(&rows[0]), ["title", "author"]);
 }
 
 #[test]
@@ -3353,146 +3650,94 @@ fn test_ft_hybrid_with_full_pipeline() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "p:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "category",
-        "TAG",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
-    let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[
-        b"HSET",
-        b"p:1",
-        b"title",
-        b"laptop",
-        b"category",
-        b"electronics",
-        b"price",
-        b"1000",
-        b"v",
-        &v,
-    ]);
-    c.cmd(&[
-        b"HSET",
-        b"p:2",
-        b"title",
-        b"phone",
-        b"category",
-        b"electronics",
-        b"price",
-        b"500",
-        b"v",
-        &v,
-    ]);
-    c.cmd(&[
-        b"HSET",
-        b"p:3",
-        b"title",
-        b"tablet",
-        b"category",
-        b"electronics",
-        b"price",
-        b"300",
-        b"v",
-        &v,
-    ]);
-    c.cmd(&[
-        b"HSET",
-        b"p:4",
-        b"title",
-        b"chair",
-        b"category",
-        b"furniture",
-        b"price",
-        b"100",
-        b"v",
-        &v,
-    ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // GROUPBY category, REDUCE COUNT and AVG, FILTER on count.
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"*",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"2",
-        b"@category",
-        b"@price",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-        b"GROUPBY",
-        b"1",
-        b"@category",
-        b"REDUCE",
-        b"COUNT",
-        b"0",
-        b"AS",
-        b"cnt",
-        b"REDUCE",
-        b"AVG",
-        b"1",
-        b"@price",
-        b"AS",
-        b"avg_price",
-        b"FILTER",
-        b"@cnt > 1",
-    ]);
-    let arr = r.as_array();
-
-    // Only electronics has cnt > 1.
-    assert_eq!(
-        arr[0].as_int(),
-        1,
-        "FILTER @cnt > 1 should leave only electronics"
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "p:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "category",
+            "TAG",
+            "price",
+            "NUMERIC",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ])
+        .is_ok()
     );
-    let row = arr[1].as_array();
-
-    // Find category and avg_price in the flat field array
-    let mut cat = "";
-    let mut avg = 0.0;
-    let mut cnt = 0i64;
-    let mut i = 0;
-    while i + 1 < row.len() {
-        match row[i].as_str() {
-            "category" => cat = row[i + 1].as_str(),
-            "avg_price" => avg = row[i + 1].as_str().parse().unwrap_or(0.0),
-            "cnt" => cnt = row[i + 1].as_str().parse().unwrap_or(0),
-            _ => {}
-        }
-        i += 2;
+    let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+    for (key, title, category, price) in [
+        ("p:1", "laptop", "electronics", "1000"),
+        ("p:2", "phone", "electronics", "500"),
+        ("p:3", "tablet", "electronics", "300"),
+        ("p:4", "chair", "furniture", "100"),
+    ] {
+        c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"title",
+            title.as_bytes(),
+            b"category",
+            category.as_bytes(),
+            b"price",
+            price.as_bytes(),
+            b"v",
+            &v,
+        ]);
     }
-    assert_eq!(cat, "electronics");
-    assert_eq!(cnt, 3);
+    // GROUPBY category, REDUCE COUNT and AVG, FILTER on the count.
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "*",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "2",
+            "@category",
+            "@price",
+            "GROUPBY",
+            "1",
+            "@category",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "cnt",
+            "REDUCE",
+            "AVG",
+            "1",
+            "@price",
+            "AS",
+            "avg_price",
+            "FILTER",
+            "@cnt > 1",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1, "FILTER @cnt > 1 should leave only electronics");
+    assert_eq!(row_get(&rows[0], "category"), Some("electronics"));
+    assert_eq!(row_get(&rows[0], "cnt"), Some("3"));
+    let avg: f64 = row_get(&rows[0], "avg_price").unwrap().parse().unwrap();
     assert!((avg - 600.0).abs() < 0.5, "avg should be 600, got {avg}");
 }
 
@@ -3501,78 +3746,36 @@ fn test_ft_hybrid_apply_after_fusion() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "p:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &["price", "NUMERIC"]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[b"HSET", b"p:1", b"title", b"a", b"price", b"100", b"v", &v]);
-    c.cmd(&[b"HSET", b"p:2", b"title", b"a", b"price", b"200", b"v", &v]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // APPLY without GROUPBY — adds a computed field to each per-doc row.
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:a",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"1",
-        b"@price",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-        b"APPLY",
-        b"@price * 1.1",
-        b"AS",
-        b"with_tax",
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 2);
-
-    // Each result row should include the with_tax field
-    let mut found_with_tax = 0;
-    for row_idx in [2, 4] {
-        let row = arr[row_idx].as_array();
-        for i in (0..row.len()).step_by(2) {
-            if row[i].as_str() == "with_tax" {
-                let v: f64 = row[i + 1].as_str().parse().unwrap();
-                assert!(v > 0.0);
-                found_with_tax += 1;
-            }
-        }
-    }
-    assert_eq!(
-        found_with_tax, 2,
-        "with_tax should be computed for both rows"
+    c.cmd(&[b"HSET", b"d:1", b"title", b"a", b"price", b"100", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:2", b"title", b"a", b"price", b"200", b"v", &v]);
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:a",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "1",
+            "@price",
+            "APPLY",
+            "@price * 1.1",
+            "AS",
+            "with_tax",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
     );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 2);
+    for row in &rows {
+        let v: f64 = row_get(row, "with_tax").unwrap().parse().unwrap();
+        assert!(v > 0.0);
+    }
 }
 
 #[test]
@@ -3580,60 +3783,106 @@ fn test_ft_hybrid_filter_before_groupby() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "p:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &["price", "NUMERIC"]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[b"HSET", b"p:1", b"title", b"a", b"price", b"100", b"v", &v]);
-    c.cmd(&[b"HSET", b"p:2", b"title", b"a", b"price", b"200", b"v", &v]);
-    c.cmd(&[b"HSET", b"p:3", b"title", b"a", b"price", b"50", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:1", b"title", b"a", b"price", b"100", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:2", b"title", b"a", b"price", b"200", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:3", b"title", b"a", b"price", b"50", b"v", &v]);
+    // A FILTER after the VSIM clause's own is a step after fusion. The
+    // total counts what it leaves; LIMIT pages it.
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:a",
+            "VSIM",
+            "@v",
+            "$q",
+            "YIELD_SCORE_AS",
+            "vs",
+            "LOAD",
+            "1",
+            "@price",
+            "FILTER",
+            "@price > 75",
+            "LIMIT",
+            "0",
+            "1",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 2, "FILTER @price > 75 should drop d:3");
+    assert_eq!(rows.len(), 1);
+}
 
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+/// What the server sends back to `commands`, sent at once on a fresh
+/// connection, up to the end of the line after `until`.
+fn raw_replies(port: u16, commands: &[Vec<&[u8]>], until: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for args in commands {
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            buf.extend_from_slice(arg);
+            buf.extend_from_slice(b"\r\n");
+        }
+        stream.write_all(&buf).unwrap();
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let text = String::from_utf8_lossy(&out).into_owned();
+        if let Some(at) = text.find(until)
+            && text[at + until.len()..].contains("\r\n")
+        {
+            return text;
+        }
+        let n = stream.read(&mut chunk).expect(&text);
+        assert!(n > 0, "closed: {text}");
+        out.extend_from_slice(&chunk[..n]);
+    }
+}
 
-    // FILTER as a pipeline clause — runs after fusion, prunes per-doc rows.
-    let r = c.cmd(&[
+/// RESP3: the reply and each row are maps, and the time a double.
+#[test]
+fn test_ft_hybrid_resp3_maps() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
+    let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+    c.cmd(&[b"HSET", b"d:1", b"title", b"rust", b"v", &v]);
+    let hybrid: Vec<&[u8]> = vec![
         b"FT.HYBRID",
         b"idx",
         b"SEARCH",
-        b"@title:a",
+        b"@title:rust",
         b"VSIM",
         b"@v",
         b"$q",
-        b"LOAD",
-        b"1",
-        b"@price",
         b"PARAMS",
         b"2",
         b"q",
-        &q,
-        b"FILTER",
-        b"@price > 75",
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 2, "FILTER @price > 75 should drop p:3");
+        &v,
+    ];
+    let raw = raw_replies(port, &[vec![b"HELLO", b"3"], hybrid], "execution_time\r\n");
+    let reply = &raw[raw.find("%4\r\n$13\r\ntotal_results").expect(&raw)..];
+    assert!(
+        reply.starts_with(
+            "%4\r\n$13\r\ntotal_results\r\n:1\r\n$7\r\nresults\r\n*1\r\n%2\r\n$5\r\n__key\r\n$3\r\nd:1\r\n$7\r\n__score\r\n"
+        ),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("$8\r\nwarnings\r\n*0\r\n$14\r\nexecution_time\r\n,"),
+        "{reply}"
+    );
 }
 
 #[test]
@@ -3818,7 +4067,7 @@ fn test_p1_multi_vector_hybrid_with_compaction() {
         b"$q",
         b"COMBINE",
         b"RRF",
-        b"2",
+        b"0",
         b"LIMIT",
         b"0",
         b"5",
@@ -3827,8 +4076,7 @@ fn test_p1_multi_vector_hybrid_with_compaction() {
         b"q",
         &q,
     ]);
-    let arr = r.as_array();
-    let count = arr[0].as_int();
+    let (count, _) = hybrid_rows(&r);
     assert!(count > 0, "hybrid search should return results");
 
     // Delete 100 docs to cross the compaction threshold (>= 64 tombstones,
@@ -3895,14 +4143,10 @@ fn test_p1_multi_vector_hybrid_with_compaction() {
         b"q",
         &q,
     ]);
-    let arr2 = r2.as_array();
-    assert!(
-        arr2[0].as_int() > 0,
-        "search should still work post-compaction"
-    );
+    let (count, rows) = hybrid_rows(&r2);
+    assert!(count > 0, "search should still work post-compaction");
     // No deleted keys in results
-    for i in (1..arr2.len()).step_by(2) {
-        let key = arr2[i].as_str();
+    for key in hybrid_keys(&rows) {
         let n: usize = key.strip_prefix("p:").and_then(|s| s.parse().ok()).unwrap();
         assert!(n >= 100, "deleted key {key} should not appear in results");
     }
@@ -4068,9 +4312,8 @@ fn test_hybrid_picks_correct_vector_field() {
         b"q",
         &q,
     ]);
-    let arr1 = r1.as_array();
     assert_eq!(
-        arr1[1].as_str(),
+        hybrid_keys(&hybrid_rows(&r1).1)[0],
         "p:1",
         "v1-anchored hybrid (vector-only) should rank d:1 first"
     );
@@ -4096,9 +4339,8 @@ fn test_hybrid_picks_correct_vector_field() {
         b"q",
         &q,
     ]);
-    let arr2 = r2.as_array();
     assert_eq!(
-        arr2[1].as_str(),
+        hybrid_keys(&hybrid_rows(&r2).1)[0],
         "p:2",
         "v2-anchored hybrid (vector-only) should rank d:2 first"
     );
@@ -4340,22 +4582,10 @@ fn test_hybrid_full_pipeline_with_geodistance() {
         b"FILTER",
         b"@cnt > 1",
     ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 1, "only sf has cnt > 1");
-    let row = arr[1].as_array();
-    let mut city = "";
-    let mut cnt = 0i64;
-    let mut i = 0;
-    while i + 1 < row.len() {
-        match row[i].as_str() {
-            "city" => city = row[i + 1].as_str(),
-            "cnt" => cnt = row[i + 1].as_str().parse().unwrap_or(0),
-            _ => {}
-        }
-        i += 2;
-    }
-    assert_eq!(city, "sf");
-    assert_eq!(cnt, 2);
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1, "only sf has cnt > 1");
+    assert_eq!(row_get(&rows[0], "city"), Some("sf"));
+    assert_eq!(row_get(&rows[0], "cnt"), Some("2"));
 }
 
 #[test]
@@ -4441,9 +4671,8 @@ fn test_alter_then_hybrid_on_new_vector_field() {
         b"q",
         &q,
     ]);
-    let arr = r.as_array();
     assert_eq!(
-        arr[1].as_str(),
+        hybrid_keys(&hybrid_rows(&r).1)[0],
         "p:2",
         "hybrid on FT.ALTER-added field should work end-to-end"
     );

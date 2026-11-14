@@ -1,106 +1,55 @@
-// FT.HYBRID — Redis 8.4 hybrid text + vector search.
+// FT.HYBRID — Redis 8.4+ hybrid text + vector search.
 //
-// Combines two ranked result lists (one from text/filter search, one from
-// vector KNN) into a single ranked list using a score-fusion method.
-// Two methods supported:
+//   FT.HYBRID index
+//     SEARCH query [SCORER name] [YIELD_SCORE_AS name]
+//     VSIM @field $param
+//       [KNN count K k [EF_RUNTIME ef] [SHARD_K_RATIO r]
+//        | RANGE count RADIUS r [EPSILON e]]
+//       [FILTER filter] [YIELD_SCORE_AS name]
+//     [COMBINE RRF count [CONSTANT c] [WINDOW w] [YIELD_SCORE_AS name]
+//      | COMBINE LINEAR count [ALPHA a BETA b] [WINDOW w] [YIELD_SCORE_AS name]]
+//     [LIMIT offset num] [SORTBY nargs @field [ASC|DESC] ... | NOSORT]
+//     [PARAMS nargs name value ...] [TIMEOUT ms] [FORMAT fmt]
+//     [LOAD count @field [AS name] ... | LOAD *]
+//     [GROUPBY ... [REDUCE ...]] [APPLY expr AS name] [FILTER expr]
 //
-//   RRF (Reciprocal Rank Fusion)
-//     score(d) = Σ 1 / (k + rank_i(d))    for each list i
-//     where k = CONSTANT (default 60). Scale-free — doesn't care about
-//     raw score distributions, only relative ranks within each list.
+// Two ranked lists, one from the text query (scored by `SCORER`, as FT.SEARCH
+// scores it) and one from the vector query, fused into one:
 //
-//   LINEAR
-//     score(d) = α · text_norm(d) + β · vsim_norm(d)
-//     where text_norm and vsim_norm are min-max normalized to [0,1].
-//     Vector distances are inverted during normalization since lower
-//     distance means more similar.
+//   RRF     score(d) = Σ 1 / (CONSTANT + rank_i(d)), over the lists d is in.
+//   LINEAR  score(d) = ALPHA · text(d) + BETA · vector(d), where text is the
+//           scorer's own score and vector the similarity Redis yields for
+//           the distance (see `similarity`). A list d is not in adds 0.
 //
-// Why a separate file: ft_search and ft_aggregate already make vector.rs
-// over 2k lines. Hybrid is structurally distinct (two parallel rankings
-// then fusion) — co-locating it with FT.SEARCH would entangle the parsers.
+// Each list is cut to WINDOW first. The reply is Redis's:
+//
+//   total_results N  results [row ...]  warnings [...]  execution_time ms
+//
+// a row being `__key` and `__score` (the fused score), or the fields LOADed,
+// with the scores named by `YIELD_SCORE_AS`. RESP3 makes the reply and each
+// row a map.
 
-use crate::store::ValueRef;
+use std::time::Instant;
+
 use ahash::AHashMap;
 
+use crate::commands::aggregate_pipeline::Row;
 use crate::commands::ctx::Ctx;
-use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str, resp_error, resp_integer};
-use crate::vector::{FieldType, KnnResult, LiveIndex, knn_flat, knn_hnsw};
+use crate::resp::write::{
+    resp_array, resp_bulk, resp_bulk_str, resp_double_resp3, resp_error, resp_integer, resp_map_for,
+};
+use crate::vector::score::Scorer;
+use crate::vector::{DistanceMetric, FieldType, KnnResult, LiveIndex, VectorAlgo};
 
-#[derive(Debug)]
-enum LoadSpec {
-    All,
-    Fields(Vec<String>),
+// ── Parsed command ──────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq)]
+enum VectorMethod {
+    Knn { k: usize, ef_runtime: Option<usize> },
+    Range { radius: f64, epsilon: Option<f64> },
 }
 
-// ── Parsed command structure ────────────────────────────────────────────────
-//
-// Hand-rolled parser instead of pulling in a parser-combinator crate.
-// FT.HYBRID's grammar is small and section-based — sections are introduced
-// by keywords (SEARCH, VSIM, COMBINE, etc.) so a token-walking state
-// machine reads cleanly.
-
-#[derive(Debug, Default)]
-struct HybridQuery {
-    index_name: String,
-    search_query: String,
-    vsim_field: String,
-    vsim_param: String,
-    knn_k: usize,
-    knn_ef_runtime: Option<usize>,
-    fusion: Fusion,
-    limit_offset: usize,
-    limit_count: usize,
-    params: AHashMap<String, Vec<u8>>,
-
-    /// Field name for the per-row text relevance score in the response.
-    /// Defaults to "text_score". `YIELD_SCORE_AS` after SEARCH overrides.
-    text_score_alias: Option<String>,
-
-    /// Field name for the vector-similarity score. Defaults to "vsim_score".
-    /// `YIELD_SCORE_AS` inside VSIM overrides.
-    vsim_score_alias: Option<String>,
-
-    /// Field name for the fused hybrid score. Defaults to "hybrid_score".
-    /// `YIELD_SCORE_AS` inside COMBINE overrides.
-    hybrid_score_alias: Option<String>,
-
-    /// Optional explicit sort. None = sort by hybrid_score descending (the
-    /// default). `NOSORT` produces Some(SortSpec::None). A SORTBY with a
-    /// field name produces Some(SortSpec::By { ... }).
-    sort: Option<SortSpec>,
-    /// What hash fields to return per result.
-    /// None = no LOAD specified, return only scores (4.1/4.2 behavior).
-    /// Some(LoadSpec::All) = LOAD *, return every hash field.
-    /// Some(LoadSpec::Fields(v)) = LOAD with explicit field names.
-    load: Option<LoadSpec>,
-    /// Index into `cmd` where the aggregation pipeline tail begins.
-    /// Set by the parser when it encounters GROUPBY/APPLY/FILTER. None
-    /// means there's no pipeline tail and we emit the score-and-load
-    /// response directly.
-    pipeline_start: Option<usize>,
-}
-
-impl HybridQuery {
-    fn text_alias(&self) -> &str {
-        self.text_score_alias.as_deref().unwrap_or("text_score")
-    }
-    fn vsim_alias(&self) -> &str {
-        self.vsim_score_alias.as_deref().unwrap_or("vsim_score")
-    }
-    fn hybrid_alias(&self) -> &str {
-        self.hybrid_score_alias.as_deref().unwrap_or("hybrid_score")
-    }
-}
-
-#[derive(Debug)]
-enum SortSpec {
-    /// NOSORT: emit results in fusion order, don't re-sort after pagination.
-    None,
-    /// SORTBY: sort the result page by a named field with direction.
-    By { field: String, descending: bool },
-}
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Fusion {
     Rrf {
         window: usize,
@@ -113,872 +62,1380 @@ enum Fusion {
     },
 }
 
-impl Default for Fusion {
-    fn default() -> Self {
-        // Redis defaults: RRF with WINDOW=20 CONSTANT=60
-        Fusion::Rrf {
-            window: 20,
-            constant: 60.0,
-        }
-    }
+#[derive(Debug)]
+struct HybridQuery {
+    index_name: String,
+    search_query: String,
+    /// `SCORER`, as given: checked once the command has parsed, as Redis
+    /// does.
+    scorer: Option<String>,
+    text_yield: Option<String>,
+    vsim_field: String,
+    vsim_param: String,
+    method: VectorMethod,
+    /// `FILTER` of the `VSIM` clause: which documents the vector query may
+    /// return. A `FILTER` after the clause is a pipeline step.
+    vsim_filter: Option<String>,
+    vsim_yield: Option<String>,
+    fusion: Fusion,
+    hybrid_yield: Option<String>,
+    limit_offset: usize,
+    limit_count: usize,
+    nosort: bool,
+    timeout_ms: Option<u64>,
+    params: AHashMap<String, Vec<u8>>,
+    /// The pipeline steps, in order: `LOAD`, `APPLY`, `FILTER`, `GROUPBY`
+    /// with its `REDUCE`s, and `SORTBY`.
+    tail: Vec<Vec<u8>>,
 }
 
-// ── Parser ──────────────────────────────────────────────────────────────────
+fn word(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn arg<'a>(cmd: &[&'a [u8]], i: usize, name: &str) -> Result<&'a [u8], String> {
+    cmd.get(i)
+        .copied()
+        .ok_or_else(|| format!("SEARCH_PARSE_ARGS {name}: Missing argument"))
+}
+
+fn number<T: std::str::FromStr>(cmd: &[&[u8]], i: usize, name: &str) -> Result<T, String> {
+    std::str::from_utf8(arg(cmd, i, name)?)
+        .ok()
+        .and_then(|s| s.parse::<T>().ok())
+        .ok_or_else(|| {
+            format!("SEARCH_PARSE_ARGS {name}: Could not convert argument to expected type")
+        })
+}
+
+/// The `count` of a `KNN` / `RANGE` / `COMBINE` block: its arguments go in
+/// name–value pairs.
+fn pair_count(cmd: &[&[u8]], i: usize, what: &str) -> Result<usize, String> {
+    let n: usize = std::str::from_utf8(arg(cmd, i, what)?)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("SEARCH_SYNTAX Invalid argument count for {what}"))?;
+    Ok(n)
+}
+
+fn is(b: &[u8], w: &str) -> bool {
+    b.eq_ignore_ascii_case(w.as_bytes())
+}
 
 fn parse(cmd: &[&[u8]]) -> Result<HybridQuery, String> {
-    if cmd.len() < 6 {
-        return Err("ERR wrong number of arguments for 'ft.hybrid' command".into());
+    if cmd.len() < 3 {
+        return Err("ERR wrong number of arguments for 'FT.HYBRID' command".into());
     }
-
     let mut q = HybridQuery {
-        knn_k: 10,
+        index_name: word(cmd[1]),
+        search_query: String::new(),
+        scorer: None,
+        text_yield: None,
+        vsim_field: String::new(),
+        vsim_param: String::new(),
+        method: VectorMethod::Knn {
+            k: 10,
+            ef_runtime: None,
+        },
+        vsim_filter: None,
+        vsim_yield: None,
+        fusion: Fusion::Rrf {
+            window: 20,
+            constant: 60.0,
+        },
+        hybrid_yield: None,
         limit_offset: 0,
         limit_count: 10,
-        ..Default::default()
+        nosort: false,
+        timeout_ms: None,
+        params: AHashMap::new(),
+        tail: Vec::new(),
     };
 
-    q.index_name = utf8(cmd[1])?.to_string();
-
-    // Walk tokens. Every section is introduced by an uppercase keyword.
-    // Within a section we consume option tokens until we see the next
-    // section keyword or run off the end.
-    let mut i = 2usize;
-    while i < cmd.len() {
-        let tok = utf8(cmd[i])?.to_ascii_uppercase();
-        match tok.as_str() {
-            "SEARCH" => {
-                i += 1;
-                if i >= cmd.len() {
-                    return Err("ERR SEARCH requires a query".into());
-                }
-                q.search_query = utf8(cmd[i])?.to_string();
-                i += 1;
-                // SEARCH may be followed by SCORER (ignored, sub-step 4.4)
-                // or YIELD_SCORE_AS. Only YIELD_SCORE_AS is implemented now.
-                while i < cmd.len() {
-                    let opt = utf8(cmd[i])?.to_ascii_uppercase();
-                    if opt == "YIELD_SCORE_AS" {
-                        i += 1;
-                        if i >= cmd.len() {
-                            return Err("ERR YIELD_SCORE_AS requires a name".into());
-                        }
-                        q.text_score_alias = Some(utf8(cmd[i])?.to_string());
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            "VSIM" => {
-                i += 1;
-                if i + 1 >= cmd.len() {
-                    return Err("ERR VSIM requires field and param".into());
-                }
-                q.vsim_field = utf8(cmd[i])?
-                    .strip_prefix('@')
-                    .unwrap_or(utf8(cmd[i])?)
-                    .to_string();
-                i += 1;
-                q.vsim_param = utf8(cmd[i])?
-                    .strip_prefix('$')
-                    .ok_or_else(|| "ERR VSIM param must start with $".to_string())?
-                    .to_string();
-                i += 1;
-                // Optional KNN sub-block
-                if i < cmd.len() && utf8(cmd[i])?.eq_ignore_ascii_case("KNN") {
-                    i += 1;
-                    // count — positional hint; we read+ignore the value
-                    let _count: usize = utf8(cmd[i])?
-                        .parse()
-                        .map_err(|_| "ERR KNN count must be an integer".to_string())?;
-                    i += 1;
-                    while i < cmd.len() {
-                        let opt = utf8(cmd[i])?.to_ascii_uppercase();
-                        if matches!(
-                            opt.as_str(),
-                            "COMBINE"
-                                | "LIMIT"
-                                | "PARAMS"
-                                | "SORTBY"
-                                | "NOSORT"
-                                | "LOAD"
-                                | "YIELD_SCORE_AS"
-                                | "GROUPBY"
-                                | "APPLY"
-                                | "FILTER"
-                        ) {
-                            break;
-                        }
-                        match opt.as_str() {
-                            "K" => {
-                                i += 1;
-                                q.knn_k = utf8(cmd[i])?
-                                    .parse()
-                                    .map_err(|_| "ERR K must be an integer".to_string())?;
-                                i += 1;
-                            }
-                            "EF_RUNTIME" => {
-                                i += 1;
-                                q.knn_ef_runtime =
-                                    Some(utf8(cmd[i])?.parse().map_err(|_| {
-                                        "ERR EF_RUNTIME must be integer".to_string()
-                                    })?);
-                                i += 1;
-                            }
-                            _ => break, // unknown option — let outer loop handle it
-                        }
-                    }
-                }
-
-                // VSIM-level options that come after the KNN sub-block:
-                // YIELD_SCORE_AS for the vector-similarity score.
-                while i < cmd.len() {
-                    let opt = utf8(cmd[i])?.to_ascii_uppercase();
-                    if opt == "YIELD_SCORE_AS" {
-                        i += 1;
-                        if i >= cmd.len() {
-                            return Err("ERR YIELD_SCORE_AS requires a name".into());
-                        }
-                        q.vsim_score_alias = Some(utf8(cmd[i])?.to_string());
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            "COMBINE" => {
-                i += 1;
-                let method = utf8(cmd[i])?.to_ascii_uppercase();
-                i += 1;
-                // count is purely positional — read and discard
-                let _count: usize = utf8(cmd[i])?
-                    .parse()
-                    .map_err(|_| "ERR COMBINE count must be an integer".to_string())?;
-                i += 1;
-                match method.as_str() {
-                    "RRF" => {
-                        let mut window = 20usize;
-                        let mut constant = 60.0f64;
-                        while i < cmd.len() {
-                            let opt = utf8(cmd[i])?.to_ascii_uppercase();
-                            if matches!(
-                                opt.as_str(),
-                                "COMBINE" | "LIMIT" | "PARAMS" | "SORTBY" | "NOSORT"
-                            ) {
-                                break;
-                            }
-                            match opt.as_str() {
-                                "WINDOW" => {
-                                    i += 1;
-                                    window = utf8(cmd[i])?
-                                        .parse()
-                                        .map_err(|_| "ERR WINDOW must be integer".to_string())?;
-                                    i += 1;
-                                }
-                                "CONSTANT" => {
-                                    i += 1;
-                                    constant = utf8(cmd[i])?
-                                        .parse()
-                                        .map_err(|_| "ERR CONSTANT must be a number".to_string())?;
-                                    i += 1;
-                                }
-                                "YIELD_SCORE_AS" => {
-                                    i += 1;
-                                    if i >= cmd.len() {
-                                        return Err("ERR YIELD_SCORE_AS requires a name".into());
-                                    }
-                                    q.hybrid_score_alias = Some(utf8(cmd[i])?.to_string());
-                                    i += 1;
-                                }
-                                _ => break,
-                            }
-                        }
-                        q.fusion = Fusion::Rrf { window, constant };
-                    }
-                    "LINEAR" => {
-                        let mut alpha = 0.5f64;
-                        let mut beta = 0.5f64;
-                        let mut window = 20usize;
-                        while i < cmd.len() {
-                            let opt = utf8(cmd[i])?.to_ascii_uppercase();
-                            if matches!(
-                                opt.as_str(),
-                                "COMBINE" | "LIMIT" | "PARAMS" | "SORTBY" | "NOSORT"
-                            ) {
-                                break;
-                            }
-                            match opt.as_str() {
-                                "ALPHA" => {
-                                    i += 1;
-                                    alpha = utf8(cmd[i])?
-                                        .parse()
-                                        .map_err(|_| "ERR ALPHA must be a number".to_string())?;
-                                    i += 1;
-                                }
-                                "BETA" => {
-                                    i += 1;
-                                    beta = utf8(cmd[i])?
-                                        .parse()
-                                        .map_err(|_| "ERR BETA must be a number".to_string())?;
-                                    i += 1;
-                                }
-                                "WINDOW" => {
-                                    i += 1;
-                                    window = utf8(cmd[i])?
-                                        .parse()
-                                        .map_err(|_| "ERR WINDOW must be integer".to_string())?;
-                                    i += 1;
-                                }
-                                "YIELD_SCORE_AS" => {
-                                    i += 1;
-                                    if i >= cmd.len() {
-                                        return Err("ERR YIELD_SCORE_AS requires a name".into());
-                                    }
-                                    q.hybrid_score_alias = Some(utf8(cmd[i])?.to_string());
-                                    i += 1;
-                                }
-                                _ => break,
-                            }
-                        }
-                        q.fusion = Fusion::Linear {
-                            alpha,
-                            beta,
-                            window,
-                        };
-                    }
-                    other => return Err(format!("ERR unknown COMBINE method '{other}'")),
-                }
-            }
-            "LIMIT" => {
-                i += 1;
-                q.limit_offset = utf8(cmd[i])?
-                    .parse()
-                    .map_err(|_| "ERR LIMIT offset must be integer".to_string())?;
-                i += 1;
-                q.limit_count = utf8(cmd[i])?
-                    .parse()
-                    .map_err(|_| "ERR LIMIT count must be integer".to_string())?;
-                i += 1;
-            }
-            "PARAMS" => {
-                i += 1;
-                let n: usize = utf8(cmd[i])?
-                    .parse()
-                    .map_err(|_| "ERR PARAMS nargs must be integer".to_string())?;
-                i += 1;
-                if !n.is_multiple_of(2) {
-                    return Err("ERR PARAMS nargs must be even".into());
-                }
-                for _ in 0..n / 2 {
-                    if i + 1 >= cmd.len() {
-                        return Err("ERR PARAMS truncated".into());
-                    }
-                    let name = utf8(cmd[i])?.to_string();
-                    let val = cmd[i + 1].to_vec();
-                    q.params.insert(name, val);
-                    i += 2;
-                }
-            }
-            "SORTBY" => {
-                i += 1;
-                // SORTBY <count> <field> [ASC|DESC]
-                // count is the number-of-args hint; we read+ignore.
-                let _count: usize = utf8(cmd[i])?
-                    .parse()
-                    .map_err(|_| "ERR SORTBY count must be integer".to_string())?;
-                i += 1;
-                let field = utf8(cmd[i])?
-                    .strip_prefix('@')
-                    .unwrap_or(utf8(cmd[i])?)
-                    .to_string();
-                i += 1;
-                // Optional direction. Default ASC matches Redis SORTBY.
-                let descending = if i < cmd.len() {
-                    let dir = utf8(cmd[i])?.to_ascii_uppercase();
-                    match dir.as_str() {
-                        "ASC" => {
-                            i += 1;
-                            false
-                        }
-                        "DESC" => {
-                            i += 1;
-                            true
-                        }
-                        _ => false, // not a direction token; another section follows
-                    }
-                } else {
-                    false
-                };
-                q.sort = Some(SortSpec::By { field, descending });
-            }
-            "NOSORT" => {
-                i += 1;
-                q.sort = Some(SortSpec::None);
-            }
-            "LOAD" => {
-                i += 1;
-                if i >= cmd.len() {
-                    return Err("ERR LOAD requires count or *".into());
-                }
-                let first = utf8(cmd[i])?;
-                if first == "*" {
-                    q.load = Some(LoadSpec::All);
-                    i += 1;
-                } else {
-                    let count: usize = first
-                        .parse()
-                        .map_err(|_| "ERR LOAD count must be * or integer".to_string())?;
-                    i += 1;
-                    // `count` is the client's word: no more than there are arguments.
-                    let mut fields = Vec::with_capacity(count.min(cmd.len()));
-                    for _ in 0..count {
-                        if i >= cmd.len() {
-                            return Err("ERR LOAD truncated".into());
-                        }
-                        let name = utf8(cmd[i])?
-                            .strip_prefix('@')
-                            .unwrap_or(utf8(cmd[i])?)
-                            .to_string();
-                        fields.push(name);
-                        i += 1;
-                    }
-                    q.load = Some(LoadSpec::Fields(fields));
-                }
-            }
-            "GROUPBY" | "APPLY" | "FILTER" => {
-                // Before handing off to the pipeline, look ahead for a PARAMS
-                // section anywhere in the remaining tokens. PARAMS is a
-                // top-level FT.HYBRID concept; it can legitimately appear
-                // after pipeline clauses in Redis's grammar.
-                let mut j = i;
-                while j < cmd.len() {
-                    let t = utf8(cmd[j])?.to_ascii_uppercase();
-                    if t == "PARAMS" {
-                        let n: usize = utf8(cmd[j + 1])?
-                            .parse()
-                            .map_err(|_| "ERR PARAMS nargs must be integer".to_string())?;
-                        if !n.is_multiple_of(2) {
-                            return Err("ERR PARAMS nargs must be even".into());
-                        }
-                        let mut k = j + 2;
-                        for _ in 0..n / 2 {
-                            if k + 1 >= cmd.len() {
-                                return Err("ERR PARAMS truncated".into());
-                            }
-                            q.params
-                                .insert(utf8(cmd[k])?.to_string(), cmd[k + 1].to_vec());
-                            k += 2;
-                        }
-                        break;
-                    }
-                    j += 1;
-                }
-
-                q.pipeline_start = Some(i);
-                break;
-            }
-            // For now, anything we don't recognize is a syntax error.
-            other => return Err(format!("ERR unknown FT.HYBRID token '{other}'")),
+    // ── SEARCH query [SCORER name] [YIELD_SCORE_AS name] ────────────────────
+    if !is(cmd[2], "SEARCH") {
+        return Err("SEARCH_SYNTAX Invalid subqueries count: expected an unsigned integer".into());
+    }
+    q.search_query = word(arg(cmd, 3, "SEARCH")?);
+    let mut i = 4;
+    loop {
+        let Some(&tok) = cmd.get(i) else {
+            return Err("SEARCH_SYNTAX VSIM argument is missing".into());
+        };
+        if is(tok, "SCORER") {
+            q.scorer = Some(word(arg(cmd, i + 1, "SCORER")?));
+            i += 2;
+        } else if is(tok, "YIELD_SCORE_AS") {
+            q.text_yield = Some(word(arg(cmd, i + 1, "YIELD_SCORE_AS")?));
+            i += 2;
+        } else if is(tok, "VSIM") {
+            break;
+        } else {
+            return Err(format!(
+                "SEARCH_ARG_UNRECOGNIZED Unknown argument `{}` in SEARCH",
+                word(tok)
+            ));
         }
     }
 
-    if q.search_query.is_empty() {
-        return Err("ERR FT.HYBRID requires SEARCH".into());
+    // ── VSIM @field $param ──────────────────────────────────────────────────
+    let field = word(arg(cmd, i + 1, "VSIM")?);
+    q.vsim_field = field.strip_prefix('@').unwrap_or(&field).to_string();
+    let param = word(arg(cmd, i + 2, "VSIM")?);
+    q.vsim_param = param
+        .strip_prefix('$')
+        .ok_or_else(|| {
+            "SEARCH_SYNTAX VSIM vector argument must be a parameter, as $name".to_string()
+        })?
+        .to_string();
+    i += 3;
+
+    // [KNN count ... | RANGE count ...]
+    if let Some(&tok) = cmd.get(i)
+        && (is(tok, "KNN") || is(tok, "RANGE"))
+    {
+        let knn = is(tok, "KNN");
+        let what = if knn { "KNN" } else { "RANGE" };
+        let n = pair_count(cmd, i + 1, what)?;
+        if n == 0 || !n.is_multiple_of(2) {
+            return Err(format!(
+                "SEARCH_SYNTAX Invalid argument count: {n} (must be a positive even number for key/value pairs)"
+            ));
+        }
+        let end = (i + 2).saturating_add(n);
+        if end > cmd.len() {
+            return Err(format!("SEARCH_SYNTAX Missing arguments for {what}"));
+        }
+        let mut k = 10usize;
+        let mut ef_runtime = None;
+        let mut radius = None;
+        let mut epsilon = None;
+        let mut at = i + 2;
+        while at < end {
+            let name = cmd[at].to_ascii_uppercase();
+            match (knn, name.as_slice()) {
+                (true, b"K") => {
+                    k = std::str::from_utf8(cmd[at + 1])
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|k| *k > 0)
+                        .ok_or_else(|| "SEARCH_SYNTAX Invalid K value".to_string())?;
+                }
+                (true, b"EF_RUNTIME") => {
+                    ef_runtime = Some(number::<usize>(cmd, at + 1, "EF_RUNTIME")?);
+                }
+                (true, b"SHARD_K_RATIO") => {
+                    // How many of `K` each shard returns: one node here.
+                    number::<f64>(cmd, at + 1, "SHARD_K_RATIO")?;
+                }
+                (false, b"RADIUS") => radius = Some(number::<f64>(cmd, at + 1, "RADIUS")?),
+                (false, b"EPSILON") => epsilon = Some(number::<f64>(cmd, at + 1, "EPSILON")?),
+                _ => {
+                    return Err(format!(
+                        "SEARCH_ARG_UNRECOGNIZED Unknown argument `{}` in {what}",
+                        word(cmd[at])
+                    ));
+                }
+            }
+            at += 2;
+        }
+        q.method = if knn {
+            VectorMethod::Knn { k, ef_runtime }
+        } else {
+            VectorMethod::Range {
+                radius: radius
+                    .ok_or_else(|| "SEARCH_SYNTAX Missing required argument RADIUS".to_string())?,
+                epsilon,
+            }
+        };
+        i = end;
     }
-    if q.vsim_field.is_empty() {
-        return Err("ERR FT.HYBRID requires VSIM".into());
+    // [FILTER filter] [YIELD_SCORE_AS name]
+    if cmd.get(i).is_some_and(|t| is(t, "FILTER")) {
+        q.vsim_filter = Some(word(arg(cmd, i + 1, "FILTER")?));
+        i += 2;
     }
+    if cmd.get(i).is_some_and(|t| is(t, "YIELD_SCORE_AS")) {
+        q.vsim_yield = Some(word(arg(cmd, i + 1, "YIELD_SCORE_AS")?));
+        i += 2;
+    }
+
+    // ── The rest, in any order ──────────────────────────────────────────────
+    while i < cmd.len() {
+        let tok = cmd[i].to_ascii_uppercase();
+        match tok.as_slice() {
+            b"COMBINE" => i = parse_combine(cmd, i, &mut q)?,
+            b"LIMIT" => {
+                q.limit_offset = number(cmd, i + 1, "LIMIT")?;
+                q.limit_count = number(cmd, i + 2, "LIMIT")?;
+                i += 3;
+            }
+            b"NOSORT" => {
+                q.nosort = true;
+                i += 1;
+            }
+            b"PARAMS" => {
+                let n: usize = number(cmd, i + 1, "PARAMS")?;
+                if !n.is_multiple_of(2) {
+                    return Err("SEARCH_PARSE_ARGS PARAMS: Bad arguments, expected an even number of name-value pairs".into());
+                }
+                if n > cmd.len() - (i + 2).min(cmd.len()) {
+                    return Err("SEARCH_PARSE_ARGS PARAMS: Missing argument".into());
+                }
+                for pair in cmd[i + 2..i + 2 + n].chunks(2) {
+                    q.params.insert(word(pair[0]), pair[1].to_vec());
+                }
+                i += 2 + n;
+            }
+            b"TIMEOUT" => {
+                q.timeout_ms = Some(number(cmd, i + 1, "TIMEOUT")?);
+                i += 2;
+            }
+            b"FORMAT" => {
+                // `STRING` or `EXPAND`: values are strings either way here.
+                arg(cmd, i + 1, "FORMAT")?;
+                i += 2;
+            }
+            b"DIALECT" => {
+                return Err("SEARCH_PARSE_ARGS DIALECT is not supported in FT.HYBRID or any of its subqueries. Please check the documentation on search-default-dialect configuration.".into());
+            }
+            b"LOAD" => {
+                let end = if cmd.get(i + 1).is_some_and(|a| *a == b"*") {
+                    i + 2
+                } else {
+                    let n: usize = number(cmd, i + 1, "LOAD")?;
+                    let end = (i + 2).saturating_add(n);
+                    if end > cmd.len() {
+                        return Err("SEARCH_PARSE_ARGS LOAD: Missing argument".into());
+                    }
+                    let mut at = i + 2;
+                    while at < end {
+                        let name = cmd[at];
+                        if !name.starts_with(b"@") && !name.starts_with(b"$") {
+                            return Err(format!(
+                                "SEARCH_PARSE_ARGS Missing prefix: name requires '@' prefix, JSON path require '$' prefix, got: {} in LOAD",
+                                word(name)
+                            ));
+                        }
+                        at += if cmd.get(at + 1).is_some_and(|a| is(a, "AS")) && at + 2 < end {
+                            3
+                        } else {
+                            1
+                        };
+                    }
+                    end
+                };
+                q.tail.extend(cmd[i..end].iter().map(|a| a.to_vec()));
+                i = end;
+            }
+            b"SORTBY" | b"APPLY" | b"FILTER" | b"GROUPBY" => {
+                let end = step_end(cmd, i)?;
+                q.tail.extend(cmd[i..end].iter().map(|a| a.to_vec()));
+                i = end;
+            }
+            _ => {
+                return Err(format!(
+                    "SEARCH_PARSE_ARGS {}: Unknown argument",
+                    word(cmd[i])
+                ));
+            }
+        }
+    }
+
     if !q.params.contains_key(&q.vsim_param) {
         return Err(format!(
-            "ERR PARAMS does not contain VSIM param '{}'",
+            "SEARCH_PARAM_NOT_FOUND Parameter not found `{}`",
             q.vsim_param
         ));
     }
-
     Ok(q)
 }
 
-fn utf8(b: &[u8]) -> Result<&str, String> {
-    std::str::from_utf8(b).map_err(|_| "ERR argument must be valid UTF-8".to_string())
-}
-
-// ── Score fusion ────────────────────────────────────────────────────────────
-
-/// Apply RRF: each document's hybrid score = Σ 1 / (k + rank_in_list).
-/// Documents not present in a list contribute 0 from that list.
-/// Returns a sorted Vec of (key, hybrid_score) descending.
-fn rrf_fuse(
-    text_results: &[(String, f64)],
-    vsim_results: &[(String, f64)],
-    constant: f64,
-    window: usize,
-) -> Vec<(String, f64)> {
-    let mut scores: AHashMap<String, f64> = AHashMap::new();
-
-    for (rank, (key, _)) in text_results.iter().take(window).enumerate() {
-        let r = (rank + 1) as f64; // 1-based rank
-        *scores.entry(key.clone()).or_insert(0.0) += 1.0 / (constant + r);
-    }
-    for (rank, (key, _)) in vsim_results.iter().take(window).enumerate() {
-        let r = (rank + 1) as f64;
-        *scores.entry(key.clone()).or_insert(0.0) += 1.0 / (constant + r);
-    }
-
-    let mut out: Vec<(String, f64)> = scores.into_iter().collect();
-    out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1)); // descending
-    out
-}
-
-/// Apply LINEAR fusion: hybrid = α · norm(text) + β · norm(vsim).
-/// Both scores are min-max normalized to [0,1] independently. Vector
-/// distances are inverted (1 - normalized) since lower distance = more
-/// similar. Documents missing from a list contribute 0 from that list.
-fn linear_fuse(
-    text_results: &[(String, f64)],
-    vsim_results: &[(String, f64)],
-    alpha: f64,
-    beta: f64,
-    window: usize,
-) -> Vec<(String, f64)> {
-    fn min_max(vals: &[f64]) -> (f64, f64) {
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &v in vals {
-            if v < lo {
-                lo = v;
-            }
-            if v > hi {
-                hi = v;
+/// Where the step after fusion at `cmd[i]` (`LOAD`, `SORTBY`, `APPLY`,
+/// `FILTER`, `GROUPBY` with its `REDUCE`s) ends; an error if the command ends first.
+/// Its counts are the client's: added without overflow, each step forward.
+fn step_end(cmd: &[&[u8]], i: usize) -> Result<usize, String> {
+    let count = |at: usize| -> usize {
+        cmd.get(at)
+            .and_then(|a| std::str::from_utf8(a).ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    let at_word = |at: usize, w: &str| cmd.get(at).is_some_and(|a| is(a, w));
+    let end = if at_word(i, "LOAD") {
+        if cmd.get(i + 1).is_some_and(|a| *a == b"*") {
+            i + 2
+        } else {
+            (i + 2).saturating_add(count(i + 1))
+        }
+    } else if at_word(i, "SORTBY") {
+        let end = (i + 2).saturating_add(count(i + 1));
+        if at_word(end, "MAX") { end + 2 } else { end }
+    } else if at_word(i, "APPLY") {
+        if at_word(i + 2, "AS") { i + 4 } else { i + 2 }
+    } else if at_word(i, "GROUPBY") {
+        let mut at = (i + 2).saturating_add(count(i + 1));
+        while at < cmd.len() && at_word(at, "REDUCE") {
+            at = (at + 3).saturating_add(count(at + 2));
+            if at_word(at, "AS") {
+                at += 2;
             }
         }
-        (lo, hi)
+        at
+    } else {
+        // FILTER expr
+        i + 2
+    };
+    if end > cmd.len() {
+        return Err(format!(
+            "SEARCH_PARSE_ARGS {}: Missing argument",
+            word(cmd[i])
+        ));
     }
-
-    let text_window: Vec<&(String, f64)> = text_results.iter().take(window).collect();
-    let vsim_window: Vec<&(String, f64)> = vsim_results.iter().take(window).collect();
-
-    let text_vals: Vec<f64> = text_window.iter().map(|(_, s)| *s).collect();
-    let vsim_vals: Vec<f64> = vsim_window.iter().map(|(_, s)| *s).collect();
-
-    let (t_lo, t_hi) = min_max(&text_vals);
-    let (v_lo, v_hi) = min_max(&vsim_vals);
-
-    let t_range = t_hi - t_lo;
-    let v_range = v_hi - v_lo;
-
-    let mut scores: AHashMap<String, f64> = AHashMap::new();
-
-    // Text score: higher is already better in our text-search returns
-    // (we use a synthetic relevance, see text_search below). Normalize
-    // upward: norm = (s - lo) / range.
-    for (key, s) in &text_window {
-        let n = if t_range > 0.0 {
-            (s - t_lo) / t_range
-        } else {
-            1.0
-        };
-        *scores.entry(key.clone()).or_insert(0.0) += alpha * n;
-    }
-
-    // Vector score: this is a *distance* (lower = more similar). Invert
-    // during normalization so higher = better.
-    for (key, d) in &vsim_window {
-        let n = if v_range > 0.0 {
-            1.0 - (d - v_lo) / v_range
-        } else {
-            1.0
-        };
-        *scores.entry(key.clone()).or_insert(0.0) += beta * n;
-    }
-
-    let mut out: Vec<(String, f64)> = scores.into_iter().collect();
-    out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-    out
+    Ok(end)
 }
 
-// ── The two component queries ───────────────────────────────────────────────
+/// `COMBINE RRF|LINEAR count ... [YIELD_SCORE_AS name]` at `cmd[i]`; where
+/// the clause ends.
+fn parse_combine(cmd: &[&[u8]], i: usize, q: &mut HybridQuery) -> Result<usize, String> {
+    let method = arg(cmd, i + 1, "COMBINE")?.to_ascii_uppercase();
+    let rrf = match method.as_slice() {
+        b"RRF" => true,
+        b"LINEAR" => false,
+        _ => return Err("SEARCH_PARSE_ARGS COMBINE: Invalid value for argument".into()),
+    };
+    let what = if rrf { "RRF" } else { "LINEAR" };
+    let n: usize = number(cmd, i + 2, what)?;
+    if !n.is_multiple_of(2) {
+        return Err(format!(
+            "SEARCH_PARSE_ARGS {what} expects pairs of key value arguments, argument count must be an even number"
+        ));
+    }
+    let end = (i + 3).saturating_add(n);
+    if end > cmd.len() {
+        return Err(format!("SEARCH_PARSE_ARGS {what}: Missing argument"));
+    }
+    let mut window = 20usize;
+    let mut constant = 60.0f64;
+    let mut alpha = None;
+    let mut beta = None;
+    let mut at = i + 3;
+    while at < end {
+        let name = cmd[at].to_ascii_uppercase();
+        match (rrf, name.as_slice()) {
+            (_, b"WINDOW") => {
+                window = number(cmd, at + 1, "WINDOW")?;
+                if window == 0 {
+                    return Err("SEARCH_PARSE_ARGS WINDOW: Value below minimum".into());
+                }
+            }
+            (_, b"YIELD_SCORE_AS") => q.hybrid_yield = Some(word(cmd[at + 1])),
+            (true, b"CONSTANT") => constant = number(cmd, at + 1, "CONSTANT")?,
+            (false, b"ALPHA") => alpha = Some(number::<f64>(cmd, at + 1, "ALPHA")?),
+            (false, b"BETA") => beta = Some(number::<f64>(cmd, at + 1, "BETA")?),
+            _ => {
+                return Err(format!(
+                    "SEARCH_PARSE_ARGS {}: Unknown argument",
+                    word(cmd[at])
+                ));
+            }
+        }
+        at += 2;
+    }
+    q.fusion = if rrf {
+        Fusion::Rrf { window, constant }
+    } else {
+        let (alpha, beta) = match (alpha, beta) {
+            (Some(a), Some(b)) => (a, b),
+            (None, None) => (0.3, 0.7),
+            (Some(_), None) => return Err("SEARCH_SYNTAX Missing value for BETA".into()),
+            (None, Some(_)) => return Err("SEARCH_SYNTAX Missing value for ALPHA".into()),
+        };
+        Fusion::Linear {
+            alpha,
+            beta,
+            window,
+        }
+    };
+    let mut end = end;
+    if cmd.get(end).is_some_and(|t| is(t, "YIELD_SCORE_AS")) {
+        q.hybrid_yield = Some(word(arg(cmd, end + 1, "YIELD_SCORE_AS")?));
+        end += 2;
+    }
+    Ok(end)
+}
 
-/// Run the text/filter portion. Returns (key, relevance_score) sorted by
-/// score descending.
-///
-/// The query is the same language FT.SEARCH takes, and is run the same way:
-/// see `commands::search::filter_search`.
-pub(crate) fn text_search(
+/// `SCORER`'s name as Redis takes it: one of the scorers, in capitals.
+fn scorer_named(name: &str) -> Result<Scorer, String> {
+    Scorer::parse(name)
+        .filter(|_| !name.bytes().any(|b| b.is_ascii_lowercase()))
+        .ok_or_else(|| format!("SEARCH_QUERY_BAD No such scorer {name}"))
+}
+
+// ── Scores ──────────────────────────────────────────────────────────────────
+
+/// The similarity Redis yields for a vector `distance`, and fuses with
+/// LINEAR: higher is closer.
+fn similarity(metric: &DistanceMetric, distance: f64) -> f64 {
+    match metric {
+        // The squared Euclidean distance, 0 to ∞.
+        DistanceMetric::L2 => 1.0 / (1.0 + distance),
+        // 1 - cos, 0 to 2.
+        DistanceMetric::Cosine => 1.0 - distance / 2.0,
+        // 1 - dot. Redis 8.10.2 yields (1 + distance) / 2 here.
+        DistanceMetric::InnerProduct => (1.0 + distance) / 2.0,
+    }
+}
+
+/// A score as Redis writes it in a row: `%.12g`.
+fn score_text(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        return if value.is_nan() {
+            "nan".to_string()
+        } else if value > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    let scientific = format!("{value:.11e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let trim = |s: &str| -> String {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    if !(-4..12).contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa), exponent.abs())
+    } else {
+        trim(&format!("{:.*}", (11 - exponent) as usize, value))
+    }
+}
+
+/// Best first; a tie by key, so a reply is the same each time.
+fn rank(list: &mut [(String, f64)], higher_first: bool) {
+    list.sort_unstable_by(|a, b| {
+        let by_score = if higher_first {
+            b.1.total_cmp(&a.1)
+        } else {
+            a.1.total_cmp(&b.1)
+        };
+        by_score.then_with(|| a.0.cmp(&b.0))
+    });
+}
+
+/// RRF over the two windows: each document's Σ 1 / (constant + rank).
+fn rrf_fuse(text: &[(String, f64)], vsim: &[(String, f64)], constant: f64) -> Vec<(String, f64)> {
+    let mut scores: AHashMap<&str, f64> = AHashMap::new();
+    for list in [text, vsim] {
+        for (at, (key, _)) in list.iter().enumerate() {
+            *scores.entry(key).or_insert(0.0) += 1.0 / (constant + (at + 1) as f64);
+        }
+    }
+    scores
+        .into_iter()
+        .map(|(k, s)| (k.to_string(), s))
+        .collect()
+}
+
+/// LINEAR over the two windows: α · text score + β · vector similarity.
+fn linear_fuse(
+    text: &[(String, f64)],
+    vsim: &[(String, f64)],
+    alpha: f64,
+    beta: f64,
+) -> Vec<(String, f64)> {
+    let mut scores: AHashMap<&str, f64> = AHashMap::new();
+    for (key, score) in text {
+        *scores.entry(key).or_insert(0.0) += alpha * score;
+    }
+    for (key, similarity) in vsim {
+        *scores.entry(key).or_insert(0.0) += beta * similarity;
+    }
+    scores
+        .into_iter()
+        .map(|(k, s)| (k.to_string(), s))
+        .collect()
+}
+
+// ── The two queries ─────────────────────────────────────────────────────────
+
+/// The text query, scored by `scorer`: (key, score), best first.
+fn text_ranked(
     ctx: &Ctx,
     def: &crate::vector::IndexDef,
     query: &str,
     params: &AHashMap<String, Vec<u8>>,
-) -> Result<Vec<(String, f64)>, String> {
+    scorer: Scorer,
+    deadline: Option<Instant>,
+) -> Result<(Vec<(String, f64)>, bool), String> {
     let parsed = crate::vector::filter::parse_query(query, params, def)?;
-    let mut out: Vec<(String, f64)> =
-        crate::commands::search::filter_search(ctx, def, &parsed.filter, None, None)
-            .matches
-            .into_iter()
-            .map(|found| (found.key, found.score))
-            .collect();
-    out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    Ok(out)
+    let found = crate::commands::search::filter_search_scored(
+        ctx,
+        def,
+        &parsed.filter,
+        None,
+        deadline,
+        scorer,
+    );
+    let mut out: Vec<(String, f64)> = found
+        .matches
+        .into_iter()
+        .map(|found| (found.key, found.score))
+        .collect();
+    rank(&mut out, true);
+    Ok((out, found.timed_out))
 }
 
-/// Run the vector KNN portion. Returns (key, distance) sorted ascending.
-fn vsim_search(
-    db: &crate::store::Db,
+/// The vector query: (key, distance), nearest first.
+#[allow(clippy::too_many_arguments)]
+fn vsim_ranked(
+    ctx: &Ctx,
     def: &crate::vector::IndexDef,
-    field: &str,
+    field: &crate::vector::SchemaField,
     query_vec: &[f32],
-    k: usize,
-    ef_runtime: Option<usize>,
-) -> Result<Vec<(String, f64)>, String> {
-    let vf = def
-        .vector_field_by_name(field)
-        .ok_or_else(|| format!("ERR no such vector field '{field}' in index"))?;
-
-    let metric = match &vf.field_type {
-        FieldType::Vector { metric, .. } => metric.clone(),
-        _ => return Err("ERR field is not VECTOR".into()),
+    method: &VectorMethod,
+    filter: Option<&str>,
+    params: &AHashMap<String, Vec<u8>>,
+    deadline: Option<Instant>,
+) -> Result<(Vec<(String, f64)>, bool), String> {
+    let FieldType::Vector { metric, algo, .. } = &field.field_type else {
+        return Err(format!(
+            "SEARCH_SYNTAX Expected a VECTOR field `{}`",
+            field.attribute()
+        ));
     };
-
     let live = def
         .indexes
-        .get(field)
-        .ok_or_else(|| "ERR vector field has no live index".to_string())?;
-
-    let ef = ef_runtime.unwrap_or_else(|| match &vf.field_type {
-        FieldType::Vector {
-            algo: crate::vector::VectorAlgo::Hnsw { ef_runtime, .. },
-            ..
-        } => *ef_runtime,
-        _ => k * 2,
-    });
-    let knn: Vec<KnnResult> =
-        crate::commands::vector::nearest_shown(db, &vf.name, k, |n| match live {
-            LiveIndex::Flat(idx) => knn_flat(idx, query_vec, n, &metric),
-            LiveIndex::Hnsw(idx) => knn_hnsw(idx, query_vec, n, ef.max(n).max(50), &metric),
-        });
-
-    Ok(knn.into_iter().map(|r| (r.key, r.score as f64)).collect())
-}
-
-/// Look up a single hash field on a key and parse it as f64.
-/// Returns f64::NEG_INFINITY for missing keys, missing fields, or
-/// non-numeric values — making them sort to the natural minimum.
-fn read_numeric_field(
-    db: &crate::store::Db,
-    def: &crate::vector::IndexDef,
-    key: &str,
-    field: &str,
-) -> f64 {
-    let raw = crate::key_bytes::bytes_of(key);
-    let Some(value) = crate::store::get_shard(db, &*raw)
-        .read()
-        .get(&*raw)
-        .map(ValueRef::to_value)
-    else {
-        return f64::NEG_INFINITY;
+        .get(&field.name)
+        .ok_or_else(|| "The vector field has no index".to_string())?;
+    let db = &ctx.store[*ctx.selected_db];
+    let filter = match filter {
+        Some(text) => crate::vector::filter::parse_query(text, params, def)?.filter,
+        None => crate::vector::filter::Filter::MatchAll,
     };
-    let Some(inner) = crate::vector::query_doc_fields(&def.on, &def.fields, value.view()) else {
-        return f64::NEG_INFINITY;
+    let unfiltered = matches!(filter, crate::vector::filter::Filter::MatchAll);
+    let mut timed_out = false;
+
+    // Every document the filter accepts, measured as it is found; the
+    // nearest `k` of them kept.
+    let scan = |k: usize, timed_out: &mut bool| -> Vec<KnnResult> {
+        let mut scorer = crate::commands::vector::FilteredKnn::new(live, query_vec, k, metric);
+        *timed_out = crate::commands::search::filter_each(
+            ctx,
+            def,
+            &filter,
+            None,
+            deadline,
+            |key, fields, json| {
+                if json.is_some() || fields.get(field.name.as_str()).is_some() {
+                    scorer.offer(key);
+                }
+            },
+        );
+        scorer.nearest()
     };
-    // By the name the query knows the field by.
-    let field = def
-        .field_by_attribute(field)
-        .map_or(field, |f| f.name.as_str());
-    match inner.get(field) {
-        Some(raw) => match std::str::from_utf8(raw) {
-            Ok(s) => s.parse::<f64>().unwrap_or(f64::NEG_INFINITY),
-            Err(_) => f64::NEG_INFINITY,
-        },
-        None => f64::NEG_INFINITY,
-    }
+
+    let nearest: Vec<KnnResult> = match method {
+        VectorMethod::Knn { k, ef_runtime } if unfiltered => {
+            let ef = ef_runtime.unwrap_or(match algo {
+                VectorAlgo::Hnsw { ef_runtime, .. } => *ef_runtime,
+                VectorAlgo::Flat => k * 2,
+            });
+            crate::commands::vector::nearest_shown(db, &field.name, *k, |n| match live {
+                LiveIndex::Flat(idx) => crate::vector::knn_flat(idx, query_vec, n, metric),
+                LiveIndex::Hnsw(idx) => {
+                    crate::vector::knn_hnsw(idx, query_vec, n, ef.max(n).max(50), metric)
+                }
+            })
+        }
+        VectorMethod::Knn { k, ef_runtime } => {
+            let knn = crate::vector::filter::Knn {
+                k: *k,
+                field: field.name.clone(),
+                vector: query_vec.to_vec(),
+                alias: String::new(),
+                ef_runtime: *ef_runtime,
+                policy: None,
+                batch_size: None,
+            };
+            match crate::commands::vector::knn_planned(
+                ctx, def, &filter, None, &knn, field, deadline,
+            ) {
+                Some((nearest, cut)) => {
+                    timed_out = cut;
+                    nearest
+                }
+                None => scan(*k, &mut timed_out),
+            }
+        }
+        VectorMethod::Range { radius, .. } => {
+            let mut within = scan(usize::MAX, &mut timed_out);
+            within.retain(|hit| f64::from(hit.score) <= *radius);
+            within
+        }
+    };
+    Ok((
+        nearest
+            .into_iter()
+            .map(|hit| (hit.key, f64::from(hit.score)))
+            .collect(),
+        timed_out,
+    ))
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
-    let q = match parse(&ctx.cmd) {
-        Ok(q) => q,
-        Err(e) => return Some(resp_error(&e)),
+    let started = Instant::now();
+    match run(ctx, started) {
+        Ok(reply) => Some(reply),
+        Err(e) => Some(resp_error(&e)),
+    }
+}
+
+fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
+    let q = parse(&ctx.cmd)?;
+    let scorer = match &q.scorer {
+        Some(name) => scorer_named(name)?,
+        None => Scorer::default_scorer(),
     };
 
-    // Snapshot the index def so we don't hold the index_store lock through
-    // the keyspace walk + KNN.
-    let (def_clone, query_vec) = {
-        let store = ctx.index_store.read();
-        let def = match store.get(&q.index_name) {
-            Some(d) => d.clone(),
-            None => {
-                return Some(resp_error(&crate::commands::search::no_such_index(
-                    &q.index_name,
-                )));
-            }
-        };
-
-        // Decode vector param: PARAMS holds raw bytes in the field's type.
-        let raw = q.params.get(&q.vsim_param).unwrap(); // checked in parse()
-        let vf = match def.vector_field_by_name(&q.vsim_field) {
-            Some(f) => f,
-            None => {
-                return Some(resp_error(&format!(
-                    "ERR no such vector field '{}'",
-                    q.vsim_field
-                )));
-            }
-        };
-        let (dim, data_type) = match &vf.field_type {
-            FieldType::Vector { dim, data_type, .. } => (*dim, *data_type),
-            _ => return Some(resp_error("ERR field is not VECTOR")),
-        };
-        let Some(v) = data_type.decode(raw, dim) else {
-            return Some(resp_error(&format!(
-                "ERR vector param wrong size: expected {} bytes, got {}",
-                dim * data_type.size(),
-                raw.len()
-            )));
-        };
-        (def, v)
+    let def = ctx
+        .index_store
+        .read()
+        .get(&q.index_name)
+        .cloned()
+        .ok_or_else(|| crate::commands::search::no_such_index(&q.index_name))?;
+    let field = def
+        .field_by_attribute(&q.vsim_field)
+        .or_else(|| def.fields.iter().find(|f| f.name == q.vsim_field))
+        .filter(|f| matches!(f.field_type, FieldType::Vector { .. }))
+        .ok_or_else(|| format!("SEARCH_SYNTAX Expected a VECTOR field `{}`", q.vsim_field))?;
+    let FieldType::Vector {
+        dim,
+        data_type,
+        metric,
+        algo,
+        ..
+    } = &field.field_type
+    else {
+        unreachable!("checked above");
     };
-
-    let text_ranked = match text_search(ctx, &def_clone, &q.search_query, &q.params) {
-        Ok(r) => r,
-        Err(e) => return Some(resp_error(&e)),
+    // EF_RUNTIME and EPSILON are HNSW's.
+    let hnsw_only = match &q.method {
+        VectorMethod::Knn { ef_runtime, .. } => ef_runtime.is_some(),
+        VectorMethod::Range { epsilon, .. } => epsilon.is_some(),
     };
+    if hnsw_only && matches!(algo, VectorAlgo::Flat) {
+        return Err(
+            "SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)"
+                .into(),
+        );
+    }
+    let raw = &q.params[&q.vsim_param];
+    let query_vec = data_type.decode(raw, *dim).ok_or_else(|| {
+        format!(
+            "SEARCH_QUERY_BAD Error parsing vector similarity query: query vector blob size ({}) does not match index's expected size ({}).",
+            raw.len(),
+            dim * data_type.size()
+        )
+    })?;
+    let deadline = crate::commands::search::search_deadline(q.timeout_ms);
 
-    let vsim_ranked = match vsim_search(
-        &ctx.store[*ctx.selected_db],
-        &def_clone,
-        &q.vsim_field,
+    // ── The two lists, each cut to the window ───────────────────────────────
+    let (mut text, text_cut) =
+        text_ranked(ctx, &def, &q.search_query, &q.params, scorer, deadline)?;
+    let (mut vsim, vsim_cut) = vsim_ranked(
+        ctx,
+        &def,
+        field,
         &query_vec,
-        q.knn_k,
-        q.knn_ef_runtime,
-    ) {
-        Ok(r) => r,
-        Err(e) => return Some(resp_error(&e)),
+        &q.method,
+        q.vsim_filter.as_deref(),
+        &q.params,
+        deadline,
+    )?;
+    // Nearest first; at the same distance, by key.
+    rank(&mut vsim, false);
+    let mut timed_out = text_cut || vsim_cut;
+    let window = match q.fusion {
+        Fusion::Rrf { window, .. } | Fusion::Linear { window, .. } => window,
     };
-
-    let fused = match q.fusion {
-        Fusion::Rrf { window, constant } => rrf_fuse(&text_ranked, &vsim_ranked, constant, window),
-        Fusion::Linear {
-            alpha,
-            beta,
-            window,
-        } => linear_fuse(&text_ranked, &vsim_ranked, alpha, beta, window),
-    };
-
-    // ── Apply user-specified sort or fall through to fusion order ─────────
-    //
-    // Default behaviour: results come out of rrf_fuse / linear_fuse already
-    // sorted by hybrid score descending. SORTBY overrides with a named
-    // field. NOSORT keeps fusion order (effectively a no-op since fusion
-    // already produced sorted output, but documented here for clarity).
-    let mut all_with_components: Vec<(String, f64, f64, f64)> = {
-        // Build per-row score tuples (hybrid, text, vsim) so SORTBY can
-        // pick any of them by name. Done before pagination because SORTBY
-        // sorts the full set, then LIMIT pages.
-        let text_lookup: AHashMap<&str, f64> =
-            text_ranked.iter().map(|(k, s)| (k.as_str(), *s)).collect();
-        let vsim_lookup: AHashMap<&str, f64> =
-            vsim_ranked.iter().map(|(k, s)| (k.as_str(), *s)).collect();
-
-        fused
-            .into_iter()
-            .map(|(key, hybrid)| {
-                let t = text_lookup.get(key.as_str()).copied().unwrap_or(0.0);
-                let v = vsim_lookup.get(key.as_str()).copied().unwrap_or(0.0);
-                (key, hybrid, t, v)
-            })
-            .collect()
-    };
-
-    type ScoreGetterType = Option<fn(&(String, f64, f64, f64)) -> f64>;
-
-    match &q.sort {
-        None => {
-            // Default: already sorted by hybrid descending — nothing to do.
-        }
-        Some(SortSpec::None) => {
-            // NOSORT: leave fusion order untouched.
-        }
-        Some(SortSpec::By { field, descending }) => {
-            // Built-in score fields first — these are already in the tuple.
-            let score_getter: ScoreGetterType = if field == q.hybrid_alias() {
-                Some(|t| t.1)
-            } else if field == q.text_alias() {
-                Some(|t| t.2)
-            } else if field == q.vsim_alias() {
-                Some(|t| t.3)
-            } else {
-                None
-            };
-
-            if let Some(get) = score_getter {
-                if *descending {
-                    all_with_components.sort_by(|a, b| get(b).total_cmp(&get(a)));
-                } else {
-                    all_with_components.sort_by(|a, b| get(a).total_cmp(&get(b)));
-                }
-            } else {
-                // Hash field — need to read the value per row before sort.
-                // We parse as f64; non-numeric or absent fields sort as
-                // -inf (they sink to the bottom on DESC, top on ASC, which
-                // matches Redis's default of "missing < any number").
-                let db_ref = &ctx.store[*ctx.selected_db];
-                let mut keyed: Vec<(f64, (String, f64, f64, f64))> =
-                    Vec::with_capacity(all_with_components.len());
-                for row in all_with_components.into_iter() {
-                    let v = read_numeric_field(db_ref, &def_clone, &row.0, field);
-                    keyed.push((v, row));
-                }
-                if *descending {
-                    keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
-                } else {
-                    keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
-                }
-                all_with_components = keyed.into_iter().map(|(_, r)| r).collect();
-            }
-        }
+    text.truncate(window);
+    vsim.truncate(window);
+    for hit in &mut vsim {
+        hit.1 = similarity(metric, hit.1);
     }
 
-    let page: Vec<(String, f64, f64, f64)> = all_with_components
-        .into_iter()
-        .skip(q.limit_offset)
-        .take(q.limit_count)
-        .collect();
-
-    // ── Load hash fields if requested ─────────────────────────────────────
-    //
-    // For each paged result, fetch its hash and pull the requested fields.
-    // We do this once per result, taking the shard read lock briefly each
-    // time. The alternative — pre-fetching all results before sort — would
-    // duplicate work when LIMIT is small relative to the total.
-    // ── Build per-row materialised data ───────────────────────────────────
-    //
-    // Convert the paged result into a Vec<Row> so we can either:
-    //   (a) hand off to the aggregation pipeline if there's a tail
-    //   (b) emit the score-and-load response directly
-    //
-    // Each row carries the score fields (always) and the LOAD'd hash
-    // fields (if LOAD specified). __key holds the doc key for the pipeline
-    // to use; we strip it before emitting.
-
-    let db_ref = &ctx.store[*ctx.selected_db];
-
-    let mut rows: Vec<crate::commands::aggregate_pipeline::Row> = Vec::with_capacity(page.len());
-
-    for (key, hybrid_s, text_s, vsim_s) in &page {
-        let mut row = ahash::AHashMap::new();
-        row.insert("__key".to_string(), key.clone());
-        row.insert(q.hybrid_alias().to_string(), format!("{hybrid_s:.6}"));
-        row.insert(q.text_alias().to_string(), format!("{text_s:.6}"));
-        row.insert(q.vsim_alias().to_string(), format!("{vsim_s:.6}"));
-
-        if let Some(spec) = &q.load {
-            let raw = crate::key_bytes::bytes_of(key);
-            let value = crate::store::get_shard(db_ref, &*raw)
-                .read()
-                .get(&*raw)
-                .map(ValueRef::to_value);
-            let inner = value.as_ref().and_then(|value| {
-                crate::vector::query_doc_fields(&def_clone.on, &def_clone.fields, value.view())
-            });
-            if let Some(inner) = inner {
-                // A field of a JSON document goes by the name the schema
-                // gives its path; a hash field by its own.
-                let json = matches!(def_clone.on, crate::vector::IndexOn::Json);
-                match spec {
-                    LoadSpec::All => {
-                        for (fname, fval) in inner.iter() {
-                            let shown =
-                                match def_clone.fields.iter().find(|f| json && &f.name == fname) {
-                                    Some(f) => f.attribute(),
-                                    None => fname.as_str(),
-                                };
-                            // Score aliases take precedence over fields of
-                            // the same name — don't overwrite.
-                            if row.contains_key(shown) {
-                                continue;
-                            }
-                            // Text only: a vector's bytes are not a value.
-                            if let Ok(s) = std::str::from_utf8(fval) {
-                                row.insert(shown.to_string(), s.to_string());
-                            }
-                        }
-                    }
-                    LoadSpec::Fields(names) => {
-                        for name in names {
-                            if row.contains_key(name) {
-                                continue;
-                            }
-                            let stored = def_clone
-                                .field_by_attribute(name)
-                                .map_or(name.as_str(), |f| f.name.as_str());
-                            if let Some(val) = inner.get(stored) {
-                                let s = std::str::from_utf8(val).unwrap_or("").to_string();
-                                row.insert(name.clone(), s);
-                            }
-                        }
-                    }
-                }
-            }
+    let mut fused = match q.fusion {
+        Fusion::Rrf { constant, .. } => rrf_fuse(&text, &vsim, constant),
+        Fusion::Linear { alpha, beta, .. } => linear_fuse(&text, &vsim, alpha, beta),
+    };
+    if q.nosort {
+        // As the lists gave them: the text query's, then the vector query's.
+        let mut order: AHashMap<&str, usize> = AHashMap::new();
+        for (at, (key, _)) in text.iter().chain(vsim.iter()).enumerate() {
+            order.entry(key.as_str()).or_insert(at);
         }
+        fused.sort_by_key(|(key, _)| order[key.as_str()]);
+    } else {
+        rank(&mut fused, true);
+    }
 
+    // ── Rows ────────────────────────────────────────────────────────────────
+    let text_of: AHashMap<&str, f64> = text.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+    let vsim_of: AHashMap<&str, f64> = vsim.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+    let json = matches!(def.on, crate::vector::IndexOn::Json);
+    let load_all = q.tail.windows(2).any(|w| is(&w[0], "LOAD") && w[1] == b"*");
+    let db = &ctx.store[*ctx.selected_db];
+    let mut rows: Vec<Row> = Vec::with_capacity(fused.len());
+    for (key, score) in fused {
+        let mut row: Row = AHashMap::new();
+        // The document's fields, for the steps after fusion and for what
+        // they show: only when there are any.
+        if !q.tail.is_empty() {
+            crate::commands::search::with_doc(db, &def, &key, |fields, doc| {
+                for (name, value) in fields.iter() {
+                    // Text only: a vector's bytes are not a value a row can
+                    // show or a step can compute with.
+                    let Ok(value) = std::str::from_utf8(value) else {
+                        continue;
+                    };
+                    let shown = match def.fields.iter().find(|f| json && &f.name == name) {
+                        Some(f) => f.attribute().to_string(),
+                        None => name.clone(),
+                    };
+                    row.insert(shown, value.to_string());
+                }
+                if load_all && let Some(doc) = doc {
+                    row.insert("$".to_string(), doc.to_string());
+                }
+            });
+        }
+        if let (Some(name), Some(s)) = (&q.text_yield, text_of.get(key.as_str())) {
+            row.insert(name.clone(), score_text(*s));
+        }
+        if let (Some(name), Some(s)) = (&q.vsim_yield, vsim_of.get(key.as_str())) {
+            row.insert(name.clone(), score_text(*s));
+        }
+        if let Some(name) = &q.hybrid_yield {
+            row.insert(name.clone(), score_text(score));
+        }
+        row.insert("__score".to_string(), score_text(score));
+        row.insert("__key".to_string(), key);
         rows.push(row);
     }
 
-    // ── Run the aggregation pipeline if there's a tail ────────────────────
-    //
-    // GROUPBY/APPLY/FILTER (and any SORTBY/LIMIT they may carry) live in
-    // aggregate_pipeline::run. Without a tail, rows are already paged and
-    // ready to emit.
-    if let Some(start) = q.pipeline_start {
-        rows = crate::commands::aggregate_pipeline::run(rows, &ctx.cmd, start);
+    // ── The steps after fusion, then the page ───────────────────────────────
+    if !q.tail.is_empty() {
+        let tail: Vec<&[u8]> = q.tail.iter().map(Vec::as_slice).collect();
+        let (after, cut) =
+            crate::commands::aggregate_pipeline::run_within(rows, &tail, 0, deadline);
+        rows = after;
+        timed_out |= cut;
     }
+    if timed_out && crate::commands::search::on_timeout_fails() {
+        return Err("Timeout limit was reached".into());
+    }
+    let total = rows.len();
+    let shown = shown_fields(&q);
+    let grouped = q.tail.iter().any(|a| is(a, "GROUPBY"));
+    let results: Vec<Vec<u8>> = rows
+        .into_iter()
+        .skip(q.limit_offset)
+        .take(q.limit_count)
+        .map(|row| row_reply(&row, &shown, grouped, load_all, ctx.resp))
+        .collect();
 
-    // ── Emit RESP response ─────────────────────────────────────────────────
-    //
-    // Format: [count, key1, [fields1], key2, [fields2], ...]
-    // After GROUPBY there's no per-doc key (rows are aggregated groups),
-    // so we emit them without a key element — same as FT.AGGREGATE does.
+    let resp = ctx.resp;
+    let warnings = if timed_out {
+        vec![resp_bulk_str("Timeout limit was reached")]
+    } else {
+        Vec::new()
+    };
+    let millis = started.elapsed().as_secs_f64() * 1000.0;
+    let execution_time = if resp == 3 {
+        resp_double_resp3(millis)
+    } else {
+        resp_bulk_str(&format!("{millis:.6}"))
+    };
+    Ok(resp_map_for(
+        resp,
+        vec![
+            resp_bulk_str("total_results"),
+            resp_integer(total as i64),
+            resp_bulk_str("results"),
+            resp_array(results),
+            resp_bulk_str("warnings"),
+            resp_array(warnings),
+            resp_bulk_str("execution_time"),
+            execution_time,
+        ],
+    ))
+}
 
-    let had_groupby = q.pipeline_start.is_some()
-        && rows
-            .first()
-            .map(|r| !r.contains_key("__key"))
-            .unwrap_or(false);
-
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    out.push(resp_integer(rows.len() as i64));
-
-    for row in rows {
-        if had_groupby {
-            // Aggregated group rows: emit as a single flat array of
-            // alternating field/value, no leading key.
-            let mut row_out: Vec<Vec<u8>> = Vec::new();
-            for (k, v) in row {
-                if k.starts_with("__") {
-                    continue;
-                }
-                row_out.push(resp_bulk_str(&k));
-                row_out.push(crate::commands::aggregate_pipeline::value_reply(
-                    &v, ctx.resp,
-                ));
-            }
-            out.push(resp_array(row_out));
-        } else {
-            // Per-doc rows: emit key followed by a fields array.
-            let key = row.get("__key").cloned().unwrap_or_default();
-            out.push(resp_bulk(&crate::key_bytes::bytes_of(&key)));
-
-            let mut row_out: Vec<Vec<u8>> = Vec::new();
-            for (k, v) in row {
-                if k == "__key" || k.starts_with("__") {
-                    continue;
-                }
-                row_out.push(resp_bulk_str(&k));
-                row_out.push(resp_bulk_str(&v));
-            }
-            out.push(resp_array(row_out));
+/// What a row shows, in order, as (field, name shown): the text score's
+/// name; the fields `LOAD`ed, or else `__key` and `__score`; the vector
+/// score's and the fused score's names; and what `SORTBY` and `APPLY` name.
+fn shown_fields(q: &HybridQuery) -> Vec<(String, String)> {
+    let mut shown: Vec<(String, String)> = Vec::new();
+    let mut push = |field: String, name: String| {
+        if !shown.iter().any(|(_, n)| *n == name) {
+            shown.push((field, name));
+        }
+    };
+    if let Some(name) = &q.text_yield {
+        push(name.clone(), name.clone());
+    }
+    let tail: Vec<&[u8]> = q.tail.iter().map(Vec::as_slice).collect();
+    let loads = tail.iter().any(|a| is(a, "LOAD"));
+    if !loads {
+        push("__key".into(), "__key".into());
+        if q.hybrid_yield.is_none() {
+            push("__score".into(), "__score".into());
         }
     }
+    let name_of = |a: &[u8]| -> String { word(a).trim_start_matches('@').to_string() };
+    let mut i = 0;
+    let mut after: Vec<(String, String)> = Vec::new();
+    while i < tail.len() {
+        let end = step_end(&tail, i).unwrap_or(tail.len());
+        if is(tail[i], "LOAD") && tail.get(i + 1).is_some_and(|a| *a != b"*") {
+            let mut at = i + 2;
+            while at < end {
+                let field = name_of(tail[at]);
+                if at + 2 < end && is(tail[at + 1], "AS") {
+                    push(field, name_of(tail[at + 2]));
+                    at += 3;
+                } else {
+                    push(field.clone(), field);
+                    at += 1;
+                }
+            }
+        } else if is(tail[i], "SORTBY") {
+            for a in &tail[(i + 2).min(end)..end] {
+                if a.starts_with(b"@") {
+                    let field = name_of(a);
+                    after.push((field.clone(), field));
+                }
+            }
+        } else if is(tail[i], "APPLY") {
+            let name = if tail.get(i + 2).is_some_and(|a| is(a, "AS")) && i + 3 < tail.len() {
+                word(tail[i + 3])
+            } else {
+                word(tail[i + 1])
+            };
+            after.push((name.clone(), name));
+        }
+        i = end.max(i + 1);
+    }
+    if let Some(name) = &q.vsim_yield {
+        push(name.clone(), name.clone());
+    }
+    if let Some(name) = &q.hybrid_yield {
+        push(name.clone(), name.clone());
+    }
+    for (field, name) in after {
+        push(field, name);
+    }
+    shown
+}
 
-    Some(resp_array(out))
+fn row_reply(
+    row: &Row,
+    shown: &[(String, String)],
+    grouped: bool,
+    load_all: bool,
+    resp: u8,
+) -> Vec<u8> {
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    if grouped {
+        // A group is not a document: every value it holds.
+        let mut fields: Vec<(&String, &String)> =
+            row.iter().filter(|(k, _)| !k.starts_with("__")).collect();
+        fields.sort();
+        pairs.extend(fields.into_iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    } else {
+        for (field, name) in shown {
+            if let Some(value) = row.get(field) {
+                pairs.push((name.as_str(), value.as_str()));
+            }
+        }
+        if load_all {
+            // `LOAD *`: every field of the document, after what is named.
+            let mut fields: Vec<(&String, &String)> = row
+                .iter()
+                .filter(|(k, _)| !k.starts_with("__") && !shown.iter().any(|(f, _)| f == *k))
+                .collect();
+            fields.sort();
+            pairs.extend(fields.into_iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        }
+    }
+    let encoded: Vec<Vec<u8>> = pairs
+        .into_iter()
+        .flat_map(|(name, value)| {
+            let value = if name == "__key" {
+                resp_bulk(&crate::key_bytes::bytes_of(value))
+            } else {
+                crate::commands::aggregate_pipeline::value_reply(value, resp)
+            };
+            [resp_bulk_str(name), value]
+        })
+        .collect();
+    resp_map_for(resp, encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(words: &[&str]) -> Vec<Vec<u8>> {
+        words.iter().map(|w| w.as_bytes().to_vec()).collect()
+    }
+
+    fn parsed(words: &[&str]) -> Result<HybridQuery, String> {
+        let owned = args(words);
+        let cmd: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+        parse(&cmd)
+    }
+
+    const TAIL: [&str; 4] = ["PARAMS", "2", "q", "xxxx"];
+
+    fn with_tail(words: &[&'static str]) -> Vec<&'static str> {
+        words.iter().copied().chain(TAIL).collect()
+    }
+
+    #[test]
+    fn scorer_and_yield_in_the_search_clause() {
+        let q = parsed(&with_tail(&[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@t:rust",
+            "SCORER",
+            "BM25STD",
+            "YIELD_SCORE_AS",
+            "ts",
+            "VSIM",
+            "@v",
+            "$q",
+        ]))
+        .unwrap();
+        assert_eq!(q.scorer.as_deref(), Some("BM25STD"));
+        assert_eq!(q.text_yield.as_deref(), Some("ts"));
+        // Either order, the last of each.
+        let q = parsed(&with_tail(&[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@t:rust",
+            "YIELD_SCORE_AS",
+            "a",
+            "SCORER",
+            "TFIDF",
+            "SCORER",
+            "BM25",
+            "VSIM",
+            "@v",
+            "$q",
+        ]))
+        .unwrap();
+        assert_eq!(q.scorer.as_deref(), Some("BM25"));
+        assert_eq!(q.text_yield.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn scorer_names_are_redis_s() {
+        assert_eq!(scorer_named("TFIDF").unwrap(), Scorer::Tfidf);
+        assert_eq!(scorer_named("TFIDF.DOCNORM").unwrap(), Scorer::TfidfDocNorm);
+        assert_eq!(
+            scorer_named("NOPE").unwrap_err(),
+            "SEARCH_QUERY_BAD No such scorer NOPE"
+        );
+        assert_eq!(
+            scorer_named("tfidf").unwrap_err(),
+            "SEARCH_QUERY_BAD No such scorer tfidf"
+        );
+    }
+
+    #[test]
+    fn vsim_filter_and_pipeline_filter() {
+        let q = parsed(&with_tail(&[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "x",
+            "VSIM",
+            "@v",
+            "$q",
+            "KNN",
+            "2",
+            "K",
+            "3",
+            "FILTER",
+            "@tag:{a}",
+            "YIELD_SCORE_AS",
+            "vs",
+            "FILTER",
+            "@n>2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            q.method,
+            VectorMethod::Knn {
+                k: 3,
+                ef_runtime: None
+            }
+        );
+        assert_eq!(q.vsim_filter.as_deref(), Some("@tag:{a}"));
+        assert_eq!(q.vsim_yield.as_deref(), Some("vs"));
+        assert_eq!(q.tail, args(&["FILTER", "@n>2"]));
+    }
+
+    #[test]
+    fn combine_clauses() {
+        let q = parsed(&with_tail(&[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "x",
+            "VSIM",
+            "@v",
+            "$q",
+            "COMBINE",
+            "LINEAR",
+            "4",
+            "ALPHA",
+            "0.05",
+            "BETA",
+            "0.95",
+            "YIELD_SCORE_AS",
+            "hs",
+        ]))
+        .unwrap();
+        assert_eq!(
+            q.fusion,
+            Fusion::Linear {
+                alpha: 0.05,
+                beta: 0.95,
+                window: 20
+            }
+        );
+        assert_eq!(q.hybrid_yield.as_deref(), Some("hs"));
+        let q = parsed(&with_tail(&[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "x",
+            "VSIM",
+            "@v",
+            "$q",
+            "COMBINE",
+            "LINEAR",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(
+            q.fusion,
+            Fusion::Linear {
+                alpha: 0.3,
+                beta: 0.7,
+                window: 20
+            }
+        );
+        let q = parsed(&with_tail(&[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "x",
+            "VSIM",
+            "@v",
+            "$q",
+            "COMBINE",
+            "RRF",
+            "4",
+            "WINDOW",
+            "5",
+            "CONSTANT",
+            "10",
+        ]))
+        .unwrap();
+        assert_eq!(
+            q.fusion,
+            Fusion::Rrf {
+                window: 5,
+                constant: 10.0
+            }
+        );
+    }
+
+    #[test]
+    fn errors_are_redis_s() {
+        let err = |words: &[&'static str]| parsed(&with_tail(words)).unwrap_err();
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VERBATIM",
+                "VSIM",
+                "@v",
+                "$q"
+            ]),
+            "SEARCH_ARG_UNRECOGNIZED Unknown argument `VERBATIM` in SEARCH"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "BOGUS"
+            ]),
+            "SEARCH_PARSE_ARGS BOGUS: Unknown argument"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "KNN",
+                "0"
+            ]),
+            "SEARCH_SYNTAX Invalid argument count: 0 (must be a positive even number for key/value pairs)"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "KNN",
+                "2",
+                "K",
+                "0"
+            ]),
+            "SEARCH_SYNTAX Invalid K value"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "KNN",
+                "4",
+                "K",
+                "3",
+                "YIELD_SCORE_AS",
+                "vs"
+            ]),
+            "SEARCH_ARG_UNRECOGNIZED Unknown argument `YIELD_SCORE_AS` in KNN"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                "FOO",
+                "0"
+            ]),
+            "SEARCH_PARSE_ARGS COMBINE: Invalid value for argument"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                "LINEAR",
+                "2",
+                "ALPHA",
+                "1"
+            ]),
+            "SEARCH_SYNTAX Missing value for BETA"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                "RRF",
+                "2",
+                "WINDOW",
+                "0"
+            ]),
+            "SEARCH_PARSE_ARGS WINDOW: Value below minimum"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "SORTBY",
+                "1",
+                "@n",
+                "DESC"
+            ]),
+            "SEARCH_PARSE_ARGS DESC: Unknown argument"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "LOAD",
+                "1",
+                "title"
+            ]),
+            "SEARCH_PARSE_ARGS Missing prefix: name requires '@' prefix, JSON path require '$' prefix, got: title in LOAD"
+        );
+        assert_eq!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "TIMEOUT",
+                "abc"
+            ]),
+            "SEARCH_PARSE_ARGS TIMEOUT: Could not convert argument to expected type"
+        );
+        assert!(
+            err(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "DIALECT",
+                "2"
+            ])
+            .starts_with("SEARCH_PARSE_ARGS DIALECT is not supported in FT.HYBRID")
+        );
+        assert_eq!(
+            parsed(&[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$nope",
+                "PARAMS",
+                "2",
+                "q",
+                "x"
+            ])
+            .unwrap_err(),
+            "SEARCH_PARAM_NOT_FOUND Parameter not found `nope`"
+        );
+    }
+
+    #[test]
+    fn counts_past_the_end_are_refused() {
+        let big = "18446744073709551615";
+        for words in [
+            vec!["LOAD", big, "@a"],
+            vec!["PARAMS", "18446744073709551614", "q", "x"],
+            vec!["SORTBY", big, "@a"],
+            vec!["GROUPBY", big, "@a"],
+            vec![
+                "GROUPBY",
+                "1",
+                "@a",
+                "REDUCE",
+                "COUNT",
+                "18446744073709551613",
+                "AS",
+                "c",
+            ],
+            vec!["COMBINE", "RRF", "18446744073709551614"],
+        ] {
+            let mut all = vec!["FT.HYBRID", "idx", "SEARCH", "x", "VSIM", "@v", "$q"];
+            all.extend(words.iter().copied());
+            all.extend(TAIL);
+            assert!(parsed(&all).is_err(), "{words:?}");
+        }
+        let knn = [
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "x",
+            "VSIM",
+            "@v",
+            "$q",
+            "KNN",
+            "18446744073709551614",
+        ];
+        assert!(parsed(&with_tail(&knn)).is_err());
+    }
+
+    #[test]
+    fn scores_are_written_as_redis_writes_them() {
+        assert_eq!(score_text(0.032266458496023), "0.032266458496");
+        assert_eq!(score_text(2.0682214534039685), "2.0682214534");
+        assert_eq!(score_text(1.0), "1");
+        assert_eq!(score_text(0.0), "0");
+        assert_eq!(score_text(2.0 / 3.0), "0.666666666667");
+        assert_eq!(score_text(0.1), "0.1");
+        assert_eq!(score_text(1.5e-7), "1.5e-07");
+    }
+
+    #[test]
+    fn similarity_is_redis_s() {
+        assert_eq!(similarity(&DistanceMetric::L2, 0.0), 1.0);
+        assert!((similarity(&DistanceMetric::L2, 0.5) - 2.0 / 3.0).abs() < 1e-12);
+        assert_eq!(similarity(&DistanceMetric::Cosine, 1.0), 0.5);
+        assert_eq!(similarity(&DistanceMetric::InnerProduct, 0.0), 0.5);
+    }
 }

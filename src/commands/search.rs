@@ -1165,20 +1165,9 @@ pub(crate) fn relevance(
     scoring.score(def, key, fields, json)
 }
 
-/// Every document of the index that the filter accepts. In no particular
-/// order. Stops when `deadline` has passed, and then `timed_out` is true.
-pub(crate) fn filter_search(
-    ctx: &Ctx,
-    def: &IndexDef,
-    filter: &Filter,
-    only: Option<&AHashSet<String>>,
-    deadline: Option<Instant>,
-) -> FilterHits {
-    let scorer = crate::vector::score::Scorer::default_scorer();
-    filter_search_scored(ctx, def, filter, only, deadline, scorer)
-}
-
-/// [`filter_search`], scored by `scorer` (`SCORER`).
+/// Every document of the index that the filter accepts, scored by `scorer`
+/// (`SCORER`). In no particular order. Stops when `deadline` has passed, and
+/// then `timed_out` is true.
 pub(crate) fn filter_search_scored(
     ctx: &Ctx,
     def: &IndexDef,
@@ -1204,7 +1193,7 @@ pub(crate) fn filter_search_scored(
 }
 
 /// Every document of the index that the filter accepts, into `accept`, with
-/// its key and fields: [`filter_search`] without the copies, for a caller
+/// its key and fields: [`filter_search_scored`] without the copies, for a caller
 /// that keeps only some of them. True if it stopped because `deadline` had
 /// passed. `accept` may run under a shard's read lock.
 pub(crate) fn filter_each(

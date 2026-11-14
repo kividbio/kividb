@@ -1,12 +1,13 @@
 # RedisVL
 
-RedisVL's `SearchIndex`, `SemanticCache`, and `SemanticRouter` work on KiviDB. Point `redis_url` at
-KiviDB (port `6380` by default). `HybridQuery` does not: it sends `FT.HYBRID` with `SCORER`, and KiviDB
-rejects that token. The default image is enough. This path runs no Lua.
+RedisVL's `SearchIndex`, `HybridQuery`, `SemanticCache`, and `SemanticRouter` work on KiviDB. Point
+`redis_url` at KiviDB (port `6380` by default). `HybridQuery` needs a build with the fix for #767 (the
+next release after 1.2.2): 1.2.2 and earlier refuse the `SCORER` it sends. The default image is enough.
+This path runs no Lua.
 
-**Checked:** 59 of 67 checks pass on KiviDB 1.2.2, and 67 of 67 pass on Redis 8.10.3, with `redisvl`
-`0.32.0` and `redis-py` `8.1.0`. The eight failures are the `HybridQuery` checks. See the
-[report](../../benchmarks/redisvl-compat/REPORT.md) for each check and the versions.
+**Checked:** 67 of 67 checks pass on KiviDB built from `master` with #767, and on Redis 8.10.3, with
+`redisvl` `0.32.0` and `redis-py` `8.1.0`. KiviDB 1.2.2 passed 59: the eight `HybridQuery` checks
+failed. See the [report](../../benchmarks/redisvl-compat/REPORT.md) for each check and the versions.
 
 ## Example
 
@@ -101,28 +102,9 @@ That prints `port 6380`.
 
 ## What differs from Redis
 
-`HybridQuery` fails on KiviDB before it searches. RedisVL's default `text_scorer` is `BM25STD`, so the
-command includes `SCORER BM25STD`. KiviDB 1.2.2 answers `unknown FT.HYBRID token 'SCORER'`. Redis 8.10.3
-runs the same command and returns the document. The minimal repro, already run against both:
-
-```python
-from redisvl.query import HybridQuery
-
-index.query(HybridQuery(
-    text="rust compiler",
-    text_field_name="content",
-    vector=embed("interest rates rose again this quarter"),
-    vector_field_name="embedding",
-    return_fields=["content"],
-    num_results=1,
-    combination_method="RRF",
-    stopwords=None,
-))
-```
-
-The index above has to exist first, with a `content` text field and an `embedding` vector, and one
-document loaded. The full script is in the [report](../../benchmarks/redisvl-compat/REPORT.md#the-gap).
-The command on the wire is:
+`HybridQuery` fails on KiviDB 1.2.2 before it searches. RedisVL's default `text_scorer` is `BM25STD`, so
+the command includes `SCORER BM25STD`, and 1.2.2 answers `unknown FT.HYBRID token 'SCORER'`. Its reply
+was not Redis's either. The command on the wire is:
 
 ```
 FT.HYBRID reprohybrid SEARCH (~@content:(rust | compiler)) SCORER BM25STD
@@ -130,13 +112,10 @@ FT.HYBRID reprohybrid SEARCH (~@content:(rust | compiler)) SCORER BM25STD
   LOAD 1 @content LIMIT 0 1 PARAMS 2 vector <float32 blob>
 ```
 
-On current `master`, `src/commands/hybrid.rs` reads `YIELD_SCORE_AS` after `SEARCH` and then leaves
-`SCORER` for the unknown-token error. A comment there says the scorer is ignored for now; the token is
-not consumed. This shows up for LINEAR and RRF, with and without a tag filter, on a hash index and on a
-JSON index: eight checks, one error. Creating the index and loading it still succeed.
-
-`AggregateHybridQuery` is a different call (`FT.AGGREGATE`). Those checks pass. The harness still runs
-`HybridQuery` and records the failure.
+The fix for #767 takes `SCORER` and the vector side's `FILTER`, and replies as Redis 8.10 does. On a
+build with it, LINEAR and RRF, with and without a tag filter, on a hash index and on a JSON index, give
+the documents Redis gives. `AggregateHybridQuery` is a different call (`FT.AGGREGATE`) and passed on
+1.2.2 too.
 
 Nothing else in this pass needs a setting Redis does not. The port is `6380`. The `-lua` image is not
 required.
