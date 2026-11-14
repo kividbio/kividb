@@ -5494,6 +5494,9 @@ fn slots_given_away_and_back() -> (Vec<Node>, Node, Vec<String>) {
         },
     );
     set_all(&mut nodes[1].conn(), &keys, "v2");
+    // Past the source's failover grace after a handover away, so that a
+    // failover right after the import back meets the import's own.
+    std::thread::sleep(Duration::from_secs(4));
 
     let back = nodes[0]
         .conn()
@@ -5542,9 +5545,13 @@ fn a_slot_given_away_and_back_keeps_its_keys_through_a_manual_failover() {
         }
         false
     });
+    // Held back by the import's own grace: the handover away's was over.
     let refused = nodes[0].log();
+    let held_back = refused.lines().any(|l| {
+        l.contains("Manual failover requested by") && l.contains("took its slots over")
+    });
     assert!(
-        refused.contains("took its slots over") || first.err().is_some(),
+        held_back || first.err().is_some(),
         "the first failover was not held back: {first:?}\n{refused}"
     );
     // Long past the time a promoted replica waits before it drops a slot
