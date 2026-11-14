@@ -740,28 +740,32 @@ pub(super) fn claim_effect(
     delivered_at_ms: u64,
     delivery_count: u64,
 ) -> Vec<Vec<u8>> {
-    let (id, at, count) = (
-        id.to_string(),
-        delivered_at_ms.to_string(),
-        delivery_count.to_string(),
-    );
-    [
-        &b"XCLAIM"[..],
-        key,
-        group,
-        consumer,
-        b"0",
-        id.as_bytes(),
-        b"TIME",
-        at.as_bytes(),
-        b"RETRYCOUNT",
-        count.as_bytes(),
-        b"FORCE",
-        b"JUSTID",
+    // Written straight into the arguments, without `format!`: this runs
+    // once for every entry XREADGROUP delivers.
+    use crate::resp::write::push_decimal;
+    let decimal = |n: u64| {
+        let mut out = Vec::with_capacity(20);
+        push_decimal(&mut out, n);
+        out
+    };
+    let mut id_arg = Vec::with_capacity(41);
+    push_decimal(&mut id_arg, id.ms);
+    id_arg.push(b'-');
+    push_decimal(&mut id_arg, id.seq);
+    vec![
+        b"XCLAIM".to_vec(),
+        key.to_vec(),
+        group.to_vec(),
+        consumer.to_vec(),
+        b"0".to_vec(),
+        id_arg,
+        b"TIME".to_vec(),
+        decimal(delivered_at_ms),
+        b"RETRYCOUNT".to_vec(),
+        decimal(delivery_count),
+        b"FORCE".to_vec(),
+        b"JUSTID".to_vec(),
     ]
-    .iter()
-    .map(|s| s.to_vec())
-    .collect()
 }
 
 // ── How far a group has read ──────────────────────────────────────────────────
@@ -902,7 +906,7 @@ pub(super) fn setid_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PelEntry;
+    use crate::types::Pel;
     const NO_FIELDS: &[(&[u8], &[u8])] = &[];
 
     const DEFAULTS: (u64, u64) = (100, 100);
@@ -1026,19 +1030,13 @@ mod tests {
             name: "g".into(),
             last_id: id(last),
             entries_read: last,
-            pel: pending
-                .iter()
-                .map(|ms| {
-                    (
-                        id(*ms),
-                        PelEntry {
-                            consumer: "c".into(),
-                            delivered_at: 1,
-                            delivery_count: 1,
-                        },
-                    )
-                })
-                .collect(),
+            pel: {
+                let mut pel = Pel::new();
+                for ms in pending {
+                    pel.insert(id(*ms), b"c", 1, 1);
+                }
+                pel
+            },
             consumers: Default::default(),
             active: Default::default(),
         }
@@ -1056,6 +1054,33 @@ mod tests {
         assert_eq!(s.groups[&b"g"[..]].pel.len(), 2);
         // Trimmed, not deleted: the mark `XDEL` leaves is where it was.
         assert_eq!(s.max_deleted_id, StreamId::min());
+    }
+
+    #[test]
+    fn claim_effect_spells_out_the_delivery() {
+        let args = claim_effect(
+            b"k",
+            b"g",
+            b"c",
+            &StreamId::new(1_700_000_000_000, 18_446_744_073_709_551_615),
+            0,
+            42,
+        );
+        let want: Vec<&[u8]> = vec![
+            b"XCLAIM",
+            b"k",
+            b"g",
+            b"c",
+            b"0",
+            b"1700000000000-18446744073709551615",
+            b"TIME",
+            b"0",
+            b"RETRYCOUNT",
+            b"42",
+            b"FORCE",
+            b"JUSTID",
+        ];
+        assert_eq!(args, want);
     }
 
     #[test]

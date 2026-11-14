@@ -3,7 +3,7 @@ use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::SharedBytes;
 use crate::types::{
-    ConsumerGroup, KiviDBValue, PelEntry, SortedSetInner, StreamId, StreamInner, TsInner,
+    ConsumerGroup, KiviDBValue, Pel, SortedSetInner, StreamId, StreamInner, TsInner,
 };
 use crate::types::{VSetEntry, VectorSetInner};
 use crate::vector::{DistanceMetric, FieldType, IndexOn, IndexSchema, SchemaField, VectorAlgo};
@@ -425,7 +425,7 @@ fn write_stream_groups(w: &mut impl Write, inner: &StreamInner) -> io::Result<()
         w.write_all(&(g.pel.len() as u32).to_le_bytes())?;
         for (id, pel) in g.pel.iter() {
             write_stream_id(w, id)?;
-            write_bytes(w, pel.consumer.as_bytes())?;
+            write_bytes(w, pel.consumer().as_bytes())?;
             w.write_all(&pel.delivered_at.to_le_bytes())?;
             w.write_all(&pel.delivery_count.to_le_bytes())?;
         }
@@ -543,20 +543,15 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
         let last_id = read_stream_id(r)?;
         let entries_read = read_u64_le(r)?;
         let pel_count = read_u32_le(r)? as usize;
-        let mut pel = std::collections::BTreeMap::new();
+        // Inserting each entry builds the per-consumer index, which is not
+        // saved.
+        let mut pel = Pel::new();
         for _ in 0..pel_count {
             let id = read_stream_id(r)?;
-            let consumer = crate::types::StreamName::from(read_bytes(r)?);
+            let consumer = read_bytes(r)?;
             let delivered_at = read_u64_le(r)?;
             let delivery_count = read_u64_le(r)?;
-            pel.insert(
-                id,
-                PelEntry {
-                    consumer,
-                    delivered_at,
-                    delivery_count,
-                },
-            );
+            pel.insert(id, &consumer, delivered_at, delivery_count);
         }
         let ccount = read_u32_le(r)? as usize;
         let mut consumers = AHashMap::with_capacity(hint(ccount));
@@ -3995,7 +3990,7 @@ impl<'a> LpCursor<'a> {
 /// Type 26 on ends with idempotent production: duration, size, and for each
 /// producer its idempotent IDs and the entries they made, then two counters.
 fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
-    use crate::types::{ConsumerGroup, IdmpRecord, PelEntry, ProducerIdmp, StreamInner};
+    use crate::types::{ConsumerGroup, IdmpRecord, ProducerIdmp, StreamInner};
     const DELETED: i64 = 1;
     const SAMEFIELDS: i64 = 2;
 
@@ -4092,15 +4087,11 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             let id = rdb_read_raw_stream_id(r)?;
             let delivered_at = rdb_read_millisecond_time(r)?.max(0) as u64;
             let delivery_count = rdb_read_plain_length(r)?;
-            // Owned by no one until a consumer below claims it.
-            let entry = PelEntry {
-                consumer: crate::types::StreamName::default(),
-                delivered_at,
-                delivery_count,
-            };
-            if group.pel.insert(id, entry).is_some() {
+            if group.pel.contains_key(&id) {
                 return Err(rdb_invalid("a pending entry is listed twice"));
             }
+            // Owned by no one until a consumer below claims it.
+            group.pel.insert(id, b"", delivered_at, delivery_count);
         }
         for _ in 0..rdb_read_plain_length(r)? {
             let consumer = crate::types::StreamName::from(rdb_read_string(r)?);
@@ -4117,8 +4108,10 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             }
             for _ in 0..rdb_read_plain_length(r)? {
                 let id = rdb_read_raw_stream_id(r)?;
-                match group.pel.get_mut(&id) {
-                    Some(entry) if entry.consumer.is_empty() => entry.consumer = consumer.clone(),
+                match group.pel.get(&id) {
+                    Some(entry) if entry.consumer().is_empty() => {
+                        group.pel.assign(&id, &consumer);
+                    }
                     _ => return Err(rdb_invalid("a consumer owns an entry the group does not")),
                 }
             }
@@ -4127,7 +4120,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             for _ in 0..rdb_read_plain_length(r)? {
                 let id = rdb_read_raw_stream_id(r)?;
                 match group.pel.get_mut(&id) {
-                    Some(entry) if entry.consumer.is_empty() => entry.delivered_at = 0,
+                    Some(entry) if entry.consumer().is_empty() => entry.delivered_at = 0,
                     _ => return Err(rdb_invalid("a released entry is owned or not pending")),
                 }
             }
