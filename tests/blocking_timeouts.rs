@@ -357,39 +357,165 @@ fn rpoplpush_and_lmove_on_an_empty_list_answer_with_a_null_bulk_string() {
     }
 }
 
+const NOT_A_FLOAT: &str = "-ERR timeout is not a float or out of range\r\n";
+const OUT_OF_RANGE: &str = "-ERR timeout is out of range\r\n";
+const NEGATIVE: &str = "-ERR timeout is negative\r\n";
+const NIL: &str = "*-1\r\n";
+
+/// Every timeout text below with what Redis 8.10.2 answers `BLPOP` (all
+/// the blocking commands read it alike). Redis reads a `long double`: a
+/// number too small for an `f64` is a 1 ms timeout, one below half the
+/// smallest subnormal (about 1.8226e-4951) or above the largest value
+/// (about 1.1897e4932) is not a float. The one deliberate difference:
+/// Redis 8.10.2 waits forever on a negative timeout that is under half a
+/// millisecond (`-1e-343`); KiviDB refuses every negative one.
+const TIMEOUTS: &[(&str, &str)] = &[
+    ("1e-343", NIL),
+    ("1e-400", NIL),
+    ("+1e-343", NIL),
+    (".5e-343", NIL),
+    ("5.e-343", NIL),
+    ("1e-4950", NIL),
+    ("1000e-4953", NIL),
+    ("1.83e-4951", NIL),
+    ("2e-4951", NIL),
+    ("3e-4951", NIL),
+    ("4e-4951", NIL),
+    ("1e-4951", NOT_A_FLOAT),
+    ("1.8e-4951", NOT_A_FLOAT),
+    ("1.82e-4951", NOT_A_FLOAT),
+    ("1e-4952", NOT_A_FLOAT),
+    ("1e-5000", NOT_A_FLOAT),
+    ("0.001e-4948", NOT_A_FLOAT),
+    ("0.0001e-4947", NOT_A_FLOAT),
+    ("-1e-5000", NOT_A_FLOAT),
+    ("1e-99999999999999999999", NOT_A_FLOAT),
+    ("1e99999999999999999999", NOT_A_FLOAT),
+    ("1.2e4932", NOT_A_FLOAT),
+    ("1e4933", NOT_A_FLOAT),
+    ("1e5000", NOT_A_FLOAT),
+    ("xe-5", NOT_A_FLOAT),
+    ("1.2.3e-400", NOT_A_FLOAT),
+    ("1e2e3", NOT_A_FLOAT),
+    ("1e", NOT_A_FLOAT),
+    ("1e-", NOT_A_FLOAT),
+    (".", NOT_A_FLOAT),
+    ("", NOT_A_FLOAT),
+    (" 1", NOT_A_FLOAT),
+    ("1 ", NOT_A_FLOAT),
+    ("1abc", NOT_A_FLOAT),
+    ("nan", NOT_A_FLOAT),
+    ("inf", OUT_OF_RANGE),
+    ("+inf", OUT_OF_RANGE),
+    ("2e308", OUT_OF_RANGE),
+    ("1e4000", OUT_OF_RANGE),
+    ("1e4932", OUT_OF_RANGE),
+    ("1.1e4932", OUT_OF_RANGE),
+    ("-1", NEGATIVE),
+    ("-inf", NEGATIVE),
+    ("-2e308", NEGATIVE),
+    ("-1e-343", NEGATIVE),
+    ("-1e-4950", NEGATIVE),
+];
+
+/// Each timeout text is answered as Redis answers it, and a tiny one is
+/// answered at once.
 #[test]
 fn blocking_timeout_extreme_floats() {
     for &io in io_models() {
         let server = Server::start(io);
         let mut c = server.conn(2);
+        for &(text, want) in TIMEOUTS {
+            let started = Instant::now();
+            assert_eq!(c.cmd(&["BLPOP", "n:list", text]), want, "{io} {text:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{io} {text:?} took {:?}",
+                started.elapsed()
+            );
+        }
+    }
+}
 
-        // Tiny but real number: rounds to 1ms, returns nil - not an error, not a hang.
-        assert_eq!(
-            c.cmd(&["BLPOP", "n:list", "1e-343"]),
-            "*-1\r\n",
-            "{io} 1e-343"
-        );
-        // Exponent absurdly small: not a float.
-        assert_eq!(
-            c.cmd(&["BLPOP", "n:list", "1e-5000"]),
-            "-ERR timeout is not a float or out of range\r\n",
-            "{io} 1e-5000"
-        );
-        // Infinity / overflow: out of range.
-        assert_eq!(
-            c.cmd(&["BLPOP", "n:list", "inf"]),
-            "-ERR timeout is out of range\r\n",
-            "{io} inf"
-        );
-        assert_eq!(
-            c.cmd(&["BLPOP", "n:list", "2e308"]),
-            "-ERR timeout is out of range\r\n",
-            "{io} 2e308"
-        );
-        assert_eq!(
-            c.cmd(&["BLPOP", "n:list", "1e4000"]),
-            "-ERR timeout is out of range\r\n",
-            "{io} 1e4000"
-        );
+/// Every blocking command that reads a timeout shares the reading:
+/// `1e-343` and `1e-4950` wait 1 ms, `1e-5000` and `-1e-343` are refused.
+/// (`XREAD ... BLOCK` takes whole milliseconds and is another reading.)
+#[test]
+fn every_blocking_command_reads_a_tiny_timeout_alike() {
+    let commands: &[&dyn Fn(&str) -> Vec<String>] = &[
+        &|t| ["BLPOP", "k:list", t].map(String::from).to_vec(),
+        &|t| ["BRPOP", "k:list", t].map(String::from).to_vec(),
+        &|t| ["BRPOPLPUSH", "k:list", "k:dst", t].map(String::from).to_vec(),
+        &|t| {
+            ["BLMOVE", "k:list", "k:dst", "LEFT", "RIGHT", t]
+                .map(String::from)
+                .to_vec()
+        },
+        &|t| ["BLMPOP", t, "1", "k:list", "LEFT"].map(String::from).to_vec(),
+        &|t| {
+            ["BLMOVEM", "k:list", "k:dst", "LEFT", "RIGHT", t, "COUNT", "2", "OBO"]
+                .map(String::from)
+                .to_vec()
+        },
+        &|t| ["BZPOPMIN", "k:zset", t].map(String::from).to_vec(),
+        &|t| ["BZPOPMAX", "k:zset", t].map(String::from).to_vec(),
+        &|t| ["BZMPOP", t, "1", "k:zset", "MIN"].map(String::from).to_vec(),
+    ];
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut c = server.conn(2);
+        for make in commands {
+            for (text, want) in [
+                ("1e-343", NIL),
+                ("1e-4950", NIL),
+                ("1e-5000", NOT_A_FLOAT),
+                ("-1e-343", NEGATIVE),
+                ("2e308", OUT_OF_RANGE),
+            ] {
+                let args = make(text);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let started = Instant::now();
+                assert_eq!(c.cmd(&args), want, "{io} {args:?}");
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "{io} {args:?} took {:?}",
+                    started.elapsed()
+                );
+            }
+        }
+    }
+}
+
+/// A zero timeout, in any spelling, still waits for ever: nothing answers
+/// until a second connection pushes an element.
+#[test]
+fn a_zero_timeout_still_blocks_until_an_element_arrives() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut pusher = server.conn(2);
+        for (n, text) in ["0", "0.0", "0e10", "-0", "-0.0"].iter().enumerate() {
+            let key = format!("z:list{n}");
+            let mut waiter = server.conn(2);
+            waiter
+                .reader
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            waiter.send(&["BLPOP", &key, text]);
+            let mut line = String::new();
+            let early = waiter.reader.read_line(&mut line);
+            assert!(
+                early.is_err(),
+                "{io} {text}: BLPOP answered {line:?} before any push"
+            );
+            waiter
+                .reader
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            assert_eq!(pusher.cmd(&["LPUSH", &key, "v"]), ":1\r\n", "{io} {text}");
+            let want = format!("*2\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len());
+            assert_eq!(waiter.raw(), want, "{io} {text}");
+        }
     }
 }

@@ -224,122 +224,114 @@ pub struct Interrupted {
 /// The timeout of a blocking command, in seconds, as Redis reads one: any
 /// float (hexadecimal included), not negative, and not so large that the
 /// deadline in milliseconds would overflow.
+///
+/// Redis reads the number as a `long double` and rounds it up to whole
+/// milliseconds, so a timeout too small for an `f64` (`1e-343`) is still a
+/// real one and waits 1 ms; only a text that no `long double` can hold
+/// (`1e-5000`, `1e5000`) is "not a float". `parse_score` refuses such texts
+/// and [`parse_rounded_away_timeout`] sorts them out.
 pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
-    let text = std::str::from_utf8(raw).unwrap_or("");
-    match crate::commands::zset::parse_score(raw) {
-        Some(v) => {
-            // `1e-343` underflows to 0.0 in f64, but as written e no be zero.
-            // Na tiny but real timeout -> 1ms, no be 0.
-            if v == 0.0 && !is_zero_written_timeout(text) {
-                return Ok(0.001);
-            }
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            if v * 1000.0 + now_ms as f64 >= i64::MAX as f64 {
-                return Err(resp_error("ERR timeout is out of range"));
-            }
-            return Ok(v);
-        }
-        None => {
-            // parse_score refused am. Let Rust f64 parser decide,
-            // no magic -1000 cut-off. If e parse to 0 but no be
-            // written zero, na underflow -> 1ms. If e fail to parse
-            // at all, check exponent: > 308 na overflow.
-            if let Ok(v) = text.parse::<f64>() {
-                if v == 0.0 && !is_zero_written_timeout(text) {
-                    return Ok(0.001);
-                }
-                if !v.is_finite() {
-                    return Err(resp_error("ERR timeout is out of range"));
-                }
-                return Ok(v);
-            }
-            if let Some(exp) = timeout_exponent(text) {
-                if exp > 308 {
-                    return Err(resp_error("ERR timeout is out of range"));
-                }
-                // exp <= 308 but parse still fail, and no be written zero:
-                // na tiny underflow, no be invalid float.
-                if !is_zero_written_timeout(text) {
-                    return Ok(0.001);
-                }
-                return Ok(0.0);
-            }
-            return Err(resp_error("ERR timeout is not a float or out of range"));
-        }
-    }
-}
-
-// Is the number zero as written? e.g. "0", "0.0", "0e10", "-0.00e-5"
-// Full validation: one optional sign, mantissa must be only digits/dot
-// with at least one digit, all digits must be '0', optional valid exponent.
-fn is_zero_written_timeout(text: &str) -> bool {
-    let Some((mantissa, _exp)) = split_timeout_parts(text) else {
-        return false;
+    let Some(secs) = crate::commands::zset::parse_score(raw) else {
+        return parse_rounded_away_timeout(raw);
     };
-    !mantissa.is_empty()
-        && mantissa.bytes().all(|b| b == b'0' || b == b'.')
-        && mantissa.bytes().any(|b| b.is_ascii_digit())
+    if secs < 0.0 {
+        return Err(resp_error("ERR timeout is negative"));
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_millis() as f64);
+    if secs * 1000.0 + now_ms >= i64::MAX as f64 {
+        return Err(resp_error("ERR timeout is out of range"));
+    }
+    Ok(secs)
 }
 
-// Split "[-]mantissa[eE][+/-]exponent" with FULL validation.
-// Returns None if any part get extra 'e', extra sign, empty mantissa,
-// empty exponent, or non-digit for exponent.
-fn split_timeout_parts(text: &str) -> Option<(&str, Option<&str>)> {
-    let s = text.trim();
-    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if s.is_empty() {
-        return None;
-    }
-    let (mantissa, exp) = match s.split_once(['e', 'E']) {
-        Some((m, e)) => (m, Some(e)),
-        None => (s, None),
+/// The smallest and the largest magnitude a `long double` keeps, as a power
+/// of ten and the first 22 digits: half the smallest subnormal (2^-16446,
+/// that rounds to 0 and so is no number), and the largest value (2^16384 -
+/// 2^16320).
+const LONG_DOUBLE_TINY: (i64, &[u8; DIGITS]) = (-4951, b"1822599765941237301264");
+const LONG_DOUBLE_HUGE: (i64, &[u8; DIGITS]) = (4932, b"1189731495357231765021");
+const DIGITS: usize = 22;
+
+/// A timeout that `parse_score` did not take: one that an `f64` rounds to 0
+/// or to infinity, or that is no number at all.
+fn parse_rounded_away_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
+    let not_a_float = || resp_error("ERR timeout is not a float or out of range");
+    let Some((negative, magnitude)) = std::str::from_utf8(raw).ok().and_then(split_timeout_parts)
+    else {
+        return Err(not_a_float());
     };
-    if mantissa.is_empty() || mantissa.contains(['e', 'E']) {
-        return None;
+    // A zero as written is a timeout that never ends, and `parse_score`
+    // has read it already.
+    let Some(magnitude) = magnitude else {
+        return Ok(0.0);
+    };
+    // Redis tells these apart from a number of any size before it looks at
+    // the sign: `-1e-5000` is not a float, but `-1e-343` is negative.
+    if magnitude <= (LONG_DOUBLE_TINY.0, *LONG_DOUBLE_TINY.1)
+        || magnitude > (LONG_DOUBLE_HUGE.0, *LONG_DOUBLE_HUGE.1)
+    {
+        return Err(not_a_float());
     }
-    let mut dot = false;
-    let mut digit = false;
-    for b in mantissa.bytes() {
-        match b {
-            b'0'..=b'9' => digit = true,
-            b'.' if !dot => dot = true,
-            _ => return None,
-        }
+    if negative {
+        return Err(resp_error("ERR timeout is negative"));
     }
-    if !digit {
-        return None;
+    if magnitude.0 > 0 {
+        return Err(resp_error("ERR timeout is out of range"));
     }
-    if let Some(e) = exp {
-        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
-        if e.is_empty() || !e.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-    }
-    Some((mantissa, exp))
+    // A tiny timeout, but not zero: the shortest wait there is.
+    Ok(0.001)
 }
 
-// Exponent after 'e'/'E', e.g. -343 for "1e-343". None if no exponent
-// or if the whole text no be valid float syntax.
-fn timeout_exponent(text: &str) -> Option<i64> {
-    let (_, exp) = split_timeout_parts(text)?;
-    let exp = exp?;
-    let exp = exp.strip_prefix(['+', '-']).unwrap_or(exp);
-    let mut value: i64 = 0;
-    for b in exp.bytes() {
-        value = value.saturating_mul(10).saturating_add((b - b'0') as i64);
-        if value > 100_000 {
-            value = 100_000;
-        }
+/// Split a decimal number, `[+-]digits[.digits][e[+-]digits]` with at least
+/// one digit before the `e`, into its sign and its magnitude: the power of
+/// ten of its first non-zero digit and its first [`DIGITS`] digits from
+/// there (the rest zeros), or `None` for the magnitude of a zero. `None` if
+/// the text is no number. The power saturates, so `1e-99999999999999999999`
+/// is read at once.
+fn split_timeout_parts(text: &str) -> Option<(bool, Option<(i64, [u8; DIGITS])>)> {
+    let (negative, unsigned) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut all = whole.bytes().chain(fraction.bytes()).peekable();
+    if all.peek().is_none() || !all.clone().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    let negative = text
-        .trim()
-        .split_once(['e', 'E'])
-        .map(|(_, e)| e.starts_with('-'))
-        .unwrap_or(false);
-    Some(if negative { -value } else { value })
+    let exponent = match exponent {
+        None => 0,
+        Some(exponent) => {
+            let (negative, digits) = match exponent.as_bytes().first() {
+                Some(b'-') => (true, &exponent[1..]),
+                Some(b'+') => (false, &exponent[1..]),
+                _ => (false, exponent),
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let value = digits.bytes().fold(0i64, |acc, b| {
+                acc.saturating_mul(10).saturating_add(i64::from(b - b'0')).min(1 << 40)
+            });
+            if negative { -value } else { value }
+        }
+    };
+    let zeros = all.clone().take_while(|&b| b == b'0').count();
+    if zeros == whole.len() + fraction.len() {
+        return Some((negative, None));
+    }
+    let power = whole.len() as i64 - 1 - zeros as i64 + exponent;
+    let mut digits = [b'0'; DIGITS];
+    for (slot, b) in digits.iter_mut().zip(all.skip(zeros)) {
+        *slot = b;
+    }
+    Some((negative, Some((power, digits))))
 }
 
 /// Mark an error reply as one a woken client is told even though it says
@@ -707,7 +699,6 @@ pub fn wait_for_keys(
     let outcome = match (reply, remaining) {
         (Some(reply), _) => Ok(reply),
         (None, Some(remaining)) if !timed_out => Err(remaining),
-
         (None, _) => {
             crate::stats::record_miss();
             // A wait that ran out is answered with a null array. A caller
@@ -1218,13 +1209,57 @@ mod gone_resume_tests {
     }
 
     #[test]
-    fn parse_timeout_underflow_is_1ms() {
-        assert_eq!(parse_timeout(b"1e-343").unwrap(), 0.001);
-        assert_eq!(parse_timeout(b"1e-1001").unwrap(), 0.001);
-        assert_eq!(parse_timeout(b"0").unwrap(), 0.0);
-        assert_eq!(parse_timeout(b"0.0e10").unwrap(), 0.0);
-        assert!(parse_timeout(b"1e2e3").is_err());
-        assert!(parse_timeout(b"e999").is_err());
-        assert!(parse_timeout(b"1e309").is_err());
+    fn parse_timeout_reads_a_long_double() {
+        let err = |raw: &[u8]| String::from_utf8(parse_timeout(raw).unwrap_err()).unwrap();
+        // Too small for an f64 but not for a long double: the shortest wait.
+        for raw in [
+            "1e-343",
+            "1e-400",
+            "+1e-343",
+            ".5e-343",
+            "5.e-343",
+            "1e-4950",
+            "1000e-4953",
+            "1.83e-4951",
+            "3e-4951",
+        ] {
+            assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.001, "{raw}");
+        }
+        // Zero in any spelling never ends.
+        for raw in ["0", "0.0", "0e10", "-0", "-0.0", "-0e10"] {
+            assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.0, "{raw}");
+        }
+        for raw in [
+            "1e-4951",
+            "1.8e-4951",
+            "0.001e-4948",
+            "1e-5000",
+            "-1e-5000",
+            "1e-99999999999999999999",
+            "1e99999999999999999999",
+            "1.2e4932",
+            "1e4933",
+            "xe-5",
+            "1.2.3e-400",
+            "1e2e3",
+            "e999",
+            "1e",
+            "1e-",
+            ".",
+            "",
+            " 1",
+            "1 ",
+            "1abc",
+            "--1",
+            "nan",
+        ] {
+            assert!(err(raw.as_bytes()).contains("not a float"), "{raw}");
+        }
+        for raw in ["inf", "+inf", "2e308", "1e309", "1e4000", "1.1e4932"] {
+            assert!(err(raw.as_bytes()).contains("out of range"), "{raw}");
+        }
+        for raw in ["-1", "-inf", "-2e308", "-1e-343", "-1e-4950"] {
+            assert!(err(raw.as_bytes()).contains("negative"), "{raw}");
+        }
     }
 }
