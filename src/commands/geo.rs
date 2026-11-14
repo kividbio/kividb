@@ -11,30 +11,22 @@ use std::sync::Arc;
 
 /// Effective protocol for the reply being built (honours `redis.setresp`).
 ///
-/// Geo replies carry distances and coordinates, which Redis emits with
-/// `addReplyHumanLongDouble` — a bulk string under RESP2 and the double type
-/// (`,`) under RESP3. GEOHASH is unaffected: its values are genuine base32
-/// strings, not numbers.
+/// Geo replies carry coordinates, which Redis emits with `addReplyDouble`: the
+/// double type (`,`) under RESP3, a bulk string of the same digits under
+/// RESP2. Distances are bulk strings under both (`addReplyDoubleDistance`).
+/// GEOHASH is unaffected: its values are genuine base32 strings, not numbers.
 #[inline]
 fn reply_resp(ctx: &Ctx) -> u8 {
     crate::commands::handler::effective_resp_for_reply(ctx)
 }
 
 /// A coordinate pair, `[lon, lat]`, shaped for `resp`.
-///
-/// The RESP2 branch keeps the existing fixed 17-decimal rendering so its bytes
-/// are unchanged. RESP3 uses the shortest round-trip form: a client parses
-/// either into the same `f64`, and the short form is what the double type is
-/// for.
 #[inline]
 fn coord_pair(resp: u8, lon: f64, lat: f64) -> Vec<u8> {
     if resp >= 3 {
         resp_array(vec![resp_double_resp3(lon), resp_double_resp3(lat)])
     } else {
-        resp_array(vec![
-            resp_bulk_str(&format!("{:.17}", lon)),
-            resp_bulk_str(&format!("{:.17}", lat)),
-        ])
+        resp_array(vec![resp_double_bulk(lon), resp_double_bulk(lat)])
     }
 }
 
@@ -405,7 +397,6 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
 // ── GEODIST ───────────────────────────────────────────────────────────────────
 // GEODIST key member1 member2 [M|KM|FT|MI]
 fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
-    let resp = reply_resp(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 4 || cmd.len() > 5 {
         return resp_error("ERR wrong number of arguments for 'geodist' command");
@@ -456,16 +447,6 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR unsupported unit provided. please use M, KM, FT, MI");
     }
 
-    // Redis replies with addReplyHumanLongDouble → the double type under RESP3.
-    // Parse the already-formatted, unit-converted string back rather than
-    // recomputing, so both protocols report the exact same number. A parse
-    // failure is unreachable in practice; falling through to the RESP2 form
-    // beats emitting a malformed double if it ever isn't.
-    if resp >= 3
-        && let Ok(d) = format_dist(dist, unit).parse::<f64>()
-    {
-        return resp_double_resp3(d);
-    }
     resp_bulk_str(&format_dist(dist, unit))
 }
 
@@ -1093,13 +1074,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
                 }
                 let mut item = vec![resp_bulk(&point.member)];
                 if with_dist {
-                    // A distance: RESP3 sends it as a double — the same
-                    // treatment as GEODIST.
-                    let text = format!("{:.4}", point.distance_m / unit_m);
-                    match (resp >= 3).then(|| text.parse::<f64>()) {
-                        Some(Ok(d)) => item.push(resp_double_resp3(d)),
-                        _ => item.push(resp_bulk_str(&text)),
-                    }
+                    item.push(resp_bulk_str(&format!("{:.4}", point.distance_m / unit_m)));
                 }
                 if with_hash {
                     item.push(resp_integer(point.score as i64));
