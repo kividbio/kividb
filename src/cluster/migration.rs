@@ -68,29 +68,6 @@ pub fn write_pause_timeout_ms(config: &crate::config::Config) -> u64 {
     }
 }
 
-/// `cluster-slot-migration-write-pause-timeout` as the server started with
-/// it: see [`takeover_answer_wait_ms`].
-static CONFIGURED_WRITE_PAUSE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
-
-/// Note the server's `cluster-slot-migration-write-pause-timeout`, at start.
-pub(crate) fn note_configured_write_pause_timeout(config: &crate::config::Config) {
-    CONFIGURED_WRITE_PAUSE_TIMEOUT_MS.store(
-        config.cluster_slot_migration_write_pause_timeout,
-        Ordering::Relaxed,
-    );
-}
-
-/// How long the source of a handover waits for the destination's answer to
-/// its `TAKEOVER`: the write pause timeout, as it is now. Until it knows
-/// whether the destination took the slots, it keeps claiming them, and
-/// keeps their keys (#517, `ClusterState::given_away`).
-pub(crate) fn takeover_answer_wait_ms() -> u64 {
-    match WRITE_PAUSE_TIMEOUT_MS.load(Ordering::Relaxed) {
-        UNSET => CONFIGURED_WRITE_PAUSE_TIMEOUT_MS.load(Ordering::Relaxed),
-        v => v,
-    }
-}
-
 /// `CONFIG SET cluster-slot-migration-handoff-max-lag-bytes`.
 pub fn set_handoff_max_lag_bytes(bytes: u64) {
     HANDOFF_MAX_LAG_BYTES.store(bytes.min(UNSET - 1), Ordering::Relaxed);
@@ -472,15 +449,16 @@ impl Env {
     fn registry(&self) -> &Registry {
         &self.cluster.slot_migrations
     }
+}
 
-    fn address_of(&self, node: &NodeId) -> Option<(String, u16)> {
-        self.cluster
-            .nodes
-            .read()
-            .get(node)
-            .filter(|n| !n.ip.is_empty() && n.client_port != 0)
-            .map(|n| (n.ip.clone(), n.client_port))
-    }
+/// A node's client address, if this node knows it.
+fn address_of(cluster: &ClusterState, node: &NodeId) -> Option<(String, u16)> {
+    cluster
+        .nodes
+        .read()
+        .get(node)
+        .filter(|n| !n.ip.is_empty() && n.client_port != 0)
+        .map(|n| (n.ip.clone(), n.client_port))
 }
 
 /// Give the destination the definitions of this node's indexes before its
@@ -532,8 +510,16 @@ fn command(parts: &[&[u8]]) -> Vec<u8> {
 
 impl Peer {
     fn connect(env: &Env, node: &NodeId) -> Result<Self, String> {
-        let (host, port) = env
-            .address_of(node)
+        Self::connect_from(&env.cluster, &env.repl_state, node)
+    }
+
+    /// [`Self::connect`], with only what it needs of the server.
+    fn connect_from(
+        cluster: &ClusterState,
+        repl_state: &ReplState,
+        node: &NodeId,
+    ) -> Result<Self, String> {
+        let (host, port) = address_of(cluster, node)
             .ok_or_else(|| "the other node's address is not known".to_string())?;
         let addr = (host.as_str(), port)
             .to_socket_addrs()
@@ -549,7 +535,7 @@ impl Peer {
             sock,
         };
 
-        let (user, password) = env.repl_state.master_credentials();
+        let (user, password) = repl_state.master_credentials();
         if !password.is_empty() {
             let auth = if user.is_empty() {
                 // As the default user, by name: `AUTH <password>` is refused by a
@@ -1275,7 +1261,7 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
     if let Some(slot) = slots_of(&ranges).find(|s| !cluster.owns_slot(*s)) {
         return Err(format!("I am not the owner of slot {slot}"));
     }
-    if env.address_of(&dest).is_none() {
+    if address_of(cluster, &dest).is_none() {
         return Err("unknown destination node".into());
     }
     env.registry().add(Task {
@@ -1499,6 +1485,28 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     }
     no_failover_since()?;
 
+    // From here until this node knows how the handover ends, the slots are
+    // left out of its claims, here and after a restart (#517, see
+    // `PendingHandover`): a claim of them is then never one made while the
+    // destination may have them. Saved before writes are paused, and before
+    // the destination is asked to take them.
+    struct Pending<'a>(&'a ClusterState, &'a str);
+    impl Drop for Pending<'_> {
+        fn drop(&mut self) {
+            // However it ended: handed over, refused, given up before the
+            // destination was asked, claimed back, or taken by another node.
+            self.0.settle_handover(self.1);
+        }
+    }
+    env.cluster
+        .begin_pending_handover(super::PendingHandover {
+            task_id: task.id.clone(),
+            dest: task.dest,
+            slots: slots_of(&task.ranges).collect(),
+        })
+        .map_err(|e| format!("could not save the cluster config before the handover: {e}"))?;
+    let _pending = Pending(&env.cluster, &task.id);
+
     // ── Handoff ──────────────────────────────────────────────────────────
     // Pause client writes, let the ones in flight finish, send what they
     // wrote, and hand the slots over.
@@ -1681,14 +1689,35 @@ enum Asked {
 /// slots over, telling it the attempt is given up if it has not
 /// (`CLUSTER SYNCSLOTS FAIL`, see [`Registry::fence`]).
 fn ask_destination(env: &Env, task: &Task, why: &str) -> Asked {
+    ask_destination_from(
+        &env.cluster,
+        &env.repl_state,
+        &task.id,
+        &task.dest,
+        &task.ranges,
+        why,
+    )
+}
+
+/// [`ask_destination`], with only what it needs of the server: also asked
+/// after a restart, of a handover whose outcome this node did not know
+/// ([`settle_pending_handovers`]).
+fn ask_destination_from(
+    cluster: &ClusterState,
+    repl_state: &ReplState,
+    task_id: &str,
+    dest: &NodeId,
+    ranges: &[(u16, u16)],
+    why: &str,
+) -> Asked {
     let mut parts: Vec<Vec<u8>> = vec![
         b"CLUSTER".to_vec(),
         b"SYNCSLOTS".to_vec(),
         b"FAIL".to_vec(),
-        task.id.as_bytes().to_vec(),
+        task_id.as_bytes().to_vec(),
         why.as_bytes().to_vec(),
     ];
-    for (start, end) in &task.ranges {
+    for (start, end) in ranges {
         parts.push(start.to_string().into_bytes());
         parts.push(end.to_string().into_bytes());
     }
@@ -1696,13 +1725,9 @@ fn ask_destination(env: &Env, task: &Task, why: &str) -> Asked {
     // Who asks: the destination heeds it only from the source of its
     // current attempt (#516).
     parts.push(b"FROM".to_vec());
-    parts.push(
-        super::node_id_str(&env.cluster.myself())
-            .as_bytes()
-            .to_vec(),
-    );
+    parts.push(super::node_id_str(&cluster.myself()).as_bytes().to_vec());
     let ask = |parts: &[Vec<u8>]| {
-        let mut peer = Peer::connect(env, &task.dest)?;
+        let mut peer = Peer::connect_from(cluster, repl_state, dest)?;
         let _ = peer.sock.set_read_timeout(Some(Duration::from_secs(5)));
         peer.call(&crate::resp::write::encode_resp_command(parts))
     };
@@ -1816,6 +1841,115 @@ fn await_takeover(env: &Env, task: &Task, error: &str) -> Result<(), String> {
         }
         std::thread::sleep(ASK_AGAIN);
     }
+}
+
+/// After a restart: settle the handovers away from this node whose outcome
+/// it did not know when it went down ([`super::PendingHandover`]), left out
+/// of its claims until then. Each is settled as [`await_takeover`] settles
+/// one: by the destination's claim (the slots are no longer this node's),
+/// its answer (it took them: they are handed over here, and their keys
+/// dropped; it did not: they stay), or, the destination marked FAIL, by
+/// claiming them back at a newer epoch. Asked every 200 ms, with no end:
+/// until then the slots are this node's in every view, only not claimed.
+pub(crate) fn settle_pending_handovers(cluster: &ClusterState, repl_state: &ReplState) {
+    let mut logged: Option<Instant> = None;
+    loop {
+        let pending = cluster.pending_handovers.lock().clone();
+        if pending.is_empty() {
+            return;
+        }
+        if cluster.my_master_id().is_some() {
+            // A replica: its master's claims are not its own.
+            for p in &pending {
+                cluster.settle_handover(&p.task_id);
+            }
+            return;
+        }
+        let me = cluster.myself();
+        for p in pending {
+            let mine: Vec<u16> = p
+                .slots
+                .iter()
+                .copied()
+                .filter(|&slot| cluster.slot_owner(slot) == Some(me))
+                .collect();
+            let dest = super::node_id_str(&p.dest).to_string();
+            if mine.is_empty() {
+                log_info!(
+                    "Cluster: the handover {} to {dest}, under way when this node went down, \
+                     is settled: the slots are no longer this node's",
+                    p.task_id
+                );
+                cluster.settle_handover(&p.task_id);
+                continue;
+            }
+            let ranges = ranges_of(&mine);
+            let why = "the source restarted during the handover";
+            match ask_destination_from(cluster, repl_state, &p.task_id, &p.dest, &ranges, why) {
+                Asked::Taken => {
+                    let handed = cluster.hand_over_slots(mine.into_iter(), p.dest);
+                    cluster.settle_handover(&p.task_id);
+                    let _ = cluster.save_to_disk();
+                    log_info!(
+                        "Cluster: {dest} took slots {} over before this node went down: \
+                         handed over here too",
+                        ranges_text(&ranges)
+                    );
+                    if !handed.is_empty() {
+                        drop_lost_slots(cluster, handed);
+                    }
+                }
+                Asked::NotTaken => {
+                    cluster.settle_handover(&p.task_id);
+                    log_info!(
+                        "Cluster: {dest} did not take slots {} over: they stay with this node",
+                        ranges_text(&ranges)
+                    );
+                }
+                Asked::Unsure(why) => {
+                    let failed = cluster
+                        .nodes
+                        .read()
+                        .get(&p.dest)
+                        .is_none_or(|n| n.flags.contains(super::NodeFlags::FAIL));
+                    if failed {
+                        let _ = cluster.bump_epoch();
+                        if let Err(e) = cluster.take_over_slots(mine.into_iter()) {
+                            log_warn!("Cluster: Could not save the cluster config: {e}");
+                            continue;
+                        }
+                        cluster.settle_handover(&p.task_id);
+                        log_warn!(
+                            "Cluster: {dest} has failed; it did not answer whether it took \
+                             slots {} over ({why}), and they are claimed here again at epoch {}",
+                            ranges_text(&ranges),
+                            cluster.current_epoch()
+                        );
+                    } else if logged.is_none_or(|at| at.elapsed() >= LOG_HELD_EVERY) {
+                        logged = Some(Instant::now());
+                        log_warn!(
+                            "Cluster: slots {} are left out of this node's claims until it \
+                             knows whether {dest} took them over ({why})",
+                            ranges_text(&ranges)
+                        );
+                    }
+                }
+            }
+        }
+        std::thread::sleep(ASK_AGAIN);
+    }
+}
+
+/// `slots`, in order, as ranges.
+fn ranges_of(slots: &[u16]) -> Vec<(u16, u16)> {
+    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    for &slot in slots {
+        match ranges.last_mut() {
+            Some((_, end)) if *end + 1 == slot => *end = slot,
+            _ => ranges.push((slot, slot)),
+        }
+    }
+    ranges
 }
 
 // ── Destination ──────────────────────────────────────────────────────────────

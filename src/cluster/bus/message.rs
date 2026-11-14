@@ -44,7 +44,10 @@
 //
 // A node's hostname (`cluster-announce-hostname`) travels in its flags
 // string, as a `host=<name>` token: nodes that do not know it ignore an
-// unknown token, where a new field would have them drop the message. A
+// unknown token, where a new field would have them drop the message. So
+// does `pending-unclaimed`, in a PING's or PONG's own flags: the sender
+// leaves the slots of a handover under way out of its claims (#517, see
+// `ClusterState::my_slot_claims`). A
 // hostname has no commas (see `valid_hostname`). Decoders take at least the
 // fields they know and skip any after them, so that a later version can add
 // some.
@@ -101,6 +104,9 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// It leaves the slots of a handover under way out of its claims
+        /// (`pending-unclaimed`); false from a node of an earlier version.
+        sender_unclaims_pending: bool,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
     },
@@ -116,6 +122,9 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// It leaves the slots of a handover under way out of its claims
+        /// (`pending-unclaimed`); false from a node of an earlier version.
+        sender_unclaims_pending: bool,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
     },
@@ -232,6 +241,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_unclaims_pending,
             gossip,
             slot_claims,
         } => resp_array(vec![
@@ -243,10 +253,11 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                 *sender_cluster_port,
                 *sender_config_epoch,
             )),
-            resp_bulk_str(&flags_with_host(
+            resp_bulk_str(&own_flags(
                 *sender_flags,
                 sender_hostname,
                 *sender_announced_client_port,
+                *sender_unclaims_pending,
             )),
             match sender_master_id {
                 Some(m) => resp_bulk(m),
@@ -265,6 +276,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_unclaims_pending,
             gossip,
             slot_claims,
         } => resp_array(vec![
@@ -276,10 +288,11 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                 *sender_cluster_port,
                 *sender_config_epoch,
             )),
-            resp_bulk_str(&flags_with_host(
+            resp_bulk_str(&own_flags(
                 *sender_flags,
                 sender_hostname,
                 *sender_announced_client_port,
+                *sender_unclaims_pending,
             )),
             match sender_master_id {
                 Some(m) => resp_bulk(m),
@@ -453,6 +466,23 @@ fn flags_with_host(flags: NodeFlags, hostname: &str, client_port: u16) -> String
     s
 }
 
+/// A PING's or PONG's own flags string: [`flags_with_host`], and
+/// `pending-unclaimed` if the sender leaves the slots of a handover under
+/// way out of its claims.
+fn own_flags(flags: NodeFlags, hostname: &str, client_port: u16, unclaims_pending: bool) -> String {
+    let mut s = flags_with_host(flags, hostname, client_port);
+    if unclaims_pending {
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(PENDING_UNCLAIMED);
+    }
+    s
+}
+
+/// See [`own_flags`].
+const PENDING_UNCLAIMED: &str = "pending-unclaimed";
+
 /// The announced client port in a flags string; 0 if there is none.
 fn cport_of(flags: &str) -> u16 {
     flags
@@ -533,6 +563,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
             let sender_flags = parse_flags(flags_str);
             let sender_hostname = host_of(flags_str);
             let sender_announced_client_port = cport_of(flags_str);
+            let sender_unclaims_pending = flags_str.split(',').any(|t| t == PENDING_UNCLAIMED);
             let sender_master_id = if parts[4].is_empty() {
                 None
             } else {
@@ -551,6 +582,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_unclaims_pending,
                     gossip,
                     slot_claims,
                 }
@@ -565,6 +597,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_unclaims_pending,
                     gossip,
                     slot_claims,
                 }
@@ -984,6 +1017,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_unclaims_pending: false,
         };
         let bytes = encode(&msg);
         let (decoded, consumed) = decode(&bytes).unwrap().unwrap();
@@ -1020,6 +1054,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_unclaims_pending: false,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1050,6 +1085,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: "a.example".into(),
             sender_announced_client_port: 30001,
+            sender_unclaims_pending: false,
             gossip: vec![GossipEntry {
                 id: other,
                 ip: "10.0.0.2".into(),
@@ -1119,6 +1155,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: "shard-1a.db.example".into(),
             sender_announced_client_port: 0,
+            sender_unclaims_pending: false,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1140,6 +1177,14 @@ mod tests {
             parse_flags("master,host=shard-1a.db.example"),
             NodeFlags::MASTER
         );
+        // Nor does `pending-unclaimed` change what an earlier version reads
+        // (its `parse_flags`, `host_of` and `cport_of` are these).
+        assert_eq!(
+            parse_flags("master,host=a,cport=7000,pending-unclaimed"),
+            NodeFlags::MASTER
+        );
+        assert_eq!(host_of("master,host=a,cport=7000,pending-unclaimed"), "a");
+        assert_eq!(cport_of("master,host=a,cport=7000,pending-unclaimed"), 7000);
 
         // One more field at the end, as a later version might send. The
         // parser hands nested arrays (gossip, claims) back raw.
@@ -1232,6 +1277,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_unclaims_pending: false,
         };
         let bytes = encode(&msg);
         let (decoded, consumed) = decode(&bytes).unwrap().unwrap();
@@ -1281,6 +1327,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_unclaims_pending: false,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();

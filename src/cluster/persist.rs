@@ -23,6 +23,7 @@
 // rename. This is the standard way to avoid a half-written file if the
 // process crashes mid-save.
 
+use crate::cluster::PendingHandover;
 use crate::cluster::node::{ClusterNode, NodeFlags, NodeId, node_id_str, parse_node_id};
 use crate::cluster::slot::CLUSTER_SLOTS;
 use ahash::AHashMap;
@@ -40,6 +41,8 @@ pub struct LoadedConfig {
     pub last_vote_epoch: u64,
     /// See `ClusterState::given_away`.
     pub given_away: Vec<u16>,
+    /// See `ClusterState::pending_handovers`.
+    pub pending_handovers: Vec<PendingHandover>,
 }
 
 /// Read nodes.conf from disk. Returns Ok(None) if the file does not exist
@@ -56,6 +59,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
     let mut current_epoch: u64 = 0;
     let mut last_vote_epoch: u64 = 0;
     let mut given_away: Vec<u16> = Vec::new();
+    let mut pending_handovers: Vec<PendingHandover> = Vec::new();
     // Box<[Option<NodeId>; 16384]> via the same dance as in mod.rs
     let mut slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
         .into_boxed_slice()
@@ -77,6 +81,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
                     "currentEpoch" => current_epoch = v.parse().unwrap_or(0),
                     "lastVoteEpoch" => last_vote_epoch = v.parse().unwrap_or(0),
                     "givenAwaySlots" => given_away = parse_slot_list(v),
+                    "pendingHandovers" => pending_handovers = parse_pending(v),
                     _ => {}
                 }
             }
@@ -173,6 +178,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
         current_epoch,
         last_vote_epoch,
         given_away,
+        pending_handovers,
     }))
 }
 
@@ -186,6 +192,7 @@ pub fn save(
     current_epoch: u64,
     last_vote_epoch: u64,
     given_away: &[u16],
+    pending_handovers: &[PendingHandover],
 ) -> std::io::Result<()> {
     let tmp_path = path.with_extension("conf.tmp");
 
@@ -268,6 +275,14 @@ pub fn save(
     if !given_away.is_empty() {
         write!(out, " givenAwaySlots {}", format_slot_list(given_away)).unwrap();
     }
+    if !pending_handovers.is_empty() {
+        write!(
+            out,
+            " pendingHandovers {}",
+            format_pending(pending_handovers)
+        )
+        .unwrap();
+    }
     out.push(b'\n');
 
     write_atomically(path, &tmp_path, &out)
@@ -349,6 +364,7 @@ fn topology_fingerprint(
     current_epoch: u64,
     last_vote_epoch: u64,
     given_away: &[u16],
+    pending_handovers: &[PendingHandover],
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -373,6 +389,7 @@ fn topology_fingerprint(
     current_epoch.hash(&mut h);
     last_vote_epoch.hash(&mut h);
     given_away.hash(&mut h);
+    format_pending(pending_handovers).hash(&mut h);
     h.finish()
 }
 
@@ -431,7 +448,7 @@ fn save_then(
     let asked = std::time::Instant::now();
     let saving = state.save_lock.lock();
     let locked = asked.elapsed().as_millis();
-    let (nodes_snap, slots_snap, epoch, last_vote, given_away) = {
+    let (nodes_snap, slots_snap, epoch, last_vote, given_away, pending) = {
         let nodes = state.nodes.read();
         let slots = state.slots.read();
         let epoch = state.current_epoch.load(Ordering::Relaxed);
@@ -447,9 +464,24 @@ fn save_then(
         }
         // Taken last (see `ClusterState::given_away`).
         let given_away = state.given_away.lock().slots();
-        (nodes.clone(), slots_copy, epoch, last_vote, given_away)
+        let pending = state.pending_handovers.lock().clone();
+        (
+            nodes.clone(),
+            slots_copy,
+            epoch,
+            last_vote,
+            given_away,
+            pending,
+        )
     };
-    let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote, &given_away);
+    let fingerprint = topology_fingerprint(
+        &nodes_snap,
+        &slots_snap,
+        epoch,
+        last_vote,
+        &given_away,
+        &pending,
+    );
     if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint && path.exists() {
         if let Some(publish) = publish {
             publish();
@@ -463,6 +495,7 @@ fn save_then(
         epoch,
         last_vote,
         &given_away,
+        &pending,
     )?;
     let deferred = DEFER_SYNC.with(|d| d.get());
     // A change to publish waits for the sync, with the lock held, so that a
@@ -535,6 +568,42 @@ fn format_slot_list(slots: &[u16]) -> String {
         i += 1;
     }
     out
+}
+
+/// `<task>:<destination>:<slots>[;...]`, the slots as [`format_slot_list`]
+/// writes them: the handovers of [`PendingHandover`], as a value of the vars
+/// line.
+fn format_pending(pending: &[PendingHandover]) -> String {
+    pending
+        .iter()
+        .map(|p| {
+            format!(
+                "{}:{}:{}",
+                p.task_id,
+                node_id_str(&p.dest),
+                format_slot_list(&p.slots)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// What [`format_pending`] wrote. A part that does not read as one is
+/// skipped.
+fn parse_pending(s: &str) -> Vec<PendingHandover> {
+    s.split(';')
+        .filter_map(|part| {
+            let mut fields = part.splitn(3, ':');
+            let task_id = fields.next()?;
+            let dest = parse_node_id(fields.next()?.as_bytes())?;
+            let slots = parse_slot_list(fields.next()?);
+            (!task_id.is_empty() && !slots.is_empty()).then(|| PendingHandover {
+                task_id: task_id.to_string(),
+                dest,
+                slots,
+            })
+        })
+        .collect()
 }
 
 /// What [`format_slot_list`] wrote. A part that is not a slot or a range of
@@ -716,7 +785,7 @@ mod tests {
             .unwrap();
 
         let tmp = NamedTempFile::new().unwrap();
-        save(tmp.path(), &nodes, &slots, 7, 0, &[]).unwrap();
+        save(tmp.path(), &nodes, &slots, 7, 0, &[], &[]).unwrap();
 
         let loaded = load(tmp.path()).unwrap().unwrap();
         assert_eq!(loaded.myself, me);
@@ -759,7 +828,7 @@ mod tests {
         }
 
         let tmp = NamedTempFile::new().unwrap();
-        save(tmp.path(), &nodes, &slots, 0, 0, &[]).unwrap();
+        save(tmp.path(), &nodes, &slots, 0, 0, &[], &[]).unwrap();
 
         let loaded = load(tmp.path()).unwrap().unwrap();
         // All the slots we wrote should still be ours.
@@ -826,7 +895,20 @@ mod tests {
             .unwrap();
         let given: Vec<u16> = (0..=1000).chain([2000]).chain(16380..=16383).collect();
         let tmp = NamedTempFile::new().unwrap();
-        save(tmp.path(), &nodes, &slots, 9, 4, &given).unwrap();
+        let dest = generate_node_id();
+        let pending = vec![
+            PendingHandover {
+                task_id: "a".repeat(40),
+                dest,
+                slots: (0..=20).chain([30]).collect(),
+            },
+            PendingHandover {
+                task_id: "b".repeat(40),
+                dest: me,
+                slots: vec![100],
+            },
+        ];
+        save(tmp.path(), &nodes, &slots, 9, 4, &given, &pending).unwrap();
         let text = fs::read_to_string(tmp.path()).unwrap();
         assert!(
             text.contains(
@@ -836,12 +918,26 @@ mod tests {
         );
         let loaded = load(tmp.path()).unwrap().unwrap();
         assert_eq!(loaded.given_away, given);
+        assert_eq!(loaded.pending_handovers, pending);
+        assert!(
+            text.contains(&format!(
+                " pendingHandovers {}:{}:0-20,30;{}:{}:100",
+                "a".repeat(40),
+                node_id_str(&dest),
+                "b".repeat(40),
+                node_id_str(&me)
+            )),
+            "{text}"
+        );
         assert_eq!((loaded.current_epoch, loaded.last_vote_epoch), (9, 4));
 
-        save(tmp.path(), &nodes, &slots, 9, 4, &[]).unwrap();
+        save(tmp.path(), &nodes, &slots, 9, 4, &[], &[]).unwrap();
         let text = fs::read_to_string(tmp.path()).unwrap();
         assert!(!text.contains("givenAwaySlots"), "{text}");
-        assert!(load(tmp.path()).unwrap().unwrap().given_away.is_empty());
+        assert!(!text.contains("pendingHandovers"), "{text}");
+        let loaded = load(tmp.path()).unwrap().unwrap();
+        assert!(loaded.given_away.is_empty() && loaded.pending_handovers.is_empty());
+        assert!(parse_pending("x;:00:1;abc:nothex:5").is_empty());
         assert_eq!(parse_slot_list("5-3,x,7,16384,1-2"), vec![1, 2, 7]);
     }
 }

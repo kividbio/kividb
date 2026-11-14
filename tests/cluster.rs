@@ -283,9 +283,17 @@ impl Node {
         if !conf.exists() {
             std::fs::write(&conf, "").unwrap();
         }
+        // The short node timeout, unless the test gives one of its own.
+        let node_timeout = NODE_TIMEOUT_MS.to_string();
+        let timeout: &[&str] = if self.extra.iter().any(|a| a == "--cluster-node-timeout") {
+            &[]
+        } else {
+            &["--cluster-node-timeout", &node_timeout]
+        };
         let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(&self.dir)
             .args(bind)
+            .args(timeout)
             .args([
                 "--port",
                 &self.port.to_string(),
@@ -295,8 +303,6 @@ impl Node {
                 "2",
                 "--cluster-enabled",
                 "yes",
-                "--cluster-node-timeout",
-                &NODE_TIMEOUT_MS.to_string(),
                 "--configfile",
                 "kividb.conf",
             ])
@@ -498,7 +504,12 @@ fn add_replica(cluster: &[Node], master: &Node) -> Node {
 
 /// [`add_replica`], its process given `env` as well.
 fn add_replica_with_env(cluster: &[Node], master: &Node, env: &[(&str, &str)]) -> Node {
-    let replica = Node::start_with_env(&[], env);
+    add_replica_with(cluster, master, &[], env)
+}
+
+/// [`add_replica`], started with `extra` and its process given `env`.
+fn add_replica_with(cluster: &[Node], master: &Node, extra: &[&str], env: &[(&str, &str)]) -> Node {
+    let replica = Node::start_with_env(extra, env);
     let r = cluster[0]
         .conn()
         .cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
@@ -5313,18 +5324,45 @@ fn not_as_written(node: &Node, keys: &[String], value: &str) -> Vec<String> {
         .collect()
 }
 
+/// What the #517 tests look for in a promoted replica's log.
+const PROMOTED_WITH_GIVEN_AWAY: &str = "slot(s) the old master gave away while this node was its \
+                                        replica are dropped once their owner claims them again";
+const DROPPING_GIVEN_AWAY: &str = "dropping the keys of ";
+const LET_GO_GIVEN_AWAY: &str = "are no longer claimed by";
+const KEPT_FROM_EARLIER_VERSION: &str = "keeping the keys of ";
+
+/// How many slots the "dropping the keys" lines of `log` add up to.
+fn given_away_dropped(log: &str) -> usize {
+    log.lines()
+        .filter(|l| l.contains("slot(s) the old master gave away while"))
+        .filter_map(|l| {
+            let rest = &l[l.find(DROPPING_GIVEN_AWAY)? + DROPPING_GIVEN_AWAY.len()..];
+            rest.split(' ').next()?.parse::<usize>().ok()
+        })
+        .sum()
+}
+
 /// A master killed right after a `CLUSTER MIGRATION IMPORT` handed slots
-/// over, before its deletion of their keys reached its replica (held here
-/// at the failpoint `slot-keys-checked`). Its replica, promoted, used to
-/// keep the keys of the slots that had moved away for good: in `DBSIZE`,
-/// `SCAN`, its snapshots and the full syncs of its own replicas (#517). It
-/// remembers now that its master gave those slots away, and drops their
-/// keys once promoted; every other key stays, and so does every write the
-/// new owner acknowledged.
-#[test]
-fn a_replica_promoted_after_its_master_handed_slots_over_drops_their_keys() {
+/// 0-1000 over to the second master (`dst_env` its environment), before its
+/// deletion of their keys reached its replica (held at the failpoint
+/// `slot-keys-checked`), with the new owner's writes to them acknowledged;
+/// its replica promoted. Returns the cluster, the replica, the moved keys
+/// (`new` on the new owner), the source's other keys (`v`), the new owner's
+/// own (`v`), and when the promotion was seen.
+#[allow(clippy::type_complexity)]
+fn promoted_after_a_handover(
+    dst_env: &[(&str, &str)],
+) -> (
+    Vec<Node>,
+    Node,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Instant,
+) {
     let src = Node::start_with_env(&[], &[("KIVIDB_TEST_FAILPOINTS", CHECKED)]);
-    let (mut nodes, ranges) = form_cluster_of(vec![src, Node::start(&[]), Node::start(&[])]);
+    let dst = Node::start_with_env(&[], dst_env);
+    let (mut nodes, ranges) = form_cluster_of(vec![src, dst, Node::start(&[])]);
     let replica = add_replica(&nodes, &nodes[0]);
     wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
 
@@ -5386,24 +5424,35 @@ fn a_replica_promoted_after_its_master_handed_slots_over_drops_their_keys() {
         Duration::from_secs(60),
         || replica.is_master(),
     );
+    let promoted = Instant::now();
+    (nodes, replica, moved, kept, elsewhere, promoted)
+}
+
+/// A master killed right after a `CLUSTER MIGRATION IMPORT` handed slots
+/// over, before its deletion of their keys reached its replica. Its
+/// replica, promoted, used to keep the keys of the slots that had moved
+/// away for good: in `DBSIZE`, `SCAN`, its snapshots and the full syncs of
+/// its own replicas (#517). It remembers now that its master gave those
+/// slots away, and drops their keys once their owner claims them, two
+/// heartbeats after the promotion; every other key stays, and so does
+/// every write the new owner acknowledged.
+#[test]
+fn a_replica_promoted_after_its_master_handed_slots_over_drops_their_keys() {
+    let (nodes, replica, moved, kept, elsewhere, promoted) = promoted_after_a_handover(&[]);
     wait_until(
         "the promoted replica to drop the moved keys",
         Duration::from_secs(30),
         || replica.conn().cmd(&["DBSIZE"]).int() == kept.len() as i64,
     );
+    eprintln!(
+        "#517: the moved keys were gone {} ms after the promotion was seen",
+        promoted.elapsed().as_millis()
+    );
     // The drop may be split across the owner's heartbeats: each slot is
     // dropped once, so the messages add up to all of them.
     let log = replica.log();
-    let marker = "dropping the keys of ";
-    let dropped: usize = log
-        .lines()
-        .filter(|l| l.contains("slot(s) the old master gave away while"))
-        .filter_map(|l| {
-            let rest = &l[l.find(marker)? + marker.len()..];
-            rest.split(' ').next()?.parse::<usize>().ok()
-        })
-        .sum();
-    assert_eq!(dropped, 1001, "{log}");
+    assert!(log.contains(PROMOTED_WITH_GIVEN_AWAY), "{log}");
+    assert_eq!(given_away_dropped(&log), 1001, "{log}");
     let lost = not_as_written(&replica, &kept, "v");
     assert!(
         lost.is_empty(),
@@ -5428,6 +5477,31 @@ fn a_replica_promoted_after_its_master_handed_slots_over_drops_their_keys() {
             .unwrap_or_default()
             .contains("givenAwaySlots")
     });
+}
+
+/// The same, with a new owner of an earlier version, as in a rolling
+/// upgrade (`KIVIDB_TEST_NO_PENDING_UNCLAIMED`): one that does not say it
+/// leaves the slots of a handover under way out of its claims. Its claims
+/// cannot tell the promoted replica that the slots are not back with the
+/// old master, so the keys are kept, and that is logged.
+#[test]
+fn a_replica_keeps_the_keys_when_the_new_owner_runs_an_earlier_version() {
+    let (nodes, replica, moved, kept, _elsewhere, _) =
+        promoted_after_a_handover(&[("KIVIDB_TEST_NO_PENDING_UNCLAIMED", "1")]);
+    wait_until(
+        "the promoted replica to keep the moved keys, and say so",
+        Duration::from_secs(30),
+        || replica.log().contains(KEPT_FROM_EARLIER_VERSION),
+    );
+    let log = replica.log();
+    assert_eq!(given_away_dropped(&log), 0, "{log}");
+    assert_eq!(
+        replica.conn().cmd(&["DBSIZE"]).int(),
+        (moved.len() + kept.len()) as i64,
+        "{log}"
+    );
+    assert!(not_as_written(&replica, &kept, "v").is_empty());
+    assert!(not_as_written(&nodes[1], &moved, "new").is_empty());
 }
 
 /// A replica whose master gave no slot away drops nothing when it is
@@ -5466,18 +5540,36 @@ fn a_replica_whose_master_gave_nothing_away_drops_nothing_when_promoted() {
     assert!(!replica.log().contains("the old master gave away"));
 }
 
-/// Slots 0-20 given away by the source (to the second master) and taken
-/// back by it, with atomic imports, and the new values of their keys
-/// written on the source and acknowledged. The source's replica has heard
-/// of the first move (it is in its nodes.conf). Returns the cluster, the
-/// replica, and the keys, whose value is now `v3`.
-fn slots_given_away_and_back() -> (Vec<Node>, Node, Vec<String>) {
-    let (nodes, _) = form_cluster(3);
-    let replica = add_replica(&nodes, &nodes[0]);
+/// The round trip of the tests below. Slots 0-20 given away by the source
+/// (nodes[0], `m_env` its environment) to the second master (nodes[1]),
+/// whose writes to their keys (`v2`) are acknowledged; the source's replica
+/// has noted it (its nodes.conf). Every node runs with `extra`. Then the
+/// replica takes in none of the claims of the node `ignore` gives the index
+/// of (`KIVIDB_TEST_IGNORE_CLAIMS`), and the source imports the slots back.
+/// Returns the cluster, the replica, the keys, and the task id of the
+/// import back.
+fn slots_given_away_then_back(
+    extra: &[&str],
+    m_env: &[(&str, &str)],
+    ignore: usize,
+) -> (Vec<Node>, Node, Vec<String>, String) {
+    let (nodes, _) = form_cluster_of(vec![
+        Node::start_with_env(extra, m_env),
+        Node::start(extra),
+        Node::start(extra),
+    ]);
+    let replica = add_replica_with(
+        &nodes,
+        &nodes[0],
+        extra,
+        &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")],
+    );
     wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
     let keys = keys_in(0..=20, "rt", 200);
     set_all(&mut nodes[0].conn(), &keys, "v1");
-    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    wait_until("the replica to sync", Duration::from_secs(30), || {
+        nodes[0].conn().cmd(&["WAIT", "1", "1000"]).int() == 1
+    });
 
     let away = nodes[1]
         .conn()
@@ -5498,13 +5590,26 @@ fn slots_given_away_and_back() -> (Vec<Node>, Node, Vec<String>) {
     // failover right after the import back meets the import's own.
     std::thread::sleep(Duration::from_secs(4));
 
+    std::fs::write(replica.dir.join("ignore-claims"), nodes[ignore].id()).unwrap();
     let back = nodes[0]
         .conn()
         .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "20"])
         .text();
-    wait_import_completed(&nodes[0], &back);
-    set_all(&mut nodes[0].conn(), &keys, "v3");
-    (nodes, replica, keys)
+    assert_eq!(back.len(), 40, "{back}");
+    (nodes, replica, keys, back)
+}
+
+/// How many keys `node` has in the slots of `keys`.
+fn keys_in_their_slots(node: &Node, keys: &[String]) -> i64 {
+    let slots: std::collections::BTreeSet<u16> = keys.iter().map(|k| slot_of(k)).collect();
+    let mut c = node.conn();
+    slots
+        .iter()
+        .map(|slot| {
+            c.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot.to_string()])
+                .int()
+        })
+        .sum()
 }
 
 /// The keys of `keys` on `node` whose value is not `value`, once `node`
@@ -5522,16 +5627,34 @@ fn not_as_written_once_owned(node: &Node, keys: &[String], value: &str) -> Vec<S
     not_as_written(node, keys, value)
 }
 
+/// The slot ranges of the row of `CLUSTER NODES` on `on` that starts with
+/// `id`, as written there.
+fn slots_in_row(on: &Node, id: &str) -> Vec<String> {
+    on.conn()
+        .cmd(&["CLUSTER", "NODES"])
+        .text()
+        .lines()
+        .find(|l| l.starts_with(id))
+        .map(|l| l.split(' ').skip(8).map(String::from).collect())
+        .unwrap_or_default()
+}
+
 /// A slot given away and taken back, and the source's replica made master
-/// with `CLUSTER FAILOVER` at once (#517). The source refuses it a while,
-/// as it does after a handover away, until its replica has heard its claim
-/// of the slot; the replica, made master then, owns the slot and has every
-/// acknowledged write to it. A replica promoted before it heard, still
-/// taking the slot for the second master's, used to drop its keys, the only
-/// copy once the source followed it.
+/// with `CLUSTER FAILOVER` at once, before it has heard the source's claim
+/// of the slot (it takes none of the source's claims in, here). The source
+/// refuses the failover a while after the import, as it does after a
+/// handover away; the replica, promoted all the same, still takes the slot
+/// for the second master's. That one no longer claims it, so the replica
+/// keeps the slot's keys (#517): it used to drop them, once its old master
+/// had followed it the only copy. Once it hears the source's claim, every
+/// node agrees the source owns exactly the slots 0-20, with every
+/// acknowledged write.
 #[test]
 fn a_slot_given_away_and_back_keeps_its_keys_through_a_manual_failover() {
-    let (nodes, replica, keys) = slots_given_away_and_back();
+    let (nodes, replica, keys, back) = slots_given_away_then_back(&[], &[], 0);
+    wait_import_completed(&nodes[0], &back);
+    set_all(&mut nodes[0].conn(), &keys, "v3");
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
     let first = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
     let mut asked = Instant::now();
     wait_until("the replica to take over", Duration::from_secs(60), || {
@@ -5554,71 +5677,313 @@ fn a_slot_given_away_and_back_keeps_its_keys_through_a_manual_failover() {
         held_back || first.err().is_some(),
         "the first failover was not held back: {first:?}\n{refused}"
     );
-    // Long past the time a promoted replica waits before it drops a slot
-    // its old master gave away (a heartbeat and a TAKEOVER's answer).
-    std::thread::sleep(Duration::from_secs(14));
-    let replica_id = replica.id();
+    // The second master does not claim the slots: let go of, their keys
+    // kept. Once let go of, a slot is never dropped.
+    wait_until(
+        "the replica to let the slots go",
+        Duration::from_secs(20),
+        || replica.log().contains(LET_GO_GIVEN_AWAY),
+    );
+    let log = replica.log();
+    assert_eq!(given_away_dropped(&log), 0, "{log}");
+    assert_eq!(keys_in_their_slots(&replica, &keys), keys.len() as i64);
+
+    // The replica hears the source's claims again: the source owns the
+    // slots, and only those, in every view.
+    std::fs::write(replica.dir.join("ignore-claims"), "").unwrap();
+    let m_id = nodes[0].id();
     for n in [&nodes[1], &nodes[2], &replica] {
         wait_until(
-            "the slot's owner to be agreed",
-            Duration::from_secs(20),
-            || {
-                n.conn()
-                    .cmd(&["CLUSTER", "NODES"])
-                    .text()
-                    .lines()
-                    .any(|l| l.starts_with(&replica_id) && l.contains(" 0-"))
-            },
+            "the slots' owner to be agreed",
+            Duration::from_secs(30),
+            || slots_in_row(n, &m_id) == ["0-20"],
         );
     }
-    let lost = not_as_written(&replica, &keys, "v3");
+    let lost = not_as_written(&nodes[0], &keys, "v3");
     assert!(
         lost.is_empty(),
         "{} of {} acknowledged writes lost\n{}",
         lost.len(),
         keys.len(),
-        replica.log()
+        nodes[0].log()
+    );
+    assert_eq!(given_away_dropped(&replica.log()), 0);
+}
+
+/// What the source of the import back logs once it has taken the slots
+/// and holds its answer and claims back (`KIVIDB_TEST_TAKEOVER_LOST_MS`).
+const TAKEOVER_HELD_BACK: &str = "the TAKEOVER's reply and claim are held back";
+
+/// The import back: the source takes the slots over, saves them in
+/// nodes.conf, and then, before its answer or its claim has reached anyone
+/// (`KIVIDB_TEST_TAKEOVER_LOST_MS`), dies, once its replica has every key.
+/// The second master does not know whether it took the slots, and waits.
+fn kill_the_source_after_it_took_the_slots_back(
+    nodes: &mut [Node],
+    replica: &Node,
+    keys: &[String],
+) {
+    wait_until(
+        "the source to take the slots back",
+        Duration::from_secs(60),
+        || nodes[0].log().contains(TAKEOVER_HELD_BACK),
+    );
+    assert!(
+        std::fs::read_to_string(nodes[0].dir.join("nodes.conf"))
+            .unwrap()
+            .lines()
+            .any(|l| l.contains("myself") && l.split(' ').skip(8).any(|r| r.starts_with("0-"))),
+        "the source has not saved the slots"
+    );
+    wait_until(
+        "the replica to have every key the import brought",
+        Duration::from_secs(30),
+        || keys_in_their_slots(replica, keys) == keys.len() as i64,
+    );
+    nodes[0].kill();
+}
+
+/// A slot given away and taken back, the source killed once it has taken
+/// it back but before its answer or its claim got out, and its replica
+/// made master with `CLUSTER FAILOVER TAKEOVER` (#517). The second master
+/// does not know whether the source took the slot: it leaves the slot out
+/// of its claims until it does, which is once the source is marked FAIL
+/// and it claims the slot back. The replica, which takes it for the second
+/// master's, lets it go and keeps its keys; the second master has them too.
+#[test]
+fn a_slot_given_away_and_back_keeps_its_keys_through_a_takeover() {
+    let (mut nodes, replica, keys, _) =
+        slots_given_away_then_back(&[], &[("KIVIDB_TEST_TAKEOVER_LOST_MS", "60000")], 0);
+    kill_the_source_after_it_took_the_slots_back(&mut nodes, &replica, &keys);
+    wait_until(
+        "the replica to let the slots go",
+        Duration::from_secs(20),
+        || replica.log().contains(LET_GO_GIVEN_AWAY),
+    );
+    let _ = replica.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
+    wait_until("the replica to take over", Duration::from_secs(30), || {
+        replica.is_master()
+    });
+    wait_until(
+        "the second master to claim the slots back",
+        Duration::from_secs(60),
+        || {
+            nodes[1]
+                .log()
+                .contains("they are claimed here again at epoch")
+        },
+    );
+    // Well past the time a promoted replica begins to count claims.
+    std::thread::sleep(Duration::from_secs(3));
+    let log = replica.log();
+    assert_eq!(given_away_dropped(&log), 0, "{log}");
+    assert_eq!(
+        keys_in_their_slots(&replica, &keys),
+        keys.len() as i64,
+        "{log}"
+    );
+    let lost = not_as_written(&nodes[1], &keys, "v2");
+    assert!(lost.is_empty(), "{} lost on the second master", lost.len());
+    let lost = not_as_written_once_owned(&replica, &keys, "v2");
+    assert!(
+        lost.is_empty(),
+        "{} of {} acknowledged writes lost\n{log}",
+        lost.len(),
+        keys.len()
     );
 }
 
-/// A slot given away and taken back, the source killed at once, and its
-/// replica made master with `CLUSTER FAILOVER TAKEOVER` (#517). Whether or
-/// not it heard the source's claim first, it keeps the slot's keys, the
-/// only copy, with every acknowledged write: the second master, which it
-/// may still take for the owner, no longer claims the slot.
+/// The config epoch of the stopped `node`, in its nodes.conf.
+fn config_epoch_saved(node: &Node) -> u64 {
+    let conf = std::fs::read_to_string(node.dir.join("nodes.conf")).unwrap();
+    conf.lines()
+        .find(|l| l.split(' ').nth(2).is_some_and(|f| f.contains("myself")))
+        .and_then(|l| l.split(' ').nth(6)?.parse().ok())
+        .unwrap_or_else(|| panic!("no config epoch in:\n{conf}"))
+}
+
+/// `CLUSTER BUMPEPOCH` on `node`, once it has seen epoch `above`: its
+/// config epoch.
+fn bump_epoch_above(node: &Node, above: u64) -> u64 {
+    wait_until("the node to see the epoch", Duration::from_secs(20), || {
+        node.cluster_info("cluster_current_epoch")
+            .parse::<u64>()
+            .unwrap()
+            >= above
+    });
+    let r = node.conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    assert!(r.starts_with("BUMPED "), "{r}");
+    let epoch: u64 = node.cluster_info("cluster_my_epoch").parse().unwrap();
+    assert!(epoch > above, "{epoch} <= {above}");
+    epoch
+}
+
+/// The data-loss case a review of #517 found. The source (M) gave slots
+/// 0-20 to the second master (D), and D handed them back with an import
+/// into M. M took them over, saved them in nodes.conf, and died before its
+/// answer or its claim reached D or its replica (R). R was made master
+/// with `CLUSTER FAILOVER TAKEOVER`, still taking the slots for D's (here,
+/// it takes in none of D's claims until it is promoted). D waits, with no
+/// time limit, until M answers, its claim comes, or it is marked FAIL; it
+/// used to claim the slots all that time, and R dropped their keys some
+/// 11 s after its promotion. M then came back before D marked it FAIL,
+/// claimed the slots at its newer epoch without the imported data, and D
+/// deleted its copy: every copy was gone. Now D leaves the slots out of
+/// its claims while it waits, and R keeps the keys.
 #[test]
-fn a_slot_given_away_and_back_keeps_its_keys_through_a_takeover() {
-    let (mut nodes, replica, keys) = slots_given_away_and_back();
-    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
-    nodes[0].kill();
+fn a_slot_taken_back_by_a_master_that_died_and_returned_keeps_its_keys() {
+    // A node timeout long enough for M to come back before it is marked
+    // FAIL.
+    let extra = ["--cluster-node-timeout", "20000"];
+    let (mut nodes, replica, keys, _) =
+        slots_given_away_then_back(&extra, &[("KIVIDB_TEST_TAKEOVER_LOST_MS", "60000")], 1);
+    wait_until(
+        "D to save the handover under way",
+        Duration::from_secs(30),
+        || {
+            std::fs::read_to_string(nodes[1].dir.join("nodes.conf"))
+                .unwrap_or_default()
+                .contains("pendingHandovers")
+        },
+    );
+    kill_the_source_after_it_took_the_slots_back(&mut nodes, &replica, &keys);
     let r = replica.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
     assert!(r.is_ok(), "{r:?}");
     wait_until("the replica to take over", Duration::from_secs(10), || {
         replica.is_master()
     });
-    // Long past the time a promoted replica waits before it drops a slot
-    // its old master gave away.
-    std::thread::sleep(Duration::from_secs(14));
-    let count: i64 = keys
-        .iter()
-        .map(|k| slot_of(k))
-        .collect::<std::collections::BTreeSet<u16>>()
-        .iter()
-        .map(|slot| {
-            replica
-                .conn()
-                .cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot.to_string()])
-                .int()
-        })
-        .sum();
-    assert_eq!(count, keys.len() as i64, "{}", replica.log());
-    let lost = not_as_written_once_owned(&replica, &keys, "v3");
+    wait_until(
+        "the replica to note it was promoted with slots given away",
+        Duration::from_secs(10),
+        || replica.log().contains(PROMOTED_WITH_GIVEN_AWAY),
+    );
+    // R's epoch above the one M took the slots at, which no other node has
+    // heard of: R took over at one above the highest it had heard of, the
+    // same, and as two masters of one epoch, one of them would move above
+    // the other when M came back, M perhaps, and take R's slots.
+    let taken_at = config_epoch_saved(&nodes[0]);
+    let mut r_epoch: u64 = replica.cluster_info("cluster_my_epoch").parse().unwrap();
+    loop {
+        let other = bump_epoch_above(&nodes[2], r_epoch);
+        r_epoch = bump_epoch_above(&replica, other);
+        if other > taken_at {
+            break;
+        }
+    }
+
+    // R hears D now: D does not claim the slots, and R lets them go.
+    std::fs::write(replica.dir.join("ignore-claims"), "").unwrap();
+    wait_until(
+        "the replica to let the slots go",
+        Duration::from_secs(20),
+        || replica.log().contains(LET_GO_GIVEN_AWAY),
+    );
+    assert_eq!(given_away_dropped(&replica.log()), 0);
+
+    // M comes back, D has not marked it FAIL, and M claims the slots.
+    nodes[0].restart();
+    let m_id = nodes[0].id();
+    wait_until(
+        "D to take M for the slots' owner",
+        Duration::from_secs(30),
+        || slots_in_row(&nodes[1], &m_id).iter().any(|r| r == "0-20"),
+    );
+    eprintln!(
+        "#517: M came back with {} of the {} keys",
+        keys_in_their_slots(&nodes[0], &keys),
+        keys.len()
+    );
+    // Well past the time a promoted replica begins to count claims.
+    std::thread::sleep(Duration::from_secs(3));
+    let log = replica.log();
+    assert_eq!(given_away_dropped(&log), 0, "{log}");
+    assert_eq!(
+        keys_in_their_slots(&replica, &keys),
+        keys.len() as i64,
+        "{log}"
+    );
+    let lost = not_as_written_once_owned(&replica, &keys, "v2");
     assert!(
         lost.is_empty(),
-        "{} of {} acknowledged writes lost\n{}",
+        "{} of {} acknowledged writes lost\n{log}",
         lost.len(),
-        keys.len(),
-        replica.log()
+        keys.len()
+    );
+}
+
+/// The same, but it is D that restarts while it waits for M's answer. The
+/// slots of the handover under way are saved in its nodes.conf, and a
+/// restarted D still leaves them out of its claims, until it knows: here,
+/// once M is marked FAIL, and D claims them back. R, which takes in none of
+/// D's claims until it is promoted, lets them go and keeps the keys.
+#[test]
+fn a_slot_handed_back_by_a_master_that_restarted_keeps_its_keys() {
+    let extra = ["--cluster-node-timeout", "15000"];
+    let (mut nodes, replica, keys, _) =
+        slots_given_away_then_back(&extra, &[("KIVIDB_TEST_TAKEOVER_LOST_MS", "60000")], 1);
+    kill_the_source_after_it_took_the_slots_back(&mut nodes, &replica, &keys);
+    let conf = std::fs::read_to_string(nodes[1].dir.join("nodes.conf")).unwrap();
+    assert!(conf.contains("pendingHandovers"), "{conf}");
+    nodes[1].restart();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !nodes[1]
+        .log()
+        .contains("are left out of this node's claims until it knows")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the restarted D does not wait for M's answer:
+{}",
+            nodes[1].log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    wait_until("the replica to take over", Duration::from_secs(10), || {
+        replica.is_master()
+    });
+    wait_until(
+        "the replica to note it was promoted with slots given away",
+        Duration::from_secs(10),
+        || replica.log().contains(PROMOTED_WITH_GIVEN_AWAY),
+    );
+    std::fs::write(replica.dir.join("ignore-claims"), "").unwrap();
+    wait_until(
+        "the replica to let the slots go",
+        Duration::from_secs(20),
+        || replica.log().contains(LET_GO_GIVEN_AWAY),
+    );
+    assert_eq!(given_away_dropped(&replica.log()), 0);
+    // D settles the handover once M is marked FAIL: it claims the slots
+    // back, and no longer leaves them out.
+    wait_until(
+        "the restarted D to claim the slots back",
+        Duration::from_secs(90),
+        || {
+            nodes[1]
+                .log()
+                .contains("they are claimed here again at epoch")
+        },
+    );
+    let d_id = nodes[1].id();
+    wait_until(
+        "the slots to be D's in the replica's view",
+        Duration::from_secs(20),
+        || slots_in_row(&replica, &d_id).iter().any(|r| r == "0-20"),
+    );
+    wait_until("D to forget the handover", Duration::from_secs(10), || {
+        !std::fs::read_to_string(nodes[1].dir.join("nodes.conf"))
+            .unwrap_or_default()
+            .contains("pendingHandovers")
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    let log = replica.log();
+    assert_eq!(given_away_dropped(&log), 0, "{log}");
+    assert_eq!(
+        keys_in_their_slots(&replica, &keys),
+        keys.len() as i64,
+        "{log}"
     );
 }
 

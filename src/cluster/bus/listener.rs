@@ -230,6 +230,7 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_unclaims_pending,
         } => {
             // A PING from a node we do not know is answered — so it can see
             // we are alive — but it does not get itself added by pinging.
@@ -247,6 +248,7 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_unclaims_pending,
                     gossip,
                     &slot_claims,
                 );
@@ -265,6 +267,7 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_unclaims_pending,
         } => {
             // A PONG is a reply to something we sent. From a stranger it is
             // only acceptable as the answer to our own MEET — which the
@@ -281,6 +284,7 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_unclaims_pending,
                     gossip,
                     &slot_claims,
                 );
@@ -409,6 +413,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         sender_master_id,
         sender_hostname,
         sender_announced_client_port,
+        sender_unclaims_pending,
     } = msg
     {
         state.forgotten.write().remove(&sender_id);
@@ -428,6 +433,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_unclaims_pending,
             gossip,
             &slot_claims,
         );
@@ -448,6 +454,7 @@ fn apply_heartbeat(
     sender_master_id: Option<NodeId>,
     sender_hostname: String,
     sender_announced_client_port: u16,
+    sender_unclaims_pending: bool,
     gossip: Vec<GossipEntry>,
     slot_claims: &[crate::cluster::bus::SlotClaim],
 ) {
@@ -488,7 +495,7 @@ fn apply_heartbeat(
     }
     // A replica announces no slots; claims only ever come from masters.
     if sender_flags.contains(NodeFlags::MASTER) && !test_ignores_claims_of(&sender_id) {
-        state.apply_peer_slot_claims(sender_id, slot_claims);
+        state.apply_peer_slot_claims_from(sender_id, slot_claims, sender_unclaims_pending);
     }
     state.save_soon();
 }
@@ -676,6 +683,7 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,
+        sender_unclaims_pending: crate::cluster::unclaims_pending(),
         gossip,
         slot_claims: state.my_slot_claims(),
     }
@@ -771,6 +779,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_unclaims_pending: true,
             gossip,
             slot_claims: vec![],
         }
@@ -865,6 +874,7 @@ mod tests {
             None,
             String::new(),
             0,
+            true,
             vec![],
             &[SlotClaim {
                 start: 0,

@@ -143,16 +143,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of its own replicas, beside the destination's newer copy. A replica now
   remembers the slots another master's claim took from its master, in
   nodes.conf too, and once promoted deletes their keys in the background,
-  as a master deletes those of a slot it loses: once the slot's owner has
-  claimed it in a heartbeat taken in well after the old master's last word
-  (a heartbeat and the `TAKEOVER` answer timeout later). A slot that may
-  have come back to the old master unheard of keeps its keys: one the taker
-  stops claiming, or one only claimed before then; so does every slot the
-  promoted node owns. A master also refuses a failover to its replica for
-  3 s after an atomic import into it took its slots over, as it already
-  did after a handover away, so the replica hears its claim first. The
-  replication stream is unchanged, and earlier versions read nodes.conf as
-  before.
+  as a master deletes those of a slot it loses, once the slot's owner
+  claims it two heartbeats after the promotion. So that such a claim can
+  never be one made while the slot was being handed back to the old
+  master, a master now leaves the slots of a handover under way out of its
+  claims until it knows how the handover ended, however long that takes
+  and across a restart (in nodes.conf), and says so in its heartbeats; the
+  slots stay its own meanwhile, in every node's view. A slot its owner does
+  not claim keeps its keys, and so does one claimed by an owner of an
+  earlier version (logged), as in a rolling upgrade. A master also refuses
+  a failover to its replica for 3 s after an atomic import into it took
+  its slots over, as it already did after a handover away, so the replica
+  hears its claim first. The replication stream is unchanged, and earlier
+  versions read nodes.conf and the heartbeats as before.
 
 - **Consumer-group commands about one consumer no longer walk the whole
   pending list (#637).** `XINFO CONSUMERS` counted each consumer's pending

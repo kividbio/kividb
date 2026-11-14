@@ -308,6 +308,7 @@ pub(super) fn our_ping(state: &ClusterState) -> BusMessage {
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,
+        sender_unclaims_pending: crate::cluster::unclaims_pending(),
         gossip,
         slot_claims: state.my_slot_claims(),
     }
