@@ -350,6 +350,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KEYS` and `SCAN` still run alone, as before, so as not to see a script
   part-way through.
 
+- **`SINTER` of a big set with a small one costs the small set's size, not
+  the big one's (#759).** `SINTER`, `SINTERSTORE`, `SINTERCARD`, `SDIFF`,
+  `SDIFFSTORE` and `SUNION` copied every set they named out of the store
+  before working on the copies. They now read the sets in place, an
+  intersection walks the smallest set and looks its members up in the
+  others, a difference walks only the first set, and `SINTERCARD` stops at
+  its `LIMIT`. `SINTER` of a 20M-member set with a 4,096-member one went
+  from 2,555 ms to 2.3 ms (Redis 8.10.2: 4.7 ms), and `SINTERCARD` of the
+  two from 2,533 ms to 0.26 ms (Redis: 1.9 ms); at 1M members, 94.6 ms to
+  2.2 ms (Redis: 2.6 ms). Replies are the same as before.
+
 - **A full `SCAN … MATCH` over a large keyspace no longer trails Redis
   (#751).** Each call hashed every key of the shard it was in to find its
   page, visiting each key's entry, and matched each key byte by byte

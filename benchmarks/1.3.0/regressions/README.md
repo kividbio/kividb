@@ -20,6 +20,7 @@ added the same way (see [Adding a suite](#adding-a-suite)).
 | `02-growth-ping` | #752 / #780 | worst `PING` while 8M keys are loaded in 2,000-`SET` pipelines; Tokio, and io_uring with `--threads 1`; `FULL=1` adds 17.5M keys with `EX` |
 | `03-give-back` | #753 / #763 | RSS 1.5, 5 and 15 s after deleting a 3M-field hash, `HDEL` of 1M fields, and a mixed churn |
 | `04-long-commands` | #754 / #757 | `KEYS` over 2M keys, `SCAN COUNT 2000000`, `DEL` of a 3M-field hash, each with 4 `PING` probes; Tokio and io_uring |
+| `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one |
 
 ## Running it
 
@@ -329,3 +330,42 @@ What this run shows besides the gated gains:
   Tokio from 2.0 to 3.0 ms (and 0.7 to 1.5 ms on io_uring with one thread),
   while its worst PING fell from 112 to 9.7 ms.
 - `SCAN 0 MATCH user:99* COUNT 2000000` takes 112 ms instead of 254-265 ms.
+
+### Suite 14 (#759)
+
+Recorded 2026-11-15 on the same VM size (Azure Standard_D4s_v5, a fresh VM
+of the same image), `FULL=1 --only 14 --record`; the candidate is the fix's
+commit `a2cc71d5`, `cargo build --release`. Runs: `pr759-d4s_v5` (recorded)
+and `pr759-d4s_v5-rerun` (the noise check, every gate passed). About 3.5
+minutes with `FULL=1`, most of it loading 20M members into each engine.
+
+Medians of 5 timed runs (ms), recorded run:
+
+| N | command | v1.2.2 | candidate | Redis 8.10.2 | gate |
+|---|---|---:|---:|---:|---|
+| 1M | `SINTER big small` | 94.6 | 2.18 | 2.58 | rel 50% or 2 ms; keep 60% of gain; <= 2x Redis |
+| 1M | `SINTER small big` | 70.3 | 2.12 | 2.30 | same |
+| 1M | `SINTERCARD 2 big small` | 93.0 | 0.19 | 0.46 | rel 50% or 2 ms |
+| 1M | `... LIMIT 100` | 91.6 | 0.056 | 0.059 | rel 50% or 2 ms |
+| 1M | `SINTERSTORE dst big small` | 92.7 | 0.30 | 0.87 | rel 50% or 2 ms |
+| 1M | `SDIFF small big` | 69.7 | 1.95 | 2.56 | as `SINTER` |
+| 5M | `SINTER big small` | 534.3 | 2.27 | 3.48 | as above |
+| 5M | `SINTER small big` | 450.6 | 2.11 | 3.37 | |
+| 5M | `SINTERCARD 2 big small` | 529.7 | 0.24 | 1.55 | |
+| 5M | `... LIMIT 100` | 532.3 | 0.057 | 0.11 | |
+| 5M | `SINTERSTORE dst big small` | 532.2 | 0.35 | 2.15 | |
+| 5M | `SDIFF small big` | 449.1 | 2.12 | 3.85 | |
+| 20M | `SINTER big small` | 2,555 | 2.28 | 4.69 | |
+| 20M | `SINTER small big` | 2,431 | 2.08 | 4.37 | |
+| 20M | `SINTERCARD 2 big small` | 2,533 | 0.26 | 1.91 | |
+| 20M | `... LIMIT 100` | 2,531 | 0.056 | 0.13 | |
+| 20M | `SINTERSTORE dst big small` | 2,535 | 0.37 | 3.10 | |
+| 20M | `SDIFF small big` | 2,448 | 1.98 | 5.00 | |
+
+The replies (2,097 members at 1M and 20M, 2,098 at 5M; 1,998-1,999 for
+`SDIFF`) are the same on all three engines and gated exactly. The
+candidate's run-to-run spread between the two runs was -4 to +35 % on
+the count-only rows (0.05-0.37 ms: round-trip noise, hence no ratio or Redis
+gate on them) and -5 to +8 % on the rest. The time no longer depends on N:
+what is left is the round trip and redis-py building a Python set of ~2,000
+members.

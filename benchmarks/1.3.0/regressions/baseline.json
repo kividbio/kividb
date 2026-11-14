@@ -2326,6 +2326,954 @@
           "kind": "info"
         }
       ]
+    },
+    "14-sinter-big-small/default/1m_big_card": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_big_card",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1000000.0,
+        "candidate": 1000000.0,
+        "redis": 1000000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sdiff_small_big_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sdiff_small_big_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 69.7005,
+        "candidate": 1.9511,
+        "redis": 2.5627,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sdiff_small_big_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sdiff_small_big_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1999.0,
+        "candidate": 1999.0,
+        "redis": 1999.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sinter_big_small_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sinter_big_small_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 94.6175,
+        "candidate": 2.1805,
+        "redis": 2.581,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sinter_big_small_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sinter_big_small_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sinter_small_big_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sinter_small_big_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 70.2455,
+        "candidate": 2.1206,
+        "redis": 2.3049,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sinter_small_big_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sinter_small_big_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sintercard_limit_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sintercard_limit_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 91.5745,
+        "candidate": 0.056,
+        "redis": 0.0593,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sintercard_limit_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sintercard_limit_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 100.0,
+        "candidate": 100.0,
+        "redis": 100.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sintercard_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sintercard_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 93.0237,
+        "candidate": 0.1899,
+        "redis": 0.4639,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sintercard_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sintercard_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sinterstore_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sinterstore_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 92.6891,
+        "candidate": 0.3024,
+        "redis": 0.8662,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/1m_sinterstore_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "1m_sinterstore_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_big_card": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_big_card",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 5000000.0,
+        "candidate": 5000000.0,
+        "redis": 5000000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sdiff_small_big_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sdiff_small_big_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 449.1262,
+        "candidate": 2.1201,
+        "redis": 3.8524,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sdiff_small_big_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sdiff_small_big_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1998.0,
+        "candidate": 1998.0,
+        "redis": 1998.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sinter_big_small_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sinter_big_small_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 534.2741,
+        "candidate": 2.2695,
+        "redis": 3.4766,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sinter_big_small_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sinter_big_small_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2098.0,
+        "candidate": 2098.0,
+        "redis": 2098.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sinter_small_big_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sinter_small_big_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 450.6496,
+        "candidate": 2.109,
+        "redis": 3.3654,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sinter_small_big_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sinter_small_big_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2098.0,
+        "candidate": 2098.0,
+        "redis": 2098.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sintercard_limit_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sintercard_limit_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 532.271,
+        "candidate": 0.0566,
+        "redis": 0.1103,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sintercard_limit_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sintercard_limit_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 100.0,
+        "candidate": 100.0,
+        "redis": 100.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sintercard_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sintercard_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 529.6741,
+        "candidate": 0.238,
+        "redis": 1.5466,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sintercard_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sintercard_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2098.0,
+        "candidate": 2098.0,
+        "redis": 2098.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sinterstore_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sinterstore_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 532.2221,
+        "candidate": 0.349,
+        "redis": 2.1531,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/default/5m_sinterstore_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "default",
+      "metric": "5m_sinterstore_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2098.0,
+        "candidate": 2098.0,
+        "redis": 2098.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_big_card": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_big_card",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 20000000.0,
+        "candidate": 20000000.0,
+        "redis": 20000000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sdiff_small_big_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sdiff_small_big_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2447.9039,
+        "candidate": 1.9823,
+        "redis": 4.999,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sdiff_small_big_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sdiff_small_big_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1999.0,
+        "candidate": 1999.0,
+        "redis": 1999.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sinter_big_small_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sinter_big_small_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2554.522,
+        "candidate": 2.2803,
+        "redis": 4.6897,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sinter_big_small_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sinter_big_small_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sinter_small_big_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sinter_small_big_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2431.1903,
+        "candidate": 2.0816,
+        "redis": 4.3672,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sinter_small_big_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sinter_small_big_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sintercard_limit_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sintercard_limit_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2531.279,
+        "candidate": 0.0561,
+        "redis": 0.1246,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sintercard_limit_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sintercard_limit_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 100.0,
+        "candidate": 100.0,
+        "redis": 100.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sintercard_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sintercard_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2532.665,
+        "candidate": 0.2584,
+        "redis": 1.9124,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sintercard_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sintercard_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sinterstore_ms": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sinterstore_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2535.0056,
+        "candidate": 0.3693,
+        "redis": 3.1017,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 2
+        }
+      ]
+    },
+    "14-sinter-big-small/n20m/20m_sinterstore_reply": {
+      "suite": "14-sinter-big-small",
+      "config": "n20m",
+      "metric": "20m_sinterstore_reply",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2097.0,
+        "candidate": 2097.0,
+        "redis": 2097.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "a2cc71d5",
+        "label": "pr759-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
     }
   }
 }
