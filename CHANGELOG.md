@@ -121,6 +121,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`string.format('%d', x)` in a script takes an `x` with a fraction, as
+  Redis does (#747).** Scripts run on Lua 5.4, which failed with "number has
+  no integer representation" where Redis's Lua 5.1 cuts the number toward
+  zero: `string.format("%d%03d", t[1], t[2] / 1000)`, which
+  affinidi-messaging-mediator uses to store every message, failed. All of
+  `%d %i %o %u %x %X %c` now take such numbers in scripts and function
+  libraries, with Redis's results for flags, widths and numbers out of
+  range. Numbers also leave a script as on Redis: `1e20` is passed to a
+  command as `1e+20`, a reply out of the integer range is
+  `-9223372036854775808` (it was `9223372036854775807`), `cjson` writes 14
+  significant digits and `10 / 2` as `5`, and `cmsgpack` packs `10 / 2` as
+  an integer and `1.5` as a 32-bit float. The docs now say scripts run on
+  Lua 5.4 and list what differs from Redis, with workarounds
+  ([SCRIPTS.md](docs/SCRIPTS.md)).
+
 - **An atomic slot import that does not complete keeps the keys the node
   held of those slots before it (#745).** A canceled, failed or timed-out
   `CLUSTER MIGRATION IMPORT` deleted every key of its slots on the

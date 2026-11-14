@@ -2305,3 +2305,198 @@ fn a_ts_time_above_i64_max_is_refused_in_a_script() {
     ]);
     assert!(matches!(reply, RespValue::Int(5)), "{reply:?}");
 }
+
+/// `string.format`'s integer conversions take a number with a fraction and
+/// cut it toward zero, as Redis's Lua 5.1 does, where Lua 5.4 failed with
+/// "number has no integer representation" (#747). Scripts still run on Lua
+/// 5.4, and say so. The replies are Redis 8.10.2's for the same scripts.
+#[test]
+fn string_format_takes_fractions_for_integer_conversions_as_redis_does() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let bulk = |text: &str| RespValue::Bulk(text.as_bytes().to_vec());
+    let lowest = "-9223372036854775808";
+    let cases: Vec<(&str, RespValue)> = vec![
+        // The issue's table.
+        ("return string.format('%d', 1.5)", bulk("1")),
+        ("return string.format('%d', 3.0)", bulk("3")),
+        (
+            "return string.format('%d%03d', 1731571200, 123456 / 1000)",
+            bulk("1731571200123"),
+        ),
+        ("return string.format('%x', 255.9)", bulk("ff")),
+        ("return 7 / 2", RespValue::Int(3)),
+        // The differences that stay, and are documented.
+        ("return tostring(10 / 2)", bulk("5.0")),
+        ("return _VERSION", bulk("Lua 5.4")),
+        // Every integer conversion, flags, width and precision.
+        ("return string.format('%d', -1.5)", bulk("-1")),
+        ("return string.format('%i', 3.99)", bulk("3")),
+        ("return string.format('%o', 8.5)", bulk("10")),
+        ("return string.format('%u', 3.5)", bulk("3")),
+        ("return string.format('%X', 255.9)", bulk("FF")),
+        (
+            "return string.format('%c%c%c', 76.1, 117.9, 97)",
+            bulk("Lua"),
+        ),
+        (
+            "return string.format('%3c|%-3c|', 72.5, 72.5)",
+            bulk("  H|H  |"),
+        ),
+        ("return string.format('%+d % d', 3.5, 3.5)", bulk("+3  3")),
+        (
+            "return string.format('%#x %#o', 255.5, 8.5)",
+            bulk("0xff 010"),
+        ),
+        (
+            "return string.format('%.3d|%-6d|%06d', 7.7, 7.7, -7.7)",
+            bulk("007|7     |-00007"),
+        ),
+        ("return string.format('%08.3d', -7.5)", bulk("    -007")),
+        ("return string.format('%.0d', 0.5)", bulk("")),
+        ("return string.format('%%%d%%', 5.5)", bulk("%5%")),
+        ("return string.format('%d', '12.7')", bulk("12")),
+        ("return string.format('%d', 1.5, 'extra')", bulk("1")),
+        ("return ('%d'):format(1.5)", bulk("1")),
+        // Other conversions are Lua 5.4's, beside the integer ones.
+        (
+            "return string.format('%05.1f|%d|%s', 1.25, 2.5, 'x')",
+            bulk("001.2|2|x"),
+        ),
+        (
+            "return string.format('%5.2s|%d', 'abc', 9.9)",
+            bulk("   ab|9"),
+        ),
+        // Out of range, as Redis gives it.
+        ("return string.format('%d', 2^63)", bulk(lowest)),
+        ("return string.format('%d', 1e20)", bulk(lowest)),
+        ("return string.format('%d', -1e20)", bulk(lowest)),
+        ("return string.format('%d', 0/0)", bulk(lowest)),
+        ("return string.format('%x', 2^63)", bulk("8000000000000000")),
+        ("return string.format('%x', 1e20)", bulk("0")),
+        ("return string.format('%x', -1.5)", bulk("ffffffffffffffff")),
+        (
+            "return string.format('%u', -1.5)",
+            bulk("18446744073709551615"),
+        ),
+        ("return string.format('%c', 300.5)", bulk(",")),
+        ("return string.format('a%cb', 0.5)", bulk("ab")),
+        // affinidi-messaging-mediator's store_message: TIME's seconds and
+        // microseconds as milliseconds.
+        (
+            "local t = redis.call('TIME') \
+             local ms = string.format('%d%03d', t[1], t[2] / 1000) \
+             return #ms == #t[1] + 3 and ms:sub(1, #t[1]) == t[1]",
+            RespValue::Int(1),
+        ),
+    ];
+    for (script, expected) in cases {
+        assert_eq!(c.cmds(&["EVAL", script, "0"]), expected, "{script}");
+    }
+    // Errors stay Lua's, for the argument at fault.
+    for (script, message) in [
+        (
+            "return string.format('%d %d', 1.5)",
+            "bad argument #3 to 'format' (no value)",
+        ),
+        (
+            "return string.format('%d %d', 1.5, 'x')",
+            "bad argument #3 to 'format' (number expected, got string)",
+        ),
+    ] {
+        let reply = c.cmds(&["EVAL", script, "0"]);
+        assert!(reply.as_error().contains(message), "{script}: {reply:?}");
+    }
+
+    // The same in a function library, as the mediator loads its own.
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    let load = c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=lib747\n\
+         redis.register_function('store_time', function(keys, args)\n\
+           local time = redis.call('TIME')\n\
+           local ms = string.format('%d%03d', time[1], time[2] / 1000)\n\
+           return {ms, string.format('%d', args[1] / 1000)}\n\
+         end)",
+    ]);
+    assert_eq!(load.as_str(), "lib747");
+    let RespValue::Array(reply) = c.cmds(&["FCALL", "store_time", "0", "123456"]) else {
+        panic!("FCALL store_time");
+    };
+    assert_eq!(reply[1], bulk("123"));
+    assert!(
+        matches!(&reply[0], RespValue::Bulk(ms) if ms.len() == 13),
+        "{reply:?}"
+    );
+    c.cmds(&["FUNCTION", "FLUSH"]);
+}
+
+/// Numbers leave a script as Redis's leave one (#747): written into a
+/// command's arguments as Redis writes them, cut to the lowest integer as a
+/// reply when out of range, with 14 digits from `cjson`, and as integers or
+/// 32-bit floats from `cmsgpack` when they are those.
+#[test]
+fn numbers_leave_a_script_as_redis_s_do() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let bulk = |text: &str| RespValue::Bulk(text.as_bytes().to_vec());
+    let arguments = [
+        ("1e20", "1e+20"),
+        ("2^63", "9223372036854776000"),
+        ("2^62", "4611686018427387904"),
+        ("10 / 2", "5"),
+        ("-1e-7", "-1e-7"),
+        ("1.5e300", "1.5e+300"),
+        ("0.00001", "0.00001"),
+        ("1/3", "0.3333333333333333"),
+        ("1/0", "inf"),
+        ("-1/0", "-inf"),
+    ];
+    for (number, expected) in arguments {
+        let script =
+            format!("redis.call('SET', 'lua747', {number}) return redis.call('GET', 'lua747')");
+        assert_eq!(c.cmds(&["EVAL", &script, "0"]), bulk(expected), "{script}");
+    }
+    let cases: Vec<(&str, RespValue)> = vec![
+        (
+            "return {1.9, -1.9, 2^62, 1e30, math.huge, 0/0}",
+            RespValue::Array(vec![
+                RespValue::Int(1),
+                RespValue::Int(-1),
+                RespValue::Int(1 << 62),
+                RespValue::Int(i64::MIN),
+                RespValue::Int(i64::MIN),
+                RespValue::Int(i64::MIN),
+            ]),
+        ),
+        (
+            "return cjson.encode({a = 1/3})",
+            bulk(r#"{"a":0.33333333333333}"#),
+        ),
+        (
+            "return cjson.encode({1, 2.5, 10/2, 100/3, 1e13, 12345678901234.5})",
+            bulk("[1,2.5,5,33.333333333333,10000000000000,12345678901234]"),
+        ),
+        (
+            "return cmsgpack.pack(1.5, 10/2, 2^40, 0.1)",
+            RespValue::Bulk(vec![
+                0xca, 0x3f, 0xc0, 0, 0,    // 1.5, a 32-bit float
+                0x05, // 5, an integer
+                0xcf, 0, 0, 1, 0, 0, 0, 0, 0, // 2^40, an integer
+                0xcb, 0x3f, 0xb9, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a, // 0.1
+            ]),
+        ),
+        (
+            "return cmsgpack.unpack(cmsgpack.pack(1.5)) * 2",
+            RespValue::Int(3),
+        ),
+    ];
+    for (script, expected) in cases {
+        assert_eq!(c.cmds(&["EVAL", script, "0"]), expected, "{script}");
+    }
+}

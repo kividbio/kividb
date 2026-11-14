@@ -24,6 +24,14 @@ If you aren't sure whether your application runs scripts, run
 `INFO commandstats` on your Redis and look for `cmdstat_eval`,
 `cmdstat_evalsha` and `cmdstat_fcall`.
 
+Scripts and function libraries run on Lua 5.4, where Redis runs Lua 5.1.
+Most move over unchanged, and `string.format('%d', x)` takes an `x` with a
+fraction as on Redis. One thing to look for: a number divided with `/` is a
+float, written `5.0` and not `5`, so a key or a value built with `..` or
+`tostring` from a division differs. Wrap the division in `math.floor(...)`
+or format it with `string.format('%d', ...)`. The other differences, with
+workarounds, are in [SCRIPTS.md](SCRIPTS.md#lua-54-and-how-it-differs-from-rediss-lua-51).
+
 ## 2. Port and network
 
 - **KiviDB listens on 6380, not 6379**, so the two can run side by side
