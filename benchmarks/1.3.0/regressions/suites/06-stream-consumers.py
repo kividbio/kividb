@@ -26,7 +26,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import Suite, Config, KEEP_IMPROVEMENT, rel, info, scaled, median  # noqa: E402
+from suite import Suite, Config, KEEP_IMPROVEMENT, rel, info, bound, scaled, median  # noqa: E402
 from nodes import redis_tool  # noqa: E402
 
 S = Suite("06-stream-consumers", [Config("pel")])
@@ -47,14 +47,18 @@ def bench_under_poll(port, key, n):
     import redis
     stop = threading.Event()
     polls = []
+    errors = []
 
     def poll():
-        c = redis.Redis(port=port)
-        while not stop.is_set():
-            t = time.perf_counter()
-            c.execute_command("XINFO", "CONSUMERS", "polled", "g")
-            polls.append((time.perf_counter() - t) * 1000)
-            stop.wait(0.05)
+        try:
+            c = redis.Redis(port=port)
+            while not stop.is_set():
+                t = time.perf_counter()
+                c.execute_command("XINFO", "CONSUMERS", "polled", "g")
+                polls.append((time.perf_counter() - t) * 1000)
+                stop.wait(0.05)
+        except BaseException as e:  # a dead poller would leave the rate below unpolled
+            errors.append(e)
 
     th = threading.Thread(target=poll, daemon=True)
     th.start()
@@ -63,6 +67,9 @@ def bench_under_poll(port, key, n):
                           "XADD", key, "*", "f", "v"], capture_output=True, text=True, timeout=900).stdout
     stop.set()
     th.join()
+    if errors:
+        raise RuntimeError("the XINFO CONSUMERS poller died after %d polls, so the XADD rate was not "
+                           "measured under polling: %r" % (len(polls), errors[0]))
     out = out.replace("\r", "\n")
     rps = float(re.findall(r"throughput summary: ([\d.]+) requests per second", out)[-1])
     lat = re.search(r"latency summary \(msec\):\s*\n\s*avg\s+min\s+p50\s+p95\s+p99\s+max\s*\n\s*([\d.\s]+)", out)
@@ -110,7 +117,7 @@ def run(ctx):
     ctx.raw["other"] = r
     ctx.emit("xadd_other_stream_rps", r["rps"], "req/s", "higher", gate=rel(25))
     ctx.emit("xadd_other_stream_max_ms", r["max"], "ms", "lower", gate=info())
-    ctx.emit("xinfo_polls", r["polls"], "calls", "higher", gate=info())
+    ctx.emit("xinfo_polls", r["polls"], "calls", "higher", gate=bound(min=5))
 
 
 if __name__ == "__main__":

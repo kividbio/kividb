@@ -29,7 +29,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, THROUGHPUT, EXACT, rel, bound, info, vs_v1_2_2, median, scaled)  # noqa: E402
+from suite import (Suite, Config, THROUGHPUT, EXACT, rel, bound, info, jitter, vs_v1_2_2, median, scaled)  # noqa: E402
 from probe import Probe  # noqa: E402
 
 RUNS = 3
@@ -110,15 +110,15 @@ def run(ctx):
         ctx.emit(case + "_cmd_ms", median(cmd), "ms", "lower", gate=gate, samples=cmd)
         if tokio:
             # Off the driver: no PING may wait more than 20 ms (the command takes 130-300 ms).
-            ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=bound(max=20), samples=worst)
-            ctx.emit(case + "_worst_ping_max_ms", max(worst), "ms", "lower", gate=bound(max=20))
+            ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=jitter(bound(max=20)), samples=worst)
+            ctx.emit(case + "_worst_ping_max_ms", max(worst), "ms", "lower", gate=jitter(bound(max=20)))
         else:
             # How many of the 4 probes share the command's ring is chance (0 to 4), so the worst
             # over all probes is shown only. The gate is on the probe that waited least: a long
             # command must not hold up every connection, as it does on Redis.
-            ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=info(), samples=worst)
+            ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=jitter(info()), samples=worst)
             least = [min(r["each_ms"]) for r in runs]
-            ctx.emit(case + "_least_worst_ping_ms", median(least), "ms", "lower", gate=rel(50, abs=10),
+            ctx.emit(case + "_least_worst_ping_ms", median(least), "ms", "lower", gate=jitter(rel(50, abs=10)),
                      samples=least)
         ctx.emit(case + "_probes_stalled", median([r["stalled"] for r in runs]), "probes", "lower", gate=info())
         gate = EXACT if case in ("keys", "del") else info()
