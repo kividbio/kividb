@@ -3,6 +3,10 @@
 </p>
 
 <p align="center">
+  <b>English</b> · <a href="README.zh.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/kividbio/kividb/actions/workflows/ci.yml"><img src="https://github.com/kividbio/kividb/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI"></a>
   <a href="https://github.com/kividbio/kividb/releases/latest"><img src="https://img.shields.io/github/v/release/kividbio/kividb?sort=semver" alt="Latest release"></a>
   <a href="https://hub.docker.com/r/kividb/kividb"><img src="https://img.shields.io/docker/pulls/kividb/kividb" alt="Docker pulls"></a>
