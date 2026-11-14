@@ -1882,7 +1882,6 @@ impl Config {
             | "io-threads-do-reads"
             | "lazyfree-lazy-eviction"
             | "lazyfree-lazy-server-del"
-            | "lazyfree-lazy-user-del"
             | "no-appendfsync-on-rewrite"
             | "proc-title-template"
             | "rdbcompression"
@@ -1936,6 +1935,7 @@ impl Config {
                                 | "aof-ack-after-write"
                                 | "maxclients"
                                 | "lazyfree-lazy-expire"
+                                | "lazyfree-lazy-user-del"
                                 | "latency-tracking"
                                 | "latency-tracking-info-percentiles"
                                 | "rdbchecksum"
@@ -2289,15 +2289,18 @@ mod config_file_tests {
         }
     }
 
-    /// `lazyfree-lazy-expire` and `latency-tracking` from a config file are
-    /// set, as `CONFIG SET` sets them, and not reported as having no
-    /// effect: they have one (#232). A value other than yes or no is
-    /// refused, there and in the other `lazyfree-*` directives.
+    /// `lazyfree-lazy-expire`, `lazyfree-lazy-user-del` (#754) and
+    /// `latency-tracking` from a config file are set, as `CONFIG SET` sets
+    /// them, and not reported as having no effect: they have one (#232). A
+    /// value other than yes or no is refused, there and in the other
+    /// `lazyfree-*` directives.
     #[test]
     fn lazyfree_lazy_expire_and_latency_tracking_are_applied_from_the_file() {
         // Only to what they are already: other tests of this process go by
         // them. tests/expired_propagation.rs sets `no` from a file.
-        let (_, warnings) = load("lazyfree-lazy-expire YES\nlatency-tracking yes\n").unwrap();
+        let (_, warnings) =
+            load("lazyfree-lazy-expire YES\nlazyfree-lazy-user-del no\nlatency-tracking yes\n")
+                .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         for bad in [
             "lazyfree-lazy-expire maybe\n",

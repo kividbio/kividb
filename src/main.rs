@@ -633,6 +633,7 @@ fn run_tokio(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let threads = config.resolve_threads();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
+        .thread_keep_alive(commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()?
         .block_on(async_main_tokio(config, started_at))

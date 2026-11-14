@@ -82,6 +82,7 @@ static ALLOCATOR: memory_use::Counting = memory_use::Counting;
 
 pub static RUNTIME_MAXMEMORY: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
 /// Entry point for integration tests — starts a tokio server on the given
 /// config and blocks the calling thread. Meant to run inside a thread::spawn.
 pub fn run_for_test(config: config::Config) {
@@ -106,6 +107,7 @@ pub fn run_for_test(config: config::Config) {
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_keep_alive(crate::commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()
         .unwrap()

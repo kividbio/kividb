@@ -1333,7 +1333,9 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             // Settings of Redis's that take yes or no: remembered, and in
             // effect where KiviDB has what they set (`lazyfree-lazy-expire`
             // decides whether a key that expires is propagated as `UNLINK`
-            // or `DEL`; `latency-tracking`, whether `INFO latencystats`
+            // or `DEL`; `lazyfree-lazy-user-del`, whether `DEL` frees a large
+            // value in the background, as `UNLINK` does (#754);
+            // `latency-tracking`, whether `INFO latencystats`
             // reports; `rdbchecksum no`, that an RDB file's checksum is not
             // checked as it is loaded). Anything else is refused, as Redis
             // refuses it.
