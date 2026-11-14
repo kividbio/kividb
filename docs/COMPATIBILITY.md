@@ -109,6 +109,15 @@ other files:
 - The default build has no Lua. The scripting commands return an error
   there; use the `lua` or `full` build for job queues and anything else that
   runs scripts.
+- Scripts run on **Lua 5.4**, not Redis's Lua 5.1. `string.format('%d')`
+  and the other integer conversions take numbers with a fraction as 5.1
+  does, and numbers are passed to commands, returned, and encoded by
+  `cjson` and `cmsgpack` as Redis does. What stays 5.4: `/` gives a float
+  that is written with `.0` (`tostring(10 / 2)` is `"5.0"`, so keys built
+  with `..` from a division differ; use `math.floor` or
+  `string.format('%d')`), integers are exact 64-bit numbers, and 5.4's
+  syntax (`//`, bitwise operators, `goto`) and `table.unpack` are there.
+  The full list, with workarounds: [SCRIPTS.md](SCRIPTS.md#lua-54-and-how-it-differs-from-rediss-lua-51).
 - `save <points>` has no effect: KiviDB doesn't snapshot on a schedule. Use
   the AOF or `BGSAVE`.
 - `appendfsync no` is taken as `everysec`; `always` and `everysec` do what

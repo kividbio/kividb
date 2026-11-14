@@ -1375,6 +1375,16 @@ fn msgpack_encode(val: &LuaValue, buf: &mut Vec<u8>, depth: u32) {
         LuaValue::Boolean(false) => buf.push(0xc2),
         LuaValue::Boolean(true) => buf.push(0xc3),
         LuaValue::Integer(n) => msgpack_encode_int(*n, buf),
+        // As Redis's cmsgpack (#747): a number with an integer value is
+        // written as an integer (`10 / 2` is 5, not 5.0), and a float a
+        // 32-bit one holds exactly as one.
+        LuaValue::Number(f) if (-TWO_TO_63..TWO_TO_63).contains(f) && f.trunc() == *f => {
+            msgpack_encode_int(*f as i64, buf)
+        }
+        LuaValue::Number(f) if f64::from(*f as f32) == *f => {
+            buf.push(0xca);
+            buf.extend_from_slice(&(*f as f32).to_bits().to_be_bytes());
+        }
         LuaValue::Number(f) => {
             buf.push(0xcb);
             buf.extend_from_slice(&f.to_bits().to_be_bytes());
@@ -2261,6 +2271,15 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
+    // `string.format` with Lua 5.1's integer conversions, as Redis's
+    // scripts have them (#747): see [`super::lua_format`].
+    // SAFETY: the state has the `string` library, and the closure leaves
+    // the stack as it found it.
+    unsafe {
+        lua.exec_raw::<()>((), |state| super::lua_format::install(state))
+            .unwrap();
+    }
+
     // A table raised by `error` is kept with its `err` and the line, as
     // Redis's error handler reads one: see [`remember_error_table`]. `pcall`
     // and `assert` are Redis's (#90).
@@ -2823,7 +2842,15 @@ fn lua_to_json_value(lua: &Lua, val: &LuaValue, depth: i64) -> LuaResult<serde_j
                     "Cannot serialise number: NaN/Inf".into(),
                 ));
             }
-            Ok(serde_json::Number::from_f64(*n)
+            // As Redis's cjson writes a number, with 14 significant digits
+            // (#747): `1/3` is 0.33333333333333, and `10 / 2` is 5, not
+            // 5.0. (What `%.14g` writes with an exponent, as `1e+20`, is
+            // written here as serde_json writes it, `1e20`: the same number.)
+            let n: f64 = format!("{n:.13e}").parse().unwrap_or(*n);
+            if n.trunc() == n && n.abs() < 1e14 {
+                return Ok(serde_json::Value::Number((n as i64).into()));
+            }
+            Ok(serde_json::Number::from_f64(n)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null))
         }
@@ -3148,7 +3175,7 @@ fn lua_to_resp_inner(
             resp_null_for(protocol.client)
         }),
         LuaValue::Integer(n) => Ok(resp_integer(n)),
-        LuaValue::Number(n) => Ok(resp_integer(n as i64)),
+        LuaValue::Number(n) => Ok(resp_integer(lua_number_reply(n))),
         LuaValue::String(s) => Ok(resp_bulk(s.as_bytes().as_ref())),
         LuaValue::Table(t) => {
             let eff_resp = protocol.client;
@@ -3324,18 +3351,65 @@ fn strip_shebang_for_lua(body: &str) -> String {
     }
 }
 
-/// Format a Lua `number` for `redis.call` argv (must preserve `0.01` for `DEBUG SLEEP`, etc.).
-#[inline]
+/// 2^63, as a float: where a float stops fitting in an `i64`.
+const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// A Lua float as `redis.call` passes it to a command, as Redis writes one
+/// (#747): an integer within 2^62 in plain digits, and anything else as its
+/// shortest round-trip digits, in plain notation while that stays short
+/// (`1000000000000000.5`, `9223372036854776000`, `0.00001`) and in
+/// exponent notation past that (`1e+20`, `1e-7`). `0.01` stays `0.01`, for
+/// sub-second sleeps. (An integer, Lua 5.4's other kind of number, is
+/// written in plain digits.)
 fn lua_float_redis_arg(n: f64) -> Vec<u8> {
-    if !n.is_finite() {
-        return b"0".to_vec();
+    const LIMIT: f64 = 4_611_686_018_427_387_904.0; // 2^62
+    if (-LIMIT..=LIMIT).contains(&n) && n.trunc() == n {
+        return (n as i64).to_string().into_bytes();
     }
-    // Redis uses integer digits when the value is integral (INCRBY args, scores as ints).
-    // Truncating every float to `i64` breaks sub-second sleeps: `0.01 as i64` → `"0"`.
-    if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-        ((n as i64).to_string()).into_bytes()
+    let sign = if n.is_sign_negative() { "-" } else { "" };
+    if n.is_nan() {
+        return format!("{sign}nan").into_bytes();
+    }
+    if n.is_infinite() {
+        return format!("{sign}inf").into_bytes();
+    }
+    // The shortest digits that read back as `n`, and the power of ten of
+    // the first: "1.5e300" is digits "15", exponent 300.
+    let scientific = format!("{:e}", n.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let count = digits.len() as i32;
+    // The power of ten of the last digit.
+    let last = exponent - (count - 1);
+    let magnitude = exponent.abs();
+    let text = if last >= 0 && magnitude < count + 7 {
+        format!("{digits}{}", "0".repeat(last as usize))
+    } else if last < 0 && (last > -7 || magnitude < 4) {
+        let point = count + last;
+        if point <= 0 {
+            format!("0.{}{digits}", "0".repeat((-point) as usize))
+        } else {
+            let (whole, fraction) = digits.split_at(point as usize);
+            format!("{whole}.{fraction}")
+        }
     } else {
-        n.to_string().into_bytes()
+        let (first, rest) = digits.split_at(1);
+        let point = if rest.is_empty() { "" } else { "." };
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        format!("{first}{point}{rest}e{exponent_sign}{magnitude}")
+    };
+    format!("{sign}{text}").into_bytes()
+}
+
+/// A Lua float as an integer reply: cut toward zero, as Redis's
+/// `(long long)` cast does on x86-64, which gives the lowest integer for
+/// what does not fit (NaN, infinity, 1e30) (#747).
+fn lua_number_reply(n: f64) -> i64 {
+    if (-TWO_TO_63..TWO_TO_63).contains(&n) {
+        n as i64
+    } else {
+        i64::MIN
     }
 }
 
