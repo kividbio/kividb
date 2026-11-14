@@ -1679,21 +1679,26 @@ impl ClusterState {
     /// our current config_epoch. Used by the heartbeat task to populate
     /// outgoing PING/PONG messages.
     pub fn my_slot_claims(&self) -> Vec<crate::cluster::bus::SlotClaim> {
+        self.slot_claims_of(self.myself())
+    }
+
+    /// The slots `owner` owns in this node's view, as contiguous ranges,
+    /// paired with its config epoch in this node's view: this node's own
+    /// claims ([`Self::my_slot_claims`]), or what a replica standing for
+    /// election claims for its master (#524, [`Self::cast_vote`]).
+    pub fn slot_claims_of(&self, owner: NodeId) -> Vec<crate::cluster::bus::SlotClaim> {
         if !self.enabled {
             return vec![];
         }
         let my_epoch = {
             let nodes = self.nodes.read();
-            nodes
-                .get(&self.myself())
-                .map(|n| n.config_epoch)
-                .unwrap_or(0)
+            nodes.get(&owner).map(|n| n.config_epoch).unwrap_or(0)
         };
         let slots = self.slots.read();
         let mut out = Vec::new();
         let mut start: Option<usize> = None;
         for i in 0..CLUSTER_SLOTS {
-            let owned = matches!(slots[i], Some(o) if o == self.myself());
+            let owned = matches!(slots[i], Some(o) if o == owner);
             match (start, owned) {
                 (None, true) => start = Some(i),
                 (Some(s), false) => {
@@ -2296,13 +2301,22 @@ impl ClusterState {
     /// * the epoch is not behind the cluster's, and we have not voted in it —
     ///   one vote per epoch is what makes two winners impossible;
     /// * we have not voted for another replica of the same master within the
-    ///   last two node timeouts.
+    ///   last two node timeouts;
+    /// * none of the slots the candidate `claims` for its master, if the
+    ///   request says (an automatic failover's, from this version on), has
+    ///   an owner here other than that master at a newer config epoch than
+    ///   the claim's, as in Redis (#524). A replica that has not heard that
+    ///   its master gave a slot away, in a slot handover or a failover,
+    ///   would claim it at the election's epoch once promoted, newer than
+    ///   the owner's, and the owner's acknowledged writes to it would be
+    ///   lost.
     pub fn cast_vote(
         &self,
         candidate: NodeId,
         master_id: NodeId,
         request_epoch: u64,
         force: bool,
+        claims: Option<&[crate::cluster::bus::SlotClaim]>,
     ) -> bool {
         if !self.enabled {
             return false;
@@ -2333,6 +2347,16 @@ impl ClusterState {
             return false;
         }
         if request_epoch < self.current_epoch.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(claims) = claims
+            && let Some(why) = self.newer_owner_of_claimed(master_id, claims)
+        {
+            log_info!(
+                "Cluster: Not voting for {} to take over from {}: {why}",
+                node_id_str(&candidate),
+                node_id_str(&master_id)
+            );
             return false;
         }
         // Taken before `handoff_holds` and the tasks of `slot_migrations`
@@ -2386,6 +2410,38 @@ impl ClusterState {
                 return true;
             }
         }
+    }
+
+    /// Of the slots a candidate `claims` for `master_id`, the first that
+    /// another node owns here at a newer config epoch than the claim's, and
+    /// why it is refused: see [`Self::cast_vote`].
+    fn newer_owner_of_claimed(
+        &self,
+        master_id: NodeId,
+        claims: &[crate::cluster::bus::SlotClaim],
+    ) -> Option<String> {
+        let epochs: AHashMap<NodeId, u64> = {
+            let nodes = self.nodes.read();
+            nodes.iter().map(|(id, n)| (*id, n.config_epoch)).collect()
+        };
+        let slots = self.slots.read();
+        for claim in claims {
+            let end = claim.end.min((CLUSTER_SLOTS - 1) as u16);
+            for slot in claim.start..=end {
+                if let Some(owner) = slots[slot as usize]
+                    && owner != master_id
+                    && let Some(&epoch) = epochs.get(&owner)
+                    && epoch > claim.epoch
+                {
+                    return Some(format!(
+                        "it claims slot {slot} at epoch {}, and {} owns it at epoch {epoch}",
+                        claim.epoch,
+                        node_id_str(&owner)
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Begin an election to replace `master_id`. Returns the new epoch. Bumps
@@ -3926,8 +3982,76 @@ mod tests {
         let (cs, a, _b) = three_master_cluster();
         let replica = add_replica(&cs, a);
 
-        assert!(!cs.cast_vote(replica, a, 5, false), "master is healthy");
-        assert!(cs.cast_vote(replica, a, 5, true), "manual failover");
+        assert!(
+            !cs.cast_vote(replica, a, 5, false, None),
+            "master is healthy"
+        );
+        assert!(cs.cast_vote(replica, a, 5, true, None), "manual failover");
+    }
+
+    /// A vote is refused to a candidate that claims, in an automatic
+    /// failover's request, a slot this node knows a newer owner of: a slot
+    /// its master gave away, in a handover or a failover it has not heard of
+    /// (#524). Promoted, it would claim the slot at the election's epoch,
+    /// newer than the owner's, and the owner's acknowledged writes to it
+    /// would be lost. A claim at the owner's epoch or newer, of its
+    /// master's own slots or of slots no one owns, is not refused; nor is a
+    /// request without claims, as an earlier version sends it.
+    #[test]
+    fn no_vote_for_a_candidate_claiming_a_slot_with_a_newer_owner() {
+        let claim = |start, end, epoch| crate::cluster::bus::SlotClaim { start, end, epoch };
+        let (cs, a, b) = three_master_cluster();
+        let me = cs.myself();
+        let replica = add_replica(&cs, a);
+        {
+            let mut nodes = cs.nodes.write();
+            nodes.get_mut(&a).unwrap().mark_failed(now_ms());
+            nodes.get_mut(&a).unwrap().config_epoch = 3;
+            nodes.get_mut(&b).unwrap().config_epoch = 7;
+            nodes.get_mut(&me).unwrap().config_epoch = 5;
+        }
+        // `b` has taken 5461-5500 from `a`, in this node's view.
+        {
+            let mut slots = cs.slots.write();
+            for slot in 5461..=5500 {
+                slots[slot] = Some(b);
+            }
+        }
+        let stale = [claim(5461, 10922, 3)];
+        assert!(!cs.cast_vote(replica, a, 10, false, Some(&stale)));
+        // One of this node's own.
+        assert!(!cs.cast_vote(replica, a, 11, false, Some(&[claim(100, 100, 3)])));
+        // Refused, the vote is not spent: the same candidate, its claims
+        // now current, has it. So would a slot no one owns, or one of `b`'s
+        // claimed at `b`'s epoch.
+        let current = [claim(5501, 10922, 3), claim(5461, 5461, 7)];
+        assert!(cs.cast_vote(replica, a, 12, false, Some(&current)));
+
+        // A request without claims is decided as before.
+        let (cs, a, b) = three_master_cluster();
+        let replica = add_replica(&cs, a);
+        {
+            let mut nodes = cs.nodes.write();
+            nodes.get_mut(&a).unwrap().mark_failed(now_ms());
+            nodes.get_mut(&b).unwrap().config_epoch = 7;
+        }
+        cs.slots.write()[5461] = Some(b);
+        assert!(cs.cast_vote(replica, a, 10, false, None));
+    }
+
+    /// The claims a candidate sends: its master's slots in its view, as
+    /// ranges, at the master's config epoch.
+    #[test]
+    fn slot_claims_of_a_master_are_its_ranges_at_its_epoch() {
+        let (cs, a, _b) = three_master_cluster();
+        cs.nodes.write().get_mut(&a).unwrap().config_epoch = 4;
+        cs.slots.write()[6000] = None;
+        let claims: Vec<(u16, u16, u64)> = cs
+            .slot_claims_of(a)
+            .iter()
+            .map(|c| (c.start, c.end, c.epoch))
+            .collect();
+        assert_eq!(claims, vec![(5461, 5999, 4), (6001, 10922, 4)]);
     }
 
     #[test]
@@ -3937,13 +4061,16 @@ mod tests {
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
         cs.nodes.write().get_mut(&b).unwrap().mark_failed(now_ms());
 
-        assert!(cs.cast_vote(ra, a, 5, false));
-        assert!(!cs.cast_vote(rb, b, 5, false), "already voted in epoch 5");
+        assert!(cs.cast_vote(ra, a, 5, false, None));
         assert!(
-            !cs.cast_vote(rb, b, 4, false),
+            !cs.cast_vote(rb, b, 5, false, None),
+            "already voted in epoch 5"
+        );
+        assert!(
+            !cs.cast_vote(rb, b, 4, false, None),
             "epoch 4 is behind the cluster"
         );
-        assert!(cs.cast_vote(rb, b, 6, false));
+        assert!(cs.cast_vote(rb, b, 6, false, None));
         assert_eq!(cs.current_epoch(), 6);
     }
 
@@ -3954,8 +4081,8 @@ mod tests {
         let (r1, r2) = (add_replica(&cs, a), add_replica(&cs, a));
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
 
-        assert!(cs.cast_vote(r1, a, 5, false));
-        assert!(!cs.cast_vote(r2, a, 6, false));
+        assert!(cs.cast_vote(r1, a, 5, false, None));
+        assert!(!cs.cast_vote(r2, a, 6, false, None));
     }
 
     #[test]
@@ -3964,7 +4091,7 @@ mod tests {
         let a = add_master(&cs, 0..=16383);
         let replica = add_replica(&cs, a);
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
-        assert!(!cs.cast_vote(replica, a, 5, false));
+        assert!(!cs.cast_vote(replica, a, 5, false, None));
     }
 
     #[test]
@@ -3972,7 +4099,7 @@ mod tests {
         let (cs, a, b) = three_master_cluster();
         let replica_of_b = add_replica(&cs, b);
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
-        assert!(!cs.cast_vote(replica_of_b, a, 5, false));
+        assert!(!cs.cast_vote(replica_of_b, a, 5, false, None));
     }
 
     // ── FORGET, RESET ────────────────────────────────────────────────────

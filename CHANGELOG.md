@@ -115,6 +115,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A master refuses its vote to a replica that claims slots it knows a
+  newer owner of (#524).** A replica that had not heard that its master
+  handed slots over in an atomic slot migration, or lost them in a
+  failover, could be elected by the other masters without the source's or
+  the destination's vote, with five or more masters. Promoted, it claimed
+  the slots at the election's epoch, newer than their owner's, and the
+  owner's acknowledged writes to them were lost. An automatic failover's
+  vote request now carries the slots the candidate would take over, at its
+  master's config epoch, and a master that knows a newer owner of one
+  refuses, as Redis does. The claims travel in the request's fifth field,
+  which earlier versions accept and read past, so votes go on working
+  through a rolling upgrade; a request from an earlier version, and a
+  manual failover's (`CLUSTER FAILOVER`, with or without `FORCE`), are
+  decided as before.
+
 - **Consumer-group commands about one consumer no longer walk the whole
   pending list (#637).** `XINFO CONSUMERS` counted each consumer's pending
   entries by reading every pending entry of the group, once per consumer,
