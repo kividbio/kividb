@@ -28,6 +28,10 @@ const TIMEOUT: Duration = Duration::from_secs(1);
 /// the health check runs with the container's environment.
 pub const PASSWORD_ENV: &str = "KIVIDB_PASSWORD";
 
+/// The ACL user to authenticate as, with `KIVIDB_PASSWORD`: `AUTH <user>
+/// <password>`. Unset, the check authenticates as the default user.
+pub const USER_ENV: &str = "KIVIDB_USER";
+
 /// Run the check, and return the exit code: 0 on PONG, 1 otherwise. Says
 /// why on standard error when it fails, which Docker keeps in the
 /// container's health log.
@@ -56,12 +60,24 @@ fn target(config: &Config) -> (u16, bool) {
     (port, config.tls_port != 0 && port == config.tls_port)
 }
 
-/// `KIVIDB_PASSWORD` if set, else `requirepass`, else none.
-fn password(config: &Config) -> Option<String> {
-    match std::env::var(PASSWORD_ENV) {
-        Ok(p) if !p.is_empty() => Some(p),
-        _ => (!config.requirepass.is_empty()).then(|| config.requirepass.clone()),
-    }
+/// The `AUTH` arguments to send first, if any, given what the environment
+/// holds for `KIVIDB_USER` and `KIVIDB_PASSWORD` (unset and empty are the
+/// same): the user and `KIVIDB_PASSWORD`, else `KIVIDB_PASSWORD` or
+/// `requirepass` for the default user. `requirepass` is the default user's
+/// password, so a named user needs `KIVIDB_PASSWORD`.
+fn auth(
+    config: &Config,
+    user: Option<String>,
+    password: Option<String>,
+) -> Result<Option<Vec<String>>, String> {
+    let user = user.filter(|u| !u.is_empty());
+    let password = password.filter(|p| !p.is_empty());
+    Ok(match (user, password) {
+        (Some(user), Some(password)) => Some(vec![user, password]),
+        (Some(_), None) => return Err(format!("{USER_ENV} is set, and {PASSWORD_ENV} is not")),
+        (None, Some(password)) => Some(vec![password]),
+        (None, None) => (!config.requirepass.is_empty()).then(|| vec![config.requirepass.clone()]),
+    })
 }
 
 fn ping(config: &Config) -> Result<(), String> {
@@ -70,19 +86,25 @@ fn ping(config: &Config) -> Result<(), String> {
     if port == 0 {
         return Err("no port to connect to: set --port, --tls-port or --ping-port".into());
     }
+    let auth = auth(
+        config,
+        std::env::var(USER_ENV).ok(),
+        std::env::var(PASSWORD_ENV).ok(),
+    )?;
     let host = config.ping_host.as_str();
     let tcp = connect(host, port, deadline)?;
 
     // AUTH and PING in one write. Only PING's reply decides: an AUTH the
     // server did not need (no password set) is refused, and PING still
     // answers PONG; a wrong password leaves PING answering NOAUTH.
-    let password = password(config);
     let mut request = Vec::new();
-    if let Some(p) = &password {
-        request.extend(command(&[b"AUTH", p.as_bytes()]));
+    if let Some(args) = &auth {
+        let mut words: Vec<&[u8]> = vec![b"AUTH"];
+        words.extend(args.iter().map(|a| a.as_bytes()));
+        request.extend(command(&words));
     }
     request.extend(command(&[b"PING"]));
-    let replies = if password.is_some() { 2 } else { 1 };
+    let replies = if auth.is_some() { 2 } else { 1 };
 
     let lines = if tls {
         exchange(
@@ -229,9 +251,9 @@ mod tls {
     }
 
     /// Takes any certificate the server presents, still checking that the
-    /// handshake is signed by its key. Used only without `tls-ca-cert-file`:
-    /// there is then nothing to check the chain against, and the check is
-    /// aimed at this host's own server (127.0.0.1 unless `--ping-host`).
+    /// handshake is signed by its key. Used only without `tls-ca-cert-file`,
+    /// when there is nothing to check the chain against, and only for a
+    /// server on this host: see [`stream`].
     #[derive(Debug)]
     struct AnyCertificate(Arc<CryptoProvider>);
 
@@ -284,14 +306,34 @@ mod tls {
     /// node does to another: it presents `tls-client-cert-file` (or
     /// `tls-cert-file`), which `tls-auth-clients yes` asks for, and checks
     /// the server's chain against the CA. Without one, the server asks for
-    /// no certificate and there is no CA to check its own against.
+    /// no certificate and there is no CA to check its own against: that is
+    /// taken only from a server on this host (a loopback address), since the
+    /// password goes to whoever answers. A server elsewhere needs the CA.
+    ///
+    /// The files are read as the server reads them, after changing to `dir`.
     pub fn stream(
         config: &crate::config::Config,
         host: &str,
         tcp: std::net::TcpStream,
     ) -> Result<Stream, String> {
-        let files = crate::tls::acceptor::Files::of(config);
+        let mut files = crate::tls::acceptor::Files::of(config);
+        for path in [
+            &mut files.cert,
+            &mut files.key,
+            &mut files.ca,
+            &mut files.client_cert,
+            &mut files.client_key,
+        ] {
+            *path = super::in_dir(&config.dir, path);
+        }
         let client = if files.ca.is_empty() {
+            let peer = tcp.peer_addr().map_err(|e| format!("socket: {e}"))?;
+            if !peer.ip().is_loopback() {
+                return Err(format!(
+                    "{peer} is not this host: set tls-ca-cert-file to check its certificate, \
+                     since the password would go to whoever answers"
+                ));
+            }
             let builder = ClientConfig::builder();
             let provider = CryptoProvider::get_default()
                 .cloned()
@@ -309,6 +351,20 @@ mod tls {
             .map_err(|e| format!("TLS: {e}"))?;
         Ok(rustls::StreamOwned::new(conn, tcp))
     }
+}
+
+/// `path` as the server opens it: relative to `dir` (the server changes to
+/// it before it reads its TLS files), unless absolute or `dir` is unset.
+/// Empty stays empty.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+fn in_dir(dir: &str, path: &str) -> String {
+    if dir.is_empty() || path.is_empty() || std::path::Path::new(path).is_absolute() {
+        return path.to_string();
+    }
+    std::path::Path::new(dir)
+        .join(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(feature = "tls")]
@@ -345,6 +401,40 @@ mod tests {
             command(&[b"AUTH", b"pa ss"]),
             b"*2\r\n$4\r\nAUTH\r\n$5\r\npa ss\r\n"
         );
+    }
+
+    #[test]
+    fn auth_takes_the_environment_first() {
+        let s = |v: &str| Some(v.to_string());
+        let none = Config::default();
+        let pass = Config {
+            requirepass: "conf".into(),
+            ..Default::default()
+        };
+        assert_eq!(auth(&none, None, None), Ok(None));
+        assert_eq!(auth(&pass, None, None), Ok(Some(vec!["conf".into()])));
+        assert_eq!(auth(&pass, None, s("env")), Ok(Some(vec!["env".into()])));
+        assert_eq!(auth(&pass, s(""), s("")), Ok(Some(vec!["conf".into()])));
+        assert_eq!(
+            auth(&pass, s("health"), s("pw")),
+            Ok(Some(vec!["health".into(), "pw".into()]))
+        );
+        // requirepass is the default user's: a named user needs its own.
+        assert!(auth(&pass, s("health"), None).is_err());
+    }
+
+    #[test]
+    fn tls_files_are_relative_to_dir() {
+        assert_eq!(in_dir("", "tls/ca.crt"), "tls/ca.crt");
+        assert_eq!(in_dir("data", ""), "");
+        let joined = in_dir("data", "tls/ca.crt");
+        assert_eq!(
+            std::path::Path::new(&joined),
+            std::path::Path::new("data").join("tls/ca.crt")
+        );
+        let absolute = std::env::temp_dir().join("ca.crt");
+        let absolute = absolute.to_str().unwrap();
+        assert_eq!(in_dir("data", absolute), absolute);
     }
 
     #[test]

@@ -383,8 +383,10 @@ volumes:
 ```
 
 **Health check.** From 1.3.0 the binary checks itself: `kividb --ping` sends `PING` to the
-server in the container and exits 0 on `PONG`, 1 otherwise, with no shell needed. It reads
-the password from `KIVIDB_PASSWORD`, so pass it to the container's environment too:
+server in the container and exits 0 on `PONG`, 1 otherwise, with no shell needed. The check
+is a separate process: it does not see `command:`, so a `--port`, `--requirepass` or `--tls-*`
+there must be repeated in `test:` or moved into a config file. It reads the password from
+`KIVIDB_PASSWORD`, so pass that to the container's environment:
 
 ```yaml
     environment:
@@ -396,7 +398,8 @@ the password from `KIVIDB_PASSWORD`, so pass it to the container's environment t
       retries: 3
 ```
 
-[CONFIGURATION.md](CONFIGURATION.md#health-checks) has the options.
+[CONFIGURATION.md](CONFIGURATION.md#health-checks) has the options, ACL users and the
+Kubernetes probes.
 
 ### The update check in containers
 
@@ -427,7 +430,9 @@ showing up in vulnerability scans, and KiviDB uses none of them. Debug from outs
   `docker cp <name>:/home/kividb/dump.kdb .`.
 - **Health checks** can't run `redis-cli` in the container. From 1.3.0, use
   `["CMD", "kividb", "--ping"]` (see [Compose](#compose)); on Kubernetes, an `exec` probe
-  with `command: ["kividb", "--ping"]`. On earlier images, `["CMD", "kividb", "--version"]`
+  with `command: ["kividb", "--ping"]`, as a readiness probe or with a startup probe, since
+  the port opens only after the data has loaded
+  ([CONFIGURATION.md](CONFIGURATION.md#health-checks)). On earlier images, `["CMD", "kividb", "--version"]`
   only proves the binary runs: use a TCP check on the port instead (Kubernetes `tcpSocket`).
 
 **io_uring in containers:** Docker's default seccomp profile blocks io_uring on recent

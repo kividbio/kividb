@@ -49,8 +49,8 @@ impl Drop for Server {
     }
 }
 
-/// Start a server with `args`, and wait for `port` to open.
-fn start(port: u16, args: &[&str]) -> Server {
+/// Start a server with `args`, and wait for each of `ports` to open.
+fn start(ports: &[u16], args: &[&str]) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let child = Command::new(BIN)
         .current_dir(dir.path())
@@ -68,9 +68,11 @@ fn start(port: u16, args: &[&str]) -> Server {
         .expect("start kividb");
     let server = Server { child, _dir: dir };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "port {port} never opened");
-        std::thread::sleep(Duration::from_millis(50));
+    for &port in ports {
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "port {port} never opened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     server
 }
@@ -78,11 +80,20 @@ fn start(port: u16, args: &[&str]) -> Server {
 /// `kividb --ping` with `args`, and `KIVIDB_PASSWORD` set to `password`
 /// (or unset).
 fn ping(args: &[&str], password: Option<&str>) -> Output {
+    ping_as(args, None, password)
+}
+
+/// [`ping`], with `KIVIDB_USER` set to `user` (or unset) as well.
+fn ping_as(args: &[&str], user: Option<&str>, password: Option<&str>) -> Output {
     let mut command = Command::new(BIN);
     command
         .arg("--ping")
         .args(args)
-        .env_remove("KIVIDB_PASSWORD");
+        .env_remove("KIVIDB_PASSWORD")
+        .env_remove("KIVIDB_USER");
+    if let Some(u) = user {
+        command.env("KIVIDB_USER", u);
+    }
     if let Some(p) = password {
         command.env("KIVIDB_PASSWORD", p);
     }
@@ -117,7 +128,7 @@ fn exits_0_on_pong_and_1_with_nothing_listening() {
         started.elapsed()
     );
 
-    let _server = start(port, &["--port", &p]);
+    let _server = start(&[port], &["--port", &p]);
     let up = ping(&["--port", &p, "--configfile", ""], None);
     assert!(healthy(&up), "{up:?}");
     assert_eq!(String::from_utf8_lossy(&up.stdout).trim(), "PONG");
@@ -140,7 +151,7 @@ fn exits_0_on_pong_and_1_with_nothing_listening() {
 fn authenticates_from_the_environment_or_the_config_file() {
     let port = free_port();
     let p = port.to_string();
-    let _server = start(port, &["--port", &p, "--requirepass", "s3cret"]);
+    let _server = start(&[port], &["--port", &p, "--requirepass", "s3cret"]);
     let args = ["--port", p.as_str(), "--configfile", ""];
 
     let none = ping(&args, None);
@@ -167,7 +178,7 @@ fn authenticates_from_the_environment_or_the_config_file() {
 fn a_password_the_server_does_not_need_is_no_failure() {
     let port = free_port();
     let p = port.to_string();
-    let _server = start(port, &["--port", &p]);
+    let _server = start(&[port], &["--port", &p]);
     let output = ping(&["--port", &p, "--configfile", ""], Some("unneeded"));
     assert!(healthy(&output), "{output:?}");
 }
@@ -215,13 +226,107 @@ fn a_config_file_it_cannot_read_is_a_failure() {
     assert!(stderr(&output).contains("no-such-directive"), "{output:?}");
 }
 
+/// The main property of a health check: a peer that takes the connection
+/// and never answers fails it within the deadline, not when Docker's own
+/// timeout kills it.
+#[test]
+fn a_peer_that_never_answers_fails_within_the_deadline() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    // Accepted, and held open without a word until the test ends.
+    let held = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+    // The binary's first start can be slow (a virus scanner looking at a new
+    // build): not what is measured here.
+    Command::new(BIN).arg("--version").output().unwrap();
+    let started = Instant::now();
+    let output = ping(&["--port", &port, "--configfile", ""], None);
+    let took = started.elapsed();
+    assert!(!healthy(&output), "{output:?}");
+    // Its own one-second deadline is what ended it...
+    assert!(
+        stderr(&output).contains("no reply within 1 s"),
+        "{output:?}"
+    );
+    // ...and the whole process took little more.
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    drop(held.join());
+}
+
+/// A command line clap refuses is exit code 1 under `--ping`: Docker
+/// reserves 2 for health checks.
+#[test]
+fn a_bad_argument_exits_1() {
+    let output = ping(&["--ping-port", "abc", "--configfile", ""], None);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).contains("abc"), "{output:?}");
+    // Without `--ping`, clap's own exit code stays.
+    let output = Command::new(BIN).args(["--port", "abc"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+/// Send `commands` on one connection and read a line for each.
+fn send(port: u16, commands: &[&[&str]]) -> Vec<String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    for args in commands {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in *args {
+            out.push_str(&format!("${}\r\n{a}\r\n", a.len()));
+        }
+        stream.write_all(out.as_bytes()).unwrap();
+    }
+    let mut reader = BufReader::new(stream);
+    commands
+        .iter()
+        .map(|_| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// With the default user off, the check authenticates as the ACL user in
+/// `KIVIDB_USER`, with `KIVIDB_PASSWORD`.
+#[test]
+fn authenticates_as_an_acl_user() {
+    let port = free_port();
+    let p = port.to_string();
+    let _server = start(&[port], &["--port", &p]);
+    let replies = send(
+        port,
+        &[
+            &["ACL", "SETUSER", "health", "on", ">pw", "+ping"],
+            &["ACL", "SETUSER", "default", "off"],
+        ],
+    );
+    assert_eq!(replies, ["+OK", "+OK"]);
+    let args = ["--port", p.as_str(), "--configfile", ""];
+
+    let output = ping(&args, None);
+    assert!(!healthy(&output), "{output:?}");
+    let output = ping_as(&args, Some("health"), Some("pw"));
+    assert!(healthy(&output), "{output:?}");
+    let output = ping_as(&args, Some("health"), Some("wrong"));
+    assert!(!healthy(&output), "{output:?}");
+    assert!(stderr(&output).contains("AUTH refused"), "{output:?}");
+    let output = ping_as(&args, Some("health"), None);
+    assert!(!healthy(&output), "{output:?}");
+    assert!(stderr(&output).contains("KIVIDB_USER"), "{output:?}");
+}
+
 #[cfg(feature = "tls")]
 mod tls {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 
     struct Files {
-        _dir: tempfile::TempDir,
+        _temp: tempfile::TempDir,
+        /// The directory the files are in.
+        dir: String,
         ca: String,
         cert: String,
         key: String,
@@ -251,7 +356,8 @@ mod tls {
             ca: write("ca.crt", ca.pem()),
             cert: write("server.crt", cert.pem()),
             key: write("server.key", key.serialize_pem()),
-            _dir: dir,
+            dir: dir.path().to_str().unwrap().to_string(),
+            _temp: dir,
         }
     }
 
@@ -271,7 +377,7 @@ mod tls {
             "--tls-key-file",
             &f.key,
         ];
-        let _server = start(tls, &tls_args);
+        let _server = start(&[tls], &tls_args);
         let mut args = tls_args.to_vec();
         args.extend(["--configfile", ""]);
         let output = ping(&args, None);
@@ -299,7 +405,7 @@ mod tls {
             "--requirepass",
             "s3cret",
         ];
-        let _server = start(tls, &tls_args);
+        let _server = start(&[tls], &tls_args);
         let mut args = tls_args.to_vec();
         args.extend(["--configfile", ""]);
         let output = ping(&args, None);
@@ -307,8 +413,90 @@ mod tls {
 
         // Without the CA file it has no certificate to present, and the
         // server refuses the handshake.
-        let output = ping(&args[..8], None);
+        let mut without_ca = args[..8].to_vec();
+        without_ca.extend(["--configfile", ""]);
+        let output = ping(&without_ca, None);
         assert!(!healthy(&output), "{output:?}");
+    }
+
+    /// A server whose certificate the configured CA did not sign fails the
+    /// check: the chain is verified.
+    #[test]
+    fn a_server_the_ca_did_not_sign_fails() {
+        let f = files();
+        let other = files();
+        let tls = free_port();
+        let t = tls.to_string();
+        let _server = start(
+            &[tls],
+            &[
+                "--port",
+                "0",
+                "--tls-port",
+                &t,
+                "--tls-cert-file",
+                &f.cert,
+                "--tls-key-file",
+                &f.key,
+                "--tls-ca-cert-file",
+                &f.ca,
+                "--tls-auth-clients",
+                "no",
+            ],
+        );
+        let output = ping(
+            &[
+                "--port",
+                "0",
+                "--tls-port",
+                &t,
+                "--tls-cert-file",
+                &other.cert,
+                "--tls-key-file",
+                &other.key,
+                "--tls-ca-cert-file",
+                &other.ca,
+                "--configfile",
+                "",
+            ],
+            None,
+        );
+        assert!(!healthy(&output), "{output:?}");
+        assert!(stderr(&output).contains("certificate"), "{output:?}");
+    }
+
+    /// Relative TLS files are opened from `dir`, as the server opens them,
+    /// whatever directory the check runs in.
+    #[test]
+    fn relative_tls_files_are_read_from_dir() {
+        let f = files();
+        let tls = free_port();
+        let t = tls.to_string();
+        let args = [
+            "--port",
+            "0",
+            "--tls-port",
+            &t,
+            "--dir",
+            &f.dir,
+            "--tls-cert-file",
+            "server.crt",
+            "--tls-key-file",
+            "server.key",
+            "--tls-ca-cert-file",
+            "ca.crt",
+        ];
+        let _server = start(&[tls], &args);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let output = Command::new(BIN)
+            .current_dir(elsewhere.path())
+            .args(["--ping", "--configfile", ""])
+            .args(args)
+            .env_remove("KIVIDB_PASSWORD")
+            .env_remove("KIVIDB_USER")
+            .output()
+            .unwrap();
+        assert!(healthy(&output), "{output:?}");
     }
 
     /// The plaintext port of a server with both is spoken to in plaintext.
@@ -327,7 +515,7 @@ mod tls {
             "--tls-key-file",
             &f.key,
         ];
-        let _server = start(tls, &tls_args);
+        let _server = start(&[plain, tls], &tls_args);
         let mut args = tls_args.to_vec();
         args.extend(["--configfile", ""]);
         assert!(healthy(&ping(&args, None)));

@@ -285,13 +285,29 @@ fn main() {
     }
 }
 
+/// Exit on a command line clap refused, as clap does (usage, exit 2), except
+/// under `--ping`: Docker reserves a health check's exit code 2, so the
+/// check fails with 1 like any other failure. `--help` and `--version` are
+/// left to clap.
+fn bad_arguments(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    let shown = matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
+    if !shown && std::env::args_os().any(|a| a == "--ping") {
+        let _ = e.print();
+        std::process::exit(1);
+    }
+    e.exit()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parsed by hand rather than with `Config::parse()`, to keep the matches:
     // the config file must not override an option given on the command line,
     // and only the matches know which those are.
-    let matches = <Config as clap::CommandFactory>::command().get_matches();
-    let mut cfg =
-        <Config as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let matches = <Config as clap::CommandFactory>::command()
+        .try_get_matches()
+        .unwrap_or_else(|e| bad_arguments(e));
+    let mut cfg = <Config as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|e| bad_arguments(e));
     let from_cli =
         |option: &str| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine);
     cfg.bind_explicit =
