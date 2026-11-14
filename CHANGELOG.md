@@ -214,6 +214,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An atomic slot migration and `CLUSTER SETSLOT` no longer take the same
+  slot at once (#755).** `CLUSTER MIGRATION IMPORT` ran on a slot in
+  `IMPORTING` or `MIGRATING` state, and `SETSLOT IMPORTING` was taken on a
+  slot being imported: keys that `MIGRATE` or `ASKING` clients wrote
+  meanwhile counted as the import's, and if it then failed it deleted them,
+  maybe the only copy. Now, as in Redis, an atomic migration refuses a slot
+  in a legacy migration on either side (`all slot states must be STABLE`),
+  and every form of `SETSLOT` refuses a slot an atomic migration to or from
+  this node is moving until it ends or is canceled (`IMPORTING` and
+  `MIGRATING` also for a few seconds after it hands the slot over).
+
 - **`FT.HYBRID` takes `SCORER` and answers as Redis 8.10 does, so RedisVL's
   `HybridQuery` works (#767).** Every `HybridQuery` sends `SCORER BM25STD`
   in the `SEARCH` clause, and KiviDB refused it (`unknown FT.HYBRID token
