@@ -184,6 +184,26 @@ mod imp {
         cluster: bool,
         replication: bool,
     ) -> Result<Settings, String> {
+        let client = client_config(&files)?;
+        // The bus asks every node for its certificate.
+        let bus = crate::tls::acceptor::build(&crate::tls::acceptor::Files {
+            auth_clients: "yes".to_string(),
+            ..files.clone()
+        })?;
+        Ok(Settings {
+            cluster,
+            replication,
+            client: Arc::new(client),
+            bus,
+            files,
+        })
+    }
+
+    /// How a node connects to another: it presents `tls-client-cert-file`
+    /// (or `tls-cert-file`) and checks the other's chain against
+    /// `tls-ca-cert-file`, not its name. `kividb --ping` connects the same
+    /// way when there is a CA file.
+    pub fn client_config(files: &crate::tls::acceptor::Files) -> Result<ClientConfig, String> {
         let mut roots = RootCertStore::empty();
         for cert in read_certs(&files.ca)? {
             roots
@@ -204,23 +224,11 @@ mod imp {
         let webpki = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
             .build()
             .map_err(|e| format!("certificate verifier: {e}"))?;
-        let client = ClientConfig::builder()
+        ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(ChainOnly(webpki)))
             .with_client_auth_cert(chain, key)
-            .map_err(|e| format!("client certificate: {e}"))?;
-        // The bus asks every node for its certificate.
-        let bus = crate::tls::acceptor::build(&crate::tls::acceptor::Files {
-            auth_clients: "yes".to_string(),
-            ..files.clone()
-        })?;
-        Ok(Settings {
-            cluster,
-            replication,
-            client: Arc::new(client),
-            bus,
-            files,
-        })
+            .map_err(|e| format!("client certificate: {e}"))
     }
 
     pub fn cluster() -> bool {
@@ -274,8 +282,8 @@ mod imp {
 
 #[cfg(feature = "tls")]
 pub use imp::{
-    accept_bus, cluster, connect_async, connect_sync, files, generation, init, reload, replication,
-    replication_set, set_replication,
+    accept_bus, client_config, cluster, connect_async, connect_sync, files, generation, init,
+    reload, replication, replication_set, set_replication,
 };
 
 #[cfg(not(feature = "tls"))]
