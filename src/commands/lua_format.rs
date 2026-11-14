@@ -19,16 +19,30 @@
 use mlua::ffi;
 use std::ffi::c_int;
 
+const MINUS: u8 = 1;
+const PLUS: u8 = 2;
+const SPACE: u8 = 4;
+const HASH: u8 = 8;
+const ZERO: u8 = 16;
+
+/// The flag a byte is in a conversion, or 0.
+const FLAG_OF: [u8; 256] = {
+    let mut table = [0; 256];
+    table[b'-' as usize] = MINUS;
+    table[b'+' as usize] = PLUS;
+    table[b' ' as usize] = SPACE;
+    table[b'#' as usize] = HASH;
+    table[b'0' as usize] = ZERO;
+    table
+};
+
 /// What one `%` conversion of a format is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Spec {
-    minus: bool,
-    plus: bool,
-    space: bool,
-    hash: bool,
-    zero: bool,
-    width: usize,
-    precision: Option<usize>,
+    /// [`MINUS`], [`PLUS`], [`SPACE`], [`HASH`] and [`ZERO`], as given.
+    flags: u8,
+    width: u8,
+    precision: Option<u8>,
     conversion: u8,
     /// Where the conversion starts (at its `%`) and ends (after its letter).
     start: usize,
@@ -36,6 +50,10 @@ struct Spec {
 }
 
 impl Spec {
+    fn has(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
     fn is_integer(&self) -> bool {
         matches!(
             self.conversion,
@@ -44,74 +62,76 @@ impl Spec {
     }
 
     /// Whether Lua 5.4 takes these flags and this precision for an integer
-    /// conversion (its `checkformat`), as 5.1 takes any.
+    /// conversion (its `checkformat`), as 5.1 takes any. (`rewrite` checks
+    /// the same, inline.)
+    #[cfg(test)]
     fn lua54_takes(&self) -> bool {
-        let (plus_space, hash, zero, precision) = match self.conversion {
-            b'd' | b'i' => (true, false, true, true),
-            b'u' => (false, false, true, true),
-            b'o' | b'x' | b'X' => (false, true, true, true),
-            _ => (false, false, false, false), // c
+        let allowed = match self.conversion {
+            b'd' | b'i' => MINUS | PLUS | SPACE | ZERO,
+            b'u' => MINUS | ZERO,
+            b'o' | b'x' | b'X' => MINUS | HASH | ZERO,
+            _ => MINUS, // c, which takes no precision either
         };
-        (plus_space || !(self.plus || self.space))
-            && (hash || !self.hash)
-            && (zero || !self.zero)
-            && (precision || self.precision.is_none())
+        self.flags & !allowed == 0 && (self.conversion != b'c' || self.precision.is_none())
     }
+}
+
+/// Up to two digits at `at`, as Lua 5.1 reads a width or a precision:
+/// their value, or `None` for a third.
+#[inline(always)]
+fn two_digits(format: &[u8], at: &mut usize) -> Option<u8> {
+    let mut value = 0;
+    for _ in 0..2 {
+        match format.get(*at) {
+            Some(byte @ b'0'..=b'9') => {
+                value = value * 10 + (byte - b'0');
+                *at += 1;
+            }
+            _ => return Some(value),
+        }
+    }
+    (!format.get(*at).is_some_and(u8::is_ascii_digit)).then_some(value)
 }
 
 /// The conversion whose `%` is at `start`, read as Lua 5.1 reads one: at
 /// most five flags, two digits of width and two of precision. `None` for
 /// `%%` and for what is not a valid conversion, which Lua's own
 /// `string.format` reports.
+#[inline(always)]
 fn parse_spec(format: &[u8], start: usize) -> Option<Spec> {
     let mut at = start + 1;
-    let mut spec = Spec {
-        minus: false,
-        plus: false,
-        space: false,
-        hash: false,
-        zero: false,
-        width: 0,
-        precision: None,
-        conversion: 0,
-        start,
-        end: 0,
-    };
-    let flags_from = at;
+    let mut flags = 0;
+    let mut count = 0;
     while let Some(&byte) = format.get(at) {
-        match byte {
-            b'-' => spec.minus = true,
-            b'+' => spec.plus = true,
-            b' ' => spec.space = true,
-            b'#' => spec.hash = true,
-            b'0' => spec.zero = true,
-            _ => break,
+        let flag = FLAG_OF[usize::from(byte)];
+        if flag == 0 {
+            break;
         }
+        flags |= flag;
         at += 1;
+        count += 1;
     }
-    if at - flags_from > 5 {
+    if count > 5 {
         return None;
     }
-    let digits = |at: &mut usize| {
-        let mut value = 0;
-        let from = *at;
-        while let Some(byte @ b'0'..=b'9') = format.get(*at) {
-            value = value * 10 + usize::from(byte - b'0');
-            *at += 1;
-        }
-        (*at - from <= 2).then_some(value)
-    };
-    spec.width = digits(&mut at)?;
+    let width = two_digits(format, &mut at)?;
+    let mut precision = None;
     if format.get(at) == Some(&b'.') {
         at += 1;
-        spec.precision = Some(digits(&mut at)?);
+        precision = Some(two_digits(format, &mut at)?);
     }
-    spec.conversion = *format.get(at)?;
-    if spec.conversion == b'%' {
+    let conversion = *format.get(at)?;
+    if conversion == b'%' {
         return None;
     }
-    spec.end = at + 1;
-    Some(spec)
+    Some(Spec {
+        flags,
+        width,
+        precision,
+        conversion,
+        start,
+        end: at + 1,
+    })
 }
 
 /// The value an integer conversion is given.
@@ -163,12 +183,12 @@ fn format_integer(spec: &Spec, value: Value, out: &mut Vec<u8>) {
             Value::Integer(n) => n as u8,
             Value::Float(n) => c_int_cast(n) as u8,
         };
-        let pad = spec.width.saturating_sub(1);
-        if !spec.minus {
+        let pad = usize::from(spec.width).saturating_sub(1);
+        if !spec.has(MINUS) {
             text.resize(pad, b' ');
         }
         text.push(byte);
-        if spec.minus {
+        if spec.has(MINUS) {
             text.resize(pad + 1, b' ');
         }
     } else {
@@ -205,29 +225,29 @@ fn format_integer(spec: &Spec, value: Value, out: &mut Vec<u8>) {
             digits.push(b'0');
         }
         if let Some(precision) = spec.precision {
-            while digits.len() < precision {
+            while digits.len() < usize::from(precision) {
                 digits.push(b'0');
             }
         }
-        if spec.hash && spec.conversion == b'o' && digits.last() != Some(&b'0') {
+        if spec.has(HASH) && spec.conversion == b'o' && digits.last() != Some(&b'0') {
             digits.push(b'0');
         }
         digits.reverse();
         let prefix: &[u8] = match spec.conversion {
             b'd' | b'i' if negative => b"-",
-            b'd' | b'i' if spec.plus => b"+",
-            b'd' | b'i' if spec.space => b" ",
-            b'x' if spec.hash && magnitude != 0 => b"0x",
-            b'X' if spec.hash && magnitude != 0 => b"0X",
+            b'd' | b'i' if spec.has(PLUS) => b"+",
+            b'd' | b'i' if spec.has(SPACE) => b" ",
+            b'x' if spec.has(HASH) && magnitude != 0 => b"0x",
+            b'X' if spec.has(HASH) && magnitude != 0 => b"0X",
             _ => b"",
         };
         let length = prefix.len() + digits.len();
-        let pad = spec.width.saturating_sub(length);
-        if spec.minus {
+        let pad = usize::from(spec.width).saturating_sub(length);
+        if spec.has(MINUS) {
             text.extend_from_slice(prefix);
             text.extend_from_slice(&digits);
             text.resize(length + pad, b' ');
-        } else if spec.zero && spec.precision.is_none() {
+        } else if spec.has(ZERO) && spec.precision.is_none() {
             text.extend_from_slice(prefix);
             text.resize(prefix.len() + pad, b'0');
             text.extend_from_slice(&digits);
@@ -278,41 +298,81 @@ unsafe fn rewrite(
     format: &[u8],
     top: c_int,
 ) -> Option<(Vec<u8>, Vec<c_int>)> {
-    // Most calls need nothing: looked for first, with nothing allocated.
+    // Most calls need nothing: looked for first, with nothing allocated,
+    // in one pass that reads conversions as `parse_spec` does.
+    let length = format.len();
     let mut needed = false;
     let mut argument = 1;
     let mut at = 0;
-    while let Some(found) = format[at..].iter().position(|&b| b == b'%') {
-        let start = at + found;
-        if format.get(start + 1) == Some(&b'%') {
-            at = start + 2;
+    while at < length {
+        if format[at] != b'%' {
+            at += 1;
             continue;
         }
-        let spec = parse_spec(format, start)?;
+        at += 1;
+        if at < length && format[at] == b'%' {
+            at += 1;
+            continue;
+        }
+        let flags_at = at;
+        let mut flags = 0;
+        while at < length && FLAG_OF[usize::from(format[at])] != 0 {
+            flags |= FLAG_OF[usize::from(format[at])];
+            at += 1;
+        }
+        let width_at = at;
+        while at < length && format[at].is_ascii_digit() {
+            at += 1;
+        }
+        if width_at - flags_at > 5 || at - width_at > 2 {
+            return None;
+        }
+        let mut precision = false;
+        if at < length && format[at] == b'.' {
+            precision = true;
+            at += 1;
+            let digits_at = at;
+            while at < length && format[at].is_ascii_digit() {
+                at += 1;
+            }
+            if at - digits_at > 2 {
+                return None;
+            }
+        }
+        if at >= length || format[at] == b'%' {
+            return None;
+        }
+        let conversion = format[at];
+        at += 1;
         argument += 1;
         if argument > top {
             // As Lua's own says it, for this argument and not a later one.
             unsafe { ffi::luaL_argerror(state, argument, c"no value".as_ptr()) };
             return None;
         }
-        if spec.is_integer() {
-            let Some((value, takes)) = (unsafe { integer_argument(state, argument) }) else {
-                unsafe {
-                    let message = ffi::lua_pushfstring(
-                        state,
-                        c"number expected, got %s".as_ptr(),
-                        ffi::luaL_typename(state, argument),
-                    );
-                    ffi::luaL_argerror(state, argument, message);
-                }
-                return None;
-            };
-            // Lua 5.1 writes `%c` of a zero byte as nothing.
-            let zero_byte =
-                spec.conversion == b'c' && matches!(value, Value::Integer(n) if n as u8 == 0);
-            needed |= !takes || !spec.lua54_takes() || zero_byte;
-        }
-        at = spec.end;
+        let allowed = match conversion {
+            b'd' | b'i' => MINUS | PLUS | SPACE | ZERO,
+            b'u' => MINUS | ZERO,
+            b'o' | b'x' | b'X' => MINUS | HASH | ZERO,
+            b'c' => MINUS,
+            _ => continue,
+        };
+        let Some((value, takes)) = (unsafe { integer_argument(state, argument) }) else {
+            unsafe {
+                let message = ffi::lua_pushfstring(
+                    state,
+                    c"number expected, got %s".as_ptr(),
+                    ffi::luaL_typename(state, argument),
+                );
+                ffi::luaL_argerror(state, argument, message);
+            }
+            return None;
+        };
+        // Flags or a precision 5.4 refuses, and `%c` of a zero byte, which
+        // Lua 5.1 writes as nothing.
+        let refused = flags & !allowed != 0 || (conversion == b'c' && precision);
+        let zero_byte = conversion == b'c' && matches!(value, Value::Integer(n) if n as u8 == 0);
+        needed |= !takes || refused || zero_byte;
     }
     if !needed {
         return None;
@@ -346,16 +406,19 @@ unsafe fn rewrite(
     Some((out, kept))
 }
 
-/// `string.format` in scripts: the original, upvalue 1, with Lua 5.1's
+/// Lua's own `string.format` (`str_format`), the same for every VM.
+static ORIGINAL: std::sync::OnceLock<ffi::lua_CFunction> = std::sync::OnceLock::new();
+
+/// `string.format` in scripts: Lua's own, [`ORIGINAL`], with Lua 5.1's
 /// integer conversions (see the module). The original is run in this
 /// call's own frame, not called: its errors then name `format`, as they did.
 ///
 /// # Safety
 ///
-/// A Lua C function, with the original `string.format` as its upvalue.
+/// A Lua C function, installed by [`install`].
 pub(crate) unsafe extern "C-unwind" fn script_string_format(state: *mut ffi::lua_State) -> c_int {
     unsafe {
-        let Some(original) = ffi::lua_tocfunction(state, ffi::lua_upvalueindex(1)) else {
+        let Some(&original) = ORIGINAL.get() else {
             return ffi::luaL_error(state, c"string.format is missing".as_ptr());
         };
         let top = ffi::lua_gettop(state);
@@ -396,7 +459,11 @@ pub(crate) unsafe fn install(state: *mut ffi::lua_State) {
         ffi::lua_checkstack(state, 3);
         ffi::lua_getglobal(state, c"string".as_ptr());
         ffi::lua_getfield(state, -1, c"format".as_ptr());
-        ffi::lua_pushcclosure(state, script_string_format, 1);
+        if let Some(original) = ffi::lua_tocfunction(state, -1) {
+            ORIGINAL.get_or_init(|| original);
+        }
+        ffi::lua_pop(state, 1);
+        ffi::lua_pushcfunction(state, script_string_format);
         ffi::lua_setfield(state, -2, c"format".as_ptr());
         ffi::lua_pop(state, 1);
     }
@@ -467,7 +534,7 @@ mod tests {
         assert_eq!(parse_spec(b"%-+ #0-d", 0), None);
         assert_eq!(parse_spec(b"%5", 0), None);
         let spec = parse_spec(b"x%-08.3dy", 1).unwrap();
-        assert!(spec.minus && spec.zero && !spec.plus);
+        assert_eq!(spec.flags, MINUS | ZERO);
         assert_eq!((spec.width, spec.precision), (8, Some(3)));
         assert_eq!((spec.conversion, spec.start, spec.end), (b'd', 1, 8));
         assert!(parse_spec(b"%5.2f", 0).is_some_and(|s| !s.is_integer()));
