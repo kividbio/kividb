@@ -834,9 +834,9 @@ fn kdb_vectorset_corrupt_is_refused() {
     assert!(kividb::snapshot::load_snapshot_bytes(&good).is_ok());
 }
 
-/// Kernels truncate mismatched vectors: such an element is dropped, the rest load.
+/// A wrong-length element refuses the whole image, never skipped or truncated.
 #[test]
-fn kdb_vectorset_legacy_wrong_length_is_skipped() {
+fn kdb_vectorset_legacy_wrong_length_is_refused() {
     let names = ["a", "b", "c", "d"];
     let vector = |n: usize| vec![n as f32 + 1.0, -2.0, 0.5];
     let mut set = VectorSetInner::new(3);
@@ -849,11 +849,9 @@ fn kdb_vectorset_legacy_wrong_length_is_skipped() {
             },
         );
     }
+    let value = KiviDBValue::VectorSet(Arc::new(RwLock::new(set)));
     let mut map = HashMap::new();
-    map.insert(
-        "v".to_string(),
-        KiviDBValue::VectorSet(Arc::new(RwLock::new(set))),
-    );
+    map.insert("v".to_string(), value.clone());
     let path = tmp_kdb("legacy_len");
     write_snapshot(&path, &[map], None).unwrap();
     let good = std::fs::read(&path).unwrap();
@@ -878,41 +876,45 @@ fn kdb_vectorset_legacy_wrong_length_is_skipped() {
         image[at] = 4;
         image.splice(at + 4 + 12..at + 4 + 12, 4.0f32.to_le_bytes());
     };
-    let elements = |image: &[u8]| {
-        let mut loaded = kividb::snapshot::load_snapshot_bytes(image).expect("the image loads");
-        let Some(KiviDBValue::VectorSet(vs)) = texted(loaded.dbs.remove(0)).remove("v") else {
-            return None;
+    let refusal = |image: &[u8]| {
+        // Loading at startup, and a replica checking a full sync.
+        let verified = kividb::snapshot::verify_snapshot(image).unwrap_err();
+        let Err(e) = kividb::snapshot::load_snapshot_bytes(image) else {
+            panic!("the image loaded")
         };
-        let inner = vs.read();
-        assert_eq!(inner.dim, 3);
-        let mut got: Vec<_> = inner
-            .entries
-            .iter()
-            .map(|(k, e)| {
-                let name = String::from_utf8(k.as_bytes().to_vec()).unwrap();
-                let v = e.vector.as_f32().unwrap().to_vec();
-                (name, v, e.attrs.as_deref().map(str::to_string))
-            })
-            .collect();
-        got.sort_by(|a, b| a.0.cmp(&b.0));
-        Some(got)
-    };
-    let kept = |list: &[usize]| -> Vec<_> {
-        list.iter()
-            .map(|&n| {
-                let attrs = format!("{{\"n\":{n}}}");
-                (names[n].to_string(), vector(n), Some(attrs))
-            })
-            .collect()
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+        assert_eq!(verified.to_string(), e.to_string());
+        e.to_string()
     };
 
-    assert_eq!(elements(&good), Some(kept(&[0, 1, 2, 3])));
-    // One short, one long: both dropped, their neighbours read in step.
+    let loaded = kividb::snapshot::load_snapshot_bytes(&good).unwrap();
+    let Some(KiviDBValue::VectorSet(vs)) =
+        texted(loaded.dbs.into_iter().next().unwrap()).remove("v")
+    else {
+        panic!("no set")
+    };
+    assert_eq!(vs.read().entries.len(), 4);
+
+    let mut short = good.clone();
+    shorten(&mut short, b'b');
+    assert!(
+        refusal(&short).contains("element \"b\" of a vector set has 2 components, not its set's 3")
+    );
+    let mut long = good.clone();
+    lengthen(&mut long, b'd');
+    assert!(
+        refusal(&long).contains("element \"d\" of a vector set has 4 components, not its set's 3")
+    );
     let mut two = good.clone();
     shorten(&mut two, b'b');
     lengthen(&mut two, b'd');
-    assert_eq!(elements(&two), Some(kept(&[0, 2])));
-    // Every element dropped: no empty set is left behind.
+    // Saved in hash order: whichever comes first is named.
+    let either = |e: String| {
+        let b = e.contains("element \"b\" of a vector set has 2 components");
+        let d = e.contains("element \"d\" of a vector set has 4 components");
+        assert!(b || d, "{e}");
+    };
+    either(refusal(&two));
     let mut all = good.clone();
     for name in *b"ac" {
         shorten(&mut all, name);
@@ -920,7 +922,97 @@ fn kdb_vectorset_legacy_wrong_length_is_skipped() {
     for name in *b"bd" {
         lengthen(&mut all, name);
     }
-    assert_eq!(elements(&all), None);
+    let e = refusal(&all);
+    assert!(
+        e.contains("has 2 components") || e.contains("has 4 components"),
+        "{e}"
+    );
+
+    // `RESTORE` and `MIGRATE` decode the same image, sealed as `DUMP` seals it.
+    let payload = kividb::snapshot::dump_payload(&value).unwrap();
+    assert!(kividb::snapshot::restore_payload_checked(&payload).is_ok());
+    let mut data = payload[..payload.len() - 10].to_vec();
+    shorten(&mut data, b'c');
+    let mut bad = data.clone();
+    bad.extend_from_slice(&[0x0a, 0x00]);
+    bad.extend_from_slice(&kividb::snapshot::crc64_digest(&data).to_le_bytes());
+    assert_eq!(
+        kividb::snapshot::restore_payload_checked(&bad).err(),
+        Some(kividb::snapshot::RestoreError::BadData)
+    );
+}
+
+/// Metadata no write produces: a non-finite Q8 norm or range, BIN padding bits.
+#[test]
+fn kdb_vectorset_impossible_metadata_is_refused() {
+    use kividb::vector::quant::{Quant, StoredVector};
+    let image_of = |quant: Quant, dim: usize| {
+        let mut set = VectorSetInner::new(dim);
+        set.quant = quant;
+        set.quant_chosen = true;
+        let v: Vec<f32> = (0..dim)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -2.0 })
+            .collect();
+        let vector = StoredVector::quantize(quant, v).unwrap();
+        set.entries.insert(
+            "a".into(),
+            VSetEntry {
+                vector,
+                attrs: None,
+            },
+        );
+        let mut map = HashMap::new();
+        map.insert(
+            "q".to_string(),
+            KiviDBValue::VectorSet(Arc::new(RwLock::new(set))),
+        );
+        let path = tmp_kdb("impossible");
+        write_snapshot(&path, &[map], None).unwrap();
+        let image = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        // The element's norm: after its 1-byte name.
+        let at = image
+            .windows(5)
+            .position(|w| w == [1u8, 0, 0, 0, b'a'])
+            .unwrap()
+            + 5;
+        (image, at)
+    };
+    let with = |image: &[u8], at: usize, bytes: &[u8]| {
+        let mut image = image.to_vec();
+        image[at..at + bytes.len()].copy_from_slice(bytes);
+        kividb::snapshot::load_snapshot_bytes(&image)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+
+    let (q8, at) = image_of(Quant::Q8, 3);
+    assert_eq!(with(&q8, at, &[]), Ok(()));
+    for (what, offset, value) in [
+        ("NaN norm", 0, f32::NAN),
+        ("infinite norm", 0, f32::INFINITY),
+        ("infinite range", 4, f32::INFINITY),
+        ("NaN range", 4, f32::NAN),
+    ] {
+        let e = with(&q8, at + offset, &value.to_le_bytes()).unwrap_err();
+        assert!(e.contains("norm or range is not finite"), "{what}: {e}");
+    }
+
+    // dim 3: one word, of which bits 3 to 63 are padding.
+    let (bin, at) = image_of(Quant::Bin, 3);
+    let word = at + 4;
+    let bits = |b: u64| b.to_le_bytes();
+    assert_eq!(with(&bin, word, &bits(0b010)), Ok(()));
+    for padding in [1u64 << 3, 1 << 63] {
+        let e = with(&bin, word, &bits(padding | 0b101)).unwrap_err();
+        assert!(
+            e.contains("bits set past its dimension"),
+            "{padding:#x}: {e}"
+        );
+    }
+    // dim 64 fills its word: every bit is a component.
+    let (full, at) = image_of(Quant::Bin, 64);
+    assert_eq!(with(&full, at + 4, &bits(u64::MAX)), Ok(()));
 }
 
 #[test]

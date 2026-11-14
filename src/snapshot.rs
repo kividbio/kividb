@@ -2487,27 +2487,36 @@ fn read_image(
                         // Any bytes, as in Redis.
                         let name = crate::key_bytes::KeyBytes::from(read_bytes(&mut r)?);
 
-                        // Set when the element's length is not the set's dimension.
-                        let mut wrong_len = None;
                         let vector = match quant {
                             Quant::F32 => {
-                                let len = if legacy {
+                                if legacy {
                                     let mut vlen_buf = [0u8; 4];
                                     r.read_exact(&mut vlen_buf)?;
                                     let len = u32::from_le_bytes(vlen_buf) as usize;
-                                    // Kernels would truncate it; read past it, then drop it.
+                                    // Kernels would truncate it: refused whole, before it is read.
                                     if len != dim {
-                                        wrong_len = Some(len);
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "element {:?} of a vector set has {len} \
+                                                 components, not its set's {dim}",
+                                                String::from_utf8_lossy(name.as_bytes()),
+                                            ),
+                                        ));
                                     }
-                                    len
-                                } else {
-                                    dim
-                                };
-                                StoredVector::F32(f32s(read_items(&mut r, len, 4)?))
+                                }
+                                StoredVector::F32(f32s(read_items(&mut r, dim, 4)?))
                             }
                             Quant::Q8 => {
                                 let norm = read_f32(&mut r)?;
                                 let range = read_f32(&mut r)?;
+                                // Never written so: quantizing refuses what has no finite norm.
+                                if !norm.is_finite() || !range.is_finite() {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "a Q8 vector's norm or range is not finite",
+                                    ));
+                                }
                                 let values = read_items(&mut r, dim, 1)?
                                     .into_iter()
                                     .map(|b| b as i8)
@@ -2521,12 +2530,20 @@ fn read_image(
                             Quant::Bin => {
                                 let norm = read_f32(&mut r)?;
                                 let words = crate::vector::quant::bin_words(dim);
-                                let bits = read_items(&mut r, words, 8)?
+                                let bits: Box<[u64]> = read_items(&mut r, words, 8)?
                                     .as_chunks::<8>()
                                     .0
                                     .iter()
                                     .map(|b| u64::from_le_bytes(*b))
                                     .collect();
+                                // Bits past the dimension are never set when written.
+                                let used = dim % 64;
+                                if used != 0 && bits.last().is_some_and(|w| w >> used != 0) {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "a BIN vector has bits set past its dimension",
+                                    ));
+                                }
                                 StoredVector::Bin { norm, bits }
                             }
                         };
@@ -2541,15 +2558,6 @@ fn read_image(
                             None
                         };
 
-                        if let Some(len) = wrong_len {
-                            log_warn!(
-                                "Snapshot: element {:?} of vector set {:?} has {len} \
-                                 components, not {dim}: it is not loaded",
-                                String::from_utf8_lossy(name.as_bytes()),
-                                String::from_utf8_lossy(&key)
-                            );
-                            continue;
-                        }
                         vs.entries.insert(name, VSetEntry { vector, attrs });
                     }
 
@@ -2650,8 +2658,6 @@ fn read_image(
             keys_read += 1;
             let has_value = match &value {
                 KiviDBValue::HashEx(hash) => !hash.read().is_empty(),
-                // Every element was dropped as corrupt.
-                KiviDBValue::VectorSet(vs) => !vs.read().entries.is_empty(),
                 _ => true,
             };
             if keep && has_value && !past_databases {

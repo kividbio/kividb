@@ -47,6 +47,16 @@ impl V {
     }
 }
 
+fn encode(args: &[&[u8]]) -> Vec<u8> {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
+}
+
 struct Conn {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -78,6 +88,11 @@ impl Conn {
             buf.extend_from_slice(b"\r\n");
         }
         self.writer.write_all(&buf).unwrap();
+        self.read()
+    }
+
+    fn cmd_bytes(&mut self, args: &[&[u8]]) -> V {
+        self.writer.write_all(&encode(args)).unwrap();
         self.read()
     }
 
@@ -1780,49 +1795,192 @@ fn snapshot_from_1_2_loads_as_f32() {
     );
 }
 
-/// A wrong-length 1.2 element is skipped; the server starts with the rest.
-#[test]
-fn snapshot_with_a_wrong_length_element_starts_without_it() {
-    let good = std::fs::read(LEGACY).unwrap();
-    // Element `a`, 3 components: made 2, its last float removed.
-    let layout = [1u8, 0, 0, 0, b'a', 3, 0, 0, 0];
-    let at = good
+/// `image` with element `name`'s vector made `len` long, its floats to match.
+fn with_length(image: &[u8], name: u8, len: u8) -> Vec<u8> {
+    let layout = [1u8, 0, 0, 0, name, 3, 0, 0, 0];
+    let at = image
         .windows(layout.len())
         .position(|w| w == layout)
-        .expect("an element a")
+        .expect("a 3-component element")
         + 5;
-    let mut bad = good.clone();
-    bad[at] = 2;
-    bad.drain(at + 4 + 8..at + 4 + 12);
-    let count = |c: &mut Conn| -> i64 {
-        ["legacy", "asked", "l2"]
-            .iter()
-            .map(|key| c.cmd(&["VCARD", key]).i())
-            .sum()
-    };
+    let mut image = image.to_vec();
+    image[at] = len;
+    let floats = at + 4 + 12;
+    match len {
+        2 => drop(image.drain(floats - 4..floats)),
+        4 => drop(image.splice(floats..floats, 7.0f32.to_le_bytes())),
+        _ => unreachable!(),
+    }
+    image
+}
+
+/// `payload` with `name`'s vector made `len` long, then resealed.
+fn dump_with_length(payload: &[u8], name: u8, len: u8) -> Vec<u8> {
+    let mut data = with_length(&payload[..payload.len() - 10], name, len);
+    let crc = kividb::snapshot::crc64_digest(&data);
+    data.extend_from_slice(&payload[payload.len() - 10..payload.len() - 8]);
+    data.extend_from_slice(&crc.to_le_bytes());
+    data
+}
+
+/// A wrong-length 1.2 element stops startup, and the file is left as it was.
+#[test]
+fn snapshot_with_a_wrong_length_element_is_refused() {
+    let good = std::fs::read(LEGACY).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("dump.kdb"), &good).unwrap();
-    let server = Server::start_in(tmp, &[]);
-    let all = count(&mut server.conn());
-    drop(server);
-
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("dump.kdb"), &bad).unwrap();
-    let server = Server::start_in(tmp, &[]);
-    let mut c = server.conn();
-    assert_eq!(count(&mut c), all - 1);
-    assert!(server.log().contains("is not loaded"), "{}", server.log());
-    assert_eq!(floats(&c.cmd(&["VEMB", "l2", "p"])), [1.0, 1.0]);
-    for key in ["legacy", "asked", "l2"] {
-        let card = c.cmd(&["VCARD", key]).i();
-        let usage = c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]);
-        assert!(card == 0 || usage.i() > 0, "{key}");
-        // Every element left is whole: a search over the set works.
-        if card > 0 {
-            let r = c.cmd(&["VSIM", key, "VALUES", "3", "1", "0", "0", "COUNT", "10"]);
-            assert!(!r.is_err() || key == "l2", "{key}: {r:?}");
-        }
+    let mut server = Server::start_in(tmp, &[]);
+    assert_eq!(server.conn().cmd(&["VCARD", "legacy"]).i(), 3);
+    server.kill();
+    let dump = server.dir.join("dump.kdb");
+    for len in [2, 4] {
+        let bad = with_length(&good, b'a', len);
+        std::fs::write(&dump, &bad).unwrap();
+        let status = server.try_restart_as(this_bin(), &[]);
+        let status = status.unwrap_or_else(|| panic!("started on a {len}-component element"));
+        assert!(!status.success());
+        let log = server.log();
+        let says = format!("element \"a\" of a vector set has {len} components, not its set's 3");
+        assert!(log.contains(&says), "{log}");
+        assert_eq!(std::fs::read(&dump).unwrap(), bad, "the file was changed");
     }
+    // Whole again, it loads as before.
+    std::fs::write(&dump, &good).unwrap();
+    server.restart();
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["VCARD", "legacy"]).i(), 3);
+    assert_eq!(floats(&c.cmd(&["VEMB", "legacy", "a"])), [3.0, -4.0, 0.0]);
+}
+
+fn dumped_set(c: &mut Conn, key: &str) -> Vec<u8> {
+    for (e, v) in [
+        ("a", [1.0, 2.0, 3.0]),
+        ("b", [4.0, 5.0, 6.0]),
+        ("c", [7.0, 8.0, 9.0]),
+    ] {
+        assert_eq!(vadd(c, key, &v, e, &[]), V::Int(1));
+    }
+    match c.cmd(&["DUMP", key]) {
+        V::Bulk(payload) => payload,
+        other => panic!("DUMP: {other:?}"),
+    }
+}
+
+/// `RESTORE` of a wrong-length element is refused whole; nothing is changed.
+#[test]
+fn restore_refuses_a_wrong_length_element() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    let payload = dumped_set(&mut c, "src");
+    let bad_data = || V::Err("ERR Bad data format".into());
+    let short = dump_with_length(&payload, b'b', 2);
+    let long = dump_with_length(&payload, b'c', 4);
+    // Every element wrong: refused, not restored as an empty set.
+    let mut all = dump_with_length(&payload, b'a', 2);
+    all = dump_with_length(&all, b'b', 4);
+    all = dump_with_length(&all, b'c', 2);
+    for bad in [&short, &long, &all] {
+        assert_eq!(c.cmd_bytes(&[b"RESTORE", b"new", b"0", bad]), bad_data());
+    }
+    assert_eq!(c.cmd(&["EXISTS", "new"]).i(), 0);
+
+    // An existing destination is kept as it was, with `REPLACE` too.
+    assert_eq!(
+        vadd(&mut c, "dst", &[9.0, 9.0, 9.0], "x", &["Q8"]),
+        V::Int(1)
+    );
+    let before = c.cmd(&["VEMB", "dst", "x", "RAW"]);
+    let r = c.cmd_bytes(&[b"RESTORE", b"dst", b"0", &short, b"REPLACE"]);
+    assert_eq!(r, bad_data());
+    let r = c.cmd_bytes(&[b"RESTORE", b"dst", b"0", &short]);
+    assert!(r.s().starts_with("BUSYKEY"), "{r:?}");
+    assert_eq!(c.cmd(&["VCARD", "dst"]).i(), 1);
+    assert_eq!(c.cmd(&["VEMB", "dst", "x", "RAW"]), before);
+
+    // The payload as dumped restores whole, over it.
+    let r = c.cmd_bytes(&[b"RESTORE", b"dst", b"0", &payload, b"REPLACE"]);
+    assert_eq!(r, V::Str("OK".into()));
+    assert_eq!(c.cmd(&["VCARD", "dst"]).i(), 3);
+    assert_eq!(floats(&c.cmd(&["VEMB", "dst", "b"])), [4.0, 5.0, 6.0]);
+    assert_eq!(quant_type(&mut c, "dst"), "f32");
+}
+
+/// Reads one command a client sent; `None` at its end.
+fn read_command(r: &mut BufReader<TcpStream>) -> Option<Vec<Vec<u8>>> {
+    let mut line = String::new();
+    if r.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let n: usize = line.trim_end().strip_prefix('*')?.parse().ok()?;
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        line.clear();
+        r.read_line(&mut line).ok()?;
+        let len: usize = line.trim_end().strip_prefix('$')?.parse().ok()?;
+        let mut arg = vec![0u8; len + 2];
+        r.read_exact(&mut arg).ok()?;
+        arg.truncate(len);
+        args.push(arg);
+    }
+    Some(args)
+}
+
+/// A port forwarding to `target`, each command passed through `edit` first.
+fn proxy(target: u16, edit: fn(&mut [Vec<u8>])) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { return };
+            let Ok(mut server) = TcpStream::connect(("127.0.0.1", target)) else {
+                return;
+            };
+            let (mut back, mut to_client) =
+                (server.try_clone().unwrap(), client.try_clone().unwrap());
+            std::thread::spawn(move || std::io::copy(&mut back, &mut to_client));
+            let mut reader = BufReader::new(client);
+            std::thread::spawn(move || {
+                while let Some(mut args) = read_command(&mut reader) {
+                    edit(&mut args);
+                    let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+                    if server.write_all(&encode(&refs)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// A `MIGRATE` whose target refuses a wrong-length element fails; the key stays.
+#[test]
+fn migrate_reports_a_wrong_length_element() {
+    let source = Server::start(&[]);
+    let target = Server::start(&[]);
+    let (mut s, mut t) = (source.conn(), target.conn());
+    dumped_set(&mut s, "bad");
+    dumped_set(&mut s, "good");
+    // Corrupted on its way, as a source with such an element would send it.
+    let port = proxy(target.port, |args| {
+        if args[0].eq_ignore_ascii_case(b"RESTORE") && args[1] == b"bad" {
+            args[3] = dump_with_length(&args[3], b'b', 2);
+        }
+    });
+    let port = port.to_string();
+    let r = s.cmd(&["MIGRATE", "127.0.0.1", &port, "bad", "0", "5000"]);
+    assert_eq!(
+        r,
+        V::Err("ERR Target instance replied with error: ERR Bad data format".into())
+    );
+    assert_eq!(s.cmd(&["VCARD", "bad"]).i(), 3);
+    assert_eq!(t.cmd(&["EXISTS", "bad"]).i(), 0);
+    // The same way, untouched: moved whole.
+    let r = s.cmd(&["MIGRATE", "127.0.0.1", &port, "good", "0", "5000"]);
+    assert_eq!(r, V::Str("OK".into()));
+    assert_eq!(s.cmd(&["EXISTS", "good"]).i(), 0);
+    assert_eq!(t.cmd(&["VCARD", "good"]).i(), 3);
+    assert_eq!(floats(&t.cmd(&["VEMB", "good", "c"])), [7.0, 8.0, 9.0]);
 }
 
 /// 1.2 loads every f32 set, NOQUANT too, and refuses Q8 and BIN whole.

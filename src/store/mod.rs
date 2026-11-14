@@ -276,6 +276,12 @@ impl ShardLock {
         self.map.read()
     }
 
+    /// [`ShardLock::read`], or `None` at once while a writer holds or awaits it.
+    #[inline(always)]
+    pub fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, ShardMap>> {
+        self.map.try_read()
+    }
+
     /// What writes under this shard's lock left to be said, said with no
     /// shard held: the keys past their time that they put new values over
     /// are expired, with their events, watches, caches and indexes, and

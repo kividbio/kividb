@@ -104,9 +104,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   f32; 1.3 keeps each node storing what the writer's release stored:
   - *Snapshots.* `Q8` and `BIN` sets use a new type tag, which 1.2 refuses
     rather than misreads. Every f32 set, `NOQUANT` ones included, is saved
-    as before, so 1.2 reads it; a `NOQUANT` set reloads as one made without
-    an option. An element of a 1.2 snapshot whose vector does not have its
-    set's dimension is logged and not loaded, instead of stopping startup.
+    as before, so 1.2 reads it. Saved that way, a `NOQUANT` set loses its
+    choice in any snapshot round trip (a restart from a snapshot,
+    `BGREWRITEAOF`, `RESTORE`, `MIGRATE`, a replica's full sync): it stays
+    f32 but, like a set made without an option, then accepts a `Q8` or `BIN`
+    `VADD` instead of refusing it. A vector
+    whose length is not its set's dimension, as a corrupt 1.2 snapshot or
+    `DUMP` payload can hold, is refused with the whole snapshot or payload:
+    startup stops and names the element, `RESTORE` answers `ERR Bad data
+    format` and changes nothing, `MIGRATE` reports the target's error and
+    keeps the key, and a replica does not load such a full sync. A `Q8`
+    vector whose norm or range is not finite, or a `BIN` one with bits set
+    past its dimension, is refused the same way; no release writes either.
+  - *`RESTORE` and `MIGRATE`.* `DUMP` payloads are in the snapshot format,
+    so f32 and `NOQUANT` sets restore and migrate to 1.2, and `Q8` and `BIN`
+    ones do not: 1.2 answers `ERR Bad data format` and stores nothing, and
+    `MIGRATE` fails with `ERR Target instance replied with error: ERR Bad
+    data format`, leaving the key on the source. `CLUSTER MIGRATION` sends
+    each key as a `RESTORE` too, so it cannot move a slot holding such a set
+    to a 1.2 node. Upgrade every node of a cluster before making such sets.
   - *AOF.* A `VADD` with `NOQUANT`, `Q8` or `BIN` is followed in the log,
     and in backup increments, by a 32-byte `KIVIDB.AOF-VSET-QUANT` record
     (about 1% of a 768-dimension `FP32` `VADD`). Replay applies an option
@@ -115,10 +131,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     upgrading with `appendonly` on, or moving between 1.2 and 1.3 after
     crashes, needs no extra step. If a crash cuts off the record after the
     `VADD` that made a set, the set is f32, as if made without an option,
-    and accepts later `VADD`s. 1.2 replays a 1.3 log, logging each record as
-    an unknown command, and stores every set as f32. `BGREWRITEAOF` saves
-    each set as stored, in the snapshot format above, so records do not
-    pile up.
+    and accepts later `VADD`s. 1.2 replays a 1.3 log and stores every set as
+    f32; 1.2.2 logs an unknown-command warning for each record, one for each
+    `VADD` with an option since the last rewrite. `BGREWRITEAOF` saves each
+    set as stored, in the snapshot format above, so records do not pile up.
   - *Replication.* 1.3 replicas announce `REPLCONF capa vset-quant`; a 1.3
     master answers them with `vset-quant` after the offset of `+FULLRESYNC`
     or the ID of `+CONTINUE`. A replica applies the options only with that
