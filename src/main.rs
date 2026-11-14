@@ -38,6 +38,7 @@ mod member_set;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
+pub mod output_limits;
 pub mod pause;
 pub mod protected_mode;
 mod pubsub;
@@ -752,7 +753,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     let shutdown = Arc::new(AtomicBool::new(false));
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
@@ -1635,7 +1636,7 @@ async fn async_main_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be

@@ -701,6 +701,8 @@ where
     // This connection's subscriptions, while it has any. `None` otherwise, so
     // that a connection that never uses pub/sub allocates nothing for it.
     let mut subscriptions: Option<crate::pubsub::Subscriptions> = None;
+    // The clock of `client-output-buffer-limit`'s soft limit, for its replies.
+    let mut reply_limit = crate::output_limits::ReplyLimit::default();
     // Tracks whether the current authenticated user has a key/command restriction.
     // Drives RESTRICTED_KEY_CLIENTS/RESTRICTED_CMD_CLIENTS so handler.rs can
     // fast-exit on the common path. Kept in sync via acl::track_restriction_counters.
@@ -2651,9 +2653,50 @@ where
         if std::mem::take(&mut aof_wait) {
             crate::aof::written(&aof_tx).await;
         }
-        if write_tcp_batch(&writer, &mut combined).await.is_err() {
+        // `client-output-buffer-limit` (#774): replies over the hard limit,
+        // or over the soft limit for longer than its seconds, end the
+        // connection unwritten, as Redis drops such a client and its output.
+        let mut write_within = None;
+        if pubsub.limits().may_exceed(combined.len()) {
+            use crate::output_limits::{Class, Verdict};
+            let class = if subscriptions.is_some() {
+                Class::PubSub
+            } else {
+                Class::Normal
+            };
+            match reply_limit.check(pubsub.limits(), class, combined.len()) {
+                Verdict::Write => {}
+                Verdict::WriteWithin(time) => write_within = Some((time, class)),
+                Verdict::Close => {
+                    crate::output_limits::note_disconnect(client_id, class, combined.len() as u64);
+                    break;
+                }
+            }
+        }
+        let shown = combined.len() >= crate::client_registry::REPLY_OUTPUT_SHOWN_FROM;
+        if shown {
+            activity.set_reply_output(combined.len());
+        }
+        let written = match write_within {
+            None => write_tcp_batch(&writer, &mut combined).await,
+            Some((time, class)) => {
+                let waiting = combined.len() as u64;
+                match tokio::time::timeout(time, write_tcp_batch(&writer, &mut combined)).await {
+                    Ok(written) => written,
+                    Err(_) => {
+                        crate::output_limits::note_disconnect(client_id, class, waiting);
+                        break;
+                    }
+                }
+            }
+        };
+        if shown {
+            activity.set_reply_output(0);
+        }
+        if written.is_err() {
             break;
         }
+        reply_limit.drained();
         // The replies to SUBSCRIBE are out: messages may follow them.
         if let Some(subs) = &subscriptions {
             subs.flushed();

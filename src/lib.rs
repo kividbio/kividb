@@ -38,6 +38,7 @@ pub mod member_set;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
+pub mod output_limits;
 pub mod pause;
 pub mod protected_mode;
 pub mod pubsub;
@@ -141,7 +142,7 @@ async fn server_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = pubsub::PubSubHub::new();
+    let pubsub = pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be

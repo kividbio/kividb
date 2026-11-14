@@ -225,6 +225,13 @@ pub struct ReplState {
     /// during its full sync (#305). See [`start_hub`].
     pub replica_max_backlog_bytes: AtomicU64,
     pub replica_sync_max_backlog_bytes: AtomicU64,
+    /// `client-output-buffer-limit replica`'s soft limit and its seconds: a
+    /// streaming replica with this much queued for longer than that is
+    /// dropped, as in Redis (#774), once its queue has been under it since
+    /// its full sync or partial resync. 0, the default, for none. Its hard
+    /// limit is `replica_max_backlog_bytes`, 0 for none.
+    pub replica_soft_limit_bytes: AtomicU64,
+    pub replica_soft_limit_secs: AtomicU64,
     /// Master side: what `INFO` reports about the backlog. Written by the hub.
     pub backlog_first_offset: AtomicU64,
     pub backlog_histlen: AtomicU64,
@@ -546,6 +553,9 @@ impl ReplState {
             backlog_ttl_secs: AtomicU64::new(3600),
             replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
             replica_sync_max_backlog_bytes: AtomicU64::new(1024 * 1024 * 1024),
+            // Off by default, unlike Redis: see `output_limits`.
+            replica_soft_limit_bytes: AtomicU64::new(0),
+            replica_soft_limit_secs: AtomicU64::new(0),
             backlog_first_offset: AtomicU64::new(0),
             backlog_histlen: AtomicU64::new(0),
             sync_full: AtomicU64::new(0),
@@ -792,6 +802,15 @@ impl ReplState {
             config.repl_replica_sync_max_backlog_bytes,
             Ordering::Relaxed,
         );
+        let replica = config
+            .client_output_buffer_limit
+            .get(crate::output_limits::Class::Replica);
+        state
+            .replica_soft_limit_bytes
+            .store(replica.soft, Ordering::Relaxed);
+        state
+            .replica_soft_limit_secs
+            .store(replica.soft_seconds, Ordering::Relaxed);
         state.hll_write_redis.store(
             config.hll_write_format.eq_ignore_ascii_case("redis"),
             Ordering::Relaxed,
@@ -2647,6 +2666,20 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                 },
                 _ = tick.tick() => {
                     backlog.report(&state);
+                    // A queue under the soft limit now is no longer over it,
+                    // though nothing was written to find that out: its clock
+                    // starts again. Without this, a replica that went over,
+                    // drained, and stayed idle was dropped by the first
+                    // large write after, as over it ever since (#774).
+                    let soft = state.replica_soft_limit_bytes.load(Ordering::Relaxed);
+                    if soft != 0 {
+                        for replica in channel_replicas.iter_mut().filter(|r| !r.syncing) {
+                            if replica.pending_bytes.bytes() < soft {
+                                replica.soft_armed = true;
+                                replica.over_soft_since = 0;
+                            }
+                        }
+                    }
                     // Give the backlog up once no replica has been attached
                     // for `repl-backlog-ttl`: keeping it means encoding every
                     // write for a replica that is not coming back.
@@ -2797,6 +2830,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             progress,
                             syncing: false,
                             peak: missed_len,
+                            over_soft_since: 0,
+                            // What it missed is queued: not held to the soft
+                            // limit until it has drained it.
+                            soft_armed: false,
                         });
                         if reply.send(Ok(())).is_err() {
                             // The connection went away while it was asking.
@@ -2934,6 +2971,8 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // and drained what was queued meanwhile.
                         syncing: true,
                         peak: 0,
+                        over_soft_since: 0,
+                        soft_armed: false,
                     });
                     log_info!("Replication: Channel replica registered: {addr}");
                 }
@@ -2969,11 +3008,21 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // an unbounded amount of undelivered data in master memory).
                     let mut alive_channels = Vec::with_capacity(channel_replicas.len());
                     // Read for each write, so that `CONFIG SET` applies at once.
-                    let streaming_limit = state.replica_max_backlog_bytes.load(Ordering::Relaxed);
-                    let sync_limit = state
-                        .replica_sync_max_backlog_bytes
-                        .load(Ordering::Relaxed)
-                        .max(streaming_limit);
+                    // 0: no limit, as `client-output-buffer-limit replica 0 0 0`
+                    // means in Redis (#774). The sync's limit is never under the
+                    // streaming one, so no streaming limit lifts it too.
+                    let unlimited_if_0 = |limit: u64| if limit == 0 { u64::MAX } else { limit };
+                    let streaming_limit =
+                        unlimited_if_0(state.replica_max_backlog_bytes.load(Ordering::Relaxed));
+                    let soft = crate::output_limits::Limit {
+                        hard: 0,
+                        soft: state.replica_soft_limit_bytes.load(Ordering::Relaxed),
+                        soft_seconds: state.replica_soft_limit_secs.load(Ordering::Relaxed),
+                    };
+                    let sync_limit = unlimited_if_0(
+                        state.replica_sync_max_backlog_bytes.load(Ordering::Relaxed),
+                    )
+                    .max(streaming_limit);
                     for mut replica in channel_replicas.drain(..) {
                         // Account for the payload *before* handing it over. The
                         // forwarder subtracts as soon as it has the payload, and
@@ -3001,7 +3050,33 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         } else {
                             streaming_limit
                         };
-                        if now_pending > limit {
+                        // Streaming, it is held to the soft limit too: more
+                        // than its seconds over it, without a break, and it
+                        // is dropped. Not in its full sync, whose queue
+                        // grows by design (#305), nor until its queue has
+                        // been under the soft limit once since then: what
+                        // queued up during a full sync, or before a partial
+                        // resync, is still being drained (with a raised hard
+                        // limit, a replica streams again with up to a
+                        // quarter of it queued). The clock is read only over
+                        // the limit.
+                        let over_soft_too_long = if replica.syncing || soft.soft == 0 {
+                            false
+                        } else if now_pending < soft.soft {
+                            replica.soft_armed = true;
+                            replica.over_soft_since = 0;
+                            false
+                        } else {
+                            replica.soft_armed
+                                && soft.exceeded(
+                                    now_pending,
+                                    &mut replica.over_soft_since,
+                                    crate::output_limits::now_secs(),
+                                )
+                        };
+                        if now_pending > limit || over_soft_too_long {
+                            crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS
+                                .fetch_add(1, Ordering::Relaxed);
                             // Replica isn't draining its queue fast enough — evict rather than
                             // let the backlog grow without bound. Dropping `tx` here (by not
                             // pushing it back into `channel_replicas`) closes its forwarder's
@@ -3013,6 +3088,17 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             replica.pending_bytes.abandon();
                             leaving.push(Arc::clone(&replica.pending_bytes));
                             forget_replica(&state, replica.id);
+                            if over_soft_too_long && now_pending <= limit {
+                                log_warn!(
+                                    "Replication: Channel replica {} has had {now_pending} bytes \
+                                     queued, over the soft limit of {} bytes, for more than {} \
+                                     seconds (client-output-buffer-limit replica) — evicting",
+                                    replica.addr,
+                                    soft.soft,
+                                    soft.soft_seconds
+                                );
+                                continue;
+                            }
                             log_warn!(
                                 "Replication: Channel replica {} exceeded backlog limit \
                                  ({now_pending} > {limit} bytes{}) — evicting",
@@ -3238,6 +3324,12 @@ struct ChannelReplica {
     syncing: bool,
     /// The most that has been queued for it at once.
     peak: u64,
+    /// When it went over the soft limit, on `output_limits::now_secs`'s
+    /// clock; 0 while it is under it.
+    over_soft_since: u64,
+    /// Its queue has been under the soft limit since its full sync or
+    /// partial resync: from then on it is held to it. See [`start_hub`].
+    soft_armed: bool,
 }
 
 /// Drop every trace of a replica from the shared state. Idempotent: the
@@ -5003,6 +5095,141 @@ mod replication_invariants_tests {
             propagate(&hub, vec![0u8; 50]);
         }
         await_connected(&state, 0).await;
+    }
+
+    /// Take everything queued for a replica, as its connection would.
+    fn drain(rx: &mut ReplRx, pending: &ReplicaQueue) {
+        let (mut bytes, mut held) = (0, 0);
+        while let Ok(payload) = rx.try_recv() {
+            bytes += payload.len();
+            held += ReplicaQueue::held_for(payload.len());
+        }
+        pending.taken(bytes, held);
+    }
+
+    /// A replica streaming again after its full sync still has what queued
+    /// up meanwhile to drain: up to a quarter of the hard limit, far over a
+    /// soft limit when the hard one is raised. It is not dropped for that,
+    /// which would start the sync again and again (#305); it is held to the
+    /// soft limit once its queue has been under it (#774).
+    #[tokio::test]
+    async fn a_replica_draining_after_its_sync_is_held_to_the_soft_limit_only_after() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(10_000, Ordering::Relaxed);
+        state.replica_soft_limit_bytes.store(100, Ordering::Relaxed);
+        state.replica_soft_limit_secs.store(0, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9010, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..20 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        // Loaded; 200 of the 1000 bytes left to drain.
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9010,
+            offset: 0,
+        })
+        .unwrap();
+        for _ in 0..16 {
+            rx.try_recv().unwrap();
+        }
+        pending.taken(800, 16 * ReplicaQueue::held_for(50));
+        // Streaming again from this write (220 bytes, under a quarter of
+        // 1000), over the soft limit from the next, and for longer than its
+        // seconds: still there.
+        propagate(&hub, vec![0u8; 20]);
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+
+        // Drained once: from now on, over the soft limit for longer than its
+        // seconds and it is dropped.
+        drain(&mut rx, &pending);
+        propagate(&hub, vec![0u8; 20]);
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        propagate(&hub, vec![0u8; 50]);
+        await_connected(&state, 0).await;
+        assert!(pending.abandoned());
+    }
+
+    /// A replica that went over the soft limit and then drained, with nothing
+    /// written meanwhile, is not over it any more: a large write after a
+    /// quiet spell starts its clock again, and does not drop it at once.
+    #[tokio::test]
+    async fn the_soft_limit_clock_starts_again_after_a_drain() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        state.replica_soft_limit_bytes.store(100, Ordering::Relaxed);
+        state.replica_soft_limit_secs.store(0, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9011, &pending);
+        await_connected(&state, 1).await;
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9011,
+            offset: 0,
+        })
+        .unwrap();
+        // Streaming, under the soft limit, then over it.
+        propagate(&hub, vec![0u8; 20]);
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        // Drained, and quiet for longer than the soft limit's seconds.
+        drain(&mut rx, &pending);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        propagate(&hub, vec![0u8; 150]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+    }
+
+    /// 0 for the hard limit is no limit, as `client-output-buffer-limit
+    /// replica 0 0 0` is in Redis; and no streaming limit lifts the sync's.
+    #[tokio::test]
+    async fn no_hard_limit_keeps_a_replica_however_far_behind() {
+        let state = Arc::new(ReplState::new_master());
+        state.replica_max_backlog_bytes.store(0, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9012, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..100 {
+            propagate(&hub, vec![0u8; 1000]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9012,
+            offset: 0,
+        })
+        .unwrap();
+        drain(&mut rx, &pending);
+        for _ in 0..100 {
+            propagate(&hub, vec![0u8; 1000]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
     }
 
     /// The sync's allowance is a bound too: the master's memory stays bounded
