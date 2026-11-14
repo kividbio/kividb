@@ -551,6 +551,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arrays with `$-1`, which redis-py's RESP3 parser refused. RESP2 replies
   are unchanged.
 
+- **A consumer created by an `XREADGROUP … BLOCK` that timed out is kept by
+  the AOF and by replicas (#654).** The consumer was created when the read
+  began to wait, but nothing was propagated for it: it was gone after a
+  restart that replayed the AOF, and a replica never had it. It is now
+  propagated as `XGROUP CREATECONSUMER` when the read starts waiting, as
+  Redis does.
+
 ## [1.2.2] - 2026-11-13
 
 See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).

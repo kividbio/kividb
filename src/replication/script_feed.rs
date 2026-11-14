@@ -130,7 +130,7 @@ pub(crate) fn effects_changed_data() -> bool {
     CHANGED.get()
 }
 
-fn effects_take() -> Vec<Vec<Vec<u8>>> {
+pub(crate) fn effects_take() -> Vec<Vec<Vec<u8>>> {
     EFFECTS.with_borrow_mut(|e| e.take()).unwrap_or_default()
 }
 

@@ -1814,6 +1814,9 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // order they blocked — the entry goes to the one that has waited longest
     // — and each gives the turn to the one behind it once it has looked,
     // which may be reading for another group.
+    // One record for the whole command: the consumer the first look creates
+    // is propagated even when the command then parks (#654).
+    effects_begin();
     let gone = blocking::client_gone(ctx);
     let resumed = blocking::take_resume(ctx);
     let timed_out = matches!(resumed, Some(None));
@@ -1977,7 +1980,8 @@ fn next_claimable_in(
 ///
 /// Every pending-list change made here is recorded as an effect (see
 /// `script_feed::effects_begin`) and that record — not the command — is what
-/// replicas and the AOF receive.
+/// replicas and the AOF receive. The caller begins the record, once for the
+/// command: a second look before parking must not drop what the first did.
 fn run_xreadgroup_delivery(
     ctx: &mut Ctx,
     keys: &[Vec<u8>],
@@ -1988,7 +1992,6 @@ fn run_xreadgroup_delivery(
     // `stream_results_reply`, so both protocols share this code path.
     let resp = reply_resp(ctx);
     let now = now_ms();
-    effects_begin();
 
     // Find every stream and group before delivering from any of them, so a
     // missing key or group fails the command with nothing half-delivered.
