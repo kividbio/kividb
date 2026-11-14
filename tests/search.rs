@@ -3580,6 +3580,103 @@ fn a_filtered_knn_keeps_on_timeout_whichever_way_it_is_answered() {
     }
 }
 
+/// FT.HYBRID's `TIMEOUT` under each `ON_TIMEOUT`, as Redis 8.10.2 answers:
+/// `return` and `return_strict` reply with what was found and a warning
+/// naming the part cut short, and `fail` with an error. Documents are loaded
+/// until a 1 ms query is cut short, then four times as many again.
+#[test]
+fn hybrid_search_keeps_on_timeout() {
+    let _one = timeout_test();
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "hyt",
+            "PREFIX",
+            "1",
+            "hyt:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+        ])
+        .ok()
+    );
+    // `AAAAAAAA` is eight bytes: two FLOAT32s.
+    let hybrid = |c: &mut Conn, timeout: &str| -> V {
+        c.cmd(&[
+            "FT.HYBRID",
+            "hyt",
+            "SEARCH",
+            "hello",
+            "VSIM",
+            "@v",
+            "$b",
+            "PARAMS",
+            "2",
+            "b",
+            "AAAAAAAA",
+            "TIMEOUT",
+            timeout,
+        ])
+    };
+    let cut_short = |reply: &V| -> bool {
+        reply
+            .get("warnings")
+            .arr()
+            .iter()
+            .any(|w| w.s() == "Timeout limit was reached (SEARCH)")
+    };
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 200_000 {
+        hset_many(&mut c, "hyt:", n, 8_000);
+        n += 8_000;
+        let mut late = || cut_short(&hybrid(&mut c, "1"));
+        if late() && late() {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(timed_out, "TIMEOUT 1 still finished after {n} documents");
+    hset_many(&mut c, "hyt:", n, 4 * n);
+
+    // No limit: no warning, a full page.
+    let all = hybrid(&mut c, "0");
+    assert!(all.get("warnings").arr().is_empty(), "{all:?}");
+    assert_eq!(all.get("results").arr().len(), 10, "{all:?}");
+
+    let mut replies = Vec::new();
+    for mode in ["return", "return_strict", "fail"] {
+        assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", mode]).ok());
+        replies.push((mode, hybrid(&mut c, "1")));
+    }
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    for (mode, reply) in replies {
+        if mode == "fail" {
+            assert_eq!(
+                reply.err(),
+                "SEARCH_TIMEOUT Timeout limit was reached",
+                "{mode}"
+            );
+        } else {
+            assert!(cut_short(&reply), "{mode}: {reply:?}");
+            assert!(reply.get("results").arr().len() <= 10, "{mode}: {reply:?}");
+        }
+    }
+}
+
 /// FT.AGGREGATE's `TIMEOUT` is the option where an option can be, not a word
 /// of another clause: an `APPLY … AS TIMEOUT`, or a parameter of that name,
 /// was taken for it, and the word after it for the milliseconds.

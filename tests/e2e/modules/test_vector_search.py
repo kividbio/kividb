@@ -500,39 +500,36 @@ def ft_hybrid_index(rb):
         pass
 
 
+def _pairs(raw):
+    """A RESP3 map, or a RESP2 flat list of names and values, as a dict."""
+    if isinstance(raw, dict):
+        return {_decode(k): v for k, v in raw.items()}
+    return {_decode(raw[i]): raw[i + 1] for i in range(0, len(raw), 2)}
+
+
+def _hybrid(raw):
+    """
+    FT.HYBRID replies as Redis 8.4+ does: total_results, results (one row of
+    names and values per result), warnings, execution_time. Returns
+    (total_results, [row dict, ...]).
+    """
+    top = _pairs(raw)
+    rows = [
+        {name: _decode(value) for name, value in _pairs(row).items()}
+        for row in top["results"]
+    ]
+    return top["total_results"], rows
+
+
 def _parse_hybrid(raw):
-    """
-    FT.HYBRID returns [count, key1, [fields1], key2, [fields2], ...]
-    after fusion (no GROUPBY). Returns (count, [(key, fields_dict), ...]).
-    """
-    count = raw[0]
-    rows = []
-    i = 1
-    while i + 1 < len(raw):
-        key = _decode(raw[i])
-        flat = raw[i + 1]
-        fields = {}
-        for j in range(0, len(flat), 2):
-            fields[_decode(flat[j])] = _decode(flat[j + 1])
-        rows.append((key, fields))
-        i += 2
-    return count, rows
+    """(total_results, [(key, fields), ...]); the key if the row shows it."""
+    total, rows = _hybrid(raw)
+    return total, [(row.get("__key"), row) for row in rows]
 
 
 def _parse_hybrid_grouped(raw):
-    """
-    FT.HYBRID with a GROUPBY tail emits [count, [fields1], [fields2], ...]
-    — flat field arrays without per-row keys.
-    """
-    count = raw[0]
-    rows = []
-    for entry in raw[1:]:
-        flat = entry
-        fields = {}
-        for j in range(0, len(flat), 2):
-            fields[_decode(flat[j])] = _decode(flat[j + 1])
-        rows.append(fields)
-    return count, rows
+    """(total_results, [fields, ...]) of an FT.HYBRID with a GROUPBY."""
+    return _hybrid(raw)
 
 
 class TestFtHybrid:
@@ -578,11 +575,9 @@ class TestFtHybrid:
         top_keys = {rows[0][0], rows[1][0]}
         assert top_keys == {"h:1", "h:3"}
 
-        # Default field names are present
+        # Without LOAD a row is the key and the fused score
         for _, fields in rows[:2]:
-            assert "hybrid_score" in fields
-            assert "text_score"   in fields
-            assert "vsim_score"   in fields
+            assert set(fields) == {"__key", "__score"}
 
     def test_linear_alpha_text_heavy(self, ft_hybrid_index):
         r = ft_hybrid_index
@@ -736,9 +731,9 @@ class TestFtHybrid:
 
         raw = r.execute_command(
             "FT.HYBRID", "h_idx",
-            "SEARCH", "@title:rust",
+            "SEARCH", "@title:rust", "YIELD_SCORE_AS", "text_score",
             "VSIM", "@v", "$q",
-            "SORTBY", "2", "text_score", "DESC",
+            "SORTBY", "2", "@text_score", "DESC",
             "PARAMS", "2", "q", v,
         )
         count, rows = _parse_hybrid(raw)
@@ -763,7 +758,8 @@ class TestFtHybrid:
             "PARAMS", "2", "q", v,
         )
         count, rows = _parse_hybrid(raw)
-        assert count == 2  # LIMIT bounds the returned rows
+        assert count == 5  # every result, before LIMIT
+        assert len(rows) == 2  # LIMIT bounds the returned rows
 
     def test_pipeline_groupby_reduce(self, ft_hybrid_index):
         r = ft_hybrid_index

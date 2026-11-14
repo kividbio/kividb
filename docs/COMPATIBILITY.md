@@ -44,8 +44,8 @@ other files:
 - LlamaIndex's Redis vector store, document store, index store and key-value store:
   [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
   [docs/integrations/llamaindex.md](integrations/llamaindex.md).
-- RedisVL (`redisvl`): SearchIndex create, load and query, including filters, SemanticCache and
-  SemanticRouter. `HybridQuery` (`FT.HYBRID` with `SCORER`) fails on KiviDB; the default image is enough,
+- RedisVL (`redisvl`): SearchIndex create, load and query, including filters, SemanticCache,
+  SemanticRouter and `HybridQuery` (`FT.HYBRID`, from the fix for #767); the default image is enough,
   no Lua: [benchmarks/redisvl-compat/REPORT.md](../benchmarks/redisvl-compat/REPORT.md) and
   [docs/integrations/redisvl.md](integrations/redisvl.md).
 - Mem0's Redis vector store and the `Memory` API on top of it, in the Python SDK and the TypeScript SDK
@@ -225,8 +225,12 @@ other files:
   wait for one).
 
 **Cluster**
-- `FT.SPELLCHECK`, `FT.PROFILE`, `FT.HYBRID` and `FT.SYNDUMP` answer from the
-  node they're sent to.
+- `FT.SPELLCHECK`, `FT.PROFILE` and `FT.SYNDUMP` answer from the node
+  they're sent to.
+- `FT.HYBRID` is refused in a cluster of more than one master ("FT.HYBRID is
+  not supported across a cluster's masters yet"), where Redis answers it
+  from every shard: one node's answer would be part of the cluster's. A
+  cluster of one master answers it.
 - Without `tls-cluster`, traffic between nodes is unencrypted, as in Redis.
 - KiviDB nodes cluster only with KiviDB nodes.
 - `cluster-node-timeout` is read only at startup: `CONFIG SET` refuses a

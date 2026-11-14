@@ -110,7 +110,7 @@ fn count_at(cmd: &[&[u8]], i: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Where the clause at `cmd[i]` ends: what [`run`] steps over for it,
+/// Where the clause at `cmd[i]` ends: what [`run_within`] steps over for it,
 /// without running it.
 fn clause_end(cmd: &[&[u8]], i: usize) -> usize {
     let is = |at: usize, word: &str| {
@@ -150,7 +150,7 @@ fn clause_end(cmd: &[&[u8]], i: usize) -> usize {
 }
 
 /// Where the option `name` (`TIMEOUT`, ...) is in the clauses from
-/// `cmd[start]` on, walked clause by clause as [`run`] walks them: a word
+/// `cmd[start]` on, walked clause by clause as [`run_within`] walks them: a word
 /// inside a clause (an `APPLY`'s `AS timeout`, a parameter's name or value,
 /// a `FILTER`'s expression) is not the option.
 pub fn option_at(cmd: &[&[u8]], start: usize, name: &str) -> Option<usize> {
@@ -168,11 +168,8 @@ pub fn option_at(cmd: &[&[u8]], start: usize, name: &str) -> Option<usize> {
 /// transformed rows. On an unrecognised clause we advance past it (lenient
 /// behaviour matching the existing ft_aggregate implementation), which
 /// handles tokens like SCORER/DIALECT that ft_search consumes earlier.
-pub fn run(rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
-    run_within(rows, cmd, start_idx, None).0
-}
-
-/// [`run`], stopping when `deadline` has passed; then the second value is
+///
+/// It stops when `deadline` has passed; then the second value is
 /// true. A step cut short keeps only what it finished (an `APPLY` the rows
 /// it computed, a `FILTER` the rows it found good, a `GROUPBY` the groups
 /// of the rows it read, or the groups it reduced), a sort with no time left
