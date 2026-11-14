@@ -6224,13 +6224,17 @@ fn an_import_cut_short_by_a_restart_keeps_the_keys_held_before_it() {
         || orphan_slots(&nodes[0]) == vec![(slot, slot, 101, Some(id1.clone()))],
     );
     let mut c = nodes[0].conn();
-    // Refused for a moment after the owner's migration ended.
+    // Refused, or stopped, for a moment after the owner's migration ended.
     let mut outcome = None;
     wait_until(
         "CLUSTER DROPORPHANS to run",
         Duration::from_secs(60),
         || {
-            assert_eq!(c.cmd(&["CLUSTER", "DROPORPHANS"]), Resp::Int(101));
+            let r = c.cmd(&["CLUSTER", "DROPORPHANS"]);
+            if r.err().is_some() {
+                return false;
+            }
+            assert_eq!(r, Resp::Int(101));
             let ended = drop_outcome(&nodes[0]);
             if ended.0 == "stopped" && ended.1 == 0 && ended.3.contains("importing or migrating") {
                 return false;
