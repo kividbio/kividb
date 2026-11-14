@@ -94,6 +94,7 @@ pub fn run_for_test(config: config::Config) {
     }
     crate::eviction::configure(&cfg);
     crate::compaction::configure(&cfg);
+    crate::give_back::set_enabled(cfg.allocator_give_back);
     // Only ever raised here, as the servers of one test process share it.
     crate::snapshot::SNAPSHOT_DATABASES
         .fetch_max(cfg.databases, std::sync::atomic::Ordering::Relaxed);

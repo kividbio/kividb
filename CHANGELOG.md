@@ -115,14 +115,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Memory freed by a large delete goes back to the system within a second
-  (#753).** Deleting a hash of 3M fields left `used_memory` at 1.4 MB but
-  RSS at 200 MiB, and deleting 1M fields with `HDEL` left 78 MiB: the free
-  pages stayed in the system allocator until a `MEMORY PURGE`. A
-  background thread now gives them back once what is allocated has fallen
-  by 32 MiB and by an eighth since the last time, at most once a second;
-  RSS falls to 17 MiB in both cases. A server under steady load does not
-  trim. `INFO memory` counts the trims in `allocator_trims`.
+- **Memory freed by a large delete goes back to the system once the server
+  is idle (#753).** Deleting a hash of 3M fields left `used_memory` at
+  1.4 MB but RSS at 200 MiB, and deleting 1M fields with `HDEL` left
+  78 MiB: the free pages stayed in the system allocator until a `MEMORY
+  PURGE`. A background thread now gives them back once what is allocated
+  has fallen by 32 MiB and by an eighth, and the server has served fewer
+  than 100 commands in the last second; RSS falls to 17 MiB in both cases.
+  A busy server is not trimmed, since a trim can hold up its threads for
+  tens of milliseconds: `MEMORY PURGE` gives the memory back on demand.
+  `INFO memory` has `allocator_trims` and `allocator_trims_skipped_busy`;
+  `allocator-give-back no` turns it off. Linux builds on glibc only.
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
   master crashed right after a `CLUSTER MIGRATION IMPORT` handover kept the

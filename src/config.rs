@@ -193,6 +193,12 @@ pub struct Config {
     #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
     pub activedefrag: bool,
 
+    /// Give the system allocator's free pages back to the system once what
+    /// is allocated has fallen far and the server is idle (#753; see
+    /// `src/give_back.rs`). On unless switched off.
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
+    pub allocator_give_back: bool,
+
     /// Waste in the slabs under which active defrag does not start (Redis
     /// `active-defrag-ignore-bytes`).
     #[arg(long, default_value_t = 64 << 20)]
@@ -628,6 +634,7 @@ impl Default for Config {
             key_access_tracking: false,
             lfu_decay_time: 1,
             activedefrag: true,
+            allocator_give_back: true,
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
@@ -755,6 +762,7 @@ impl Config {
             key_access_tracking: false,
             lfu_decay_time: 1,
             activedefrag: true,
+            allocator_give_back: true,
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
@@ -1140,6 +1148,14 @@ impl Config {
         out.push_str(&format!(
             "activedefrag {}\n",
             if self.activedefrag { "yes" } else { "no" }
+        ));
+        out.push_str(&format!(
+            "allocator-give-back {}\n",
+            if self.allocator_give_back {
+                "yes"
+            } else {
+                "no"
+            }
         ));
         out.push_str(&format!(
             "active-defrag-ignore-bytes {}\n",
@@ -1861,6 +1877,7 @@ impl Config {
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
             "activedefrag" => set!(activedefrag, yes_no(key, one()?)?),
+            "allocator-give-back" => set!(allocator_give_back, yes_no(key, one()?)?),
             "active-defrag-ignore-bytes" => {
                 set!(active_defrag_ignore_bytes, parse_memory(key, one()?)?)
             }
