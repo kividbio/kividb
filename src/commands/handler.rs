@@ -1730,7 +1730,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // A parked command has not done its work yet — there is nothing to
     // propagate, invalidate or feed to MONITOR until it is resumed, and the
     // reply above is a discarded placeholder. The resume dispatch runs this.
+    // All but what it did before it parked: the consumer an `XREADGROUP`
+    // created (#654).
     if crate::commands::blocking::parked(ctx) {
+        if name == "XREADGROUP" {
+            propagate_before_park(ctx, name);
+        }
         return result;
     }
 
@@ -1763,6 +1768,36 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         result
     };
     crate::tracking::with_what_came_before(result)
+}
+
+/// What an `XREADGROUP` that is about to wait has already changed: the
+/// consumer it created, which stays whether anything is delivered or not.
+/// Redis propagates it as `XGROUP CREATECONSUMER` when the command blocks;
+/// waiting for the resume left it out of the AOF and the replicas
+/// whenever the wait timed out, since by then the consumer was there to
+/// be found (#654). Deliveries are not made before a park, so this is the
+/// whole of it; a resumed command propagates what it delivers itself.
+#[cold]
+#[inline(never)]
+fn propagate_before_park(ctx: &Ctx, name: &str) {
+    let effects = replication::script_feed::effects_take();
+    if effects.is_empty() {
+        return;
+    }
+    if !ctx.apply_replication {
+        ctx.repl_state.note_local_write_of(name);
+    }
+    if ctx.skip_write_side_effects {
+        return;
+    }
+    if replication::write_is_observed(ctx) {
+        for parts in &effects {
+            replication::replicate_one_write(ctx, parts);
+        }
+    }
+    if replication::script_feed::effects_changed_data() {
+        crate::stats::record_rdb_change();
+    }
 }
 
 /// Replication/AOF propagation, WATCH notification, RDB-change tracking, MONITOR broadcast,
