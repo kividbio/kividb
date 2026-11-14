@@ -2500,3 +2500,44 @@ fn numbers_leave_a_script_as_redis_s_do() {
         assert_eq!(c.cmds(&["EVAL", script, "0"]), expected, "{script}");
     }
 }
+
+/// `string.format` keeps what it builds in Lua's memory, so that an error
+/// leaves nothing behind: no memory leak on an error path (#747). Resident
+/// memory stays put over many large calls under `pcall`.
+#[test]
+fn string_format_frees_what_it_built_when_it_fails() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let rss = |c: &mut Conn| -> u64 {
+        let info = c.cmds(&["INFO", "memory"]);
+        info.as_str()
+            .lines()
+            .find_map(|l| l.strip_prefix("used_memory_rss:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    // 600,000 `%s` and a `%d` given a fraction: a rewrite, with as many
+    // arguments kept. Ten calls per script, each under `pcall`.
+    let script = "local n = 600000 \
+         local t = {} for i = 1, n do t[i] = 'x' end t[n + 1] = 1.5 \
+         local f = string.rep('%s', n) .. '%d' \
+         local ok = 0 \
+         for i = 1, 10 do \
+           if pcall(string.format, f, table.unpack(t)) then ok = ok + 1 end \
+         end \
+         t = nil f = nil collectgarbage() \
+         return ok";
+    // Once to warm the allocator up, then measured.
+    assert!(matches!(c.cmds(&["EVAL", script, "0"]), RespValue::Int(_)));
+    let before = rss(&mut c);
+    for _ in 0..3 {
+        assert!(matches!(c.cmds(&["EVAL", script, "0"]), RespValue::Int(_)));
+    }
+    let after = rss(&mut c);
+    let grown = after.saturating_sub(before);
+    assert!(grown < 32 << 20, "resident memory grew {grown} bytes");
+}

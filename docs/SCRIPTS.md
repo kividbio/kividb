@@ -31,13 +31,13 @@ where numbers leave a script behave as Redis's do:
   `string.format('%d', 1.5)` gives `1`. Lua 5.4 on its own fails with
   "number has no integer representation". A number out of the integer range
   gives what Redis gives (`string.format('%d', 2^63)` and `1e20` are
-  `-9223372036854775808`). (Since 1.3.0.)
+  `-9223372036854775808`, as Redis gives on x86-64). (Since 1.3.0.)
 - **A number passed to `redis.call`** is written as Redis writes it: `10 / 2`
   as `5`, `1e20` as `1e+20`, `2^63` as `9223372036854776000`.
 - **A number returned from a script** is cut toward zero to an integer
   reply; one out of the integer range (`1e30`, `math.huge`) is
-  `-9223372036854775808`, as in Redis.
-- **`cjson.encode`** writes numbers with 14 significant digits, and `10 / 2`
+  `-9223372036854775808`, as Redis gives on x86-64.
+- **`cjson.encode`** writes floats with 14 significant digits, and `10 / 2`
   as `5`; **`cmsgpack.pack`** writes a number with an integer value as an
   integer, and a float that a 32-bit float holds exactly as one.
 
@@ -50,7 +50,10 @@ What is still Lua 5.4, with the way to write it so that it works on both:
 | `string.rep`, `string.sub`, `string.char` and other functions that take a position or a count fail on a number with a fraction | cut it toward zero | `math.floor(n)` |
 | `//`, `&`, `\|`, `~`, `<<`, `>>`, `goto` and `<const>` are accepted, and `goto` is a keyword | syntax errors | leave them out of scripts that must also run on Redis |
 | `unpack` and `table.unpack` are both there, as are `table.pack`, `math.tointeger`, `string.pack` and `utf8` | `unpack` only | `unpack` |
-| `load` takes source text; `loadstring`, `setfenv`, `getfenv`, `gcinfo`, `table.getn`, `table.maxn`, `math.mod` and `string.gfind` are not there | there | `load(text)` in KiviDB, `#t` for `table.getn(t)`, `math.fmod` for `math.mod` |
+| `load` takes source text; `gcinfo`, `table.getn`, `table.maxn`, `math.mod` and `string.gfind` are not there | `load` takes a function; the others are there | `#t` for `table.getn(t)`, `math.fmod` for `math.mod`, `collectgarbage('count')` for `gcinfo()` |
+| `string.format('%s', 10 / 2)` is `"5.0"` | `"5"` | `string.format('%d', n)` for a number you want written without a fraction |
+| `string.format('%q', 1.5)` writes the float in hexadecimal (`0x1.8p+0`) | `"1.5"` | `string.format('%q', tostring(x))`, or `%s` |
+| `%05s`, `%#s` and `%+s` (flags other than `-` on `%s`) are errors | taken | leave the flag out |
 | `bit` returns unsigned 32-bit numbers (`bit.bnot(0)` is `4294967295`) and `bit.tohex` writes capitals | signed (`-1`), lower case | `bit.tobit(x)` on what you compare, `string.lower(bit.tohex(x))` |
 
 Moving scripts to Lua 5.1 entirely, so that these go too, is tracked
