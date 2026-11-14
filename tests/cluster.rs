@@ -9309,3 +9309,69 @@ fn randomkey_is_even_over_a_busy_hash_tag() {
     let share = tagged as f64 / picks.len() as f64;
     assert!((0.44..0.56).contains(&share), "tagged share {share}");
 }
+
+/// FT.HYBRID is not answered across masters yet: sent to any master of a
+/// cluster of more than one, it is refused rather than answered from that
+/// master's slots alone. A cluster of one master holds every document, and
+/// answers it.
+#[test]
+fn hybrid_search_is_refused_across_masters() {
+    let create: [&str; 16] = [
+        "FT.CREATE",
+        "hy",
+        "ON",
+        "HASH",
+        "SCHEMA",
+        "t",
+        "TEXT",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+    ];
+    let blob: Vec<u8> = [1.0f32, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let hybrid = |c: &mut Conn| {
+        c.cmd_bytes(&[
+            b"FT.HYBRID",
+            b"hy",
+            b"SEARCH",
+            b"hello",
+            b"VSIM",
+            b"@v",
+            b"$b",
+            b"PARAMS",
+            b"2",
+            b"b",
+            &blob,
+        ])
+    };
+
+    let (nodes, _) = form_cluster(2);
+    let mut args = create.to_vec();
+    args.push("L2");
+    let r = nodes[0].conn().cmd(&args);
+    assert!(r.is_ok(), "{r:?}");
+    for node in &nodes {
+        let reply = hybrid(&mut node.conn());
+        assert_eq!(
+            reply.err(),
+            Some("ERR FT.HYBRID is not supported across a cluster's masters yet"),
+            "{reply:?}"
+        );
+    }
+
+    let (lone, _) = form_cluster(1);
+    let mut c = lone[0].conn();
+    assert!(c.cmd(&args).is_ok());
+    let r = c.cmd_bytes(&[b"HSET", b"doc", b"t", b"hello", b"v", &blob]);
+    assert!(matches!(r, Resp::Int(2)), "{r:?}");
+    let reply = hybrid(&mut c);
+    let fields = reply.array();
+    assert_eq!(fields[0].text(), "total_results", "{reply:?}");
+    assert_eq!(fields[1].int(), 1, "{reply:?}");
+}

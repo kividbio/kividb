@@ -108,6 +108,19 @@ fn number<T: std::str::FromStr>(cmd: &[&[u8]], i: usize, name: &str) -> Result<T
         })
 }
 
+/// `CONSTANT`, `ALPHA` or `BETA`: a number, refused when it is infinite or
+/// too large for a double, as Redis 8.10.2 refuses it. Redis takes `nan`,
+/// zero and negative numbers here, and so does this.
+fn weight(cmd: &[&[u8]], i: usize, name: &str) -> Result<f64, String> {
+    let value: f64 = number(cmd, i, name)?;
+    if value.is_infinite() {
+        return Err(format!(
+            "SEARCH_PARSE_ARGS {name}: Could not convert argument to expected type"
+        ));
+    }
+    Ok(value)
+}
+
 /// The `count` of a `KNN` / `RANGE` / `COMBINE` block: its arguments go in
 /// name–value pairs.
 fn pair_count(cmd: &[&[u8]], i: usize, what: &str) -> Result<usize, String> {
@@ -430,9 +443,9 @@ fn parse_combine(cmd: &[&[u8]], i: usize, q: &mut HybridQuery) -> Result<usize, 
                 }
             }
             (_, b"YIELD_SCORE_AS") => q.hybrid_yield = Some(word(cmd[at + 1])),
-            (true, b"CONSTANT") => constant = number(cmd, at + 1, "CONSTANT")?,
-            (false, b"ALPHA") => alpha = Some(number::<f64>(cmd, at + 1, "ALPHA")?),
-            (false, b"BETA") => beta = Some(number::<f64>(cmd, at + 1, "BETA")?),
+            (true, b"CONSTANT") => constant = weight(cmd, at + 1, "CONSTANT")?,
+            (false, b"ALPHA") => alpha = Some(weight(cmd, at + 1, "ALPHA")?),
+            (false, b"BETA") => beta = Some(weight(cmd, at + 1, "BETA")?),
             _ => {
                 return Err(format!(
                     "SEARCH_PARSE_ARGS {}: Unknown argument",
@@ -645,9 +658,9 @@ fn vsim_ranked(
 
     let nearest: Vec<KnnResult> = match method {
         VectorMethod::Knn { k, ef_runtime } if unfiltered => {
-            let ef = ef_runtime.unwrap_or(match algo {
+            let ef = ef_runtime.unwrap_or_else(|| match algo {
                 VectorAlgo::Hnsw { ef_runtime, .. } => *ef_runtime,
-                VectorAlgo::Flat => k * 2,
+                VectorAlgo::Flat => k.saturating_mul(2),
             });
             crate::commands::vector::nearest_shown(db, &field.name, *k, |n| match live {
                 LiveIndex::Flat(idx) => crate::vector::knn_flat(idx, query_vec, n, metric),
@@ -701,7 +714,19 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 }
 
+/// `ON_TIMEOUT fail`: a query cut short is an error. Unlike FT.SEARCH here,
+/// `return_strict` is not: Redis 8.10.2 answers FT.HYBRID under
+/// `return-strict` with what was found and the warning.
+fn timeout_fails() -> bool {
+    crate::commands::search_tools::config_value("ON_TIMEOUT").eq_ignore_ascii_case("fail")
+}
+
 fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
+    // This node's documents are only its slots': an answer from them alone
+    // would be a part of the cluster's, given as the whole.
+    if crate::cluster::search::coordinates(ctx) {
+        return Err("ERR FT.HYBRID is not supported across a cluster's masters yet".into());
+    }
     let q = parse(&ctx.cmd)?;
     let scorer = match &q.scorer {
         Some(name) => scorer_named(name)?,
@@ -765,7 +790,6 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
     )?;
     // Nearest first; at the same distance, by key.
     rank(&mut vsim, false);
-    let mut timed_out = text_cut || vsim_cut;
     let window = match q.fusion {
         Fusion::Rrf { window, .. } | Fusion::Linear { window, .. } => window,
     };
@@ -835,15 +859,26 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
     }
 
     // ── The steps after fusion, then the page ───────────────────────────────
+    let mut tail_cut = false;
     if !q.tail.is_empty() {
         let tail: Vec<&[u8]> = q.tail.iter().map(Vec::as_slice).collect();
         let (after, cut) =
             crate::commands::aggregate_pipeline::run_within(rows, &tail, 0, deadline);
         rows = after;
-        timed_out |= cut;
+        tail_cut = cut;
     }
-    if timed_out && crate::commands::search::on_timeout_fails() {
-        return Err("Timeout limit was reached".into());
+    // A warning for each part that ran out of time, as Redis names them.
+    let warnings: Vec<Vec<u8>> = [
+        (text_cut, "Timeout limit was reached (SEARCH)"),
+        (vsim_cut, "Timeout limit was reached (VSIM)"),
+        (tail_cut, "Timeout limit was reached"),
+    ]
+    .into_iter()
+    .filter(|(cut, _)| *cut)
+    .map(|(_, warning)| resp_bulk_str(warning))
+    .collect();
+    if !warnings.is_empty() && timeout_fails() {
+        return Err("SEARCH_TIMEOUT Timeout limit was reached".into());
     }
     let total = rows.len();
     let shown = shown_fields(&q);
@@ -856,11 +891,6 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
         .collect();
 
     let resp = ctx.resp;
-    let warnings = if timed_out {
-        vec![resp_bulk_str("Timeout limit was reached")]
-    } else {
-        Vec::new()
-    };
     let millis = started.elapsed().as_secs_f64() * 1000.0;
     let execution_time = if resp == 3 {
         resp_double_resp3(millis)
@@ -1418,6 +1448,52 @@ mod tests {
             "18446744073709551614",
         ];
         assert!(parsed(&with_tail(&knn)).is_err());
+    }
+
+    /// Redis 8.10.2 refuses an infinite `CONSTANT`, `ALPHA` or `BETA`, or one
+    /// past a double's range, and takes `nan`, zero and negative numbers.
+    #[test]
+    fn combine_weights_are_finite() {
+        let combine = |method: &'static str, n: &'static str, rest: &[&'static str]| {
+            let mut words = vec![
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "x",
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                method,
+                n,
+            ];
+            words.extend_from_slice(rest);
+            parsed(&with_tail(&words))
+        };
+        for bad in ["inf", "-inf", "+inf", "infinity", "1e400", "-1.8e308"] {
+            assert_eq!(
+                combine("RRF", "2", &["CONSTANT", bad]).unwrap_err(),
+                "SEARCH_PARSE_ARGS CONSTANT: Could not convert argument to expected type",
+                "{bad}"
+            );
+            assert_eq!(
+                combine("LINEAR", "4", &["ALPHA", bad, "BETA", "1"]).unwrap_err(),
+                "SEARCH_PARSE_ARGS ALPHA: Could not convert argument to expected type",
+                "{bad}"
+            );
+            assert_eq!(
+                combine("LINEAR", "4", &["ALPHA", "1", "BETA", bad]).unwrap_err(),
+                "SEARCH_PARSE_ARGS BETA: Could not convert argument to expected type",
+                "{bad}"
+            );
+        }
+        for good in ["0", "-1", "nan", "0.5", "1e308"] {
+            assert!(combine("RRF", "2", &["CONSTANT", good]).is_ok(), "{good}");
+            assert!(
+                combine("LINEAR", "4", &["ALPHA", good, "BETA", good]).is_ok(),
+                "{good}"
+            );
+        }
     }
 
     #[test]

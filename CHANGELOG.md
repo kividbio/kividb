@@ -22,6 +22,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   target stream top item"), logs a warning and goes on: nothing is lost,
   only its `iids-duplicates` count stays behind. An earlier release
   replaying such an AOF skips those lines the same way.
+- **`FT.HYBRID` answers in Redis 8.10's shape, not 1.2.x's (#767).** Code
+  that reads the array 1.2.0 to 1.2.2 replied must change; redis-py and
+  RedisVL read the new one, which Redis 8.4 and later send. What changes:
+  - The reply is `total_results`, `results`, `warnings` and
+    `execution_time`, a map under RESP3, not a count then keys and fields.
+  - With `LOAD`, a row has only the fields loaded: no key, unless `LOAD
+    @__key`.
+  - Rows have no `text_score`, `vsim_score` or `hybrid_score` unless asked
+    for: name them with `YIELD_SCORE_AS` in the `SEARCH`, `VSIM` or
+    `COMBINE` clause.
+  - `LINEAR` adds the raw text score and the vector similarity, weighted by
+    `ALPHA` and `BETA`, with no min-max scaling, so fused scores and their
+    order differ.
+  - `total_results` counts the results before `LIMIT`.
+  - `TIMEOUT` is taken (and `search-timeout` applies); `DIALECT` is
+    refused.
+
+  In a cluster of more than one master, `FT.HYBRID` is now refused, where
+  1.2.x answered from the one node's slots without saying so.
 
 ### Added
 

@@ -214,8 +214,12 @@ other files:
   wait for one).
 
 **Cluster**
-- `FT.SPELLCHECK`, `FT.PROFILE`, `FT.HYBRID` and `FT.SYNDUMP` answer from the
-  node they're sent to.
+- `FT.SPELLCHECK`, `FT.PROFILE` and `FT.SYNDUMP` answer from the node
+  they're sent to.
+- `FT.HYBRID` is refused in a cluster of more than one master ("FT.HYBRID is
+  not supported across a cluster's masters yet"), where Redis answers it
+  from every shard: one node's answer would be part of the cluster's. A
+  cluster of one master answers it.
 - Without `tls-cluster`, traffic between nodes is unencrypted, as in Redis.
 - KiviDB nodes cluster only with KiviDB nodes.
 - `cluster-node-timeout` is read only at startup: `CONFIG SET` refuses a
