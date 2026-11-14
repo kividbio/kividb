@@ -27,8 +27,15 @@ it fail for that reason and not their own.
 a server started empty**, with a no-progress limit of five minutes and a
 limit of fifteen on a unit as a whole. A unit that hangs or dies costs
 itself. The script prints a line per unit, writes the table to the job's
-summary page, and keeps every unit's log as an artifact. It exits 0 whatever
-the tests did: it is a measurement, not a gate.
+summary page, and keeps every unit's log as an artifact.
+
+It is a gate on what fails. `scripts/redis_compat_known_failures.txt` lists
+the tests KiviDB is known to fail, by unit and name. A unit with any other
+failure, or that ends early (an exception, a test that never finishes, the
+unit's time running out, the server gone), is run once more, and fails the job if it fails again: a
+regression fails twice, a flake once. A listed test that passes is printed
+as a notice, to be taken off the list. `scripts/redis_compat_check.sh`
+decides; `scripts/redis_compat_check_test.sh` tests it.
 
 ```
 scripts/redis_compat.sh <kividb-binary> <redis-checkout> [<output-dir>]
@@ -44,7 +51,8 @@ tests of that kind and contribute nothing either way.
 
 CI runs Redis 8.10.2's suite since 1.1.1, the release KiviDB reports itself
 as. The figures below are from Redis 8.0.0's suite, which it ran before; the
-CI job's summary has the current ones.
+CI job's summary has the current ones, and
+`scripts/redis_compat_known_failures.txt` what fails today.
 
 Redis 8.0.0's suite, on Linux, io_uring loop:
 

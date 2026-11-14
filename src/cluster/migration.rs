@@ -284,7 +284,19 @@ impl Registry {
     }
 
     /// Add `task` unless a running task already covers one of its slots.
+    #[cfg(test)]
     fn add(&self, task: Task) -> Result<(), String> {
+        self.add_unless(task, || Ok(()))
+    }
+
+    /// [`Self::add`], unless `refused` says why not, asked with the tasks
+    /// locked: no `CLUSTER SETSLOT` changes a slot's state in between
+    /// ([`super::ClusterState::setslot_unless_migrating`], #755).
+    fn add_unless(
+        &self,
+        task: Task,
+        refused: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut tasks = self.tasks.lock();
         let clash = tasks
             .iter()
@@ -292,6 +304,7 @@ impl Registry {
         if clash {
             return Err("a migration of some of these slots is already in progress".into());
         }
+        refused()?;
         // A retry of a task that failed here replaces its record. Both used to
         // be kept, and the first was the one found: the retry ran as the old
         // task and its end was recorded on that, so the new record stayed
@@ -456,6 +469,29 @@ impl Registry {
     /// order of `ClusterState`'s locks.
     pub(crate) fn with_tasks<R>(&self, f: impl FnOnce(&[Task]) -> R) -> R {
         f(&self.tasks.lock())
+    }
+
+    /// Why `CLUSTER SETSLOT` may not change `slot` now, if it may not
+    /// (#755): an atomic slot migration of it, to or from this node, is
+    /// running (canceled, too, until it has cleaned up). An import counts
+    /// every key of its slots that it did not find here as one it brought,
+    /// and deletes them if it does not complete: keys moved in meanwhile by
+    /// `MIGRATE`, or written by `ASKING` clients, would go with them, and
+    /// may be the only copy. As Redis refuses it, every form of `SETSLOT`.
+    /// Only while the task runs, as in Redis: one that has ended holds
+    /// nothing up, so `redis-cli --cluster reshard` can move a slot on as
+    /// soon as an atomic migration has brought it.
+    pub(crate) fn setslot_refusal(tasks: &[Task], slot: u16) -> Option<String> {
+        tasks
+            .iter()
+            .any(|t| in_ranges(&t.ranges, slot) && t.state == TaskState::InProgress)
+            .then(|| {
+                format!(
+                    "Slot {slot} is currently in an active atomic slot migration. CLUSTER \
+                     SETSLOT cannot be used at this time. To perform a legacy slot migration \
+                     instead, first cancel the ongoing task with CLUSTER MIGRATION CANCEL"
+                )
+            })
     }
 
     /// Ask running tasks to stop: the one with this id, or all of them.
@@ -1720,28 +1756,31 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
     if env.address_of(&dest).is_none() {
         return Err("unknown destination node".into());
     }
-    env.registry().add(Task {
-        id: task_id.to_string(),
-        ranges: ranges.clone(),
-        source: me,
-        dest,
-        operation: Operation::Migrate,
-        state: TaskState::InProgress,
-        last_error: String::new(),
-        retries: 0,
-        create_time_ms: now_ms(),
-        start_time_ms: now_ms(),
-        end_time_ms: 0,
-        write_pause_ms: 0,
-        capture_pause_ms: 0,
-        cancel: Arc::new(AtomicBool::new(false)),
-        last_activity_ms: Arc::new(AtomicU64::new(0)),
-        attempt_failed: Arc::new(AtomicBool::new(false)),
-        attempt_floor: Arc::new(AtomicU64::new(0)),
-        taking_over: false,
-        ended_at: None,
-        held_before: Arc::default(),
-    })?;
+    env.registry().add_unless(
+        Task {
+            id: task_id.to_string(),
+            ranges: ranges.clone(),
+            source: me,
+            dest,
+            operation: Operation::Migrate,
+            state: TaskState::InProgress,
+            last_error: String::new(),
+            retries: 0,
+            create_time_ms: now_ms(),
+            start_time_ms: now_ms(),
+            end_time_ms: 0,
+            write_pause_ms: 0,
+            capture_pause_ms: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+            attempt_failed: Arc::new(AtomicBool::new(false)),
+            attempt_floor: Arc::new(AtomicU64::new(0)),
+            taking_over: false,
+            ended_at: None,
+            held_before: Arc::default(),
+        },
+        || no_legacy_migration(cluster, &ranges),
+    )?;
 
     let id = task_id.to_string();
     let thread_env = env.clone();
@@ -2274,28 +2313,31 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
     }
     let source = single_owner(cluster, &ranges)?;
     let id = super::node_id_str(&super::generate_node_id()).to_string();
-    env.registry().add(Task {
-        id: id.clone(),
-        ranges,
-        source,
-        dest: cluster.myself(),
-        operation: Operation::Import,
-        state: TaskState::InProgress,
-        last_error: String::new(),
-        retries: 0,
-        create_time_ms: now_ms(),
-        start_time_ms: 0,
-        end_time_ms: 0,
-        write_pause_ms: 0,
-        capture_pause_ms: 0,
-        cancel: Arc::new(AtomicBool::new(false)),
-        last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
-        attempt_failed: Arc::new(AtomicBool::new(false)),
-        attempt_floor: Arc::new(AtomicU64::new(0)),
-        taking_over: false,
-        ended_at: None,
-        held_before: Arc::default(),
-    })?;
+    env.registry().add_unless(
+        Task {
+            id: id.clone(),
+            ranges: ranges.clone(),
+            source,
+            dest: cluster.myself(),
+            operation: Operation::Import,
+            state: TaskState::InProgress,
+            last_error: String::new(),
+            retries: 0,
+            create_time_ms: now_ms(),
+            start_time_ms: 0,
+            end_time_ms: 0,
+            write_pause_ms: 0,
+            capture_pause_ms: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
+            attempt_failed: Arc::new(AtomicBool::new(false)),
+            attempt_floor: Arc::new(AtomicU64::new(0)),
+            taking_over: false,
+            ended_at: None,
+            held_before: Arc::default(),
+        },
+        || no_legacy_migration(cluster, &ranges),
+    )?;
 
     save_imports(cluster);
     let task_id = id.clone();
@@ -2333,6 +2375,40 @@ fn single_owner(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<NodeId,
     }
     owner.ok_or_else(|| "no slots given".to_string())
 }
+
+/// Refused if one of `ranges` is in a legacy migration here (`CLUSTER
+/// SETSLOT IMPORTING` or `MIGRATING`), on either side of an atomic one
+/// (#755). An import counts the keys it did not find here when it began as
+/// brought by it, and deletes them if it does not complete: those `MIGRATE`
+/// or `ASKING` clients write meanwhile would go too, and may be the only
+/// copy. Redis refuses it too, on either side. Asked with the tasks locked
+/// ([`Registry::add_unless`]): `SETSLOT` changes no slot's state meanwhile.
+/// The reply is Redis's, word for word; which slot, and its state, go to
+/// the log.
+fn no_legacy_migration(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<(), String> {
+    let found = {
+        let migrations = cluster.migrations.read();
+        slots_of(ranges).find_map(|slot| {
+            let state = match migrations.get(&slot)? {
+                MigrationState::Importing { .. } => "IMPORTING",
+                MigrationState::Migrating { .. } => "MIGRATING",
+            };
+            Some((slot, state))
+        })
+    };
+    let Some((slot, state)) = found else {
+        return Ok(());
+    };
+    log_warn!(
+        "Cluster: atomic slot migration refused: slot {slot} is in {state} state (CLUSTER SETSLOT); \
+         finish that migration, or clear it with CLUSTER SETSLOT {slot} STABLE"
+    );
+    Err(LEGACY_MIGRATION_REFUSED.into())
+}
+
+/// Redis's reply to an atomic slot migration of a slot in a legacy one.
+const LEGACY_MIGRATION_REFUSED: &str =
+    "all slot states must be STABLE to start a slot migration task.";
 
 // ── Imports under way, on disk ───────────────────────────────────────────────
 //
@@ -3104,6 +3180,52 @@ mod tests {
             ended_at: None,
             held_before: Arc::default(),
         }
+    }
+
+    /// An atomic slot migration and a legacy one (`CLUSTER SETSLOT`) refuse
+    /// each other's slots (#755).
+    #[test]
+    fn setslot_and_an_atomic_migration_refuse_each_others_slots() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let other = super::super::generate_node_id();
+        let registry = &cs.slot_migrations;
+        registry.add(task("a", vec![(10, 20)])).unwrap();
+        let setslot = |slot: u16| cs.setslot_unless_migrating(slot, || Ok(()));
+        let refused = setslot(10).unwrap_err();
+        assert!(
+            refused.contains("active atomic slot migration"),
+            "{refused}"
+        );
+        assert!(setslot(21).is_ok());
+        // A canceled one, still cleaning up, too.
+        registry.cancel(Some("a"));
+        assert!(setslot(20).is_err());
+        // Once one has ended, nothing waits, as in Redis: `redis-cli
+        // --cluster reshard` may move the slot on at once.
+        registry.finish("a", TaskState::Completed, None);
+        assert!(setslot(15).is_ok());
+        registry.add(task("b", vec![(30, 40)])).unwrap();
+        registry.finish("b", TaskState::Canceled, None);
+        assert!(setslot(35).is_ok());
+
+        // The other way: no atomic migration of a slot in a legacy one.
+        cs.migrations
+            .write()
+            .insert(50, MigrationState::Importing { src_id: other });
+        cs.migrations
+            .write()
+            .insert(60, MigrationState::Migrating { dest_id: other });
+        let start = |ranges: Ranges| {
+            registry.add_unless(task("c", ranges.clone()), || {
+                no_legacy_migration(&cs, &ranges)
+            })
+        };
+        // Redis's reply, word for word, on either side.
+        let redis = "all slot states must be STABLE to start a slot migration task.";
+        assert_eq!(start(vec![(45, 55)]).unwrap_err(), redis);
+        assert_eq!(start(vec![(60, 60)]).unwrap_err(), redis);
+        assert!(registry.get("c").is_none());
+        start(vec![(51, 59)]).unwrap();
     }
 
     #[test]

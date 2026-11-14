@@ -25,8 +25,8 @@
     "scan": 9
   },
   "counts": {
-    "PASS": 59,
-    "FAIL": 8
+    "PASS": 67,
+    "FAIL": 0
   },
   "checks": [
     {
@@ -39,7 +39,7 @@
       "check": "SearchIndex hash flat: create and load",
       "status": "PASS",
       "detail": "",
-      "ms": 47
+      "ms": 219
     },
     {
       "check": "SearchIndex hash flat: vector query returns the closest document first",
@@ -111,7 +111,7 @@
       "check": "SearchIndex hash flat: drop a document",
       "status": "PASS",
       "detail": "",
-      "ms": 1
+      "ms": 0
     },
     {
       "check": "SearchIndex hash flat: delete the index",
@@ -123,7 +123,7 @@
       "check": "SearchIndex hash hnsw: create and load",
       "status": "PASS",
       "detail": "",
-      "ms": 4
+      "ms": 2
     },
     {
       "check": "SearchIndex hash hnsw: vector query returns the closest document first",
@@ -201,7 +201,7 @@
       "check": "SearchIndex json flat: create and load",
       "status": "PASS",
       "detail": "",
-      "ms": 4
+      "ms": 6
     },
     {
       "check": "SearchIndex json flat: vector query returns the closest document first",
@@ -285,67 +285,67 @@
       "check": "HybridQuery hash: create and load",
       "status": "PASS",
       "detail": "",
-      "ms": 4
+      "ms": 2
     },
     {
       "check": "HybridQuery hash: LINEAR fusion weighted toward the vector",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "status": "PASS",
+      "detail": "",
       "ms": 1
     },
     {
       "check": "HybridQuery hash: LINEAR fusion weighted toward the text",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "status": "PASS",
+      "detail": "",
       "ms": 0
     },
     {
       "check": "HybridQuery hash: RRF fusion",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
-      "ms": 6
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
     },
     {
       "check": "HybridQuery hash: hybrid query with a tag filter",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "status": "PASS",
+      "detail": "",
       "ms": 0
     },
     {
       "check": "HybridQuery json: create and load",
       "status": "PASS",
       "detail": "",
-      "ms": 5
-    },
-    {
-      "check": "HybridQuery json: LINEAR fusion weighted toward the vector",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
       "ms": 2
     },
     {
+      "check": "HybridQuery json: LINEAR fusion weighted toward the vector",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
       "check": "HybridQuery json: LINEAR fusion weighted toward the text",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "status": "PASS",
+      "detail": "",
       "ms": 0
     },
     {
       "check": "HybridQuery json: RRF fusion",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "status": "PASS",
+      "detail": "",
       "ms": 0
     },
     {
       "check": "HybridQuery json: hybrid query with a tag filter",
-      "status": "FAIL",
-      "detail": "ResponseError: unknown FT.HYBRID token 'SCORER'",
+      "status": "PASS",
+      "detail": "",
       "ms": 0
     },
     {
       "check": "AggregateHybridQuery: create and load",
       "status": "PASS",
       "detail": "",
-      "ms": 4
+      "ms": 2
     },
     {
       "check": "AggregateHybridQuery: vector weight 0.1 ranks the text match first",
@@ -405,7 +405,7 @@
       "check": "SemanticRouter: an exact reference routes to that route",
       "status": "PASS",
       "detail": "",
-      "ms": 1
+      "ms": 0
     },
     {
       "check": "SemanticRouter: a near statement routes under the threshold",

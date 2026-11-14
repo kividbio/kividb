@@ -8,6 +8,7 @@ on:
       - 'tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/redis_compat*'
       - '.github/workflows/ci.yml'
   # By hand, from the Actions tab: the full build and test of a branch, e.g.
   # master before a release tag. Skips the change detection below.
@@ -57,6 +58,7 @@ jobs:
               - 'tests/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'scripts/redis_compat*'
 
   rust:
     needs: detect-changes
@@ -83,6 +85,28 @@ jobs:
 
       - name: Test
         run: cargo test --features lua,tls
+
+      # Mixed-version tests need the 1.2.2 release binary, pinned by digest.
+      - name: Test against KiviDB 1.2.2
+        run: |
+          if [ "$(uname -m)" != x86_64 ]; then
+            echo "Only the x86_64 Linux 1.2.2 binary is pinned, not $(uname -m)" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/kividb-1.2.2"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/kividb.tar.gz" \
+            https://github.com/kividbio/kividb/releases/download/v1.2.2/kividb-linux-x86_64.tar.gz
+          echo "3af9821b71801006835b7fc208a16a890fb0c8fa709ffabf2ad115641da9c51d  $dir/kividb.tar.gz" \
+            | sha256sum -c -
+          tar -xzf "$dir/kividb.tar.gz" -C "$dir"
+          set -o pipefail
+          # Fail if any 1.2 test was skipped, not only if one failed.
+          expected=$(grep -c '^#\[ignore = "needs a 1.2 binary' tests/vset_persistence.rs)
+          KIVIDB_1_2_BIN="$dir/kividb/kividb" \
+            cargo test --features lua,tls --test vset_persistence -- --ignored --test-threads=1 \
+            | tee "$dir/test.log"
+          grep -q "test result: ok. $expected passed; 0 failed" "$dir/test.log"
 
       - name: Build
         run: cargo build --release --features lua,tls
@@ -158,10 +182,11 @@ jobs:
     # As `rust`: on a manual run detect-changes is skipped, and a job that
     # needs a job that needs it is skipped too unless it says otherwise.
     if: always() && needs.rust.result == 'success'
-    # Never marks the PR as failed — it's a signal, not a gate
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Test the gate
+        run: bash scripts/redis_compat_check_test.sh
 
       - name: Install Tcl
         timeout-minutes: 10

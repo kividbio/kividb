@@ -1,6 +1,7 @@
 pub mod doc_keys;
 pub mod filter;
 pub mod postings;
+pub mod quant;
 pub mod score;
 pub mod simd;
 pub mod slots;

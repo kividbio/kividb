@@ -22,6 +22,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   target stream top item"), logs a warning and goes on: nothing is lost,
   only its `iids-duplicates` count stays behind. An earlier release
   replaying such an AOF skips those lines the same way.
+- **`FT.HYBRID` answers in Redis 8.10's shape, not 1.2.x's (#767).** Code
+  that reads the array 1.2.0 to 1.2.2 replied must change; redis-py and
+  RedisVL read the new one, which Redis 8.4 and later send. What changes:
+  - The reply is `total_results`, `results`, `warnings` and
+    `execution_time`, a map under RESP3, not a count then keys and fields.
+  - With `LOAD`, a row has only the fields loaded: no key, unless `LOAD
+    @__key`.
+  - Rows have no `text_score`, `vsim_score` or `hybrid_score` unless asked
+    for: name them with `YIELD_SCORE_AS` in the `SEARCH`, `VSIM` or
+    `COMBINE` clause.
+  - `LINEAR` adds the raw text score and the vector similarity, weighted by
+    `ALPHA` and `BETA`, with no min-max scaling, so fused scores and their
+    order differ.
+  - `total_results` counts the results before `LIMIT`.
+  - `TIMEOUT` is taken (and `search-timeout` applies); `DIALECT` is
+    refused.
+
+  In a cluster of more than one master, `FT.HYBRID` is now refused, where
+  1.2.x answered from the one node's slots without saying so.
 
 ### Added
 
@@ -84,7 +103,89 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for each item. Replicas and the AOF get only the items a write took.
   Cuckoo filters, Count-min sketches, Top-K and t-digests follow.
 
+- **Vector sets store vectors quantized when `VADD` asks for it (#697).**
+  `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
+  bit per component, as Redis 8 does: about 3.6-3.8x and 15-22x less memory
+  than f32 at 768-1536 dimensions. Quantization, dequantization and scores
+  follow Redis 8.10.3's formulas, and the Q8 distance is clamped to [0, 2]
+  as in Redis. The norm is computed in f64, so a stored component, norm or
+  range can differ from Redis's in the last bit (Redis's own bytes differ
+  between builds with and without FMA); KiviDB's are the same on every CPU,
+  and it keeps vectors whose f32 norm would overflow or underflow, which
+  Redis returns as NaN or keeps unnormalized. Q8 recall equals Redis's exact
+  search, and BIN recall is within 0.004 of it. Q8 and BIN refuse infinite
+  components. `VEMB` now replies with doubles and `VEMB RAW` with Redis's
+  array; `VSIM` refuses a query of the wrong dimension, and `VSIM` and
+  `VLINKS` order equal scores by element name. `MEMORY USAGE` of a vector
+  set counts the bytes it stores instead of estimating f32.
+
+  Two differences from Redis, both lenient and as in 1.2: a set made
+  without an option stays f32 (Redis's default is `Q8`) and accepts any
+  option later, staying f32; and a `VADD` without an option into a set made
+  with one is accepted, in the set's quantization (Redis refuses it unless
+  the set is `Q8`).
+
+  **Mixed versions.** 1.2 accepted `NOQUANT`, `Q8` and `BIN` and stored
+  f32; 1.3 keeps each node storing what the writer's release stored:
+  - *Snapshots.* `Q8` and `BIN` sets use a new type tag, which 1.2 refuses
+    rather than misreads. Every f32 set, `NOQUANT` ones included, is saved
+    as before, so 1.2 reads it. Saved that way, a `NOQUANT` set loses its
+    choice in any snapshot round trip (a restart from a snapshot,
+    `BGREWRITEAOF`, `RESTORE`, `MIGRATE`, a replica's full sync): it stays
+    f32 but, like a set made without an option, then accepts a `Q8` or `BIN`
+    `VADD` instead of refusing it. A vector
+    whose length is not its set's dimension, as a corrupt 1.2 snapshot or
+    `DUMP` payload can hold, is refused with the whole snapshot or payload:
+    startup stops and names the element, `RESTORE` answers `ERR Bad data
+    format` and changes nothing, `MIGRATE` reports the target's error and
+    keeps the key, and a replica does not load such a full sync. A `Q8`
+    vector whose norm or range is not finite, or a `BIN` one with bits set
+    past its dimension, is refused the same way; no release writes either.
+  - *`RESTORE` and `MIGRATE`.* `DUMP` payloads are in the snapshot format,
+    so f32 and `NOQUANT` sets restore and migrate to 1.2, and `Q8` and `BIN`
+    ones do not: 1.2 answers `ERR Bad data format` and stores nothing, and
+    `MIGRATE` fails with `ERR Target instance replied with error: ERR Bad
+    data format`, leaving the key on the source. `CLUSTER MIGRATION` sends
+    each key as a `RESTORE` too, so it cannot move a slot holding such a set
+    to a 1.2 node. Upgrade every node of a cluster before making such sets.
+  - *AOF.* A `VADD` with `NOQUANT`, `Q8` or `BIN` is followed in the log,
+    and in backup increments, by a 32-byte `KIVIDB.AOF-VSET-QUANT` record
+    (about 1% of a 768-dimension `FP32` `VADD`). Replay applies an option
+    only when that record follows its `VADD`; a `VADD` without one, as 1.2
+    wrote it, is applied with the option dropped, as 1.2 applied it. So
+    upgrading with `appendonly` on, or moving between 1.2 and 1.3 after
+    crashes, needs no extra step. If a crash cuts off the record after the
+    `VADD` that made a set, the set is f32, as if made without an option,
+    and accepts later `VADD`s. 1.2 replays a 1.3 log and stores every set as
+    f32; 1.2.2 logs an unknown-command warning for each record, one for each
+    `VADD` with an option since the last rewrite. `BGREWRITEAOF` saves each
+    set as stored, in the snapshot format above, so records do not pile up.
+  - *Replication.* 1.3 replicas announce `REPLCONF capa vset-quant`; a 1.3
+    master answers them with `vset-quant` after the offset of `+FULLRESYNC`
+    or the ID of `+CONTINUE`. A replica applies the options only with that
+    word or, from a master that sends none, if `INFO server` shows Redis, or
+    KiviDB with `kividb_vset_quantization:1` (printed by a node that keeps
+    the options). Otherwise, from 1.2 or from a master whose `INFO` it may
+    not run, it logs why and drops the options before applying the stream,
+    so its AOF holds what it applied. Redis's minimal replica ACL (`+psync
+    +replconf +ping`) does not allow `INFO`: give the replication user
+    `+info`, or a Redis master's `Q8` and `BIN` sets are f32 on 1.3
+    replicas. KiviDB replicas do not chain. A replica's backlog keeps its
+    master's bytes so offsets match; promoted, it syncs in full a replica
+    that would continue from before the last option it dropped. A 1.3
+    master holding a `Q8` or `BIN` set refuses a full sync to a KiviDB
+    replica without `vset-quant`, which logs why, instead of sending
+    snapshots 1.2 refuses. **Upgrade replicas before masters.**
+
 ### Changed
+
+- **Geo coordinates and distances are written as Redis 8.10 writes them
+  (#701).** Under RESP2, `GEOPOS` and `WITHCOORD` give the fewest digits
+  that read back as the same coordinate (`13.361389338970184`), not 17
+  decimals (`13.36138933897018433`). Under RESP3, `GEODIST` and `WITHDIST`
+  give a bulk string (`166274.1516`), as under RESP2, not a double. A client
+  that parses the numbers gets the same values; one that compares the text,
+  or reads a RESP3 distance as a double, sees the change.
 
 - **`MEMORY USAGE` of a stream is what its entries take, and reads
   differently (#683).** Stream entries are now packed into blocks, and
@@ -118,8 +219,132 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   counted from then).
   `FT.SPELLCHECK` sends `TERM` (RESP2) and `results` (RESP3) as simple
   strings, as RediSearch does; they were bulk strings.
+- **`ARLASTITEMS` and the search and vector replies follow the protocol of
+  the client or the script (#439).** `ARLASTITEMS` sent `$-1` for an empty
+  slot to a RESP3 client; it is now `_`, as in Redis 8.10. `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.CURSOR`, `FT.CONFIG GET`, `FT.SPELLCHECK`, `FT.INFO`,
+  `FT.PROFILE`, `FT.HYBRID`, `VEMB` and `ARINFO` took the connection's
+  protocol, so inside a script they ignored `redis.setresp`. They now follow
+  it, as the other commands do: RESP2 shapes by default, RESP3 ones after
+  `redis.setresp(3)`. A script can now read a RESP3 map or set whose key is
+  a status reply, as `FT.SPELLCHECK`'s `results` is (#797): as in Redis, the
+  key is the table `{ok='results'}`. It was an error ("map key must be
+  string or integer").
 
 ### Fixed
+
+- **`Q8` and `BIN` vector sets search and load at full speed on x86-64
+  (#793).** The int8 dot product, the Hamming distance and quantizing
+  compiled for the baseline x86-64 target, which has no SSE4.1 or POPCNT, so
+  a `Q8` `VSIM` was slower than an f32 one there. They now pick AVX-512BW or
+  AVX2 and POPCNT at run time, once, as the f32 kernels already did; release
+  binaries still run on any x86-64, arm64 is unchanged, and stored vectors and
+  scores are the same bits as before. Measured on x86-64 Azure D4s_v5 (768
+  dimensions, 10,000 vectors, 8 clients): `Q8` `VSIM` 910 -> 2,621 q/s
+  (f32: 699; v1.2.2: 686; Redis 8.10.2 Q8 with HNSW: 6,960), `BIN` 3,704 ->
+  4,963 q/s, and `VADD ... Q8` 51.6k -> 61.4k a second, the f32 rate.
+
+- **`DUMP`/`RESTORE`, `MIGRATE` and slot migration of vector sets and time
+  series work between KiviDB nodes, and the docs no longer say they don't
+  (#722).** Payloads are a one-entry snapshot image: Redis can't read
+  them, and KiviDB doesn't read Redis's for these two types. A vector set
+  moves whole, every quantization included, except that, as through a
+  snapshot, a `NOQUANT` set's explicit choice isn't kept (so a 1.2 node
+  still restores it during a rolling upgrade; the set then accepts a
+  `VADD` with any quantization option). A time series moves with its
+  samples, labels, retention, chunk size and duplicate policy, but not its
+  compaction rules: an atomic slot migration (`CLUSTER MIGRATION`)
+  recreates them on the new owner, while `DUMP`/`RESTORE`, `MIGRATE` and
+  `MIGRATE`-based resharding (`redis-cli --cluster reshard`) drop them, so
+  run `TS.CREATERULE` again afterwards.
+
+- **An atomic slot migration and `CLUSTER SETSLOT` no longer take the same
+  slot at once (#755).** `CLUSTER MIGRATION IMPORT` ran on a slot in
+  `IMPORTING` or `MIGRATING` state, and `SETSLOT IMPORTING` was taken on a
+  slot being imported: keys that `MIGRATE` or `ASKING` clients wrote
+  meanwhile counted as the import's, and if it then failed it deleted them,
+  maybe the only copy. Now, as in Redis, an atomic migration refuses a slot
+  in a legacy migration on either side (`all slot states must be STABLE`),
+  and every form of `SETSLOT` refuses a slot an atomic migration to or from
+  this node is moving until it has ended (a canceled one once it has
+  cleaned up).
+
+- **`FT.HYBRID` takes `SCORER` and answers as Redis 8.10 does, so RedisVL's
+  `HybridQuery` works (#767).** Every `HybridQuery` sends `SCORER BM25STD`
+  in the `SEARCH` clause, and KiviDB refused it (`unknown FT.HYBRID token
+  'SCORER'`); its reply, a count then keys and fields, was not Redis's
+  either, so redis-py could not have read it. The scorer now ranks the text
+  side as it does in `FT.SEARCH` (an unknown name, or one not in capitals:
+  `No such scorer`), and the reply is Redis's: `total_results`, `results`
+  (`__key` and `__score`, or the fields `LOAD`ed, with the
+  `YIELD_SCORE_AS` names), `warnings` and `execution_time`, a map under
+  RESP3. `FILTER` in the `VSIM` clause now limits the vector side, `RANGE`,
+  `TIMEOUT` and `FORMAT` are taken, `LINEAR` fuses the scores themselves
+  (defaults `ALPHA 0.3 BETA 0.7`) where it fused them min-max scaled, and
+  errors carry Redis's codes. The RedisVL harness passes 67 of 67 checks.
+
+- **`client-output-buffer-limit` is in effect, as in Redis (#774).**
+  `CONFIG SET client-output-buffer-limit "pubsub 0 0 0"` was taken and read
+  back, but subscribers were still dropped at 32 MB, so a 45 MB message
+  never arrived. The `normal`, `pubsub` and `replica` (`slave`) classes now
+  hold to their hard limit, and to their soft limit for more than its
+  seconds, with Redis's syntax, units, error messages and `CONFIG REWRITE`
+  lines; `CONFIG GET` always gives all three, the defaults until
+  changed. `PUBLISH` counts a subscriber that its message takes over the
+  limit, as Redis does, `CLIENT LIST` shows what waits for a client as
+  `omem`, and `INFO` has `client_output_buffer_limit_disconnections`. A
+  replica's hard limit is `repl-replica-max-backlog-bytes` under another
+  name, which now takes 0 for no limit (that lifts
+  `repl-replica-sync-max-backlog-bytes` too). Unlike Redis, a replica has
+  no soft limit by default (`slave 268435456 0 0`, where Redis has 64 MB
+  for 60 seconds), so that a burst a replica came through before does not
+  become a full resync; one that is set holds only once the replica's queue
+  has been under it after a full sync or partial resync. A redis.conf line
+  `client-output-buffer-limit replica 256mb 64mb 60` now takes effect: it
+  sets the hard limit back to 256 MB if `repl-replica-max-backlog-bytes`
+  was raised earlier in the file (the last line wins), and turns that soft
+  limit on.
+
+- **`string.format('%d', x)` in a script takes an `x` with a fraction, as
+  Redis does (#747).** Scripts run on Lua 5.4, which failed with "number has
+  no integer representation" where Redis's Lua 5.1 cuts the number toward
+  zero: `string.format("%d%03d", t[1], t[2] / 1000)`, which
+  affinidi-messaging-mediator uses to store every message, failed. All of
+  `%d %i %o %u %x %X %c` now take such numbers in scripts and function
+  libraries, with Redis's results for flags, widths and numbers out of
+  range. Numbers also leave a script as on Redis: `1e20` is passed to a
+  command as `1e+20`, a reply out of the integer range is
+  `-9223372036854775808` (it was `9223372036854775807`), `cjson` writes floats
+  with 14 significant digits and `10 / 2` as `5`, and `cmsgpack` packs `10 / 2` as
+  an integer and `1.5` as a 32-bit float. The docs now say scripts run on
+  Lua 5.4 and list what differs from Redis, with workarounds
+  ([SCRIPTS.md](docs/SCRIPTS.md)).
+
+- **Memory freed by a large delete goes back to the system once the server
+  is idle (#753).** Deleting a hash of 3M fields left `used_memory` at
+  1.4 MB but RSS at 200 MiB, and deleting 1M fields with `HDEL` left
+  78 MiB: the free pages stayed in the system allocator until a `MEMORY
+  PURGE`. A background thread now gives them back once what is allocated
+  has fallen by 32 MiB and by an eighth, and the server has served fewer
+  than 100 commands in the last second; RSS falls to 17 MiB in both cases.
+  A busy server is not trimmed, since a trim can hold up its threads for
+  tens of milliseconds: `MEMORY PURGE` gives the memory back on demand.
+  `INFO memory` has `allocator_trims` and `allocator_trims_skipped_busy`;
+  `allocator-give-back no` turns it off. Linux builds on glibc only.
+
+- **A shard's table grows without holding up other clients (#752).** A
+  full table grew in one step, every key hashed again with the shard
+  locked: 18 ms for a shard of 230,000 keys, 37 ms for 460,000, and the
+  shards, filling evenly, grew at about the same time. While 8 million keys
+  were written, a `PING` on another connection waited up to 141 ms on the
+  Tokio I/O model (Redis 8.10.2: 17 ms), and 160 ms at 17.5 million keys
+  with a time to live. A large table now grows as Redis's do: a new table
+  twice the size takes the new keys, each write to the shard moves 16 of
+  the old one's over, and the expiry thread finishes a growth that writes
+  have stopped moving on. The expiry thread's sweep of the keys with a time
+  to live, every 20 s, now hands the shard to a waiting writer between its
+  turns instead of taking it back first. The longest `PING` is now 21 ms
+  at 8 million keys and 20-24 ms at 17.5 million (Redis: 17-18 ms).
 
 - **An atomic slot import that does not complete keeps the keys the node
   held of those slots before it (#745).** A canceled, failed or timed-out
@@ -132,6 +357,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CLUSTER ORPHANSLOTS` lists and `CLUSTER DROPORPHANS` cleans up. If the
   slot is given to the node while that cleanup runs, the brought keys it
   has not reached stay, as live data of the slot.
+
+- **A long `KEYS`, `SCAN` or `DEL` of a big value no longer holds up every
+  other connection on the Tokio I/O model (#754).** The Tokio worker that
+  got such a command was often the one waiting on the sockets for everyone,
+  so a `PING` on another connection waited for the whole command (140 ms
+  behind a `KEYS` over 2M keys). That work now runs with the worker's other
+  connections handed to another thread, and `KEYS` and `SCAN` copy only the
+  keys that match. `DEL` now follows `lazyfree-lazy-user-del`: with `yes` it
+  frees a big value in the background as `UNLINK` does, and a config file
+  setting it no longer warns that it has no effect; the default stays `no`.
+  On io_uring, a long command still holds up the connections served by its
+  own thread (#762). In a build with Lua and `lua-parallel-scripts yes`,
+  `KEYS` and `SCAN` still run alone, as before, so as not to see a script
+  part-way through.
+
+- **A full `SCAN … MATCH` over a large keyspace no longer trails Redis
+  (#751).** Each call hashed every key of the shard it was in to find its
+  page, visiting each key's entry, and matched each key byte by byte
+  through the general glob matcher. A call now finds its page from the hash
+  fragment each table slot already keeps, and reads only the entries of
+  that page; patterns such as `prefix:*`, `*suffix` and `*part*` are
+  matched by comparing bytes. A full `SCAN 0 MATCH schedule:* COUNT 1000`
+  over 2,002,000 keys went from 1.31 s to 0.48 s (Redis 8.10.2:
+  0.53 s), and one without `MATCH` from 2.98 s to 1.93 s (Redis: 2.04 s).
+  `HSCAN`, `SSCAN` and `ZSCAN` match patterns the same way. A `SCAN`
+  cursor is now valid only on the server that gave it, until it restarts,
+  as in Redis: one from before a restart, a failover or another replica
+  ends the iteration or skips keys, rather than resuming it.
 
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its

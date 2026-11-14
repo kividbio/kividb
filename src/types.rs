@@ -319,26 +319,25 @@ impl<'a> Ord for ZScoreKey<'a> {
 
 #[derive(Clone)]
 pub struct VSetEntry {
-    pub vector: Vec<f32>,
-    pub attrs: Option<String>, // JSON string, stored raw
+    pub vector: crate::vector::quant::StoredVector,
+    pub attrs: Option<Box<str>>, // JSON string, stored raw
 }
 
 /// The inner data for a VectorSet key.
-/// All vectors must share the same dimension.
+/// All vectors must share the same dimension and quantization.
 #[derive(Clone)]
 pub struct VectorSetInner {
     pub dim: usize,
     pub entries: AHashMap<crate::key_bytes::KeyBytes, VSetEntry>,
     pub metric: DistanceMetric,
+    pub quant: crate::vector::quant::Quant,
+    /// Unchosen and legacy sets accept any quantization option and stay f32.
+    pub quant_chosen: bool,
 }
 
 impl VectorSetInner {
     pub fn new(dim: usize) -> Self {
-        Self {
-            dim,
-            entries: AHashMap::new(),
-            metric: DistanceMetric::Cosine,
-        }
+        Self::with_metric(dim, DistanceMetric::Cosine)
     }
 
     // Add a constructor that accepts a metric
@@ -347,6 +346,8 @@ impl VectorSetInner {
             dim,
             entries: AHashMap::new(),
             metric,
+            quant: crate::vector::quant::Quant::F32,
+            quant_chosen: false,
         }
     }
 }

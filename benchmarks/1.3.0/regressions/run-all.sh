@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# The 1.3.0 regression suite's single runner. See README.md.
+#
+#   run-all.sh --candidate <path-to-kividb | tag> [--label NAME] [--only 01,04]
+#              [--engines v1_2_2,candidate,redis] [--record] [--candidate-commit SHA]
+#   FULL=1 run-all.sh ...      also the long configurations (17.5M keys with EX)
+#
+# Each suite runs against v1.2.2 (the release tarball, SHA-256 checked), the
+# candidate and Redis 8.10.x, one server at a time on this machine, each
+# configuration on a fresh server. Results go to results/<label>/: summary.md,
+# summary.json and raw.tar.gz. The exit status is 1 when a gate fails or the
+# run is invalid (a suite or server failed, a recorded metric is missing, the
+# VM or a reference binary differs); see lib/compare.py. --record writes the
+# measured values into baseline.json, and refuses to on such a run.
+#   ALLOW_VM_CHANGE=1          compare/record on another VM size than recorded
+#   REGRESS_REDIS_SHA256=<sha> accept another redis-server than the pinned one
+#   SCALE=0.01                 smoke run: tiny datasets, gates not checked
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+export REGRESS_LIB=$here/lib
+# shellcheck source=lib/engines.sh
+source "$here/lib/engines.sh"
+
+CANDIDATE= LABEL= ONLY= ENGINES=v1_2_2,candidate,redis RECORD= CAND_COMMIT=
+REFERENCE_TAG=${REFERENCE_TAG:-v1.2.2}
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-1800}
+while [ $# -gt 0 ]; do
+  case $1 in
+    --candidate) CANDIDATE=$2; shift 2 ;;
+    --label) LABEL=$2; shift 2 ;;
+    --only) ONLY=$2; shift 2 ;;
+    --engines) ENGINES=$2; shift 2 ;;
+    --record) RECORD=--record; shift ;;
+    --candidate-commit) CAND_COMMIT=$2; shift 2 ;;
+    -h | --help) sed -n '2,17p' "$0"; exit 0 ;;
+    *) echo "unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$CANDIDATE" ] || { echo "--candidate <path|tag> is required" >&2; exit 2; }
+[ "$(uname -s)" = Linux ] || { echo "Linux only (VmRSS, io_uring)" >&2; exit 2; }
+for e in ${ENGINES//,/ }; do
+  case $e in v1_2_2 | candidate | redis) ;; *) echo "unknown engine $e" >&2; exit 2 ;; esac
+done
+
+# Which suites. Every --only entry must name a suite.
+mapfile -t SUITES < <(cd "$here/suites" && ls [0-9][0-9]-*.py | sort)
+[ ${#SUITES[@]} -gt 0 ] || { echo "no suites in $here/suites" >&2; exit 2; }
+suite_matches() { case $1 in "$2" | "$2"-* | "$2".py) return 0 ;; esac; return 1; }
+want_suite() {
+  [ -z "$ONLY" ] && return 0
+  local w
+  for w in ${ONLY//,/ }; do suite_matches "$1" "$w" && return 0; done
+  return 1
+}
+for w in ${ONLY//,/ }; do
+  hit=
+  for f in "${SUITES[@]}"; do suite_matches "${f%.py}" "$w" && hit=1; done
+  [ -n "$hit" ] || { echo "--only $w names no suite (have: ${SUITES[*]%.py})" >&2; exit 2; }
+done
+want_engine() { case ",$ENGINES," in *",$1,"*) return 0 ;; esac; return 1; }
+
+mkdir -p "$REGRESS_CACHE"
+# Python: a venv with the pinned client.
+VENV=$REGRESS_CACHE/venv
+if [ ! -x "$VENV/bin/python" ] || ! cmp -s "$here/requirements.txt" "$VENV/.requirements"; then
+  rm -rf "$VENV"
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install -q --disable-pip-version-check -r "$here/requirements.txt"
+  cp "$here/requirements.txt" "$VENV/.requirements"
+fi
+export PYTHON=$VENV/bin/python
+
+# Engines.
+declare -A BIN KIND
+BIN[v1_2_2]=$(engines_fetch_release "$REFERENCE_TAG" default "$REGRESS_CACHE/releases")
+engines_fetch_release "$REFERENCE_TAG" full "$REGRESS_CACHE/releases" >/dev/null  # for suites that need Lua
+BIN[candidate]=$(engines_resolve_candidate "$CANDIDATE" "$REGRESS_CACHE/releases")
+BIN[redis]=$(engines_resolve_redis "$REGRESS_CACHE/redis")
+KIND[v1_2_2]=kividb KIND[candidate]=kividb KIND[redis]=redis
+# redis-cli and redis-benchmark of the same build, for the suites that drive them.
+export REGRESS_REDIS_SERVER=${BIN[redis]}
+if [ -z "$CAND_COMMIT" ]; then
+  CAND_COMMIT=$("${BIN[candidate]}" --version 2>/dev/null | head -1 || true)
+fi
+# Which allocator the candidate uses: the Lua builds (lua, full) link mimalloc,
+# and suite 03 measures glibc malloc's give-back.
+if grep -aq 'mimalloc' "$(readlink -f "${BIN[candidate]}")"; then CAND_ALLOC=mimalloc; else CAND_ALLOC=glibc; fi
+export REGRESS_CANDIDATE_ALLOCATOR=$CAND_ALLOC
+[ -n "$LABEL" ] || LABEL=run-$(date -u +%Y%m%d-%H%M%S)
+OUT=$here/results/$LABEL
+mkdir -p "$OUT"
+rm -f "$OUT/results.jsonl"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/kividb-regress-run.XXXXXX")
+mkdir -p "$WORK/raw/logs"
+CHILD=
+# Self-hosted suites record each node's pid here (lib/nodes.py). If a suite is
+# SIGKILLed its nodes are left running; reap_nodes kills those, and only those
+# whose /proc/<pid>/cmdline still holds the binary the file names (a recycled
+# pid is not touched). Never by process name.
+export REGRESS_PIDDIR=$WORK/pids
+mkdir -p "$REGRESS_PIDDIR"
+reap_nodes() {
+  local f pid bin
+  for f in "$REGRESS_PIDDIR"/*; do
+    [ -f "$f" ] || continue
+    pid=${f##*/}
+    bin=$(cat "$f" 2>/dev/null) || bin=
+    if [ -n "$bin" ] && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF -- "$bin"; then
+      echo "reaping leftover node $pid ($bin)" >&2
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF -- "$bin"; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$f"
+  done
+}
+trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; reap_nodes; engine_stop; rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
+
+FAILURES=$WORK/failures.txt EXPECTED=$WORK/expected.jsonl
+: >"$FAILURES"
+: >"$EXPECTED"
+status=0
+fail() { echo "!!! $*" >&2; echo "$*" >>"$FAILURES"; status=1; }
+
+vm_size() {
+  curl -fs -m 2 -H Metadata:true "http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-02-01&format=text" 2>/dev/null ||
+    curl -fs -m 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "${VM_SIZE:-unknown}"
+}
+
+declare -A SECS
+ran=0
+for f in "${SUITES[@]}"; do
+  suite=${f%.py}
+  want_suite "$suite" || continue
+  echo "=== $suite"
+  s0=$(date +%s)
+  # A suite that fails to import or to list its configurations fails the run.
+  if ! cfgs=$("$PYTHON" "$here/suites/$f" --configs </dev/null) || [ -z "$cfgs" ]; then
+    fail "$suite: --configs failed or listed nothing"
+    continue
+  fi
+  while IFS= read -r cfg; do
+    name=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$cfg")
+    io=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["io"])' "$cfg")
+    threads=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["threads"])' "$cfg")
+    engs=$("$PYTHON" -c 'import json,sys;print(" ".join(json.loads(sys.argv[1])["engines"]))' "$cfg")
+    selfh=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1]).get("self_hosted", False)))' "$cfg")
+    "$PYTHON" -c 'import json,sys;c=json.loads(sys.argv[1]);print(json.dumps({"suite":sys.argv[2],"config":c["name"],"engines":c["engines"]}))' \
+      "$cfg" "$suite" >>"$EXPECTED"
+    for e in $engs; do
+      want_engine "$e" || continue
+      echo "--- $suite $name $e"
+      ran=$((ran + 1))
+      srv=()
+      if [ "$selfh" = 1 ]; then
+        # The suite starts (and always stops) its own servers from --bin.
+        ENGINE_LOG=/dev/null
+      else
+        engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
+        srv=(--port "$ENGINE_PORT" --pid "$ENGINE_PID")
+      fi
+      # In the background and waited for, so that a signal stops the run at once.
+      timeout "$SUITE_TIMEOUT" "$PYTHON" "$here/suites/$f" --config "$name" --engine "$e" \
+        --kind "${KIND[$e]}" "${srv[@]}" --bin "${BIN[$e]}" --out "$WORK" </dev/null &
+      CHILD=$!
+      rc=0
+      wait "$CHILD" || rc=$?
+      CHILD=
+      reap_nodes
+      [ $rc -eq 0 ] || fail "$suite $name $e: suite exited $rc"
+      tail -c 65536 "$ENGINE_LOG" >"$WORK/raw/logs/$suite-$name-$e.log" 2>/dev/null || true
+      engine_stop
+    done
+  done <<<"$cfgs"
+  SECS[$suite]=$(($(date +%s) - s0))
+  echo "=== $suite took ${SECS[$suite]} s"
+done
+[ $ran -gt 0 ] || fail "nothing ran (--only $ONLY, --engines $ENGINES)"
+if [ -f "$WORK/results.jsonl" ]; then cp "$WORK/results.jsonl" "$OUT/results.jsonl"; fi
+
+# Where and what: env.json.
+{
+  secs=$(for k in "${!SECS[@]}"; do printf '"%s": %s,' "$k" "${SECS[$k]}"; done)
+  "$PYTHON" - "$OUT/env.json" "$LABEL" "$CAND_COMMIT" "{${secs%,}}" "$(vm_size)" \
+    "${BIN[v1_2_2]}" "${BIN[candidate]}" "${BIN[redis]}" "$FAILURES" "$EXPECTED" "$ENGINES" \
+    "${SCALE:-1}" "${FULL:-0}" "$ONLY" "$CAND_ALLOC" <<'EOF'
+import json, sys, os, platform, subprocess, hashlib, datetime
+(out, label, commit, secs, vm, b122, bcand, bredis, failures, expected, engines,
+ scale, full, only, alloc) = sys.argv[1:16]
+def sha(p):
+    h = hashlib.sha256()
+    with open(os.path.realpath(p), "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+def ver(p):
+    try:
+        return subprocess.run([p, "--version"], capture_output=True, text=True, timeout=10).stdout.strip().splitlines()[0]
+    except Exception as e:
+        return "?"
+cpu = "?"
+try:
+    cpu = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
+except Exception:
+    pass
+# Indicative only: best of 3 of a fixed sha256 loop, to tell a slow host from a fast one at a glance.
+calib = None
+try:
+    import time
+    best = None
+    for _ in range(3):
+        t = time.perf_counter()
+        d = b"x" * 64
+        for _ in range(200000):
+            d = hashlib.sha256(d).digest()
+        best = min(best or 1e9, time.perf_counter() - t)
+    calib = round(best * 1000, 1)
+except Exception:
+    pass
+import redis
+env = {
+    "label": label, "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
+    "vm": vm, "cpu": cpu, "nproc": os.cpu_count(), "calib_ms": calib, "kernel": platform.release(),
+    "glibc": platform.libc_ver()[1], "python": platform.python_version(), "redis_py": redis.__version__,
+    "candidate_commit": commit, "candidate_allocator": alloc, "suite_seconds": json.loads(secs),
+    "scale": scale, "full": full, "only": only, "engines_selected": engines.split(","),
+    "failures": [l.strip() for l in open(failures) if l.strip()],
+    "expected": [json.loads(l) for l in open(expected) if l.strip()],
+    "engines": {k: {"path": p, "sha256": sha(p), "version": ver(p)}
+                for k, p in (("v1_2_2", b122), ("candidate", bcand), ("redis", bredis))},
+}
+env["run_failed"] = bool(env["failures"])
+json.dump(env, open(out, "w"), indent=1)
+EOF
+}
+
+# One small tarball of the raw files; the summaries next to it.
+cp "$OUT/env.json" "$WORK/raw/"
+[ -f "$OUT/results.jsonl" ] && cp "$OUT/results.jsonl" "$WORK/raw/"
+tar -czf "$OUT/raw.tar.gz" -C "$WORK" raw
+# compare.py also judges an empty or failed run (INVALID) and refuses --record on it.
+set +e
+"$PYTHON" "$here/lib/compare.py" "$OUT" --baseline "$here/baseline.json" --label "$LABEL" $RECORD \
+  ${ALLOW_VM_CHANGE:+--allow-vm-change}
+cmp=$?
+set -e
+[ $cmp -ne 0 ] && status=$cmp
+rm -f "$OUT/results.jsonl"  # it is inside raw.tar.gz
+echo "results: $OUT"
+exit $status

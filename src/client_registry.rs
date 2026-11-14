@@ -69,7 +69,16 @@ pub struct Activity {
     /// watched in the low. Written by the connection's loop as its replies go
     /// out, only when they changed.
     tx: AtomicU64,
+    /// `CLIENT LIST`'s `omem` (#774): a large batch of replies while it is
+    /// being written (one under [`REPLY_OUTPUT_SHOWN_FROM`] is written at
+    /// once, and not shown), and what is queued for a subscriber.
+    reply_output: AtomicU64,
+    pubsub_output: AtomicU64,
 }
+
+/// A batch of replies this large or larger is shown in `omem` while it is
+/// written; a smaller one goes out in one write, and is not.
+pub const REPLY_OUTPUT_SHOWN_FROM: usize = 64 * 1024;
 
 /// Clients blocked in a command with a timeout: `clients_in_timeout_table`.
 static IN_TIMEOUT_TABLE: AtomicU64 = AtomicU64::new(0);
@@ -338,6 +347,21 @@ fn unpack<const N: usize>(from: &[AtomicU64; N], len: usize) -> String {
 }
 
 impl Activity {
+    /// See [`Activity::reply_output`].
+    pub fn set_reply_output(&self, bytes: usize) {
+        self.reply_output.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// See [`Activity::pubsub_output`].
+    pub fn set_pubsub_output(&self, bytes: usize) {
+        self.pubsub_output.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// What is waiting to be written to the connection: `omem`.
+    pub fn output(&self) -> u64 {
+        self.reply_output.load(Ordering::Relaxed) + self.pubsub_output.load(Ordering::Relaxed)
+    }
+
     /// The connection's transaction now: the commands queued if it is in
     /// one, and the keys it watches. See [`Activity::tx`].
     #[inline]
@@ -560,6 +584,8 @@ pub struct ClientInfo {
     /// been told `+LOSTDATA`; 0 if it did not. See
     /// `ReplState::psync_offer`.
     pub replica_lost_data: u8,
+    /// `None` until a KiviDB capa arrives; then whether it reads Q8 and BIN.
+    pub replica_vset_quant: Option<bool>,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -605,6 +631,7 @@ impl ClientInfo {
             replica_listening_port: 0,
             replica_takes_digest: false,
             replica_lost_data: 0,
+            replica_vset_quant: None,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -654,7 +681,7 @@ impl ClientInfo {
         format!(
             "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} \
             ssub={} multi={} watch={} qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
-            rbs=0 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem={} events=r cmd={} \
+            rbs=0 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem={} events=r cmd={} \
             user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} \
             tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} \
             avg-pipeline-len-cnt={}\n",
@@ -673,8 +700,10 @@ impl ClientInfo {
             self.activity.tx().1,
             qbuf,
             qbuf_free,
-            // What KiviDB measures of a client's memory: its query buffer.
-            qbuf + qbuf_free,
+            self.activity.output(),
+            // What KiviDB measures of a client's memory: its query buffer,
+            // and what is waiting to be written to it.
+            qbuf + qbuf_free + self.activity.output(),
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -1059,16 +1088,18 @@ impl ClientRegistryInner {
             .count()
     }
 
-    /// What the clients' query buffers hold, the replicas' apart:
-    /// `(mem_clients_normal, mem_clients_slaves)` (#152).
+    /// What the clients' query buffers hold, and what is waiting to be
+    /// written to them, the replicas' apart: `(mem_clients_normal,
+    /// mem_clients_slaves)` (#152).
     pub fn buffer_totals(&self) -> (u64, u64) {
         let (mut normal, mut replicas) = (0u64, 0u64);
         for info in self.clients.read().values() {
             let (len, free) = info.query_buffer.values();
+            let used = len + free + info.activity.output();
             if info.flags.contains('S') {
-                replicas += len + free;
+                replicas += used;
             } else {
-                normal += len + free;
+                normal += used;
             }
         }
         (normal, replicas)
@@ -1114,6 +1145,14 @@ impl ClientRegistryInner {
         }
     }
 
+    /// The connection's [`Activity`], while it is connected.
+    pub fn activity(&self, id: u64) -> Option<Arc<Activity>> {
+        self.clients
+            .read()
+            .get(&id)
+            .map(|info| Arc::clone(&info.activity))
+    }
+
     pub fn list(&self) -> Vec<ClientInfo> {
         // ClientInfo no longer derives Clone (kill_tx isn't Clone).
         // Build list lines directly instead of cloning.
@@ -1154,6 +1193,7 @@ impl ClientRegistryInner {
                 replica_listening_port: c.replica_listening_port,
                 replica_takes_digest: c.replica_takes_digest,
                 replica_lost_data: c.replica_lost_data,
+                replica_vset_quant: c.replica_vset_quant,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -1194,6 +1234,7 @@ impl ClientRegistryInner {
             replica_listening_port: c.replica_listening_port,
             replica_takes_digest: c.replica_takes_digest,
             replica_lost_data: c.replica_lost_data,
+            replica_vset_quant: c.replica_vset_quant,
             subscriptions: c.subscriptions,
         })
     }

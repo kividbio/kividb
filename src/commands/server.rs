@@ -542,6 +542,16 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR CONFIG SET failed (possibly related to argument 'activedefrag') - argument must be 'yes' or 'no'",
                 )),
             },
+            // Giving free memory back once idle (#753): see src/give_back.rs.
+            "allocator-give-back" => match value.to_ascii_lowercase().as_str() {
+                "yes" | "no" => {
+                    crate::give_back::set_enabled(value.eq_ignore_ascii_case("yes"));
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'allocator-give-back') - argument must be 'yes' or 'no'",
+                )),
+            },
             "active-defrag-ignore-bytes" => match memory_size(value) {
                 Some(bytes) => {
                     crate::compaction::set_ignore_bytes(bytes as u64);
@@ -810,10 +820,14 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 )),
             },
             // Read for each write the hub queues: a change applies to the
-            // replicas already attached (#305).
+            // replicas already attached (#305). 0 is no limit, as
+            // `client-output-buffer-limit replica 0 0 0` sets it; and any
+            // value that sets, this takes back, so that `CONFIG GET` reads
+            // back through `CONFIG SET` (and a failed `CONFIG SET` of several
+            // settings puts it back) (#774).
             "repl-replica-max-backlog-bytes" | "repl-replica-sync-max-backlog-bytes" => {
                 match memory_size(value) {
-                    Some(bytes) if bytes > 0 && bytes <= i64::MAX as usize => {
+                    Some(bytes) => {
                         let limit = if param == "repl-replica-max-backlog-bytes" {
                             &ctx.repl_state.replica_max_backlog_bytes
                         } else {
@@ -822,12 +836,39 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         limit.store(bytes as u64, Ordering::Relaxed);
                         Some(resp_simple("OK"))
                     }
-                    _ => Some(resp_error(&format!(
+                    None => Some(resp_error(&format!(
                         "ERR CONFIG SET failed (possibly related to argument '{param}') - \
-                         argument must be a memory value of at least 1 byte"
+                         argument must be a memory value"
                     ))),
                 }
             }
+            // `<class> <hard> <soft> <seconds>`, for one class or more (#774).
+            // Normal and subscribed clients' limits are the hub's, read as
+            // each reply or message is queued; a replica's are the
+            // replication's, read for each write the hub queues, its hard
+            // limit being `repl-replica-max-backlog-bytes`.
+            "client-output-buffer-limit" => match crate::output_limits::parse(value) {
+                Ok(classes) => {
+                    for (class, limit) in classes {
+                        if class == crate::output_limits::Class::Replica {
+                            let rs = &ctx.repl_state;
+                            rs.replica_max_backlog_bytes
+                                .store(limit.hard, Ordering::Relaxed);
+                            rs.replica_soft_limit_bytes
+                                .store(limit.soft, Ordering::Relaxed);
+                            rs.replica_soft_limit_secs
+                                .store(limit.soft_seconds, Ordering::Relaxed);
+                        } else {
+                            ctx.pubsub.limits().set(class, limit);
+                        }
+                    }
+                    Some(resp_simple("OK"))
+                }
+                Err(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'client-output-buffer-limit') - {why}"
+                ))),
+            },
             // Read when a shutdown begins to wait for the replicas.
             "shutdown-timeout" => match value.parse::<u64>() {
                 Ok(v) if v <= i32::MAX as u64 => {
@@ -1333,7 +1374,9 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             // Settings of Redis's that take yes or no: remembered, and in
             // effect where KiviDB has what they set (`lazyfree-lazy-expire`
             // decides whether a key that expires is propagated as `UNLINK`
-            // or `DEL`; `latency-tracking`, whether `INFO latencystats`
+            // or `DEL`; `lazyfree-lazy-user-del`, whether `DEL` frees a large
+            // value in the background, as `UNLINK` does (#754);
+            // `latency-tracking`, whether `INFO latencystats`
             // reports; `rdbchecksum no`, that an RDB file's checksum is not
             // checked as it is loaded). Anything else is refused, as Redis
             // refuses it.
@@ -1982,6 +2025,26 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
     )
 });
 
+/// `client-output-buffer-limit` in effect now, as `CONFIG GET` gives it.
+fn output_buffer_limits(ctx: &Ctx) -> String {
+    use crate::output_limits::{Class, Limit, Limits};
+    use std::sync::atomic::Ordering::Relaxed;
+    let rs = &ctx.repl_state;
+    let mut limits = Limits::default();
+    for class in [Class::Normal, Class::PubSub] {
+        limits.set(class, ctx.pubsub.limits().get(class));
+    }
+    limits.set(
+        Class::Replica,
+        Limit {
+            hard: rs.replica_max_backlog_bytes.load(Relaxed),
+            soft: rs.replica_soft_limit_bytes.load(Relaxed),
+            soft_seconds: rs.replica_soft_limit_secs.load(Relaxed),
+        },
+    );
+    limits.to_config_string()
+}
+
 /// Every setting `CONFIG GET` knows, with its value now: the ones that are
 /// in effect, then the ones that are only remembered.
 fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
@@ -2023,6 +2086,8 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("logfile", ctx.config.logfile.clone()),
         ("log-format", ctx.config.log_format.clone()),
         ("databases", ctx.config.databases.to_string()),
+        // All three classes, always, as Redis gives them (#774).
+        ("client-output-buffer-limit", output_buffer_limits(ctx)),
         // As given with `--threads` (0: one per core), the value `CONFIG
         // REWRITE` keeps, not the count it resolved to on this machine.
         ("threads", ctx.config.threads.to_string()),
@@ -2047,6 +2112,15 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "activedefrag",
             if crate::compaction::enabled() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        (
+            "allocator-give-back",
+            if crate::give_back::enabled() {
                 "yes"
             } else {
                 "no"
@@ -3737,19 +3811,14 @@ fn keysize_count(bins: &mut KeysizeBins, value: crate::store::ValueRef<'_>) {
 ///
 /// A shard nobody writes to meanwhile is counted exactly. Under writes the
 /// count is approximate, as a `SCAN` is: a key written or deleted
-/// meanwhile is counted or not, and keys move between buckets when the
-/// table is rehashed. A resize changes how many buckets there are, and the
-/// shard is then counted again (in one hold after a few tries); a rehash
-/// in place, at the same size, which the table does when deleted keys
-/// have used up its room to grow, cannot be seen from here, and in the
-/// part not yet counted a key may then be counted twice or not at all.
+/// meanwhile is counted or not. Keys move between buckets when the table
+/// grows, rehashes in place, shrinks or takes a step of a growth, and each
+/// of those changes `ShardMap::layout`: the shard is then counted again
+/// (in one hold after a few tries).
 ///
 /// One hold for the whole shard would be exact: about 20 ms for a shard
 /// of a million keys (21 ns a key measured, 5 million keys on 8 vCPUs), a
-/// wait for every write to it, every 10 s while `INFO all` is asked. A
-/// count of rehashes kept by the table would let the walk start again on
-/// one too, but needs a check on every insert, the `SET` path. For a
-/// distribution refreshed every 10 seconds neither is worth it.
+/// wait for every write to it, every 10 s while `INFO all` is asked.
 ///
 /// `between` is called with no lock held after each part (for tests).
 fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> KeysizeBins {
@@ -3761,7 +3830,9 @@ fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> 
         loop {
             let map = read_lock!(shard);
             let buckets = map.buckets();
-            if *size.get_or_insert(buckets) != buckets {
+            // A growth's steps move keys without a change of size.
+            let layout = (buckets, map.layout());
+            if *size.get_or_insert(layout) != layout {
                 tries += 1;
                 if tries < 3 {
                     continue 'shard;
@@ -4316,6 +4387,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // (`replication::expiry_propagated_by`).
                 out.push_str(crate::replication::EXPIRY_PROPAGATED_INFO);
                 out.push_str("\r\n");
+                // Not on a replica of a master that ignores the options.
+                if ctx.repl_state.keeps_vset_quant() {
+                    out.push_str(crate::replication::VSET_QUANT_INFO);
+                    out.push_str("\r\n");
+                }
                 // And each hash field expired here, as an `HDEL`
                 // (`replication::field_expiry_propagated_by`). Not said under
                 // `KIVIDB_TEST_NO_FIELD_EXPIRY_CAPABILITY`, for the tests of a
@@ -4535,6 +4611,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!(
                     "slowlog_commands_time_ms_max:{:.2}\r\n",
                     slow_us_max as f64 / 1000.0
+                ));
+                out.push_str(&format!(
+                    "client_output_buffer_limit_disconnections:{}\r\n",
+                    crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.load(Ordering::Relaxed)
                 ));
                 out.push_str(&format!(
                     "total_error_replies:{}\r\n",
@@ -4810,6 +4890,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let fill = crate::value_slab::fill();
                 out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
                 out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
+                // Times freed memory was given back to the system after a
+                // large fall in what is allocated (#753).
+                out.push_str(&format!(
+                    "allocator_trims:{}\r\n",
+                    crate::give_back::trims()
+                ));
+                // ... and times one was put off while the server was busy.
+                out.push_str(&format!(
+                    "allocator_trims_skipped_busy:{}\r\n",
+                    crate::give_back::skipped_busy()
+                ));
                 out.push_str(&format!(
                     "used_memory_rss_human:{}\r\n",
                     crate::commands::memory::human_bytes_pub(rss)
@@ -5257,6 +5348,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // resets its `stat_active_defrag_*` (#370).
                     crate::compaction::reset_stats();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
+                    crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.store(0, Ordering::Relaxed);
                     // Not `rdb_changes_since_last_save`: that is not a
                     // statistic, and Redis keeps it (#566).
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
@@ -5630,6 +5722,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_takes_digest = true;
+                        info.replica_vset_quant.get_or_insert(false);
                     });
                 }
                 if cmd[i].eq_ignore_ascii_case(b"capa")
@@ -5637,6 +5730,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_lost_data = 1;
+                        info.replica_vset_quant.get_or_insert(false);
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1].eq_ignore_ascii_case(b"vset-quant")
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_vset_quant = Some(true);
                     });
                 }
                 i += 2;

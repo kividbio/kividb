@@ -44,8 +44,8 @@ other files:
 - LlamaIndex's Redis vector store, document store, index store and key-value store:
   [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
   [docs/integrations/llamaindex.md](integrations/llamaindex.md).
-- RedisVL (`redisvl`): SearchIndex create, load and query, including filters, SemanticCache and
-  SemanticRouter. `HybridQuery` (`FT.HYBRID` with `SCORER`) fails on KiviDB; the default image is enough,
+- RedisVL (`redisvl`): SearchIndex create, load and query, including filters, SemanticCache,
+  SemanticRouter and `HybridQuery` (`FT.HYBRID`, from the fix for #767); the default image is enough,
   no Lua: [benchmarks/redisvl-compat/REPORT.md](../benchmarks/redisvl-compat/REPORT.md) and
   [docs/integrations/redisvl.md](integrations/redisvl.md).
 - Mem0's Redis vector store and the `Memory` API on top of it, in the Python SDK and the TypeScript SDK
@@ -109,6 +109,15 @@ other files:
 - The default build has no Lua. The scripting commands return an error
   there; use the `lua` or `full` build for job queues and anything else that
   runs scripts.
+- Scripts run on **Lua 5.4**, not Redis's Lua 5.1. `string.format('%d')`
+  and the other integer conversions take numbers with a fraction as 5.1
+  does, and numbers are passed to commands, returned, and encoded by
+  `cjson` and `cmsgpack` as Redis does. What stays 5.4: `/` gives a float
+  that is written with `.0` (`tostring(10 / 2)` is `"5.0"`, so keys built
+  with `..` from a division differ; use `math.floor` or
+  `string.format('%d')`), integers are exact 64-bit numbers, and 5.4's
+  syntax (`//`, bitwise operators, `goto`) and `table.unpack` are there.
+  The full list, with workarounds: [SCRIPTS.md](SCRIPTS.md#lua-54-and-how-it-differs-from-rediss-lua-51).
 - `save <points>` has no effect: KiviDB doesn't snapshot on a schedule. Use
   the AOF or `BGSAVE`.
 - `appendfsync no` is taken as `everysec`; `always` and `everysec` do what
@@ -151,7 +160,15 @@ other files:
   KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
   data back off KiviDB means copying it key by key. Bloom filters are the
   exception: their payloads are Redis's, and Redis restores them.
-- `DUMP`/`RESTORE` doesn't support time series and vector sets.
+- `DUMP`/`RESTORE` and `MIGRATE` of time series and vector sets work between
+  KiviDB nodes only: their payloads are KiviDB's own, and Redis's for these
+  types (module values) aren't read either. A series' compaction rules and
+  source are left out, as RedisTimeSeries leaves them out, so after
+  `RESTORE`, `MIGRATE` or `MIGRATE`-based resharding run `TS.CREATERULE`
+  again; an atomic slot migration (`CLUSTER MIGRATION`) recreates the rules
+  itself. A vector set made
+  `NOQUANT` arrives as a set made without an option, so it then accepts a
+  `VADD` with any quantization option, the same as after a snapshot reload.
 - Search: no stemming or phonetic matching (`NOSTEM` and `PHONETIC` are
   accepted and change nothing). `GEO` and `GEOSHAPE` fields, `GEOFILTER` and
   `INFIELDS` are refused. Query `TIMEOUT` is accepted but doesn't cut a query
@@ -196,7 +213,18 @@ other files:
   in `HELLO` and in `INFO`.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set.
-- `client-output-buffer-limit` isn't configurable.
+- `client-output-buffer-limit`'s replica hard limit is
+  `repl-replica-max-backlog-bytes` (0: no limit, which lifts
+  `repl-replica-sync-max-backlog-bytes` too); during a full sync a replica
+  is held to `repl-replica-sync-max-backlog-bytes` instead. A replica has no
+  soft limit by default (`slave 268435456 0 0`; Redis: 64 MB for 60
+  seconds), on purpose: a burst a replica comes through should not become a
+  full resync of a large dataset. One that is set holds only once the
+  replica's queue has been under it after its full sync or partial resync.
+  A redis.conf line `client-output-buffer-limit replica 256mb 64mb 60` turns
+  it on, and overrides a raised `repl-replica-max-backlog-bytes` earlier in
+  the file (the last line wins). The limits count the bytes waiting, not
+  the allocator's rounding of them.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica
   of a KiviDB master older than 1.1.3 expires keys by its own clock (such a
   master sends no `DEL` for the keys it expires). A replica of a 1.2.0
@@ -205,8 +233,12 @@ other files:
   wait for one).
 
 **Cluster**
-- `FT.SPELLCHECK`, `FT.PROFILE`, `FT.HYBRID` and `FT.SYNDUMP` answer from the
-  node they're sent to.
+- `FT.SPELLCHECK`, `FT.PROFILE` and `FT.SYNDUMP` answer from the node
+  they're sent to.
+- `FT.HYBRID` is refused in a cluster of more than one master ("FT.HYBRID is
+  not supported across a cluster's masters yet"), where Redis answers it
+  from every shard: one node's answer would be part of the cluster's. A
+  cluster of one master answers it.
 - Without `tls-cluster`, traffic between nodes is unencrypted, as in Redis.
 - KiviDB nodes cluster only with KiviDB nodes.
 - `cluster-node-timeout` is read only at startup: `CONFIG SET` refuses a

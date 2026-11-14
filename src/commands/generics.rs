@@ -344,72 +344,103 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // The keyspace is gone through a shard at a time, and each
             // shard in the order of its keys' positions (see
-            // `helpers::scan_position`): the cursor is the shard, and the
-            // position to go on from in it. Keys written or deleted while
-            // a scan is under way do not move the others.
-            const SHARD_SHIFT: u32 = 48;
+            // `ShardMap::scan`): the cursor is the shard, and the position
+            // to go on from in it. Keys written or deleted while a scan is
+            // under way do not move the others, and neither does a shard's
+            // table growing or shrinking.
+            const POSITION_BITS: u32 = crate::store::SCAN_POSITIONS.trailing_zeros();
             let db = &ctx.store[*ctx.selected_db];
             let num_shards = db.len() as u64;
-            let mut shard_idx = cursor >> SHARD_SHIFT;
-            let mut position = cursor & ((1u64 << SHARD_SHIFT) - 1);
+            let mut shard_idx = cursor >> POSITION_BITS;
+            let mut position = cursor & (crate::store::SCAN_POSITIONS - 1);
+            let pattern = options.pattern.as_deref().map(super::glob_redis::Glob::new);
+            let of_type = options.of_type.as_deref();
 
-            let mut keys: Vec<crate::store::Key> = Vec::new();
-            let mut looked_at = 0usize;
-            let mut next_cursor: u64 = 0;
-            while shard_idx < num_shards {
-                let map = read_lock!(db[shard_idx as usize]);
-                let (page, next) = crate::commands::helpers::scan_page(
-                    map.iter().map(|(key, value)| {
-                        (crate::commands::helpers::scan_position(key), (key, value))
-                    }),
-                    position,
-                    options.count.saturating_sub(looked_at).max(1),
-                    map.len(),
+            // As Redis does, a key is told whether it matches before it is
+            // asked whether it is past its time, and only the ones that
+            // match are copied (#754): here straight into the reply.
+            let walk = || {
+                let mut found = Vec::new();
+                let mut returned = 0usize;
+                // Keys past their time: expired once the shard is let go of.
+                let mut past: Vec<crate::store::Key> = Vec::new();
+                let mut looked_at = 0usize;
+                let mut next_cursor: u64 = 0;
+                while shard_idx < num_shards {
+                    let map = read_lock!(db[shard_idx as usize]);
                     // A shard is a small part of the keyspace: it is gone
-                    // through in a few pages.
-                    16,
-                );
-                // `COUNT` is how many keys to look at, not how many to
-                // return: the ones of another type count too.
-                looked_at += page.len();
-                keys.extend(
-                    page.into_iter()
-                        .filter(|(_, value)| {
-                            options
-                                .of_type
-                                .as_deref()
-                                .is_none_or(|t| value.type_name().eq_ignore_ascii_case(t))
-                        })
-                        .map(|(key, _)| crate::store::Key::new(key)),
-                );
-                drop(map);
-                if next != 0 {
-                    next_cursor = (shard_idx << SHARD_SHIFT) | next;
-                    break;
-                }
-                shard_idx += 1;
-                position = 0;
-                if looked_at >= options.count {
-                    if shard_idx < num_shards {
-                        next_cursor = shard_idx << SHARD_SHIFT;
+                    // through in a few pages whatever `COUNT` says.
+                    let want = options
+                        .count
+                        .saturating_sub(looked_at)
+                        .max(map.len() / 16)
+                        .max(1);
+                    let next = map.scan(position, want, |entry| {
+                        // `COUNT` is how many keys to look at, not how many
+                        // to return: the ones of another type count too.
+                        looked_at += 1;
+                        let key = entry.key();
+                        if pattern.as_ref().is_some_and(|glob| !glob.matches(key)) {
+                            return;
+                        }
+                        if of_type
+                            .is_some_and(|t| !entry.value().type_name().eq_ignore_ascii_case(t))
+                        {
+                            return;
+                        }
+                        if entry
+                            .expires()
+                            .is_some_and(crate::commands::helpers::is_past)
+                        {
+                            past.push(crate::store::Key::new(key));
+                            return;
+                        }
+                        write_bulk(&mut found, key);
+                        returned += 1;
+                    });
+                    drop(map);
+                    if next != 0 {
+                        next_cursor = (shard_idx << POSITION_BITS) | next;
+                        break;
                     }
-                    break;
+                    shard_idx += 1;
+                    position = 0;
+                    if looked_at >= options.count {
+                        if shard_idx < num_shards {
+                            next_cursor = shard_idx << POSITION_BITS;
+                        }
+                        break;
+                    }
                 }
-            }
-            // Falling out of the loop with shard_idx == num_shards means
-            // every shard was gone through: next_cursor stays 0 (done).
+                // Falling out of the loop with shard_idx == num_shards means
+                // every shard was gone through: next_cursor stays 0 (done).
 
-            keys.retain(|k| !lazy_expire_on_read(ctx.store, *ctx.selected_db, k));
-            if let Some(ref pat) = options.pattern {
-                keys.retain(|k| crate::commands::helpers::glob_match_bytes(pat, k));
-            }
+                // A key past its time is not returned, and is expired as a
+                // read of it would expire it. (A key written again since the
+                // shard was let go of is not: it was not there all along.)
+                for key in &past {
+                    lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
+                }
+                (found, returned, next_cursor)
+            };
+            // The keys it looks at: no more than `COUNT`, nor than there are.
+            // Counted only for a `COUNT` that could be long work.
+            let units = if options.count >= crate::commands::helpers::LONG_WORK {
+                options.count.min(crate::commands::helpers::db_len(db))
+            } else {
+                options.count
+            };
+            let (found, returned, next_cursor) = crate::commands::helpers::long_work(units, walk);
 
-            let key_items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk(k)).collect();
-
-            Some(resp_array(vec![
-                resp_bulk_str(&next_cursor.to_string()),
-                resp_array(key_items),
-            ]))
+            let cursor = next_cursor.to_string();
+            let mut reply = Vec::with_capacity(found.len() + 32);
+            reply.extend_from_slice(b"*2\r\n");
+            write_bulk(&mut reply, cursor.as_bytes());
+            reply.push(b'*');
+            reply.extend_from_slice(returned.to_string().as_bytes());
+            reply.extend_from_slice(b"\r\n");
+            reply.extend_from_slice(&found);
+            Some(reply)
         }
 
         "KEYS" => {
@@ -421,25 +452,30 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let pattern = cmd[1];
 
             let db = &ctx.store[*ctx.selected_db];
-            // Collect into a temporary — we need the count before we can
-            // write the RESP array header, and we can't hold all shard locks
-            // simultaneously. Collecting key slices (not copies) keeps this cheap.
-            // Note: we can't return borrowed keys across the lock boundary,
-            // so we collect owned keys.
-            let mut candidates: Vec<crate::store::Key> = Vec::new();
-            for shard in db.iter() {
-                let map = read_lock!(shard);
-                candidates.extend(map.keys().map(crate::store::Key::new));
-            }
-            let mut matching: Vec<crate::store::Key> = Vec::new();
-            for key in candidates {
-                if lazy_expire_on_read(ctx.store, *ctx.selected_db, &key) {
-                    continue;
+            // A shard at a time, each let go of before the next is taken:
+            // nothing waits for the whole walk, only for the shard it is
+            // looking at (#754). Unlike Redis's, which runs alone, the
+            // answer is not the keyspace at one instant: a key written,
+            // meanwhile, to a shard already gone through is not in it. Only
+            // the keys that match are copied. Copying every key, and
+            // matching the copies, was most of what a `KEYS` over millions
+            // of keys cost.
+            let walk = || {
+                let mut matching: Vec<crate::store::Key> = Vec::new();
+                for shard in db.iter() {
+                    let map = read_lock!(shard);
+                    matching.extend(
+                        map.keys()
+                            .filter(|key| crate::commands::helpers::glob_match_bytes(pattern, key))
+                            .map(crate::store::Key::new),
+                    );
                 }
-                if crate::commands::helpers::glob_match_bytes(pattern, &key) {
-                    matching.push(key);
-                }
-            }
+                // A key past its time is not listed, and goes.
+                matching.retain(|key| !lazy_expire_on_read(ctx.store, *ctx.selected_db, key));
+                matching
+            };
+            let matching =
+                crate::commands::helpers::long_work(crate::commands::helpers::db_len(db), walk);
 
             let mut buf = Vec::with_capacity(16 + matching.len() * 24);
             buf.push(b'*');
@@ -958,7 +994,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut removed = 0i64;
             // `UNLINK` frees a large value in the background (`lazyfree`);
-            // `DEL` frees it here, as Redis does with `lazyfree-lazy-user-del no`.
+            // `DEL` frees it here, as Redis does with `lazyfree-lazy-user-del
+            // no`, and as `UNLINK` does with `yes` (`lazyfree::release_deleted`).
             let unlink = cmd[0].eq_ignore_ascii_case(b"UNLINK");
 
             // Any bytes: what a master expires, evicts or migrates away is
@@ -978,13 +1015,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     continue;
                 }
-                let deleted = if unlink {
-                    take_key(ctx.store, *ctx.selected_db, key)
-                        .map(crate::lazyfree::release)
-                        .is_some()
-                } else {
-                    delete_key(ctx.store, *ctx.selected_db, key)
-                };
+                let deleted = take_key(ctx.store, *ctx.selected_db, key)
+                    .map(|value| {
+                        if unlink {
+                            crate::lazyfree::release(value)
+                        } else if !matches!(value, KiviDBValue::String(_)) {
+                            // A string is one allocation: freed here, as
+                            // it is dropped, with nothing to weigh.
+                            crate::lazyfree::release_deleted(value)
+                        }
+                    })
+                    .is_some();
                 // A document that was deleted left its indexes when the
                 // shard was let go of (`ShardMap::remove`).
                 if deleted {

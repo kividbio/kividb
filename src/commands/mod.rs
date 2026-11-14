@@ -36,6 +36,8 @@ pub(crate) mod long_double;
 #[cfg(feature = "lua")]
 mod lua;
 #[cfg(feature = "lua")]
+mod lua_format;
+#[cfg(feature = "lua")]
 pub(crate) use lua::{
     cached_script_declares_no_writes, cached_script_declares_writes, function_declares_no_writes,
     library_snapshot, lua_command_runs_long_sync_vm, restore_library_snapshot,

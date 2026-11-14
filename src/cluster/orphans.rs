@@ -341,7 +341,9 @@ fn count_shard(shard: &crate::store::Shard, unserved: &[bool], counts: &mut [u64
         let complete = loop {
             let map = crate::read_lock!(shard);
             let buckets = map.buckets();
-            if *size.get_or_insert(buckets) != buckets {
+            // A growth's steps move keys without a change of size.
+            let layout = (buckets, map.layout());
+            if *size.get_or_insert(layout) != layout {
                 break false;
             }
             let end = (at + BUCKETS_PER_HOLD).min(buckets);

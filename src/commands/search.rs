@@ -496,7 +496,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error(&no_such_index(name)));
     };
     let def = &def;
-    let resp = ctx.resp;
+    let resp = search_resp(ctx);
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
     // The index's own database, whichever the client has selected.
     let mut num_docs = count_docs(def, cluster);
@@ -1165,20 +1165,9 @@ pub(crate) fn relevance(
     scoring.score(def, key, fields, json)
 }
 
-/// Every document of the index that the filter accepts. In no particular
-/// order. Stops when `deadline` has passed, and then `timed_out` is true.
-pub(crate) fn filter_search(
-    ctx: &Ctx,
-    def: &IndexDef,
-    filter: &Filter,
-    only: Option<&AHashSet<String>>,
-    deadline: Option<Instant>,
-) -> FilterHits {
-    let scorer = crate::vector::score::Scorer::default_scorer();
-    filter_search_scored(ctx, def, filter, only, deadline, scorer)
-}
-
-/// [`filter_search`], scored by `scorer` (`SCORER`).
+/// Every document of the index that the filter accepts, scored by `scorer`
+/// (`SCORER`). In no particular order. Stops when `deadline` has passed, and
+/// then `timed_out` is true.
 pub(crate) fn filter_search_scored(
     ctx: &Ctx,
     def: &IndexDef,
@@ -1204,7 +1193,7 @@ pub(crate) fn filter_search_scored(
 }
 
 /// Every document of the index that the filter accepts, into `accept`, with
-/// its key and fields: [`filter_search`] without the copies, for a caller
+/// its key and fields: [`filter_search_scored`] without the copies, for a caller
 /// that keeps only some of them. True if it stopped because `deadline` had
 /// passed. `accept` may run under a shard's read lock.
 pub(crate) fn filter_each(
@@ -2581,7 +2570,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             },
         })
         .collect();
-    let page = encode_page(ctx.resp, &page, total, &args, nocontent, timed_out);
+    let page = encode_page(search_resp(ctx), &page, total, &args, nocontent, timed_out);
     // A coordinator that asks for it is told whether this part timed out;
     // one from before there was a timeout gets the page as it expects it.
     if shard && crate::cluster::search::wants_timeout_flag(&ctx.cmd) {
@@ -2705,6 +2694,18 @@ fn encode_page(
 thread_local! {
     /// Set while a coordinator runs its own part of a search.
     static SHARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The protocol a reply is written in: a script's own (`redis.setresp`)
+/// inside one, the client's otherwise. A shard's part is always RESP2,
+/// whatever the script says: the coordinator parses it as such.
+#[inline]
+fn search_resp(ctx: &Ctx) -> u8 {
+    if SHARD.with(|s| s.get()) {
+        2
+    } else {
+        crate::commands::handler::effective_resp_for_reply(ctx)
+    }
 }
 
 /// FT.SEARCH across the cluster: see `cluster::search`.
@@ -2876,7 +2877,12 @@ fn coordinate(
         return Err("Timeout limit was reached".into());
     }
     Ok(encode_page(
-        ctx.resp, &page, total, args, nocontent, timed_out,
+        search_resp(ctx),
+        &page,
+        total,
+        args,
+        nocontent,
+        timed_out,
     ))
 }
 

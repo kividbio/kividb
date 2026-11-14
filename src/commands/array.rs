@@ -1207,12 +1207,13 @@ fn cmd_arlastitems(ctx: &mut Ctx) -> Vec<u8> {
             if !rev {
                 items.reverse();
             }
+            let nil = nil_element(ctx);
             resp_array(
                 items
                     .iter()
                     .map(|v| match v {
                         Some(v) => resp_bulk(v),
-                        None => crate::resp::write::resp_null_bulk(),
+                        None => nil.clone(),
                     })
                     .collect(),
             )
@@ -1272,7 +1273,7 @@ fn cmd_arinfo(ctx: &mut Ctx) -> Vec<u8> {
         full = true;
     }
 
-    let resp3 = ctx.resp == 3;
+    let resp3 = reply_resp(ctx) == 3;
     let resp = reply_resp(ctx);
     match with_array_read(ctx, &key, None, |inner| {
         let stats = slice_stats(inner);

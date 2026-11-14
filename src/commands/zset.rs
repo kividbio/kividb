@@ -1551,12 +1551,12 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
                 1024,
             );
             let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
+            let pattern = options
+                .pattern
+                .as_deref()
+                .map(crate::commands::glob_redis::Glob::new);
             for (member, score) in page {
-                if options
-                    .pattern
-                    .as_deref()
-                    .is_some_and(|pat| !crate::commands::helpers::glob_match_bytes(pat, member))
-                {
+                if pattern.as_ref().is_some_and(|glob| !glob.matches(member)) {
                     continue;
                 }
                 // ZSCAN keeps the flat, all-bulk-string shape under RESP3

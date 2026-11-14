@@ -434,7 +434,7 @@ pub fn active_expire_cycle(
             // looks only at those (#618): before, every cycle went over every
             // key with a time to live, due or not.
             if read_lock!(db_values[shard]).ttl_sweep_due(now) {
-                while !write_lock!(db_values[shard]).sweep_ttl(now, TTL_SWEEP_STEPS) {}
+                db_values[shard].sweep_ttl(now, TTL_SWEEP_STEPS);
             }
             // A batch at a time: a pass stops at the batch's last key, so it
             // copies no more keys than it deletes. Collecting every due key
@@ -638,11 +638,13 @@ const SHRINK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Shrink the tables, and lists of keys with a time to live, of `cursor`'s
 /// shards that keys have mostly left ([`store::ShardLock::shrink_if_sparse`],
-/// #113).
+/// #113), and finish the growth of those growing
+/// ([`store::ShardLock::step_growth`], #752).
 fn shrink_sparse_tables(store: &Store, cursor: &ExpireCursor) {
     for db in store.iter() {
         for (s, shard) in db.iter().enumerate() {
             if cursor.owns(s) {
+                shard.step_growth();
                 shard.shrink_if_sparse();
             }
         }
@@ -783,6 +785,50 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// [`glob_match`] of bytes: a channel's name need not be UTF-8.
 pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
     super::glob_redis::matches(pattern, text)
+}
+
+/// How many keys, or elements, a command goes through before it is long
+/// enough for [`long_work`] to move it off the runtime: a few milliseconds of
+/// work. Below it, what moving costs (a thread handed the runtime's work, tens
+/// of microseconds) is more than what it saves.
+pub const LONG_WORK: usize = 65_536;
+
+/// Run `f`, a command's work over `units` keys or elements, so that other
+/// clients are served meanwhile.
+///
+/// On the Tokio runtime a command runs on a worker thread, inline. The
+/// worker that got the command is, often, the one that was waiting on the
+/// sockets for the others: while it runs a long command nothing waits on
+/// them, and every connection's next command waits for this one to end,
+/// whatever thread would have served it (#754). So past [`LONG_WORK`] the
+/// work runs with the worker's other tasks handed to another thread, as
+/// `tokio::task::block_in_place` does. On the io_uring runtime, each thread
+/// serves its own connections, and only those wait.
+#[inline]
+pub fn long_work<R>(units: usize, f: impl FnOnce() -> R) -> R {
+    if units >= LONG_WORK {
+        crate::cluster::migration::off_the_runtime(f)
+    } else {
+        f()
+    }
+}
+
+/// How long the Tokio runtime keeps an idle thread of its blocking pool.
+///
+/// [`long_work`] hands its worker's tasks to a thread of that pool, and the
+/// thread the command ran on joins the pool when it ends. With Tokio's
+/// default of 10 s, long commands further apart than that made a new thread
+/// each time, and every new thread that runs a command takes, for good, a
+/// slot of the command gate and of the write gate and a stripe of
+/// `memory_use`: past 128 slots every `EXEC` and script takes all 128.
+/// Kept for hours, the threads that served long commands serve the next.
+pub const RUNTIME_THREAD_KEEP_ALIVE: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
+/// How many keys database `db` holds, expired ones not yet removed included:
+/// `DBSIZE`. A shard's lock at a time.
+pub fn db_len(db: &crate::store::Db) -> usize {
+    db.iter().map(|shard| read_lock!(shard).len()).sum()
 }
 
 /// The latest deadline a command may give a hash field, in Unix

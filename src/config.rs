@@ -193,6 +193,12 @@ pub struct Config {
     #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
     pub activedefrag: bool,
 
+    /// Give the system allocator's free pages back to the system once what
+    /// is allocated has fallen far and the server is idle (#753; see
+    /// `src/give_back.rs`). On unless switched off.
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
+    pub allocator_give_back: bool,
+
     /// Waste in the slabs under which active defrag does not start (Redis
     /// `active-defrag-ignore-bytes`).
     #[arg(long, default_value_t = 64 << 20)]
@@ -307,6 +313,12 @@ pub struct Config {
     #[arg(skip)]
     pub configfile_named: bool,
 
+    /// `client-output-buffer-limit`, from the configuration file (#774):
+    /// see [`crate::output_limits`]. The replica class's hard limit is
+    /// `repl_replica_max_backlog_bytes`; the one here is not read.
+    #[arg(skip)]
+    pub client_output_buffer_limit: crate::output_limits::Limits,
+
     /// Port to accept TLS connections on. 0 = TLS disabled.
     /// Separate from `port` so the uring hot-path on `port` is untouched.
     #[arg(long, default_value_t = 0)]
@@ -381,10 +393,11 @@ pub struct Config {
     pub notify_keyspace_events: String,
 
     /// Max bytes a master will queue for a single replica that isn't keeping up
-    /// (analogous to Redis's `client-output-buffer-limit slave <hard-limit>`).
-    /// Once exceeded the replica is disconnected — it must full-resync to catch
-    /// back up — rather than letting the queue grow without bound. Settable at
-    /// runtime.
+    /// (Redis's `client-output-buffer-limit slave <hard-limit>`, which sets
+    /// it too). Once exceeded the replica is disconnected — it must
+    /// full-resync to catch back up — rather than letting the queue grow
+    /// without bound. 0 is no limit, and lifts
+    /// `repl-replica-sync-max-backlog-bytes` too. Settable at runtime.
     #[arg(long, default_value_t = 268_435_456)]
     pub repl_replica_max_backlog_bytes: u64,
 
@@ -628,6 +641,7 @@ impl Default for Config {
             key_access_tracking: false,
             lfu_decay_time: 1,
             activedefrag: true,
+            allocator_give_back: true,
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
@@ -663,6 +677,7 @@ impl Default for Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            client_output_buffer_limit: crate::output_limits::Limits::default(),
             repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -755,6 +770,7 @@ impl Config {
             key_access_tracking: false,
             lfu_decay_time: 1,
             activedefrag: true,
+            allocator_give_back: true,
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
@@ -790,6 +806,7 @@ impl Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            client_output_buffer_limit: crate::output_limits::Limits::default(),
             repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -1051,6 +1068,17 @@ impl Config {
         }
     }
 
+    /// `client-output-buffer-limit` as configured, the replica class's hard
+    /// limit being `repl-replica-max-backlog-bytes`.
+    pub fn output_buffer_limits(&self) -> crate::output_limits::Limits {
+        use crate::output_limits::Class;
+        let mut limits = self.client_output_buffer_limit;
+        let mut replica = limits.get(Class::Replica);
+        replica.hard = self.repl_replica_max_backlog_bytes;
+        limits.set(Class::Replica, replica);
+        limits
+    }
+
     /// Returns true if TLS should be enabled.
     /// Requires tls_port > 0 AND both cert + key files configured.
     pub fn tls_enabled(&self) -> bool {
@@ -1142,6 +1170,14 @@ impl Config {
             if self.activedefrag { "yes" } else { "no" }
         ));
         out.push_str(&format!(
+            "allocator-give-back {}\n",
+            if self.allocator_give_back {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
+        out.push_str(&format!(
             "active-defrag-ignore-bytes {}\n",
             self.active_defrag_ignore_bytes
         ));
@@ -1199,6 +1235,8 @@ impl Config {
             "repl-replica-sync-max-backlog-bytes {}\n",
             self.repl_replica_sync_max_backlog_bytes
         ));
+        // A line for each class not at Redis's default, as Redis writes them.
+        out.push_str(&self.output_buffer_limits().rewrite_lines());
         if !self.masterauth.is_empty() {
             out.push_str(&format!("masterauth {}\n", quote(&self.masterauth)));
         }
@@ -1657,6 +1695,23 @@ impl Config {
             "repl-replica-max-backlog-bytes" => {
                 set!(repl_replica_max_backlog_bytes, parse_memory(key, one()?)?)
             }
+            // `<class> <hard> <soft> <seconds>`, for one class or more; a
+            // line for each class, as Redis writes them, or all on one. A
+            // replica's hard limit is `repl-replica-max-backlog-bytes` (#774).
+            "client-output-buffer-limit" => {
+                if args.is_empty() {
+                    return Err(format!("'{key}' needs a value"));
+                }
+                let value = args.join(" ");
+                let classes = crate::output_limits::parse(&value)
+                    .map_err(|why| format!("invalid value '{value}' for '{key}': {why}"))?;
+                for (class, limit) in classes {
+                    if class == crate::output_limits::Class::Replica {
+                        set!(repl_replica_max_backlog_bytes, limit.hard);
+                    }
+                    self.client_output_buffer_limit.set(class, limit);
+                }
+            }
             "repl-replica-sync-max-backlog-bytes" => {
                 set!(
                     repl_replica_sync_max_backlog_bytes,
@@ -1861,6 +1916,7 @@ impl Config {
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
             "activedefrag" => set!(activedefrag, yes_no(key, one()?)?),
+            "allocator-give-back" => set!(allocator_give_back, yes_no(key, one()?)?),
             "active-defrag-ignore-bytes" => {
                 set!(active_defrag_ignore_bytes, parse_memory(key, one()?)?)
             }
@@ -1882,7 +1938,6 @@ impl Config {
             | "io-threads-do-reads"
             | "lazyfree-lazy-eviction"
             | "lazyfree-lazy-server-del"
-            | "lazyfree-lazy-user-del"
             | "no-appendfsync-on-rewrite"
             | "proc-title-template"
             | "rdbcompression"
@@ -1936,6 +1991,7 @@ impl Config {
                                 | "aof-ack-after-write"
                                 | "maxclients"
                                 | "lazyfree-lazy-expire"
+                                | "lazyfree-lazy-user-del"
                                 | "latency-tracking"
                                 | "latency-tracking-info-percentiles"
                                 | "rdbchecksum"
@@ -2289,15 +2345,18 @@ mod config_file_tests {
         }
     }
 
-    /// `lazyfree-lazy-expire` and `latency-tracking` from a config file are
-    /// set, as `CONFIG SET` sets them, and not reported as having no
-    /// effect: they have one (#232). A value other than yes or no is
-    /// refused, there and in the other `lazyfree-*` directives.
+    /// `lazyfree-lazy-expire`, `lazyfree-lazy-user-del` (#754) and
+    /// `latency-tracking` from a config file are set, as `CONFIG SET` sets
+    /// them, and not reported as having no effect: they have one (#232). A
+    /// value other than yes or no is refused, there and in the other
+    /// `lazyfree-*` directives.
     #[test]
     fn lazyfree_lazy_expire_and_latency_tracking_are_applied_from_the_file() {
         // Only to what they are already: other tests of this process go by
         // them. tests/expired_propagation.rs sets `no` from a file.
-        let (_, warnings) = load("lazyfree-lazy-expire YES\nlatency-tracking yes\n").unwrap();
+        let (_, warnings) =
+            load("lazyfree-lazy-expire YES\nlazyfree-lazy-user-del no\nlatency-tracking yes\n")
+                .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         for bad in [
             "lazyfree-lazy-expire maybe\n",

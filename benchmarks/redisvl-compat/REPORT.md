@@ -4,19 +4,19 @@
 ([`redisvl_kividb_compat.py`](redisvl_kividb_compat.py)) and no API keys: a stub plays the embedding
 model.
 
-**59 of 67 checks pass on KiviDB, and 67 of 67 on Redis 8.10.3.**
-The eight failures are every `HybridQuery` check, on a hash index and on a JSON index. KiviDB answers
-`unknown FT.HYBRID token 'SCORER'`. Those eight pass on Redis. Every other check passes on both, and no
-check was skipped. The default image is enough: the run sent no `EVAL`, `EVALSHA`, `FCALL`, or `SCRIPT`.
+**67 of 67 checks pass on KiviDB with the fix for #767, and 67 of 67 on Redis 8.10.3.**
+KiviDB 1.2.2 passed 59: it failed the eight `HybridQuery` checks, on a hash index and on a JSON index,
+with `unknown FT.HYBRID token 'SCORER'`. No check was skipped. The default build is enough: the run sent
+no `EVAL`, `EVALSHA`, `FCALL`, or `SCRIPT`.
 
 | | |
 |---|---|
-| KiviDB | `1.2.2` as the server reports it, image `kividb/kividb:latest` (`sha256:8853c7b1e73e`), default build, no Lua |
+| KiviDB | branch `fix/hybrid-scorer` (#767) on `master` `4a08e72b`, built from source with `cargo build --release`, default build, no Lua. Before: `1.2.2`, image `kividb/kividb:latest` (`sha256:8853c7b1e73e`) |
 | Reference | Redis `8.10.3` (the `redis:8.10` image, `sha256:1f88291b4c57`) |
 | `redisvl` | `0.32.0` |
 | `redis-py` / `numpy` | `8.1.0` / `2.5.4` (see [`requirements.txt`](requirements.txt)) |
 | Python | `3.12.3` |
-| Run | 2026-11-14. KiviDB listened on `0.0.0.0:6380` inside the container, published as `127.0.0.1:6380` |
+| Run | 2026-11-14, on a Linux VM. KiviDB listened on `127.0.0.1:6380`; Redis in the `redis:8.10` image |
 
 ## Results
 
@@ -89,23 +89,23 @@ check was skipped. The default image is enough: the run sent no `EVAL`, `EVALSHA
 | Check | KiviDB | Redis 8 |
 |---|---|---|
 | create and load | PASS | PASS |
-| LINEAR fusion weighted toward the vector | FAIL | PASS |
-| LINEAR fusion weighted toward the text | FAIL | PASS |
-| RRF fusion | FAIL | PASS |
-| hybrid query with a tag filter | FAIL | PASS |
+| LINEAR fusion weighted toward the vector | PASS | PASS |
+| LINEAR fusion weighted toward the text | PASS | PASS |
+| RRF fusion | PASS | PASS |
+| hybrid query with a tag filter | PASS | PASS |
 
 ### HybridQuery, JSON (`FT.HYBRID`)
 
 | Check | KiviDB | Redis 8 |
 |---|---|---|
 | create and load | PASS | PASS |
-| LINEAR fusion weighted toward the vector | FAIL | PASS |
-| LINEAR fusion weighted toward the text | FAIL | PASS |
-| RRF fusion | FAIL | PASS |
-| hybrid query with a tag filter | FAIL | PASS |
+| LINEAR fusion weighted toward the vector | PASS | PASS |
+| LINEAR fusion weighted toward the text | PASS | PASS |
+| RRF fusion | PASS | PASS |
+| hybrid query with a tag filter | PASS | PASS |
 
-Each KiviDB failure is `ResponseError: unknown FT.HYBRID token 'SCORER'`. The query never runs, so these
-checks say nothing about fusion once the command is accepted. See [The gap](#the-gap).
+On KiviDB 1.2.2 each of these failed with `ResponseError: unknown FT.HYBRID token 'SCORER'`. See
+[What #767 changed](#what-767-changed).
 
 ### AggregateHybridQuery
 
@@ -143,68 +143,9 @@ and it does not send `FT.HYBRID`.
 Raw results: [`results-kividb.json`](results-kividb.json),
 [`results-redis8.json`](results-redis8.json).
 
-## The gap
+## What #767 changed
 
-`HybridQuery` always sends `SCORER`, because `text_scorer` defaults to `BM25STD`. Redis 8.10.3 accepts
-the command and returns the text match. KiviDB 1.2.2 rejects the token.
-
-On current `master` the parser in `src/commands/hybrid.rs` reads `YIELD_SCORE_AS` after `SEARCH` and
-then stops. `SCORER` falls through to the unknown-token error. A comment there says `SCORER` is ignored
-for now; the token is not consumed, so the command errors before that.
-
-This environment cannot open a `redis-compat` issue. The repro below is the one to file.
-
-```python
-import hashlib
-import math
-import re
-
-from redisvl.index import SearchIndex
-from redisvl.query import HybridQuery
-from redisvl.redis.utils import array_to_buffer
-
-DIM = 64
-
-
-def embed(text):
-    v = [0.0] * DIM
-    for tok in re.findall(r"[a-z0-9]+", text.lower()):
-        v[int(hashlib.md5(tok.encode()).hexdigest(), 16) % DIM] += 1.0
-    n = math.sqrt(sum(x * x for x in v)) or 1.0
-    return [x / n for x in v]
-
-
-text = "a new rust compiler release is out"
-schema = {
-    "index": {"name": "reprohybrid", "prefix": "reprohybrid", "storage_type": "hash"},
-    "fields": [
-        {"name": "content", "type": "text"},
-        {"name": "embedding", "type": "vector", "attrs": {
-            "dims": DIM, "algorithm": "flat", "distance_metric": "cosine", "datatype": "float32"}},
-    ],
-}
-index = SearchIndex.from_dict(schema, redis_url="redis://127.0.0.1:6380")
-index.create(overwrite=True)
-index.load([{
-    "id": "rust",
-    "content": text,
-    "embedding": array_to_buffer(embed(text), "float32"),
-}], id_field="id")
-
-index.query(HybridQuery(
-    text="rust compiler",
-    text_field_name="content",
-    vector=embed("interest rates rose again this quarter"),
-    vector_field_name="embedding",
-    return_fields=["content"],
-    num_results=1,
-    combination_method="RRF",
-    stopwords=None,
-))
-```
-
-KiviDB raises `redis.exceptions.ResponseError: unknown FT.HYBRID token 'SCORER'`.
-Redis 8.10.3 returns the stored document. The command RedisVL sends is:
+`HybridQuery` always sends `SCORER`, because `text_scorer` defaults to `BM25STD`:
 
 ```
 FT.HYBRID reprohybrid SEARCH (~@content:(rust | compiler)) SCORER BM25STD
@@ -212,8 +153,11 @@ FT.HYBRID reprohybrid SEARCH (~@content:(rust | compiler)) SCORER BM25STD
   LOAD 1 @content LIMIT 0 1 PARAMS 2 vector <float32 blob>
 ```
 
-The same `SCORER BM25STD` clause is on the LINEAR queries and on the filtered hybrid query, and on a
-JSON index. All eight fail the same way. Creating and loading the index first succeeds.
+KiviDB 1.2.2 refused the token. Past it, two more things stood in the way: the reply was not Redis's
+(redis-py reads `total_results`, `results`, `warnings` and `execution_time`), and the filtered query puts
+`FILTER @topic:{tech}` in the `VSIM` clause, where Redis applies it to the vector side. With the fix,
+`SCORER` scores the text side as `FT.SEARCH` does, the reply is Redis's, and the vector side's `FILTER` is
+applied. All eight `HybridQuery` checks pass, with the documents Redis returns.
 
 ## Commands RedisVL sent
 
@@ -228,7 +172,7 @@ library creates. No `EVAL`, `EVALSHA`, `FCALL`, or `SCRIPT`.
   numeric, and text filters, a combined filter, `FilterQuery`, `TextQuery`, fetch, drop, and delete.
 - It shows `AggregateHybridQuery`, `SemanticCache` (hit, miss, filter, clear), and `SemanticRouter`
   (exact, near, far, `route_many`, `add_route`) behave as they do on Redis 8.10.3.
-- It shows `HybridQuery` does not run on this KiviDB build, because of `SCORER`.
+- It shows `HybridQuery` (LINEAR, RRF, and a filtered query) on a hash index and on a JSON index.
 - The embedding is a hashed bag of words, so it proves the wiring, not the quality of a real model's
   results.
 - The corpus is four documents. It does not measure speed, recall, or behaviour at size.
@@ -240,8 +184,9 @@ library creates. No `EVAL`, `EVALSHA`, `FCALL`, or `SCRIPT`.
 ```bash
 pip install -r requirements.txt
 
-# KiviDB. The default image has no Lua, and this harness does not need it.
-docker run -d --name kividb -p 6380:6380 kividb/kividb
+# KiviDB, built from source until a release has #767. The default build has no Lua, and this
+# harness does not need it.
+cargo build --release && ./target/release/kividb --port 6380 &
 python redisvl_kividb_compat.py --url redis://127.0.0.1:6380 --label kividb
 
 # Reference

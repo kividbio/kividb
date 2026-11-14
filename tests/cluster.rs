@@ -2834,6 +2834,193 @@ fn atomic_slot_migration_moves_time_series_with_their_rules() {
     assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]).array().len(), 2);
 }
 
+/// Vector sets of each quantization (the default one last) and a series.
+const MOVED_VSETS: [(&str, &str); 4] = [
+    ("vq8", "Q8"),
+    ("vbin", "BIN"),
+    ("vnoq", "NOQUANT"),
+    ("vdef", ""),
+];
+
+/// [`MOVED_VSETS`] with attributes, and a series with labels and settings,
+/// under `k`; `vq8` with a time to live.
+fn add_vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) {
+    for (name, opt) in MOVED_VSETS {
+        let key = k(name);
+        for n in 0..8 {
+            let v: Vec<String> = (0..16)
+                .map(|i| (((i * 7 + n * 5) % 13) as f32 - 6.5).to_string())
+                .collect();
+            let e = format!("e{n}");
+            let mut args = vec!["VADD", &key, "VALUES", "16"];
+            args.extend(v.iter().map(String::as_str));
+            args.push(&e);
+            if !opt.is_empty() {
+                args.push(opt);
+            }
+            assert_eq!(c.cmd(&args), Resp::Int(1), "{key} {e}");
+        }
+        assert_eq!(c.cmd(&["VSETATTR", &key, "e3", r#"{"n":3}"#]), Resp::Int(1));
+    }
+    assert_eq!(c.cmd(&["PEXPIRE", &k("vq8"), "500000"]), Resp::Int(1));
+    assert!(
+        c.cmd(&[
+            "TS.CREATE",
+            &k("ts"),
+            "RETENTION",
+            "100000",
+            "CHUNK_SIZE",
+            "128",
+            "DUPLICATE_POLICY",
+            "MAX",
+            "LABELS",
+            "kind",
+            "moved722",
+        ])
+        .is_ok()
+    );
+    for (at, value) in [("1", "1.5"), ("2", "-2"), ("3", "1e300")] {
+        assert_eq!(
+            c.cmd(&["TS.ADD", &k("ts"), at, value]).int().to_string(),
+            at
+        );
+    }
+}
+
+/// What a move must keep of [`add_vsets_and_series`]'s keys.
+fn vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) -> Vec<Resp> {
+    let mut out = Vec::new();
+    for (name, _) in MOVED_VSETS {
+        let key = k(name);
+        out.push(c.cmd(&["VINFO", &key]));
+        out.push(c.cmd(&["VCARD", &key]));
+        out.push(c.cmd(&["VSIM", &key, "ELE", "e1", "COUNT", "4", "WITHSCORES"]));
+        for n in 0..8 {
+            let e = format!("e{n}");
+            out.push(c.cmd(&["VEMB", &key, &e, "RAW"]));
+            out.push(c.cmd(&["VGETATTR", &key, &e]));
+        }
+    }
+    out.push(c.cmd(&["TS.RANGE", &k("ts"), "-", "+"]));
+    let info = c.cmd(&["TS.INFO", &k("ts")]);
+    for field in [
+        "totalSamples",
+        "retentionTime",
+        "chunkSize",
+        "duplicatePolicy",
+        "labels",
+    ] {
+        out.push(task_field(&info, field));
+    }
+    out
+}
+
+/// After a move: the time to live came along, the series is found by its
+/// label, and the Q8 and BIN sets still refuse another quantization. A
+/// `NOQUANT` set takes one, as after a reload: its choice is not kept.
+fn check_moved(c: &mut Conn, k: &dyn Fn(&str) -> String) {
+    let pttl = c.cmd(&["PTTL", &k("vq8")]).int();
+    assert!((1..=500_000).contains(&pttl), "PTTL {pttl}");
+    assert_eq!(c.cmd(&["PTTL", &k("vbin")]).int(), -1);
+    assert_eq!(
+        c.cmd(&["TS.QUERYINDEX", "kind=moved722"]).array(),
+        [Resp::Bulk(k("ts").into_bytes())]
+    );
+    let v: Vec<String> = (0..16).map(|i| (i as f32 + 0.5).to_string()).collect();
+    for (name, opt, refused) in [
+        ("vq8", "BIN", true),
+        ("vbin", "Q8", true),
+        ("vnoq", "Q8", false),
+        ("vdef", "Q8", false),
+    ] {
+        let key = k(name);
+        let mut args = vec!["VADD", &key, "VALUES", "16"];
+        args.extend(v.iter().map(String::as_str));
+        args.extend(["new", opt]);
+        let r = c.cmd(&args);
+        if refused {
+            assert!(
+                r.err().is_some_and(|e| e.contains("quantization mismatch")),
+                "{name}: {r:?}"
+            );
+        } else {
+            assert_eq!(r, Resp::Int(1), "{name}");
+        }
+    }
+}
+
+/// A slot holding vector sets of each quantization and a series moves by
+/// `MIGRATE`, as the resharding tools move it, whole (#722).
+#[test]
+fn migrate_moves_a_slot_of_vector_sets_and_series_whole() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "vs722");
+    let slot = slot_of(&tag).to_string();
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    add_vsets_and_series(&mut s, &k);
+    let before = vsets_and_series(&mut s, &k);
+
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let keys: Vec<String> = MOVED_VSETS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(["ts"])
+        .map(k)
+        .collect();
+    let mut args = vec!["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"];
+    args.extend(keys.iter().map(String::as_str));
+    let reply = s.cmd(&args);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 5);
+    assert_eq!(vsets_and_series(&mut d, &k), before);
+    check_moved(&mut d, &k);
+}
+
+/// The same slot moved by an atomic slot migration (#722).
+#[test]
+fn atomic_slot_migration_moves_vector_sets_and_series_whole() {
+    let (nodes, _) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let tag = key_in(0..=1000, "vs722");
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    add_vsets_and_series(&mut s, &k);
+    let before = vsets_and_series(&mut s, &k);
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(dst, &task_id);
+
+    let mut d = dst.conn();
+    assert_eq!(vsets_and_series(&mut d, &k), before);
+    check_moved(&mut d, &k);
+}
+
 /// A slot left open by a reshard that stopped part way, with keys on both
 /// sides, is closed by the commands `redis-cli --cluster fix` sends, and
 /// every key reads back (#295). Fix picks the node with the most keys as
@@ -5220,6 +5407,225 @@ fn slot_migration_refuses_what_it_cannot_do() {
     // And nothing above disturbed the cluster.
     assert_eq!(nodes[0].cluster_info("cluster_slots_assigned"), "16384");
     assert_eq!(nodes[0].cluster_info("cluster_state"), "ok");
+}
+
+/// Redis's reply to an atomic slot migration of a slot in a legacy one.
+const NOT_STABLE: &str = "all slot states must be STABLE to start a slot migration task.";
+
+/// An atomic slot import (`CLUSTER MIGRATION IMPORT`) and a legacy one
+/// (`CLUSTER SETSLOT IMPORTING` / `MIGRATING` and `MIGRATE`) refuse each
+/// other's slots (#755). The import counted the keys a `MIGRATE` or an
+/// `ASKING` client wrote meanwhile as its own, and deleted them if it did
+/// not complete: they may be the only copy.
+///
+/// Here, an import of a slot in a legacy migration: the destination
+/// refuses it while the slot is `IMPORTING` there; the source refuses to
+/// start it while the slot is `MIGRATING` there, and the import tries again
+/// until it is `STABLE`, then completes.
+#[test]
+fn an_atomic_import_is_refused_on_a_slot_in_a_legacy_migration() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let slot = ranges[0].0 + 10;
+    let slot_s = slot.to_string();
+    let wider = (slot + 5).to_string();
+    let key = key_in(slot..=slot, "legacy");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+    assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+
+    // The destination: the slot is IMPORTING there.
+    assert!(
+        d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    for (a, b) in [(&slot_s, &slot_s), (&ranges[0].0.to_string(), &wider)] {
+        // Redis's reply, byte for byte.
+        let refused = d.cmd(&["CLUSTER", "MIGRATION", "IMPORT", a, b]);
+        assert_eq!(
+            refused.err(),
+            Some(&*format!("ERR {NOT_STABLE}")),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(
+        d.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ALL"])
+            .array()
+            .len(),
+        0
+    );
+    assert!(d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "STABLE"]).is_ok());
+
+    // The source: the slot is MIGRATING there. The import is taken, and
+    // its attempts are refused by the source until the slot is STABLE.
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to refuse the import",
+        Duration::from_secs(30),
+        || {
+            let status = d.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+            status
+                .array()
+                .first()
+                .is_some_and(|task| task_field(task, "last_error").text().contains(NOT_STABLE))
+        },
+    );
+    // The source has no task, still owns the slot, and serves the key.
+    assert_eq!(
+        s.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ALL"])
+            .array()
+            .len(),
+        0
+    );
+    assert_eq!(s.cmd(&["GET", &key]).text(), "v");
+    assert!(s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "STABLE"]).is_ok());
+
+    wait_import_completed(dst, &task_id);
+    assert_eq!(d.cmd(&["GET", &key]).text(), "v");
+}
+
+/// No form of `CLUSTER SETSLOT` changes a slot that an atomic slot
+/// migration is moving, on either side, as in Redis (#755): `IMPORTING`
+/// on the destination would have let `MIGRATE` and `ASKING` clients write
+/// keys the import counted as its own, and deleted if it did not complete;
+/// `MIGRATING` on the source would have sent keys on to the destination by
+/// `MIGRATE`. Other slots are not held up, and the import completes.
+#[test]
+fn setslot_is_refused_on_a_slot_an_atomic_migration_is_moving() {
+    let (nodes, ranges) = form_cluster_with_env(2, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "6000")]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let slot = ranges[0].0 + 10;
+    let slot_s = slot.to_string();
+    let other = (ranges[0].0 + 500).to_string();
+    let key = key_in(slot..=slot, "atomic");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+    assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to wait before its handoff",
+        Duration::from_secs(30),
+        || src.log().contains("(test) the handoff of slots"),
+    );
+
+    let refused = |c: &mut Conn, args: &[&str]| {
+        let mut cmd = vec!["CLUSTER", "SETSLOT", slot_s.as_str()];
+        cmd.extend_from_slice(args);
+        let reply = c.cmd(&cmd);
+        assert!(
+            reply
+                .err()
+                .is_some_and(|e| e.contains("active atomic slot migration")),
+            "{cmd:?}: {reply:?}"
+        );
+    };
+    // The destination, importing the slot.
+    refused(&mut d, &["IMPORTING", &src_id]);
+    refused(&mut d, &["STABLE"]);
+    refused(&mut d, &["NODE", &dst_id]);
+    refused(&mut d, &["NODE", &src_id]);
+    // The source, exporting it.
+    refused(&mut s, &["MIGRATING", &dst_id]);
+    refused(&mut s, &["STABLE"]);
+    refused(&mut s, &["NODE", &dst_id]);
+    // A slot the migration does not move: as before.
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &other, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    assert!(s.cmd(&["CLUSTER", "SETSLOT", &other, "STABLE"]).is_ok());
+
+    wait_import_completed(dst, &task_id);
+    assert_eq!(d.cmd(&["GET", &key]).text(), "v");
+}
+
+/// Once an atomic import is canceled and has stopped on both sides, a
+/// legacy migration of its slots, as `redis-cli --cluster reshard` makes
+/// one, goes ahead and moves every key (#755): the way Redis's error points
+/// to.
+#[test]
+fn a_canceled_atomic_import_lets_a_legacy_migration_of_its_slots_begin() {
+    let (nodes, ranges) = form_cluster_with_env(2, &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "3000")]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let slot = ranges[0].0 + 10;
+    let slot_s = slot.to_string();
+    let key = key_in(slot..=slot, "both");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+    assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the source to wait before its handoff",
+        Duration::from_secs(30),
+        || src.log().contains("(test) the handoff of slots"),
+    );
+    let refused = d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", &src_id]);
+    assert!(refused.err().is_some(), "{refused:?}");
+    assert_eq!(
+        d.cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &task_id])
+            .int(),
+        1
+    );
+    let running = |c: &mut Conn| {
+        let status = c.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+        status
+            .array()
+            .first()
+            .is_some_and(|task| task_field(task, "state").text() == "in_progress")
+    };
+    wait_until("the import to stop", Duration::from_secs(30), || {
+        !running(&mut d)
+    });
+    wait_until("the source to stop", Duration::from_secs(30), || {
+        !running(&mut s)
+    });
+
+    // The legacy migration, step by step.
+    assert!(
+        d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    // And no atomic import of the slot meanwhile.
+    let again = d.cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s]);
+    assert!(
+        again.err().is_some_and(|e| e.contains(NOT_STABLE)),
+        "{again:?}"
+    );
+    let port = dst.port.to_string();
+    let reply = s.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS", &key]);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert!(
+        d.cmd(&["CLUSTER", "SETSLOT", &slot_s, "NODE", &dst_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot_s, "NODE", &dst_id])
+            .is_ok()
+    );
+    assert_eq!(d.cmd(&["GET", &key]).text(), "v");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot_s]).int(), 0);
 }
 
 /// A slot taken over by another master without its keys being moved — here
@@ -9308,4 +9714,70 @@ fn randomkey_is_even_over_a_busy_hash_tag() {
     // Half; about 0.008 either way.
     let share = tagged as f64 / picks.len() as f64;
     assert!((0.44..0.56).contains(&share), "tagged share {share}");
+}
+
+/// FT.HYBRID is not answered across masters yet: sent to any master of a
+/// cluster of more than one, it is refused rather than answered from that
+/// master's slots alone. A cluster of one master holds every document, and
+/// answers it.
+#[test]
+fn hybrid_search_is_refused_across_masters() {
+    let create: [&str; 16] = [
+        "FT.CREATE",
+        "hy",
+        "ON",
+        "HASH",
+        "SCHEMA",
+        "t",
+        "TEXT",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+    ];
+    let blob: Vec<u8> = [1.0f32, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let hybrid = |c: &mut Conn| {
+        c.cmd_bytes(&[
+            b"FT.HYBRID",
+            b"hy",
+            b"SEARCH",
+            b"hello",
+            b"VSIM",
+            b"@v",
+            b"$b",
+            b"PARAMS",
+            b"2",
+            b"b",
+            &blob,
+        ])
+    };
+
+    let (nodes, _) = form_cluster(2);
+    let mut args = create.to_vec();
+    args.push("L2");
+    let r = nodes[0].conn().cmd(&args);
+    assert!(r.is_ok(), "{r:?}");
+    for node in &nodes {
+        let reply = hybrid(&mut node.conn());
+        assert_eq!(
+            reply.err(),
+            Some("ERR FT.HYBRID is not supported across a cluster's masters yet"),
+            "{reply:?}"
+        );
+    }
+
+    let (lone, _) = form_cluster(1);
+    let mut c = lone[0].conn();
+    assert!(c.cmd(&args).is_ok());
+    let r = c.cmd_bytes(&[b"HSET", b"doc", b"t", b"hello", b"v", &blob]);
+    assert!(matches!(r, Resp::Int(2)), "{r:?}");
+    let reply = hybrid(&mut c);
+    let fields = reply.array();
+    assert_eq!(fields[0].text(), "total_results", "{reply:?}");
+    assert_eq!(fields[1].int(), 1, "{reply:?}");
 }

@@ -24,6 +24,7 @@ mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+mod give_back;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
@@ -37,6 +38,7 @@ mod member_set;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
+pub mod output_limits;
 pub mod pause;
 pub mod protected_mode;
 mod pubsub;
@@ -351,6 +353,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
     compaction::configure(&config);
+    give_back::set_enabled(config.allocator_give_back);
     snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
     snapshot::SNAPSHOT_CLUSTER.store(config.cluster_enabled, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
@@ -633,6 +636,7 @@ fn run_tokio(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let threads = config.resolve_threads();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
+        .thread_keep_alive(commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()?
         .block_on(async_main_tokio(config, started_at))
@@ -749,7 +753,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     let shutdown = Arc::new(AtomicBool::new(false));
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
@@ -820,6 +824,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     if config.cluster_enabled {
         log_info!(
             "Cluster: Node ID        : {}",
@@ -1631,7 +1636,7 @@ async fn async_main_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be
@@ -1650,6 +1655,7 @@ async fn async_main_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
