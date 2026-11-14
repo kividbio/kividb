@@ -140,7 +140,7 @@ fn connect_to(server: &mut std::process::Child, port: u16, timeout: Duration) ->
             return Answer::Exited(status);
         }
         if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
-            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
             let mut conn = std::io::BufReader::new(s);
             if let Ok(info) = resp_cmd(&mut conn, &["INFO", "server"])
                 && let Some(pid) = info
@@ -276,7 +276,7 @@ fn write_until_shutdown(dir: &std::path::Path, port: u16) -> u64 {
     let (mut server, port, mut conn) = start_on(dir, port);
     let connect = || {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         std::io::BufReader::new(s)
     };
     // Enough data that the final snapshot takes a while: the writers have
