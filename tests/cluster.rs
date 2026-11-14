@@ -4164,6 +4164,210 @@ fn a_failover_of_the_source_during_an_atomic_import_loses_no_acknowledged_write(
     );
 }
 
+/// The keys of `prefix:N` that hash into `range`, `n` of them, set on
+/// `node` to `value`; and a check that they all have it on another.
+struct Written {
+    keys: Vec<String>,
+    value: &'static str,
+}
+
+impl Written {
+    fn on(node: &Node, range: std::ops::RangeInclusive<u16>, prefix: &str, n: usize) -> Self {
+        let keys: Vec<String> = (0..)
+            .map(|i| format!("{prefix}:{i}"))
+            .filter(|k| range.contains(&slot_of(k)))
+            .take(n)
+            .collect();
+        let value = "v";
+        let sets: Vec<Vec<&str>> = keys
+            .iter()
+            .map(|k| vec!["SET", k.as_str(), value])
+            .collect();
+        let replies = node.conn().pipeline(&sets);
+        assert!(replies.iter().all(Resp::is_ok), "{replies:?}");
+        Written { keys, value }
+    }
+
+    /// The keys not as written on `node`.
+    fn missing_on(&self, node: &Node) -> Vec<String> {
+        let gets: Vec<Vec<&str>> = self.keys.iter().map(|k| vec!["GET", k.as_str()]).collect();
+        self.keys
+            .iter()
+            .zip(node.conn().pipeline(&gets))
+            .filter(|(_, got)| !matches!(got, Resp::Bulk(v) if v == self.value.as_bytes()))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+/// The node that owns `slot` in `node`'s `CLUSTER NODES`.
+fn owner_in_view_of(node: &Node, slot: u16) -> Option<String> {
+    let nodes = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+    nodes.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let owns = fields.iter().skip(8).any(|range| {
+            let (a, b) = range.split_once('-').unwrap_or((range, range));
+            matches!((a.parse::<u16>(), b.parse::<u16>()), (Ok(a), Ok(b)) if a <= slot && slot <= b)
+        });
+        owns.then(|| fields[0].to_string())
+    })
+}
+
+/// A replica whose master handed slots over to another master, and that has
+/// not heard of it, is refused votes when it stands for election (#524).
+/// Five masters, so the three that are neither the source nor the
+/// destination make a quorum without either. The replica takes in none of
+/// the destination's claims (`KIVIDB_TEST_IGNORE_CLAIMS`); the source is
+/// killed once the handover is done. The replica's request says which slots
+/// it would take over, the moved ones among them, at its master's old epoch,
+/// and every master knows a newer owner of those. It used to be elected,
+/// and claimed them at the election's epoch, newer than the destination's:
+/// the destination's acknowledged writes to them were lost. Once it hears
+/// the destination's claim, it is elected, to the slots its master still
+/// had.
+#[test]
+fn a_replica_that_has_not_heard_its_master_gave_slots_away_is_refused_votes() {
+    let (mut nodes, ranges) = form_cluster(5);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[0],
+        &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")],
+    );
+    let all = |nodes: &[Node]| -> Vec<String> {
+        nodes
+            .iter()
+            .chain(std::iter::once(&replica))
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect()
+    };
+    {
+        let both: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&both, 6);
+    }
+    let replica_id = replica.id();
+    let dst_id = nodes[1].id();
+    std::fs::write(replica.dir.join("ignore-claims"), &dst_id).unwrap();
+    assert!(
+        replica
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-replica-validity-factor", "0"])
+            .is_ok()
+    );
+    let kept = Written::on(&nodes[0], 101..=ranges[0].1, "kept", 300);
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(&nodes[1], &task_id);
+    wait_until(
+        "every master to hear of the new owner",
+        Duration::from_secs(20),
+        || {
+            nodes[1..]
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    let src_id = nodes[0].id();
+    assert_eq!(owner_in_view_of(&replica, 50), Some(src_id.clone()));
+    // Acknowledged by the new owner.
+    let moved = Written::on(&nodes[1], 0..=100, "moved", 300);
+
+    nodes[0].kill();
+    let refused = format!("Not voting for {replica_id} to take over from {src_id}: it claims slot");
+    wait_until(
+        "the masters to refuse the replica their votes, or to elect it",
+        Duration::from_secs(60),
+        || {
+            replica.is_master()
+                || nodes[1..]
+                    .iter()
+                    .filter(|n| n.log().contains(&refused))
+                    .count()
+                    >= 3
+        },
+    );
+    assert!(
+        !replica.is_master(),
+        "elected with a claim of the moved slots; slot 50 is now {:?}'s in its view\n{}",
+        owner_in_view_of(&replica, 50),
+        all(&nodes).join("\n")
+    );
+    assert!(
+        nodes[1..]
+            .iter()
+            .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str())),
+        "{}",
+        all(&nodes).join("\n")
+    );
+
+    // It hears of the new owner, and is elected to the rest.
+    std::fs::remove_file(replica.dir.join("ignore-claims")).unwrap();
+    wait_until("the replica to be elected", Duration::from_secs(60), || {
+        replica.is_master()
+    });
+    wait_until(
+        "the cluster to be up again",
+        Duration::from_secs(30),
+        || {
+            nodes[1..]
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_state") == "ok")
+        },
+    );
+    for n in nodes[1..].iter().chain(std::iter::once(&replica)) {
+        assert_eq!(owner_in_view_of(n, 50).as_deref(), Some(dst_id.as_str()));
+        assert_eq!(
+            owner_in_view_of(n, 101).as_deref(),
+            Some(replica_id.as_str())
+        );
+    }
+    let lost = moved.missing_on(&nodes[1]);
+    assert!(lost.is_empty(), "{} acknowledged writes lost", lost.len());
+    let lost = kept.missing_on(&replica);
+    assert!(
+        lost.is_empty(),
+        "{} keys lost on the new master",
+        lost.len()
+    );
+}
+
+/// A replica that asks for votes as an earlier version does, without its
+/// claims (`KIVIDB_TEST_AUTH_REQUEST_WITHOUT_CLAIMS`), is elected as before
+/// (#524): this version's voters decide such a request as they did.
+#[test]
+fn a_replica_that_sends_no_claims_is_elected_as_before() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[0],
+        &[("KIVIDB_TEST_AUTH_REQUEST_WITHOUT_CLAIMS", "1")],
+    );
+    {
+        let both: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&both, 4);
+    }
+    let kept = Written::on(&nodes[0], ranges[0].0..=ranges[0].1, "kept", 200);
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    nodes[0].kill();
+    wait_until(
+        "the replica to be promoted",
+        Duration::from_secs(60),
+        || replica.is_master(),
+    );
+    let replica_id = replica.id();
+    for n in [&nodes[1], &nodes[2], &replica] {
+        wait_until("the new owner to be known", Duration::from_secs(20), || {
+            owner_in_view_of(n, ranges[0].0).as_deref() == Some(replica_id.as_str())
+        });
+    }
+    assert!(kept.missing_on(&replica).is_empty());
+}
+
 /// A write routed here before an atomic slot migration handed its slot
 /// over, and held up before the write gate until the handoff had let writes
 /// go again, is sent on with `-MOVED`. It used to run here, on a slot the
