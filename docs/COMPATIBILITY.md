@@ -44,6 +44,10 @@ other files:
 - LlamaIndex's Redis vector store, document store, index store and key-value store:
   [benchmarks/llamaindex-compat/REPORT.md](../benchmarks/llamaindex-compat/REPORT.md) and
   [docs/integrations/llamaindex.md](integrations/llamaindex.md).
+- RedisVL (`redisvl`): SearchIndex create, load and query, including filters, SemanticCache and
+  SemanticRouter. `HybridQuery` (`FT.HYBRID` with `SCORER`) fails on KiviDB; the default image is enough,
+  no Lua: [benchmarks/redisvl-compat/REPORT.md](../benchmarks/redisvl-compat/REPORT.md) and
+  [docs/integrations/redisvl.md](integrations/redisvl.md).
 - Mem0's Redis vector store and the `Memory` API on top of it, in the Python SDK and the TypeScript SDK
   (whose Valkey store works too):
   [benchmarks/mem0-compat/REPORT.md](../benchmarks/mem0-compat/REPORT.md),

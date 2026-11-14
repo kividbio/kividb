@@ -2093,6 +2093,9 @@ fn new_commands_reach_a_replica_as_their_effects() {
     // still be recognised.
     let info = r.cmd(&["XINFO", "STREAM", "rp:s"]);
     assert_eq!(info.field("iids-tracked").i(), 1);
+    // And counts the retry, as the master did (#655).
+    assert_eq!(info.field("iids-added").i(), 1);
+    assert_eq!(info.field("iids-duplicates").i(), 1);
 
     assert_eq!(r.cmd(&["HGET", "rp:h", "name"]).s(), "alice");
     assert_eq!(r.cmd(&["HGET", "rp:h", "age"]).s(), "30");
