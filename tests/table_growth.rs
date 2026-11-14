@@ -171,6 +171,7 @@ fn growing_tables_do_not_hold_up_other_connections() {
     thread::sleep(Duration::from_millis(200));
     let started = Instant::now();
     let mut longest_pipeline = Duration::ZERO;
+    let mut pipelines = Vec::with_capacity(keys / PIPELINE + 1);
     let mut buf = Vec::new();
     for from in (0..keys).step_by(PIPELINE) {
         buf.clear();
@@ -183,6 +184,7 @@ fn growing_tables_do_not_hold_up_other_connections() {
             assert_eq!(load.read(), "+OK");
         }
         longest_pipeline = longest_pipeline.max(sent.elapsed());
+        pipelines.push(sent.elapsed());
     }
     let took = started.elapsed();
     stop.store(true, Ordering::Relaxed);
@@ -191,18 +193,135 @@ fn growing_tables_do_not_hold_up_other_connections() {
     for key in [&names[0], &names[keys / 2], &names[keys - 1]] {
         assert_eq!(load.cmd(&["GET", key]), "0123456789abcdef");
     }
+    pipelines.sort();
+    let typical = pipelines[pipelines.len() / 2];
+    // On a machine slower than the one the limit was measured on, the
+    // limit grows with it: a pipeline's typical time says how slow it is.
+    let limit = Duration::from_millis(LIMIT_MS).max(typical * PIPELINES_OF_SLACK);
     eprintln!(
-        "{keys} keys in one of {shards} shards in {took:?}; longest pipeline \
-         {longest_pipeline:?}; {pings} PINGs, the longest {worst:?}"
+        "{keys} keys in one of {shards} shards in {took:?}; pipelines took \
+         {typical:?} typically, {longest_pipeline:?} at the longest; {pings} \
+         PINGs, the longest {worst:?} (limit {limit:?})"
     );
     assert!(pings > 100, "{pings} PINGs");
     assert!(
-        worst < Duration::from_millis(LIMIT_MS),
-        "a PING on another connection waited {worst:?} while {keys} keys were written"
+        worst < limit,
+        "a PING on another connection waited {worst:?} while {keys} keys were \
+         written, pipelines taking {typical:?} typically"
     );
 }
 
-/// The longest a `PING` may wait. In a debug build on a 4-core VM: 382 ms
-/// before (the last growth, of 917,504 keys, in one step), 20 ms now, which
-/// is how long a pipeline of 1,000 writes takes.
+/// The longest a `PING` may wait, on a machine as fast as the one it was
+/// measured on. In a debug build on a 4-core VM: 382 ms before (the last
+/// growth, of 917,504 keys, in one step), 20 ms now, which is how long a
+/// pipeline of 1,000 writes takes.
 const LIMIT_MS: u64 = 150;
+
+/// On a slower machine (a shared CI runner, say), the limit is this many
+/// typical pipelines instead. The growth that stalled took 19 of them.
+const PIPELINES_OF_SLACK: u32 = 7;
+
+/// `SET`s over keys that are there, and `INCR`s, among the writes that grow
+/// a table: every write that begins a growth in steps moves the keys to the
+/// old table, the written one too, and a write over a key must find it
+/// there. Found only in the new table, the write added the key again: two
+/// entries for one key, `DBSIZE` one too many, and either value read back
+/// (#780 review).
+#[test]
+fn writes_over_keys_while_tables_grow_keep_one_entry_each() {
+    // Keys of the first shard: its table grows in steps five times (from
+    // 3,584 keys, 7,168, ... 57,344).
+    const KEYS: usize = 60_000;
+    const COUNTERS: usize = 64;
+    const PIPELINE: usize = 500;
+    let shards = kividb::store::num_shards();
+    let mut names = (0..)
+        .map(|i| format!("w:{i}"))
+        .filter(|key| kividb::store::shard_index(shards, key) == 0);
+    let keys: Vec<String> = names.by_ref().take(KEYS).collect();
+    let counters: Vec<String> = names.take(COUNTERS).collect();
+
+    let port = start_server();
+    let mut c = Conn::connect(port);
+    // Commands sent together, each with the reply it must get.
+    let mut sent: Vec<(Vec<String>, String)> = Vec::new();
+    let flush = |c: &mut Conn, sent: &mut Vec<(Vec<String>, String)>| {
+        let mut buf = Vec::new();
+        for (args, _) in sent.iter() {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            buf.extend_from_slice(&command(&args));
+        }
+        c.send(&buf);
+        for (args, want) in sent.drain(..) {
+            assert_eq!(&c.read(), &want, "{args:?}");
+        }
+    };
+    let cmd = |args: &[&str], want: String| (args.iter().map(|a| a.to_string()).collect(), want);
+
+    let mut last: std::collections::HashMap<&str, String> = Default::default();
+    let mut counts = vec![0u64; COUNTERS];
+    // Three writes over keys that are there for each new key: most of the
+    // writes that fill a table are writes over a key.
+    let mut x = 88_172_645_463_325_252u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x as usize
+    };
+    for (i, key) in keys.iter().enumerate() {
+        let value = format!("new {i}");
+        sent.push(cmd(&["SET", key, &value], "+OK".into()));
+        last.insert(key, value);
+        for round in 0..3 {
+            if round == 1 {
+                let n = next() % COUNTERS;
+                counts[n] += 1;
+                sent.push(cmd(&["INCR", &counters[n]], format!(":{}", counts[n])));
+            } else {
+                let over = keys[next() % (i + 1)].as_str();
+                let value = format!("over {i} {round}");
+                sent.push(cmd(&["SET", over, &value], "+OK".into()));
+                last.insert(over, value);
+            }
+        }
+        if (i + 1) % PIPELINE == 0 {
+            flush(&mut c, &mut sent);
+        }
+    }
+    flush(&mut c, &mut sent);
+    let written = KEYS + counts.iter().filter(|&&n| n > 0).count();
+    assert_eq!(c.cmd(&["DBSIZE"]), format!(":{written}"));
+    for (n, (key, value)) in last.iter().enumerate() {
+        sent.push(cmd(&["GET", key], value.clone()));
+        if n % PIPELINE == 0 {
+            flush(&mut c, &mut sent);
+        }
+    }
+    for (key, n) in counters.iter().zip(&counts) {
+        if *n > 0 {
+            sent.push(cmd(&["GET", key], n.to_string()));
+        }
+    }
+    flush(&mut c, &mut sent);
+    // Deleted, each key is gone: no second entry comes back.
+    for (n, key) in keys.iter().enumerate() {
+        sent.push(cmd(&["DEL", key], ":1".into()));
+        if n % PIPELINE == 0 {
+            flush(&mut c, &mut sent);
+        }
+    }
+    flush(&mut c, &mut sent);
+    for (n, key) in keys.iter().enumerate() {
+        sent.push(cmd(&["EXISTS", key], ":0".into()));
+        if n % PIPELINE == 0 {
+            flush(&mut c, &mut sent);
+        }
+    }
+    flush(&mut c, &mut sent);
+    assert_eq!(
+        c.cmd(&["DBSIZE"]),
+        format!(":{}", written - KEYS),
+        "keys left after every one was deleted"
+    );
+}

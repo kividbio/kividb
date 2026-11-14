@@ -176,8 +176,9 @@ pub struct ShardLock {
     /// done about keys past their time that a write puts a value over
     /// (`expiry::written_over`).
     place: std::sync::OnceLock<(usize, usize)>,
-    /// The table's layout (`ShardMap::layout`) when [`ShardLock::step_growth`]
-    /// last looked: whether writes have moved a growth on since.
+    /// The keys a growth had left to move (`ShardMap::growth_left`) when
+    /// [`ShardLock::step_growth`] last looked: whether writes have moved it
+    /// on much since.
     growth_seen: AtomicU64,
 }
 
@@ -433,22 +434,33 @@ impl ShardLock {
     /// each shard about once a second, with the shrinking. Returns whether
     /// the table was growing.
     ///
-    /// A table that writes moved on since the last call is left to them:
-    /// this thread taking the shard's lock again and again, as a write
-    /// lets go of it, is what made writes wait. Taken in turns of
+    /// A growth that writes moved on by at least a turn's worth of keys
+    /// since the last call, or that began since, is left to them: they
+    /// finish it at their pace, and this thread taking the shard's lock
+    /// again and again, as a write lets go of it, is what made writes
+    /// wait. One that writes moved less than that, a shard written to a
+    /// few times a second or not at all, is finished here: left to such
+    /// writes, a growth of 230,000 keys would take hours, every look that
+    /// misses looking in two tables meanwhile. Taken in turns of
     /// [`GROWTH_BACKGROUND_STEP`] keys, each handed straight to a writer
     /// waiting for the shard, if there is one: the loop would otherwise
     /// take it again before the writer woke up, and a pipeline of writes
     /// waited for the whole growth, 12 ms a shard of 230,000 keys (#752).
     pub fn step_growth(&self) -> bool {
-        let layout = {
+        let left = {
             let map = self.read();
             if !map.is_growing() {
+                // The next growth's first look finds it begun since.
+                self.growth_seen.store(u64::MAX, Ordering::Relaxed);
                 return false;
             }
-            map.layout()
+            map.growth_left() as u64
         };
-        if self.growth_seen.swap(layout, Ordering::Relaxed) != layout {
+        let before = self.growth_seen.swap(left, Ordering::Relaxed);
+        // `None`: a growth begun since the last look, or more left than
+        // then, which only a growth begun since can have.
+        let moved = before.checked_sub(left);
+        if moved.is_none_or(|moved| moved >= GROWTH_BACKGROUND_STEP as u64) {
             return true;
         }
         loop {
@@ -739,19 +751,36 @@ mod flush_tests {
             shard.write().insert(format!("k{n}").as_str(), val());
             n += 1;
         }
-        // The first look: moved on since (by the write that began it).
+        // The first look: a growth begun since the last.
         assert!(shard.step_growth());
         assert!(shard.read().is_growing());
-        // Moved on by a write since the last look: left to the writes.
+        // Moved on by a turn's worth of keys since the last look: left to
+        // the writes.
+        let left = shard.read().growth_left();
+        while shard.read().growth_left() + GROWTH_BACKGROUND_STEP > left {
+            shard.write().insert(format!("more{n}").as_str(), val());
+            n += 1;
+        }
+        assert!(shard.read().is_growing());
+        assert!(shard.step_growth());
+        assert!(shard.read().is_growing());
+        // A write or two since: too slow, finished here.
         shard.write().insert("one more", val());
         n += 1;
-        assert!(shard.step_growth());
-        assert!(shard.read().is_growing());
-        // No write since: finished.
         assert!(shard.step_growth());
         assert!(!shard.read().is_growing());
         assert_eq!(shard.read().len(), n);
         assert!(!shard.step_growth());
+        // And one no write moves at all.
+        while !shard.read().is_growing() {
+            shard.write().insert(format!("more{n}").as_str(), val());
+            n += 1;
+        }
+        assert!(shard.step_growth());
+        assert!(shard.read().is_growing());
+        assert!(shard.step_growth());
+        assert!(!shard.read().is_growing());
+        assert_eq!(shard.read().len(), n);
     }
 
     /// The bug this guards: `clear()` empties a shard but keeps its bucket array
