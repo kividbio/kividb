@@ -822,3 +822,47 @@ fn memory_usage_and_used_memory_follow_the_entries() {
     let held = used(&mut c) - before;
     assert!(held < 8_000, "{held} B held after the stream went");
 }
+
+#[test]
+fn idempotent_duplicates_are_counted_again_by_an_aof_replay() {
+    // Redis 8.10 propagates an `XADD … IDMP` that its producer had already
+    // delivered, so that a replay of the AOF counts it in `iids-duplicates`
+    // as the first run did. It used to be propagated as nothing, and the
+    // count started over after a restart (#655). The entries and the IDs
+    // remembered come back as they were.
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    let first = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+    for _ in 0..2 {
+        let retry = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+        assert_eq!(retry, first);
+    }
+    let auto = c.ok(&["XADD", "s", "IDMPAUTO", "p2", "*", "f", "w"]);
+    let retry = c.ok(&["XADD", "s", "IDMPAUTO", "p2", "*", "f", "w"]);
+    assert_eq!(retry, auto);
+
+    let info = |c: &mut Conn| {
+        let info = c.ok(&["XINFO", "STREAM", "s"]);
+        let n = |name: &str| info.field(name).int();
+        (
+            n("length"),
+            n("iids-tracked"),
+            n("iids-added"),
+            n("iids-duplicates"),
+            info.field("last-generated-id").str(),
+        )
+    };
+    let want = info(&mut c);
+    assert_eq!((want.0, want.1, want.2, want.3), (2, 2, 2, 3));
+
+    drop(c);
+    server.kill();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(info(&mut c), want, "AOF");
+    // A retry after the replay is still recognised, and counted.
+    let retry = c.ok(&["XADD", "s", "IDMP", "p1", "id1", "*", "f", "v"]);
+    assert_eq!(retry, first);
+    assert_eq!(info(&mut c).3, 4);
+}

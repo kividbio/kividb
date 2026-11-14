@@ -551,6 +551,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arrays with `$-1`, which redis-py's RESP3 parser refused. RESP2 replies
   are unchanged.
 
+- **The duplicates an idempotent `XADD … IDMP` dropped are counted again by
+  an AOF replay and on replicas (#655).** `iids-duplicates` in `XINFO
+  STREAM` started over after a restart that replayed the AOF, and a replica
+  never counted any: a duplicate was propagated as nothing. As in Redis, it
+  is now propagated, under the ID of the entry it duplicates, and a replica
+  or a replay counts it and adds nothing.
+
 ## [1.2.2] - 2026-11-13
 
 See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).

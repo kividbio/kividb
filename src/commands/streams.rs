@@ -601,13 +601,27 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
     // A retry of a message this producer already delivered: reply with the
     // entry it produced the first time and add nothing. A replica does not
     // second-guess its master, which has already made this decision.
-    if let Some((producer, iid)) = &idmp
-        && !ctx.apply_replication
-        && !ctx.bypass_cluster_check
-        && let Some(existing) =
-            stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
-    {
-        return resp_bulk_str(&existing.to_string());
+    //
+    // The duplicate is propagated all the same, as Redis propagates it, so
+    // that replicas and an AOF replay count it in `iids-duplicates` too
+    // (#655): under the entry's own ID, which a replica or a replay takes
+    // for the duplicate it is rather than for a new entry.
+    if let Some((producer, iid)) = &idmp {
+        if !ctx.apply_replication && !ctx.bypass_cluster_check {
+            if let Some(existing) =
+                stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
+            {
+                let existing = existing.to_string();
+                let mut parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
+                parts[id_index] = existing.clone().into_bytes();
+                effect(parts);
+                return resp_bulk_str(&existing);
+            }
+        } else if let NewId::Explicit(id) = &new_id
+            && stream_extra::idmp_applied_duplicate(&mut inner, producer, iid, id)
+        {
+            return resp_bulk_str(&id.to_string());
+        }
     }
 
     // The next ID is worked out without ever adding to a sequence number
