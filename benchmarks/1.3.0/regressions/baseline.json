@@ -2326,6 +2326,1489 @@
           "kind": "info"
         }
       ]
+    },
+    "05-stream-memory/one1m/one_field_bytes_per_entry": {
+      "suite": "05-stream-memory",
+      "config": "one1m",
+      "metric": "one_field_bytes_per_entry",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 158.4168,
+        "candidate": 6.2284,
+        "redis": 13.1015,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "05-stream-memory/one1m/one_field_load_s": {
+      "suite": "05-stream-memory",
+      "config": "one1m",
+      "metric": "one_field_load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 8.3792,
+        "candidate": 8.1854,
+        "redis": 8.1278,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "05-stream-memory/one1m/one_field_rss_mib": {
+      "suite": "05-stream-memory",
+      "config": "one1m",
+      "metric": "one_field_rss_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 195.8125,
+        "candidate": 20.7148,
+        "redis": 25.4414,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "05-stream-memory/one1m/one_field_used_mib": {
+      "suite": "05-stream-memory",
+      "config": "one1m",
+      "metric": "one_field_used_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 152.4392,
+        "candidate": 7.3269,
+        "redis": 13.2933,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "05-stream-memory/shapes/shared5_bytes_per_entry": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "shared5_bytes_per_entry",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 478.3704,
+        "candidate": 14.6503,
+        "redis": 26.1553,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "05-stream-memory/shapes/shared5_load_s": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "shared5_load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.7702,
+        "candidate": 2.6619,
+        "redis": 2.6611,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "05-stream-memory/shapes/unique5_bytes_per_entry": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "unique5_bytes_per_entry",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 478.4452,
+        "candidate": 54.0097,
+        "redis": 75.358,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "05-stream-memory/shapes/unique5_load_s": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "unique5_load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.8612,
+        "candidate": 2.7631,
+        "redis": 2.7847,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "05-stream-memory/shapes/val200_bytes_per_entry": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "val200_bytes_per_entry",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 350.9367,
+        "candidate": 216.4766,
+        "redis": 216.2848,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "05-stream-memory/shapes/val200_load_s": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "val200_load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.4968,
+        "candidate": 1.5318,
+        "redis": 1.5194,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "05-stream-memory/shapes/xadd5_rps": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "xadd5_rps",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 332446.81,
+        "candidate": 535331.88,
+        "redis": 516528.94,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        }
+      ]
+    },
+    "05-stream-memory/shapes/xrange5_count10_rps": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "xrange5_count10_rps",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 89955.02,
+        "candidate": 86380.65,
+        "redis": 131810.19,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        }
+      ]
+    },
+    "05-stream-memory/shapes/xrange_one_id_rps": {
+      "suite": "05-stream-memory",
+      "config": "shapes",
+      "metric": "xrange_one_id_rps",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 485436.91,
+        "candidate": 443262.41,
+        "redis": 454545.44,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        }
+      ]
+    },
+    "06-stream-consumers/pel/pending_bytes_per_entry": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "pending_bytes_per_entry",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 115.931,
+        "candidate": 122.3209,
+        "redis": 166.6546,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 2
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xadd_other_stream_max_ms": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xadd_other_stream_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 133.631,
+        "candidate": 0.471,
+        "redis": 0.423,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xadd_other_stream_rps": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xadd_other_stream_rps",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 103519.66,
+        "candidate": 104384.13,
+        "redis": 139958.02,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xadd_polled_stream_max_ms": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xadd_polled_stream_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 76.031,
+        "candidate": 0.823,
+        "redis": 0.407,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xadd_polled_stream_rps": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xadd_polled_stream_rps",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 42799.06,
+        "candidate": 117370.89,
+        "redis": 144092.22,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xinfo_consumers_ms": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xinfo_consumers_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 65.1947,
+        "candidate": 0.3954,
+        "redis": 0.3621,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 0.5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xinfo_polls": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xinfo_polls",
+      "unit": "calls",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 14.0,
+        "candidate": 42.0,
+        "redis": 33.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "min": 5
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xpending_c50_ms": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xpending_c50_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.6079,
+        "candidate": 0.1101,
+        "redis": 0.0859,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 0.5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xpending_summary_ms": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xpending_summary_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 7.5934,
+        "candidate": 0.193,
+        "redis": 0.1649,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 0.5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "06-stream-consumers/pel/xreadgroup_c50_history_ms": {
+      "suite": "06-stream-consumers",
+      "config": "pel",
+      "metric": "xreadgroup_c50_history_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.5923,
+        "candidate": 0.1325,
+        "redis": 0.0992,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 0.5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "07-save-ping/tokio1/ping_during_save_max_ms": {
+      "suite": "07-save-ping",
+      "config": "tokio1",
+      "metric": "ping_during_save_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 338.2345,
+        "candidate": 2.1872,
+        "redis": 531.6997,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "07-save-ping/tokio1/ping_during_save_ms": {
+      "suite": "07-save-ping",
+      "config": "tokio1",
+      "metric": "ping_during_save_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 333.3347,
+        "candidate": 1.4765,
+        "redis": 501.3783,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "07-save-ping/tokio1/save_ms": {
+      "suite": "07-save-ping",
+      "config": "tokio1",
+      "metric": "save_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 333.735,
+        "candidate": 339.4119,
+        "redis": 501.8691,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "08-ft-info/ftinfo/ft_info_polls_per_s": {
+      "suite": "08-ft-info",
+      "config": "ftinfo",
+      "metric": "ft_info_polls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 17.991,
+        "candidate": 15599.8763,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "08-ft-info/ftinfo/ft_info_text_ms": {
+      "suite": "08-ft-info",
+      "config": "ftinfo",
+      "metric": "ft_info_text_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 116.2983,
+        "candidate": 0.1203,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 0.5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "08-ft-info/ftinfo/ft_info_vec_ms": {
+      "suite": "08-ft-info",
+      "config": "ftinfo",
+      "metric": "ft_info_vec_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 116.7065,
+        "candidate": 0.1248,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 0.5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "08-ft-info/ftinfo/hset_vec_doc_rps": {
+      "suite": "08-ft-info",
+      "config": "ftinfo",
+      "metric": "hset_vec_doc_rps",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 110864.74,
+        "candidate": 107797.34,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        }
+      ]
+    },
+    "08-ft-info/ftinfo/populate_s": {
+      "suite": "08-ft-info",
+      "config": "ftinfo",
+      "metric": "populate_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0976,
+        "candidate": 2.0931,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "08-ft-info/ftinfo/set_rps_beside_ft_info": {
+      "suite": "08-ft-info",
+      "config": "ftinfo",
+      "metric": "set_rps_beside_ft_info",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 113.1,
+        "candidate": 47430.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 20
+        }
+      ]
+    },
+    "08-ft-info/ftinfo/vec_doc_bytes": {
+      "suite": "08-ft-info",
+      "config": "ftinfo",
+      "metric": "vec_doc_bytes",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 474.4765,
+        "candidate": 494.1431,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 4
+        }
+      ]
+    },
+    "09-vector-sets/bin_768_50k/bytes_per_vector": {
+      "suite": "09-vector-sets",
+      "config": "bin_768_50k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3167.7,
+        "candidate": 191.7,
+        "redis": 853.2,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "09-vector-sets/bin_768_50k/recall_at_10": {
+      "suite": "09-vector-sets",
+      "config": "bin_768_50k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 0.103,
+        "redis": 0.1067,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        }
+      ]
+    },
+    "09-vector-sets/bin_768_50k/vadd_per_s": {
+      "suite": "09-vector-sets",
+      "config": "bin_768_50k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 95745.6,
+        "candidate": 61976.5,
+        "redis": 5827.4,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "09-vector-sets/bin_768_50k/vsim_qps": {
+      "suite": "09-vector-sets",
+      "config": "bin_768_50k",
+      "metric": "vsim_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 116.1,
+        "candidate": 750.2,
+        "redis": 7918.6,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "09-vector-sets/f32_768_10k/recall_at_10": {
+      "suite": "09-vector-sets",
+      "config": "f32_768_10k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 1.0,
+        "redis": 1.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        }
+      ]
+    },
+    "09-vector-sets/f32_768_10k/vadd_per_s": {
+      "suite": "09-vector-sets",
+      "config": "f32_768_10k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 66395.4,
+        "candidate": 62037.9,
+        "redis": 2350.5,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "09-vector-sets/f32_768_10k/vsim_p50_ms": {
+      "suite": "09-vector-sets",
+      "config": "f32_768_10k",
+      "metric": "vsim_p50_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.853,
+        "candidate": 1.908,
+        "redis": 0.357,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "09-vector-sets/f32_768_10k/vsim_qps": {
+      "suite": "09-vector-sets",
+      "config": "f32_768_10k",
+      "metric": "vsim_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1123.9,
+        "candidate": 1115.5,
+        "redis": 6628.9,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_10k/recall_at_10": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_10k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 0.972,
+        "redis": 0.972,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_10k/vadd_per_s": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_10k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 66887.1,
+        "candidate": 52817.4,
+        "redis": 3990.6,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_10k/vsim_p50_ms": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_10k",
+      "metric": "vsim_p50_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.998,
+        "candidate": 2.072,
+        "redis": 0.283,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_10k/vsim_qps": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_10k",
+      "metric": "vsim_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1109.0,
+        "candidate": 986.1,
+        "redis": 7876.9,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_50k/bytes_per_vector": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_50k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3167.7,
+        "candidate": 863.7,
+        "redis": 1525.8,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_50k/recall_at_10": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_50k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 0.965,
+        "redis": 0.9627,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_50k/vadd_per_s": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_50k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 75277.7,
+        "candidate": 64379.4,
+        "redis": 3632.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "09-vector-sets/q8_768_50k/vsim_qps": {
+      "suite": "09-vector-sets",
+      "config": "q8_768_50k",
+      "metric": "vsim_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 115.5,
+        "candidate": 118.1,
+        "redis": 6568.9,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2-09"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "10-redisvl/redisvl/checks_failed": {
+      "suite": "10-redisvl",
+      "config": "redisvl",
+      "metric": "checks_failed",
+      "unit": "checks",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 8.0,
+        "candidate": 0.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 0
+        }
+      ]
+    },
+    "10-redisvl/redisvl/checks_passed": {
+      "suite": "10-redisvl",
+      "config": "redisvl",
+      "metric": "checks_passed",
+      "unit": "checks",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 59.0,
+        "candidate": 67.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "10-redisvl/redisvl/lua_commands_sent": {
+      "suite": "10-redisvl",
+      "config": "redisvl",
+      "metric": "lua_commands_sent",
+      "unit": "commands",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "11-migrate-conns/migrate/keys_left_on_source": {
+      "suite": "11-migrate-conns",
+      "config": "migrate",
+      "metric": "keys_left_on_source",
+      "unit": "keys",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": 0.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "11-migrate-conns/migrate/keys_on_target": {
+      "suite": "11-migrate-conns",
+      "config": "migrate",
+      "metric": "keys_on_target",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2000.0,
+        "candidate": 2000.0,
+        "redis": 2000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "11-migrate-conns/migrate/migrate_ms": {
+      "suite": "11-migrate-conns",
+      "config": "migrate",
+      "metric": "migrate_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.1602,
+        "candidate": 0.1047,
+        "redis": 0.0955,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "11-migrate-conns/migrate/target_connections": {
+      "suite": "11-migrate-conns",
+      "config": "migrate",
+      "metric": "target_connections",
+      "unit": "connections",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2000.0,
+        "candidate": 1.0,
+        "redis": 1.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 3
+        }
+      ]
+    },
+    "12-search-fanout/cluster3/peer_connections_max": {
+      "suite": "12-search-fanout",
+      "config": "cluster3",
+      "metric": "peer_connections_max",
+      "unit": "connections",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2000.0,
+        "candidate": 1.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 20
+        }
+      ]
+    },
+    "12-search-fanout/cluster3/peer_kept_clients_max": {
+      "suite": "12-search-fanout",
+      "config": "cluster3",
+      "metric": "peer_kept_clients_max",
+      "unit": "clients",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 2.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "12-search-fanout/cluster3/searches_per_s": {
+      "suite": "12-search-fanout",
+      "config": "cluster3",
+      "metric": "searches_per_s",
+      "unit": "searches/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 4519.743,
+        "candidate": 5772.0865,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "12-search-fanout/cluster3/searches_wrong_count": {
+      "suite": "12-search-fanout",
+      "config": "cluster3",
+      "metric": "searches_wrong_count",
+      "unit": "searches",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "13-cluster-reshard/reshard1000/cluster_check_failed": {
+      "suite": "13-cluster-reshard",
+      "config": "reshard1000",
+      "metric": "cluster_check_failed",
+      "unit": "-",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": 0.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 0
+        }
+      ]
+    },
+    "13-cluster-reshard/reshard1000/keys_after": {
+      "suite": "13-cluster-reshard",
+      "config": "reshard1000",
+      "metric": "keys_after",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 3000000.0,
+        "candidate": 3000000.0,
+        "redis": 3000000.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "13-cluster-reshard/reshard1000/keys_moved": {
+      "suite": "13-cluster-reshard",
+      "config": "reshard1000",
+      "metric": "keys_moved",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 183078.0,
+        "candidate": 183078.0,
+        "redis": 183078.0,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "13-cluster-reshard/reshard1000/load_s": {
+      "suite": "13-cluster-reshard",
+      "config": "reshard1000",
+      "metric": "load_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 23.9061,
+        "candidate": 24.21,
+        "redis": 23.936,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "13-cluster-reshard/reshard1000/reshard_s": {
+      "suite": "13-cluster-reshard",
+      "config": "reshard1000",
+      "metric": "reshard_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 381.7793,
+        "candidate": 25.3011,
+        "redis": 7.113,
+        "vm": "Standard_D4s_v5",
+        "date": "2026-11-14",
+        "commit": "d66f0f93",
+        "label": "master-d66f0f93-d4s_v5-part2"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
     }
   }
 }

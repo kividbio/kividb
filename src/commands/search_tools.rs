@@ -297,7 +297,7 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
         cursors.remove(&id);
     }
     Some(cursor_reply(
-        ctx.resp,
+        crate::commands::handler::effective_resp_for_reply(ctx),
         total,
         &rows,
         if left { id } else { 0 },
@@ -521,7 +521,7 @@ pub(crate) fn ft_config(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .iter()
                 .filter(|(name, _)| crate::commands::helpers::glob_match(&pattern, name))
                 .collect();
-            if ctx.resp == 3 {
+            if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
                 return Some(resp_map_for(
                     3,
                     found
@@ -1015,7 +1015,7 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
 
     let shard = resp_map_for(
-        ctx.resp,
+        crate::commands::handler::effective_resp_for_reply(ctx),
         vec![
             resp_bulk_str("Total profile time"),
             millis(total + parsing),
@@ -1034,7 +1034,7 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ],
     );
     let profile = resp_map_for(
-        ctx.resp,
+        crate::commands::handler::effective_resp_for_reply(ctx),
         vec![
             resp_bulk_str("Shards"),
             resp_array(vec![shard]),
@@ -1042,19 +1042,21 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
             resp_array(vec![]),
         ],
     );
-    Some(if ctx.resp == 3 {
-        resp_map_for(
-            3,
-            vec![
-                resp_bulk_str("Results"),
-                reply,
-                resp_bulk_str("Profile"),
-                profile,
-            ],
-        )
-    } else {
-        resp_array(vec![reply, profile])
-    })
+    Some(
+        if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
+            resp_map_for(
+                3,
+                vec![
+                    resp_bulk_str("Results"),
+                    reply,
+                    resp_bulk_str("Profile"),
+                    profile,
+                ],
+            )
+        } else {
+            resp_array(vec![reply, profile])
+        },
+    )
 }
 
 #[cfg(test)]

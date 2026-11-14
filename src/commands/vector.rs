@@ -1017,7 +1017,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // `WITHCURSOR`: the first rows now, the rest as they are asked for.
     if let Some((count, max_idle)) = cursor {
         return Some(crate::commands::search_tools::open_cursor(
-            ctx.resp,
+            crate::commands::handler::effective_resp_for_reply(ctx),
             &index_name,
             rows_out,
             count,
@@ -1030,7 +1030,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // are on this page; any other reports the page.
     let total = groups.unwrap_or(rows_out.len());
     Some(crate::commands::search_tools::rows_reply(
-        ctx.resp, total, &rows_out, timed_out,
+        crate::commands::handler::effective_resp_for_reply(ctx),
+        total,
+        &rows_out,
+        timed_out,
     ))
 }
 // ── format_f64 ────────────────────────────────────────────────────────────────
@@ -1511,7 +1514,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // A suggestion's score is the share of the index's documents that hold
     // it (`spell_check.c`), best first, written as Redis writes a double; a
     // word only in an INCLUDE dictionary scores 0.
-    let resp3 = ctx.resp == 3;
+    let resp3 = crate::commands::handler::effective_resp_for_reply(ctx) == 3;
     let score = |docs: usize| -> Vec<u8> {
         let digits = crate::commands::helpers::format_score(docs as f64 / total_docs);
         if resp3 {

@@ -77,6 +77,8 @@ engines_fetch_release "$REFERENCE_TAG" full "$REGRESS_CACHE/releases" >/dev/null
 BIN[candidate]=$(engines_resolve_candidate "$CANDIDATE" "$REGRESS_CACHE/releases")
 BIN[redis]=$(engines_resolve_redis "$REGRESS_CACHE/redis")
 KIND[v1_2_2]=kividb KIND[candidate]=kividb KIND[redis]=redis
+# redis-cli and redis-benchmark of the same build, for the suites that drive them.
+export REGRESS_REDIS_SERVER=${BIN[redis]}
 if [ -z "$CAND_COMMIT" ]; then
   CAND_COMMIT=$("${BIN[candidate]}" --version 2>/dev/null | head -1 || true)
 fi
@@ -91,7 +93,30 @@ rm -f "$OUT/results.jsonl"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/kividb-regress-run.XXXXXX")
 mkdir -p "$WORK/raw/logs"
 CHILD=
-trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; engine_stop; rm -rf "$WORK"' EXIT
+# Self-hosted suites record each node's pid here (lib/nodes.py). If a suite is
+# SIGKILLed its nodes are left running; reap_nodes kills those, and only those
+# whose /proc/<pid>/cmdline still holds the binary the file names (a recycled
+# pid is not touched). Never by process name.
+export REGRESS_PIDDIR=$WORK/pids
+mkdir -p "$REGRESS_PIDDIR"
+reap_nodes() {
+  local f pid bin
+  for f in "$REGRESS_PIDDIR"/*; do
+    [ -f "$f" ] || continue
+    pid=${f##*/}
+    bin=$(cat "$f" 2>/dev/null) || bin=
+    if [ -n "$bin" ] && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF -- "$bin"; then
+      echo "reaping leftover node $pid ($bin)" >&2
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -qF -- "$bin"; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$f"
+  done
+}
+trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; reap_nodes; engine_stop; rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
 FAILURES=$WORK/failures.txt EXPECTED=$WORK/expected.jsonl
@@ -122,20 +147,29 @@ for f in "${SUITES[@]}"; do
     io=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["io"])' "$cfg")
     threads=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["threads"])' "$cfg")
     engs=$("$PYTHON" -c 'import json,sys;print(" ".join(json.loads(sys.argv[1])["engines"]))' "$cfg")
+    selfh=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1]).get("self_hosted", False)))' "$cfg")
     "$PYTHON" -c 'import json,sys;c=json.loads(sys.argv[1]);print(json.dumps({"suite":sys.argv[2],"config":c["name"],"engines":c["engines"]}))' \
       "$cfg" "$suite" >>"$EXPECTED"
     for e in $engs; do
       want_engine "$e" || continue
       echo "--- $suite $name $e"
       ran=$((ran + 1))
-      engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
+      srv=()
+      if [ "$selfh" = 1 ]; then
+        # The suite starts (and always stops) its own servers from --bin.
+        ENGINE_LOG=/dev/null
+      else
+        engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
+        srv=(--port "$ENGINE_PORT" --pid "$ENGINE_PID")
+      fi
       # In the background and waited for, so that a signal stops the run at once.
       timeout "$SUITE_TIMEOUT" "$PYTHON" "$here/suites/$f" --config "$name" --engine "$e" \
-        --kind "${KIND[$e]}" --port "$ENGINE_PORT" --pid "$ENGINE_PID" --out "$WORK" </dev/null &
+        --kind "${KIND[$e]}" "${srv[@]}" --bin "${BIN[$e]}" --out "$WORK" </dev/null &
       CHILD=$!
       rc=0
       wait "$CHILD" || rc=$?
       CHILD=
+      reap_nodes
       [ $rc -eq 0 ] || fail "$suite $name $e: suite exited $rc"
       tail -c 65536 "$ENGINE_LOG" >"$WORK/raw/logs/$suite-$name-$e.log" 2>/dev/null || true
       engine_stop

@@ -466,7 +466,7 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("ERR invalid option"));
     }
     let raw = cmd.len() > 3;
-    let resp = ctx.resp;
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
