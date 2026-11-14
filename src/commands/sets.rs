@@ -1,5 +1,6 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
+use crate::commands::set_card::{diff_each, distinct, inter_each, read_all, sets_at};
 use crate::keyspace_events::{KS_SET, notify};
 use crate::resp::write::*;
 use crate::store;
@@ -21,87 +22,41 @@ fn reply_resp(ctx: &Ctx) -> u8 {
     crate::commands::handler::effective_resp_for_reply(ctx)
 }
 
-// ── load_set ──────────────────────────────────────────────────────────────────
-// Reads the set at `key` and returns a cloned, owned AHashSet.
-// Returns Some(empty set) when the key doesn't exist.
-// Returns None on WRONGTYPE — callers treat None as an error signal.
+// ── set algebra ───────────────────────────────────────────────────────────────
+// The sets are read where they are stored, under their read locks (taken
+// together, in one global order: see `set_card::read_all`), and nothing is
+// copied out first. A missing or expired key is an empty set; a key of another
+// type is a WRONGTYPE error wherever it is.
 //
-// We clone the inner set rather than holding the RwLock across set-algebra
-// operations. This keeps lock scopes short and avoids holding the shard lock
-// while doing O(n) work (diff/inter/union). The clone is O(n) in the set size,
-// same as the operation itself, so it doesn't change the complexity class.
-fn load_set(ctx: &Ctx, key: &[u8]) -> Option<crate::member_set::MemberSet> {
-    if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
-        return Some(crate::member_set::MemberSet::new());
-    }
-    let db_ref = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db_ref, key);
-    let map = read_lock!(shard);
+// SINTER walks the smallest set and looks its members up in the others, so
+// it costs the smallest set's size however big the others are (#759): it used
+// to copy every set out of the store first, 20M members to intersect with
+// 4,096. SDIFF walks only the first set.
 
-    match map.get(key) {
-        None => Some(crate::member_set::MemberSet::new()),
-        Some(ValueRef::Set(s)) => Some(s.read().clone()),
-        Some(_) => None,
-    }
-}
-
-/// The members of a set, copied out of the store.
-type Members = crate::member_set::MemberSet;
-
-/// The sets named by `key_args`, in order. A key that does not exist is an
-/// empty set; a key that holds something else is a WRONGTYPE error, whichever
-/// position it is in.
-fn load_sets(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Members>, Vec<u8>> {
-    key_args
-        .iter()
-        .map(|key_bytes| {
-            let key: &[u8] = key_bytes;
-            load_set(ctx, key).ok_or_else(|| {
-                resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
-            })
-        })
-        .collect()
-}
-
-// ── set_diff ──────────────────────────────────────────────────────────────────
-// Returns elements in the first set that are absent from all subsequent sets.
-// `key_args` is a slice of raw command bytes — each entry is a key name.
-// Uses retain() for a single O(n) pass per additional set rather than nested
-// loops, keeping overall complexity at O(n * m) where m is number of sets.
+/// Returns elements in the first set that are absent from all subsequent sets.
 fn set_diff(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
-    let mut sets = load_sets(ctx, key_args)?.into_iter();
-    let Some(mut result) = sets.next() else {
-        return Ok(vec![]);
-    };
-    for other in sets {
-        result.retain(|v| !other.contains(v));
-    }
-    Ok(result.into_iter().collect())
+    let sets = sets_at(ctx, key_args)?;
+    let mut result = Vec::new();
+    diff_each(&sets, 0, |member| result.push(Arc::clone(member)));
+    Ok(result)
 }
 
-// ── set_inter ─────────────────────────────────────────────────────────────────
-// Returns only elements present in every set.
-// Starts with the first set, then retains only elements found in each
-// subsequent set.
+/// Returns only elements present in every set.
 fn set_inter(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
-    let mut sets = load_sets(ctx, key_args)?.into_iter();
-    let Some(mut result) = sets.next() else {
-        return Ok(vec![]);
-    };
-    for other in sets {
-        result.retain(|v| other.contains(v));
-    }
-    Ok(result.into_iter().collect())
+    let sets = sets_at(ctx, key_args)?;
+    let mut result = Vec::new();
+    inter_each(&sets, 0, |member| result.push(Arc::clone(member)));
+    Ok(result)
 }
 
-// ── set_union ─────────────────────────────────────────────────────────────────
-// Returns all unique elements across every set.
-// Extends a single accumulator AHashSet — duplicates are deduplicated
-// automatically by the set semantics.
+/// Returns all unique elements across every set.
 fn set_union(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
-    let mut result = AHashSet::<Arc<[u8]>>::new();
-    for set in load_sets(ctx, key_args)? {
-        result.extend(set);
+    let sets = sets_at(ctx, key_args)?;
+    let guards = read_all(&distinct(sets.iter().flatten()));
+    let mut result =
+        AHashSet::<Arc<[u8]>>::with_capacity(guards.iter().map(|set| set.len()).max().unwrap_or(0));
+    for set in &guards {
+        result.extend(set.iter().cloned());
     }
     Ok(result.into_iter().collect())
 }
@@ -712,15 +667,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 _ => return Some(resp_error("ERR syntax error")),
             };
 
-            let result = match set_inter(ctx, &cmd[2..keys_end]) {
-                Ok(result) => result,
+            // Counted without building the intersection, and stopped at
+            // `limit`.
+            let sets = match sets_at(ctx, &cmd[2..keys_end]) {
+                Ok(sets) => sets,
                 Err(e) => return Some(e),
             };
-            let count = if limit > 0 {
-                result.len().min(limit)
-            } else {
-                result.len()
-            };
+            let count = inter_each(&sets, limit, |_| {});
             crate::stats::record_hit();
             Some(resp_integer(count as i64))
         }

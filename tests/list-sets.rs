@@ -1212,3 +1212,276 @@ fn test_sort_store_from_an_expired_list_empties_the_destination() {
         assert_eq!(c.cmds(&["SORT", &src]).as_array().len(), 0);
     }
 }
+
+// ── #759: set algebra walks the smallest set, reads the sets in place ────────
+
+/// `SADD key` of `members`, 1,000 at a time.
+fn sadd_all(c: &mut Conn, key: &str, members: impl IntoIterator<Item = String>) {
+    let members: Vec<String> = members.into_iter().collect();
+    for chunk in members.chunks(1000) {
+        let mut args = vec!["SADD", key];
+        args.extend(chunk.iter().map(String::as_str));
+        assert!(c.cmds(&args).as_int() >= 0);
+    }
+}
+
+fn sorted_members(v: &RespValue) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .as_array()
+        .iter()
+        .map(|m| m.as_str().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// The same answers as before #759, whichever order the sets are named in,
+/// with the same key named twice, an integer and a string set, and `LIMIT`.
+#[test]
+fn test_set_algebra_of_a_big_and_a_small_set() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    sadd_all(&mut c, "big", (0..20_000).map(|i| i.to_string()));
+    let small: Vec<String> = (0..60)
+        .map(|i| (i * 331).to_string())
+        .chain(["x", "y", "-1", "20000"].map(String::from))
+        .collect();
+    sadd_all(&mut c, "small", small.clone());
+    sadd_all(&mut c, "mid", (0..20_000).step_by(2).map(|i| i.to_string()));
+    sadd_all(&mut c, "words", ["x", "0", "zz"].map(String::from));
+
+    let in_big = |m: &String| m.parse::<u32>().is_ok_and(|n| n < 20_000);
+    let inter: Vec<String> = sorted(small.iter().filter(|m| in_big(m)).cloned().collect());
+    let inter3: Vec<String> = sorted(
+        inter
+            .iter()
+            .filter(|m| m.parse::<u32>().unwrap() % 2 == 0)
+            .cloned()
+            .collect(),
+    );
+    assert_eq!(inter.len(), 60);
+    assert_eq!(inter3.len(), 30);
+
+    for keys in [
+        &["big", "small"][..],
+        &["small", "big"],
+        &["big", "small", "big"],
+        &["small", "small", "big", "small"],
+    ] {
+        let mut args = vec!["SINTER"];
+        args.extend(keys);
+        assert_eq!(sorted_members(&c.cmds(&args)), inter, "SINTER {keys:?}");
+        let n = keys.len().to_string();
+        let mut args = vec!["SINTERCARD", n.as_str()];
+        args.extend(keys);
+        assert_eq!(c.cmds(&args).as_int(), 60, "SINTERCARD {keys:?}");
+        for (limit, want) in [("0", 60), ("1", 1), ("59", 59), ("60", 60), ("1000", 60)] {
+            let mut with_limit = args.clone();
+            with_limit.extend(["LIMIT", limit]);
+            assert_eq!(c.cmds(&with_limit).as_int(), want, "{with_limit:?}");
+        }
+    }
+    for keys in [&["big", "small", "mid"][..], &["mid", "big", "small"]] {
+        let mut args = vec!["SINTER"];
+        args.extend(keys);
+        assert_eq!(sorted_members(&c.cmds(&args)), inter3, "SINTER {keys:?}");
+    }
+    assert_eq!(
+        sorted_members(&c.cmds(&["SINTER", "small", "words"])),
+        vec!["0", "x"]
+    );
+    assert_eq!(
+        sorted_members(&c.cmds(&["SINTER", "big", "words"])),
+        vec!["0"]
+    );
+    assert_eq!(c.cmds(&["SINTER", "big", "big"]).as_array().len(), 20_000);
+    assert_eq!(c.cmds(&["SINTERCARD", "1", "big"]).as_int(), 20_000);
+
+    // SINTERSTORE, into a new key and into one of its own sources.
+    assert_eq!(c.cmds(&["SINTERSTORE", "dst", "big", "small"]).as_int(), 60);
+    assert_eq!(sorted_members(&c.cmds(&["SMEMBERS", "dst"])), inter);
+    assert_eq!(c.cmds(&["SINTERSTORE", "mid", "mid", "small"]).as_int(), 30);
+    assert_eq!(sorted_members(&c.cmds(&["SMEMBERS", "mid"])), inter3);
+
+    // SDIFF walks the first set, small or big.
+    let small_only = sorted(small.iter().filter(|m| !in_big(m)).cloned().collect());
+    assert_eq!(small_only, vec!["-1", "20000", "x", "y"]);
+    assert_eq!(
+        sorted_members(&c.cmds(&["SDIFF", "small", "big"])),
+        small_only
+    );
+    assert_eq!(
+        sorted_members(&c.cmds(&["SDIFF", "small", "big", "words", "nokey"])),
+        vec!["-1", "20000", "y"]
+    );
+    assert_eq!(
+        c.cmds(&["SDIFF", "big", "small"]).as_array().len(),
+        20_000 - 60
+    );
+    assert_eq!(c.cmds(&["SDIFF", "small", "small"]).as_array().len(), 0);
+    assert_eq!(c.cmds(&["SDIFFSTORE", "dst", "small", "big"]).as_int(), 4);
+    assert_eq!(sorted_members(&c.cmds(&["SMEMBERS", "dst"])), small_only);
+    assert_eq!(c.cmds(&["SDIFFCARD", "2", "small", "big"]).as_int(), 4);
+
+    // SUNION reads them in place too.
+    assert_eq!(
+        c.cmds(&["SUNION", "big", "small", "small", "words"])
+            .as_array()
+            .len(),
+        20_000 + 4 + 1
+    );
+    assert_eq!(
+        c.cmds(&["SUNIONSTORE", "dst", "small", "words"]).as_int(),
+        64 + 1
+    );
+}
+
+/// Missing, expired and wrong-type keys, wherever they are in the list.
+#[test]
+fn test_set_algebra_missing_expired_and_wrong_type_keys() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    sadd_all(&mut c, "big", (0..5_000).map(|i| i.to_string()));
+    sadd_all(&mut c, "small", ["1", "2", "x"].map(String::from));
+    assert!(c.cmds(&["SET", "str", "v"]).is_ok());
+
+    for keys in [
+        &["big", "nokey"][..],
+        &["nokey", "big"],
+        &["small", "big", "nokey"],
+    ] {
+        let mut args = vec!["SINTER"];
+        args.extend(keys);
+        assert_eq!(c.cmds(&args).as_array().len(), 0, "{args:?}");
+        let n = keys.len().to_string();
+        let mut card = vec!["SINTERCARD", n.as_str()];
+        card.extend(keys);
+        assert_eq!(c.cmds(&card).as_int(), 0, "{card:?}");
+    }
+    // A key of another type is an error wherever it is, even after a missing
+    // key has made the answer empty.
+    for keys in [
+        &["str", "big"][..],
+        &["big", "str"],
+        &["nokey", "str"],
+        &["small", "big", "str"],
+    ] {
+        for cmd in ["SINTER", "SDIFF", "SUNION"] {
+            let mut args = vec![cmd];
+            args.extend(keys);
+            let reply = c.cmds(&args);
+            assert!(
+                matches!(&reply, RespValue::Error(e) if e.starts_with("WRONGTYPE")),
+                "{args:?}: {reply:?}"
+            );
+        }
+        let n = keys.len().to_string();
+        let mut card = vec!["SINTERCARD", n.as_str()];
+        card.extend(keys);
+        assert!(c.cmds(&card).is_error(), "{card:?}");
+        let mut store = vec!["SINTERSTORE", "dst"];
+        store.extend(keys);
+        assert!(c.cmds(&store).is_error(), "{store:?}");
+    }
+    assert_eq!(c.cmds(&["EXISTS", "dst"]).as_int(), 0);
+
+    // An expired set is an empty one, as the smallest set or as the first.
+    assert!(c.cmds(&["SINTERSTORE", "dst", "big", "small"]).as_int() == 2);
+    assert_eq!(c.cmds(&["PEXPIRE", "small", "20"]).as_int(), 1);
+    thread::sleep(Duration::from_millis(40));
+    assert_eq!(c.cmds(&["SINTER", "big", "small"]).as_array().len(), 0);
+    assert_eq!(c.cmds(&["SINTERCARD", "2", "small", "big"]).as_int(), 0);
+    assert_eq!(c.cmds(&["SDIFF", "small", "big"]).as_array().len(), 0);
+    assert_eq!(c.cmds(&["SDIFF", "big", "small"]).as_array().len(), 5_000);
+    assert_eq!(c.cmds(&["SINTERSTORE", "dst", "big", "small"]).as_int(), 0);
+    assert_eq!(c.cmds(&["EXISTS", "dst"]).as_int(), 0);
+}
+
+/// Readers that name the same sets in opposite orders, beside writers of
+/// those sets, all finish: each command takes its sets' read locks in one
+/// global order, so none holds one while waiting for another's.
+#[test]
+fn test_set_algebra_in_opposite_orders_beside_writers() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    sadd_all(&mut c, "a", (0..2_000).map(|i| i.to_string()));
+    sadd_all(&mut c, "b", (1_000..3_000).map(|i| i.to_string()));
+    let workers: Vec<_> = (0..8)
+        .map(|t| {
+            thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let (x, y) = if t % 2 == 0 { ("a", "b") } else { ("b", "a") };
+                for i in 0..300 {
+                    if t < 4 {
+                        // The 1,000 shared members are never written.
+                        assert!(c.cmds(&["SINTERCARD", "2", x, y]).as_int() >= 1_000);
+                        assert!(c.cmds(&["SINTER", x, y]).as_array().len() >= 1_000);
+                        assert!(c.cmds(&["SDIFF", x, y]).as_array().len() >= 1_000);
+                        assert!(c.cmds(&["SUNION", x, y]).as_array().len() >= 3_000);
+                    } else {
+                        let m = format!("w{t}-{i}");
+                        assert_eq!(c.cmds(&["SADD", x, &m]).as_int(), 1);
+                        assert_eq!(c.cmds(&["SREM", x, &m]).as_int(), 1);
+                        c.cmds(&["SADD", y, &m]);
+                        c.cmds(&["SREM", y, &m]);
+                    }
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    assert_eq!(c.cmds(&["SINTERCARD", "2", "a", "b"]).as_int(), 1_000);
+}
+
+/// What #759 measured: the time of `SINTER big small` follows the small set.
+/// It copied every set out of the store first, so a 500,000-member set made
+/// each call cost tens to hundreds of milliseconds, even in a release build;
+/// now a 50-member walk is well under a millisecond of work.
+#[test]
+fn test_sinter_cost_follows_the_smallest_set() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    sadd_all(&mut c, "big", (0..500_000).map(|i| i.to_string()));
+    sadd_all(&mut c, "small", (0..50).map(|i| (i * 9_973).to_string()));
+    let fastest = |c: &mut Conn, args: &[&str], want: i64| {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                let r = c.cmds(args);
+                let took = t.elapsed();
+                let n = match &r {
+                    RespValue::Int(n) => *n,
+                    other => other.as_array().len() as i64,
+                };
+                assert_eq!(n, want, "{args:?}");
+                took
+            })
+            .min()
+            .unwrap()
+    };
+    for args in [
+        &["SINTER", "big", "small"][..],
+        &["SINTER", "small", "big"],
+        &["SINTERCARD", "2", "big", "small"],
+        &["SINTERSTORE", "dst", "big", "small"],
+        &["SDIFF", "small", "big"],
+    ] {
+        let want = if args[0] == "SDIFF" { 0 } else { 50 };
+        let took = fastest(&mut c, args, want);
+        assert!(
+            took < Duration::from_millis(25),
+            "{args:?} took {took:?} with a 50-member set"
+        );
+    }
+}
