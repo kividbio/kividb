@@ -115,6 +115,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Memory freed by a large delete goes back to the system within a second
+  (#753).** Deleting a hash of 3M fields left `used_memory` at 1.4 MB but
+  RSS at 200 MiB, and deleting 1M fields with `HDEL` left 78 MiB: the free
+  pages stayed in the system allocator until a `MEMORY PURGE`. A
+  background thread now gives them back once what is allocated has fallen
+  by 32 MiB and by an eighth since the last time, at most once a second;
+  RSS falls to 17 MiB in both cases. A server under steady load does not
+  trim. `INFO memory` counts the trims in `allocator_trims`.
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
   master crashed right after a `CLUSTER MIGRATION IMPORT` handover kept the

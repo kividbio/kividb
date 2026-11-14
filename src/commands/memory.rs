@@ -602,8 +602,10 @@ fn doctor_says(
 ///
 /// Freeing a Rust allocation only returns it to the allocator. glibc keeps the
 /// pages mapped in its arena free lists until asked, so without this a flush
-/// shows up nowhere in `used_memory` (which is RSS). Used by `MEMORY PURGE` and
-/// by flushes big enough to be worth the walk over every arena.
+/// shows up nowhere in RSS (`used_memory_rss`). Used by `MEMORY PURGE`, by
+/// flushes big enough to be worth the walk over every arena, and by the thread
+/// that gives memory back after a large fall in what is allocated
+/// (`give_back`).
 pub(crate) fn purge_allocator() {
     #[cfg(target_os = "linux")]
     unsafe {

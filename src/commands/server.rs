@@ -4810,6 +4810,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let fill = crate::value_slab::fill();
                 out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
                 out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
+                // Times freed memory was given back to the system after a
+                // large fall in what is allocated (#753).
+                out.push_str(&format!(
+                    "allocator_trims:{}\r\n",
+                    crate::give_back::trims()
+                ));
                 out.push_str(&format!(
                     "used_memory_rss_human:{}\r\n",
                     crate::commands::memory::human_bytes_pub(rss)

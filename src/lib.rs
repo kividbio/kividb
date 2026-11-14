@@ -26,6 +26,7 @@ pub mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod give_back;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod latency;
@@ -156,6 +157,7 @@ async fn server_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
