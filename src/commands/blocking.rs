@@ -605,6 +605,11 @@ pub fn wait_for_keys(
     let outcome = match (reply, remaining) {
         (Some(reply), _) => Ok(reply),
         (None, Some(remaining)) if !timed_out => Err(remaining),
+        // #704: deadline passed on first look, but we have not parked yet.
+        // Park once with zero time so a write landing in this window
+        // still wakes us. On resume, timed_out is true, so we fall
+        // through to null below and never loop.
+        (None, None) if !timed_out && deadline.is_some() => Err(Some(std::time::Duration::ZERO)),
         (None, _) => {
             crate::stats::record_miss();
             // A wait that ran out is answered with a null array. A caller
