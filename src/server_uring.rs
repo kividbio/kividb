@@ -928,6 +928,8 @@ pub async fn handle_client(
     // This connection's subscriptions, while it has any. `None` otherwise, so
     // that a connection that never uses pub/sub allocates nothing for it.
     let mut subscriptions: Option<crate::pubsub::Subscriptions> = None;
+    // The clock of `client-output-buffer-limit`'s soft limit, for its replies.
+    let mut reply_limit = crate::output_limits::ReplyLimit::default();
     // How a blocking command's wait was cut short. See `park_blocking_uring`.
     let mut interrupted = crate::commands::blocking::Interrupted::default();
 
@@ -2859,14 +2861,58 @@ pub async fn handle_client(
         if std::mem::take(&mut aof_wait) {
             crate::aof::written(&aof_tx).await;
         }
+        // `client-output-buffer-limit` (#774): replies over the hard limit,
+        // or over the soft limit for longer than its seconds, end the
+        // connection unwritten, as Redis drops such a client and its output.
+        let mut write_within = None;
+        if pubsub.limits().may_exceed(out_buf.len()) {
+            use crate::output_limits::{Class, Verdict};
+            let class = if subscriptions.is_some() {
+                Class::PubSub
+            } else {
+                Class::Normal
+            };
+            match reply_limit.check(pubsub.limits(), class, out_buf.len()) {
+                Verdict::Write => {}
+                Verdict::WriteWithin(time) => write_within = Some((time, class)),
+                Verdict::Close => {
+                    crate::output_limits::note_disconnect(client_id, class, out_buf.len() as u64);
+                    break;
+                }
+            }
+        }
         if !out_buf.is_empty() {
             std::mem::swap(&mut out_buf, &mut spare_buf);
             crate::stats::TOTAL_NET_OUTPUT_BYTES
                 .fetch_add(spare_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
             crate::stats::record_write();
+            let shown = spare_buf.len() >= crate::client_registry::REPLY_OUTPUT_SHOWN_FROM;
+            if shown {
+                activity.set_reply_output(spare_buf.len());
+            }
             let _w = write_guard.lock().await;
-            let (res, returned) = stream.write_all(spare_buf).await;
+            let (res, returned) = match write_within {
+                None => stream.write_all(spare_buf).await,
+                Some((time, class)) => {
+                    let waiting = spare_buf.len() as u64;
+                    match tokio::time::timeout(time, stream.write_all(spare_buf)).await {
+                        Ok(written) => written,
+                        Err(_) => {
+                            crate::output_limits::note_disconnect(client_id, class, waiting);
+                            // The write still holds the socket open until
+                            // it completes, which for a client that reads
+                            // nothing is never: shut down, it ends at once.
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            break;
+                        }
+                    }
+                }
+            };
             drop(_w);
+            if shown {
+                activity.set_reply_output(0);
+            }
+            reply_limit.drained();
             spare_buf = returned;
             spare_buf.clear();
             // Nor is one that grew to hold one large reply.

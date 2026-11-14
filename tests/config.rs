@@ -871,7 +871,10 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
     ] {
         assert!(c.cmds(&["CONFIG", "SET", name, "512mb"]).is_ok(), "{name}");
         assert_eq!(get(&mut c, name).as_deref(), Some("536870912"), "{name}");
-        let reply = c.cmds(&["CONFIG", "SET", name, "0"]);
+        // 0 is no limit, as in Redis (#774).
+        assert!(c.cmds(&["CONFIG", "SET", name, "0"]).is_ok(), "{name}");
+        assert_eq!(get(&mut c, name).as_deref(), Some("0"), "{name}");
+        let reply = c.cmds(&["CONFIG", "SET", name, "-1"]);
         assert!(reply.is_error(), "{name}: {reply:?}");
     }
     // One refused takes the others back with it.

@@ -6,26 +6,23 @@
 //! task takes from its queue and writes to the socket. So a subscriber sees
 //! messages in the order they were published, whichever of its channels and
 //! patterns they came through, and none is ever left out of the middle: a
-//! subscriber that cannot keep up is disconnected once its queue passes the
-//! limits below — Redis's `client-output-buffer-limit pubsub 32mb 8mb 60`.
+//! subscriber that cannot keep up is disconnected once its queue passes
+//! `client-output-buffer-limit pubsub` (Redis's `32mb 8mb 60` by default;
+//! `0 0 0` lets it grow without bound). See [`crate::output_limits`].
 //!
 //! A subscribed connection stays in its ordinary command loop. Under RESP3
 //! it keeps every command; under RESP2 the loop allows it only
 //! (P|S)SUBSCRIBE, (P|S)UNSUBSCRIBE, PING, QUIT and RESET until it has no
 //! subscriptions left, when it is an ordinary connection again.
 
-use crate::client_registry::ClientRegistry;
+use crate::client_registry::{Activity, ClientRegistry};
+use crate::output_limits::{Class, Limits, OutputLimits};
 use ahash::{AHashMap, AHashSet};
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Notify, mpsc};
 
-/// A subscriber with more than this queued is disconnected.
-const HARD_LIMIT: usize = 32 << 20;
-/// So is one that has had more than this queued for `SOFT_SECONDS`.
-const SOFT_LIMIT: usize = 8 << 20;
-const SOFT_SECONDS: u64 = 60;
 /// How much the forwarder takes from the queue for one write.
 const BATCH_BYTES: usize = 256 << 10;
 
@@ -55,16 +52,6 @@ impl Delivery {
     }
 }
 
-/// Seconds since the first call, from 1: 0 is kept to mean "not set".
-fn uptime_secs() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_secs()
-        + 1
-}
-
 // ── Subscriber ────────────────────────────────────────────────────────────────
 
 /// The hub's side of a subscribed connection.
@@ -74,6 +61,10 @@ struct Subscriber {
     queue: mpsc::UnboundedSender<Delivery>,
     /// Weight queued and not yet taken by the forwarder.
     pending: AtomicUsize,
+    /// The server's `client-output-buffer-limit`s.
+    limits: Arc<OutputLimits>,
+    /// The connection's, where `CLIENT LIST` reads `omem` from.
+    activity: Option<Arc<Activity>>,
     /// When `pending` went over the soft limit; 0 while it is under.
     over_soft_since: AtomicU64,
     /// Set once it has been disconnected for falling behind.
@@ -106,12 +97,18 @@ impl Subscriber {
         }
         let weight = delivery.weight();
         let pending = self.pending.fetch_add(weight, Ordering::Relaxed) + weight;
-        if pending > SOFT_LIMIT {
-            if pending > HARD_LIMIT || self.over_soft_limit_too_long() {
-                self.closed.store(true, Ordering::Relaxed);
-                return Offer::Overflow;
-            }
-        } else if self.over_soft_since.load(Ordering::Relaxed) != 0 {
+        self.note_pending(pending);
+        // As Redis does: at the hard limit at once, over the soft limit once
+        // it has been for longer than its seconds. 0 turns a limit off.
+        let limit = self.limits.get(Class::PubSub);
+        let over_soft = limit.soft != 0 && pending as u64 >= limit.soft;
+        if (limit.hard != 0 && pending as u64 >= limit.hard)
+            || (over_soft && self.over_soft_limit_too_long(limit.soft_seconds))
+        {
+            self.closed.store(true, Ordering::Relaxed);
+            return Offer::Overflow;
+        }
+        if !over_soft && self.over_soft_since.load(Ordering::Relaxed) != 0 {
             self.over_soft_since.store(0, Ordering::Relaxed);
         }
         // To itself: held until this connection's reply is written, as Redis
@@ -128,19 +125,27 @@ impl Subscriber {
         }
     }
 
-    fn over_soft_limit_too_long(&self) -> bool {
-        let now = uptime_secs();
+    fn over_soft_limit_too_long(&self, seconds: u64) -> bool {
+        let now = crate::output_limits::now_secs();
         match self
             .over_soft_since
             .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
         {
             Ok(_) => false,
-            Err(since) => now.saturating_sub(since) >= SOFT_SECONDS,
+            Err(since) => now.saturating_sub(since) > seconds,
+        }
+    }
+
+    /// What `CLIENT LIST` shows as the connection's `omem`.
+    fn note_pending(&self, pending: usize) {
+        if let Some(activity) = &self.activity {
+            activity.set_pubsub_output(pending);
         }
     }
 
     /// Close the connection of a subscriber that fell too far behind.
     fn disconnect(&self) {
+        crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.fetch_add(1, Ordering::Relaxed);
         log_warn!(
             "Client id={} closed: it is subscribed and {} bytes behind, over the \
              pub/sub output buffer limit",
@@ -162,6 +167,8 @@ struct Shared {
     /// Subscriptions of every kind, so that a publish with nobody listening
     /// — every keyspace event on most servers — takes no lock.
     subscriptions: AtomicUsize,
+    /// `client-output-buffer-limit` for normal and subscribed clients.
+    limits: Arc<OutputLimits>,
 }
 
 #[derive(Clone)]
@@ -177,12 +184,29 @@ impl Default for PubSubHub {
 
 impl PubSubHub {
     pub fn new() -> Self {
+        Self::with_limits(&Limits::default())
+    }
+
+    /// A hub whose subscribers, and whose server's other clients, are held
+    /// to `limits` (the configuration's `client-output-buffer-limit`).
+    pub fn with_limits(limits: &Limits) -> Self {
+        let output = OutputLimits::default();
+        for class in [Class::Normal, Class::PubSub] {
+            output.set(class, limits.get(class));
+        }
         let inner = Arc::new(Shared {
             tables: RwLock::new([Table::new(), Table::new(), Table::new()]),
             subscriptions: AtomicUsize::new(0),
+            limits: Arc::new(output),
         });
         watch_soft_limit(Arc::downgrade(&inner));
         Self { inner }
+    }
+
+    /// The `client-output-buffer-limit`s of normal and subscribed clients,
+    /// which `CONFIG SET` changes.
+    pub fn limits(&self) -> &OutputLimits {
+        &self.inner.limits
     }
 
     fn add(&self, kind: usize, name: &Name, subscriber: &Arc<Subscriber>) {
@@ -213,7 +237,9 @@ impl PubSubHub {
 
     /// To the channel's subscribers and to those of every pattern it matches.
     /// Returns how many subscriptions it was delivered to — a client that has
-    /// both the channel and a matching pattern counts twice, as in Redis.
+    /// both the channel and a matching pattern counts twice, as in Redis. One
+    /// that this message takes over its output buffer limit counts too, as
+    /// in Redis, which queues the message and then disconnects it (#774).
     pub fn publish(&self, channel: &(impl AsRef<[u8]> + ?Sized), payload: Arc<[u8]>) -> usize {
         self.publish_from(channel, payload, None)
     }
@@ -357,7 +383,7 @@ impl PubSubHub {
 }
 
 /// Every second: a subscriber that has stayed over the soft limit for
-/// `SOFT_SECONDS` is disconnected. It was found out only when another message
+/// longer than its seconds is disconnected. It was found out only when another message
 /// was published to it, so one left behind by a burst stayed connected, and
 /// holding its memory, for as long as nothing more came (#161). Ends with the
 /// hub.
@@ -374,23 +400,27 @@ fn watch_soft_limit(shared: std::sync::Weak<Shared>) {
                     continue;
                 }
                 // With the tables unlocked, as `publish` does.
-                for subscriber in cut_off_late(&shared, uptime_secs()) {
+                for subscriber in cut_off_late(&shared, crate::output_limits::now_secs()) {
                     subscriber.disconnect();
                 }
             }
         });
 }
 
-/// The subscribers over the soft limit for `SOFT_SECONDS` at `now`, marked
-/// closed, for the caller to disconnect.
+/// The subscribers over the soft limit for longer than its seconds at `now`,
+/// marked closed, for the caller to disconnect.
 fn cut_off_late(shared: &Shared, now: u64) -> Vec<Arc<Subscriber>> {
     let mut late: Vec<Arc<Subscriber>> = Vec::new();
+    let limit = shared.limits.get(Class::PubSub);
+    if limit.soft == 0 {
+        return late;
+    }
     for table in shared.tables.read().iter() {
         for subscriber in table.values().flatten() {
             let since = subscriber.over_soft_since.load(Ordering::Relaxed);
             if since != 0
-                && now.saturating_sub(since) >= SOFT_SECONDS
-                && subscriber.pending.load(Ordering::Relaxed) > SOFT_LIMIT
+                && now.saturating_sub(since) > limit.soft_seconds
+                && subscriber.pending.load(Ordering::Relaxed) as u64 >= limit.soft
                 && !late.iter().any(|seen| Arc::ptr_eq(seen, subscriber))
                 && !subscriber.closed.swap(true, Ordering::Relaxed)
             {
@@ -401,7 +431,8 @@ fn cut_off_late(shared: &Shared, now: u64) -> Vec<Arc<Subscriber>> {
     late
 }
 
-/// 1 if the subscriber took the message.
+/// 1 if the subscriber took the message, or was taken over its limit by it
+/// (Redis counts it, and then disconnects it).
 fn hand_over(
     subscriber: &Arc<Subscriber>,
     delivery: Delivery,
@@ -413,7 +444,7 @@ fn hand_over(
         Offer::Refused => 0,
         Offer::Overflow => {
             overflowed.push(Arc::clone(subscriber));
-            0
+            1
         }
     }
 }
@@ -535,11 +566,14 @@ pub fn connect(
     client_id: u64,
 ) -> (Subscriptions, Outbox) {
     let (queue, rx) = mpsc::unbounded_channel();
+    let activity = registry.activity(client_id);
     let me = Arc::new(Subscriber {
         client_id,
         registry,
         queue,
         pending: AtomicUsize::new(0),
+        limits: Arc::clone(&hub.inner.limits),
+        activity,
         over_soft_since: AtomicU64::new(0),
         closed: AtomicBool::new(false),
         live: Mutex::new([AHashSet::new(), AHashSet::new(), AHashSet::new()]),
@@ -728,7 +762,9 @@ impl Outbox {
             }
         }
         let pending = self.me.pending.fetch_sub(weight, Ordering::Relaxed) - weight;
-        if pending <= SOFT_LIMIT {
+        self.me.note_pending(pending);
+        let soft = self.me.limits.get(Class::PubSub).soft;
+        if soft == 0 || (pending as u64) < soft {
             self.me.over_soft_since.store(0, Ordering::Relaxed);
         }
         // The reply to a SUBSCRIBE goes first: see `Subscriber::hold`. What
@@ -962,29 +998,51 @@ mod tests {
         subs.handle(&[b"SUBSCRIBE", b"a"], 2);
         let big: Arc<[u8]> = Arc::from(vec![0u8; 1 << 20]);
         // Nobody is reading its queue: every message up to the limit is
-        // queued, and after that it takes none.
+        // queued, the one that takes it over is counted (as Redis counts
+        // it) and not queued, and after that it takes none.
+        let hard = DEFAULT_PUBSUB.hard as usize;
         let taken: usize = (0..40).map(|_| hub.publish("a", Arc::clone(&big))).sum();
-        assert_eq!(taken, HARD_LIMIT / ((1 << 20) + 65));
+        assert_eq!(taken, hard / ((1 << 20) + 65) + 1);
         assert_eq!(hub.publish("a", Arc::from(&b"small"[..])), 0);
     }
 
-    /// Over the soft limit for `SOFT_SECONDS`, a subscriber is disconnected
-    /// by the timer, with nothing more published to it (#161).
+    const DEFAULT_PUBSUB: crate::output_limits::Limit =
+        crate::output_limits::DEFAULTS[Class::PubSub as usize];
+
+    /// Over the soft limit for longer than its seconds, a subscriber is
+    /// disconnected by the timer, with nothing more published to it (#161).
     #[test]
     fn a_subscriber_over_the_soft_limit_too_long_is_cut_off_by_the_timer() {
         let hub = PubSubHub::new();
         let (mut subs, _outbox) = subscriber(&hub, 1);
         subs.handle(&[b"SUBSCRIBE", b"a"], 2);
         let me = Arc::clone(&subs.me);
-        me.pending.store(SOFT_LIMIT + 1, Ordering::Relaxed);
+        let (soft, seconds) = (DEFAULT_PUBSUB.soft as usize, DEFAULT_PUBSUB.soft_seconds);
+        me.pending.store(soft, Ordering::Relaxed);
         me.over_soft_since.store(100, Ordering::Relaxed);
-        // Not yet: one second short.
-        assert!(cut_off_late(&hub.inner, 100 + SOFT_SECONDS - 1).is_empty());
-        let late = cut_off_late(&hub.inner, 100 + SOFT_SECONDS);
+        // Not yet: as in Redis, it takes more than the seconds.
+        assert!(cut_off_late(&hub.inner, 100 + seconds).is_empty());
+        let late = cut_off_late(&hub.inner, 100 + seconds + 1);
         assert!(late.len() == 1 && Arc::ptr_eq(&late[0], &me));
         assert!(me.closed.load(Ordering::Relaxed));
         // Once: it is closed now.
-        assert!(cut_off_late(&hub.inner, 100 + SOFT_SECONDS).is_empty());
+        assert!(cut_off_late(&hub.inner, 100 + seconds + 1).is_empty());
+    }
+
+    /// `pubsub 0 0 0` takes the limit away: a message larger than the
+    /// default hard limit is queued (#774).
+    #[test]
+    fn no_limit_queues_any_message() {
+        let hub = PubSubHub::new();
+        hub.limits()
+            .set(Class::PubSub, crate::output_limits::Limit::default());
+        let (mut subs, _outbox) = subscriber(&hub, 1);
+        subs.handle(&[b"SUBSCRIBE", b"a"], 2);
+        let huge: Arc<[u8]> = Arc::from(vec![0u8; 40 << 20]);
+        assert_eq!(hub.publish("a", Arc::clone(&huge)), 1);
+        assert_eq!(hub.publish("a", huge), 1);
+        assert!(!subs.me.closed.load(Ordering::Relaxed));
+        assert!(cut_off_late(&hub.inner, u64::MAX).is_empty());
     }
 
     #[test]

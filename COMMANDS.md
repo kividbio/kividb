@@ -858,7 +858,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 
 - A subscribed connection stays in its ordinary command loop. Under RESP3 it keeps every command; under RESP2 it is limited to the commands above until it has no subscriptions left.
 - Every subscribed connection has one queue. A publish appends to the queue of each subscriber, and the connection's forwarder task writes from it to the socket, so a subscriber sees messages in the order they were published, whichever channel or pattern they came through.
-- No message is skipped. A subscriber that cannot keep up is disconnected once its queue passes Redis's default `client-output-buffer-limit pubsub` (32 MB, or 8 MB for 60 seconds).
+- No message is skipped. A subscriber that cannot keep up is disconnected once its queue passes `client-output-buffer-limit pubsub` (Redis's default: 32 MB, or 8 MB for more than 60 seconds). `CONFIG SET client-output-buffer-limit "pubsub 0 0 0"` removes the limit. `PUBLISH` counts a subscriber that its message takes over the limit, as Redis does, and then disconnects it.
 
 ---
 
@@ -1595,7 +1595,7 @@ names; with no session running the cost to a command is one atomic load.
 | `search-global-timeout` (Redis 8.10) | Not implemented. Query `TIMEOUT`, `search-timeout` and `search-on-timeout` cut a query short; `search-timeout` is `0`, no limit, by default (Redis: 500) |
 | `FT.HYBRID` `EXPLAINSCORE` and `WITHCURSOR` (Redis 8.10) | Refused with an error. `SHARD_K_RATIO` is accepted and changes nothing on one node |
 | Per-client and server parse-batch metrics in `CLIENT LIST` / `INFO` (Redis 8.8) | Not reported |
-| `client-output-buffer-limit` | Not configurable. Pub/Sub subscribers are held to Redis's default (32 MB, or 8 MB for 60 s); replicas to `repl-replica-max-backlog-bytes`, and during a full sync to `repl-replica-sync-max-backlog-bytes` |
+| `client-output-buffer-limit` | Configurable, as in Redis, for `normal`, `pubsub` and `replica`. A replica's hard limit is `repl-replica-max-backlog-bytes` under another name, and during a full sync a replica is held to `repl-replica-sync-max-backlog-bytes` and not to the soft limit. A replica has no soft limit by default (Redis: 64 MB for 60 s); one that is set holds once the replica's queue has been under it after a full sync or partial resync. The limits count the bytes waiting, not the allocator's rounding of them: under the default 32 MB limit, Redis drops a subscriber for a 31 MB message and KiviDB delivers it |
 | A master's replication ID across a restart, without the AOF | A master restarted without the AOF has a new ID, so its replicas resync in full. With the AOF on, a master stopped cleanly keeps its ID and offset, and one restarted after a crash continues a replica that holds the same data. (A restarted *replica* continues by partial resync.) |
 
 The full account of Redis 8.4 – 8.10 is in

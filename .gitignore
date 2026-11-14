@@ -5,6 +5,7 @@
 *.aof
 *.log
 *.txt
+!scripts/redis_compat_known_failures.txt
 ./*.py
 *.kdb
 # Test fixtures are committed.
