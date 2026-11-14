@@ -3019,9 +3019,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         soft: state.replica_soft_limit_bytes.load(Ordering::Relaxed),
                         soft_seconds: state.replica_soft_limit_secs.load(Ordering::Relaxed),
                     };
-                    let sync_limit =
-                        unlimited_if_0(state.replica_sync_max_backlog_bytes.load(Ordering::Relaxed))
-                            .max(streaming_limit);
+                    let sync_limit = unlimited_if_0(
+                        state.replica_sync_max_backlog_bytes.load(Ordering::Relaxed),
+                    )
+                    .max(streaming_limit);
                     for mut replica in channel_replicas.drain(..) {
                         // Account for the payload *before* handing it over. The
                         // forwarder subtracts as soon as it has the payload, and

@@ -454,7 +454,10 @@ fn every_value_reads_back_and_a_failed_config_set_puts_it_back() {
             "repl-replica-sync-max-backlog-bytes",
         ] {
             let current = server.get(name);
-            assert!(c.cmd(&["CONFIG", "SET", name, &current]).ok(), "{name} {current}");
+            assert!(
+                c.cmd(&["CONFIG", "SET", name, &current]).ok(),
+                "{name} {current}"
+            );
             assert_eq!(server.get(name), current);
         }
     }
@@ -770,10 +773,13 @@ fn a_replica_drains_after_its_sync_and_is_dropped_only_when_it_stays_over() {
             .text()
             .contains("master_link_status:up")
         {
-            assert!(Instant::now() < deadline, "{hard}: the replica never synced");
+            assert!(
+                Instant::now() < deadline,
+                "{hard}: the replica never synced"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
-        // Streaming, with the writes go on.
+        // Streaming, as the writes go on.
         std::thread::sleep(Duration::from_secs(4));
         assert_eq!(info_number(&master, "connected_slaves"), 1, "{hard}");
         assert_eq!(info_number(&master, "sync_full"), 1, "{hard}: synced again");
@@ -785,10 +791,19 @@ fn a_replica_drains_after_its_sync_and_is_dropped_only_when_it_stays_over() {
 
         // Stopped, it falls behind and stays over the soft limit.
         let pid = replica.child.id().to_string();
-        assert!(Command::new("kill").args(["-STOP", &pid]).status().unwrap().success());
+        assert!(
+            Command::new("kill")
+                .args(["-STOP", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         while info_number(&master, "client_output_buffer_limit_disconnections") == 0 {
-            assert!(Instant::now() < deadline, "{hard}: a stopped replica was kept");
+            assert!(
+                Instant::now() < deadline,
+                "{hard}: a stopped replica was kept"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
         let _ = Command::new("kill").args(["-CONT", &pid]).status();

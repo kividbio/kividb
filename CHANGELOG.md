@@ -201,7 +201,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never arrived. The `normal`, `pubsub` and `replica` (`slave`) classes now
   hold to their hard limit, and to their soft limit for more than its
   seconds, with Redis's syntax, units, error messages and `CONFIG REWRITE`
-  lines; `CONFIG GET` always gives all three, Redis's defaults until
+  lines; `CONFIG GET` always gives all three, the defaults until
   changed. `PUBLISH` counts a subscriber that its message takes over the
   limit, as Redis does, `CLIENT LIST` shows what waits for a client as
   `omem`, and `INFO` has `client_output_buffer_limit_disconnections`. A
