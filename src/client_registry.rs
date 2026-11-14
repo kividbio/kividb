@@ -560,6 +560,8 @@ pub struct ClientInfo {
     /// been told `+LOSTDATA`; 0 if it did not. See
     /// `ReplState::psync_offer`.
     pub replica_lost_data: u8,
+    /// `None` until a KiviDB capa arrives; then whether it reads Q8 and BIN.
+    pub replica_vset_quant: Option<bool>,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -605,6 +607,7 @@ impl ClientInfo {
             replica_listening_port: 0,
             replica_takes_digest: false,
             replica_lost_data: 0,
+            replica_vset_quant: None,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -1154,6 +1157,7 @@ impl ClientRegistryInner {
                 replica_listening_port: c.replica_listening_port,
                 replica_takes_digest: c.replica_takes_digest,
                 replica_lost_data: c.replica_lost_data,
+                replica_vset_quant: c.replica_vset_quant,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -1194,6 +1198,7 @@ impl ClientRegistryInner {
             replica_listening_port: c.replica_listening_port,
             replica_takes_digest: c.replica_takes_digest,
             replica_lost_data: c.replica_lost_data,
+            replica_vset_quant: c.replica_vset_quant,
             subscriptions: c.subscriptions,
         })
     }

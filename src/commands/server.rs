@@ -4337,6 +4337,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // (`replication::expiry_propagated_by`).
                 out.push_str(crate::replication::EXPIRY_PROPAGATED_INFO);
                 out.push_str("\r\n");
+                // Not on a replica of a master that ignores the options.
+                if ctx.repl_state.keeps_vset_quant() {
+                    out.push_str(crate::replication::VSET_QUANT_INFO);
+                    out.push_str("\r\n");
+                }
                 // And each hash field expired here, as an `HDEL`
                 // (`replication::field_expiry_propagated_by`). Not said under
                 // `KIVIDB_TEST_NO_FIELD_EXPIRY_CAPABILITY`, for the tests of a
@@ -5662,6 +5667,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_takes_digest = true;
+                        info.replica_vset_quant.get_or_insert(false);
                     });
                 }
                 if cmd[i].eq_ignore_ascii_case(b"capa")
@@ -5669,6 +5675,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_lost_data = 1;
+                        info.replica_vset_quant.get_or_insert(false);
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1].eq_ignore_ascii_case(b"vset-quant")
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_vset_quant = Some(true);
                     });
                 }
                 i += 2;

@@ -454,7 +454,7 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VADD` | `VADD key [REDUCE dim] [DISTANCE L2\|COSINE\|INNERPRODUCT] (FP32 \| VALUES num) vector element [SETATTR json] [NOQUANT\|Q8\|BIN] [EF n] [M n]` | Add or update an element with its vector; `FP32` accepts raw little-endian bytes, `VALUES n` accepts space-separated floats; returns 1 if new, 0 if updated; AOF-logged |
+| `VADD` | `VADD key [REDUCE dim] [DISTANCE L2\|COSINE\|INNERPRODUCT] (FP32 \| VALUES num) vector element [SETATTR json] [NOQUANT\|Q8\|BIN] [EF n] [M n]` | Add or update an element with its vector; `FP32` accepts raw little-endian bytes, `VALUES n` accepts space-separated floats; returns 1 if new, 0 if updated; AOF-logged. `NOQUANT`, `Q8` (int8 with a norm and range, as Redis) or `BIN` (one bit per component) is chosen when the set is made; a set made without one keeps f32 (Redis's default is `Q8`) and accepts any of them later, as 1.2 did; a set made with one refuses another with Redis's `asked quantization mismatch` error; a `VADD` without one is accepted into any set, in its quantization (Redis accepts it only into a `Q8` set) |
 | `VREM` | `VREM key element [element ...]` | Remove one or more elements; returns count removed; AOF-logged |
 | `VCARD` | `VCARD key` | Return the number of elements in the set; 0 if key does not exist |
 | `VDIM` | `VDIM key` | Return the vector dimension; nil if key does not exist |
@@ -464,7 +464,7 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VEMB` | `VEMB key element [RAW]` | Return the vector as an array of float strings; with `RAW`, return raw little-endian FP32 bytes |
+| `VEMB` | `VEMB key element [RAW]` | Return the vector as doubles (dequantized for `Q8`; +1/-1 for `BIN`, as Redis); with `RAW`, Redis's array: the quantization (`f32`, `int8`, `bin`), the stored bytes (unit length; `BIN` in 64-bit words), the L2 norm, and for `int8` the range |
 | `VGETATTR` | `VGETATTR key element` | Return the JSON attributes string attached to an element; nil if none |
 | `VSETATTR` | `VSETATTR key element json` | Attach a JSON attributes string to an element; pass empty string `""` to remove; AOF-logged |
 
@@ -472,13 +472,13 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [FILTER expr] [FILTER-EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `FILTER` keeps the elements whose JSON attributes pass Redis's expression (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024, 2025]`, arithmetic, `not`, `**`); an element without a field it asks for does not pass. The search is exact, so `EF` and `FILTER-EF` change nothing; `ELE` queries by an existing element's vector; `WITHSCORES` gives each a similarity from the set's metric: for cosine, the default and Redis's only one, `(1 + cosine) / 2` as in Redis (1 the same direction, 0.5 at right angles, 0 opposite); for `IP` the dot product; for `L2` `1 / (1 + distance)` |
+| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [FILTER expr] [FILTER-EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `FILTER` keeps the elements whose JSON attributes pass Redis's expression (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024, 2025]`, arithmetic, `not`, `**`); an element without a field it asks for does not pass. The search is exact, so `EF` and `FILTER-EF` change nothing; `ELE` queries by an existing element's vector; `WITHSCORES` gives each a similarity from the set's metric: for cosine, the default and Redis's only one, `(1 + cosine) / 2` as in Redis (1 the same direction, 0.5 at right angles, 0 opposite); for `IP` the dot product; for `L2` `1 / (1 + distance)`. A `Q8` or `BIN` set quantizes the query as Redis does, so scores are Redis's to within 1e-6 (KiviDB computes the norm in f64, Redis in f32). Equal scores are ordered by element name. A query of another dimension than the set's is an error, as in Redis |
 
 ### Inspection and traversal
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VINFO` | `VINFO key` | Return metadata: `vector-dim`, `vector-count`, `quant-type` (always `f32`: vectors are kept at full precision, whatever `VADD` asked for), `index-type`, `max-level` |
+| `VINFO` | `VINFO key` | Return metadata: `vector-dim`, `vector-count`, `quant-type` (`f32`, `int8` or `bin`, as the set stores its vectors), `index-type`, `max-level` |
 | `VLINKS` | `VLINKS key element [WITHSCORES]` | Return nearest neighbours of an element (up to 16) as a single-layer array; approximated via brute-force cosine similarity |
 | `VRANDMEMBER` | `VRANDMEMBER key [count]` | Return random elements; positive count returns distinct elements up to set size; negative count returns `\|count\|` elements with repetition allowed |
 | `VRANGE` | `VRANGE key start end [count]` | Return elements in lexicographical range of element names; bounds follow ZRANGEBYLEX syntax: `[inclusive`, `(exclusive`, `-` for start, `+` for end |

@@ -1425,8 +1425,13 @@ where
             }
             if cmd_name == "PSYNC"
                 && !tx.active
-                && let Some(offer) =
-                    repl_state.psync_offer(&cluster_state, &client_registry, client_id, &cmd)
+                && let Some(offer) = repl_state.psync_offer(
+                    &cluster_state,
+                    &client_registry,
+                    client_id,
+                    &cmd,
+                    &store,
+                )
             {
                 combined.extend_from_slice(&offer);
                 parse_offset += consumed;
@@ -2673,6 +2678,9 @@ where
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                let vset_quant_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_vset_quant == Some(true));
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595).
                 client_registry.update(client_id, |info| {
@@ -2703,6 +2711,7 @@ where
                     buffer,
                     listening_port,
                     psync,
+                    vset_quant_announced,
                     kill_rx,
                 )
                 .await?;

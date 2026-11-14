@@ -669,6 +669,12 @@ async fn run_replication_session(
             .find_map(|line| line.strip_prefix("kividb_version:"))
             .map(|version| version.trim().to_string())
     });
+    // Asked only of a master whose `PSYNC` reply does not say.
+    let info_keeps_vset_quant = crate::replication::vset_quant_kept_by(master_info.as_deref());
+    // Unknown again until this master's `PSYNC` reply.
+    repl_state
+        .master_keeps_vset_quant
+        .store(false, Ordering::Relaxed);
     repl_state.master_dd_deletes.store(
         master_version
             .as_deref()
@@ -735,7 +741,15 @@ async fn run_replication_session(
     // of offering a sync: see `ClusterState::check_dataset_at_start`.
     send_command(
         &mut writer,
-        &["REPLCONF", "capa", "dataset-digest", "capa", "lost-data"],
+        &[
+            "REPLCONF",
+            "capa",
+            "dataset-digest",
+            "capa",
+            "lost-data",
+            "capa",
+            "vset-quant",
+        ],
     )
     .await?;
     let _ = guarded(
@@ -844,6 +858,25 @@ async fn run_replication_session(
         .first()
         .map(|s| s.trim_start_matches('+').to_ascii_uppercase())
         .unwrap_or_default();
+    // Before any of the stream is applied, logged or recorded.
+    let keeps_vset_quant = if crate::replication::psync_reply_keeps_vset_quant(&fullresync) {
+        true
+    } else {
+        let syncs = cmd0 == "FULLRESYNC" || cmd0 == "CONTINUE";
+        if syncs && !info_keeps_vset_quant {
+            log_info!(
+                "Replication: The master (KiviDB {}) did not offer vset-quant: this replica \
+                 stores its vector sets as f32, as an older master did",
+                master_version
+                    .as_deref()
+                    .unwrap_or("?, no INFO server answer")
+            );
+        }
+        info_keeps_vset_quant
+    };
+    repl_state
+        .master_keeps_vset_quant
+        .store(keeps_vset_quant, Ordering::Relaxed);
 
     // The stream as it will be read below: what has arrived and is not yet
     // applied, how many bytes have arrived in all, and which database the
@@ -1176,6 +1209,10 @@ async fn run_replication_session(
             offset: master_offset,
             db: 0,
         }));
+        // Nothing before this offset is continuable; an older watermark is another numbering.
+        repl_state
+            .vset_quant_dropped_until
+            .store(master_offset, Ordering::Relaxed);
         repl_state.set_stream_origin(repl_state.cluster_master_node());
         // Every key in it that this master expires is sent as a `DEL`, if
         // it sends them at all: nothing is left for a sweep.
@@ -1398,12 +1435,22 @@ async fn run_replication_session(
         let mut applied_commands = false;
         if pending_input {
             pending_input = false;
+            // Stored as the older master did; the backlog keeps raw bytes for offsets.
+            let keeps_vset_quant = repl_state.master_keeps_vset_quant.load(Ordering::Relaxed);
+            let mut dropped_vset_quant = false;
             // One command, a write the master sent as it is.
             macro_rules! apply {
                 ($cmd:expr) => {
                     repl_apply
                         .apply_command(
-                            $cmd,
+                            if keeps_vset_quant {
+                                $cmd
+                            } else {
+                                let (cmd, dropped) =
+                                    crate::vector::quant::without_quant_options($cmd);
+                                dropped_vset_quant |= dropped;
+                                cmd
+                            },
                             store,
                             repl_state,
                             index_store,
@@ -1555,6 +1602,11 @@ async fn run_replication_session(
                 head += parse_pos;
                 transaction_scanned = 0;
                 applied = offset - (repl_buf.len() - head) as u64;
+                if std::mem::take(&mut dropped_vset_quant) {
+                    repl_state
+                        .vset_quant_dropped_until
+                        .fetch_max(applied, Ordering::Relaxed);
+                }
                 repl_state.repl_offset.store(applied, Ordering::Relaxed);
                 if let Some(point) = repl_state.resync_point.lock().as_mut() {
                     point.offset = applied;
@@ -2398,6 +2450,8 @@ pub async fn handle_replica_connection<R, W>(
     listening_port: Option<u16>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
+    // It sent `REPLCONF capa vset-quant`.
+    vset_quant_announced: bool,
     // The connection's `CLIENT KILL` signal: it ends the link (#595).
     mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -2551,11 +2605,13 @@ where
     // The payload is not counted against `maxmemory` until it is written
     // (#284).
     let mut payload_not_counted = None;
+    // Outside the stream: offsets do not count it.
+    let word = repl_state.vset_quant_word(vset_quant_announced);
     match full_sync {
-        None => frames.push(format!("+CONTINUE {}\r\n", repl_state.repl_id()).into_bytes()),
+        None => frames.push(format!("+CONTINUE {}{word}\r\n", repl_state.repl_id()).into_bytes()),
         Some(sync) => {
             if !legacy_sync {
-                frames.push(sync.announcement(&repl_state.repl_id()).into_bytes());
+                frames.push(sync.announcement(&repl_state.repl_id(), word).into_bytes());
             }
             frames.push(format!("${}\r\n", sync.payload.len()).into_bytes());
             frames.push(sync.payload);

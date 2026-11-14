@@ -203,10 +203,20 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::VectorSet(arc) => {
             let inner = arc.read();
-            // Each entry: dim * 4 bytes (f32) + attrs string
-            let count = inner.entries.len();
-            let dim = inner.dim;
-            key_overhead + count * dim * 4 + 200
+            // Counts stored vector bytes, so quantized sets report less.
+            let elements = layout::sampled(inner.entries.len(), samples, || {
+                inner.entries.iter().map(|(name, entry)| {
+                    crate::key_bytes::KeyBytes::heap_bytes_of(name.as_bytes())
+                        + entry.vector.heap_bytes()
+                        + entry.attrs.as_ref().map_or(0, |a| a.len())
+                })
+            });
+            entry()
+                + layout::arc_of::<RwLock<crate::types::VectorSetInner>>()
+                + layout::std_hash_map::<crate::key_bytes::KeyBytes, crate::types::VSetEntry>(
+                    inner.entries.capacity(),
+                )
+                + elements
         }
 
         ValueRef::Array(arc) => {

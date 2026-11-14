@@ -72,6 +72,11 @@ pub struct ReplState {
     /// documents on the master. Set at each connection to a master, from the
     /// release it says it is (`INFO server`); see [`dd_deleted_by`].
     pub master_dd_deletes: AtomicBool,
+    /// Whether the current master stores `VADD` quantization; false until its `PSYNC` reply.
+    pub master_keeps_vset_quant: AtomicBool,
+    /// Master offset after the last stripped `VADD`; earlier continuations
+    /// would re-apply its options.
+    pub vset_quant_dropped_until: AtomicU64,
     /// Whether this replica's master sends a `DEL` (or `UNLINK`) for every
     /// key it expires, as KiviDB does since 1.1.3 and Redis always has. Then
     /// the replica deletes no expired key itself and waits for that `DEL`
@@ -504,6 +509,8 @@ impl ReplState {
             repl_stream_last_db: AtomicU64::new(u64::MAX),
             several_databases: AtomicBool::new(false),
             master_dd_deletes: AtomicBool::new(false),
+            master_keeps_vset_quant: AtomicBool::new(false),
+            vset_quant_dropped_until: AtomicU64::new(0),
             master_propagates_expiry: AtomicBool::new(true),
             expiry_sweep_owed: AtomicBool::new(true),
             master_propagates_field_expiry: AtomicBool::new(true),
@@ -1239,6 +1246,8 @@ impl ReplState {
             }
         }
         self.slave_mode.store(true, Ordering::Release);
+        // Unknown until this replica's handshake reads its master's INFO.
+        self.master_keeps_vset_quant.store(false, Ordering::Relaxed);
         *self.role.write() = "slave".into();
         // A `WAIT` waiting on this master's replicas ends now (see
         // `wait_for_replicas`).
@@ -1294,7 +1303,11 @@ impl ReplState {
         registry: &crate::client_registry::ClientRegistry,
         client_id: u64,
         cmd: &[&[u8]],
+        store: &crate::store::Store,
     ) -> Option<Vec<u8>> {
+        if let Some(refusal) = self.vset_quant_refusal(registry, client_id, cmd, store) {
+            return Some(refusal);
+        }
         if cluster.lost_dataset() && !self.is_slave() {
             let (mut stage, mut addr, mut port) = (0u8, String::new(), 0u16);
             registry.update(client_id, |info| {
@@ -1332,6 +1345,39 @@ impl ReplState {
             }
         }
         self.digest_offer(registry, client_id, cmd)
+    }
+
+    /// 1.2 replicas refuse Q8/BIN snapshots and retry forever; tell them why instead.
+    fn vset_quant_refusal(
+        &self,
+        registry: &crate::client_registry::ClientRegistry,
+        client_id: u64,
+        cmd: &[&[u8]],
+        store: &crate::store::Store,
+    ) -> Option<Vec<u8>> {
+        if self.is_slave() {
+            return None;
+        }
+        let mut reads = None;
+        registry.update(client_id, |info| reads = info.replica_vset_quant);
+        if reads != Some(false) {
+            return None;
+        }
+        let dropped = self.vset_quant_dropped_until.load(Ordering::Relaxed);
+        let continued = PsyncRequest::parse(cmd)
+            .is_some_and(|p| self.continues_stream(&p.repl_id, p.offset) && p.offset > dropped);
+        if continued || !crate::vector::quant::store_holds_quantized_set(store) {
+            return None;
+        }
+        let mut addr = String::new();
+        registry.update(client_id, |info| addr.clone_from(&info.addr));
+        log_throttled!(
+            60,
+            crate::loglevel::WARN,
+            "Replication: Not syncing replica {addr}: it is an older KiviDB, which cannot read \
+             the Q8 or BIN vector sets this master holds. Upgrade replicas before masters"
+        );
+        Some(VSET_QUANT_REFUSAL.as_bytes().to_vec())
     }
 
     /// The answer to a `PSYNC` that cannot be continued, from a replica that
@@ -1378,6 +1424,21 @@ impl ReplState {
     #[inline]
     pub fn is_slave(&self) -> bool {
         self.slave_mode.load(Ordering::Relaxed)
+    }
+
+    /// A master's stream keeps `VADD` quantization; a replica's only if its master's does.
+    pub fn keeps_vset_quant(&self) -> bool {
+        !hides_vset_quant_capability()
+            && (!self.is_slave() || self.master_keeps_vset_quant.load(Ordering::Relaxed))
+    }
+
+    /// What ends `+FULLRESYNC` or `+CONTINUE` for a replica that announced `vset-quant`.
+    pub fn vset_quant_word(&self, announced: bool) -> &'static str {
+        if announced && self.keeps_vset_quant() {
+            VSET_QUANT_WORD
+        } else {
+            ""
+        }
     }
 }
 
@@ -2273,6 +2334,51 @@ pub fn expiry_propagated_by(info: Option<&str>) -> bool {
     }
 }
 
+/// What a replica that cannot read quantized sets is told (see
+/// [`ReplState::vset_quant_refusal`]).
+pub const VSET_QUANT_REFUSAL: &str = "-ERR this master holds Q8 or BIN vector sets, which this \
+     replica's KiviDB release cannot read: upgrade the replica to KiviDB 1.3 or later\r\n";
+
+/// Says this node's stream keeps the quantization `VADD` asks for.
+pub const VSET_QUANT_INFO: &str = "kividb_vset_quantization:1";
+
+/// The capability a replica announces, and its master's `PSYNC` reply repeats.
+pub const VSET_QUANT_CAPA: &str = "vset-quant";
+
+/// Added to a `PSYNC` reply only for replicas announcing [`VSET_QUANT_CAPA`].
+const VSET_QUANT_WORD: &str = " vset-quant";
+
+/// Whether a `+FULLRESYNC` or `+CONTINUE` line says the stream keeps the options.
+pub fn psync_reply_keeps_vset_quant(reply: &str) -> bool {
+    // After the id and offset: neither can be this word.
+    reply
+        .split_whitespace()
+        .skip(1)
+        .any(|word| word == VSET_QUANT_CAPA)
+}
+
+/// Test only: `KIVIDB_TEST_NO_VSET_QUANT_CAPABILITY` acts as an older master.
+pub fn hides_vset_quant_capability() -> bool {
+    static HIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIDES.get_or_init(|| std::env::var_os("KIVIDB_TEST_NO_VSET_QUANT_CAPABILITY").is_some())
+}
+
+/// Without the `PSYNC` word: Redis keeps options; KiviDB 1.2, or no answer, drops them.
+pub fn vset_quant_kept_by(info: Option<&str>) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    let mut kividb = false;
+    for line in info.lines() {
+        let line = line.trim();
+        if line == VSET_QUANT_INFO {
+            return true;
+        }
+        kividb |= line.starts_with("kividb_version:");
+    }
+    !kividb
+}
+
 /// The line of `INFO server` by which a KiviDB master says it sends an
 /// `HDEL` (or a `DEL`) for every hash field it expires.
 pub const FIELD_EXPIRY_PROPAGATED_INFO: &str = "kividb_expired_fields_propagated:1";
@@ -2366,6 +2472,41 @@ mod expiry_version_tests {
         assert!(expiry_propagated_by(Some(&kividb("garbage"))));
         assert_eq!(uptime_in(redis), Some(5));
         assert_eq!(uptime_in(&kividb("1.1.2")), None);
+    }
+}
+
+#[cfg(test)]
+mod vset_quant_version_tests {
+    use super::{VSET_QUANT_INFO, psync_reply_keeps_vset_quant, vset_quant_kept_by};
+
+    #[test]
+    fn only_older_kividb_masters_drop_quantization() {
+        let old = "# Server\r\nredis_version:8.10.0\r\nkividb_version:1.2.1\r\n";
+        assert!(!vset_quant_kept_by(Some(old)));
+        assert!(vset_quant_kept_by(Some(&format!(
+            "{old}{VSET_QUANT_INFO}\r\n"
+        ))));
+        // Redis keeps what it is asked for.
+        assert!(vset_quant_kept_by(Some(
+            "# Server\r\nredis_version:8.10.3\r\n"
+        )));
+        // No answer: taken as an older master, which loses nothing.
+        assert!(!vset_quant_kept_by(None));
+    }
+
+    #[test]
+    fn the_psync_word_is_read_after_the_id() {
+        let id = "a".repeat(40);
+        for (reply, keeps) in [
+            (format!("+FULLRESYNC {id} 1234 vset-quant"), true),
+            (format!("+FULLRESYNC {id} 1234"), false),
+            (format!("+CONTINUE {id} vset-quant"), true),
+            (format!("+CONTINUE {id}"), false),
+            ("+CONTINUE".to_string(), false),
+            ("+vset-quant".to_string(), false),
+        ] {
+            assert_eq!(psync_reply_keeps_vset_quant(&reply), keeps, "{reply}");
+        }
     }
 }
 
@@ -3030,9 +3171,9 @@ pub struct FullSync {
 }
 
 impl FullSync {
-    /// The line that announces it.
-    pub fn announcement(&self, repl_id: &str) -> String {
-        format!("+FULLRESYNC {repl_id} {}\r\n", self.base)
+    /// The line that announces it; `word` from [`ReplState::vset_quant_word`].
+    pub fn announcement(&self, repl_id: &str, word: &str) -> String {
+        format!("+FULLRESYNC {repl_id} {}{word}\r\n", self.base)
     }
 }
 
@@ -3052,6 +3193,17 @@ pub async fn request_continuation(
     };
     if !repl_state.continues_stream(&psync.repl_id, psync.offset) {
         // It followed some other master.
+        repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
+        return Err(registration);
+    }
+    let dropped = repl_state.vset_quant_dropped_until.load(Ordering::Relaxed);
+    if psync.offset <= dropped {
+        // The backlog holds a `VADD` whose quantization was not applied here.
+        log_info!(
+            "Replication: Not continuing a replica from offset {}: the stream up to {dropped} \
+             holds a VADD whose quantization an older master ignored — syncing it in full",
+            psync.offset
+        );
         repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
         return Err(registration);
     }
@@ -3435,7 +3587,10 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
         note_group_write(ctx.aof_enabled);
     }
 
-    for payload_bytes in payloads {
+    // The command is the last payload; a `SELECT` may come first.
+    let marked = ctx.aof_enabled && crate::vector::quant::carries_quant_option(parts);
+    let count = payloads.len();
+    for (n, payload_bytes) in payloads.into_iter().enumerate() {
         if tapped {
             ctx.repl_state.feed_taps(&payload_bytes);
         }
@@ -3462,8 +3617,14 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
             }
         }
         if ctx.aof_enabled {
-            crate::aof::AOF_WRITTEN.fetch_add(enc_len, std::sync::atomic::Ordering::Relaxed);
-            crate::aof::queue_record(ctx.aof_tx, raw_opt.take().expect("encoded for AOF path"));
+            let mut record = raw_opt.take().expect("encoded for AOF path");
+            // In the same record, so no crash separates them. AOF only.
+            if marked && n + 1 == count {
+                record.extend_from_slice(crate::aof::VSET_QUANT_MARKER);
+            }
+            crate::aof::AOF_WRITTEN
+                .fetch_add(record.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::aof::queue_record(ctx.aof_tx, record);
         }
     }
     // Only advance after bytes are emitted: writes that ran with no replicas must not
@@ -3788,6 +3949,10 @@ fn append_to_own_aof(
     let mut combined = Vec::new();
     for p in payloads {
         combined.extend_from_slice(&p);
+    }
+    // `parts` as applied: options a non-keeping master sent are gone already.
+    if crate::vector::quant::carries_quant_option(parts) {
+        combined.extend_from_slice(crate::aof::VSET_QUANT_MARKER);
     }
     crate::aof::AOF_WRITTEN.fetch_add(combined.len() as u64, Ordering::Relaxed);
     crate::aof::queue_record(ctx.aof_tx, combined);
