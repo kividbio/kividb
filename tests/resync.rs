@@ -177,6 +177,53 @@ fn free_port() -> u16 {
     }
 }
 
+/// The process id of the server `c` is connected to, if it says (`INFO`
+/// may be refused, as before `AUTH`).
+fn answering_pid(c: &mut Conn) -> Option<u32> {
+    match c.cmd(&["INFO", "server"]) {
+        V::Str(info) => info
+            .lines()
+            .find_map(|l| l.strip_prefix("process_id:"))
+            .and_then(|pid| pid.trim().parse().ok()),
+        _ => None,
+    }
+}
+
+/// Start a server with `spawn` on `port`, or on another free port if that
+/// one is taken, and connect to it, and to no other process. A port is free
+/// between a server's exit and its restart, and another test's server can be
+/// started on it then (under `cargo nextest` many start at once): the
+/// restarted one cannot listen, and a client that only connected read the
+/// other's empty dataset as what the restart had loaded.
+fn start_verified(mut spawn: impl FnMut(u16) -> Child, port: u16) -> (Child, Conn) {
+    let mut port = port;
+    for _ in 0..10 {
+        let mut child = spawn(port);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let answered = loop {
+            if child.try_wait().unwrap().is_some() {
+                // It could not take the port.
+                break None;
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                let mut c = Conn::connect(port);
+                break Some((answering_pid(&mut c), c));
+            }
+            assert!(Instant::now() < deadline, "no server came up on {port}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        match answered {
+            Some((Some(pid), c)) if pid == child.id() => return (child, c),
+            Some((pid, _)) => eprintln!("port {port} is answered by {pid:?}, not by the server started on it"),
+            None => eprintln!("the server could not take port {port}"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        port = free_port();
+    }
+    panic!("no port could be had for the server");
+}
+
 fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
     kividb_with(dir, port, extra, &[])
 }
@@ -266,7 +313,18 @@ impl Server {
 
     fn restart(&mut self) {
         self.child = kividb_with(&self.dir, self.port, &self.args, &self.env);
-        assert_eq!(self.conn().cmd(&["PING"]).s(), "PONG");
+        let mut c = self.conn();
+        // Not another test's server, started on the port while this one was
+        // down: what that one holds says nothing about this one.
+        if let Some(pid) = answering_pid(&mut c) {
+            assert_eq!(
+                pid,
+                self.child.id(),
+                "port {} is answered by another process than the restarted server",
+                self.port
+            );
+        }
+        assert_eq!(c.cmd(&["PING"]).s(), "PONG");
     }
 }
 
@@ -1562,7 +1620,7 @@ fn sigterm_waits_for_the_final_snapshot() {
     let dir = tempfile::tempdir().unwrap().keep();
     let port = free_port();
     let log = std::fs::File::create(dir.join("server.log")).unwrap();
-    let spawn = |dir: &Path| {
+    let spawn = |dir: &Path, port: u16| {
         Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(dir)
             .args([
@@ -1581,8 +1639,8 @@ fn sigterm_waits_for_the_final_snapshot() {
             .spawn()
             .expect("could not start kividb")
     };
-    let mut child = spawn(&dir);
-    let mut c = Conn::connect(port);
+    let (mut child, mut c) = start_verified(|port| spawn(&dir, port), port);
+    let port = c.reader.get_ref().peer_addr().unwrap().port();
 
     // Enough that writing it out takes a moment.
     let value = "v".repeat(200);
@@ -1641,10 +1699,9 @@ fn sigterm_waits_for_the_final_snapshot() {
         "the process ended before its snapshot was written:\n{output}"
     );
 
-    // And what it saved is everything.
-    let mut child = spawn(&dir);
-    let mut c = Conn::connect(port);
-    assert_eq!(c.cmd(&["DBSIZE"]).i(), total as i64);
+    // And what it saved is everything, as the restarted server says.
+    let (mut child, mut c) = start_verified(|port| spawn(&dir, port), port);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), total as i64, "{}", std::fs::read_to_string(dir.join("server.log")).unwrap());
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
