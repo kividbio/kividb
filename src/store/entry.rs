@@ -984,6 +984,12 @@ impl Slot {
         Slot(self.0 & !ADDRESS | at)
     }
 
+    /// The slot's bits, for tests that check one is unchanged.
+    #[cfg(test)]
+    pub(super) fn raw(self) -> u64 {
+        self.0
+    }
+
     /// The fragment of this slot's key's hash, as a hash that has it: what
     /// a slot for another entry of the same key is made with.
     #[inline]

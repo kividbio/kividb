@@ -434,7 +434,7 @@ pub fn active_expire_cycle(
             // looks only at those (#618): before, every cycle went over every
             // key with a time to live, due or not.
             if read_lock!(db_values[shard]).ttl_sweep_due(now) {
-                while !write_lock!(db_values[shard]).sweep_ttl(now, TTL_SWEEP_STEPS) {}
+                db_values[shard].sweep_ttl(now, TTL_SWEEP_STEPS);
             }
             // A batch at a time: a pass stops at the batch's last key, so it
             // copies no more keys than it deletes. Collecting every due key
@@ -638,11 +638,13 @@ const SHRINK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Shrink the tables, and lists of keys with a time to live, of `cursor`'s
 /// shards that keys have mostly left ([`store::ShardLock::shrink_if_sparse`],
-/// #113).
+/// #113), and finish the growth of those growing
+/// ([`store::ShardLock::step_growth`], #752).
 fn shrink_sparse_tables(store: &Store, cursor: &ExpireCursor) {
     for db in store.iter() {
         for (s, shard) in db.iter().enumerate() {
             if cursor.owns(s) {
+                shard.step_growth();
                 shard.shrink_if_sparse();
             }
         }

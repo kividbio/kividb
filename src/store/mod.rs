@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use ahash::AHashSet;
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
 mod access;
@@ -176,6 +176,9 @@ pub struct ShardLock {
     /// done about keys past their time that a write puts a value over
     /// (`expiry::written_over`).
     place: std::sync::OnceLock<(usize, usize)>,
+    /// The table's layout (`ShardMap::layout`) when [`ShardLock::step_growth`]
+    /// last looked: whether writes have moved a growth on since.
+    growth_seen: AtomicU64,
 }
 
 /// How long [`ShardLock::write_after_spinning`] looks for a busy shard to
@@ -268,6 +271,7 @@ impl ShardLock {
             keys: AtomicUsize::new(map.len()),
             map: RwLock::new(map),
             place: std::sync::OnceLock::new(),
+            growth_seen: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -422,7 +426,68 @@ impl ShardLock {
         m.shrink_to(keep);
         true
     }
+
+    /// Finish the growth of a table that writes have stopped moving on
+    /// (`ShardMap::make_room`): so that it ends, and looks that miss stop
+    /// looking in two tables, when the writes to the shard stop. Called on
+    /// each shard about once a second, with the shrinking. Returns whether
+    /// the table was growing.
+    ///
+    /// A table that writes moved on since the last call is left to them:
+    /// this thread taking the shard's lock again and again, as a write
+    /// lets go of it, is what made writes wait. Taken in turns of
+    /// [`GROWTH_BACKGROUND_STEP`] keys, each handed straight to a writer
+    /// waiting for the shard, if there is one: the loop would otherwise
+    /// take it again before the writer woke up, and a pipeline of writes
+    /// waited for the whole growth, 12 ms a shard of 230,000 keys (#752).
+    pub fn step_growth(&self) -> bool {
+        let layout = {
+            let map = self.read();
+            if !map.is_growing() {
+                return false;
+            }
+            map.layout()
+        };
+        if self.growth_seen.swap(layout, Ordering::Relaxed) != layout {
+            return true;
+        }
+        loop {
+            // Not `write`: moving keys changes no count a writer leaves,
+            // and leaves nothing to announce.
+            let mut map = self.map.write();
+            let done = map.step_growth(GROWTH_BACKGROUND_STEP);
+            parking_lot::RwLockWriteGuard::unlock_fair(map);
+            if done {
+                return true;
+            }
+        }
+    }
 }
+
+impl ShardLock {
+    /// [`ShardMap::sweep_ttl`] until the sweep is done, `steps` keys for
+    /// each hold of the lock, each handed straight to a writer waiting for
+    /// the shard, if there is one. The expiry thread took the lock back
+    /// before the writer it woke could, again and again: every 20 s, a
+    /// pipeline of writes to a shard of 550,000 keys with a time to live
+    /// waited for the whole sweep, and a `PING` on another connection up
+    /// to 40 ms (#752). Moving keys between the list's parts changes no
+    /// count a writer leaves, and leaves nothing to announce.
+    pub fn sweep_ttl(&self, now: u64, steps: usize) {
+        loop {
+            let mut map = self.map.write();
+            let done = map.sweep_ttl(now, steps);
+            parking_lot::RwLockWriteGuard::unlock_fair(map);
+            if done {
+                return;
+            }
+        }
+    }
+}
+
+/// Keys [`ShardLock::step_growth`] moves for each hold of a shard's lock:
+/// tens of microseconds.
+const GROWTH_BACKGROUND_STEP: usize = 512;
 
 impl Default for ShardLock {
     fn default() -> Self {
@@ -661,6 +726,32 @@ mod flush_tests {
             let m = s.read();
             (len + m.len(), cap + m.capacity())
         })
+    }
+
+    /// A growth in steps that writes stop in the middle of is finished by
+    /// the expiry thread's sweep; one that writes move on is left to them
+    /// (#752).
+    #[test]
+    fn a_growth_writes_leave_is_finished_in_the_background() {
+        let shard = ShardLock::new(ShardMap::new());
+        let mut n = 0;
+        while !shard.read().is_growing() {
+            shard.write().insert(format!("k{n}").as_str(), val());
+            n += 1;
+        }
+        // The first look: moved on since (by the write that began it).
+        assert!(shard.step_growth());
+        assert!(shard.read().is_growing());
+        // Moved on by a write since the last look: left to the writes.
+        shard.write().insert("one more", val());
+        n += 1;
+        assert!(shard.step_growth());
+        assert!(shard.read().is_growing());
+        // No write since: finished.
+        assert!(shard.step_growth());
+        assert!(!shard.read().is_growing());
+        assert_eq!(shard.read().len(), n);
+        assert!(!shard.step_growth());
     }
 
     /// The bug this guards: `clear()` empties a shard but keeps its bucket array
