@@ -53,8 +53,10 @@ you already use carry over, under the same names.
 directive KiviDB doesn't know stops the server, with an error naming it.
 Start from KiviDB's own file and carry over the settings you changed.
 Directives for machinery KiviDB doesn't have (`io-threads`, `hz`,
-`tcp-keepalive`, `lazyfree-*`, `rdbcompression` and similar) are accepted
-with a warning and do nothing.
+`tcp-keepalive`, `lazyfree-lazy-eviction`, `rdbcompression` and similar)
+are accepted with a warning and do nothing. `lazyfree-lazy-expire` and
+`lazyfree-lazy-user-del` are in effect: `lazyfree-lazy-user-del yes` makes
+`DEL` free a large value in the background, as `UNLINK` does.
 
 The ones that behave differently:
 
