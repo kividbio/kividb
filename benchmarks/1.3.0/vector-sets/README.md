@@ -170,5 +170,6 @@ Kernels, from `cargo test --release --lib simd::tests::int_timing -- --ignored -
 - **VADD Q8** is back to the f32 rate. What is left of quantizing, in Q8 and BIN alike, is the f64 norm: summed
   in order so it is the same bits on every CPU (a sequential chain of 768 additions), then one f64 division per
   component. Summing in lanes would be faster but would change the last bit of stored norms and values.
-- **Regression gate** (for suite 09 once it carries one): `q8_768_10k` `vsim_qps` at least 2x `f32_768_10k`'s in
-  the same run (measured 3.8x), so a lost kernel shows however the VM's absolute speed moves.
+- **Regression gate:** suite 09 of `../regressions` gates `q8_768_10k` `vsim_qps` on keeping 60% of its gain over
+  v1.2.2's f32 search in the same run (recorded 3.67x, so at least 2.2x), so a lost kernel shows however the VM's
+  absolute speed moves.

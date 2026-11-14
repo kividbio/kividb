@@ -3352,18 +3352,22 @@
       "unit": "q/s",
       "better": "higher",
       "recorded": {
-        "v1_2_2": 1109.0,
-        "candidate": 986.1,
-        "redis": 7876.9,
+        "v1_2_2": 678.6,
+        "candidate": 2493.0,
+        "redis": 6731.8,
         "vm": "Standard_D4s_v5",
         "date": "2026-11-14",
-        "commit": "d66f0f93",
-        "label": "master-d66f0f93-d4s_v5-part2-09"
+        "commit": "9501caa6",
+        "label": "simd-9501caa6-d4s_v5-09"
       },
       "gate": [
         {
           "kind": "rel",
           "pct": 25
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
         }
       ]
     },
