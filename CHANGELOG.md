@@ -115,6 +115,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An atomic slot import that does not complete keeps the keys the node
+  held of those slots before it (#745).** A canceled, failed or timed-out
+  `CLUSTER MIGRATION IMPORT` deleted every key of its slots on the
+  importing node, the orphans it held before the import with them (#517),
+  which may be the only copy. The node now notes those keys before it asks
+  the source for anything and deletes only the keys the import brought. A
+  restart part way, or more than a million keys (or 64 MiB of names) held
+  before, leaves every key of a slot it held keys of before, which
+  `CLUSTER ORPHANSLOTS` lists and `CLUSTER DROPORPHANS` cleans up. If the
+  slot is given to the node while that cleanup runs, the brought keys it
+  has not reached stay, as live data of the slot.
+
 - **A master reports the keys it holds of slots it does not serve, and
   `CLUSTER DROPORPHANS` deletes them (#517).** A replica promoted after its
   master crashed right after a `CLUSTER MIGRATION IMPORT` handover kept the

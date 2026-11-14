@@ -163,6 +163,101 @@ pub struct Task {
     /// When the task ended, on the monotonic clock (`end_time_ms` is the
     /// wall clock's, for `CLUSTER MIGRATION STATUS`).
     pub ended_at: Option<Instant>,
+    /// Import only: the keys this node held of the slots before the source
+    /// was first asked to send any, noted then. An import that does not
+    /// complete deletes only the others: those it brought (#745). Let go
+    /// of when the task ends ([`Registry::finish`]).
+    pub held_before: Arc<Mutex<Held>>,
+}
+
+/// [`Task::held_before`].
+#[derive(Default, Clone)]
+pub enum Held {
+    /// Not noted yet: the source has not been asked for anything.
+    #[default]
+    NotYet,
+    Noted(Arc<HeldBefore>),
+    /// The task has ended, and no longer needs them.
+    Released,
+}
+
+impl Task {
+    /// The keys held before the import, once noted and until it ends.
+    fn held(&self) -> Held {
+        self.held_before.lock().clone()
+    }
+}
+
+/// At most this many keys held before an import are noted by name, or
+/// [`HELD_BEFORE_MAX_BYTES`] bytes of names; past either, every key of the
+/// import's slots that had any is kept if it does not complete.
+const HELD_BEFORE_MAX_KEYS: usize = 1 << 20;
+const HELD_BEFORE_MAX_BYTES: usize = 64 << 20;
+
+/// The keys a node held of the slots of an import before the source was
+/// first asked to send any (see [`Task::held_before`]). Orphans, mostly:
+/// keys of a slot it lost, or that its old master handed over, and a copy
+/// of which the owner may not have (#517).
+#[derive(Default)]
+pub struct HeldBefore {
+    keys: std::collections::HashSet<crate::store::Key>,
+    /// The slots of those keys, in order.
+    slots: Vec<u16>,
+    /// There were too many to note by name ([`HELD_BEFORE_MAX_KEYS`]):
+    /// `keys` is empty, and every key of `slots` is kept.
+    whole: bool,
+}
+
+impl HeldBefore {
+    /// The keys `store` holds of `ranges` now.
+    fn note(store: &crate::store::Store, ranges: &[(u16, u16)]) -> Self {
+        Self::note_at_most(store, ranges, HELD_BEFORE_MAX_KEYS, HELD_BEFORE_MAX_BYTES)
+    }
+
+    /// [`Self::note`], at most `max_keys` keys or `max_bytes` bytes of
+    /// names by name.
+    fn note_at_most(
+        store: &crate::store::Store,
+        ranges: &[(u16, u16)],
+        max_keys: usize,
+        max_bytes: usize,
+    ) -> Self {
+        let mut held = HeldBefore::default();
+        let Some(db) = store.first() else {
+            return held;
+        };
+        let mut bytes = 0usize;
+        let mut slots = vec![false; super::CLUSTER_SLOTS];
+        let holds = crate::store::shards_of_slots(db.len(), |slot| in_ranges(ranges, slot));
+        for (shard, _) in db.iter().zip(holds).filter(|(_, holds)| *holds) {
+            let shard = crate::read_lock!(shard);
+            for key in shard.keys() {
+                let slot = key_hash_slot(key);
+                if !in_ranges(ranges, slot) {
+                    continue;
+                }
+                slots[slot as usize] = true;
+                if held.whole {
+                    continue;
+                }
+                bytes += key.len();
+                if held.keys.len() >= max_keys || bytes > max_bytes {
+                    held.whole = true;
+                    held.keys = Default::default();
+                    continue;
+                }
+                held.keys.insert(crate::store::Key::new(key));
+            }
+        }
+        held.slots = (0..super::CLUSTER_SLOTS as u16)
+            .filter(|&slot| slots[slot as usize])
+            .collect();
+        held
+    }
+
+    fn has_slot(&self, slot: u16) -> bool {
+        self.slots.binary_search(&slot).is_ok()
+    }
 }
 
 /// This node's migration tasks, running and recently finished.
@@ -218,16 +313,21 @@ impl Registry {
     }
 
     fn finish(&self, id: &str, state: TaskState, error: Option<String>) {
+        let mut released = Held::Released;
         self.update(id, |task| {
             if task.state == TaskState::InProgress {
                 task.state = state;
                 task.end_time_ms = now_ms();
                 task.ended_at = Some(Instant::now());
+                // Up to a million names, not to be kept with the task (one
+                // of the last 64): let go of, out of the lock.
+                std::mem::swap(&mut *task.held_before.lock(), &mut released);
                 if let Some(error) = error {
                     task.last_error = error;
                 }
             }
         });
+        drop(released);
     }
 
     /// The destination's side of `TAKEOVER`, from client `client_id`: begin
@@ -419,6 +519,18 @@ fn ranges_overlap(a: &[(u16, u16)], b: &[(u16, u16)]) -> bool {
 
 fn slots_of(ranges: &[(u16, u16)]) -> impl Iterator<Item = u16> + '_ {
     ranges.iter().flat_map(|(start, end)| *start..=*end)
+}
+
+/// `slots`, in order and once each, as ranges.
+fn slot_runs(slots: impl IntoIterator<Item = u16>) -> Ranges {
+    let mut runs: Ranges = Vec::new();
+    for slot in slots {
+        match runs.last_mut() {
+            Some((_, end)) if slot == *end + 1 => *end = slot,
+            _ => runs.push((slot, slot)),
+        }
+    }
+    runs
 }
 
 /// `0-1000 2000-3000`
@@ -1628,6 +1740,7 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
         attempt_floor: Arc::new(AtomicU64::new(0)),
         taking_over: false,
         ended_at: None,
+        held_before: Arc::default(),
     })?;
 
     let id = task_id.to_string();
@@ -2181,6 +2294,7 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
         attempt_floor: Arc::new(AtomicU64::new(0)),
         taking_over: false,
         ended_at: None,
+        held_before: Arc::default(),
     })?;
 
     save_imports(cluster);
@@ -2234,6 +2348,15 @@ fn single_owner(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<NodeId,
 // Only the atomic import's: keys moved here by MIGRATE (key by key) were
 // deleted at the source as they left, and are the only copy. Those Redis
 // keeps, and so does this.
+//
+// Nor the keys this node held of a slot before the import: orphans, of
+// which the owner may have no copy (#517, #745). Their names are not kept on
+// disk, so a slot that had any is written down after the word `keep`, and
+// at startup all its keys are left, the import's with them: `CLUSTER
+// ORPHANSLOTS` lists them, and `CLUSTER DROPORPHANS` deletes those the
+// owner has. Until the keys held are noted, every slot of the import is
+// one to keep: the source has not been asked for anything yet. An earlier
+// version reads such a line as no import at all, and leaves its keys too.
 
 /// `<cluster-config-file>.imports`.
 fn imports_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
@@ -2245,16 +2368,42 @@ fn imports_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
 }
 
 /// Write down the ranges of the imports under way (none: remove the file).
+///
+/// One writer at a time, from the look at the tasks to the rename: the
+/// import threads, `CLUSTER MIGRATION IMPORT` and a `TAKEOVER` each write
+/// the file, and a look taken before another task changed, written after
+/// it, would put back what it replaced (a slot's `keep` lost, its keys
+/// deleted at the next startup), as two writes of the temporary file at
+/// once could leave half a line. The file is on disk before it replaces
+/// the old one.
 fn save_imports(cluster: &ClusterState) {
+    static WRITING: Mutex<()> = Mutex::new(());
     let Some(path) = imports_path(cluster) else {
         return;
     };
+    let _one = WRITING.lock();
     let lines: Vec<String> = cluster
         .slot_migrations
         .all()
         .iter()
         .filter(|t| t.operation == Operation::Import && t.state == TaskState::InProgress)
-        .map(|t| format!("{} {}", t.id, ranges_text(&t.ranges)))
+        .map(|t| {
+            // Released: the task ended since the look; all kept meanwhile.
+            let keep = match t.held() {
+                Held::Noted(held) => slot_runs(held.slots.iter().copied()),
+                Held::NotYet | Held::Released => t.ranges.clone(),
+            };
+            if keep.is_empty() {
+                format!("{} {}", t.id, ranges_text(&t.ranges))
+            } else {
+                format!(
+                    "{} {} keep {}",
+                    t.id,
+                    ranges_text(&t.ranges),
+                    ranges_text(&keep)
+                )
+            }
+        })
         .collect();
     let written = if lines.is_empty() {
         match std::fs::remove_file(&path) {
@@ -2265,7 +2414,16 @@ fn save_imports(cluster: &ClusterState) {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = std::path::PathBuf::from(tmp);
-        std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|()| std::fs::rename(&tmp, &path))
+        write_synced(&tmp, (lines.join("\n") + "\n").as_bytes())
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map(|()| {
+                // The rename too, where the system allows it.
+                if let Some(dir) = path.parent()
+                    && let Ok(dir) = std::fs::File::open(dir)
+                {
+                    let _ = dir.sync_all();
+                }
+            })
     };
     if let Err(e) = written {
         log_warn!(
@@ -2275,8 +2433,34 @@ fn save_imports(cluster: &ClusterState) {
     }
 }
 
+/// `bytes` written to a new `path`, and on disk.
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// One line of the imports file: the import's ranges, and those of its
+/// slots whose keys are all to be kept (see above). `None` if it is not one.
+fn parse_import_line(line: &str) -> Option<(Ranges, Ranges)> {
+    fn ranges_of(words: &[&str]) -> Option<Ranges> {
+        let parts: Vec<&[u8]> = words
+            .iter()
+            .flat_map(|r| r.split('-'))
+            .map(str::as_bytes)
+            .collect();
+        parse_ranges(&parts).ok()
+    }
+    let words: Vec<&str> = line.split_whitespace().skip(1).collect();
+    match words.iter().position(|&w| w == "keep") {
+        None => Some((ranges_of(&words)?, Vec::new())),
+        Some(at) => Some((ranges_of(&words[..at])?, ranges_of(&words[at + 1..])?)),
+    }
+}
+
 /// At startup: delete the keys of the imports that were under way when this
-/// node went down, in the slots it does not own (#108). Then forget them.
+/// node went down, in the slots it does not own (#108), but for the slots
+/// it held keys of before the import (#745). Then forget them.
 pub(crate) fn drop_unfinished_imports(cluster: &ClusterState) {
     let Some(path) = imports_path(cluster) else {
         return;
@@ -2286,21 +2470,35 @@ pub(crate) fn drop_unfinished_imports(cluster: &ClusterState) {
     };
     let me = cluster.myself();
     let mut cut_short: Vec<u16> = Vec::new();
+    let mut kept: Vec<u16> = Vec::new();
     for line in text.lines() {
-        let mut words = line.split_whitespace();
-        let _task = words.next();
-        let ranges: Vec<&[u8]> = words
-            .flat_map(|r| r.split('-'))
-            .map(str::as_bytes)
-            .collect();
-        let Ok(ranges) = parse_ranges(&ranges) else {
+        // A line it cannot read is left: its keys stay.
+        let Some((ranges, keep)) = parse_import_line(line) else {
             continue;
         };
         let slots = cluster.slots.read();
-        cut_short.extend(slots_of(&ranges).filter(|&s| slots[s as usize] != Some(me)));
+        for slot in slots_of(&ranges).filter(|&s| slots[s as usize] != Some(me)) {
+            if in_ranges(&keep, slot) {
+                kept.push(slot);
+            } else {
+                cut_short.push(slot);
+            }
+        }
     }
+    kept.sort_unstable();
+    kept.dedup();
     cut_short.sort_unstable();
     cut_short.dedup();
+    cut_short.retain(|slot| kept.binary_search(slot).is_err());
+    if !kept.is_empty() {
+        log_warn!(
+            "Cluster: {} slot(s) were being imported when this node stopped, of which it \
+             held keys before the import: all their keys are left, as they may be the only \
+             copy. CLUSTER ORPHANSLOTS lists them, and CLUSTER DROPORPHANS deletes those \
+             their owner has",
+            kept.len()
+        );
+    }
     if !cut_short.is_empty() {
         log_info!(
             "Cluster: {} slot(s) were being imported when this node stopped; \
@@ -2379,6 +2577,42 @@ fn run_import(env: Env, task_id: String) {
                 let slots: Vec<u16> = slots_of(&task.ranges).collect();
                 let _ = delete_before_coming(&env, &slots, "an atomic import", Some(&task.id));
                 env.cluster.slot_deletions.came_here(slots);
+                // The keys left are this node's from before the import:
+                // noted at the first attempt, before the source is asked
+                // for any, and kept if the import does not complete (#745).
+                // Not again later: an earlier attempt may have left some of
+                // its own.
+                if matches!(task.held(), Held::NotYet) {
+                    let held = HeldBefore::note(&env.store, &task.ranges);
+                    if held.whole {
+                        log_warn!(
+                            "Cluster: this node holds more than {HELD_BEFORE_MAX_KEYS} key(s), \
+                             or {} MiB of names, of {} of the slots it is to import ({}): too \
+                             many to note; if the import does not complete, every key of those \
+                             slots is kept, what it brought too (CLUSTER DROPORPHANS deletes \
+                             those the owner has)",
+                            HELD_BEFORE_MAX_BYTES >> 20,
+                            held.slots.len(),
+                            ranges_text(&task.ranges)
+                        );
+                    } else if !held.slots.is_empty() {
+                        log_info!(
+                            "Cluster: this node holds {} key(s) of {} of the slots it is to \
+                             import ({}); kept if the import does not complete",
+                            held.keys.len(),
+                            held.slots.len(),
+                            ranges_text(&task.ranges)
+                        );
+                    }
+                    {
+                        // Not once the task has ended meanwhile.
+                        let mut slot = task.held_before.lock();
+                        if matches!(*slot, Held::NotYet) {
+                            *slot = Held::Noted(Arc::new(held));
+                        }
+                    }
+                    save_imports(&env.cluster);
+                }
                 import_attempt(&env, &task, source)
             }
         };
@@ -2461,9 +2695,22 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
 }
 
 /// Discard the keys of an import that did not complete — but never the keys
-/// of slots this node has come to own or imports otherwise, nor any on a
-/// node that has become a replica, whose keys are its master's (see
-/// [`OwnDataset`]).
+/// this node held of its slots before it (#745), nor the keys of slots this
+/// node has come to own or imports otherwise, nor any on a node that has
+/// become a replica, whose keys are its master's (see [`OwnDataset`]).
+///
+/// The keys held before are orphans: of a slot this node lost, or that its
+/// old master handed over (#517). They may be the only copy, and stay:
+/// `CLUSTER DROPORPHANS` deletes those their owner has. A key of the same
+/// name the import wrote over stays too, as the source sent it. A slot that
+/// had none has all its keys deleted, as before; one that had some is
+/// cleaned key by key, as a confirmed deletion (`DeleteRun::begin_as`): a
+/// command that gives this node the slot meanwhile leaves the keys, as it
+/// does those of a `CLUSTER DROPORPHANS`, instead of deleting them all: the
+/// keys the import brought that the deletion had not reached by then stay,
+/// live data of the slot, as the source sent them. Too many keys held to
+/// note ([`HeldBefore::whole`]): every key of the slots that had any stays,
+/// as after a restart part way, for `CLUSTER DROPORPHANS`.
 fn delete_unowned(env: &Env, task: &Task) {
     if env.cluster.my_master_id().is_some() {
         return;
@@ -2471,20 +2718,66 @@ fn delete_unowned(env: &Env, task: &Task) {
     let Some(own) = OwnDataset::now(&env.repl_state) else {
         return;
     };
-    let mut run = DeleteRun::begin(&env.cluster, slots_of(&task.ranges), Some(&task.id));
-    if !run.deletes_any() {
+    // Not noted: the source was never asked to send anything, and every key
+    // this node has of the slots is one it had.
+    let Held::Noted(held) = task.held() else {
         return;
+    };
+    let (keep, all): (Vec<u16>, Vec<u16>) =
+        slots_of(&task.ranges).partition(|&slot| held.has_slot(slot));
+    if held.whole && !keep.is_empty() {
+        log_warn!(
+            "Cluster: an import that did not complete: kept every key of {} slot(s) of it \
+             ({}), what it brought too: this node held too many of them before it to note; \
+             CLUSTER ORPHANSLOTS lists them, and CLUSTER DROPORPHANS deletes those the owner has",
+            keep.len(),
+            ranges_text(&task.ranges)
+        );
     }
-    let deleted = delete_keys(
-        &env.store,
-        &env.repl_state,
-        &env.hub_tx,
-        &mut run,
-        own,
-        || {},
-        || {},
-    );
-    log_deletion("an import that did not complete", &deleted);
+    let keep = if held.whole { Vec::new() } else { keep };
+    if !all.is_empty() {
+        let mut run = DeleteRun::begin(&env.cluster, all, Some(&task.id));
+        if run.deletes_any() {
+            let deleted = delete_keys(
+                &env.store,
+                &env.repl_state,
+                &env.hub_tx,
+                &mut run,
+                own,
+                || {},
+                || {},
+            );
+            log_deletion("an import that did not complete", &deleted);
+        }
+    }
+    if !keep.is_empty() {
+        let mut run = DeleteRun::begin_as(&env.cluster, keep, Some(&task.id), true);
+        if !run.deletes_any() {
+            return;
+        }
+        let mut brought = |chunk: &[crate::store::Key]| -> Result<Vec<bool>, String> {
+            Ok(chunk.iter().map(|k| !held.keys.contains(k)).collect())
+        };
+        let deleted = delete_keys_confirmed(
+            &env.store,
+            &env.repl_state,
+            &env.hub_tx,
+            &mut run,
+            own,
+            || {},
+            || {},
+            Some(&mut brought),
+        );
+        log_deletion("an import that did not complete", &deleted);
+        log_info!(
+            "Cluster: an import that did not complete: deleted {} key(s) it brought, and \
+             kept {} this node held before it, in {} slot(s) ({})",
+            deleted.removed,
+            deleted.kept,
+            held.slots.len(),
+            ranges_text(&task.ranges)
+        );
+    }
 }
 
 /// `CLUSTER SYNCSLOTS APPLY`, on the destination, from client `client_id`:
@@ -2809,6 +3102,7 @@ mod tests {
             attempt_floor: Arc::new(AtomicU64::new(0)),
             taking_over: false,
             ended_at: None,
+            held_before: Arc::default(),
         }
     }
 
@@ -3538,6 +3832,8 @@ mod tests {
     #[test]
     fn an_import_that_did_not_complete_is_deleted_on_a_master_only() {
         let import = task("in", vec![(LOST, LOST)]);
+        // The old keys play the import's: none were here before it.
+        *import.held_before.lock() = Held::Noted(Arc::default());
         let lost = Lost::new();
         lost.repl_state.become_slave();
         delete_unowned(&lost.env(), &import);
@@ -3560,6 +3856,189 @@ mod tests {
         lost.cluster.slot_migrations.add(import.clone()).unwrap();
         delete_unowned(&lost.env(), &import);
         assert_eq!(lost.old_keys_left(), 0);
+    }
+
+    /// An import that did not complete deletes only the keys it brought.
+    /// The keys this node held of the slot before it, orphans that may be
+    /// the only copy (#517), used to be deleted with them (#745). They
+    /// stay, and so does one the import wrote over, as the source sent it.
+    /// A slot of the import of which it held none has all its keys deleted,
+    /// as before; and an import whose source was never asked to send
+    /// anything (nothing noted) deletes nothing.
+    #[test]
+    fn an_import_that_did_not_complete_keeps_the_keys_held_before_it() {
+        const BESIDE: u16 = LOST + 1;
+        let lost = Lost::new();
+        lost.cluster.slots.write()[BESIDE as usize] = Some(lost.other);
+        let import = task("in", vec![(LOST, BESIDE)]);
+        lost.cluster.slot_migrations.add(import.clone()).unwrap();
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+
+        let held = HeldBefore::note(&lost.store, &import.ranges);
+        assert_eq!(held.slots, vec![LOST]);
+        assert_eq!(held.keys.len(), OLD);
+        *import.held_before.lock() = Held::Noted(Arc::new(held));
+        // What the import brings: keys of its own in both slots, and a new
+        // value of a key held.
+        let beside_tag = (0..)
+            .map(|i| format!("b{i}"))
+            .find(|t| key_hash_slot(t.as_bytes()) == BESIDE)
+            .unwrap();
+        let brought: Vec<String> = (0..300)
+            .map(|i| format!("{{{}}}:new:{i}", tag()))
+            .chain((0..300).map(|i| format!("{{{beside_tag}}}:new:{i}")))
+            .collect();
+        for key in &brought {
+            set(&lost.store, key, "new");
+        }
+        set(&lost.store, &old_key(0), "sent");
+
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+        assert_eq!(lost.value(&old_key(0)), Some(b"sent".to_vec()));
+        assert_eq!(lost.value(&old_key(1)), Some(b"old".to_vec()));
+        let left: Vec<&String> = brought.iter().filter(|k| lost.value(k).is_some()).collect();
+        assert!(left.is_empty(), "{} brought keys left", left.len());
+        // Nothing is left running.
+        assert!(
+            !lost
+                .cluster
+                .slot_deletions
+                .running([LOST, BESIDE].into_iter())
+        );
+    }
+
+    /// The imports file: the import's ranges, and after `keep` those of its
+    /// slots whose keys are all kept at startup (#745). A line of an
+    /// earlier version has no `keep`.
+    #[test]
+    fn a_line_of_the_imports_file_reads_back() {
+        assert_eq!(
+            slot_runs([1, 2, 3, 7, 9, 10]),
+            vec![(1, 3), (7, 7), (9, 10)]
+        );
+        assert_eq!(slot_runs([]), vec![]);
+        assert_eq!(
+            parse_import_line("abc 0-100 200-300"),
+            Some((vec![(0, 100), (200, 300)], vec![]))
+        );
+        assert_eq!(
+            parse_import_line("abc 0-100 200-300 keep 5-5 250-260"),
+            Some((vec![(0, 100), (200, 300)], vec![(5, 5), (250, 260)]))
+        );
+        assert_eq!(parse_import_line("abc 0-100 keep"), None);
+        assert_eq!(parse_import_line("abc 0-100 keep x"), None);
+        assert_eq!(parse_import_line("abc"), None);
+        assert_eq!(parse_import_line(""), None);
+    }
+
+    /// Past the bound on the keys held before an import noted by name, by
+    /// count or by bytes of names, none is noted, and an import that does
+    /// not complete keeps every key of the slots that had any, those it
+    /// brought too: never one held before deleted (#745 review). A slot
+    /// that had none is still cleaned whole.
+    #[test]
+    fn too_many_keys_held_before_an_import_are_all_kept() {
+        const BESIDE: u16 = LOST + 1;
+        let ranges = vec![(LOST, BESIDE)];
+        let lost = Lost::new();
+        let by_count = HeldBefore::note_at_most(&lost.store, &ranges, 100, usize::MAX);
+        let by_bytes = HeldBefore::note_at_most(&lost.store, &ranges, usize::MAX, 1000);
+        let under = HeldBefore::note_at_most(&lost.store, &ranges, OLD, usize::MAX);
+        for held in [&by_count, &by_bytes] {
+            assert!(held.whole);
+            assert!(held.keys.is_empty());
+            assert_eq!(held.slots, vec![LOST]);
+        }
+        assert!(!under.whole);
+        assert_eq!(under.keys.len(), OLD);
+
+        lost.cluster.slots.write()[BESIDE as usize] = Some(lost.other);
+        let import = task("in", ranges);
+        lost.cluster.slot_migrations.add(import.clone()).unwrap();
+        *import.held_before.lock() = Held::Noted(Arc::new(by_count));
+        let beside_tag = (0..)
+            .map(|i| format!("b{i}"))
+            .find(|t| key_hash_slot(t.as_bytes()) == BESIDE)
+            .unwrap();
+        let brought = format!("{{{}}}:new", tag());
+        let beside = format!("{{{beside_tag}}}:new");
+        set(&lost.store, &brought, "new");
+        set(&lost.store, &beside, "new");
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+        assert!(lost.value(&brought).is_some());
+        assert!(lost.value(&beside).is_none());
+    }
+
+    /// The keys held before an import are let go of when it ends, not kept
+    /// with the last 64 tasks (#745 review); and a task that has ended is
+    /// not given them after.
+    #[test]
+    fn the_keys_held_before_an_import_go_when_it_ends() {
+        let registry = Registry::default();
+        let import = task("in", vec![(LOST, LOST)]);
+        registry.add(import.clone()).unwrap();
+        *import.held_before.lock() = Held::Noted(Arc::default());
+        registry.finish("in", TaskState::Failed, None);
+        assert!(matches!(import.held(), Held::Released));
+        assert!(matches!(registry.get("in").unwrap().held(), Held::Released));
+    }
+
+    /// `save_imports` from many threads at once, each changing its own
+    /// task's line in between, as the import threads, `CLUSTER MIGRATION
+    /// IMPORT` and a `TAKEOVER` do: every file written reads back whole,
+    /// and the last one is the tasks as they are, not a look taken before
+    /// another task changed (#745 review).
+    #[test]
+    fn imports_written_at_once_read_back_whole_and_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster = Arc::new(ClusterState::new_enabled(
+            Some(dir.path().join("nodes.conf")),
+            15000,
+        ));
+        let path = imports_path(&cluster).unwrap();
+        const THREADS: u16 = 8;
+        let threads: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let cluster = Arc::clone(&cluster);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let first = i * 100;
+                    let import = task(&format!("t{i}"), vec![(first, first + 99)]);
+                    cluster.slot_migrations.add(import.clone()).unwrap();
+                    for round in 0..200u16 {
+                        let held = HeldBefore {
+                            slots: vec![first + round % 100],
+                            ..Default::default()
+                        };
+                        *import.held_before.lock() = Held::Noted(Arc::new(held));
+                        save_imports(&cluster);
+                        let text = std::fs::read_to_string(&path).unwrap();
+                        for line in text.lines() {
+                            assert!(parse_import_line(line).is_some(), "{line:?}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let last = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = last.lines().collect();
+        lines.sort_unstable();
+        let mut want: Vec<String> = (0..THREADS)
+            .map(|i| {
+                let first = i * 100;
+                // Of the last round, 199.
+                let kept = first + 99;
+                format!("t{i} {first}-{} keep {kept}-{kept}", first + 99)
+            })
+            .collect();
+        want.sort_unstable();
+        assert_eq!(lines, want);
     }
 
     /// The slot comes back while a batch of its deletion has picked its
