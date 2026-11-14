@@ -1,5 +1,10 @@
 {
   "_about": "Recorded values and gates of benchmarks/1.3.0/regressions (see README.md). One entry per metric, keyed suite/config/metric. Written by lib/compare.py --record; gates may be tuned by hand and survive a re-record.",
+  "pins": {
+    "_comment": "SHA-256 of the binaries the recorded values were measured with. compare.py marks a run INVALID when v1.2.2's differs (it never should: it is the release tarball's binary), or when redis-server's differs and REGRESS_REDIS_SHA256 does not name the new one (a deliberate Redis bump, after which --record stores it).",
+    "v1_2_2_sha256": "38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e",
+    "redis_sha256": "b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c"
+  },
   "metrics": {
     "01-scan-match/default/dbsize": {
       "suite": "01-scan-match",

@@ -8,8 +8,13 @@
 # Each suite runs against v1.2.2 (the release tarball, SHA-256 checked), the
 # candidate and Redis 8.10.x, one server at a time on this machine, each
 # configuration on a fresh server. Results go to results/<label>/: summary.md,
-# summary.json and raw.tar.gz. The exit status is compare.py's: 1 when a gate
-# fails. --record writes the measured values into baseline.json instead.
+# summary.json and raw.tar.gz. The exit status is 1 when a gate fails or the
+# run is invalid (a suite or server failed, a recorded metric is missing, the
+# VM or a reference binary differs); see lib/compare.py. --record writes the
+# measured values into baseline.json, and refuses to on such a run.
+#   ALLOW_VM_CHANGE=1          compare/record on another VM size than recorded
+#   REGRESS_REDIS_SHA256=<sha> accept another redis-server than the pinned one
+#   SCALE=0.01                 smoke run: tiny datasets, gates not checked
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 export REGRESS_LIB=$here/lib
@@ -27,12 +32,32 @@ while [ $# -gt 0 ]; do
     --engines) ENGINES=$2; shift 2 ;;
     --record) RECORD=--record; shift ;;
     --candidate-commit) CAND_COMMIT=$2; shift 2 ;;
-    -h | --help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$CANDIDATE" ] || { echo "--candidate <path|tag> is required" >&2; exit 2; }
 [ "$(uname -s)" = Linux ] || { echo "Linux only (VmRSS, io_uring)" >&2; exit 2; }
+for e in ${ENGINES//,/ }; do
+  case $e in v1_2_2 | candidate | redis) ;; *) echo "unknown engine $e" >&2; exit 2 ;; esac
+done
+
+# Which suites. Every --only entry must name a suite.
+mapfile -t SUITES < <(cd "$here/suites" && ls [0-9][0-9]-*.py | sort)
+[ ${#SUITES[@]} -gt 0 ] || { echo "no suites in $here/suites" >&2; exit 2; }
+suite_matches() { case $1 in "$2" | "$2"-* | "$2".py) return 0 ;; esac; return 1; }
+want_suite() {
+  [ -z "$ONLY" ] && return 0
+  local w
+  for w in ${ONLY//,/ }; do suite_matches "$1" "$w" && return 0; done
+  return 1
+}
+for w in ${ONLY//,/ }; do
+  hit=
+  for f in "${SUITES[@]}"; do suite_matches "${f%.py}" "$w" && hit=1; done
+  [ -n "$hit" ] || { echo "--only $w names no suite (have: ${SUITES[*]%.py})" >&2; exit 2; }
+done
+want_engine() { case ",$ENGINES," in *",$1,"*) return 0 ;; esac; return 1; }
 
 mkdir -p "$REGRESS_CACHE"
 # Python: a venv with the pinned client.
@@ -55,6 +80,10 @@ KIND[v1_2_2]=kividb KIND[candidate]=kividb KIND[redis]=redis
 if [ -z "$CAND_COMMIT" ]; then
   CAND_COMMIT=$("${BIN[candidate]}" --version 2>/dev/null | head -1 || true)
 fi
+# Which allocator the candidate uses: the Lua builds (lua, full) link mimalloc,
+# and suite 03 measures glibc malloc's give-back.
+if grep -aq 'mimalloc' "$(readlink -f "${BIN[candidate]}")"; then CAND_ALLOC=mimalloc; else CAND_ALLOC=glibc; fi
+export REGRESS_CANDIDATE_ALLOCATOR=$CAND_ALLOC
 [ -n "$LABEL" ] || LABEL=run-$(date -u +%Y%m%d-%H%M%S)
 OUT=$here/results/$LABEL
 mkdir -p "$OUT"
@@ -65,37 +94,41 @@ CHILD=
 trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; engine_stop; rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
+FAILURES=$WORK/failures.txt EXPECTED=$WORK/expected.jsonl
+: >"$FAILURES"
+: >"$EXPECTED"
+status=0
+fail() { echo "!!! $*" >&2; echo "$*" >>"$FAILURES"; status=1; }
+
 vm_size() {
   curl -fs -m 2 -H Metadata:true "http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-02-01&format=text" 2>/dev/null ||
     curl -fs -m 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "${VM_SIZE:-unknown}"
 }
 
-# Which suites.
-mapfile -t SUITES < <(cd "$here/suites" && ls [0-9][0-9]-*.py | sort)
-want_suite() {
-  [ -z "$ONLY" ] && return 0
-  local s=$1 w
-  for w in ${ONLY//,/ }; do case $s in "$w" | "$w"-* | "$w".py) return 0 ;; esac; done
-  return 1
-}
-want_engine() { case ",$ENGINES," in *",$1,"*) return 0 ;; esac; return 1; }
-
 declare -A SECS
-status=0
+ran=0
 for f in "${SUITES[@]}"; do
   suite=${f%.py}
   want_suite "$suite" || continue
   echo "=== $suite"
   s0=$(date +%s)
+  # A suite that fails to import or to list its configurations fails the run.
+  if ! cfgs=$("$PYTHON" "$here/suites/$f" --configs </dev/null) || [ -z "$cfgs" ]; then
+    fail "$suite: --configs failed or listed nothing"
+    continue
+  fi
   while IFS= read -r cfg; do
     name=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$cfg")
     io=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["io"])' "$cfg")
     threads=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["threads"])' "$cfg")
     engs=$("$PYTHON" -c 'import json,sys;print(" ".join(json.loads(sys.argv[1])["engines"]))' "$cfg")
+    "$PYTHON" -c 'import json,sys;c=json.loads(sys.argv[1]);print(json.dumps({"suite":sys.argv[2],"config":c["name"],"engines":c["engines"]}))' \
+      "$cfg" "$suite" >>"$EXPECTED"
     for e in $engs; do
       want_engine "$e" || continue
       echo "--- $suite $name $e"
-      engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { status=1; continue; }
+      ran=$((ran + 1))
+      engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
       # In the background and waited for, so that a signal stops the run at once.
       timeout "$SUITE_TIMEOUT" "$PYTHON" "$here/suites/$f" --config "$name" --engine "$e" \
         --kind "${KIND[$e]}" --port "$ENGINE_PORT" --pid "$ENGINE_PID" --out "$WORK" </dev/null &
@@ -103,26 +136,26 @@ for f in "${SUITES[@]}"; do
       rc=0
       wait "$CHILD" || rc=$?
       CHILD=
-      if [ $rc -ne 0 ]; then
-        echo "!!! $suite $name $e failed ($rc)" >&2
-        status=1
-      fi
+      [ $rc -eq 0 ] || fail "$suite $name $e: suite exited $rc"
       tail -c 65536 "$ENGINE_LOG" >"$WORK/raw/logs/$suite-$name-$e.log" 2>/dev/null || true
       engine_stop
     done
-  done < <("$PYTHON" "$here/suites/$f" --configs)
+  done <<<"$cfgs"
   SECS[$suite]=$(($(date +%s) - s0))
   echo "=== $suite took ${SECS[$suite]} s"
 done
-[ -f "$WORK/results.jsonl" ] && cp "$WORK/results.jsonl" "$OUT/results.jsonl"
+[ $ran -gt 0 ] || fail "nothing ran (--only $ONLY, --engines $ENGINES)"
+if [ -f "$WORK/results.jsonl" ]; then cp "$WORK/results.jsonl" "$OUT/results.jsonl"; fi
 
 # Where and what: env.json.
 {
   secs=$(for k in "${!SECS[@]}"; do printf '"%s": %s,' "$k" "${SECS[$k]}"; done)
   "$PYTHON" - "$OUT/env.json" "$LABEL" "$CAND_COMMIT" "{${secs%,}}" "$(vm_size)" \
-    "${BIN[v1_2_2]}" "${BIN[candidate]}" "${BIN[redis]}" <<'EOF'
+    "${BIN[v1_2_2]}" "${BIN[candidate]}" "${BIN[redis]}" "$FAILURES" "$EXPECTED" "$ENGINES" \
+    "${SCALE:-1}" "${FULL:-0}" "$ONLY" "$CAND_ALLOC" <<'EOF'
 import json, sys, os, platform, subprocess, hashlib, datetime
-out, label, commit, secs, vm, b122, bcand, bredis = sys.argv[1:9]
+(out, label, commit, secs, vm, b122, bcand, bredis, failures, expected, engines,
+ scale, full, only, alloc) = sys.argv[1:16]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.realpath(p), "rb") as f:
@@ -144,10 +177,14 @@ env = {
     "label": label, "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
     "vm": vm, "cpu": cpu, "nproc": os.cpu_count(), "kernel": platform.release(),
     "glibc": platform.libc_ver()[1], "python": platform.python_version(), "redis_py": redis.__version__,
-    "candidate_commit": commit, "suite_seconds": json.loads(secs),
+    "candidate_commit": commit, "candidate_allocator": alloc, "suite_seconds": json.loads(secs),
+    "scale": scale, "full": full, "only": only, "engines_selected": engines.split(","),
+    "failures": [l.strip() for l in open(failures) if l.strip()],
+    "expected": [json.loads(l) for l in open(expected) if l.strip()],
     "engines": {k: {"path": p, "sha256": sha(p), "version": ver(p)}
                 for k, p in (("v1_2_2", b122), ("candidate", bcand), ("redis", bredis))},
 }
+env["run_failed"] = bool(env["failures"])
 json.dump(env, open(out, "w"), indent=1)
 EOF
 }
@@ -156,13 +193,13 @@ EOF
 cp "$OUT/env.json" "$WORK/raw/"
 [ -f "$OUT/results.jsonl" ] && cp "$OUT/results.jsonl" "$WORK/raw/"
 tar -czf "$OUT/raw.tar.gz" -C "$WORK" raw
-if [ -f "$OUT/results.jsonl" ]; then
-  set +e
-  "$PYTHON" "$here/lib/compare.py" "$OUT" --baseline "$here/baseline.json" --label "$LABEL" $RECORD
-  cmp=$?
-  set -e
-  [ $cmp -ne 0 ] && status=$cmp
-fi
+# compare.py also judges an empty or failed run (INVALID) and refuses --record on it.
+set +e
+"$PYTHON" "$here/lib/compare.py" "$OUT" --baseline "$here/baseline.json" --label "$LABEL" $RECORD \
+  ${ALLOW_VM_CHANGE:+--allow-vm-change}
+cmp=$?
+set -e
+[ $cmp -ne 0 ] && status=$cmp
 rm -f "$OUT/results.jsonl"  # it is inside raw.tar.gz
 echo "results: $OUT"
 exit $status

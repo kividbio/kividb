@@ -5,7 +5,10 @@
 #
 #   engines_fetch_release <tag> <variant> <dir>  -> prints the binary's path
 #        Downloads kividb[-<variant>]-linux-<arch>.tar.gz of <tag> and the
-#        release's SHA256SUMS.txt, checks the tarball against it, unpacks it.
+#        release's SHA256SUMS.txt (or reuses a cached copy that still matches
+#        it), checks the tarball against it, and unpacks the binary afresh.
+#        compare.py also checks the v1.2.2 binary's SHA-256 against the pin in
+#        baseline.json.
 #        <variant> is "default" (glibc, no Lua) or one of full, lua, tls.
 #   engines_resolve_candidate <path|tag> <dir>   -> prints the binary's path
 #        An existing file is used as it is; anything else is taken as a tag.
@@ -51,30 +54,34 @@ engines_sum_line() { # SHA256SUMS.txt name -> its line as "<sum>  <name>"; fails
 }
 
 engines_fetch_release() {
-  local tag=$1 variant=$2 dir=$3 arch name base out
+  local tag=$1 variant=$2 dir=$3 arch name base out sums
   arch=$(engines_arch) || return 1
   if [ "$variant" = default ]; then name=kividb-linux-$arch.tar.gz; else name=kividb-$variant-linux-$arch.tar.gz; fi
   out=$dir/$tag/$variant
-  if [ -x "$out/kividb" ] && [ -f "$out/.verified" ]; then echo "$out/kividb"; return 0; fi
+  sums=$dir/$tag/SHA256SUMS.txt
   mkdir -p "$out"
   base=https://github.com/$KIVIDB_REPO/releases/download/$tag
-  engines_log "fetching $name of $tag"
-  curl -fsSL --retry 3 -o "$dir/$tag/SHA256SUMS.txt" "$base/SHA256SUMS.txt" || { engines_log "no SHA256SUMS.txt for $tag"; return 1; }
-  curl -fsSL --retry 3 -o "$dir/$tag/$name" "$base/$name" || { engines_log "no $name for $tag"; return 1; }
-  # Check exactly the one file we use; a missing line is a failure, not a pass.
-  if ! engines_sum_line "$dir/$tag/SHA256SUMS.txt" "$name" | (cd "$dir/$tag" && sha256sum -c --status -); then
-    engines_log "SHA-256 of $name does not match SHA256SUMS.txt of $tag"
-    rm -f "$dir/$tag/$name"
-    return 1
+  # A cached tarball is used only if it still matches the release's SHA256SUMS.txt;
+  # the binary is extracted from it afresh on every run, never trusted from the cache.
+  if ! { [ -f "$sums" ] && [ -f "$dir/$tag/$name" ] &&
+    engines_sum_line "$sums" "$name" | (cd "$dir/$tag" && sha256sum -c --status -); }; then
+    engines_log "fetching $name of $tag"
+    curl -fsSL --retry 3 -o "$sums" "$base/SHA256SUMS.txt" || { engines_log "no SHA256SUMS.txt for $tag"; return 1; }
+    curl -fsSL --retry 3 -o "$dir/$tag/$name" "$base/$name" || { engines_log "no $name for $tag"; return 1; }
+    # Check exactly the one file we use; a missing line is a failure, not a pass.
+    if ! engines_sum_line "$sums" "$name" | (cd "$dir/$tag" && sha256sum -c --status -); then
+      engines_log "SHA-256 of $name does not match SHA256SUMS.txt of $tag"
+      rm -f "$dir/$tag/$name"
+      return 1
+    fi
   fi
-  rm -rf "$out/pkg" "$out/kividb"
+  rm -rf "$out/pkg" "$out/kividb" "$out/.verified"
   mkdir -p "$out/pkg"
   tar -xzf "$dir/$tag/$name" -C "$out/pkg"
   local bin
   bin=$(find "$out/pkg" -type f -name kividb -perm -u+x | head -1)
   [ -n "$bin" ] || { engines_log "no kividb binary inside $name"; return 1; }
   ln -s "$bin" "$out/kividb"
-  engines_sum_line "$dir/$tag/SHA256SUMS.txt" "$name" > "$out/.verified"
   echo "$out/kividb"
 }
 

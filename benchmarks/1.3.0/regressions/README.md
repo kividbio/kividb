@@ -37,12 +37,14 @@ benchmarks/1.3.0/regressions/run-all.sh --candidate target/release/kividb \
 |---|---|
 | `--candidate <path\|tag>` | a kividb binary, or a release tag such as `v1.3.0` (its default-build tarball, SHA-256 checked) |
 | `--label NAME` | results go to `results/NAME/` (default `run-<UTC time>`) |
-| `--only 01,04` | only these suites (number or full name) |
+| `--only 01,04` | only these suites (number or full name); an entry that names no suite is an error |
 | `--engines v1_2_2,candidate` | only these engines; gates that need a missing engine are reported as skipped |
 | `--record` | write this run's values into `baseline.json` (see below) |
 | `--candidate-commit SHA` | recorded with the values (default: the binary's `--version`) |
 | `FULL=1` | also the long configurations (`02-growth-ping/ex17m`: 17.5M keys, about 8 more minutes) |
-| `SCALE=0.01` | a smoke run of the code paths with tiny datasets; its numbers mean nothing, never record one |
+| `SCALE=0.01` | a smoke run of the code paths with tiny datasets: verdict `SMOKE`, gates not checked, `--record` refused |
+| `ALLOW_VM_CHANGE=1` | compare (or record) on another VM size than the one the baseline was recorded on |
+| `REGRESS_REDIS_SHA256=<sha>` | accept a redis-server other than the pinned one (a deliberate Redis bump; `--record` then pins it) |
 | `REDIS_SERVER`, `REDIS_VERSION` | a Redis binary to use; otherwise `/opt/redis-$REDIS_VERSION/src/redis-server`, otherwise Redis is built from its tag |
 | `REGRESS_CACHE` | downloads, the Redis build and the Python venv (default `~/.cache/kividb-regress`) |
 | `SUITE_TIMEOUT` | seconds one suite may take against one server (default 1800) |
@@ -57,11 +59,36 @@ exit. Then `lib/compare.py` compares the run with `baseline.json`:
 - `results/<label>/summary.md` and `summary.json`: every metric for the three
   engines, the recorded value, each gate's limit and result;
 - `results/<label>/env.json`: VM size, CPU, kernel, glibc, Python, redis-py,
-  each binary's path, version and SHA-256, the run time of each suite;
+  each binary's path, version and SHA-256, the candidate's allocator, `FULL`,
+  `SCALE`, `--only`, the engines, the suite/configurations that were run, any
+  failures, and the run time of each suite;
 - `results/<label>/raw.tar.gz`: per server run, the metrics with their
   samples, the slowest `PING`s, RSS timelines and the server's log tail.
 
-The exit status is 1 when a gate fails.
+The verdict and exit status:
+
+| verdict | when | exit |
+|---|---|---|
+| `ok` | every gate passed | 0 |
+| `REGRESSED` | a gate failed | 1 |
+| `INVALID` | the run cannot be judged: a suite failed to import, list its configurations or finish, a server did not start, nothing ran, a recorded metric of a suite/configuration that ran is missing or lacks an engine's value, the VM size differs from the recorded one, or the v1.2.2 or redis-server binary differs from the SHA-256 pinned in `baseline.json` (`pins`) | 1 |
+| `SMOKE` | `SCALE` is not 1: only that every metric came out | 0 |
+
+A wrong argument (an unknown `--only` entry or engine) exits 2 before
+anything runs. `--record` refuses (exit 1, `baseline.json` untouched) on an
+`INVALID` run, a `SCALE` run, a run without all three engines, or a null
+value, and never overwrites a recorded value with null.
+
+Binaries: the v1.2.2 tarball (cached or not) is checked against the release's
+`SHA256SUMS.txt` on every run and the binary unpacked from it afresh; its
+SHA-256 must also equal `pins.v1_2_2_sha256`
+(`38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`).
+redis-server must match `pins.redis_sha256`
+(`b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`, the
+8.10.2 build in `/opt/redis-8.10.2` of our Azure VM image; a build made
+elsewhere differs, so set `REGRESS_REDIS_SHA256` to use it). Suite 03 measures
+glibc malloc's give-back: a candidate that links mimalloc (a `lua` or `full`
+build) fails it on purpose.
 
 ## Method
 
@@ -97,7 +124,7 @@ They are checked against the candidate only.
 
 | kind | rule | used for |
 |---|---|---|
-| `rel` | within `pct` % of the recorded candidate value, in the worse direction; `abs` adds a slack in the metric's unit (the larger wins); `redis_plus` also allows up to Redis's value this session plus that much | throughput/time: 10 %; memory held: 5 %; RSS after a give-back: 25 % or 5 MiB; worst PING: max(1.5x recorded, Redis + 10 ms); #770 guard rows: 15 % |
+| `rel` | within `pct` % of the recorded candidate value, in the worse direction; `abs` adds a slack in the metric's unit (the larger wins); `redis_plus` also allows up to Redis's value this session plus that much | throughput/time: 10 %; memory held: 5 %; RSS after a give-back: 25 % or 5 MiB; worst PING: max(1.5x recorded, Redis + 10 ms); #770 guard rows: 35 % (measured spread up to 28 %) |
 | `ratio` | the gain over v1.2.2 measured this session (v1.2.2/candidate for lower-is-better) is at least `keep` x the recorded gain | every claimed improvement: keep 60 % |
 | `vs_redis` | candidate at most `max_x` times worse than Redis this session | SCAN iterations: 1.3x |
 | `bound` | absolute: `eq` (`"recorded"`: equal to the recorded value), `max`, `min` | counts (exact); worst PING on Tokio during a long command: 20 ms |

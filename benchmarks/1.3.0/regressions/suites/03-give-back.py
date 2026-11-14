@@ -2,7 +2,9 @@
 """#753: RSS given back to the system after a large delete (fixed in #763).
 
 Three scenarios, each on a fresh server (default build: glibc malloc, where
-the give-back thread runs; Redis uses its jemalloc):
+the give-back thread runs; Redis uses its jemalloc). A candidate that links
+mimalloc (a lua or full build) fails this suite on purpose: run-all.sh detects
+it and the suite refuses to measure it.
 
   hashdel  HSET of 3,000,000 fields f0.. = v (1,000 per HSET), then one DEL
   hdel     HSET of 1,000,000 fields, then HDEL of all of them, 100 per HDEL
@@ -84,6 +86,9 @@ SCEN = {"hashdel": hashdel, "hdel": hdel, "churn": churn}
 
 @S.run
 def run(ctx):
+    if ctx.engine == "candidate" and os.environ.get("REGRESS_CANDIDATE_ALLOCATOR") == "mimalloc":
+        raise RuntimeError("03-give-back measures glibc malloc's give-back, and this candidate links "
+                           "mimalloc (a lua or full build): use a default build, or --only the other suites")
     c = ctx.client()
     c.flushall()
     pid = ctx.pid

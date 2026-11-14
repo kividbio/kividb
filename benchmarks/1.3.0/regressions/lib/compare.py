@@ -2,17 +2,31 @@
 """Compare a run's results with baseline.json; write summary.md and summary.json.
 
     compare.py <results-dir> [--baseline baseline.json] [--record] [--reset-gates]
+               [--allow-vm-change]
 
 <results-dir> holds results.jsonl (one line per engine x metric, written by
-the suites) and env.json (written by run-all.sh). Exit status: 0 when no gate
-fails, 1 when one does, 2 on bad input.
+the suites) and env.json (written by run-all.sh).
+
+Verdicts and exit status:
+  ok         every gate passed                                        exit 0
+  REGRESSED  a gate failed                                            exit 1
+  INVALID    the run cannot be compared: a suite or server failed,    exit 1
+             a recorded metric of a suite/config that ran is missing
+             (or lacks an engine's value), nothing ran, the VM size
+             differs from the recorded one, or the v1.2.2 or
+             redis-server binary is not the pinned one
+             (REGRESS_REDIS_SHA256=<sha> accepts a deliberate Redis change)
+  SMOKE      SCALE != 1: gates are not checked, only that every       exit 0
+             metric came out
 
 --record writes this run's values into the baseline as the new recorded
 values (v1.2.2, candidate and Redis, with the VM, date and candidate commit).
-A metric already in the baseline keeps its gate, so tolerances tuned by hand
-survive a re-record; --reset-gates takes the gates the suites declare instead.
-Metrics in the baseline that this run did not measure (another --only, or no
-FULL=1) are left as they are and reported as "not run", never as failures.
+It refuses (exit 1, nothing written) when the run is INVALID, is a SCALE
+smoke run, is not a three-engine run, or has a null value. A value is never
+overwritten with null. A metric already in the baseline keeps its gate, so
+tolerances tuned by hand survive a re-record; --reset-gates takes the gates
+the suites declare instead. Metrics of suites/configs that did not run
+(another --only, or no FULL=1) are left as they are and listed as "not run".
 """
 import argparse
 import datetime
@@ -126,7 +140,7 @@ def check_gate(g, m, rec):
     return "FAIL", "unknown gate kind %r" % kind
 
 
-def evaluate(results, baseline):
+def evaluate(results, baseline, smoke=False):
     rows = []
     for key in sorted(results):
         m = results[key]
@@ -135,10 +149,13 @@ def evaluate(results, baseline):
         gates = (entry or {}).get("gate") or m["gate"]
         if isinstance(gates, dict):
             gates = [gates]
-        checks = [(g,) + check_gate(g, m, rec) for g in gates]
+        if smoke:  # SCALE != 1: the numbers mean nothing
+            checks = [(g, "smoke", "") for g in gates]
+        else:
+            checks = [(g,) + check_gate(g, m, rec) for g in gates]
         sts = [c[1] for c in checks]
         status = "FAIL" if "FAIL" in sts else "pass" if "pass" in sts else \
-            "new" if "new" in sts else "skip" if "skip" in sts else "info"
+            "new" if "new" in sts else "skip" if "skip" in sts else "smoke" if "smoke" in sts else "info"
         rows.append({"key": key, "suite": m["suite"], "config": m["config"], "metric": m["metric"],
                      "unit": m["unit"], "better": m["better"], "values": m["values"],
                      "samples": m["samples"], "recorded_candidate": rec.get("candidate"),
@@ -148,16 +165,68 @@ def evaluate(results, baseline):
     return rows, not_run
 
 
-def write_summary(outdir, rows, not_run, env, label):
+def validity_problems(env, baseline, results, smoke, allow_vm_change):
+    """What makes this run's verdict meaningless; any one makes it INVALID."""
+    probs = []
+    if not env:
+        probs.append("no env.json: run-all.sh did not finish")
+    if env.get("run_failed"):
+        probs.append("the run failed: %s" % "; ".join(env.get("failures") or ["see the log"]))
+    if not results:
+        probs.append("no results: nothing ran")
+    metrics = baseline.get("metrics", {})
+    # The machine size the values were recorded on.
+    vms = {m.get("recorded", {}).get("vm") for m in metrics.values()} - {None}
+    if vms and not smoke and env.get("vm") not in vms and not allow_vm_change:
+        probs.append("VM size %r differs from the recorded %s" % (env.get("vm"), ", ".join(sorted(vms))))
+    # The reference binaries the values were recorded with.
+    pins = baseline.get("pins", {})
+    engines = env.get("engines", {})
+    selected = env.get("engines_selected") or list(ENG)
+    want = pins.get("v1_2_2_sha256")
+    got = engines.get("v1_2_2", {}).get("sha256")
+    if want and "v1_2_2" in selected and got != want:
+        probs.append("v1.2.2 binary sha256 %s is not the pinned %s" % (got, want))
+    want = os.environ.get("REGRESS_REDIS_SHA256") or pins.get("redis_sha256")
+    got = engines.get("redis", {}).get("sha256")
+    if want and "redis" in selected and got != want:
+        probs.append("redis-server sha256 %s is not the pinned %s (set REGRESS_REDIS_SHA256=<sha> for a "
+                     "deliberate Redis change)" % (got, want))
+    # Everything that should have come out did: every recorded metric of every
+    # suite/config that ran, with a value from every engine that ran it.
+    for exp in env.get("expected", []):
+        engs = [e for e in exp["engines"] if e in selected]
+        if not engs:
+            continue
+        prefix = "%s/%s/" % (exp["suite"], exp["config"])
+        keys = {k for k in metrics if k.startswith(prefix)} | {k for k in results if k.startswith(prefix)}
+        if not keys:
+            probs.append("%s* produced no metrics" % prefix)
+        for k in sorted(keys):
+            if k not in results:
+                probs.append("%s: missing" % k)
+                continue
+            for e in engs:
+                if results[k]["values"].get(e) is None:
+                    probs.append("%s: no %s value" % (k, e))
+    return probs
+
+
+def write_summary(outdir, rows, not_run, env, label, problems, smoke):
     fails = [r for r in rows if r["status"] == "FAIL"]
-    summary = {"label": label, "env": env, "rows": rows, "not_run": not_run,
-               "failed": [r["key"] for r in fails], "verdict": "REGRESSED" if fails else "ok"}
+    verdict = "INVALID" if problems else "SMOKE" if smoke else "REGRESSED" if fails else "ok"
+    summary = {"label": label, "env": env, "rows": rows, "not_run": not_run, "problems": problems,
+               "failed": [r["key"] for r in fails], "verdict": verdict}
     with open(os.path.join(outdir, "summary.json"), "w") as f:
         json.dump(summary, f, separators=(",", ":"))  # one line: keeps result commits small
         f.write("\n")
     L = ["# Regression suite: %s" % label, ""]
-    L.append("Verdict: **%s**%s" % (summary["verdict"], " (%d failed)" % len(fails) if fails else ""))
+    L.append("Verdict: **%s**%s" % (verdict, " (%d failed)" % len(fails) if fails else ""))
     L.append("")
+    if problems:
+        L += ["Why the run is invalid:", ""] + ["- %s" % p for p in problems] + [""]
+    if smoke:
+        L += ["SCALE=%s: a smoke run. The gates were not checked." % env.get("scale"), ""]
     if env:
         L.append("- Machine: %s, %s vCPU, %s, kernel %s, glibc %s" % (
             env.get("vm", "?"), env.get("nproc", "?"), env.get("cpu", "?"), env.get("kernel", "?"), env.get("glibc", "?")))
@@ -169,12 +238,12 @@ def write_summary(outdir, rows, not_run, env, label):
         if env.get("candidate_commit"):
             L.append("- candidate commit: `%s`" % env["candidate_commit"])
         if env.get("date"):
-            L.append("- date: %s" % env["date"])
+            L.append("- date: %s; FULL=%s, SCALE=%s" % (env["date"], env.get("full", "?"), env.get("scale", "?")))
         if env.get("suite_seconds"):
             L.append("- run time: " + ", ".join("%s %ss" % kv for kv in sorted(env["suite_seconds"].items())))
         L.append("")
     suite = None
-    for i, r in enumerate(rows):
+    for r in rows:
         if r["suite"] != suite:
             if suite is not None:
                 L.append("")
@@ -197,20 +266,43 @@ def write_summary(outdir, rows, not_run, env, label):
     return summary
 
 
+def record_problems(env, results, problems):
+    probs = list(problems)
+    if str(env.get("scale", "1")) not in ("1", "1.0"):
+        probs.append("SCALE=%s: a smoke run is never recorded" % env.get("scale"))
+    sel = env.get("engines_selected") or []
+    if sorted(sel) != sorted(ENG):
+        probs.append("not a three-engine run (engines: %s)" % ",".join(sel))
+    for k, m in results.items():
+        for e in ENG:
+            if e in m["values"] and m["values"][e] is None:
+                probs.append("%s: %s value is null" % (k, e))
+    return probs
+
+
 def record(baseline, results, env, label, reset_gates):
     ms = baseline.setdefault("metrics", {})
     date = env.get("date") or datetime.datetime.utcnow().strftime("%Y-%m-%d")
     for key, m in sorted(results.items()):
         old = ms.get(key, {})
+        old_rec = old.get("recorded", {})
+        rec = {}
+        for e in ENG:  # never overwrite a value with null
+            v = m["values"].get(e)
+            rec[e] = v if v is not None else old_rec.get(e)
+        rec.update({"vm": env.get("vm"), "date": date, "commit": env.get("candidate_commit"), "label": label})
         ms[key] = {
             "suite": m["suite"], "config": m["config"], "metric": m["metric"],
-            "unit": m["unit"], "better": m["better"],
-            "recorded": {"v1_2_2": m["values"].get("v1_2_2"), "candidate": m["values"].get("candidate"),
-                         "redis": m["values"].get("redis"), "vm": env.get("vm"), "date": date,
-                         "commit": env.get("candidate_commit"), "label": label},
+            "unit": m["unit"], "better": m["better"], "recorded": rec,
             "gate": m["gate"] if (reset_gates or "gate" not in old) else old["gate"],
         }
     baseline["metrics"] = dict(sorted(ms.items()))
+    pins = baseline.setdefault("pins", {})
+    eng = env.get("engines", {})
+    if eng.get("v1_2_2", {}).get("sha256"):
+        pins.setdefault("v1_2_2_sha256", eng["v1_2_2"]["sha256"])
+    if eng.get("redis", {}).get("sha256") and (os.environ.get("REGRESS_REDIS_SHA256") or "redis_sha256" not in pins):
+        pins["redis_sha256"] = eng["redis"]["sha256"]
     return baseline
 
 
@@ -220,13 +312,12 @@ def main():
     ap.add_argument("--baseline", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "baseline.json"))
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--reset-gates", action="store_true")
+    ap.add_argument("--allow-vm-change", action="store_true",
+                    help="compare or record on another VM size than the recorded one")
     ap.add_argument("--label")
     a = ap.parse_args()
     rpath = os.path.join(a.results_dir, "results.jsonl")
-    if not os.path.exists(rpath):
-        print("no %s" % rpath, file=sys.stderr)
-        return 2
-    results = load_results(rpath)
+    results = load_results(rpath) if os.path.exists(rpath) else {}
     env = {}
     if os.path.exists(os.path.join(a.results_dir, "env.json")):
         with open(os.path.join(a.results_dir, "env.json")) as f:
@@ -235,22 +326,34 @@ def main():
     if os.path.exists(a.baseline):
         with open(a.baseline) as f:
             baseline = json.load(f)
+    smoke = str(env.get("scale", "1")) not in ("1", "1.0")
     label = a.label or env.get("label") or os.path.basename(os.path.abspath(a.results_dir))
-    rows, not_run = evaluate(results, baseline)
-    summary = write_summary(a.results_dir, rows, not_run, env, label)
+    problems = validity_problems(env, baseline, results, smoke, a.allow_vm_change)
+    rows, not_run = evaluate(results, baseline, smoke)
+    summary = write_summary(a.results_dir, rows, not_run, env, label, problems, smoke)
+    for p in problems:
+        print("INVALID: %s" % p)
     for r in rows:
         if r["status"] == "FAIL":
             print("FAIL %s: candidate %s; %s" % (r["key"], fmt(r["values"].get("candidate")),
                                                  "; ".join(g["limit"] for g in r["gates"] if g["status"] == "FAIL")))
-    print("verdict: %s (%d metrics, %d failed, %d not run)" % (summary["verdict"], len(rows), len(summary["failed"]), len(not_run)))
+    print("verdict: %s (%d metrics, %d failed, %d not run)" % (
+        summary["verdict"], len(rows), len(summary["failed"]), len(not_run)))
     if a.record:
+        refuse = record_problems(env, results, problems)
+        if refuse:
+            for p in refuse:
+                print("not recording: %s" % p)
+            return 1
+        if summary["failed"]:
+            print("recording over %d failed gates: commit only if each change is explained" % len(summary["failed"]))
         record(baseline, results, env, label, a.reset_gates)
         with open(a.baseline, "w") as f:
             json.dump(baseline, f, indent=2)
             f.write("\n")
         print("recorded %d metrics into %s" % (len(results), a.baseline))
         return 0
-    return 1 if summary["failed"] else 0
+    return 1 if (problems or summary["failed"]) else 0
 
 
 if __name__ == "__main__":
