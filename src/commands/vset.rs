@@ -89,6 +89,9 @@ fn add_to_vset(db: &store::Db, key: &[u8], lenient: bool, add: Addition) -> Resu
         }
         // A reader (`VSIM`) holds the set: wait for it with the shard free.
         drop(map);
+        // Right before the wait, so a shard still held here is seen.
+        #[cfg(test)]
+        lock_tests::about_to_wait(&vs);
         let mut inner = vs.write();
         // Not `read()`: a shard writer may be waiting for this set.
         let Some(map) = shard.try_read() else {
@@ -1223,6 +1226,52 @@ mod lock_tests {
         }
     }
 
+    /// How many `VADD`s came to wait for each set, by its address. Tests
+    /// run at once, each with its own set.
+    static WAITING: parking_lot::Mutex<Vec<(usize, usize)>> = parking_lot::const_mutex(Vec::new());
+
+    fn address(vs: &Set) -> usize {
+        Arc::as_ptr(vs) as usize
+    }
+
+    /// Called by `add_to_vset` just before it blocks on `vs`.
+    pub(super) fn about_to_wait(vs: &Set) {
+        let at = address(vs);
+        let mut waiting = WAITING.lock();
+        match waiting.iter_mut().find(|(a, _)| *a == at) {
+            Some((_, n)) => *n += 1,
+            None => waiting.push((at, 1)),
+        }
+    }
+
+    fn waiting_for(vs: &Set) -> usize {
+        let at = address(vs);
+        let waiting = WAITING.lock();
+        waiting
+            .iter()
+            .find(|(a, _)| *a == at)
+            .map_or(0, |(_, n)| *n)
+    }
+
+    /// Forgets what was counted for an earlier set at `vs`'s address.
+    fn count_from_zero(vs: &Set) {
+        let at = address(vs);
+        WAITING.lock().retain(|(a, _)| *a != at);
+    }
+
+    /// Whether `n` `VADD`s let go of the shard to wait for `vs` within 10 s.
+    /// Returns rather than panics, so the caller can let go of the set first.
+    fn came_to_wait(vs: &Set, n: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while waiting_for(vs) < n {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
     /// Another key that lives in `key`'s shard.
     fn neighbour(db: &store::Db, key: &str) -> String {
         let shard = store::get_shard(db, key);
@@ -1371,6 +1420,7 @@ mod lock_tests {
         let st = store::new_store(1);
         let db = &st[0];
         let vs = made(db, "k", Some(Quant::Q8));
+        count_from_zero(&vs);
         let reading = vs.read();
         std::thread::scope(|s| {
             let vadds: Vec<_> = (0..8)
@@ -1381,13 +1431,22 @@ mod lock_tests {
                     })
                 })
                 .collect();
-            until_a_writer_waits(&vs);
+            // Every one, not only the first: one still looking the set up
+            // holds the shard for a moment, which is not waiting with it.
+            // A VADD that waits with the shard held keeps the rest from
+            // coming, and the shard from being free.
+            let all_came = came_to_wait(&vs, 8);
             let free = store::get_shard(db, "k").try_write().is_some();
             drop(reading);
             for vadd in vadds {
                 assert_eq!(vadd.join().unwrap(), Ok(true));
             }
             assert!(free, "a VADD held the shard while it waited for the set");
+            assert!(
+                all_came,
+                "only {} of 8 VADDs came to wait",
+                waiting_for(&vs)
+            );
         });
         let mut want: Vec<String> = (0..8).map(|n| format!("e{n}")).collect();
         want.insert(0, "a".into());
