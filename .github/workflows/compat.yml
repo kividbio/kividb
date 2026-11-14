@@ -1,0 +1,81 @@
+name: Compatibility
+# Runs the framework harnesses in benchmarks/*-compat that have a ci.sh against KiviDB and against
+# Redis, and fails when a check passes on Redis and fails on KiviDB (#33). The contract a harness
+# follows to take part, and how to add one, are in benchmarks/README.md.
+#
+# Actions minutes cost money, so: never on push or pull_request; one runner, the harnesses one after
+# another; a time limit on the job and on each harness. Both servers come from pinned images: Redis
+# by digest, KiviDB at the release tag (a release, the latest release on a schedule, or the image
+# given to a run by hand). No secrets: nothing here needs a model API key.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays, 04:17 UTC
+  release:
+    types: [published] # release.yml publishes the release after its images are pushed
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "KiviDB image to test (default: docker.io/kividb/kividb at the latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REDIS_IMAGE: redis:8.10.3@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
+      OUT: ${{ github.workspace }}/compat-results
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true # later runs skip most of the installs
+          cache-dependency-glob: benchmarks/*-compat/requirements.txt
+
+      - name: Pick and pull the servers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_IMAGE: ${{ inputs.image }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          image=$INPUT_IMAGE
+          if [ -z "$image" ]; then
+            tag=${RELEASE_TAG:-$(gh api repos/kividbio/kividb/releases/latest --jq .tag_name)}
+            image=docker.io/kividb/kividb:$tag
+          fi
+          echo "KIVIDB_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "WORK=$RUNNER_TEMP/compat-work" >> "$GITHUB_ENV"
+          docker pull -q "$image"
+          docker pull -q "$REDIS_IMAGE"
+          printf 'KiviDB `%s` against Redis `%s`\n\n' "$image" "$REDIS_IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+      # One step per harness, each with its own limit. `!cancelled()` runs every harness even when an
+      # earlier one found a regression; any failed step fails the job.
+      - name: semantic-kernel
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: benchmarks/ci/run-harness.sh semantic-kernel
+
+      - name: haystack-valkey
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: benchmarks/ci/run-harness.sh haystack-valkey
+
+      - name: gptcache
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: benchmarks/ci/run-harness.sh gptcache
+
+      - name: Keep the results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-results
+          path: compat-results/
+          retention-days: 14
