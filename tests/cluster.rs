@@ -5547,9 +5547,9 @@ fn a_slot_given_away_and_back_keeps_its_keys_through_a_manual_failover() {
     });
     // Held back by the import's own grace: the handover away's was over.
     let refused = nodes[0].log();
-    let held_back = refused.lines().any(|l| {
-        l.contains("Manual failover requested by") && l.contains("took its slots over")
-    });
+    let held_back = refused
+        .lines()
+        .any(|l| l.contains("Manual failover requested by") && l.contains("took its slots over"));
     assert!(
         held_back || first.err().is_some(),
         "the first failover was not held back: {first:?}\n{refused}"
@@ -5559,13 +5559,17 @@ fn a_slot_given_away_and_back_keeps_its_keys_through_a_manual_failover() {
     std::thread::sleep(Duration::from_secs(14));
     let replica_id = replica.id();
     for n in [&nodes[1], &nodes[2], &replica] {
-        wait_until("the slot's owner to be agreed", Duration::from_secs(20), || {
-            n.conn()
-                .cmd(&["CLUSTER", "NODES"])
-                .text()
-                .lines()
-                .any(|l| l.starts_with(&replica_id) && l.contains(" 0-"))
-        });
+        wait_until(
+            "the slot's owner to be agreed",
+            Duration::from_secs(20),
+            || {
+                n.conn()
+                    .cmd(&["CLUSTER", "NODES"])
+                    .text()
+                    .lines()
+                    .any(|l| l.starts_with(&replica_id) && l.contains(" 0-"))
+            },
+        );
     }
     let lost = not_as_written(&replica, &keys, "v3");
     assert!(

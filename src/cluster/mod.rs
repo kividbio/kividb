@@ -3944,7 +3944,10 @@ mod tests {
         assert!(claimed.contains(&100) && claimed.contains(&55));
         assert_eq!(cs.given_away.lock().slots(), expected);
         let after = cs.given_away.lock().drop_after_ms.unwrap();
-        assert!(after >= now_ms() + 10_000, "a heartbeat and a TAKEOVER's answer from now");
+        assert!(
+            after >= now_ms() + 10_000,
+            "a heartbeat and a TAKEOVER's answer from now"
+        );
         // Claims from before then, and those confirmed before the
         // promotion, drop nothing: the slot may have gone back to the old
         // master, and the claim be older than its going.
