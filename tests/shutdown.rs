@@ -45,7 +45,7 @@ fn kividb_bin() -> String {
 
 #[test]
 fn shutdown_nosave_exits_cleanly() {
-    let port = 16399u16;
+    let port = free_port();
     // A directory of its own: one engine to a data directory.
     let mut server = Command::new(kividb_bin())
         .current_dir(tempfile::tempdir().unwrap().keep())
@@ -351,7 +351,7 @@ fn counter_after_restart(dir: &std::path::Path, port: u16, between: impl FnOnce(
 /// a snapshot that held 0.
 #[test]
 fn port_takes_no_connection_once_the_server_has_exited() {
-    let port = 16402u16;
+    let port = free_port();
     let dir = std::env::temp_dir().join(format!("kividb-shutdown-port-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -392,7 +392,7 @@ fn port_takes_no_connection_once_the_server_has_exited() {
 
 #[test]
 fn shutdown_abort_keeps_server_alive() {
-    let port = 16400u16;
+    let port = free_port();
     let mut server = Command::new(kividb_bin())
         .current_dir(tempfile::tempdir().unwrap().keep())
         .args(["--port", &port.to_string()])
