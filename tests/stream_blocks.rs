@@ -887,7 +887,12 @@ fn a_replica_keeps_the_duplicates_it_counted_in_its_own_aof() {
     let rdir = tempfile::tempdir().unwrap();
     let replica = Server::start(
         rdir.path(),
-        &["--aof", "--replicaof", "127.0.0.1", &master.port.to_string()],
+        &[
+            "--aof",
+            "--replicaof",
+            "127.0.0.1",
+            &master.port.to_string(),
+        ],
     );
     let mut c = master.conn();
     let mut rc = replica.conn();
