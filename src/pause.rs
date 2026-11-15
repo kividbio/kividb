@@ -665,8 +665,7 @@ pub fn wait_out_handoff() {
 /// which Redis holds too: there, a pause of everything can only run out.
 /// With only writers paused, the commands that wait are the ones that may
 /// change the dataset or the replication stream: writes (not `SELECT`,
-/// which writes nothing and is held back from the stream meanwhile,
-/// `replication::replicate_one_write`: #411), `PFCOUNT` (which
+/// which writes nothing and is not propagated, #705), `PFCOUNT` (which
 /// may rewrite its key), `PUBLISH`, a script that has not declared itself
 /// free of writes, and an `EXEC` of a transaction holding any of those. A
 /// command that writes only with some of its arguments (`GEORADIUS …
@@ -730,8 +729,8 @@ pub fn queued_may_replicate<Q: AsRef<[u8]>>(command: &[Q]) -> bool {
 /// holds neither (`NOSCRIPT`, `STALE`; neither `WRITE` nor
 /// `MAY_REPLICATE`). Holding them stalled every client that loads its
 /// scripts on connect or on `NOSCRIPT` for the whole pause, the ones that
-/// only read too (#518). While writes are paused they are kept out of the
-/// replication stream and the AOF instead (`replication::held_back`).
+/// only read too (#518). They reach a replica or the AOF replayed never,
+/// as in Redis (#705).
 fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     #[cfg(feature = "lua")]
     let declared_read_only = |name: &str, first: &[u8]| match name {

@@ -1440,12 +1440,11 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
     {
         // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
-        // cache, not the dataset, and while writes are paused they are kept
-        // out of the replication stream and the AOF
-        // (`replication::held_back`), so a handoff misses nothing of them.
-        // The pause does not hold them (#518), and they used to wait the
-        // handoff out here instead, asleep on their worker thread, with
-        // every other connection of that thread (#528).
+        // cache, not the dataset, and they are never sent to the
+        // replication stream or the AOF (#705), so a handoff misses nothing
+        // of them. The pause does not hold them (#518), and they used to
+        // wait the handoff out here instead, asleep on their worker thread,
+        // with every other connection of that thread (#528).
         let handoff = crate::pause::handoff() && name != "SCRIPT";
         if !handoff
             && crate::pause::write_held_in_gate(ctx.cmd.as_slice())

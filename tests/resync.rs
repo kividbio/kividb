@@ -2668,6 +2668,139 @@ fn scripts_writing_in_several_databases_replicate_and_replay_with_their_own_sele
     assert_eq!(dataset_of_dbs(&master), expected, "{}", master.log());
 }
 
+/// A `WATCH` + `MULTI` of plain `SET`s in database 2, made right after a
+/// script that only selects a database, still reaches the replica — and the
+/// AOF — in database 2: the script's select sent nothing (#705), so the
+/// writes have to carry the `SELECT` each of them needs.
+#[cfg(feature = "lua")]
+#[test]
+fn watch_multi_after_a_select_only_script_replicates_and_replays_in_db2() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    wait_link_up(&mut replica.conn());
+
+    let select_only = "redis.call('SELECT', 4) redis.call('GET', KEYS[1]) return 1";
+    let mut c = master.conn();
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(c.cmd(&["EVAL_RO", select_only, "1", "x"]), V::Nil);
+    // A transaction of plain writes, in the connection's own database 2.
+    assert!(c.cmd(&["WATCH", "watchme"]).ok());
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["SET", "a2", "1"]);
+    c.cmd(&["SET", "b2", "2"]);
+    let exec = c.cmd(&["EXEC"]);
+    assert_eq!(exec.arr().len(), 2, "{exec:?}");
+    assert!(c.cmd(&["SET", "c2", "3"]).ok());
+
+    let at = master_offset(&mut m);
+    wait_replica_at(&replica, at);
+    let expected = dataset_of_dbs(&master);
+    for (db, key, value) in [("2", "a2", "1"), ("2", "b2", "2"), ("2", "c2", "3")] {
+        assert!(
+            expected
+                .iter()
+                .any(|(d, k, v)| { (d.as_str(), k.as_str(), v.as_str()) == (db, key, value) }),
+            "{key} {value} missing on the master in db {db}: {expected:?}"
+        );
+    }
+    assert_eq!(dataset_of_dbs(&replica), expected, "{}", replica.log());
+
+    // From the AOF alone: every write on disk, then no final save.
+    assert_eq!(c.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, c));
+    master.kill();
+    master.restart_master(&mut []);
+    assert_eq!(dataset_of_dbs(&master), expected, "{}", master.log());
+}
+
+/// A `BRPOP` blocked in database 2, woken by a push from a connection whose
+/// last write was in database 0: the push carries the `SELECT` the database
+/// it ran in needs, so the value the pop took is the one database 2 held,
+/// on the replica and after a replay from the AOF.
+#[cfg(feature = "lua")]
+#[test]
+fn brpop_in_db2_woken_by_a_db0_conns_push_replicates_and_replays() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    wait_link_up(&mut replica.conn());
+
+    // The blocked pop, in database 2.
+    let mut a = master.conn();
+    assert!(a.cmd(&["SELECT", "2"]).ok());
+    send_only(&mut a, &["BRPOP", "blist", "60"]);
+    // The push comes from a connection whose last write was in database 0.
+    let mut b = master.conn();
+    assert!(b.cmd(&["SET", "b0", "done"]).ok());
+    assert!(b.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(b.cmd(&["LPUSH", "blist", "v"]).i(), 1);
+    assert_eq!(
+        a.read(),
+        V::Arr(vec![V::Str("blist".into()), V::Str("v".into())])
+    );
+
+    let at = master_offset(&mut m);
+    wait_replica_at(&replica, at);
+    let expected = dataset_of_dbs(&master);
+    assert_eq!(dataset_of_dbs(&replica), expected, "{}", replica.log());
+
+    // From the AOF alone: every write on disk, then no final save.
+    assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, a, b));
+    master.kill();
+    master.restart_master(&mut []);
+    assert_eq!(dataset_of_dbs(&master), expected, "{}", master.log());
+}
+
+/// Writes a promoted replica makes, after a select-only script, reach a
+/// second replica that continues from it: the promotion happens at the
+/// master's offset and the script sent nothing (#705), so each write has to
+/// carry the `SELECT` of the database it ran in.
+#[cfg(feature = "lua")]
+#[test]
+fn writes_after_promotion_and_a_select_only_script_reach_a_second_replica() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let mut r1 = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r2 = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    wait_link_up(&mut r1.conn());
+    wait_link_up(&mut r2.conn());
+    let mut m = master.conn();
+    assert!(m.cmd(&["SET", "seed", "1"]).ok());
+    let at = master_offset(&mut m);
+    wait_replica_at(&r1, at);
+    wait_replica_at(&r2, at);
+
+    // Promote r1; r2 continues from it.
+    assert!(r1.conn().cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+    let r1_port = r1.port.to_string();
+    assert!(r2.conn().cmd(&["REPLICAOF", "127.0.0.1", &r1_port]).ok());
+    wait_link_up(&mut r2.conn());
+
+    let select_only = "redis.call('SELECT', 4) redis.call('GET', KEYS[1]) return 1";
+    let mut promoted = r1.conn();
+    assert!(promoted.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(promoted.cmd(&["EVAL_RO", select_only, "1", "x"]), V::Nil);
+    assert!(promoted.cmd(&["SET", "p1", "1"]).ok());
+    assert!(promoted.cmd(&["SET", "p2", "2"]).ok());
+
+    let mut rp = r1.conn();
+    let eat = master_offset(&mut rp);
+    wait_replica_at(&r2, eat);
+    let expected = dataset_of_dbs(&r1);
+    assert_eq!(dataset_of_dbs(&r2), expected, "{}", r2.log());
+
+    // From the AOF alone, the promoted replica holds the same.
+    assert_eq!(promoted.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, promoted));
+    r1.kill();
+    r1.restart_master(&mut [&mut r2]);
+    assert_eq!(dataset_of_dbs(&r1), expected, "{}", r1.log());
+}
+
 /// Milliseconds since the Unix epoch, now.
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
