@@ -484,28 +484,6 @@ impl BlockingSlot {
         parked
     }
 
-    /// Wait for the clients the last dispatch woke to have looked at their
-    /// keys, so its reply comes after their pops, as in Redis (#42). Then
-    /// release whoever woke this one: a chain (`BRPOPLPUSH a b` woken by a
-    /// push to `a`, whose push to `b` wakes `BRPOPLPUSH b c`) is all done
-    /// before the first push replies, as in Redis.
-    ///
-    /// Bounded: a woken client cannot always look at once — a paused server
-    /// holds its resume dispatch, and `CLIENT KILL` or a timeout can take it
-    /// away mid-flight. At the bound this reply goes out without waiting any
-    /// longer, as every reply did before this change, and that client's pop
-    /// lands after it. A hundred milliseconds is far longer than a dispatch,
-    /// which only has to finish what it was already running, and far shorter
-    /// than any `CLIENT PAUSE` someone would set. The bound is for all the
-    /// clients a dispatch woke together (a `FLUSHALL` wakes one on every key
-    /// waited on), not for each.
-    ///
-    /// A client that has gone does not hold it: the looks it owes are done
-    /// when its ticket goes, or with the dispatch that leaves its lines.
-    ///
-    /// `None`, nothing to wait for, is what nearly every command gets. The
-    /// wait is boxed, so that it is polled out of line, as `until_gone` is:
-    /// the connection's own future is compiled as it was without it.
     /// Whether the clients the commands before `cmd0` woke must have looked
     /// before it runs: it reads (or is not known to write), and so would see
     /// what they are yet to take. Writes do not wait, and replies are not
@@ -531,6 +509,25 @@ impl BlockingSlot {
         }
     }
 
+    /// Wait for the clients the commands before this one woke to have
+    /// looked at their keys, so that what it reads comes after their pops,
+    /// as in Redis (#42); a chain (`BRPOPLPUSH a b` woken by a push to `a`,
+    /// whose push to `b` wakes `BRPOPLPUSH b c`) is waited for whole.
+    ///
+    /// Bounded: a woken client cannot always look at once — a paused server
+    /// holds its resume dispatch, and `CLIENT KILL` or a timeout can take it
+    /// away mid-flight. At the bound the command runs without waiting any
+    /// longer, and may not see that client's pop. A hundred milliseconds is
+    /// far longer than a dispatch, which only has to finish what it was
+    /// already running, and far shorter than any `CLIENT PAUSE` someone
+    /// would set. The bound is for all of them together, not for each.
+    ///
+    /// A client that has gone does not hold it: the looks it owes are done
+    /// when its ticket goes, or with the dispatch that leaves its lines.
+    ///
+    /// `None`, nothing to wait for, is what nearly every command gets. The
+    /// wait is boxed, so that it is polled out of line, as `until_gone` is:
+    /// the connection's own future is compiled as it was without it.
     #[inline]
     pub fn settle(&mut self) -> Option<Settling> {
         if self.woken.is_empty() {
