@@ -197,6 +197,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that parses the numbers gets the same values; one that compares the text,
   or reads a RESP3 distance as a double, sees the change.
 
+- **Time series values under RESP2 are written as RedisTimeSeries writes
+  them (#701).** `TS.GET`, `TS.RANGE`, `TS.MGET`, `TS.MRANGE` and their
+  `REV` forms give a value below 1, from 2^56, or from 2^52 ending in a zero
+  with an exponent (`1E-1`, `1E21`, `5.72150878466141E15`), and an infinite
+  sum as `Infinity`, not `0.1`, `1000000000000000000000` and `inf`. RESP3
+  replies are unchanged.
+
+- **RedisJSON errors read as Redis 8.10 gives them (#701).** A JSON command
+  on a key of another type answers `Existing key has wrong Redis type`, not
+  `WRONGTYPE ...`. A JSON argument that does not parse answers with
+  serde_json's text (`EOF while parsing a value at line 1 column 3`),
+  after `ERR ` for `JSON.ARRINDEX`, `JSON.NUMINCRBY`, `JSON.NUMMULTBY` and
+  `JSON.STRAPPEND`, not `ERR invalid JSON`; one that is not UTF-8 answers
+  `Couldn't parse as UTF-8 string`. `JSON.NUMINCRBY` with a value that is
+  not a number answers `bad input number`, and `JSON.STRAPPEND` with one
+  that is not a string `WRONGTYPE wrong type of path value - expected
+  string`.
+
 - **`MEMORY USAGE` of a stream is what its entries take, and reads
   differently (#683).** Stream entries are now packed into blocks, and
   `MEMORY USAGE` counts those blocks exactly instead of estimating from a

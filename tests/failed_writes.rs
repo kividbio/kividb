@@ -322,7 +322,7 @@ fn failing_writes(c: &mut Conn) {
     let r = c.cmd(&["JSON.MSET", "a", "$.n", "10", "c", "$.x", "1"]);
     assert!(r.error().contains("created at the root"), "{r:?}");
     let r = c.cmd(&["JSON.MSET", "a", "$.n", "10", "s", "$", "1"]);
-    assert!(r.error().starts_with("WRONGTYPE"), "{r:?}");
+    assert_eq!(r.error(), "Existing key has wrong Redis type", "{r:?}");
     let r = c.cmd(&[
         "JSON.MSET",
         "a",
