@@ -1254,6 +1254,8 @@ mod tests {
             .build()
             .unwrap();
         let woken = Look::new_for_tests(5);
+        // The slot has a `Drop`, so it cannot be built with `..Default::default()`.
+        #[allow(clippy::field_reassign_with_default)]
         let mut slot = BlockingSlot::default();
         slot.woken = woken.clone();
         let started = Instant::now();
@@ -1269,6 +1271,8 @@ mod tests {
         for (n, look) in woken.iter().enumerate().skip(1) {
             look.done(&woken[..n]);
         }
+        // The slot has a `Drop`, so it cannot be built with `..Default::default()`.
+        #[allow(clippy::field_reassign_with_default)]
         let mut slot = BlockingSlot::default();
         slot.woken = woken;
         let started = Instant::now();
