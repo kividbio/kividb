@@ -820,7 +820,10 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         && !repl_is_slave
         && !ctx.apply_replication
         && !propagates_nothing(name2, ctx.cmd.as_slice(), &result)
-        && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
+        // Not a `SELECT`: a write carries the one it needs, from the database
+        // it ran in, and a script that only selected one sent nothing in
+        // Redis, whose offset it must not move (#705).
+        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
     {
         let feeds = replication::script_feed::commands_for_propagation(
             ctx,
@@ -2660,7 +2663,14 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         // `write_is_observed`), but reaching that no-op used to cost a
         // `Vec<Vec<u8>>` clone of every argument here *plus* a full RESP encode
         // inside — allocations on every single write, discarded immediately.
-        if replication::write_is_observed(ctx) && !propagates_nothing(name, &ctx.cmd, result) {
+        //
+        // Not a `SELECT` or a `SCRIPT LOAD` / `FLUSH`, which Redis sends to
+        // nobody (#705): a write carries the `SELECT` it needs, and a
+        // script's writes reach a replica as the commands it made.
+        if replication::write_is_observed(ctx)
+            && !propagates_nothing(name, &ctx.cmd, result)
+            && !matches!(name, "SELECT" | "SCRIPT")
+        {
             // Propagate the command's *effect*, not the bytes the client sent.
             // `SPOP` and `XADD … *` produce a different result each time they
             // run, so a replica re-executing them diverges (measured: a replica

@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 pub mod loglevel;
 mod acl;
 mod aof;
+mod cli_directives;
 pub mod client_registry;
 pub mod cluster;
 pub mod cmdstats;
@@ -303,8 +304,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parsed by hand rather than with `Config::parse()`, to keep the matches:
     // the config file must not override an option given on the command line,
     // and only the matches know which those are.
-    let matches = <Config as clap::CommandFactory>::command()
-        .try_get_matches()
+    //
+    // The flags KiviDB has go to clap; every other `--<directive> <values>`
+    // is held back and applied after the config file, as `redis-server` does
+    // (#390). See `src/cli_directives.rs`.
+    let command = <Config as clap::CommandFactory>::command();
+    let split =
+        cli_directives::split(&command, std::env::args_os().collect()).unwrap_or_else(|e| {
+            // As for clap's refusals: a health check fails with 1, not 2.
+            if std::env::args_os().any(|a| a == "--ping") {
+                eprintln!("kividb --ping: {e}");
+            } else {
+                log_fatal!("Bad command line: {e}");
+            }
+            std::process::exit(1)
+        });
+    let matches = command
+        .clone()
+        .try_get_matches_from(split.native.iter())
         .unwrap_or_else(|e| bad_arguments(e));
     let mut cfg = <Config as clap::FromArgMatches>::from_arg_matches(&matches)
         .unwrap_or_else(|e| bad_arguments(e));
@@ -312,7 +329,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         |option: &str| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine);
     cfg.bind_explicit =
         matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
-    let config_file = cfg.apply_config_file(&from_cli);
+    // Config file, then the text on standard input (`-`, as in Redis; not for
+    // a health check, which must not wait for it), then the directives of the
+    // command line: each over the one before, and none over a flag.
+    let mut config_file = cfg.apply_config_file(&from_cli);
+    if let Ok(warnings) = &mut config_file
+        && split.stdin
+        && !cfg.ping
+    {
+        let mut text = String::new();
+        let read = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text);
+        let applied = read
+            .map_err(|e| format!("can't read the config from standard input: {e}"))
+            .and_then(|_| {
+                cfg.apply_config_text(&text, &from_cli)
+                    .map_err(|e| format!("standard input: {e}"))
+            });
+        match applied {
+            Ok(more) => warnings.extend(more.into_iter().map(|w| format!("standard input: {w}"))),
+            Err(e) => config_file = Err(e),
+        }
+    }
+    if let Ok(warnings) = &mut config_file {
+        match cli_directives::apply(&mut cfg, &command, &split.directives, &from_cli) {
+            Ok(more) => warnings.extend(more),
+            Err(e) => config_file = Err(e),
+        }
+    }
     // `--ping` is a client: it needs the ports, TLS files and password the
     // command line and config file give, and nothing a server does after
     // this. It prints no warnings about the file: health checks run every few
