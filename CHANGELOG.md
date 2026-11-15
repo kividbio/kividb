@@ -440,9 +440,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Redis shows. Writes and replies are not held: a producer pipelining
   pushes to queues with blocked workers keeps its rate (holding replies
   until the workers had popped cost 30-40 % of the jobs per second in
-  suite 15). The one difference from Redis left: the reply of a push
-  pipelined right behind another to the same key may count an element the
-  first one's woken client has yet to take.
+  suite 15). What still differs from Redis, as it did before: a write
+  pipelined right behind the push that woke a client acts on the list
+  before that client's pop. A second push's reply may count the element
+  the woken client has yet to take; `LPUSHX` or `LSET` find the list
+  there; `LPOP`, `LMOVE`, `LTRIM`, `DEL` or `RENAME` may take the element
+  first, and the client then waits on. Nothing is lost or delivered
+  twice, and a replica applies the same order. In builds with Lua, a
+  push made by a script is not waited for by the reads that follow it.
   Thanks to @willgitdata for the fix.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis

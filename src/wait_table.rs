@@ -8,20 +8,20 @@ use tokio::sync::oneshot;
 
 // What a woken waiter receives. A client blocked in a line (see
 // [`WaitTable::enqueue_all`]) is sent the key that woke it; nothing else is
-// delivered through it â€” a waiter looks at the key for itself once it is
-// woken â€” and the other waiters are sent nothing.
+// delivered through it — a waiter looks at the key for itself once it is
+// woken — and the other waiters are sent nothing.
 pub(crate) type Value = Arc<[u8]>;
 
 /// A blocked client's place in line, taken when its command first has to
 /// wait and kept until it is answered. The client holds it; the table holds
 /// only its [`Bell`], which says whether the ticket is still held, so a
-/// client that goes away â€” answered, timed out or disconnected â€” leaves the
+/// client that goes away — answered, timed out or disconnected — leaves the
 /// line without anyone having to remember to take it out.
 ///
 /// And without losing the turn: a client that was woken and is dropped
-/// before it has looked at the key â€” its connection closed, or its command
+/// before it has looked at the key — its connection closed, or its command
 /// refused before its handler ran (a pause it went in, `READONLY` after a
-/// failover, `OOM`) â€” passes the turn to the client behind it when the ticket
+/// failover, `OOM`) — passes the turn to the client behind it when the ticket
 /// goes (see the `Drop`). Otherwise the element it was woken for would wait
 /// there for the next write, with clients blocked on the key (#384).
 pub struct Ticket {
@@ -40,7 +40,7 @@ pub struct Ticket {
 
 /// How a client standing in lines for several keys is woken: one for all of
 /// them (#758). A client blocked on 270 keys used to be given a receiver for
-/// each, raced by a task of its own with a timer of its own â€” 270 tasks and
+/// each, raced by a task of its own with a timer of its own — 270 tasks and
 /// timers for each wait, and as many again every time it was woken and
 /// waited again. It now waits on one receiver, with one timer, whichever key
 /// wakes it; the key that did is what it is sent.
@@ -429,7 +429,7 @@ struct Queued {
     woken: bool,
 }
 
-/// Key â†’ the clients in its line, by ticket: the order they blocked in.
+/// Key → the clients in its line, by ticket: the order they blocked in.
 /// Standing in line, leaving it and finding its head each take a few steps
 /// whatever the length of the line, where a sorted `Vec` took a pass over
 /// it (#758: a thousand clients blocked on the same 270 keys made every
@@ -440,7 +440,7 @@ type Lines = AHashMap<Key, BTreeMap<u64, Queued>>;
 struct LineTable {
     lines: Mutex<Lines>,
     /// Number of entries in `lines`, so a write can skip the lock entirely
-    /// when nobody is waiting â€” which is nearly always.
+    /// when nobody is waiting — which is nearly always.
     count: AtomicUsize,
 }
 
@@ -458,8 +458,12 @@ impl LineTable {
     }
 
     fn clear(&self) {
-        self.lines.lock().clear();
+        // Under the lines' lock, so that a client entering or leaving a
+        // line at the same moment is counted once, on one side or the other.
+        let mut lines = self.lines.lock();
+        lines.clear();
         IN_LINE.fetch_sub(self.count.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+        drop(lines);
     }
 }
 
@@ -476,21 +480,21 @@ pub fn anyone_in_line() -> bool {
 }
 
 pub struct WaitTable {
-    // Key â†’ stream readers (`XREAD BLOCK`, `XREADGROUP BLOCK`) waiting on it,
+    // Key → stream readers (`XREAD BLOCK`, `XREADGROUP BLOCK`) waiting on it,
     // by registration: a [`StreamWait`] takes its own out when it is dropped,
     // without looking through the others. They are all woken together, so
     // their order does not matter. See [`WaitTable::notify_stream_waiters`].
     inner: Mutex<AHashMap<Key, AHashMap<u64, oneshot::Sender<Value>>>>,
-    /// Key â†’ clients waiting to be told the key was written: `TS.READ`. See
+    /// Key → clients waiting to be told the key was written: `TS.READ`. See
     /// [`WaitTable::register_signal`].
     signals: Mutex<AHashMap<Key, Vec<oneshot::Sender<Value>>>>,
     /// Number of entries in `signals`, so a push can skip the lock entirely
-    /// when nobody is waiting â€” which is nearly always.
+    /// when nobody is waiting — which is nearly always.
     signal_count: AtomicUsize,
-    /// Key â†’ the clients blocked on it in a list or sorted-set command, in
+    /// Key → the clients blocked on it in a list or sorted-set command, in
     /// the order they blocked. See [`WaitTable::enqueue_all`].
     queues: LineTable,
-    /// Key â†’ the clients blocked on it in `XREADGROUP`, in the order they
+    /// Key → the clients blocked on it in `XREADGROUP`, in the order they
     /// blocked. A line of its own: these clients are waiting on a stream and
     /// those in `queues` on a list or a sorted set, and what one kind finds
     /// at the key says nothing about what the other will. Each line is woken
@@ -528,12 +532,12 @@ impl WaitTable {
         }
     }
 
-    // â”€â”€ The line for a key â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── The line for a key ────────────────────────────────────────────────
     //
     // Clients blocked on the same key are served in the order they blocked:
     // the one that has waited longest gets the first element. Nothing is
-    // handed to them â€” each pops for itself (see
-    // `commands::blocking::wait_for_keys`) â€” so the order has to be kept by
+    // handed to them — each pops for itself (see
+    // `commands::blocking::wait_for_keys`) — so the order has to be kept by
     // who is *woken*: one client at a time, from the front, each passing the
     // turn to the one behind it once it has looked. Waking them all would
     // leave the order to the scheduler.
@@ -575,8 +579,8 @@ impl WaitTable {
         }
     }
 
-    /// Stand in the line for each of `keys` â€” or, already in it, stay where
-    /// `ticket` says â€” under one lock, and return the receiver this client
+    /// Stand in the line for each of `keys` — or, already in it, stay where
+    /// `ticket` says — under one lock, and return the receiver this client
     /// is woken through, by whichever of them is written first.
     pub fn enqueue_all(
         &self,
@@ -930,7 +934,7 @@ impl WaitTable {
     }
 
     /// Wake all waiters registered on `key` without delivering a value.
-    /// Used by XADD to wake XREAD BLOCK clients â€” the client re-reads the
+    /// Used by XADD to wake XREAD BLOCK clients — the client re-reads the
     /// stream itself after waking, so we just need the signal.
     /// Returns the number of waiters notified.
     pub fn notify_stream_waiters(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> usize {
@@ -1062,11 +1066,11 @@ mod signal_tests {
         assert!(rx2.try_recv().is_ok());
         assert!(rx3.try_recv().is_err());
 
-        // The second found nothing and waits again, in the same placeâ€¦
+        // The second found nothing and waits again, in the same place…
         let mut rx2 = table.enqueue("k", &second);
         table.pass_on("k", &second);
         assert!(rx3.try_recv().is_ok());
-        // â€¦so the next write is its turn again, not the third client's.
+        // …so the next write is its turn again, not the third client's.
         let mut rx3 = table.enqueue("k", &third);
         table.notify_signal("k");
         assert!(rx2.try_recv().is_ok());

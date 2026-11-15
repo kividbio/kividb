@@ -420,6 +420,17 @@ pub struct BlockingSlot {
     collecting: bool,
 }
 
+impl Drop for BlockingSlot {
+    /// A connection that ends before its resume dispatch has run still owes
+    /// its looks: they are marked done here, so that whoever woke it does
+    /// not wait out the bound for a client that has gone.
+    fn drop(&mut self) {
+        if !self.looked.is_empty() {
+            crate::wait_table::all_done(std::mem::take(&mut self.looked), &[]);
+        }
+    }
+}
+
 impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
