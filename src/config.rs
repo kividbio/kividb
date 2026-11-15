@@ -79,6 +79,7 @@ const VERSION: &str = concat!(
 #[command(
     name = "kividb",
     about = "Fast Redis-compatible store",
+    after_help = "Any other configuration directive (see CONFIG GET *) is accepted as `--<directive> <value>`, as redis-server takes it: --appendonly yes --save \"900 1\". A flag above wins over the same directive; a directive wins over the config file.",
     version = VERSION,
     author = env!("CARGO_PKG_AUTHORS")
 )]
@@ -1530,7 +1531,7 @@ impl Config {
     }
 
     /// Apply one directive. `Ok(Some(_))` is a warning about it.
-    fn apply_directive(
+    pub(crate) fn apply_directive(
         &mut self,
         key: &str,
         args: &[String],
@@ -2050,7 +2051,7 @@ fn refused(key: &str, value: &str, reply: &[u8]) -> String {
     format!("invalid value '{value}' for '{key}': {why}")
 }
 
-fn split_config_line(line: &str) -> Result<Vec<String>, String> {
+pub(crate) fn split_config_line(line: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut chars = line.chars().peekable();
     loop {

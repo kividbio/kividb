@@ -55,6 +55,28 @@ read a config file only when one is named, as Redis does. The packaged systemd u
 on the command line wins over the same setting in the file. Run `kividb --help` for the full
 list.
 
+Any directive the config file or `CONFIG SET` takes is also taken on the command line in the
+form `redis-server` uses, `--<directive> <value>`, so a Compose file, Helm chart or platform
+template written for Redis starts KiviDB unchanged:
+
+```bash
+kividb --appendonly yes --requirepass s3cret --maxmemory 256mb --maxmemory-policy allkeys-lru
+kividb /etc/redis.conf --save "" --loglevel warning     # a config file first, then overrides
+```
+
+A directive is read as a config line is, with the same checks: a value that is not valid, or a
+name that is not known, stops the server at start-up with a message that names it (and the
+closest known name, for a typo). A directive may have several values (`--save 900 1 --save 300
+10`), an empty one (`--save ""`), or one that starts with a dash. The first argument, when it
+does not start with `-`, is a config file, and `-` reads config text from standard input. Names
+are not case-sensitive, and `--name=value` is taken too. A directive that KiviDB accepts but
+does not act on (`--save 900 1`, `--tcp-keepalive`, `--io-threads`, ...) logs one warning.
+
+The order of precedence, strongest first: a flag of the table below, a directive on the command
+line, the config file, the default. A flag wins over the directive for the same setting
+whatever their order (`--aof --appendonly no` turns the append-only file on), and no warning
+is logged for the directive it overrides. A flag given twice counts once, the last.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
