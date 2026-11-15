@@ -1329,7 +1329,8 @@ mod signal_tests {
         table.notify_signal("k");
         table.notify_signal("j");
         let woke = take_woken().expect("waits for the one woken before").woken;
-        assert_eq!(woke.len(), 2);
+        // One look for the client, however many of its keys were written.
+        assert_eq!(woke.len(), 1);
         all_done(first.take_looked(), &[]);
         assert!(woke.iter().all(|look| look.is_done()));
     }
