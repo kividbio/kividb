@@ -1254,10 +1254,8 @@ mod tests {
             .build()
             .unwrap();
         let woken = Look::new_for_tests(5);
-        let mut slot = BlockingSlot {
-            woken: woken.clone(),
-            ..Default::default()
-        };
+        let mut slot = BlockingSlot::default();
+        slot.woken = woken.clone();
         let started = Instant::now();
         rt.block_on(slot.settle().expect("something to wait for"));
         let waited = started.elapsed();
@@ -1271,10 +1269,8 @@ mod tests {
         for (n, look) in woken.iter().enumerate().skip(1) {
             look.done(&woken[..n]);
         }
-        let mut slot = BlockingSlot {
-            woken,
-            ..Default::default()
-        };
+        let mut slot = BlockingSlot::default();
+        slot.woken = woken;
         let started = Instant::now();
         rt.block_on(slot.settle().expect("something to wait for"));
         assert!(started.elapsed() < WOKEN_BOUND / 2);
