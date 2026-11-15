@@ -8,33 +8,10 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::free_port;
+
 const BIN: &str = env!("CARGO_BIN_EXE_kividb");
-
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on, and not one the system hands out to
-/// outgoing connections (see tests/config.rs).
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(37);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
 
 /// A kividb process in a directory of its own, killed when dropped.
 struct Server {

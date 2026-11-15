@@ -328,7 +328,7 @@ mod tls {
         }
         let client = if files.ca.is_empty() {
             let peer = tcp.peer_addr().map_err(|e| format!("socket: {e}"))?;
-            if !peer.ip().is_loopback() {
+            if !super::trusted_without_ca(peer.ip()) {
                 return Err(format!(
                     "{peer} is not this host: set tls-ca-cert-file to check its certificate, \
                      since the password would go to whoever answers"
@@ -351,6 +351,15 @@ mod tls {
             .map_err(|e| format!("TLS: {e}"))?;
         Ok(rustls::StreamOwned::new(conn, tcp))
     }
+}
+
+/// Whether a server at `ip` may be talked to over TLS with no CA to check its
+/// certificate against: only one on this host, since the password goes to
+/// whoever answers. An IPv4 loopback address written as IPv6 (`::ffff:127.0.0.1`)
+/// counts as the loopback it is.
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+fn trusted_without_ca(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
 }
 
 /// `path` as the server opens it: relative to `dir` (the server changes to
@@ -393,6 +402,25 @@ fn tls_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_loopback_peer_is_trusted_without_a_ca() {
+        for ip in ["127.0.0.1", "127.5.5.5", "::1", "::ffff:127.0.0.1"] {
+            assert!(trusted_without_ca(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "10.0.0.5",
+            "192.168.1.1",
+            "8.8.8.8",
+            "::ffff:10.0.0.5",
+            "2001:db8::1",
+            "fe80::1",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(!trusted_without_ca(ip.parse().unwrap()), "{ip}");
+        }
+    }
 
     #[test]
     fn a_command_is_an_array_of_bulk_strings() {

@@ -53,7 +53,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KIVIDB_PASSWORD` first (and an ACL user from `KIVIDB_USER`), and starts no
   server and touches no data. `--ping-host` and `--ping-port` point it
   elsewhere; without `tls-ca-cert-file` it speaks TLS only to a server on
-  this host (docs/CONFIGURATION.md, "Health checks").
+  this host (docs/CONFIGURATION.md, "Health checks"). Thanks to @vikash7485.
 - **`kividb-full` packages, with Lua and TLS, in the apt and dnf
   repositories and the Homebrew tap (#732).** `sudo apt install
   kividb-full`, `sudo dnf install kividb-full` or `brew install
