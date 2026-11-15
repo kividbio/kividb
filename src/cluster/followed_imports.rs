@@ -818,6 +818,11 @@ fn run(cluster: &Weak<ClusterState>) {
 /// the import brought (#741 review). Also notes the counts of an import not
 /// looked at yet. Written down, and the replicas told, at once.
 fn settle(cluster: &ClusterState) {
+    // Nothing to do, and nothing to wait for: most of the time, and every
+    // promotion of a node that knew of no import (called from it).
+    if cluster.followed_imports.imports.lock().is_empty() {
+        return;
+    }
     let me = cluster.myself();
     let mut gone: Vec<(String, Vec<u16>)> = Vec::new();
     let look = {
