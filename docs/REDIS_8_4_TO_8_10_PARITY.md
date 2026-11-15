@@ -123,7 +123,8 @@ does.
   `JSON.OBJLEN key`, `JSON.TYPE key` return a plain value.
 * Objects keep their members in insertion order (they used to be sorted by
   name). This shows in `JSON.GET`, `JSON.OBJKEYS` and `$~`.
-* `JSON.SET` on a key holding another type is a `WRONGTYPE` error; it used to
+* `JSON.SET` on a key holding another type is an error (`Existing key has wrong
+  Redis type`, as RedisJSON answers); it used to
   replace the key.
 * `JSON.GET` understands `INDENT`, `NEWLINE` and `SPACE`; they used to be
   taken for paths.
