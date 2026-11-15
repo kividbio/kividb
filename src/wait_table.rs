@@ -114,28 +114,21 @@ impl Bell {
 /// for each other, and a client that woke itself (its own `BLMOVE k k`) has
 /// done its look by the time it waits.
 pub struct Look {
-    then: Mutex<Option<Vec<Arc<Look>>>>,
+    /// The looks it was done with, once it is done.
+    then: std::sync::OnceLock<Vec<Arc<Look>>>,
+    /// Whether anyone waits on it: a look nobody waits for (that of a
+    /// producer that never reads) is done without touching `notify`.
+    waited: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
 impl Look {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            then: Mutex::new(None),
+            then: std::sync::OnceLock::new(),
+            waited: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         })
-    }
-
-    /// The client has looked, and woke `then` doing so. Once: a look done
-    /// stays done.
-    pub fn done(&self, then: &[Arc<Look>]) {
-        {
-            let mut state = self.then.lock();
-            if state.is_none() {
-                *state = Some(then.to_vec());
-            }
-        }
-        self.notify.notify_waiters();
     }
 
     /// `n` looks nobody will finish, for tests.
@@ -144,18 +137,34 @@ impl Look {
         (0..n).map(|_| Look::new()).collect()
     }
 
+    /// The client has looked, and woke `then` doing so. Once: a look done
+    /// stays done.
+    pub fn done(&self, then: &[Arc<Look>]) {
+        if self.then.set(then.to_vec()).is_ok() {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if self.waited.load(Ordering::SeqCst) {
+                self.notify.notify_waiters();
+            }
+        }
+    }
+
     /// Whether it is done.
+    #[inline]
     pub fn is_done(&self) -> bool {
-        self.then.lock().is_some()
+        self.then.get().is_some()
     }
 
     /// Until it is done: the looks it was done with.
     async fn wait(&self) -> Vec<Arc<Look>> {
+        // Said before looking, as `done` sets before it looks whether to
+        // notify: one of the two sees the other.
+        self.waited.store(true, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(then) = &*self.then.lock() {
+            if let Some(then) = self.then.get() {
                 return then.clone();
             }
             notified.await;
