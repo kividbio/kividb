@@ -2176,13 +2176,25 @@ fn run_xreadgroup_delivery(
                 if budget.exhausted() {
                     break;
                 }
-                let item = match entries.get(&id) {
+                let entry = entries.get(&id);
+                let item = match entry {
                     Some(entry) => format_entry(&id, entry),
                     // Still pending, but deleted from the stream since.
                     None => resp_array(vec![resp_bulk_str(&id.to_string()), resp_null_for(resp)]),
                 };
                 if !budget.admit(item.len()) {
                     break;
+                }
+                if entry.is_none() {
+                    // Reported, and left as it was: still pending, its
+                    // delivery count and time unchanged, and nothing sent,
+                    // as in Redis 8.10. It used to be counted as a delivery
+                    // and sent as the XCLAIM below, which drops an entry
+                    // that is gone: replicas and the AOF dropped what the
+                    // primary kept (#737). XCLAIM and XAUTOCLAIM drop it,
+                    // on every copy.
+                    items.push(item);
+                    continue;
                 }
                 if let Some(pending) = g.pel.get_mut(&id) {
                     pending.delivered_at = now;

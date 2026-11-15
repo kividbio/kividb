@@ -285,6 +285,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A consumer's history read of a pending entry that is gone from the
+  stream no longer makes its replicas and the AOF drop the entry (#737).**
+  `XREADGROUP ... STREAMS key 0` reports an entry removed by `XDEL`, `XTRIM`
+  or `MAXLEN` as `[id, nil]` and keeps it pending, but counted it as a
+  delivery and sent that as an `XCLAIM`, which removes an entry that is gone.
+  The primary kept it while its replicas and an AOF replay dropped it, so
+  `XPENDING` changed after a failover or a restart. Such an entry is now
+  left as it was: still pending, its delivery count and time unchanged, and
+  nothing sent, as in Redis 8.10.2. `XCLAIM` and `XAUTOCLAIM` drop it, on
+  every copy.
+
 - **A replica promoted after its master died part way through a slot
   import deletes what the import brought, and an import sent again no
   longer brings back keys the source deleted (#741).** The keys a
