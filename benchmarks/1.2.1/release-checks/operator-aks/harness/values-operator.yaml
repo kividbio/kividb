@@ -1,0 +1,6 @@
+manager:
+  image: {repository: kividbc3aks111209.azurecr.io/kividb-operator, tag: "0.7.0-473ae58", pullPolicy: Always}
+agent:
+  image: {repository: kividbc3aks111209.azurecr.io/kividb-operator-agent, tag: "0.7.0-473ae58", pullPolicy: Always}
+gui:
+  image: {repository: kividbc3aks111209.azurecr.io/kividb-operator-gui, tag: "0.7.0-473ae58", pullPolicy: Always}

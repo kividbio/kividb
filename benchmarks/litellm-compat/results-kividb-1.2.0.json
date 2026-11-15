@@ -1,0 +1,118 @@
+{
+  "meta": {
+    "label": "kividb-1.2.0",
+    "date": "2026-11-05",
+    "litellm": "1.108.0",
+    "redis_py": "5.3.1"
+  },
+  "results": [
+    {
+      "check": "PING",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2
+    },
+    {
+      "check": "SET EX / GET / TTL",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "INCR / EXPIRE / MGET",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "MULTI/EXEC pipeline",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "SCAN MATCH",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3
+    },
+    {
+      "check": "SET NX EX (locks)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "HSET / HGETALL",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "RPUSH / LRANGE / LPOP",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "EVAL + EVALSHA (Lua)",
+      "status": "FAIL",
+      "detail": "ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+      "ms": 0
+    },
+    {
+      "check": "INFO",
+      "status": "PASS",
+      "detail": "redis_version=8.10.0 kividb_version=1.2.0",
+      "ms": 0
+    },
+    {
+      "check": "FT.CREATE (HNSW + TAG, COSINE)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "FT.SEARCH KNN with TAG pre-filter",
+      "status": "PASS",
+      "detail": "nearest=reset my password",
+      "ms": 53
+    },
+    {
+      "check": "FT.INFO",
+      "status": "PASS",
+      "detail": "",
+      "ms": 0
+    },
+    {
+      "check": "FT.DROPINDEX",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1
+    },
+    {
+      "check": "LiteLLM exact cache (type=redis)",
+      "status": "PASS",
+      "detail": "",
+      "ms": 604
+    },
+    {
+      "check": "LiteLLM router TPM/RPM counters in Redis",
+      "status": "PASS",
+      "detail": "2 counter keys grew, rpm +3",
+      "ms": 3174
+    },
+    {
+      "check": "LiteLLM semantic cache (type=redis-semantic)",
+      "status": "PASS",
+      "detail": "paraphrase=hit, unrelated=miss",
+      "ms": 4036
+    },
+    {
+      "check": "LiteLLM proxy per-key rate limiter (v3, Lua scripts) on Redis",
+      "status": "FAIL",
+      "detail": "AssertionError: no counter keys in Redis: the limiter counted in process memory (its scripts failed?)",
+      "ms": 15
+    }
+  ]
+}

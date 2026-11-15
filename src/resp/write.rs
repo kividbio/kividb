@@ -87,6 +87,24 @@ pub fn resp_error(s: &str) -> Vec<u8> {
     resp_error_wire(msg)
 }
 
+/// An error whose text holds bytes that need not be UTF-8, such as a key or
+/// a consumer group's name. Redis puts those bytes into the message as they
+/// are; as in [`resp_error`], line breaks become spaces.
+pub fn resp_error_bytes(msg: &[u8]) -> Vec<u8> {
+    let msg: &[u8] = if msg.is_empty() { b"ERR" } else { msg };
+    // The error's code (its first word) is what INFO counts, and is text.
+    let code_end = memchr::memchr(b' ', msg).unwrap_or(msg.len());
+    crate::stats::record_error_reply_stats(std::str::from_utf8(&msg[..code_end]).unwrap_or("ERR"));
+    let mut out = Vec::with_capacity(msg.len() + 3);
+    out.push(b'-');
+    out.extend(
+        msg.iter()
+            .map(|&b| if matches!(b, b'\r' | b'\n') { b' ' } else { b }),
+    );
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
 /// Same wire format as [`resp_error`] without bumping error INFO stats (nested script wrappers).
 pub fn resp_error_wire(msg: &str) -> Vec<u8> {
     let msg = if msg.is_empty() { "ERR" } else { msg };
@@ -116,20 +134,14 @@ pub fn resp_bulk_str(s: &str) -> Vec<u8> {
     resp_bulk(s.as_bytes())
 }
 
-/// Shortest human-readable double string — matches Redis `d2string` / `addReplyDouble` better
-/// than `{:.17}`, which amplifies binary noise (e.g. `3.141` → a 19-char tail and wrong `$` length).
-fn format_redis_double(d: f64) -> String {
-    if !d.is_finite() {
-        return format!("{d}");
+/// A double as Redis writes one in a reply (`addReplyDouble`): the shortest
+/// digits that read back as it, laid out as a score is (`format_score`):
+/// `-0`, `10000000000000000`, `1.5e-7`, `1e+300`, not 301 digits (#472).
+pub fn format_redis_double(d: f64) -> String {
+    if d.is_nan() {
+        return "nan".to_string();
     }
-    let mut s = format!("{d}");
-    if s == "-0" {
-        return "0".to_string();
-    }
-    if s.contains('.') {
-        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-    }
-    s
+    crate::commands::helpers::format_score(d)
 }
 
 /// RESP2 encoding for a Lua `{ double = x }` reply (Redis `addReplyDouble` when `client->resp != 3`).

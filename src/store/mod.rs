@@ -3,32 +3,37 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use ahash::AHashSet;
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
 mod access;
 mod entry;
 mod shard_map;
+mod ttl_list;
 pub use access::AccessScope;
 #[allow(unused_imports)] // Not every item is named outside the store yet.
 pub use shard_map::{
-    EntryRef, EntryView, Leftover, Lookup, Relocated, Removal, ShardMap, StrRef, Taken, ValueRef,
-    Written,
+    EntryRef, EntryView, Leftover, Lookup, Relocated, Removal, SCAN_POSITIONS, ShardMap, StrRef,
+    Taken, ValueRef, Written,
 };
 
 /// Which shard `key` is in, of `shards` (a power of two).
 ///
 /// 64-bit FNV-1a on every target (a 32-bit `usize` can't hold its
 /// constants); the shard is taken from its low bits.
-#[inline]
-pub fn shard_index(shards: usize, key: &str) -> usize {
-    shard_index_of_bytes(shards, key.as_bytes())
+#[inline(always)]
+pub fn shard_index(shards: usize, key: &(impl AsRef<[u8]> + ?Sized)) -> usize {
+    shard_index_of_bytes(shards, key.as_ref())
 }
 
 /// [`shard_index`] of a key as the command gave it, not yet checked to be
-/// UTF-8 (the same shard: the hash is of the bytes).
-#[inline]
+/// UTF-8 (the same shard: the hash is of the bytes). In cluster mode the
+/// shard is the key's slot's instead ([`shard_by_slot`]).
+#[inline(always)]
 pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
+    if BY_SLOT.load(Ordering::Relaxed) {
+        return shard_index_by_slot(shards, key);
+    }
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in key {
         hash ^= u64::from(byte);
@@ -37,8 +42,96 @@ pub fn shard_index_of_bytes(shards: usize, key: &[u8]) -> usize {
     (hash as usize) & (shards - 1)
 }
 
+/// Whether a key's shard is chosen by its cluster slot (cluster mode), so
+/// that the keys of one slot are all in one shard and `CLUSTER
+/// GETKEYSINSLOT` and `COUNTKEYSINSLOT` look at that shard alone (#294).
+/// Set once at startup, before the store holds a key, and never cleared:
+/// every key of the process is then placed and found the same way.
+///
+/// What it costs: the keys of one hash tag (a BullMQ queue's `{queue}`, say)
+/// are in one shard, so writes to them take one shard lock in turn where
+/// they were spread over all. No worse than Redis, where every write takes
+/// the one thread. And shards are filled unevenly, so whatever picks a key
+/// at random picks a shard by its keys ([`pick_weighted`]).
+static BY_SLOT: AtomicBool = AtomicBool::new(false);
+
+/// Choose shards by slot from now on. Before the store holds any key.
+pub fn shard_by_slot() {
+    BY_SLOT.store(true, Ordering::Relaxed);
+    crate::log_info!("Keys placed by : cluster slot");
+}
+
+/// Whether shards are chosen by slot.
+pub fn sharded_by_slot() -> bool {
+    BY_SLOT.load(Ordering::Relaxed)
+}
+
+/// [`shard_index_of_bytes`] in cluster mode. Out of line, so that the slot
+/// hash is not inlined into every place a key's shard is looked up.
+#[cold]
+#[inline(never)]
+fn shard_index_by_slot(shards: usize, key: &[u8]) -> usize {
+    shard_of_slot(shards, crate::cluster::slot::key_hash_slot(key))
+}
+
+/// The shard of `slot`'s keys, of `shards`, when they are chosen by slot.
+#[inline]
+pub fn shard_of_slot(shards: usize, slot: u16) -> usize {
+    slot as usize & (shards - 1)
+}
+
+/// The running totals of what each shard of `shards` weighs: its keys, or
+/// (`volatile`) its keys with a time to live, as of the last write to each,
+/// read without a lock. For [`pick_weighted`].
+pub fn shard_weights(shards: &[Shard], volatile: bool, out: &mut Vec<usize>) {
+    out.clear();
+    let mut total = 0usize;
+    out.extend(shards.iter().map(|shard| {
+        total += if volatile {
+            shard.ttl_count()
+        } else {
+            shard.key_count()
+        };
+        total
+    }));
+}
+
+/// A shard picked at random in proportion to what it weighs, given the
+/// running totals of [`shard_weights`] and a random number: `None` when
+/// none weighs anything.
+///
+/// So that every key is as likely to be picked as any other, a shard is
+/// picked in proportion to its keys, and then a key of it. Picked evenly, a
+/// shard of a hundred keys came up as often as one of a million: in cluster
+/// mode, where keys are placed by slot, one busy hash tag fills one shard,
+/// and eviction then took nearly all its keys from the others (#294).
+#[inline]
+pub fn pick_weighted(weights: &[usize], random: usize) -> Option<usize> {
+    let total = *weights.last()?;
+    if total == 0 {
+        return None;
+    }
+    let at = random % total;
+    Some(weights.partition_point(|&w| w <= at))
+}
+
+/// Which of `shards` shards can hold keys of the slots `wanted` picks: the
+/// shards of those slots when keys are placed by slot, else every one.
+pub fn shards_of_slots(shards: usize, wanted: impl Fn(u16) -> bool) -> Vec<bool> {
+    if !sharded_by_slot() {
+        return vec![true; shards];
+    }
+    let mut holds = vec![false; shards];
+    for slot in 0..crate::cluster::slot::CLUSTER_SLOTS as u16 {
+        if wanted(slot) {
+            holds[shard_of_slot(shards, slot)] = true;
+        }
+    }
+    holds
+}
+
 #[inline(always)]
-pub fn get_shard<'a>(db: &'a Db, key: &str) -> &'a Shard {
+pub fn get_shard<'a>(db: &'a Db, key: &(impl AsRef<[u8]> + ?Sized)) -> &'a Shard {
     &db[shard_index(db.len(), key)]
 }
 
@@ -75,12 +168,18 @@ pub struct ShardLock {
     map: RwLock<ShardMap>,
     /// Keys in `map` with a time to live, as of the last writer to let go.
     ttls: AtomicUsize,
-    /// Whether `map` holds any key, as of the last writer to let go.
-    keys: AtomicBool,
+    /// How many keys `map` holds, as of the last writer to let go: whether
+    /// it holds any, and what a shard weighs when one is picked at random
+    /// for eviction or `RANDOMKEY` (in cluster mode shards differ a lot).
+    keys: AtomicUsize,
     /// The store (its address) and database this shard is in, for what is
     /// done about keys past their time that a write puts a value over
     /// (`expiry::written_over`).
     place: std::sync::OnceLock<(usize, usize)>,
+    /// The keys a growth had left to move (`ShardMap::growth_left`) when
+    /// [`ShardLock::step_growth`] last looked: whether writes have moved it
+    /// on much since.
+    growth_seen: AtomicU64,
 }
 
 /// How long [`ShardLock::write_after_spinning`] looks for a busy shard to
@@ -120,11 +219,11 @@ impl Drop for ShardWrite<'_> {
         if self.lock.ttls.load(Ordering::Relaxed) != ttls {
             self.lock.ttls.store(ttls, Ordering::Release);
         }
-        let keys = !self.map.is_empty();
+        let keys = self.map.len();
         if self.lock.keys.load(Ordering::Relaxed) != keys {
             self.lock.keys.store(keys, Ordering::Release);
         }
-        if self.map.wrote_over_expired() {
+        if self.map.has_to_announce() {
             return self.unlock_and_announce();
         }
         // SAFETY: dropped once, here; `map` is not used after.
@@ -133,19 +232,36 @@ impl Drop for ShardWrite<'_> {
 }
 
 impl ShardWrite<'_> {
-    /// Let go of the shard, then expire the keys past their time that
-    /// writes under the lock put new values over: their events, watches,
-    /// caches and indexes, and their `DEL` propagated, all before the
-    /// write's own (`expiry::written_over`).
+    /// Let go of the shard, then say what the writes under the lock left
+    /// to be said ([`ShardLock::announce`]).
     #[cold]
     #[inline(never)]
     fn unlock_and_announce(&mut self) {
-        let keys = self.map.take_written_over();
+        let left = self.map.take_left();
         // SAFETY: dropped once, here, from `drop`; `map` is not used after.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.map) };
-        if let Some(&(store, db)) = self.lock.place.get() {
-            crate::expiry::written_over(store, db, &keys);
+        self.lock.announce(&left);
+    }
+}
+
+/// Let go of every shard of `held`, then say what the writes under their
+/// locks left to be said ([`ShardLock::announce`]): how a writer that holds
+/// several shards at once lets go of them.
+///
+/// Dropped one by one, the first shard let go of announced while the others
+/// were still held. Announcing takes the indexes' lock and reads the key's
+/// shard, so a writer of several shards waited for the indexes with a shard
+/// held, another announcer held the indexes and waited for that shard, and
+/// with something waiting to write the indexes between them neither moved.
+pub fn unlock_together<'a>(held: impl IntoIterator<Item = ShardWrite<'a>>) {
+    let mut left = Vec::new();
+    for mut shard in held {
+        if shard.map.has_to_announce() {
+            left.push((shard.lock, shard.map.take_left()));
         }
+    }
+    for (lock, left) in left {
+        lock.announce(&left);
     }
 }
 
@@ -153,15 +269,53 @@ impl ShardLock {
     pub fn new(map: ShardMap) -> Self {
         ShardLock {
             ttls: AtomicUsize::new(map.ttl_len()),
-            keys: AtomicBool::new(!map.is_empty()),
+            keys: AtomicUsize::new(map.len()),
             map: RwLock::new(map),
             place: std::sync::OnceLock::new(),
+            growth_seen: AtomicU64::new(u64::MAX),
         }
     }
 
     #[inline(always)]
     pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, ShardMap> {
         self.map.read()
+    }
+
+    /// [`ShardLock::read`], or `None` at once while a writer holds or awaits it.
+    #[inline(always)]
+    pub fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, ShardMap>> {
+        self.map.try_read()
+    }
+
+    /// What writes under this shard's lock left to be said, said with no
+    /// shard held: the keys past their time that they put new values over
+    /// are expired, with their events, watches, caches and indexes, and
+    /// their `DEL` propagated, all before the write's own
+    /// (`expiry::written_over`); and the documents they took out or wrote
+    /// over leave their indexes (`vector::documents_left`).
+    #[cold]
+    #[inline(never)]
+    fn announce(&self, left: &[(shard_map::ToSay, Key)]) {
+        let Some(&(store, db)) = self.place.get() else {
+            return;
+        };
+        let of = |what: shard_map::ToSay| {
+            left.iter()
+                .filter(move |(said, _)| *said == what)
+                .map(|(_, key)| key)
+        };
+        if of(shard_map::ToSay::PastItsTime).next().is_some() {
+            let keys: Vec<Key> = of(shard_map::ToSay::PastItsTime).cloned().collect();
+            crate::expiry::written_over(store, db, &keys);
+        }
+        if of(shard_map::ToSay::Document).next().is_some() {
+            // By what each key holds now: a command that took a document
+            // out and put it back under the lock lost nothing.
+            let documents = of(shard_map::ToSay::Document).map(|key| key.as_bytes());
+            crate::vector::documents_left(store, db, documents, |key| {
+                self.map.read().document_at(key)
+            });
+        }
     }
 
     /// [`ShardLock::write`], if nobody holds the shard now; `None` at once
@@ -227,7 +381,14 @@ impl ShardLock {
     /// samples, on every write while memory is full.
     #[inline(always)]
     pub fn holds_no_keys(&self) -> bool {
-        !self.keys.load(Ordering::Acquire)
+        self.keys.load(Ordering::Acquire) == 0
+    }
+
+    /// How many keys this shard holds, as of the last write to it, read
+    /// without the lock.
+    #[inline]
+    pub fn key_count(&self) -> usize {
+        self.keys.load(Ordering::Acquire)
     }
 
     /// How many of this shard's keys have a time to live, as of the last
@@ -266,7 +427,79 @@ impl ShardLock {
         m.shrink_to(keep);
         true
     }
+
+    /// Finish the growth of a table that writes have stopped moving on
+    /// (`ShardMap::make_room`): so that it ends, and looks that miss stop
+    /// looking in two tables, when the writes to the shard stop. Called on
+    /// each shard about once a second, with the shrinking. Returns whether
+    /// the table was growing.
+    ///
+    /// A growth that writes moved on by at least a turn's worth of keys
+    /// since the last call, or that began since, is left to them: they
+    /// finish it at their pace, and this thread taking the shard's lock
+    /// again and again, as a write lets go of it, is what made writes
+    /// wait. One that writes moved less than that, a shard written to a
+    /// few times a second or not at all, is finished here: left to such
+    /// writes, a growth of 230,000 keys would take hours, every look that
+    /// misses looking in two tables meanwhile. Taken in turns of
+    /// [`GROWTH_BACKGROUND_STEP`] keys, each handed straight to a writer
+    /// waiting for the shard, if there is one: the loop would otherwise
+    /// take it again before the writer woke up, and a pipeline of writes
+    /// waited for the whole growth, 12 ms a shard of 230,000 keys (#752).
+    pub fn step_growth(&self) -> bool {
+        let left = {
+            let map = self.read();
+            if !map.is_growing() {
+                // The next growth's first look finds it begun since.
+                self.growth_seen.store(u64::MAX, Ordering::Relaxed);
+                return false;
+            }
+            map.growth_left() as u64
+        };
+        let before = self.growth_seen.swap(left, Ordering::Relaxed);
+        // `None`: a growth begun since the last look, or more left than
+        // then, which only a growth begun since can have.
+        let moved = before.checked_sub(left);
+        if moved.is_none_or(|moved| moved >= GROWTH_BACKGROUND_STEP as u64) {
+            return true;
+        }
+        loop {
+            // Not `write`: moving keys changes no count a writer leaves,
+            // and leaves nothing to announce.
+            let mut map = self.map.write();
+            let done = map.step_growth(GROWTH_BACKGROUND_STEP);
+            parking_lot::RwLockWriteGuard::unlock_fair(map);
+            if done {
+                return true;
+            }
+        }
+    }
 }
+
+impl ShardLock {
+    /// [`ShardMap::sweep_ttl`] until the sweep is done, `steps` keys for
+    /// each hold of the lock, each handed straight to a writer waiting for
+    /// the shard, if there is one. The expiry thread took the lock back
+    /// before the writer it woke could, again and again: every 20 s, a
+    /// pipeline of writes to a shard of 550,000 keys with a time to live
+    /// waited for the whole sweep, and a `PING` on another connection up
+    /// to 40 ms (#752). Moving keys between the list's parts changes no
+    /// count a writer leaves, and leaves nothing to announce.
+    pub fn sweep_ttl(&self, now: u64, steps: usize) {
+        loop {
+            let mut map = self.map.write();
+            let done = map.sweep_ttl(now, steps);
+            parking_lot::RwLockWriteGuard::unlock_fair(map);
+            if done {
+                return;
+            }
+        }
+    }
+}
+
+/// Keys [`ShardLock::step_growth`] moves for each hold of a shard's lock:
+/// tens of microseconds.
+const GROWTH_BACKGROUND_STEP: usize = 512;
 
 impl Default for ShardLock {
     fn default() -> Self {
@@ -274,15 +507,11 @@ impl Default for ShardLock {
     }
 }
 
-/// A key, as the keyspace holds it: the bytes in the entry itself when there
-/// are twenty-four or fewer, which is nearly every key anybody uses, and on
-/// the heap only past that.
-///
-/// As a `String` every key was a block of its own beside the table: sixteen
-/// bytes and an allocator's header for a key like `user:1234567`, and a
-/// second place in memory to go to for every lookup, to compare it. It is
-/// the same size as a `String` was, so the table is no larger.
-pub type Key = compact_str::CompactString;
+/// A key kept outside the keyspace (the keyspace keeps its keys in their
+/// entries): any bytes, inline when there are twenty-four or fewer, as
+/// nearly every key is, and on the heap only past that. See
+/// [`crate::key_bytes`].
+pub type Key = crate::key_bytes::KeyBytes;
 
 pub type Shard = Arc<ShardLock>;
 pub type Db = Arc<Vec<Shard>>;
@@ -462,7 +691,7 @@ pub fn rebuild_ts_label_index(store: &Store, ts: &SharedTsIndex) {
                         index
                             .entry(format!("{label}={label_value}"))
                             .or_default()
-                            .insert(key.to_string());
+                            .insert(crate::key_bytes::text_of(key).into_owned());
                     }
                 }
             }
@@ -509,6 +738,49 @@ mod flush_tests {
             let m = s.read();
             (len + m.len(), cap + m.capacity())
         })
+    }
+
+    /// A growth in steps that writes stop in the middle of is finished by
+    /// the expiry thread's sweep; one that writes move on is left to them
+    /// (#752).
+    #[test]
+    fn a_growth_writes_leave_is_finished_in_the_background() {
+        let shard = ShardLock::new(ShardMap::new());
+        let mut n = 0;
+        while !shard.read().is_growing() {
+            shard.write().insert(format!("k{n}").as_str(), val());
+            n += 1;
+        }
+        // The first look: a growth begun since the last.
+        assert!(shard.step_growth());
+        assert!(shard.read().is_growing());
+        // Moved on by a turn's worth of keys since the last look: left to
+        // the writes.
+        let left = shard.read().growth_left();
+        while shard.read().growth_left() + GROWTH_BACKGROUND_STEP > left {
+            shard.write().insert(format!("more{n}").as_str(), val());
+            n += 1;
+        }
+        assert!(shard.read().is_growing());
+        assert!(shard.step_growth());
+        assert!(shard.read().is_growing());
+        // A write or two since: too slow, finished here.
+        shard.write().insert("one more", val());
+        n += 1;
+        assert!(shard.step_growth());
+        assert!(!shard.read().is_growing());
+        assert_eq!(shard.read().len(), n);
+        assert!(!shard.step_growth());
+        // And one no write moves at all.
+        while !shard.read().is_growing() {
+            shard.write().insert(format!("more{n}").as_str(), val());
+            n += 1;
+        }
+        assert!(shard.step_growth());
+        assert!(shard.read().is_growing());
+        assert!(shard.step_growth());
+        assert!(!shard.read().is_growing());
+        assert_eq!(shard.read().len(), n);
     }
 
     /// The bug this guards: `clear()` empties a shard but keeps its bucket array
@@ -826,5 +1098,53 @@ mod shard_lock_tests {
         assert!(!cell.holds_no_keys());
         assert!(other.holds_no_keys());
         assert_eq!(cell.read().ttl_len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod shard_by_slot_tests {
+    use super::*;
+    use crate::cluster::slot::key_hash_slot;
+
+    /// In cluster mode a key's shard is its slot's: every key of a slot,
+    /// hash tags and all, in one shard (#294). Called directly, not through
+    /// the switch, which is the whole test process's.
+    #[test]
+    fn the_keys_of_a_slot_share_a_shard() {
+        for shards in [1, 8, 64, 512] {
+            for i in 0..2000 {
+                let key = format!("key:{i}");
+                let slot = key_hash_slot(key.as_bytes());
+                assert_eq!(
+                    shard_index_by_slot(shards, key.as_bytes()),
+                    shard_of_slot(shards, slot)
+                );
+                let tagged = format!("{{{key}}}:other");
+                assert_eq!(key_hash_slot(tagged.as_bytes()), slot);
+                assert_eq!(
+                    shard_index_by_slot(shards, tagged.as_bytes()),
+                    shard_index_by_slot(shards, key.as_bytes())
+                );
+                assert!(shard_of_slot(shards, slot) < shards);
+            }
+        }
+        // A node's slots are spread over every shard.
+        let used: std::collections::HashSet<usize> =
+            (0..16384u16).map(|slot| shard_of_slot(64, slot)).collect();
+        assert_eq!(used.len(), 64);
+    }
+
+    /// A shard is picked in proportion to what it weighs; shards that weigh
+    /// nothing never are, and with nothing anywhere, none is.
+    #[test]
+    fn shards_are_picked_by_weight() {
+        // Weights 0, 0, 5, 0, 3.
+        let totals = [0, 0, 5, 5, 8];
+        let picks: Vec<_> = (0..16)
+            .map(|r| pick_weighted(&totals, r).unwrap())
+            .collect();
+        assert_eq!(picks, [2, 2, 2, 2, 2, 4, 4, 4, 2, 2, 2, 2, 2, 4, 4, 4]);
+        assert_eq!(pick_weighted(&[], 7), None);
+        assert_eq!(pick_weighted(&[0, 0], 7), None);
     }
 }

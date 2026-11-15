@@ -34,6 +34,7 @@
 use super::{ClusterState, MigrationState, NodeId, key_hash_slot};
 use crate::replication::{HubTx, ReplPayload, ReplState};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -91,6 +92,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// promise that the slots stay with the source (see [`Registry::fence`]).
 const FENCE_TAKEN: &str = "the slots have been taken over";
 const FENCE_BUSY: &str = "the slots are being taken over";
+/// What [`parse_ranges`] says of an argument that is not a slot.
+const INVALID_SLOT: &str = "Invalid or out of range slot";
 /// How often a source that does not know whether the destination took the
 /// slots over asks it, and how often it says why writes are still held.
 const ASK_AGAIN: Duration = Duration::from_millis(200);
@@ -157,6 +160,104 @@ pub struct Task {
     /// Import only: a `TAKEOVER` has begun taking the slots over. From then
     /// on the source can no longer be told that they were not taken.
     pub taking_over: bool,
+    /// When the task ended, on the monotonic clock (`end_time_ms` is the
+    /// wall clock's, for `CLUSTER MIGRATION STATUS`).
+    pub ended_at: Option<Instant>,
+    /// Import only: the keys this node held of the slots before the source
+    /// was first asked to send any, noted then. An import that does not
+    /// complete deletes only the others: those it brought (#745). Let go
+    /// of when the task ends ([`Registry::finish`]).
+    pub held_before: Arc<Mutex<Held>>,
+}
+
+/// [`Task::held_before`].
+#[derive(Default, Clone)]
+pub enum Held {
+    /// Not noted yet: the source has not been asked for anything.
+    #[default]
+    NotYet,
+    Noted(Arc<HeldBefore>),
+    /// The task has ended, and no longer needs them.
+    Released,
+}
+
+impl Task {
+    /// The keys held before the import, once noted and until it ends.
+    fn held(&self) -> Held {
+        self.held_before.lock().clone()
+    }
+}
+
+/// At most this many keys held before an import are noted by name, or
+/// [`HELD_BEFORE_MAX_BYTES`] bytes of names; past either, every key of the
+/// import's slots that had any is kept if it does not complete.
+const HELD_BEFORE_MAX_KEYS: usize = 1 << 20;
+const HELD_BEFORE_MAX_BYTES: usize = 64 << 20;
+
+/// The keys a node held of the slots of an import before the source was
+/// first asked to send any (see [`Task::held_before`]). Orphans, mostly:
+/// keys of a slot it lost, or that its old master handed over, and a copy
+/// of which the owner may not have (#517).
+#[derive(Default)]
+pub struct HeldBefore {
+    keys: std::collections::HashSet<crate::store::Key>,
+    /// The slots of those keys, in order.
+    slots: Vec<u16>,
+    /// There were too many to note by name ([`HELD_BEFORE_MAX_KEYS`]):
+    /// `keys` is empty, and every key of `slots` is kept.
+    whole: bool,
+}
+
+impl HeldBefore {
+    /// The keys `store` holds of `ranges` now.
+    fn note(store: &crate::store::Store, ranges: &[(u16, u16)]) -> Self {
+        Self::note_at_most(store, ranges, HELD_BEFORE_MAX_KEYS, HELD_BEFORE_MAX_BYTES)
+    }
+
+    /// [`Self::note`], at most `max_keys` keys or `max_bytes` bytes of
+    /// names by name.
+    fn note_at_most(
+        store: &crate::store::Store,
+        ranges: &[(u16, u16)],
+        max_keys: usize,
+        max_bytes: usize,
+    ) -> Self {
+        let mut held = HeldBefore::default();
+        let Some(db) = store.first() else {
+            return held;
+        };
+        let mut bytes = 0usize;
+        let mut slots = vec![false; super::CLUSTER_SLOTS];
+        let holds = crate::store::shards_of_slots(db.len(), |slot| in_ranges(ranges, slot));
+        for (shard, _) in db.iter().zip(holds).filter(|(_, holds)| *holds) {
+            let shard = crate::read_lock!(shard);
+            for key in shard.keys() {
+                let slot = key_hash_slot(key);
+                if !in_ranges(ranges, slot) {
+                    continue;
+                }
+                slots[slot as usize] = true;
+                if held.whole {
+                    continue;
+                }
+                bytes += key.len();
+                if held.keys.len() >= max_keys || bytes > max_bytes {
+                    held.whole = true;
+                    held.keys = Default::default();
+                    continue;
+                }
+                held.keys.insert(crate::store::Key::new(key));
+            }
+        }
+        held.slots = (0..super::CLUSTER_SLOTS as u16)
+            .filter(|&slot| slots[slot as usize])
+            .collect();
+        held
+    }
+
+    fn has_slot(&self, slot: u16) -> bool {
+        self.slots.binary_search(&slot).is_ok()
+    }
 }
 
 /// This node's migration tasks, running and recently finished.
@@ -183,7 +284,19 @@ impl Registry {
     }
 
     /// Add `task` unless a running task already covers one of its slots.
+    #[cfg(test)]
     fn add(&self, task: Task) -> Result<(), String> {
+        self.add_unless(task, || Ok(()))
+    }
+
+    /// [`Self::add`], unless `refused` says why not, asked with the tasks
+    /// locked: no `CLUSTER SETSLOT` changes a slot's state in between
+    /// ([`super::ClusterState::setslot_unless_migrating`], #755).
+    fn add_unless(
+        &self,
+        task: Task,
+        refused: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut tasks = self.tasks.lock();
         let clash = tasks
             .iter()
@@ -191,6 +304,7 @@ impl Registry {
         if clash {
             return Err("a migration of some of these slots is already in progress".into());
         }
+        refused()?;
         // A retry of a task that failed here replaces its record. Both used to
         // be kept, and the first was the one found: the retry ran as the old
         // task and its end was recorded on that, so the new record stayed
@@ -212,15 +326,21 @@ impl Registry {
     }
 
     fn finish(&self, id: &str, state: TaskState, error: Option<String>) {
+        let mut released = Held::Released;
         self.update(id, |task| {
             if task.state == TaskState::InProgress {
                 task.state = state;
                 task.end_time_ms = now_ms();
+                task.ended_at = Some(Instant::now());
+                // Up to a million names, not to be kept with the task (one
+                // of the last 64): let go of, out of the lock.
+                std::mem::swap(&mut *task.held_before.lock(), &mut released);
                 if let Some(error) = error {
                     task.last_error = error;
                 }
             }
         });
+        drop(released);
     }
 
     /// The destination's side of `TAKEOVER`, from client `client_id`: begin
@@ -281,6 +401,52 @@ impl Registry {
         }
     }
 
+    /// A failover is about to hand the slots of `source` (with `None`, of
+    /// this node) to a replica of it (#516): the imports from it give their
+    /// current attempt up, as when the source gives one up ([`Self::fence`]),
+    /// and its `TAKEOVER` is refused. They retry, from the slots' owner then.
+    /// Refused itself, with why, if one of them is taking the slots over
+    /// now, or, from `source`, took them over in the last
+    /// [`super::HANDOVER_FAILOVER_GRACE`]: the replica would claim slots
+    /// that are this node's.
+    pub(crate) fn fence_imports(&self, source: Option<NodeId>, why: &str) -> Result<(), String> {
+        let mut tasks = self.tasks.lock();
+        let from = |t: &Task| {
+            t.operation == Operation::Import && source.is_none_or(|source| t.source == source)
+        };
+        if let Some(t) = tasks
+            .iter()
+            .find(|t| from(t) && t.state == TaskState::InProgress && t.taking_over)
+        {
+            return Err(format!(
+                "this node is taking slots {} over in an atomic slot migration",
+                ranges_text(&t.ranges)
+            ));
+        }
+        if source.is_some()
+            && let Some((t, ago)) = tasks.iter().find_map(|t| {
+                let ago = t.ended_at?.elapsed();
+                (from(t) && t.state == TaskState::Completed && ago < super::HANDOVER_FAILOVER_GRACE)
+                    .then_some((t, ago))
+            })
+        {
+            return Err(format!(
+                "this node took slots {} over from that master {} ms ago",
+                ranges_text(&t.ranges),
+                ago.as_millis()
+            ));
+        }
+        for t in tasks
+            .iter_mut()
+            .filter(|t| from(t) && t.state == TaskState::InProgress)
+        {
+            if !t.attempt_failed.swap(true, Ordering::SeqCst) {
+                t.last_error = why.to_string();
+            }
+        }
+        Ok(())
+    }
+
     /// `f` of the slot ranges of the atomic imports in progress here, but
     /// for the one with the id `except`, with the tasks locked: none begins
     /// or ends meanwhile.
@@ -296,6 +462,36 @@ impl Registry {
             .map(|t| &t.ranges)
             .collect();
         f(&importing)
+    }
+
+    /// `f` of every task, running and recently finished, with the tasks
+    /// locked: none begins or ends meanwhile. The tasks come first in the
+    /// order of `ClusterState`'s locks.
+    pub(crate) fn with_tasks<R>(&self, f: impl FnOnce(&[Task]) -> R) -> R {
+        f(&self.tasks.lock())
+    }
+
+    /// Why `CLUSTER SETSLOT` may not change `slot` now, if it may not
+    /// (#755): an atomic slot migration of it, to or from this node, is
+    /// running (canceled, too, until it has cleaned up). An import counts
+    /// every key of its slots that it did not find here as one it brought,
+    /// and deletes them if it does not complete: keys moved in meanwhile by
+    /// `MIGRATE`, or written by `ASKING` clients, would go with them, and
+    /// may be the only copy. As Redis refuses it, every form of `SETSLOT`.
+    /// Only while the task runs, as in Redis: one that has ended holds
+    /// nothing up, so `redis-cli --cluster reshard` can move a slot on as
+    /// soon as an atomic migration has brought it.
+    pub(crate) fn setslot_refusal(tasks: &[Task], slot: u16) -> Option<String> {
+        tasks
+            .iter()
+            .any(|t| in_ranges(&t.ranges, slot) && t.state == TaskState::InProgress)
+            .then(|| {
+                format!(
+                    "Slot {slot} is currently in an active atomic slot migration. CLUSTER \
+                     SETSLOT cannot be used at this time. To perform a legacy slot migration \
+                     instead, first cancel the ongoing task with CLUSTER MIGRATION CANCEL"
+                )
+            })
     }
 
     /// Ask running tasks to stop: the one with this id, or all of them.
@@ -330,7 +526,7 @@ pub fn parse_ranges(args: &[&[u8]]) -> Result<Ranges, String> {
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|s| (*s as usize) < super::CLUSTER_SLOTS)
-            .ok_or_else(|| "Invalid or out of range slot".to_string())
+            .ok_or_else(|| INVALID_SLOT.to_string())
     };
     let mut ranges: Ranges = Vec::with_capacity(args.len() / 2);
     for pair in args.chunks(2) {
@@ -359,6 +555,18 @@ fn ranges_overlap(a: &[(u16, u16)], b: &[(u16, u16)]) -> bool {
 
 fn slots_of(ranges: &[(u16, u16)]) -> impl Iterator<Item = u16> + '_ {
     ranges.iter().flat_map(|(start, end)| *start..=*end)
+}
+
+/// `slots`, in order and once each, as ranges.
+fn slot_runs(slots: impl IntoIterator<Item = u16>) -> Ranges {
+    let mut runs: Ranges = Vec::new();
+    for slot in slots {
+        match runs.last_mut() {
+            Some((_, end)) if slot == *end + 1 => *end = slot,
+            _ => runs.push((slot, slot)),
+        }
+    }
+    runs
 }
 
 /// `0-1000 2000-3000`
@@ -521,6 +729,117 @@ impl Peer {
             Err(e) => Err(format!("read from the other node failed: {e}")),
         }
     }
+
+    /// Send one already-encoded command and return its status reply's text.
+    fn ask(&mut self, encoded: &[u8]) -> Result<String, AskFailed> {
+        let stream = self.reader.get_mut();
+        if let Err(e) = stream.write_all(encoded).and_then(|()| stream.flush()) {
+            return Err(AskFailed::NoReply(format!(
+                "write to the other node failed: {e}"
+            )));
+        }
+        let mut line = Vec::new();
+        match self.reader.read_until(b'\n', &mut line) {
+            Ok(0) => Err(AskFailed::NoReply(
+                "the other node closed the connection".into(),
+            )),
+            Err(e) if line.is_empty() => Err(AskFailed::NoReply(format!(
+                "read from the other node failed: {e}"
+            ))),
+            Err(e) => Err(AskFailed::Bad(format!(
+                "read from the other node failed part way through its reply: {e}"
+            ))),
+            Ok(_) => {
+                let Some(line) = line.strip_suffix(b"\r\n") else {
+                    return Err(AskFailed::Bad(
+                        "the other node closed the connection part way through its reply".into(),
+                    ));
+                };
+                let Ok(line) = std::str::from_utf8(line) else {
+                    return Err(AskFailed::Bad("the other node's reply is not text".into()));
+                };
+                match line.as_bytes().first() {
+                    Some(b'+') => Ok(line[1..].to_string()),
+                    Some(b'-') => Err(AskFailed::Refused(line[1..].to_string())),
+                    _ => Err(AskFailed::Bad(format!(
+                        "the other node gave a reply of an unexpected kind: {line}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+/// Why [`Peer::ask`] got no answer.
+#[derive(Debug)]
+enum AskFailed {
+    /// Nothing of a reply came: the connection may have been closed before
+    /// the command reached the other node.
+    NoReply(String),
+    /// Part of a reply, or one that is not a status: the connection is no
+    /// longer in step.
+    Bad(String),
+    /// An error reply, whole: the connection is fine.
+    Refused(String),
+}
+
+/// Node-to-node connections (the ones an atomic slot migration makes:
+/// `tls-cluster`, and the replication credentials), one per node, kept from
+/// one question to the next, for `CLUSTER SYNCSLOTS ORPHANCHECK` and
+/// `ORPHANKEYS` (#517). A `CLUSTER DROPORPHANS` asks once per batch of 128
+/// keys: a connection each time would use up the ports of this node on a
+/// large one.
+#[derive(Default)]
+pub(crate) struct NodeAsker {
+    peers: Vec<(NodeId, Peer)>,
+}
+
+impl NodeAsker {
+    /// Send `parts` to `node`, and return its status reply's text. A kept
+    /// connection that gives no reply at all (closed meanwhile) is replaced
+    /// once, and the command sent again: only for questions, which change
+    /// nothing. A connection that gives part of a reply, or one this node
+    /// cannot read, is dropped.
+    pub(crate) fn ask(
+        &mut self,
+        env: &Env,
+        node: &NodeId,
+        parts: &[&[u8]],
+    ) -> Result<String, String> {
+        let encoded = command(parts);
+        let kept = self
+            .peers
+            .iter()
+            .position(|(id, _)| id == node)
+            .map(|i| self.peers.swap_remove(i).1);
+        let reused = kept.is_some();
+        let mut peer = match kept {
+            Some(peer) => peer,
+            None => Peer::connect(env, node)?,
+        };
+        let mut outcome = peer.ask(&encoded);
+        if reused && matches!(outcome, Err(AskFailed::NoReply(_))) {
+            peer = Peer::connect(env, node)?;
+            outcome = peer.ask(&encoded);
+        }
+        match outcome {
+            Ok(text) => {
+                self.peers.push((*node, peer));
+                Ok(text)
+            }
+            Err(AskFailed::Refused(e)) => {
+                self.peers.push((*node, peer));
+                Err(e)
+            }
+            Err(AskFailed::NoReply(e) | AskFailed::Bad(e)) => Err(e),
+        }
+    }
+
+    /// How many connections it keeps.
+    #[cfg(test)]
+    fn kept(&self) -> usize {
+        self.peers.len()
+    }
 }
 
 // ── Key helpers ──────────────────────────────────────────────────────────────
@@ -563,6 +882,39 @@ struct Deleted {
     /// Slots whose keys it stopped deleting, because they came back to
     /// this node meanwhile (see [`SlotDeletions`]).
     came_back: usize,
+    /// Keys a [`Confirm`] did not let it delete, and left.
+    kept: usize,
+    /// Why a [`Confirm`] stopped it, if one did: the keys not reached yet
+    /// are left.
+    halted: Option<String>,
+}
+
+/// Asked of each batch of keys before it is deleted, with no lock held:
+/// which of them may be deleted. `Err` stops the deletion there, with why.
+pub(crate) type Confirm<'a> = &'a mut dyn FnMut(&[crate::store::Key]) -> Result<Vec<bool>, String>;
+
+/// How many keys a batch of a deletion holds at most, and how many bytes
+/// of key names (a batch is also what a [`Confirm`] asks about).
+const BATCH_KEYS: usize = 128;
+const BATCH_KEY_BYTES: usize = 1 << 20;
+
+/// `keys` in batches of [`BATCH_KEYS`] keys or [`BATCH_KEY_BYTES`] bytes of
+/// names, whichever comes first; never an empty one.
+fn batches(keys: &[crate::store::Key]) -> Vec<&[crate::store::Key]> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, key) in keys.iter().enumerate() {
+        let len = key.as_bytes().len();
+        if i > start && (i - start == BATCH_KEYS || bytes + len > BATCH_KEY_BYTES) {
+            out.push(&keys[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += len;
+    }
+    if start < keys.len() {
+        out.push(&keys[start..]);
+    }
+    out
 }
 
 // ── Deleting the keys of slots that left ─────────────────────────────────────
@@ -598,7 +950,10 @@ struct Deleted {
 /// keys before it does anything else. Left to the deletion, which leaves
 /// the slot once it has come, the keys it had not reached would stay:
 /// beside the keys an import brings, and keys the slot's owner had deleted
-/// meanwhile would be back.
+/// meanwhile would be back. Not those of a `CLUSTER DROPORPHANS`, which
+/// deletes only the keys their owner says it has, and keeps the others:
+/// they may be the only copy (#517). That one leaves the slot once it has
+/// come, as any deletion does, and its keys stay.
 #[derive(Default)]
 pub struct SlotDeletions {
     /// Held by a deletion's batch from its look to its last delete, which
@@ -618,6 +973,11 @@ struct DeletionCounts {
     came: Vec<u32>,
     /// Per slot: how many deletions of its keys are under way.
     running: Vec<u32>,
+    /// Per slot: how many of those are confirmed ones (`CLUSTER
+    /// DROPORPHANS`), which delete only the keys the slot's owner says it
+    /// has. What gives this node a slot leaves their keys: a key the owner
+    /// does not have may be the only copy (#517).
+    confirmed: Vec<u32>,
 }
 
 impl DeletionCounts {
@@ -626,8 +986,17 @@ impl DeletionCounts {
         if self.came.is_empty() {
             self.came = vec![0; super::CLUSTER_SLOTS];
             self.running = vec![0; super::CLUSTER_SLOTS];
+            self.confirmed = vec![0; super::CLUSTER_SLOTS];
         }
         self
+    }
+
+    /// A run of slot `i`'s keys has ended, or left the slot.
+    fn ended(&mut self, i: usize, confirmed: bool) {
+        self.running[i] -= 1;
+        if confirmed {
+            self.confirmed[i] -= 1;
+        }
     }
 }
 
@@ -651,14 +1020,26 @@ impl SlotDeletions {
         !counts.running.is_empty() && slots.any(|slot| counts.running[slot as usize] > 0)
     }
 
-    /// Those of `slots` whose keys are being deleted.
+    /// Per slot, whether its keys are being deleted. Taken holding no other
+    /// lock (see the field).
+    pub(crate) fn running_slots(&self) -> Vec<bool> {
+        let counts = self.counts.lock();
+        if counts.running.is_empty() {
+            return vec![false; super::CLUSTER_SLOTS];
+        }
+        counts.running.iter().map(|&n| n > 0).collect()
+    }
+
+    /// Those of `slots` whose keys are being deleted, by a deletion that
+    /// deletes them all: not a confirmed one (`CLUSTER DROPORPHANS`), whose
+    /// keys stay once their slot comes here (#517).
     fn deleting(&self, slots: impl Iterator<Item = u16>) -> Vec<u16> {
         let counts = self.counts.lock();
         if counts.running.is_empty() {
             return Vec::new();
         }
         slots
-            .filter(|&slot| counts.running[slot as usize] > 0)
+            .filter(|&slot| counts.running[slot as usize] > counts.confirmed[slot as usize])
             .collect()
     }
 }
@@ -672,6 +1053,9 @@ struct DeleteRun {
     seen: Vec<Option<u32>>,
     /// How many of its slots came back to this node while it ran.
     came_back: usize,
+    /// A confirmed deletion (`CLUSTER DROPORPHANS`): see
+    /// [`DeletionCounts::confirmed`].
+    confirmed: bool,
 }
 
 impl DeleteRun {
@@ -683,6 +1067,17 @@ impl DeleteRun {
         cluster: &ClusterState,
         slots: impl IntoIterator<Item = u16>,
         import: Option<&str>,
+    ) -> Self {
+        Self::begin_as(cluster, slots, import, false)
+    }
+
+    /// [`Self::begin`]; `confirmed` for a deletion of only the keys their
+    /// owner says it has, which [`delete_before_coming`] leaves alone.
+    fn begin_as(
+        cluster: &ClusterState,
+        slots: impl IntoIterator<Item = u16>,
+        import: Option<&str>,
+        confirmed: bool,
     ) -> Self {
         let me = cluster.myself();
         let deletions = Arc::clone(&cluster.slot_deletions);
@@ -708,12 +1103,31 @@ impl DeleteRun {
                 }
                 seen[i] = Some(counts.came[i]);
                 counts.running[i] += 1;
+                if confirmed {
+                    counts.confirmed[i] += 1;
+                }
             }
         });
         DeleteRun {
             deletions,
             seen,
             came_back: 0,
+            confirmed,
+        }
+    }
+
+    /// Leave the slots that have come to this node since it began, as
+    /// [`Self::still_to_delete`] does for the keys of a batch. Holding no
+    /// other lock (see [`SlotDeletions::counts`]).
+    fn leave_come_back(&mut self) {
+        let mut counts = self.deletions.counts.lock();
+        let counts = counts.sized();
+        for (i, seen) in self.seen.iter_mut().enumerate() {
+            if seen.is_some_and(|at| counts.came[i] != at) {
+                *seen = None;
+                counts.ended(i, self.confirmed);
+                self.came_back += 1;
+            }
         }
     }
 
@@ -730,7 +1144,11 @@ impl DeleteRun {
     /// Of `keys`, which to delete: those of slots that have not come to
     /// this node since it began. One look at the `counts`, which the caller
     /// holds until they are deleted.
-    fn still_to_delete(&mut self, counts: &mut DeletionCounts, keys: &[String]) -> Vec<bool> {
+    fn still_to_delete(
+        &mut self,
+        counts: &mut DeletionCounts,
+        keys: &[crate::store::Key],
+    ) -> Vec<bool> {
         let counts = counts.sized();
         let mut delete = Vec::with_capacity(keys.len());
         for key in keys {
@@ -739,7 +1157,7 @@ impl DeleteRun {
                 Some(at) if counts.came[i] == at => true,
                 Some(_) => {
                     self.seen[i] = None;
-                    counts.running[i] -= 1;
+                    counts.ended(i, self.confirmed);
                     self.came_back += 1;
                     false
                 }
@@ -756,7 +1174,7 @@ impl Drop for DeleteRun {
         let counts = counts.sized();
         for (i, seen) in self.seen.iter().enumerate() {
             if seen.is_some() {
-                counts.running[i] -= 1;
+                counts.ended(i, self.confirmed);
             }
         }
     }
@@ -771,30 +1189,76 @@ impl Drop for DeleteRun {
 #[allow(clippy::too_many_arguments)]
 fn delete_keys(
     store: &crate::store::Store,
-    index_store: &crate::vector::IndexStore,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    run: &mut DeleteRun,
+    own: OwnDataset,
+    checked: impl FnMut(),
+    between: impl FnMut(),
+) -> Deleted {
+    delete_keys_confirmed(store, repl_state, hub_tx, run, own, checked, between, None)
+}
+
+/// [`delete_keys`], each batch's keys first put to `confirm`, if given,
+/// out of every lock: only those it confirms are deleted, the others are
+/// left (and counted), and its `Err` stops the deletion there.
+#[allow(clippy::too_many_arguments)]
+fn delete_keys_confirmed(
+    store: &crate::store::Store,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
     run: &mut DeleteRun,
     own: OwnDataset,
     mut checked: impl FnMut(),
     mut between: impl FnMut(),
+    mut confirm: Option<Confirm<'_>>,
 ) -> Deleted {
     let deletions = Arc::clone(&run.deletions);
     let mut removed = 0usize;
+    let mut kept = 0usize;
     let Some(db) = store.first() else {
         return Deleted {
             removed,
             stopped: false,
             came_back: run.came_back,
+            kept,
+            halted: None,
         };
     };
-    for shard in db.iter() {
-        let keys: Vec<String> = crate::read_lock!(shard)
+    let holds = crate::store::shards_of_slots(db.len(), |slot| run.deletes(slot));
+    for (shard, _) in db.iter().zip(holds).filter(|(_, holds)| *holds) {
+        let keys: Vec<crate::store::Key> = crate::read_lock!(shard)
             .keys()
-            .filter(|k| run.deletes(key_hash_slot(k.as_bytes())))
-            .map(|k| k.to_string())
+            .filter(|k| run.deletes(key_hash_slot(k)))
+            .map(crate::store::Key::new)
             .collect();
-        for chunk in keys.chunks(128) {
+        for chunk in batches(&keys) {
+            if confirm.is_some() {
+                // A slot that has come here is not asked about: its owner
+                // is this node, or is handing it over.
+                run.leave_come_back();
+                if !chunk
+                    .iter()
+                    .any(|k| run.deletes(key_hash_slot(k.as_bytes())))
+                {
+                    continue;
+                }
+            }
+            // Asked with nothing held: it may wait on the network.
+            let confirmed = match confirm.as_mut().map(|confirm| confirm(chunk)) {
+                None => None,
+                Some(Ok(confirmed)) if confirmed.len() == chunk.len() => Some(confirmed),
+                Some(Ok(_)) => Some(vec![false; chunk.len()]),
+                Some(Err(why)) => {
+                    return Deleted {
+                        removed,
+                        stopped: false,
+                        came_back: run.came_back,
+                        kept,
+                        halted: Some(why),
+                    };
+                }
+            };
             {
                 // One whole write, as far as a full sync or a backup is
                 // concerned.
@@ -804,6 +1268,8 @@ fn delete_keys(
                         removed,
                         stopped: true,
                         came_back: run.came_back,
+                        kept,
+                        halted: None,
                     };
                 }
                 let _order = crate::write_order::lock_keys(0, chunk.iter().map(|k| k.as_bytes()));
@@ -814,9 +1280,19 @@ fn delete_keys(
                 let delete = run.still_to_delete(&mut counts, chunk);
                 checked();
                 let mut del = vec![b"DEL".to_vec()];
-                for (key, _) in chunk.iter().zip(delete).filter(|(_, delete)| *delete) {
+                for (i, (key, _)) in chunk
+                    .iter()
+                    .zip(delete)
+                    .enumerate()
+                    .filter(|(_, (_, delete))| *delete)
+                {
+                    if confirmed.as_ref().is_some_and(|confirmed| !confirmed[i]) {
+                        kept += 1;
+                        continue;
+                    }
+                    // A document leaves its indexes with its key
+                    // (`ShardMap::remove`).
                     if crate::commands::helpers::delete_key(store, 0, key) {
-                        crate::vector::maybe_unindex(index_store, 0, key);
                         del.push(key.as_bytes().to_vec());
                         removed += 1;
                     }
@@ -832,6 +1308,8 @@ fn delete_keys(
         removed,
         stopped: false,
         came_back: run.came_back,
+        kept,
+        halted: None,
     }
 }
 
@@ -855,7 +1333,10 @@ fn stall_once_for_test(name: &'static str) -> impl FnMut() {
 /// (#353). Left to that deletion, which leaves a slot once it has come, the
 /// keys it had not reached would stay: beside the keys an import brings
 /// (`MIGRATE` without `REPLACE` refuses them, `BUSYKEY`), and keys the
-/// slot's owner had deleted meanwhile would be back.
+/// slot's owner had deleted meanwhile would be back. The keys of a `CLUSTER
+/// DROPORPHANS` are left: it deletes only those their owner says it has,
+/// and the others may be the only copy (#517). It leaves the slot once it
+/// has come, and they stay.
 ///
 /// One pass over the keyspace, as the deletion makes, without waiting for
 /// the deletion's other slots. Not inside a transaction, which holds every
@@ -890,7 +1371,6 @@ pub fn delete_before_coming(
     let deleted = off_the_runtime(|| {
         delete_keys(
             &env.store,
-            &env.index_store,
             &env.repl_state,
             &env.hub_tx,
             &mut run,
@@ -950,7 +1430,6 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
     let _ = start_dropping(
         cluster,
         &starter.store,
-        &starter.index_store,
         &starter.repl_state,
         &starter.hub_tx,
         slots,
@@ -963,7 +1442,6 @@ pub(crate) fn drop_lost_slots(cluster: &ClusterState, slots: Vec<u16>) {
 fn start_dropping(
     cluster: &ClusterState,
     store: &crate::store::Store,
-    index_store: &crate::vector::IndexStore,
     repl_state: &Arc<ReplState>,
     hub_tx: &HubTx,
     slots: Vec<u16>,
@@ -979,7 +1457,6 @@ fn start_dropping(
         return None;
     }
     let store = Arc::clone(store);
-    let index_store = Arc::clone(index_store);
     let repl_state = Arc::clone(repl_state);
     let hub_tx = hub_tx.clone();
     let spawned = std::thread::Builder::new()
@@ -987,7 +1464,6 @@ fn start_dropping(
         .spawn(move || {
             let deleted = delete_keys(
                 &store,
-                &index_store,
                 &repl_state,
                 &hub_tx,
                 &mut run,
@@ -1016,13 +1492,91 @@ fn start_dropping(
     }
 }
 
+/// What a `CLUSTER DROPORPHANS` deletion did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedOrphans {
+    pub deleted: usize,
+    /// Keys their owner did not confirm it has, left here.
+    pub kept: usize,
+    /// Why it stopped part way, if it did: the keys not reached are left.
+    pub halted: Option<String>,
+}
+
+/// `CLUSTER DROPORPHANS`: delete the keys this master holds of `slots`,
+/// which another master owns (`super::orphans` has checked, and asked it),
+/// as [`drop_lost_slots`] deletes those of a slot it lost: in batches,
+/// through the write path (replicas and the AOF are told), for as long as
+/// the dataset is this node's own, and of each slot for as long as it has
+/// not come back to this node. Each batch only the keys `confirm` confirms:
+/// those the owner has (#517). Run on the caller's thread, which is one of
+/// its own: `confirm` waits on the network. Never begun by anything but
+/// that command.
+pub(crate) fn drop_orphans_confirmed(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    slots: &[u16],
+    confirm: Confirm<'_>,
+) -> Result<DroppedOrphans, String> {
+    let own = match OwnDataset::now(repl_state) {
+        Some(own) if cluster.my_master_id().is_none() => own,
+        _ => return Err(super::orphans::ON_A_REPLICA.into()),
+    };
+    // An import into one of the slots waits for it from now on, and a slot
+    // that came here since the checks is left out.
+    // Confirmed: what gives this node one of the slots meanwhile leaves its
+    // keys, which the run then leaves too.
+    let mut run = DeleteRun::begin_as(cluster, slots.iter().copied(), None, true);
+    if !run.deletes_any() {
+        return Ok(DroppedOrphans {
+            halted: Some(CAME_BACK.to_string()),
+            ..Default::default()
+        });
+    }
+    let deleted = delete_keys_confirmed(
+        store,
+        repl_state,
+        hub_tx,
+        &mut run,
+        own,
+        || {},
+        // Out of the write gate and every lock: a test holds the deletion
+        // here, after its first batch.
+        stall_once_for_test("orphan-keys-deleting"),
+        Some(confirm),
+    );
+    drop(run);
+    log_deletion("CLUSTER DROPORPHANS", &deleted);
+    let halted = match (&deleted.halted, deleted.stopped) {
+        (Some(why), _) => Some(why.clone()),
+        (None, true) => Some(
+            "this node became a replica, or a master afresh, while it ran: its keys are no \
+             longer the ones it set out to delete"
+                .to_string(),
+        ),
+        (None, false) if deleted.came_back > 0 => Some(CAME_BACK.to_string()),
+        (None, false) => None,
+    };
+    Ok(DroppedOrphans {
+        deleted: deleted.removed,
+        kept: deleted.kept,
+        halted,
+    })
+}
+
+/// Why a `CLUSTER DROPORPHANS` left keys it had not reached of a slot that
+/// came to this node while it ran.
+const CAME_BACK: &str = "a slot came to this node while it ran (assigned, imported or taken \
+                         over): none of its keys not deleted by then were deleted";
+
 /// A key captured at the cut, with a copy of its value of its own: a list,
 /// hash or set can be changed in place once writes go on, and the copy is
 /// as it was at the cut. Copying shares the elements (and a string's bytes,
 /// which never change in place), so it is far quicker than laying the value
 /// out as its `RESTORE`, which is done afterwards.
 struct Captured {
-    key: String,
+    key: crate::store::Key,
     value: crate::types::KiviDBValue,
     expires_at: u64,
 }
@@ -1051,6 +1605,49 @@ fn restore_command(
     Ok(restore)
 }
 
+/// The time series compaction rules among `keys`, as the `TS.CREATERULE`s
+/// that make them again, to be sent after the keys' `RESTORE`s, which carry
+/// no links (`snapshot::dump_payload`). A rule's two series are in one slot
+/// and move together. Only a rule whose destination moves and names its
+/// source back; any other is dead (#593).
+fn compaction_rules(keys: &[Captured]) -> Vec<Vec<Vec<u8>>> {
+    use crate::types::KiviDBValue;
+    let sources: HashMap<&[u8], Option<String>> = keys
+        .iter()
+        .filter_map(|c| match &c.value {
+            KiviDBValue::TimeSeries(series) => {
+                Some((c.key.as_bytes(), series.read().source.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for c in keys {
+        let KiviDBValue::TimeSeries(series) = &c.value else {
+            continue;
+        };
+        let name = crate::key_bytes::text_of(c.key.as_bytes());
+        for rule in &series.read().rules {
+            let dest = crate::key_bytes::bytes_of(&rule.dest_key);
+            if sources
+                .get(&*dest)
+                .is_some_and(|source| source.as_deref() == Some(&*name))
+            {
+                out.push(vec![
+                    b"TS.CREATERULE".to_vec(),
+                    c.key.as_bytes().to_vec(),
+                    dest.into_owned(),
+                    b"AGGREGATION".to_vec(),
+                    rule.aggregation.name().as_bytes().to_vec(),
+                    rule.bucket_duration.to_string().into_bytes(),
+                    rule.align_timestamp.to_string().into_bytes(),
+                ]);
+            }
+        }
+    }
+    out
+}
+
 /// Every key in `ranges`, as what recreates it. Call with the write gate
 /// closed: it does no more than must be done while writes wait. The values
 /// are serialised afterwards (see [`Captured::into_restore`]); they used to
@@ -1062,11 +1659,12 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
     let Some(db) = env.store.first() else {
         return Ok(out);
     };
-    for shard in db.iter() {
+    let holds = crate::store::shards_of_slots(db.len(), |slot| in_ranges(ranges, slot));
+    for (shard, _) in db.iter().zip(holds).filter(|(_, holds)| *holds) {
         let map = crate::read_lock!(shard);
         for entry in map.entries() {
             let key = entry.key();
-            if !in_ranges(ranges, key_hash_slot(key.as_bytes())) {
+            if !in_ranges(ranges, key_hash_slot(key)) {
                 continue;
             }
             // In the entry beside the value.
@@ -1075,7 +1673,7 @@ fn capture(env: &Env, ranges: &[(u16, u16)]) -> std::io::Result<Vec<Captured>> {
                 continue;
             }
             out.push(Captured {
-                key: key.to_string(),
+                key: crate::store::Key::new(key),
                 value: entry.value().deep_clone(),
                 expires_at,
             });
@@ -1141,8 +1739,16 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
     if dest == me {
         return Err("cannot migrate slots to myself".into());
     }
-    if cluster.my_master_id().is_some() {
+    if cluster.my_master_id().is_some() || env.repl_state.is_slave() {
         return Err("I am a replica".into());
+    }
+    // A replica of this node may be taking its slots over (#516).
+    if cluster.writes_held() {
+        return Err(
+            "a failover of this node is under way: it does not know yet whether a \
+                    replica of it has taken its slots over"
+                .into(),
+        );
     }
     if let Some(slot) = slots_of(&ranges).find(|s| !cluster.owns_slot(*s)) {
         return Err(format!("I am not the owner of slot {slot}"));
@@ -1150,26 +1756,31 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
     if env.address_of(&dest).is_none() {
         return Err("unknown destination node".into());
     }
-    env.registry().add(Task {
-        id: task_id.to_string(),
-        ranges: ranges.clone(),
-        source: me,
-        dest,
-        operation: Operation::Migrate,
-        state: TaskState::InProgress,
-        last_error: String::new(),
-        retries: 0,
-        create_time_ms: now_ms(),
-        start_time_ms: now_ms(),
-        end_time_ms: 0,
-        write_pause_ms: 0,
-        capture_pause_ms: 0,
-        cancel: Arc::new(AtomicBool::new(false)),
-        last_activity_ms: Arc::new(AtomicU64::new(0)),
-        attempt_failed: Arc::new(AtomicBool::new(false)),
-        attempt_floor: Arc::new(AtomicU64::new(0)),
-        taking_over: false,
-    })?;
+    env.registry().add_unless(
+        Task {
+            id: task_id.to_string(),
+            ranges: ranges.clone(),
+            source: me,
+            dest,
+            operation: Operation::Migrate,
+            state: TaskState::InProgress,
+            last_error: String::new(),
+            retries: 0,
+            create_time_ms: now_ms(),
+            start_time_ms: now_ms(),
+            end_time_ms: 0,
+            write_pause_ms: 0,
+            capture_pause_ms: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+            attempt_failed: Arc::new(AtomicBool::new(false)),
+            attempt_floor: Arc::new(AtomicU64::new(0)),
+            taking_over: false,
+            ended_at: None,
+            held_before: Arc::default(),
+        },
+        || no_legacy_migration(cluster, &ranges),
+    )?;
 
     let id = task_id.to_string();
     let thread_env = env.clone();
@@ -1272,6 +1883,25 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
             Ok(())
         }
     };
+    // What this node is as the migration begins: the slots are its to hand
+    // over only while it still is (#516).
+    let failovers_at_start = env.cluster.failovers_begun();
+    let no_failover_since = || -> Result<(), String> {
+        if env.cluster.failovers_begun() == failovers_at_start {
+            Ok(())
+        } else {
+            Err(super::FAILOVER_BEGAN.into())
+        }
+    };
+    let own_at_start = OwnDataset::now(&env.repl_state).ok_or("I am a replica")?;
+    let config_epoch = || {
+        env.cluster
+            .nodes
+            .read()
+            .get(&env.cluster.myself())
+            .map(|n| n.config_epoch)
+    };
+    let epoch_at_start = config_epoch();
     let mut peer = Peer::connect(env, &task.dest)?;
     give_definitions(env, &mut peer);
 
@@ -1296,7 +1926,15 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         t.write_pause_ms = capture_ms;
     });
     let captured = captured
-        .and_then(|keys| keys.into_iter().map(Captured::into_restore).collect())
+        .and_then(|keys| {
+            let rules = compaction_rules(&keys);
+            let mut commands = keys
+                .into_iter()
+                .map(Captured::into_restore)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            commands.extend(rules);
+            Ok(commands)
+        })
         .map_err(|e| format!("could not serialise the slots' keys: {e}"))?;
     let captured: Vec<Vec<Vec<u8>>> = captured;
 
@@ -1324,6 +1962,8 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     };
     loop {
         canceled()?;
+        // Nothing more to stream for: the handover will be refused.
+        no_failover_since()?;
         let mut commands = Vec::new();
         let bytes = drain(&mut commands)?;
         forward(&mut peer, &task.id, &commands)?;
@@ -1331,6 +1971,15 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
             break;
         }
     }
+
+    if let Some(delay) = test_failpoint(&TEST_HANDOFF_DELAY) {
+        log_warn!(
+            "Cluster: (test) the handoff of slots {} waits {delay:?}",
+            ranges_text(&task.ranges)
+        );
+        std::thread::sleep(delay);
+    }
+    no_failover_since()?;
 
     // ── Handoff ──────────────────────────────────────────────────────────
     // Pause client writes, let the ones in flight finish, send what they
@@ -1389,6 +2038,35 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         // and the slots must not move without it.
         return Err("writes were let go (CLIENT UNPAUSE) before the slots were handed over".into());
     }
+    // Only by the master of the slots, as it was when the migration began,
+    // and not if a failover of it has begun since: a replica of it may
+    // have taken the slots over, and served writes to them that never
+    // reached the destination (#516). From here until the handover ends,
+    // a failover of this node is refused.
+    env.cluster.begin_handover(failovers_at_start, || {
+        if !own_at_start.still(&env.repl_state) || env.cluster.my_master_id().is_some() {
+            return Err("this node has become a replica".into());
+        }
+        if let Some(slot) = slots_of(&task.ranges).find(|&s| !env.cluster.owns_slot(s)) {
+            return Err(format!("slot {slot} is no longer this node's"));
+        }
+        let epoch = config_epoch();
+        if epoch != epoch_at_start {
+            return Err(format!(
+                "this node's config epoch went from {} to {} during the migration",
+                epoch_at_start.unwrap_or(0),
+                epoch.unwrap_or(0)
+            ));
+        }
+        Ok(())
+    })?;
+    struct Handover<'a>(&'a ClusterState);
+    impl Drop for Handover<'_> {
+        fn drop(&mut self) {
+            self.0.end_handover();
+        }
+    }
+    let _handover = Handover(&env.cluster);
 
     let deadline = paused_at + Duration::from_millis(pause_timeout);
     let _ = peer.sock.set_read_timeout(Some(
@@ -1458,7 +2136,6 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         let mut run = DeleteRun::begin(&env.cluster, handed.iter().copied(), None);
         let deleted = delete_keys(
             &env.store,
-            &env.index_store,
             &env.repl_state,
             &env.hub_tx,
             &mut run,
@@ -1497,12 +2174,26 @@ fn ask_destination(env: &Env, task: &Task, why: &str) -> Asked {
         parts.push(start.to_string().into_bytes());
         parts.push(end.to_string().into_bytes());
     }
-    let mut peer = match Peer::connect(env, &task.dest) {
-        Ok(peer) => peer,
-        Err(e) => return Asked::Unsure(e),
+    let legacy = parts.clone();
+    // Who asks: the destination heeds it only from the source of its
+    // current attempt (#516).
+    parts.push(b"FROM".to_vec());
+    parts.push(
+        super::node_id_str(&env.cluster.myself())
+            .as_bytes()
+            .to_vec(),
+    );
+    let ask = |parts: &[Vec<u8>]| {
+        let mut peer = Peer::connect(env, &task.dest)?;
+        let _ = peer.sock.set_read_timeout(Some(Duration::from_secs(5)));
+        peer.call(&crate::resp::write::encode_resp_command(parts))
     };
-    let _ = peer.sock.set_read_timeout(Some(Duration::from_secs(5)));
-    match peer.call(&crate::resp::write::encode_resp_command(&parts)) {
+    let answer = match ask(&parts) {
+        // A destination of an earlier version reads `FROM` as a slot.
+        Err(e) if e.contains(INVALID_SLOT) => ask(&legacy),
+        answer => answer,
+    };
+    match answer {
         Ok(()) => Asked::NotTaken,
         Err(e) if e.contains(FENCE_TAKEN) => Asked::Taken,
         Err(e) => Asked::Unsure(e),
@@ -1622,26 +2313,31 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
     }
     let source = single_owner(cluster, &ranges)?;
     let id = super::node_id_str(&super::generate_node_id()).to_string();
-    env.registry().add(Task {
-        id: id.clone(),
-        ranges,
-        source,
-        dest: cluster.myself(),
-        operation: Operation::Import,
-        state: TaskState::InProgress,
-        last_error: String::new(),
-        retries: 0,
-        create_time_ms: now_ms(),
-        start_time_ms: 0,
-        end_time_ms: 0,
-        write_pause_ms: 0,
-        capture_pause_ms: 0,
-        cancel: Arc::new(AtomicBool::new(false)),
-        last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
-        attempt_failed: Arc::new(AtomicBool::new(false)),
-        attempt_floor: Arc::new(AtomicU64::new(0)),
-        taking_over: false,
-    })?;
+    env.registry().add_unless(
+        Task {
+            id: id.clone(),
+            ranges: ranges.clone(),
+            source,
+            dest: cluster.myself(),
+            operation: Operation::Import,
+            state: TaskState::InProgress,
+            last_error: String::new(),
+            retries: 0,
+            create_time_ms: now_ms(),
+            start_time_ms: 0,
+            end_time_ms: 0,
+            write_pause_ms: 0,
+            capture_pause_ms: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            last_activity_ms: Arc::new(AtomicU64::new(now_ms())),
+            attempt_failed: Arc::new(AtomicBool::new(false)),
+            attempt_floor: Arc::new(AtomicU64::new(0)),
+            taking_over: false,
+            ended_at: None,
+            held_before: Arc::default(),
+        },
+        || no_legacy_migration(cluster, &ranges),
+    )?;
 
     save_imports(cluster);
     let task_id = id.clone();
@@ -1680,6 +2376,40 @@ fn single_owner(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<NodeId,
     owner.ok_or_else(|| "no slots given".to_string())
 }
 
+/// Refused if one of `ranges` is in a legacy migration here (`CLUSTER
+/// SETSLOT IMPORTING` or `MIGRATING`), on either side of an atomic one
+/// (#755). An import counts the keys it did not find here when it began as
+/// brought by it, and deletes them if it does not complete: those `MIGRATE`
+/// or `ASKING` clients write meanwhile would go too, and may be the only
+/// copy. Redis refuses it too, on either side. Asked with the tasks locked
+/// ([`Registry::add_unless`]): `SETSLOT` changes no slot's state meanwhile.
+/// The reply is Redis's, word for word; which slot, and its state, go to
+/// the log.
+fn no_legacy_migration(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<(), String> {
+    let found = {
+        let migrations = cluster.migrations.read();
+        slots_of(ranges).find_map(|slot| {
+            let state = match migrations.get(&slot)? {
+                MigrationState::Importing { .. } => "IMPORTING",
+                MigrationState::Migrating { .. } => "MIGRATING",
+            };
+            Some((slot, state))
+        })
+    };
+    let Some((slot, state)) = found else {
+        return Ok(());
+    };
+    log_warn!(
+        "Cluster: atomic slot migration refused: slot {slot} is in {state} state (CLUSTER SETSLOT); \
+         finish that migration, or clear it with CLUSTER SETSLOT {slot} STABLE"
+    );
+    Err(LEGACY_MIGRATION_REFUSED.into())
+}
+
+/// Redis's reply to an atomic slot migration of a slot in a legacy one.
+const LEGACY_MIGRATION_REFUSED: &str =
+    "all slot states must be STABLE to start a slot migration task.";
+
 // ── Imports under way, on disk ───────────────────────────────────────────────
 //
 // The keys an import has received are a copy: the source keeps serving the
@@ -1694,6 +2424,15 @@ fn single_owner(cluster: &ClusterState, ranges: &[(u16, u16)]) -> Result<NodeId,
 // Only the atomic import's: keys moved here by MIGRATE (key by key) were
 // deleted at the source as they left, and are the only copy. Those Redis
 // keeps, and so does this.
+//
+// Nor the keys this node held of a slot before the import: orphans, of
+// which the owner may have no copy (#517, #745). Their names are not kept on
+// disk, so a slot that had any is written down after the word `keep`, and
+// at startup all its keys are left, the import's with them: `CLUSTER
+// ORPHANSLOTS` lists them, and `CLUSTER DROPORPHANS` deletes those the
+// owner has. Until the keys held are noted, every slot of the import is
+// one to keep: the source has not been asked for anything yet. An earlier
+// version reads such a line as no import at all, and leaves its keys too.
 
 /// `<cluster-config-file>.imports`.
 fn imports_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
@@ -1705,16 +2444,42 @@ fn imports_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
 }
 
 /// Write down the ranges of the imports under way (none: remove the file).
+///
+/// One writer at a time, from the look at the tasks to the rename: the
+/// import threads, `CLUSTER MIGRATION IMPORT` and a `TAKEOVER` each write
+/// the file, and a look taken before another task changed, written after
+/// it, would put back what it replaced (a slot's `keep` lost, its keys
+/// deleted at the next startup), as two writes of the temporary file at
+/// once could leave half a line. The file is on disk before it replaces
+/// the old one.
 fn save_imports(cluster: &ClusterState) {
+    static WRITING: Mutex<()> = Mutex::new(());
     let Some(path) = imports_path(cluster) else {
         return;
     };
+    let _one = WRITING.lock();
     let lines: Vec<String> = cluster
         .slot_migrations
         .all()
         .iter()
         .filter(|t| t.operation == Operation::Import && t.state == TaskState::InProgress)
-        .map(|t| format!("{} {}", t.id, ranges_text(&t.ranges)))
+        .map(|t| {
+            // Released: the task ended since the look; all kept meanwhile.
+            let keep = match t.held() {
+                Held::Noted(held) => slot_runs(held.slots.iter().copied()),
+                Held::NotYet | Held::Released => t.ranges.clone(),
+            };
+            if keep.is_empty() {
+                format!("{} {}", t.id, ranges_text(&t.ranges))
+            } else {
+                format!(
+                    "{} {} keep {}",
+                    t.id,
+                    ranges_text(&t.ranges),
+                    ranges_text(&keep)
+                )
+            }
+        })
         .collect();
     let written = if lines.is_empty() {
         match std::fs::remove_file(&path) {
@@ -1725,7 +2490,16 @@ fn save_imports(cluster: &ClusterState) {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = std::path::PathBuf::from(tmp);
-        std::fs::write(&tmp, lines.join("\n") + "\n").and_then(|()| std::fs::rename(&tmp, &path))
+        write_synced(&tmp, (lines.join("\n") + "\n").as_bytes())
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map(|()| {
+                // The rename too, where the system allows it.
+                if let Some(dir) = path.parent()
+                    && let Ok(dir) = std::fs::File::open(dir)
+                {
+                    let _ = dir.sync_all();
+                }
+            })
     };
     if let Err(e) = written {
         log_warn!(
@@ -1735,8 +2509,34 @@ fn save_imports(cluster: &ClusterState) {
     }
 }
 
+/// `bytes` written to a new `path`, and on disk.
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// One line of the imports file: the import's ranges, and those of its
+/// slots whose keys are all to be kept (see above). `None` if it is not one.
+fn parse_import_line(line: &str) -> Option<(Ranges, Ranges)> {
+    fn ranges_of(words: &[&str]) -> Option<Ranges> {
+        let parts: Vec<&[u8]> = words
+            .iter()
+            .flat_map(|r| r.split('-'))
+            .map(str::as_bytes)
+            .collect();
+        parse_ranges(&parts).ok()
+    }
+    let words: Vec<&str> = line.split_whitespace().skip(1).collect();
+    match words.iter().position(|&w| w == "keep") {
+        None => Some((ranges_of(&words)?, Vec::new())),
+        Some(at) => Some((ranges_of(&words[..at])?, ranges_of(&words[at + 1..])?)),
+    }
+}
+
 /// At startup: delete the keys of the imports that were under way when this
-/// node went down, in the slots it does not own (#108). Then forget them.
+/// node went down, in the slots it does not own (#108), but for the slots
+/// it held keys of before the import (#745). Then forget them.
 pub(crate) fn drop_unfinished_imports(cluster: &ClusterState) {
     let Some(path) = imports_path(cluster) else {
         return;
@@ -1746,21 +2546,35 @@ pub(crate) fn drop_unfinished_imports(cluster: &ClusterState) {
     };
     let me = cluster.myself();
     let mut cut_short: Vec<u16> = Vec::new();
+    let mut kept: Vec<u16> = Vec::new();
     for line in text.lines() {
-        let mut words = line.split_whitespace();
-        let _task = words.next();
-        let ranges: Vec<&[u8]> = words
-            .flat_map(|r| r.split('-'))
-            .map(str::as_bytes)
-            .collect();
-        let Ok(ranges) = parse_ranges(&ranges) else {
+        // A line it cannot read is left: its keys stay.
+        let Some((ranges, keep)) = parse_import_line(line) else {
             continue;
         };
         let slots = cluster.slots.read();
-        cut_short.extend(slots_of(&ranges).filter(|&s| slots[s as usize] != Some(me)));
+        for slot in slots_of(&ranges).filter(|&s| slots[s as usize] != Some(me)) {
+            if in_ranges(&keep, slot) {
+                kept.push(slot);
+            } else {
+                cut_short.push(slot);
+            }
+        }
     }
+    kept.sort_unstable();
+    kept.dedup();
     cut_short.sort_unstable();
     cut_short.dedup();
+    cut_short.retain(|slot| kept.binary_search(slot).is_err());
+    if !kept.is_empty() {
+        log_warn!(
+            "Cluster: {} slot(s) were being imported when this node stopped, of which it \
+             held keys before the import: all their keys are left, as they may be the only \
+             copy. CLUSTER ORPHANSLOTS lists them, and CLUSTER DROPORPHANS deletes those \
+             their owner has",
+            kept.len()
+        );
+    }
     if !cut_short.is_empty() {
         log_info!(
             "Cluster: {} slot(s) were being imported when this node stopped; \
@@ -1784,6 +2598,17 @@ fn run_import(env: Env, task_id: String) {
         if task.cancel.load(Ordering::Relaxed) {
             delete_unowned(&env, &task);
             registry.finish(&task_id, TaskState::Canceled, None);
+            save_imports(&env.cluster);
+            return;
+        }
+        // A replica of this node took its slots over: it is no destination.
+        // What arrived is its new master's to keep or drop.
+        if env.cluster.my_master_id().is_some() {
+            registry.finish(
+                &task_id,
+                TaskState::Failed,
+                Some("this node has become a replica".into()),
+            );
             save_imports(&env.cluster);
             return;
         }
@@ -1817,11 +2642,56 @@ fn run_import(env: Env, task_id: String) {
         // have come here, before the source is asked to send anything: a
         // deletion of their keys begun before leaves them, and every key the
         // import writes. On its own thread: never in a transaction.
-        let slots: Vec<u16> = slots_of(&task.ranges).collect();
-        let _ = delete_before_coming(&env, &slots, "an atomic import", Some(&task.id));
-        env.cluster.slot_deletions.came_here(slots);
-
-        let outcome = import_attempt(&env, &task, source);
+        // Not from a source a replica of which may be taking the slots over
+        // (#516): its TAKEOVER would be refused, and it would stream them
+        // again and again for nothing.
+        let mut probe = task.clone();
+        probe.source = source;
+        let outcome = match source_still_owns(&env.cluster, &probe) {
+            Err(why) => Some(format!("the source was not asked to start: {why}")),
+            Ok(()) => {
+                let slots: Vec<u16> = slots_of(&task.ranges).collect();
+                let _ = delete_before_coming(&env, &slots, "an atomic import", Some(&task.id));
+                env.cluster.slot_deletions.came_here(slots);
+                // The keys left are this node's from before the import:
+                // noted at the first attempt, before the source is asked
+                // for any, and kept if the import does not complete (#745).
+                // Not again later: an earlier attempt may have left some of
+                // its own.
+                if matches!(task.held(), Held::NotYet) {
+                    let held = HeldBefore::note(&env.store, &task.ranges);
+                    if held.whole {
+                        log_warn!(
+                            "Cluster: this node holds more than {HELD_BEFORE_MAX_KEYS} key(s), \
+                             or {} MiB of names, of {} of the slots it is to import ({}): too \
+                             many to note; if the import does not complete, every key of those \
+                             slots is kept, what it brought too (CLUSTER DROPORPHANS deletes \
+                             those the owner has)",
+                            HELD_BEFORE_MAX_BYTES >> 20,
+                            held.slots.len(),
+                            ranges_text(&task.ranges)
+                        );
+                    } else if !held.slots.is_empty() {
+                        log_info!(
+                            "Cluster: this node holds {} key(s) of {} of the slots it is to \
+                             import ({}); kept if the import does not complete",
+                            held.keys.len(),
+                            held.slots.len(),
+                            ranges_text(&task.ranges)
+                        );
+                    }
+                    {
+                        // Not once the task has ended meanwhile.
+                        let mut slot = task.held_before.lock();
+                        if matches!(*slot, Held::NotYet) {
+                            *slot = Held::Noted(Arc::new(held));
+                        }
+                    }
+                    save_imports(&env.cluster);
+                }
+                import_attempt(&env, &task, source)
+            }
+        };
         match outcome {
             // Taken over, canceled, or otherwise finished by a handler.
             None => return,
@@ -1901,9 +2771,22 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
 }
 
 /// Discard the keys of an import that did not complete — but never the keys
-/// of slots this node has come to own or imports otherwise, nor any on a
-/// node that has become a replica, whose keys are its master's (see
-/// [`OwnDataset`]).
+/// this node held of its slots before it (#745), nor the keys of slots this
+/// node has come to own or imports otherwise, nor any on a node that has
+/// become a replica, whose keys are its master's (see [`OwnDataset`]).
+///
+/// The keys held before are orphans: of a slot this node lost, or that its
+/// old master handed over (#517). They may be the only copy, and stay:
+/// `CLUSTER DROPORPHANS` deletes those their owner has. A key of the same
+/// name the import wrote over stays too, as the source sent it. A slot that
+/// had none has all its keys deleted, as before; one that had some is
+/// cleaned key by key, as a confirmed deletion (`DeleteRun::begin_as`): a
+/// command that gives this node the slot meanwhile leaves the keys, as it
+/// does those of a `CLUSTER DROPORPHANS`, instead of deleting them all: the
+/// keys the import brought that the deletion had not reached by then stay,
+/// live data of the slot, as the source sent them. Too many keys held to
+/// note ([`HeldBefore::whole`]): every key of the slots that had any stays,
+/// as after a restart part way, for `CLUSTER DROPORPHANS`.
 fn delete_unowned(env: &Env, task: &Task) {
     if env.cluster.my_master_id().is_some() {
         return;
@@ -1911,30 +2794,83 @@ fn delete_unowned(env: &Env, task: &Task) {
     let Some(own) = OwnDataset::now(&env.repl_state) else {
         return;
     };
-    let mut run = DeleteRun::begin(&env.cluster, slots_of(&task.ranges), Some(&task.id));
-    if !run.deletes_any() {
+    // Not noted: the source was never asked to send anything, and every key
+    // this node has of the slots is one it had.
+    let Held::Noted(held) = task.held() else {
         return;
+    };
+    let (keep, all): (Vec<u16>, Vec<u16>) =
+        slots_of(&task.ranges).partition(|&slot| held.has_slot(slot));
+    if held.whole && !keep.is_empty() {
+        log_warn!(
+            "Cluster: an import that did not complete: kept every key of {} slot(s) of it \
+             ({}), what it brought too: this node held too many of them before it to note; \
+             CLUSTER ORPHANSLOTS lists them, and CLUSTER DROPORPHANS deletes those the owner has",
+            keep.len(),
+            ranges_text(&task.ranges)
+        );
     }
-    let deleted = delete_keys(
-        &env.store,
-        &env.index_store,
-        &env.repl_state,
-        &env.hub_tx,
-        &mut run,
-        own,
-        || {},
-        || {},
-    );
-    log_deletion("an import that did not complete", &deleted);
+    let keep = if held.whole { Vec::new() } else { keep };
+    if !all.is_empty() {
+        let mut run = DeleteRun::begin(&env.cluster, all, Some(&task.id));
+        if run.deletes_any() {
+            let deleted = delete_keys(
+                &env.store,
+                &env.repl_state,
+                &env.hub_tx,
+                &mut run,
+                own,
+                || {},
+                || {},
+            );
+            log_deletion("an import that did not complete", &deleted);
+        }
+    }
+    if !keep.is_empty() {
+        let mut run = DeleteRun::begin_as(&env.cluster, keep, Some(&task.id), true);
+        if !run.deletes_any() {
+            return;
+        }
+        let mut brought = |chunk: &[crate::store::Key]| -> Result<Vec<bool>, String> {
+            Ok(chunk.iter().map(|k| !held.keys.contains(k)).collect())
+        };
+        let deleted = delete_keys_confirmed(
+            &env.store,
+            &env.repl_state,
+            &env.hub_tx,
+            &mut run,
+            own,
+            || {},
+            || {},
+            Some(&mut brought),
+        );
+        log_deletion("an import that did not complete", &deleted);
+        log_info!(
+            "Cluster: an import that did not complete: deleted {} key(s) it brought, and \
+             kept {} this node held before it, in {} slot(s) ({})",
+            deleted.removed,
+            deleted.kept,
+            held.slots.len(),
+            ranges_text(&task.ranges)
+        );
+    }
 }
 
-/// `CLUSTER SYNCSLOTS APPLY`, on the destination: is this task expecting data?
-pub fn accept_apply(cluster: &ClusterState, task_id: &str) -> Result<(), String> {
+/// `CLUSTER SYNCSLOTS APPLY`, on the destination, from client `client_id`:
+/// is this task expecting data on that connection? Only from the current
+/// attempt's source, which connected after it was asked to start (see
+/// [`Task::attempt_floor`]), and not once the attempt is given up. The
+/// stream of an earlier attempt's source, a demoted one, still sending,
+/// used to land in the next attempt: pushes applied twice, an old value
+/// over a newer acknowledged one (#516).
+pub fn accept_apply(cluster: &ClusterState, task_id: &str, client_id: u64) -> Result<(), String> {
     match cluster.slot_migrations.get(task_id) {
         Some(task)
             if task.operation == Operation::Import
                 && task.state == TaskState::InProgress
-                && !task.cancel.load(Ordering::Relaxed) =>
+                && !task.cancel.load(Ordering::Relaxed)
+                && !task.attempt_failed.load(Ordering::SeqCst)
+                && client_id > task.attempt_floor.load(Ordering::SeqCst) =>
         {
             task.last_activity_ms.store(now_ms(), Ordering::Relaxed);
             Ok(())
@@ -1973,6 +2909,21 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     // Refused if the source has given this attempt up meanwhile: it has
     // been told that the slots stay with it, and takes writes again.
     let task = cluster.slot_migrations.begin_takeover(task_id, client_id)?;
+    // Only from the master of the slots, as this node sees it (#516). From
+    // here a vote for a replica of the source is refused (`fence_imports`).
+    if let Err(why) = source_still_owns(cluster, &task) {
+        task.attempt_failed.store(true, Ordering::SeqCst);
+        cluster.slot_migrations.takeover_undone(task_id);
+        cluster
+            .slot_migrations
+            .update(task_id, |t| t.last_error = why.clone());
+        log_warn!(
+            "Cluster: Not taking slots {} over from {}: {why}",
+            ranges_text(&task.ranges),
+            super::node_id_str(&task.source)
+        );
+        return Err(why);
+    }
     // The source keeps client writes paused until it knows how this ends.
     let started = Instant::now();
     // Saved before the source is told: it deletes its copy when told, and a
@@ -2006,6 +2957,41 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     Ok(())
 }
 
+/// Whether the source of `task` is still the master of its slots, in this
+/// node's view, for the destination to take them over (#516). A replica of
+/// the source that has taken them over, or is being elected to, serves
+/// writes that the source never sent; taken over from the source, the slots
+/// would lose them.
+fn source_still_owns(cluster: &ClusterState, task: &Task) -> Result<(), String> {
+    if cluster.my_master_id().is_some() {
+        return Err("this node has become a replica".into());
+    }
+    let source = super::node_id_str(&task.source).to_string();
+    let master = cluster.nodes.read().get(&task.source).is_some_and(|n| {
+        n.flags.contains(super::NodeFlags::MASTER) && !n.flags.contains(super::NodeFlags::FAIL)
+    });
+    if !master {
+        return Err(format!("the source {source} is no longer a master here"));
+    }
+    if let Some(slot) = slots_of(&task.ranges).find(|&s| cluster.slot_owner(s) != Some(task.source))
+    {
+        return Err(format!(
+            "slot {slot} is no longer the source's here: a replica of it may have taken it over"
+        ));
+    }
+    // For as long as the replica voted for can still win with this vote.
+    let voted = cluster.last_vote_for.lock().get(&task.source).copied();
+    if let Some(at) = voted
+        && at.elapsed() < cluster.failover_window()
+    {
+        return Err(format!(
+            "this node voted for a replica of the source {source} to take its slots over {} ms ago",
+            at.elapsed().as_millis()
+        ));
+    }
+    Ok(())
+}
+
 /// `CLUSTER SYNCSLOTS FAIL <task> <reason> [start end ...]`, on the
 /// destination: the source gave the attempt up. `Ok` promises that this
 /// node has not taken the slots (`ranges`, or the task's own) and that the
@@ -2016,12 +3002,28 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
 /// over: the `TAKEOVER` went unanswered. It holds writes until it knows
 /// (#278). A source of an earlier version did not send the ranges, nor
 /// look at the answer.
+///
+/// `from`, the node that asks, if it says (a source of an earlier version
+/// does not): the question is heeded only from the source of the current
+/// attempt. An earlier attempt's, demoted since, would fence the attempt
+/// from the new owner (#516).
 pub fn source_failed(
     cluster: &ClusterState,
     task_id: &str,
     error: &str,
     ranges: &[(u16, u16)],
+    from: Option<NodeId>,
 ) -> Result<(), String> {
+    if let Some(from) = from
+        && let Some(task) = cluster.slot_migrations.get(task_id)
+        && task.operation == Operation::Import
+        && task.source != from
+    {
+        return Err(format!(
+            "{} is not the source of this import's current attempt",
+            super::node_id_str(&from)
+        ));
+    }
     let ranges = match ranges {
         [] => cluster
             .slot_migrations
@@ -2058,6 +3060,12 @@ static TEST_TAKEOVER_REPLY_DELAY: (&str, AtomicBool) = (
     "KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS",
     AtomicBool::new(false),
 );
+
+/// `KIVIDB_TEST_HANDOFF_DELAY_MS`, never set otherwise: the first migration
+/// away from this node waits this long before its handoff, with the stream
+/// still running, as a long one does, for a failover to come meanwhile.
+static TEST_HANDOFF_DELAY: (&str, AtomicBool) =
+    ("KIVIDB_TEST_HANDOFF_DELAY_MS", AtomicBool::new(false));
 
 /// The delay a failpoint asks for, the first time it is reached.
 fn test_failpoint(failpoint: &(&str, AtomicBool)) -> Option<Duration> {
@@ -2169,7 +3177,55 @@ mod tests {
             attempt_failed: Arc::new(AtomicBool::new(false)),
             attempt_floor: Arc::new(AtomicU64::new(0)),
             taking_over: false,
+            ended_at: None,
+            held_before: Arc::default(),
         }
+    }
+
+    /// An atomic slot migration and a legacy one (`CLUSTER SETSLOT`) refuse
+    /// each other's slots (#755).
+    #[test]
+    fn setslot_and_an_atomic_migration_refuse_each_others_slots() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let other = super::super::generate_node_id();
+        let registry = &cs.slot_migrations;
+        registry.add(task("a", vec![(10, 20)])).unwrap();
+        let setslot = |slot: u16| cs.setslot_unless_migrating(slot, || Ok(()));
+        let refused = setslot(10).unwrap_err();
+        assert!(
+            refused.contains("active atomic slot migration"),
+            "{refused}"
+        );
+        assert!(setslot(21).is_ok());
+        // A canceled one, still cleaning up, too.
+        registry.cancel(Some("a"));
+        assert!(setslot(20).is_err());
+        // Once one has ended, nothing waits, as in Redis: `redis-cli
+        // --cluster reshard` may move the slot on at once.
+        registry.finish("a", TaskState::Completed, None);
+        assert!(setslot(15).is_ok());
+        registry.add(task("b", vec![(30, 40)])).unwrap();
+        registry.finish("b", TaskState::Canceled, None);
+        assert!(setslot(35).is_ok());
+
+        // The other way: no atomic migration of a slot in a legacy one.
+        cs.migrations
+            .write()
+            .insert(50, MigrationState::Importing { src_id: other });
+        cs.migrations
+            .write()
+            .insert(60, MigrationState::Migrating { dest_id: other });
+        let start = |ranges: Ranges| {
+            registry.add_unless(task("c", ranges.clone()), || {
+                no_legacy_migration(&cs, &ranges)
+            })
+        };
+        // Redis's reply, word for word, on either side.
+        let redis = "all slot states must be STABLE to start a slot migration task.";
+        assert_eq!(start(vec![(45, 55)]).unwrap_err(), redis);
+        assert_eq!(start(vec![(60, 60)]).unwrap_err(), redis);
+        assert!(registry.get("c").is_none());
+        start(vec![(51, 59)]).unwrap();
     }
 
     #[test]
@@ -2253,6 +3309,109 @@ mod tests {
         registry.add(d).unwrap();
         assert!(registry.begin_takeover("d", 100).is_err());
         assert!(registry.begin_takeover("d", 101).is_ok());
+    }
+
+    /// A failover of the source fences the imports from it (#516): their
+    /// current attempt is given up, and its `TAKEOVER` refused. Not while one
+    /// is taking the slots over, nor just after one took them from it.
+    #[test]
+    fn a_failover_of_the_source_fences_the_imports_from_it() {
+        let source = super::super::generate_node_id();
+        let other = super::super::generate_node_id();
+        let registry = Registry::default();
+        let from = |id: &str, ranges: Ranges, source| {
+            let mut t = task(id, ranges);
+            t.source = source;
+            t
+        };
+        registry.add(from("a", vec![(0, 10)], source)).unwrap();
+        registry.add(from("b", vec![(20, 30)], other)).unwrap();
+        assert_eq!(registry.fence_imports(Some(source), "elected"), Ok(()));
+        assert_eq!(registry.get("a").unwrap().last_error, "elected");
+        assert!(registry.begin_takeover("a", 1).is_err());
+        // Another source's import goes on.
+        assert!(registry.begin_takeover("b", 1).is_ok());
+        // One taking its slots over refuses the failover of its source, and
+        // of this node (`None`)...
+        let refused = registry.fence_imports(Some(other), "x").unwrap_err();
+        assert!(refused.contains("taking slots 20-30 over"), "{refused}");
+        assert!(registry.fence_imports(None, "x").is_err());
+        // ... and once it has, its source's, for a moment.
+        registry.finish("b", TaskState::Completed, None);
+        let refused = registry.fence_imports(Some(other), "x").unwrap_err();
+        assert!(refused.contains("took slots 20-30 over"), "{refused}");
+        assert_eq!(registry.fence_imports(None, "x"), Ok(()));
+    }
+
+    /// An earlier attempt's source, still streaming, or asking whether the
+    /// slots were taken, is not heeded in the next attempt (#516).
+    #[test]
+    fn an_earlier_attempts_source_is_not_heeded() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (source, stale) = (
+            super::super::generate_node_id(),
+            super::super::generate_node_id(),
+        );
+        let mut t = task("a", vec![(0, 10)]);
+        t.source = source;
+        t.attempt_floor.store(100, Ordering::SeqCst);
+        cs.slot_migrations.add(t).unwrap();
+        // A connection made before this attempt was asked for.
+        assert!(accept_apply(&cs, "a", 100).is_err());
+        assert!(accept_apply(&cs, "a", 101).is_ok());
+        // A FAIL from another node fences nothing.
+        assert!(source_failed(&cs, "a", "x", &[], Some(stale)).is_err());
+        assert!(
+            !cs.slot_migrations
+                .get("a")
+                .unwrap()
+                .attempt_failed
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            source_failed(&cs, "a", "gave up", &[], Some(source)),
+            Ok(())
+        );
+        assert!(
+            accept_apply(&cs, "a", 101).is_err(),
+            "the attempt is given up"
+        );
+        // A source that does not say who it is, as before.
+        let mut t = task("b", vec![(20, 30)]);
+        t.source = source;
+        cs.slot_migrations.add(t).unwrap();
+        assert_eq!(source_failed(&cs, "b", "x", &[], None), Ok(()));
+    }
+
+    /// `CLUSTER DROPORPHANS` leaves the keys of a slot in an atomic slot
+    /// migration here, running or ended a moment ago, and of one whose keys
+    /// are being deleted already (#517).
+    #[test]
+    fn orphans_of_a_slot_migrating_or_being_deleted_are_left() {
+        use super::super::orphans::check_droppable;
+        let cs = ClusterState::new_enabled(None, 15000);
+        let other = super::super::generate_node_id();
+        let mut node = super::super::ClusterNode::new(other, "10.0.0.1".into(), 7000, 17000);
+        node.flags |= super::super::NodeFlags::MASTER;
+        cs.nodes.write().insert(other, node);
+        for slot in 0..100 {
+            cs.slots.write()[slot] = Some(other);
+        }
+        assert_eq!(check_droppable(&cs, &[15, 40]), Ok(()));
+
+        cs.slot_migrations.add(task("a", vec![(10, 20)])).unwrap();
+        let refused = check_droppable(&cs, &[15]).unwrap_err();
+        assert!(refused.contains("is in progress"), "{refused}");
+        cs.slot_migrations.finish("a", TaskState::Completed, None);
+        let refused = check_droppable(&cs, &[15]).unwrap_err();
+        assert!(refused.contains("ended"), "{refused}");
+        assert_eq!(check_droppable(&cs, &[40]), Ok(()));
+
+        let run = DeleteRun::begin(&cs, [40], None);
+        let refused = check_droppable(&cs, &[40]).unwrap_err();
+        assert!(refused.contains("being deleted already"), "{refused}");
+        drop(run);
+        assert_eq!(check_droppable(&cs, &[40]), Ok(()));
     }
 
     #[test]
@@ -2344,7 +3503,6 @@ mod tests {
             let (mut checked, mut between) = (Some(checked), Some(between));
             delete_keys(
                 &self.store,
-                &self.index_store,
                 &self.repl_state,
                 &self.hub_tx,
                 &mut run,
@@ -2555,7 +3713,6 @@ mod tests {
             start_dropping(
                 &lost.cluster,
                 &lost.store,
-                &lost.index_store,
                 &lost.repl_state,
                 &lost.hub_tx,
                 vec![LOST],
@@ -2579,12 +3736,226 @@ mod tests {
         assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
     }
 
+    /// The keys of a slot another master owns are counted as orphans on a
+    /// master, but for those being deleted already, and on a replica not
+    /// at all; `CLUSTER DROPORPHANS`' deletion takes them on a master only,
+    /// and those alone (#517).
+    #[test]
+    fn orphans_are_counted_and_dropped_on_a_master_only() {
+        use super::super::orphans::orphan_counts;
+        let lost = Lost::new();
+        let mine = "kept";
+        set(&lost.store, mine, "v");
+        assert_eq!(
+            orphan_counts(&lost.cluster, &lost.store, &lost.repl_state),
+            vec![(LOST, OLD as u64)]
+        );
+        // Not while a deletion of them runs.
+        let run = DeleteRun::begin(&lost.cluster, [LOST], None);
+        assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
+        drop(run);
+
+        let drop_them = |lost: &Lost, confirm: Confirm<'_>| {
+            drop_orphans_confirmed(
+                &lost.cluster,
+                &lost.store,
+                &lost.repl_state,
+                &lost.hub_tx,
+                &[LOST],
+                confirm,
+            )
+        };
+        let all = |keys: &[crate::store::Key]| Ok(vec![true; keys.len()]);
+        let replica = Lost::new();
+        replica.repl_state.become_slave();
+        assert!(orphan_counts(&replica.cluster, &replica.store, &replica.repl_state).is_empty());
+        assert!(drop_them(&replica, &mut { all }).is_err());
+        assert_eq!(replica.old_keys_left(), OLD);
+
+        // Only the keys the owner confirms: here, those ending in an even
+        // digit. The others are kept, and counted.
+        let even = Lost::new();
+        let dropped = drop_them(&even, &mut |keys: &[crate::store::Key]| {
+            Ok(keys
+                .iter()
+                .map(|k| k.as_bytes().last().is_some_and(|d| d % 2 == 0))
+                .collect())
+        })
+        .unwrap();
+        assert_eq!((dropped.deleted, dropped.kept), (OLD / 2, OLD / 2));
+        assert_eq!(dropped.halted, None);
+        assert_eq!(even.old_keys_left(), OLD / 2);
+
+        // Stopped by the owner part way: the rest stays.
+        let halted = Lost::new();
+        let mut asked = 0;
+        let dropped = drop_them(&halted, &mut |keys: &[crate::store::Key]| {
+            asked += 1;
+            if asked > 1 {
+                Err("the owner went away".to_string())
+            } else {
+                Ok(vec![true; keys.len()])
+            }
+        })
+        .unwrap();
+        assert_eq!(dropped.halted.as_deref(), Some("the owner went away"));
+        assert!(dropped.deleted > 0 && dropped.deleted <= BATCH_KEYS);
+        assert_eq!(halted.old_keys_left(), OLD - dropped.deleted);
+
+        let dropped = drop_them(&lost, &mut { all }).unwrap();
+        assert_eq!((dropped.deleted, dropped.kept), (OLD, 0));
+        assert_eq!(lost.old_keys_left(), 0);
+        assert!(orphan_counts(&lost.cluster, &lost.store, &lost.repl_state).is_empty());
+        assert!(
+            crate::store::get_shard(&lost.store[0], mine)
+                .read()
+                .contains_key(mine)
+        );
+    }
+
+    /// A slot that comes to this node while a `CLUSTER DROPORPHANS` runs
+    /// (`ADDSLOTS`, `SETSLOT IMPORTING` or `NODE`, an atomic import) keeps
+    /// its keys. Taking the run for a deletion of every key of the slot,
+    /// what gives the slot used to delete them all first, those the owner
+    /// does not have too: maybe their only copy (#744 review). The run
+    /// leaves the slot from then on, and says so. A deletion of every key
+    /// (a lost slot's) is still finished first.
+    #[test]
+    fn a_slot_coming_here_keeps_the_keys_of_a_droporphans_run() {
+        let lost = Lost::new();
+        let mut came = false;
+        let dropped = drop_orphans_confirmed(
+            &lost.cluster,
+            &lost.store,
+            &lost.repl_state,
+            &lost.hub_tx,
+            &[LOST],
+            &mut |keys: &[crate::store::Key]| {
+                if !std::mem::replace(&mut came, true) {
+                    assert!(
+                        lost.cluster
+                            .slot_deletions
+                            .deleting([LOST].into_iter())
+                            .is_empty()
+                    );
+                    delete_before_coming(&lost.env(), &[LOST], "ADDSLOTS", None).unwrap();
+                    assert_eq!(lost.old_keys_left(), OLD);
+                    lost.cluster.slot_deletions.came_here([LOST]);
+                }
+                Ok(vec![true; keys.len()])
+            },
+        )
+        .unwrap();
+        assert!(came);
+        assert_eq!((dropped.deleted, dropped.kept), (0, 0));
+        assert!(
+            dropped
+                .halted
+                .as_deref()
+                .is_some_and(|why| why.contains("came to this node")),
+            "{dropped:?}"
+        );
+        assert_eq!(lost.old_keys_left(), OLD);
+        assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+
+        let run = DeleteRun::begin(&lost.cluster, [LOST], None);
+        assert_eq!(
+            lost.cluster.slot_deletions.deleting([LOST].into_iter()),
+            vec![LOST]
+        );
+        let confirmed = DeleteRun::begin_as(&lost.cluster, [LOST], None, true);
+        assert_eq!(
+            lost.cluster.slot_deletions.deleting([LOST].into_iter()),
+            vec![LOST]
+        );
+        drop(run);
+        assert!(
+            lost.cluster
+                .slot_deletions
+                .deleting([LOST].into_iter())
+                .is_empty()
+        );
+        drop(confirmed);
+        assert!(!lost.cluster.slot_deletions.running([LOST].into_iter()));
+    }
+
+    /// A `CLUSTER DROPORPHANS` asks the owner over one connection for the
+    /// whole run, not one per batch, which used up this node's ports on a
+    /// large one (#744 review). A kept connection closed meanwhile is
+    /// replaced once and the question sent again; one that gives part of a
+    /// reply is dropped, and the next question makes a new one.
+    #[test]
+    fn questions_to_a_node_share_one_connection() {
+        use std::io::{BufRead, Write};
+        let lost = Lost::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        {
+            let mut nodes = lost.cluster.nodes.write();
+            let node = nodes.get_mut(&lost.other).unwrap();
+            node.ip = "127.0.0.1".into();
+            node.client_port = port;
+        }
+        // Per connection the other node accepts: how many questions it
+        // answers, and whether it then gives half an answer before it
+        // closes it (or closes it at once).
+        let script = [(2, false), (1, true), (usize::MAX, false)];
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            for (answers, half) in script {
+                let (sock, _) = listener.accept().unwrap();
+                accepted += 1;
+                let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+                let mut writer = sock;
+                let mut answered = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let parts: usize = line.trim_end()[1..].parse().unwrap();
+                    for _ in 0..2 * parts {
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                    }
+                    if answered == answers {
+                        if half {
+                            writer.write_all(b"+ye").unwrap();
+                        }
+                        break;
+                    }
+                    writer.write_all(b"+yes\r\n").unwrap();
+                    answered += 1;
+                }
+            }
+            accepted
+        });
+        let env = lost.env();
+        let mut asker = NodeAsker::default();
+        let mut ask = || asker.ask(&env, &lost.other, &[b"PING"]);
+        // The first connection: two answers.
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        // Closed with no answer: asked again on a second one.
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        // Half an answer: an error, and the connection dropped.
+        assert!(ask().is_err());
+        // A third.
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        assert_eq!(ask().as_deref(), Ok("yes"));
+        assert_eq!(asker.kept(), 1);
+        drop(asker);
+        assert_eq!(server.join().unwrap(), 3);
+    }
+
     /// The keys of an import that did not complete are not deleted on a
     /// replica (#348), whichever says it is one, nor in a slot this node
     /// owns. On a master they are.
     #[test]
     fn an_import_that_did_not_complete_is_deleted_on_a_master_only() {
         let import = task("in", vec![(LOST, LOST)]);
+        // The old keys play the import's: none were here before it.
+        *import.held_before.lock() = Held::Noted(Arc::default());
         let lost = Lost::new();
         lost.repl_state.become_slave();
         delete_unowned(&lost.env(), &import);
@@ -2607,6 +3978,189 @@ mod tests {
         lost.cluster.slot_migrations.add(import.clone()).unwrap();
         delete_unowned(&lost.env(), &import);
         assert_eq!(lost.old_keys_left(), 0);
+    }
+
+    /// An import that did not complete deletes only the keys it brought.
+    /// The keys this node held of the slot before it, orphans that may be
+    /// the only copy (#517), used to be deleted with them (#745). They
+    /// stay, and so does one the import wrote over, as the source sent it.
+    /// A slot of the import of which it held none has all its keys deleted,
+    /// as before; and an import whose source was never asked to send
+    /// anything (nothing noted) deletes nothing.
+    #[test]
+    fn an_import_that_did_not_complete_keeps_the_keys_held_before_it() {
+        const BESIDE: u16 = LOST + 1;
+        let lost = Lost::new();
+        lost.cluster.slots.write()[BESIDE as usize] = Some(lost.other);
+        let import = task("in", vec![(LOST, BESIDE)]);
+        lost.cluster.slot_migrations.add(import.clone()).unwrap();
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+
+        let held = HeldBefore::note(&lost.store, &import.ranges);
+        assert_eq!(held.slots, vec![LOST]);
+        assert_eq!(held.keys.len(), OLD);
+        *import.held_before.lock() = Held::Noted(Arc::new(held));
+        // What the import brings: keys of its own in both slots, and a new
+        // value of a key held.
+        let beside_tag = (0..)
+            .map(|i| format!("b{i}"))
+            .find(|t| key_hash_slot(t.as_bytes()) == BESIDE)
+            .unwrap();
+        let brought: Vec<String> = (0..300)
+            .map(|i| format!("{{{}}}:new:{i}", tag()))
+            .chain((0..300).map(|i| format!("{{{beside_tag}}}:new:{i}")))
+            .collect();
+        for key in &brought {
+            set(&lost.store, key, "new");
+        }
+        set(&lost.store, &old_key(0), "sent");
+
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+        assert_eq!(lost.value(&old_key(0)), Some(b"sent".to_vec()));
+        assert_eq!(lost.value(&old_key(1)), Some(b"old".to_vec()));
+        let left: Vec<&String> = brought.iter().filter(|k| lost.value(k).is_some()).collect();
+        assert!(left.is_empty(), "{} brought keys left", left.len());
+        // Nothing is left running.
+        assert!(
+            !lost
+                .cluster
+                .slot_deletions
+                .running([LOST, BESIDE].into_iter())
+        );
+    }
+
+    /// The imports file: the import's ranges, and after `keep` those of its
+    /// slots whose keys are all kept at startup (#745). A line of an
+    /// earlier version has no `keep`.
+    #[test]
+    fn a_line_of_the_imports_file_reads_back() {
+        assert_eq!(
+            slot_runs([1, 2, 3, 7, 9, 10]),
+            vec![(1, 3), (7, 7), (9, 10)]
+        );
+        assert_eq!(slot_runs([]), vec![]);
+        assert_eq!(
+            parse_import_line("abc 0-100 200-300"),
+            Some((vec![(0, 100), (200, 300)], vec![]))
+        );
+        assert_eq!(
+            parse_import_line("abc 0-100 200-300 keep 5-5 250-260"),
+            Some((vec![(0, 100), (200, 300)], vec![(5, 5), (250, 260)]))
+        );
+        assert_eq!(parse_import_line("abc 0-100 keep"), None);
+        assert_eq!(parse_import_line("abc 0-100 keep x"), None);
+        assert_eq!(parse_import_line("abc"), None);
+        assert_eq!(parse_import_line(""), None);
+    }
+
+    /// Past the bound on the keys held before an import noted by name, by
+    /// count or by bytes of names, none is noted, and an import that does
+    /// not complete keeps every key of the slots that had any, those it
+    /// brought too: never one held before deleted (#745 review). A slot
+    /// that had none is still cleaned whole.
+    #[test]
+    fn too_many_keys_held_before_an_import_are_all_kept() {
+        const BESIDE: u16 = LOST + 1;
+        let ranges = vec![(LOST, BESIDE)];
+        let lost = Lost::new();
+        let by_count = HeldBefore::note_at_most(&lost.store, &ranges, 100, usize::MAX);
+        let by_bytes = HeldBefore::note_at_most(&lost.store, &ranges, usize::MAX, 1000);
+        let under = HeldBefore::note_at_most(&lost.store, &ranges, OLD, usize::MAX);
+        for held in [&by_count, &by_bytes] {
+            assert!(held.whole);
+            assert!(held.keys.is_empty());
+            assert_eq!(held.slots, vec![LOST]);
+        }
+        assert!(!under.whole);
+        assert_eq!(under.keys.len(), OLD);
+
+        lost.cluster.slots.write()[BESIDE as usize] = Some(lost.other);
+        let import = task("in", ranges);
+        lost.cluster.slot_migrations.add(import.clone()).unwrap();
+        *import.held_before.lock() = Held::Noted(Arc::new(by_count));
+        let beside_tag = (0..)
+            .map(|i| format!("b{i}"))
+            .find(|t| key_hash_slot(t.as_bytes()) == BESIDE)
+            .unwrap();
+        let brought = format!("{{{}}}:new", tag());
+        let beside = format!("{{{beside_tag}}}:new");
+        set(&lost.store, &brought, "new");
+        set(&lost.store, &beside, "new");
+        delete_unowned(&lost.env(), &import);
+        assert_eq!(lost.old_keys_left(), OLD);
+        assert!(lost.value(&brought).is_some());
+        assert!(lost.value(&beside).is_none());
+    }
+
+    /// The keys held before an import are let go of when it ends, not kept
+    /// with the last 64 tasks (#745 review); and a task that has ended is
+    /// not given them after.
+    #[test]
+    fn the_keys_held_before_an_import_go_when_it_ends() {
+        let registry = Registry::default();
+        let import = task("in", vec![(LOST, LOST)]);
+        registry.add(import.clone()).unwrap();
+        *import.held_before.lock() = Held::Noted(Arc::default());
+        registry.finish("in", TaskState::Failed, None);
+        assert!(matches!(import.held(), Held::Released));
+        assert!(matches!(registry.get("in").unwrap().held(), Held::Released));
+    }
+
+    /// `save_imports` from many threads at once, each changing its own
+    /// task's line in between, as the import threads, `CLUSTER MIGRATION
+    /// IMPORT` and a `TAKEOVER` do: every file written reads back whole,
+    /// and the last one is the tasks as they are, not a look taken before
+    /// another task changed (#745 review).
+    #[test]
+    fn imports_written_at_once_read_back_whole_and_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster = Arc::new(ClusterState::new_enabled(
+            Some(dir.path().join("nodes.conf")),
+            15000,
+        ));
+        let path = imports_path(&cluster).unwrap();
+        const THREADS: u16 = 8;
+        let threads: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let cluster = Arc::clone(&cluster);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let first = i * 100;
+                    let import = task(&format!("t{i}"), vec![(first, first + 99)]);
+                    cluster.slot_migrations.add(import.clone()).unwrap();
+                    for round in 0..200u16 {
+                        let held = HeldBefore {
+                            slots: vec![first + round % 100],
+                            ..Default::default()
+                        };
+                        *import.held_before.lock() = Held::Noted(Arc::new(held));
+                        save_imports(&cluster);
+                        let text = std::fs::read_to_string(&path).unwrap();
+                        for line in text.lines() {
+                            assert!(parse_import_line(line).is_some(), "{line:?}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let last = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = last.lines().collect();
+        lines.sort_unstable();
+        let mut want: Vec<String> = (0..THREADS)
+            .map(|i| {
+                let first = i * 100;
+                // Of the last round, 199.
+                let kept = first + 99;
+                format!("t{i} {first}-{} keep {kept}-{kept}", first + 99)
+            })
+            .collect();
+        want.sort_unstable();
+        assert_eq!(lines, want);
     }
 
     /// The slot comes back while a batch of its deletion has picked its

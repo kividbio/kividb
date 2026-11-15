@@ -367,14 +367,6 @@ impl Entry {
         unsafe { std::slice::from_raw_parts(self.base().add(key_at(klen, self.has_ttl())), klen) }
     }
 
-    /// The key, as the `&str` it was made from.
-    #[inline]
-    pub(super) fn key_str<'a>(self) -> &'a str {
-        // SAFETY: every key is made from a `&str` (`ShardMap::insert` and
-        // friends take one).
-        unsafe { std::str::from_utf8_unchecked(self.key()) }
-    }
-
     /// The value, for as long as the entry lives.
     #[inline(always)]
     pub(super) fn value<'a>(self) -> ValueRef<'a> {
@@ -583,6 +575,12 @@ impl Entry {
         } else {
             whole_size(klen, ttl)
         }
+    }
+
+    /// What the entry's block adds to `memory_use::allocated`: a slab's
+    /// block at its class's size.
+    pub(super) fn block_bytes(self) -> usize {
+        allocated_size(self.size())
     }
 
     #[inline]
@@ -832,8 +830,8 @@ impl EntryRef {
         EntryRef(entry)
     }
 
-    pub fn key(&self) -> &str {
-        self.0.key_str()
+    pub fn key(&self) -> &[u8] {
+        self.0.key()
     }
 
     pub fn value(&self) -> ValueRef<'_> {
@@ -878,8 +876,8 @@ impl Taken {
         Taken(entry)
     }
 
-    pub fn key(&self) -> &str {
-        self.0.key_str()
+    pub fn key(&self) -> &[u8] {
+        self.0.key()
     }
 
     pub fn value(&self) -> ValueRef<'_> {
@@ -986,11 +984,26 @@ impl Slot {
         Slot(self.0 & !ADDRESS | at)
     }
 
+    /// The slot's bits, for tests that check one is unchanged.
+    #[cfg(test)]
+    pub(super) fn raw(self) -> u64 {
+        self.0
+    }
+
     /// The fragment of this slot's key's hash, as a hash that has it: what
     /// a slot for another entry of the same key is made with.
     #[inline]
     pub(super) fn hash_part(self) -> u64 {
         (self.0 >> 52) << 32
+    }
+
+    /// Where this slot's key comes in a scan of its table: the fragment of
+    /// its hash, below `SCAN_POSITIONS`. Read from the slot alone, without
+    /// a visit to the entry, and the key's for as long as it is in the
+    /// table: the table growing or shrinking moves the slot, not this.
+    #[inline(always)]
+    pub(super) fn scan_position(self) -> usize {
+        (self.0 >> 52) as usize
     }
 
     #[inline(always)]

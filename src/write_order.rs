@@ -268,6 +268,35 @@ pub fn lock_key_for_walk(db: usize, key: &[u8]) -> OrderGuard {
     }
 }
 
+/// Wait for every write that holds the order of a key now, shared or
+/// whole, to let go of it: each stripe taken whole and let go of at once,
+/// one after another. For a change after which a write takes its key's
+/// order whole where it took it shared before: the first search index
+/// (`vector::Indexes::write_to_add`). A write that took a stripe before
+/// this got to it has finished when this returns; one that takes it after
+/// this let go of it sees what was done before this was called.
+///
+/// One stripe at a time, never two held: it cannot deadlock with a write
+/// of several keys. Not on a thread that holds stripes ([`holds_stripes`]),
+/// which would wait for itself, and which the caller asks first: there it
+/// takes nothing. Skipping only that thread's own stripes would not do
+/// either: a write holding another stripe may be waiting for one of them.
+pub fn barrier() {
+    if holds_stripes() {
+        return;
+    }
+    for stripe in &STRIPE {
+        drop(stripe.write());
+    }
+}
+
+/// Whether this thread holds stripes, so that [`barrier`] cannot run on
+/// it: a write of keys, or a script that runs beside others under its
+/// keys' order (`tag_locks`).
+pub fn holds_stripes() -> bool {
+    HELD.with(|h| h.get()) == STRIPES_HELD
+}
+
 /// The guard of a write made from inside another: it takes nothing.
 fn nested() -> OrderGuard {
     OrderGuard::holding_none(false)
@@ -298,13 +327,33 @@ mod tests {
 
     #[test]
     fn shared_holds_of_one_key_overlap() {
-        let guard = lock_key_shared(0, b"s");
-        std::thread::spawn(|| {
-            let _guard = lock_key_shared(0, b"s");
-        })
-        .join()
-        .unwrap();
-        drop(guard);
+        overlap(
+            || lock_key_shared(0, b"s"),
+            || drop(lock_key_shared(0, b"s")),
+        );
+    }
+
+    /// `beside`, on a thread of its own, gets what it takes while `hold`'s
+    /// guard is held. A `barrier` of another test queued on the stripe keeps
+    /// new shared holds out until the guard is let go of, and would wait for
+    /// it for ever if this joined the thread first: then the guard is let
+    /// go of, and it is tried again.
+    fn overlap(hold: impl Fn() -> OrderGuard, beside: fn()) {
+        for _ in 0..100 {
+            let held = hold();
+            let (got, get) = std::sync::mpsc::channel();
+            let other = std::thread::spawn(move || {
+                beside();
+                let _ = got.send(());
+            });
+            let overlapped = get.recv_timeout(Duration::from_millis(500)).is_ok();
+            drop(held);
+            other.join().unwrap();
+            if overlapped {
+                return;
+            }
+        }
+        panic!("the second shared hold never got in beside the first");
     }
 
     #[test]
@@ -344,12 +393,16 @@ mod tests {
     #[test]
     fn shared_holds_of_several_keys_overlap_and_keep_a_whole_one_out() {
         let keys = [b"ms:a".as_slice(), b"ms:b".as_slice(), b"ms:c".as_slice()];
+        overlap(
+            || lock_keys_shared(0, keys.into_iter()),
+            || {
+                drop(lock_keys_shared(
+                    0,
+                    [b"ms:c".as_slice(), b"ms:a".as_slice()].into_iter(),
+                ))
+            },
+        );
         let first = lock_keys_shared(0, keys.into_iter());
-        std::thread::spawn(move || {
-            let _second = lock_keys_shared(0, [b"ms:c".as_slice(), b"ms:a".as_slice()].into_iter());
-        })
-        .join()
-        .unwrap();
         let entered = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&entered);
         let whole = std::thread::spawn(move || {

@@ -1,0 +1,9 @@
+7011 SHUTDOWN NOSAVE -> b'+OK\r\n<closed>'
+7012 SHUTDOWN NOSAVE -> b'<closed>'
+7011 redis-py shutdown(nosave=True): RedisError SHUTDOWN seems to have failed.
+7012 redis-py shutdown(nosave=True): no error
+7011 SHUTDOWN ABORT -> b"+OK\r\nTimeoutError('timed out')"
+7012 SHUTDOWN ABORT -> b"-ERR No shutdown in progress.\r\nTimeoutError('timed out')"
+7011 SHUTDOWN -> b'+OK\r\n<closed>'
+7012 SHUTDOWN -> b'<closed>'
+both exited

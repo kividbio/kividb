@@ -59,11 +59,27 @@ pub enum IoModel {
     Tokio, // always use tokio
 }
 
+/// What `kividb --version` prints after the name: the version, and which of
+/// the release's builds this is (`update_check::variant`), since the
+/// `kividb` and `kividb-full` packages install the same `/usr/bin/kividb`
+/// (#732).
+#[cfg(all(feature = "lua", feature = "tls"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (full build: Lua, TLS)");
+#[cfg(all(feature = "lua", not(feature = "tls")))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (lua build: Lua, no TLS)");
+#[cfg(all(not(feature = "lua"), feature = "tls"))]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (tls build: TLS, no Lua)");
+#[cfg(all(not(feature = "lua"), not(feature = "tls")))]
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (default build: no Lua, no TLS)"
+);
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "kividb",
     about = "Fast Redis-compatible store",
-    version = env!("CARGO_PKG_VERSION"),
+    version = VERSION,
     author = env!("CARGO_PKG_AUTHORS")
 )]
 pub struct Config {
@@ -93,6 +109,12 @@ pub struct Config {
     /// Enable append-only file persistence
     #[arg(long, default_value_t = false)]
     pub aof: bool,
+
+    /// When the append-only file is synced to disk: `always`, before the
+    /// reply to each write, as in Redis; `everysec`, once a second. `no` is
+    /// taken as `everysec`.
+    #[arg(long, default_value = "everysec")]
+    pub appendfsync: String,
 
     /// Start a rewritten AOF with a KDB image of the dataset, so recovery loads
     /// the bulk at snapshot speed and replays only what came after it.
@@ -171,6 +193,12 @@ pub struct Config {
     #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
     pub activedefrag: bool,
 
+    /// Give the system allocator's free pages back to the system once what
+    /// is allocated has fallen far and the server is idle (#753; see
+    /// `src/give_back.rs`). On unless switched off.
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
+    pub allocator_give_back: bool,
+
     /// Waste in the slabs under which active defrag does not start (Redis
     /// `active-defrag-ignore-bytes`).
     #[arg(long, default_value_t = 64 << 20)]
@@ -220,6 +248,18 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub replica_announced_port: u16,
 
+    /// Where this replica stands when Sentinel picks one to promote (Redis
+    /// `replica-priority`, reported as `slave_priority` by `INFO
+    /// replication`): a lower one goes first, and 0 is never promoted.
+    #[arg(long, alias = "slave-priority", default_value_t = 100,
+          value_parser = clap::value_parser!(u32).range(0..=i32::MAX as i64))]
+    pub replica_priority: u32,
+
+    /// Whether Sentinel lists this replica (Redis `replica-announced`,
+    /// reported as `replica_announced` by `INFO replication`).
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
+    pub replica_announced: bool,
+
     /// Password required for AUTH (empty = no authentication required)
     #[arg(long, default_value = "")]
     pub requirepass: String,
@@ -236,6 +276,11 @@ pub struct Config {
     #[arg(long, default_value_t = 128)]
     pub slowlog_max_len: usize,
 
+    /// Maximum number of ACL LOG entries to keep (`acllog-max-len`); 0
+    /// keeps none
+    #[arg(long, default_value_t = 128)]
+    pub acllog_max_len: usize,
+
     /// True iff the server should run as a cluster node.
     /// Activated by `--cluster-enabled yes`. Defaults to false (standalone).
     #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args=1)]
@@ -251,6 +296,28 @@ pub struct Config {
     /// Equivalent to passing redis-server /etc/redis.conf.
     #[arg(long, default_value = "/etc/kividb/kividb.conf")]
     pub configfile: String,
+
+    /// Whether the server was started from `configfile`: it was there, and
+    /// was read. Only then may `CONFIG REWRITE` write it, as in Redis. A
+    /// server started without one used to create the file, and the next
+    /// server started with the same path (the default one, shared by every
+    /// server on the host) loaded it, `replicaof` and all (#442).
+    #[arg(skip)]
+    pub configfile_loaded: bool,
+
+    /// Whether `--configfile` was given on the command line. A server that
+    /// read `/etc/kividb/kividb.conf` only because it is the default path
+    /// refuses `CONFIG REWRITE`: on a host with the package installed, every
+    /// server started without `--configfile` reads that file, and any one of
+    /// them would overwrite it with its own port and `replicaof` (#475).
+    #[arg(skip)]
+    pub configfile_named: bool,
+
+    /// `client-output-buffer-limit`, from the configuration file (#774):
+    /// see [`crate::output_limits`]. The replica class's hard limit is
+    /// `repl_replica_max_backlog_bytes`; the one here is not read.
+    #[arg(skip)]
+    pub client_output_buffer_limit: crate::output_limits::Limits,
 
     /// Port to accept TLS connections on. 0 = TLS disabled.
     /// Separate from `port` so the uring hot-path on `port` is untouched.
@@ -326,10 +393,11 @@ pub struct Config {
     pub notify_keyspace_events: String,
 
     /// Max bytes a master will queue for a single replica that isn't keeping up
-    /// (analogous to Redis's `client-output-buffer-limit slave <hard-limit>`).
-    /// Once exceeded the replica is disconnected — it must full-resync to catch
-    /// back up — rather than letting the queue grow without bound. Settable at
-    /// runtime.
+    /// (Redis's `client-output-buffer-limit slave <hard-limit>`, which sets
+    /// it too). Once exceeded the replica is disconnected — it must
+    /// full-resync to catch back up — rather than letting the queue grow
+    /// without bound. 0 is no limit, and lifts
+    /// `repl-replica-sync-max-backlog-bytes` too. Settable at runtime.
     #[arg(long, default_value_t = 268_435_456)]
     pub repl_replica_max_backlog_bytes: u64,
 
@@ -462,6 +530,11 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_bus_port: u16,
 
+    /// The port the cluster bus listens on (Redis 7's `cluster-port`).
+    /// 0 = `port` + 10000. Fixed at startup.
+    #[arg(long, default_value_t = 0)]
+    pub cluster_port: u16,
+
     /// A secret every node of the cluster shares. A node connecting to
     /// another's bus port must prove it knows it (a challenge and an
     /// HMAC-SHA256 answer; the secret itself is never sent) before anything
@@ -568,6 +641,7 @@ impl Default for Config {
             key_access_tracking: false,
             lfu_decay_time: 1,
             activedefrag: true,
+            allocator_give_back: true,
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
@@ -578,10 +652,13 @@ impl Default for Config {
             io_model: IoModel::default(),
             replicaof: None,
             replica_announced_port: 0,
+            replica_priority: 100,
+            replica_announced: true,
             requirepass: "".into(),
             aclfile: "".into(),
             slowlog_log_slower_than: u64::MAX,
             slowlog_max_len: 128,
+            acllog_max_len: 128,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "/etc/kividb/kividb.conf".into(),
@@ -600,6 +677,7 @@ impl Default for Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            client_output_buffer_limit: crate::output_limits::Limits::default(),
             repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -618,9 +696,12 @@ impl Default for Config {
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
+            cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            configfile_loaded: false,
+            configfile_named: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -635,6 +716,7 @@ impl Default for Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            appendfsync: "everysec".into(),
         }
     }
 }
@@ -688,6 +770,7 @@ impl Config {
             key_access_tracking: false,
             lfu_decay_time: 1,
             activedefrag: true,
+            allocator_give_back: true,
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
@@ -698,10 +781,13 @@ impl Config {
             io_model: IoModel::Tokio,
             replicaof: None,
             replica_announced_port: 0,
+            replica_priority: 100,
+            replica_announced: true,
             requirepass: "".to_string(),
             aclfile: "".to_string(),
             slowlog_log_slower_than: 10_000,
             slowlog_max_len: 128,
+            acllog_max_len: 128,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
@@ -720,6 +806,7 @@ impl Config {
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
+            client_output_buffer_limit: crate::output_limits::Limits::default(),
             repl_backlog_size: 64 * 1024 * 1024,
             repl_backlog_ttl: 3600,
             repl_diskless_load: "disabled".into(),
@@ -738,9 +825,12 @@ impl Config {
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
             cluster_announce_bus_port: 0,
+            cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            configfile_loaded: false,
+            configfile_named: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
             cluster_require_full_coverage: true,
@@ -755,6 +845,7 @@ impl Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            appendfsync: "everysec".into(),
         }
     }
 
@@ -766,6 +857,12 @@ impl Config {
     /// it is a parameter so both outcomes are testable from one build.
     pub fn validate(&self, tls_compiled: bool) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
+
+        // Checked here too for `--databases 0`: the config file's directive
+        // is checked as it is read, the command line's was not.
+        if self.databases == 0 {
+            return Err("'databases' must be at least 1".into());
+        }
 
         if !self.update_check_url.starts_with("https://") {
             return Err(format!(
@@ -908,6 +1005,15 @@ impl Config {
                 self.hll_write_format
             ));
         }
+        if !matches!(
+            self.appendfsync.to_ascii_lowercase().as_str(),
+            "always" | "everysec" | "no"
+        ) {
+            return Err(format!(
+                "invalid appendfsync '{}' (expected always, everysec or no)",
+                self.appendfsync
+            ));
+        }
 
         if self.cluster_enabled {
             if self.replicaof.is_some() {
@@ -916,7 +1022,7 @@ impl Config {
                         .into(),
                 );
             }
-            if self.client_port() > u16::MAX - 10000 {
+            if self.cluster_port == 0 && self.client_port() > u16::MAX - 10000 {
                 return Err(format!(
                     "port {} leaves no room for the cluster bus port (port + 10000)",
                     self.client_port()
@@ -942,8 +1048,12 @@ impl Config {
         Ok(warnings)
     }
 
-    /// The port the cluster bus listens on: 10000 above the client port.
+    /// The port the cluster bus listens on: `cluster-port`, or 10000 above
+    /// the client port (#430).
     pub fn cluster_bus_port(&self) -> u16 {
+        if self.cluster_port != 0 {
+            return self.cluster_port;
+        }
         self.client_port().saturating_add(10000)
     }
 
@@ -956,6 +1066,17 @@ impl Config {
         } else {
             self.port
         }
+    }
+
+    /// `client-output-buffer-limit` as configured, the replica class's hard
+    /// limit being `repl-replica-max-backlog-bytes`.
+    pub fn output_buffer_limits(&self) -> crate::output_limits::Limits {
+        use crate::output_limits::Class;
+        let mut limits = self.client_output_buffer_limit;
+        let mut replica = limits.get(Class::Replica);
+        replica.hard = self.repl_replica_max_backlog_bytes;
+        limits.set(Class::Replica, replica);
+        limits
     }
 
     /// Returns true if TLS should be enabled.
@@ -977,6 +1098,13 @@ impl Config {
             }
             let args: Vec<String> = value.split_whitespace().map(String::from).collect();
             if args.is_empty() {
+                // Set to empty at runtime: unset, not left at what the
+                // server started with.
+                match name.to_ascii_lowercase().as_str() {
+                    "cluster-announce-ip" => config.cluster_announce_ip.clear(),
+                    "cluster-announce-hostname" => config.cluster_announce_hostname.clear(),
+                    _ => {}
+                }
                 continue;
             }
             let _ = config.apply_directive(&name.to_ascii_lowercase(), &args, &|_| false);
@@ -990,16 +1118,17 @@ impl Config {
     /// with `--key value` on restart. Comments are not preserved (that
     /// is a known limitation documented in COMMANDS.md).
     ///
-    /// Returns the Redis-compatible error string if no path was set,
-    /// or an io::Error if the write fails.
+    /// Refused, with nothing written, when the server was not started from
+    /// a config file (see [`Config::configfile_loaded`]); an io::Error if
+    /// the write fails.
     pub fn rewrite_to_disk(&self) -> Result<(), RewriteError> {
-        let path = std::path::Path::new(&self.configfile);
-
-        // Create parent directories if they don't exist.
-        // On a fresh install /etc/kividb/ won't exist yet.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(RewriteError::Io)?;
+        if !self.configfile_loaded {
+            return Err(RewriteError::NoConfigFile);
         }
+        if !self.configfile_named {
+            return Err(RewriteError::DefaultConfigFile(self.configfile.clone()));
+        }
+        let path = std::path::Path::new(&self.configfile);
 
         let mut out = String::new();
         out.push_str(&format!("port {}\n", self.port));
@@ -1039,6 +1168,14 @@ impl Config {
         out.push_str(&format!(
             "activedefrag {}\n",
             if self.activedefrag { "yes" } else { "no" }
+        ));
+        out.push_str(&format!(
+            "allocator-give-back {}\n",
+            if self.allocator_give_back {
+                "yes"
+            } else {
+                "no"
+            }
         ));
         out.push_str(&format!(
             "active-defrag-ignore-bytes {}\n",
@@ -1081,6 +1218,7 @@ impl Config {
             us => out.push_str(&format!("slowlog-log-slower-than {us}\n")),
         }
         out.push_str(&format!("slowlog-max-len {}\n", self.slowlog_max_len));
+        out.push_str(&format!("acllog-max-len {}\n", self.acllog_max_len));
         out.push_str(&format!(
             "cluster-enabled {}\n",
             if self.cluster_enabled { "yes" } else { "no" }
@@ -1097,6 +1235,8 @@ impl Config {
             "repl-replica-sync-max-backlog-bytes {}\n",
             self.repl_replica_sync_max_backlog_bytes
         ));
+        // A line for each class not at Redis's default, as Redis writes them.
+        out.push_str(&self.output_buffer_limits().rewrite_lines());
         if !self.masterauth.is_empty() {
             out.push_str(&format!("masterauth {}\n", quote(&self.masterauth)));
         }
@@ -1113,8 +1253,14 @@ impl Config {
         out.push_str(&format!("repl-backlog-ttl {}\n", self.repl_backlog_ttl));
         out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
         out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
+        out.push_str(&format!("appendfsync {}\n", self.appendfsync));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
         out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
+        out.push_str(&format!("replica-priority {}\n", self.replica_priority));
+        out.push_str(&format!(
+            "replica-announced {}\n",
+            if self.replica_announced { "yes" } else { "no" }
+        ));
         out.push_str(&format!(
             "min-replicas-to-write {}\n",
             self.min_replicas_to_write
@@ -1168,6 +1314,9 @@ impl Config {
                 "cluster-announce-bus-port {}\n",
                 self.cluster_announce_bus_port
             ));
+        }
+        if self.cluster_port != 0 {
+            out.push_str(&format!("cluster-port {}\n", self.cluster_port));
         }
         if !self.cluster_bus_secret.is_empty() {
             out.push_str(&format!("cluster-bus-secret {}\n", self.cluster_bus_secret));
@@ -1304,21 +1453,31 @@ impl Config {
         }
         let contents = match std::fs::read_to_string(&self.configfile) {
             Ok(s) => s,
-            // The file doesn't exist yet — that's fine, REWRITE creates it.
+            // No file: the server runs on its defaults and the command line,
+            // and `CONFIG REWRITE` is refused.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
                 return Err(format!("can't open config file '{}': {e}", self.configfile));
             }
         };
+        self.configfile_loaded = true;
+        self.configfile_named = from_cli("configfile");
         let file = self.configfile.clone();
-        self.apply_config_text(&contents, from_cli)
-            .map(|warnings| {
-                warnings
-                    .into_iter()
-                    .map(|w| format!("{file}: {w}"))
-                    .collect()
-            })
-            .map_err(|e| format!("{file}: {e}"))
+        let mut warnings: Vec<String> = self
+            .apply_config_text(&contents, from_cli)
+            .map_err(|e| format!("{file}: {e}"))?
+            .into_iter()
+            .map(|w| format!("{file}: {w}"))
+            .collect();
+        if !self.configfile_named {
+            warnings.push(format!(
+                "Read the config file '{file}' only because it is the default path. \
+                 A future release will read a config file only when one is named: \
+                 start the server with '--configfile {file}' to keep using it. \
+                 Until then CONFIG REWRITE is refused"
+            ));
+        }
+        Ok(warnings)
     }
 
     /// [`Config::apply_config_file`], given the text of the file.
@@ -1470,6 +1629,7 @@ impl Config {
                 )
             }
             "slowlog-max-len" => set!(slowlog_max_len, number(key, one()?)?),
+            "acllog-max-len" => set!(acllog_max_len, number(key, one()?)?),
             "slowlog-entry-max-argc" => set!(slowlog_entry_max_argc, number(key, one()?)?),
             "slowlog-entry-max-string-len" => {
                 set!(slowlog_entry_max_string_len, number(key, one()?)?)
@@ -1512,6 +1672,7 @@ impl Config {
                 set!(cluster_announce_client_port, number(key, one()?)?)
             }
             "cluster-announce-bus-port" => set!(cluster_announce_bus_port, number(key, one()?)?),
+            "cluster-port" => set!(cluster_port, number(key, one()?)?),
             "cluster-bus-secret" => set!(cluster_bus_secret, one()?.to_string()),
             "cluster-bus-port-protected-mode" => {
                 set!(cluster_bus_port_protected_mode, yes_no(key, one()?)?)
@@ -1533,6 +1694,23 @@ impl Config {
             ),
             "repl-replica-max-backlog-bytes" => {
                 set!(repl_replica_max_backlog_bytes, parse_memory(key, one()?)?)
+            }
+            // `<class> <hard> <soft> <seconds>`, for one class or more; a
+            // line for each class, as Redis writes them, or all on one. A
+            // replica's hard limit is `repl-replica-max-backlog-bytes` (#774).
+            "client-output-buffer-limit" => {
+                if args.is_empty() {
+                    return Err(format!("'{key}' needs a value"));
+                }
+                let value = args.join(" ");
+                let classes = crate::output_limits::parse(&value)
+                    .map_err(|why| format!("invalid value '{value}' for '{key}': {why}"))?;
+                for (class, limit) in classes {
+                    if class == crate::output_limits::Class::Replica {
+                        set!(repl_replica_max_backlog_bytes, limit.hard);
+                    }
+                    self.client_output_buffer_limit.set(class, limit);
+                }
             }
             "repl-replica-sync-max-backlog-bytes" => {
                 set!(
@@ -1574,6 +1752,17 @@ impl Config {
             "replica-announced-port" | "replica-announce-port" | "slave-announce-port" => {
                 set!(replica_announced_port, number(key, one()?)?)
             }
+            "replica-priority" | "slave-priority" => {
+                let priority: u32 = number(key, one()?)?;
+                if priority > i32::MAX as u32 {
+                    return Err(format!(
+                        "invalid value '{priority}' for '{key}': argument must be between 0 \
+                         and 2147483647 inclusive"
+                    ));
+                }
+                set!(replica_priority, priority)
+            }
+            "replica-announced" => set!(replica_announced, yes_no(key, one()?)?),
             "replicaof" | "slaveof" => match args {
                 [host, port] => {
                     let _: u16 = number(key, port)?;
@@ -1654,13 +1843,26 @@ impl Config {
                     );
                 }
             }
-            "appendfsync" => match one()? {
-                "everysec" => {}
-                "always" | "no" => {
-                    return no_effect("the append-only file is synced once a second");
+            // When the AOF is synced (#513). It used to be read and warned
+            // about, and the file synced once a second whatever it said.
+            "appendfsync" => {
+                let value = one()?.to_ascii_lowercase();
+                if !matches!(value.as_str(), "always" | "everysec" | "no") {
+                    return Err(format!(
+                        "invalid value '{value}' for 'appendfsync': expected always, everysec \
+                         or no"
+                    ));
                 }
-                other => return Err(format!("invalid value '{other}' for 'appendfsync'")),
-            },
+                let no = value == "no";
+                set!(appendfsync, value);
+                if no {
+                    return Ok(Some(
+                        "'appendfsync no' syncs the append-only file once a second, as \
+                         'everysec' does"
+                            .into(),
+                    ));
+                }
+            }
             "save" => {
                 if args.iter().any(|a| !a.is_empty()) {
                     return no_effect(
@@ -1714,6 +1916,7 @@ impl Config {
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
             "activedefrag" => set!(activedefrag, yes_no(key, one()?)?),
+            "allocator-give-back" => set!(allocator_give_back, yes_no(key, one()?)?),
             "active-defrag-ignore-bytes" => {
                 set!(active_defrag_ignore_bytes, parse_memory(key, one()?)?)
             }
@@ -1735,10 +1938,8 @@ impl Config {
             | "io-threads-do-reads"
             | "lazyfree-lazy-eviction"
             | "lazyfree-lazy-server-del"
-            | "lazyfree-lazy-user-del"
             | "no-appendfsync-on-rewrite"
             | "proc-title-template"
-            | "rdbchecksum"
             | "rdbcompression"
             | "repl-disable-tcp-nodelay"
             | "repl-diskless-sync"
@@ -1790,8 +1991,10 @@ impl Config {
                                 | "aof-ack-after-write"
                                 | "maxclients"
                                 | "lazyfree-lazy-expire"
+                                | "lazyfree-lazy-user-del"
                                 | "latency-tracking"
                                 | "latency-tracking-info-percentiles"
+                                | "rdbchecksum"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")
@@ -1936,6 +2139,13 @@ fn parse_yes_no(s: &str) -> Result<bool, String> {
 
 /// Error returned by `Config::rewrite_to_disk`.
 pub enum RewriteError {
+    /// The server was not started from a config file: there is none to
+    /// rewrite.
+    NoConfigFile,
+    /// The server read this file only because it is the default path, not
+    /// because `--configfile` named it; the file may be another server's
+    /// (#475).
+    DefaultConfigFile(String),
     Io(std::io::Error),
 }
 
@@ -2109,8 +2319,8 @@ mod config_file_tests {
         .unwrap();
         // All but maxclients, latency-tracking and latency-monitor-threshold,
         // which the latency monitor and `INFO latencystats` go by (#158,
-        // #232).
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        // #232), and acllog-max-len, which the ACL log goes by.
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].contains("'hash-max-listpack-entries'"),
             "{warnings:?}"
@@ -2135,15 +2345,18 @@ mod config_file_tests {
         }
     }
 
-    /// `lazyfree-lazy-expire` and `latency-tracking` from a config file are
-    /// set, as `CONFIG SET` sets them, and not reported as having no
-    /// effect: they have one (#232). A value other than yes or no is
-    /// refused, there and in the other `lazyfree-*` directives.
+    /// `lazyfree-lazy-expire`, `lazyfree-lazy-user-del` (#754) and
+    /// `latency-tracking` from a config file are set, as `CONFIG SET` sets
+    /// them, and not reported as having no effect: they have one (#232). A
+    /// value other than yes or no is refused, there and in the other
+    /// `lazyfree-*` directives.
     #[test]
     fn lazyfree_lazy_expire_and_latency_tracking_are_applied_from_the_file() {
         // Only to what they are already: other tests of this process go by
         // them. tests/expired_propagation.rs sets `no` from a file.
-        let (_, warnings) = load("lazyfree-lazy-expire YES\nlatency-tracking yes\n").unwrap();
+        let (_, warnings) =
+            load("lazyfree-lazy-expire YES\nlazyfree-lazy-user-del no\nlatency-tracking yes\n")
+                .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         for bad in [
             "lazyfree-lazy-expire maybe\n",
@@ -2229,13 +2442,25 @@ mod config_file_tests {
 
     #[test]
     fn redis_directives_with_no_effect_are_reported_and_not_fatal() {
-        let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync always\n").unwrap();
+        let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync no\n").unwrap();
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings[0].contains("line 1") && warnings[0].contains("'save'"));
         // The values KiviDB already behaves as are not worth a warning.
         let (_, warnings) =
             load("save \"\"\nappendfsync everysec\ndaemonize no\ndbfilename dump.kdb\n").unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// `appendfsync` is read from the file, not warned about and ignored
+    /// (#513).
+    #[test]
+    fn appendfsync_is_read_from_the_file() {
+        let (config, warnings) = load("appendfsync always\n").unwrap();
+        assert_eq!(config.appendfsync, "always");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (config, _) = load("appendfsync EVERYSEC\n").unwrap();
+        assert_eq!(config.appendfsync, "everysec");
+        assert!(load("appendfsync sometimes\n").is_err());
     }
 
     /// Every option the file can set is asked about by the name clap knows
@@ -2268,7 +2493,8 @@ mod config_file_tests {
             repl-backlog-size 1mb\nrepl-backlog-ttl 1\nrepl-diskless-load swapdb\n\
             hll-write-format redis\n\
             replica-full-sync-guard off\nreplica-full-sync-guard-ratio 1\n\
-            replica-announced-port 1\nreplicaof h 1\nstream-idmp-duration 1\n\
+            replica-announced-port 1\nreplica-priority 1\nreplica-announced no\n\
+            replicaof h 1\nstream-idmp-duration 1\n\
             stream-idmp-maxsize 1\nbackupdirname b\nbackup-sealed-ttl 1\npreload-file f\n\
             tls-port 1\ntls-cert-file f\ntls-key-file f\ntls-ca-cert-file f\n\
             tls-cluster no\ntls-replication no\ntls-client-cert-file f\ntls-client-key-file f\n\
@@ -2283,6 +2509,66 @@ mod config_file_tests {
             })
             .unwrap();
         assert_eq!(asked.get(), everything.lines().count());
+    }
+
+    /// A server that read its config file only because it is the default
+    /// path warns at startup and refuses `CONFIG REWRITE`, leaving the file
+    /// as it was: on a packaged host that file is the packaged server's
+    /// (#475). Named with `--configfile`, the same file is rewritten.
+    #[test]
+    fn config_file_found_by_default_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kividb.conf");
+        let original = "port 7001\n";
+        std::fs::write(&path, original).unwrap();
+        let start = |named: bool| {
+            let mut config = Config {
+                configfile: path.to_string_lossy().into_owned(),
+                ..Config::default()
+            };
+            let warnings = config
+                .apply_config_file(&|option| named && option == "configfile")
+                .unwrap();
+            (config, warnings)
+        };
+
+        let (config, warnings) = start(false);
+        assert!(config.configfile_loaded);
+        assert!(!config.configfile_named);
+        assert_eq!(config.port, 7001);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("default path") && w.contains("--configfile")),
+            "{warnings:?}"
+        );
+        let refused = Config {
+            port: 7002,
+            ..config
+        }
+        .rewrite_to_disk();
+        assert!(
+            matches!(&refused, Err(RewriteError::DefaultConfigFile(p)) if *p == path.to_string_lossy()),
+            "rewrite of a default-path config file was not refused"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let (config, warnings) = start(true);
+        assert!(config.configfile_named);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            Config {
+                port: 7002,
+                ..config
+            }
+            .rewrite_to_disk()
+            .is_ok()
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("port 7002\n")
+        );
     }
 }
 

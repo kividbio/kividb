@@ -79,6 +79,18 @@ impl Target {
                 .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// This node is a replica of a master that sends the deletion of every
+    /// hash field it expires: it removes no expired field of its own, and
+    /// hides one from reads until the master's `HDEL` arrives.
+    #[inline]
+    pub fn on_replica_fields(&self) -> bool {
+        self.repl_state.is_slave()
+            && self
+                .repl_state
+                .master_propagates_field_expiry
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether a key this node expires has to be told to anyone: it is a
     /// master, and something reads its write stream (the AOF, a replica or
     /// the backlog kept for one, a tap). As `replication::write_is_observed`
@@ -108,14 +120,14 @@ impl Target {
     /// `DEL` (or `UNLINK`) each to replicas, taps and the AOF. Inside a
     /// transaction or a script, among its writes. The caller holds what
     /// [`order`] takes.
-    pub fn propagate<'a>(&self, db: usize, keys: impl IntoIterator<Item = &'a str>) {
+    pub fn propagate<'a>(&self, db: usize, keys: impl IntoIterator<Item = &'a [u8]>) {
         let command: &[u8] = if lazy_expire() { b"UNLINK" } else { b"DEL" };
         for key in keys {
             crate::replication::replicate_expired(
                 &self.repl_state,
                 &self.hub_tx,
                 db,
-                &[command.to_vec(), key.as_bytes().to_vec()],
+                &[command.to_vec(), key.to_vec()],
             );
         }
     }
@@ -125,6 +137,27 @@ impl Target {
 fn lazy_expire() -> bool {
     crate::commands::server::remembered_config("lazyfree-lazy-expire")
         .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+}
+
+impl Target {
+    /// `fields` of the hash at `key`, which this master has just expired in
+    /// database `db`, as one `HDEL`. The caller holds what [`order`] takes.
+    pub fn propagate_fields<'a>(
+        &self,
+        db: usize,
+        key: &[u8],
+        fields: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut parts = vec![b"HDEL".to_vec(), key.to_vec()];
+        parts.extend(
+            fields
+                .into_iter()
+                .map(|f| crate::commands::helpers::name_to_bytes(f).into_owned()),
+        );
+        if parts.len() > 2 {
+            crate::replication::replicate_expired(&self.repl_state, &self.hub_tx, db, &parts);
+        }
+    }
 }
 
 static TARGETS: RwLock<Vec<(usize, Target)>> = RwLock::new(Vec::new());
@@ -201,7 +234,7 @@ pub fn order<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> Ordered {
 /// write still holding what it holds for its own record ([`order`]).
 #[cold]
 #[inline(never)]
-pub fn written_over(store: usize, db: usize, keys: &[String]) {
+pub fn written_over(store: usize, db: usize, keys: &[crate::store::Key]) {
     crate::keyspace_events::written_over_expired(store, db, keys);
     for key in keys {
         crate::watch::expired_in(store, db, key);
@@ -210,32 +243,58 @@ pub fn written_over(store: usize, db: usize, keys: &[String]) {
     }
     if let Some(target) = of_id(store).filter(Target::observed) {
         let _ordered = order(db, keys.iter().map(|key| key.as_bytes()));
-        target.propagate(db, keys.iter().map(String::as_str));
+        target.propagate(db, keys.iter().map(|key| key.as_bytes()));
     }
 }
 
 thread_local! {
-    /// How many [`Hold`]s this thread has.
+    /// How many [`Hold`]s of keys this thread has.
     static HELD: Cell<u32> = const { Cell::new(0) };
+    /// How many [`Hold`]s of hash fields this thread has.
+    static FIELDS_HELD: Cell<u32> = const { Cell::new(0) };
 }
 
-/// While this lives, no key expires on this thread ([`held`]).
+/// While this lives, no key, or no hash field, expires on this thread
+/// ([`held`], [`fields_held`]).
 pub struct Hold {
+    keys: bool,
+    fields: bool,
     _not_send: PhantomData<*const ()>,
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        if self.keys {
+            HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        }
+        if self.fields {
+            FIELDS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
+        }
     }
 }
 
-/// From now until the [`Hold`] is dropped, a key's time does not make it
-/// gone on this thread: what a thread loading a dataset, or applying its
-/// master's stream, holds. Nests.
+/// From now until the [`Hold`] is dropped, neither a key's time nor a hash
+/// field's makes it gone on this thread: what a thread loading a dataset
+/// holds, and one applying the stream of a master that sends both
+/// deletions. Nests.
 pub fn hold() -> Hold {
-    HELD.with(|held| held.set(held.get() + 1));
+    hold_of(true, true)
+}
+
+/// [`hold`] of keys alone, or of fields alone: for a replica of a master
+/// that sends the deletion of one and not the other. A single hold cannot
+/// say that: a KiviDB 1.2.0 master sends a `DEL` for every key it expires
+/// and nothing for the fields, which the replica has to expire itself.
+pub fn hold_of(keys: bool, fields: bool) -> Hold {
+    if keys {
+        HELD.with(|held| held.set(held.get() + 1));
+    }
+    if fields {
+        FIELDS_HELD.with(|held| held.set(held.get() + 1));
+    }
     Hold {
+        keys,
+        fields,
         _not_send: PhantomData,
     }
 }
@@ -245,6 +304,13 @@ pub fn hold() -> Hold {
 #[inline]
 pub fn held() -> bool {
     HELD.with(|held| held.get() > 0)
+}
+
+/// [`held`], for hash fields: a field's deadline does not make it gone on
+/// this thread. The `HDEL` that follows does.
+#[inline]
+pub fn fields_held() -> bool {
+    FIELDS_HELD.with(|held| held.get() > 0)
 }
 
 /// Datasets being loaded, on any thread: active expiry deletes nothing
@@ -273,7 +339,49 @@ impl Drop for Loading {
 /// Whether a dataset is being loaded ([`Loading`]).
 #[inline]
 pub fn loading() -> bool {
+    #[cfg(test)]
+    if undisturbed() {
+        return false;
+    }
     LOADING.load(Ordering::SeqCst) > 0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many [`Undisturbed`] this thread holds.
+    static UNDISTURBED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Whether this thread holds an [`Undisturbed`].
+#[cfg(test)]
+pub(crate) fn undisturbed() -> bool {
+    UNDISTURBED.with(|n| n.get() > 0)
+}
+
+/// For a test: on this thread, nothing stops a key or a hash field from
+/// expiring that another test did, until this is dropped. A dataset being
+/// loaded ([`loading`]) and paused writes (`pause::expiry_deferred`) are the
+/// process's, and the tests run side by side in one process: a test that
+/// loaded one, or paused writes, stopped the expiry of a test running
+/// beside it, whose master then kept a field past its deadline and wrote to
+/// it (#535). A test that loads or pauses on purpose does not take this.
+/// Nests.
+#[cfg(test)]
+pub(crate) struct Undisturbed(());
+
+#[cfg(test)]
+impl Undisturbed {
+    pub(crate) fn here() -> Self {
+        UNDISTURBED.with(|n| n.set(n.get() + 1));
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for Undisturbed {
+    fn drop(&mut self) {
+        UNDISTURBED.with(|n| n.set(n.get() - 1));
+    }
 }
 
 /// `DEBUG SET-ACTIVE-EXPIRE` and `DEBUG PAUSE-CRON`: whether the background
@@ -410,14 +518,23 @@ mod propagation_tests {
     /// A store whose expired keys are told to a hub queue, as with a
     /// replica attached. Never freed: a store is found by its address
     /// (`of`), which a store freed here could hand to another test's.
-    fn server() -> (Store, Arc<ReplState>, mpsc::UnboundedReceiver<HubMsg>) {
+    /// The test's thread is [`super::Undisturbed`] while the last item
+    /// lives: another test loading a dataset or pausing writes must not stop
+    /// this one's expiry.
+    fn server() -> (
+        Store,
+        Arc<ReplState>,
+        mpsc::UnboundedReceiver<HubMsg>,
+        super::Undisturbed,
+    ) {
+        let undisturbed = super::Undisturbed::here();
         let store = store::new_store(2);
         std::mem::forget(Arc::clone(&store));
         let repl_state = Arc::new(ReplState::new_master());
         repl_state.backlog_active.store(true, Ordering::Relaxed);
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
         super::register(&store, &repl_state, &hub_tx);
-        (store, repl_state, hub_rx)
+        (store, repl_state, hub_rx, undisturbed)
     }
 
     /// Everything in the stream so far, as one text.
@@ -459,7 +576,7 @@ mod propagation_tests {
 
     #[test]
     fn a_read_that_finds_a_key_past_its_time_sends_its_deletion_once() {
-        let (store, _repl, mut rx) = server();
+        let (store, _repl, mut rx, _undisturbed) = server();
         stale(&store, 0, "k");
         assert!(delete_key_if_expired(&store, 0, "k"));
         assert!(!delete_key_if_expired(&store, 0, "k"), "gone already");
@@ -477,7 +594,7 @@ mod propagation_tests {
     /// own record follows the `DEL` (`written_over`).
     #[test]
     fn a_write_over_a_key_past_its_time_sends_its_deletion_once_it_lets_go() {
-        let (store, _repl, mut rx) = server();
+        let (store, _repl, mut rx, _undisturbed) = server();
         stale(&store, 0, "k");
         let shard = store::get_shard(&store[0], "k");
         let mut map = shard.write();
@@ -503,7 +620,7 @@ mod propagation_tests {
 
     #[test]
     fn the_sweep_sends_each_deletion_once() {
-        let (store, _repl, mut rx) = server();
+        let (store, _repl, mut rx, _undisturbed) = server();
         let index = IndexStore::default();
         let keys: Vec<String> = (0..50).map(|i| format!("gone:{i}")).collect();
         for key in &keys {
@@ -529,11 +646,11 @@ mod propagation_tests {
 
     /// While no client has left database 0 its writes carry no `SELECT`:
     /// a deletion in another database goes back to 0 in the same piece,
-    /// and leaves the stream there (`replication::expired_for_stream`).
+    /// and leaves the stream there (`replication::in_db_for_stream`).
     /// Once one has, it goes with its `SELECT`, as every write then does.
     #[test]
     fn a_key_of_another_database_is_deleted_there_and_the_stream_goes_back() {
-        let (store, repl, mut rx) = server();
+        let (store, repl, mut rx, _undisturbed) = server();
         stale(&store, 1, "k");
         assert!(delete_key_if_expired(&store, 1, "k"));
         assert_eq!(
@@ -562,7 +679,7 @@ mod propagation_tests {
     /// sent.
     #[test]
     fn under_a_hold_nothing_is_past_its_time() {
-        let (store, _repl, mut rx) = server();
+        let (store, _repl, mut rx, _undisturbed) = server();
         stale(&store, 0, "k");
         let shard = store::get_shard(&store[0], "k");
         {
@@ -586,7 +703,7 @@ mod propagation_tests {
     /// in the stream when its change was before it in the store.
     #[test]
     fn a_deletion_waits_for_a_write_to_its_key_still_on_its_way() {
-        let (store, _repl, mut rx) = server();
+        let (store, _repl, mut rx, _undisturbed) = server();
         stale(&store, 0, "k");
         let writing = crate::write_order::lock_keys(0, std::iter::once(&b"k"[..]));
         let deleted = Arc::new(AtomicBool::new(false));
@@ -608,7 +725,7 @@ mod propagation_tests {
     /// and to the sweep, for its master's deletion.
     #[test]
     fn a_replica_neither_deletes_nor_sends() {
-        let (store, repl, mut rx) = server();
+        let (store, repl, mut rx, _undisturbed) = server();
         repl.become_slave();
         stale(&store, 0, "k");
         assert!(delete_key_if_expired(&store, 0, "k"), "gone, to a read");
@@ -631,7 +748,7 @@ mod propagation_tests {
     /// keys itself, to reads and to the sweep, and sends nothing.
     #[test]
     fn a_replica_of_a_master_that_sends_no_deletions_deletes_but_does_not_send() {
-        let (store, repl, mut rx) = server();
+        let (store, repl, mut rx, _undisturbed) = server();
         repl.become_slave();
         repl.master_propagates_expiry
             .store(false, Ordering::Relaxed);
@@ -657,7 +774,7 @@ mod propagation_tests {
     /// before the time it is given, and no others, and sends nothing.
     #[test]
     fn keys_due_before_a_time_are_deleted_and_no_others() {
-        let (store, repl, mut rx) = server();
+        let (store, repl, mut rx, _undisturbed) = server();
         repl.become_slave();
         let index = IndexStore::default();
         let now = now_ms();

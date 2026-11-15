@@ -488,6 +488,8 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "RENAME"
             | "RENAMENX"
             | "MOVE"
+            // Takes keys away; Redis flags it a write, but not `denyoom`.
+            | "MIGRATE"
             | "SWAPDB"
             | "LPOP"
             | "RPOP"
@@ -534,6 +536,9 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "EXEC"
             | "DISCARD"
             | "RESTORE-ASKING"
+            // Propagated, so `replication::is_write_command` has it, but it
+            // writes nothing (#411).
+            | "SELECT"
     )
 }
 
@@ -647,21 +652,31 @@ fn sample_shard<'m>(
     count
 }
 
-/// Up to `count` keys of one database, from a random shard and as many after
-/// it as it takes, each handed to `found` with its shard and place: of all
-/// its keys, or (`volatile`) of those with a time to live. Shards with none,
-/// as far as is known without a lock, are passed over unlocked.
+/// Up to `count` keys of one database, from a shard picked at random in
+/// proportion to its keys (`weights`, the running totals of
+/// `store::shard_weights`; evenly when they are empty or weigh nothing) and
+/// as many after it as it takes, each handed to `found` with its shard and
+/// place: of all its keys, or (`volatile`) of those with a time to live.
+/// Shards with none, as far as is known without a lock, are passed over
+/// unlocked. Within a shard the keys are sampled evenly ([`sample_shard`]),
+/// so a key is as likely to be looked at as any other of the database
+/// however unevenly the shards are filled: in cluster mode a busy hash tag
+/// fills one shard, and picked evenly that shard came up as often as one of
+/// a few keys (#294).
 fn sample_db(
     shards: &[crate::store::Shard],
     volatile: bool,
     count: usize,
+    weights: &[usize],
     rng: &mut impl Rng,
     mut found: impl FnMut(usize, usize, crate::store::EntryView<'_>),
 ) {
     if shards.is_empty() {
         return;
     }
-    let first = rng.gen_range(0..shards.len());
+    let first = crate::store::pick_weighted(weights, rng.r#gen())
+        .filter(|&i| i < shards.len())
+        .unwrap_or_else(|| rng.gen_range(0..shards.len()));
     let mut got = 0;
     for step in 0..shards.len() {
         let index = (first + step) % shards.len();
@@ -741,7 +756,7 @@ impl Choice {
     /// `spot`, whose key is `key`. Among keys as unwanted, the one offered
     /// first stays first.
     #[inline]
-    fn offer(&mut self, spot: Spot, key: &str) {
+    fn offer(&mut self, spot: Spot, key: &[u8]) {
         let top = &self.top[..self.len];
         if top.iter().any(|s| s.id == spot.id) {
             // Sampled twice, or kept and sampled again.
@@ -784,6 +799,7 @@ fn choose(
     ctx: &Ctx,
     policy: Policy,
     dbs: &[usize],
+    weights: &[Vec<usize>],
     rng: &mut impl Rng,
 ) -> Option<(usize, crate::store::Key)> {
     let now = clock();
@@ -820,17 +836,25 @@ fn choose(
         }
     }
     for &db in dbs {
-        sample_db(&ctx.store[db], volatile, count, rng, |shard, place, e| {
-            let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
-            let spot = Spot {
-                db,
-                shard,
-                place,
-                id: e.id(),
-                unwanted,
-            };
-            choice.offer(spot, e.key());
-        });
+        let weights = weights.get(db).map_or(&[][..], Vec::as_slice);
+        sample_db(
+            &ctx.store[db],
+            volatile,
+            count,
+            weights,
+            rng,
+            |shard, place, e| {
+                let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
+                let spot = Spot {
+                    db,
+                    shard,
+                    place,
+                    id: e.id(),
+                    unwanted,
+                };
+                choice.offer(spot, e.key());
+            },
+        );
     }
     choice.decide()
 }
@@ -850,13 +874,17 @@ struct Dbs {
     volatile: bool,
     found: Option<Instant>,
     list: Vec<usize>,
+    /// For each database, the running totals of its shards' keys (or keys
+    /// with a time to live), as found with the list: what a shard weighs
+    /// when one is picked to sample (`store::pick_weighted`).
+    weights: Vec<Vec<usize>>,
 }
 
 impl Dbs {
     const TRUSTED: std::time::Duration = std::time::Duration::from_millis(10);
 
     /// The list, found again if it is not to be trusted (`fresh`: it is not).
-    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> &[usize] {
+    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> (&[usize], &[Vec<usize>]) {
         let store = Arc::as_ptr(ctx.store) as *const () as usize;
         let now = Instant::now();
         if fresh
@@ -870,17 +898,15 @@ impl Dbs {
             self.volatile = volatile;
             self.found = Some(now);
             self.list.clear();
-            self.list.extend((0..ctx.store.len()).filter(|&db| {
-                ctx.store[db].iter().any(|shard| {
-                    if volatile {
-                        !shard.holds_no_ttl()
-                    } else {
-                        !shard.holds_no_keys()
-                    }
-                })
-            }));
+            self.weights.resize_with(ctx.store.len(), Vec::new);
+            for (db, weights) in self.weights.iter_mut().enumerate() {
+                crate::store::shard_weights(&ctx.store[db], volatile, weights);
+                if weights.last().is_some_and(|&total| total > 0) {
+                    self.list.push(db);
+                }
+            }
         }
-        &self.list
+        (&self.list, &self.weights)
     }
 }
 
@@ -891,14 +917,15 @@ thread_local! {
 /// Delete `key` to make room, with everything a deletion entails. Returns
 /// about how much memory that gives back (see `store::Taken::footprint`),
 /// or None if the key was gone already.
-fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
+fn evict(ctx: &mut Ctx, db: usize, key: &[u8], ordered: bool) -> Option<usize> {
     // Ordered against other writes to the key, like any write (#271). See
     // `write_order`.
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
-        .then(|| crate::write_order::lock_keys(db, std::iter::once(key.as_bytes())));
+        .then(|| crate::write_order::lock_keys(db, std::iter::once(key)));
 
+    // A document left its indexes when the shard was let go of
+    // (`ShardMap::remove`).
     let given = crate::commands::helpers::delete_key_sized(ctx.store, db, key)?;
-    crate::vector::maybe_unindex(ctx.index_store, db, key);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
     crate::stats::record_rdb_change();
@@ -917,7 +944,7 @@ fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
         // In the key's database, whichever the client has selected.
         let selected = *ctx.selected_db;
         *ctx.selected_db = db;
-        crate::replication::replicate_one_write(ctx, &[b"DEL".to_vec(), key.as_bytes().to_vec()]);
+        crate::replication::replicate_one_write(ctx, &[b"DEL".to_vec(), key.to_vec()]);
         *ctx.selected_db = selected;
     }
     Some(given)
@@ -1017,7 +1044,8 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             );
             return false;
         }
-        let Some((db, key)) = choose(ctx, policy, dbs.get(ctx, volatile, fresh), &mut rng) else {
+        let (list, weights) = dbs.get(ctx, volatile, fresh);
+        let Some((db, key)) = choose(ctx, policy, list, weights, &mut rng) else {
             if fresh {
                 return false;
             }
@@ -1154,11 +1182,46 @@ mod tests {
         rng: &mut impl Rng,
     ) -> Vec<Sampled> {
         let mut found = Vec::new();
-        sample_db(shards, volatile, count, rng, |_, _, e| {
+        sample_db(shards, volatile, count, &[], rng, |_, _, e| {
             let expires = if volatile { e.expires() } else { None };
-            found.push((e.key().to_string(), expires, e.access()))
+            found.push((
+                crate::key_bytes::text_of(e.key()).into_owned(),
+                expires,
+                e.access(),
+            ))
         });
         found
+    }
+
+    /// Shards filled unevenly, as one busy hash tag fills one in cluster
+    /// mode: picked in proportion to their keys, a key of the full shard is
+    /// as likely to be looked at as a key of the others (#294). (Picked
+    /// evenly, the full shard's 7,000 keys came up an eighth of the time.)
+    #[test]
+    fn a_full_shard_is_sampled_as_often_as_its_keys_say() {
+        let shards: Vec<crate::store::Shard> = (0..8)
+            .map(|_| Arc::new(crate::store::ShardLock::default()))
+            .collect();
+        for i in 0..7_000 {
+            shards[0].write().insert_str(format!("big{i}"), b"v");
+        }
+        for i in 0..1_000 {
+            shards[1 + i % 7].write().insert_str(format!("k{i}"), b"v");
+        }
+        let mut weights = Vec::new();
+        crate::store::shard_weights(&shards, false, &mut weights);
+        assert_eq!(weights.last(), Some(&8_000));
+        let mut rng = rand::thread_rng();
+        let (mut big, mut all) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            sample_db(&shards, false, 5, &weights, &mut rng, |shard, _, _| {
+                all += 1;
+                big += u32::from(shard == 0);
+            });
+        }
+        // 7/8 of the keys; about 0.002 either way.
+        let share = f64::from(big) / f64::from(all);
+        assert!((0.85..0.90).contains(&share), "{share}");
     }
 
     /// Every key is as likely to be sampled as any other, wherever it is in
@@ -1186,7 +1249,9 @@ mod tests {
         // 200 times each, on average.
         for _ in 0..40_000 {
             let n = sample_shard(&map, false, 5, &mut rng, |_, e| {
-                *times.entry(e.key().to_string()).or_default() += 1;
+                *times
+                    .entry(crate::key_bytes::text_of(e.key()).into_owned())
+                    .or_default() += 1;
             });
             assert_eq!(n, 5);
         }
@@ -1224,13 +1289,14 @@ mod tests {
             (7, 40),
             (8, 20),
         ] {
-            c.offer(spot(id, unwanted), &format!("k{id}"));
+            c.offer(spot(id, unwanted), format!("k{id}").as_bytes());
         }
         let ids = |s: &[Spot]| s.iter().map(|s| s.id).collect::<Vec<_>>();
         // 2 is there once; 8 is as unwanted as 3, and came after it.
         assert_eq!(ids(&c.top[..c.len]), [7, 2, 5, 3, 8]);
         assert_eq!(
-            c.decide().map(|(db, key)| (db, key.to_string())),
+            c.decide()
+                .map(|(db, key)| (db, crate::key_bytes::text_of(&key).into_owned())),
             Some((3, "k7".to_string()))
         );
         let kept = KEPT_SPOTS.with(|k| k.get());

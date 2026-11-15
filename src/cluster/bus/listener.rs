@@ -292,9 +292,16 @@ pub fn process_message(
             request_epoch,
             master_id,
             force,
+            claims,
             ..
         } => {
-            if state.cast_vote(sender_id, master_id, request_epoch, force) {
+            if state.cast_vote(
+                sender_id,
+                master_id,
+                request_epoch,
+                force,
+                claims.as_deref(),
+            ) {
                 log_info!(
                     "Cluster: Voted for {} to take over from {} at epoch {}{}",
                     node_id_str(&sender_id),
@@ -480,10 +487,25 @@ fn apply_heartbeat(
         merge_gossip_entry(state, sender_id, g, &forgotten);
     }
     // A replica announces no slots; claims only ever come from masters.
-    if sender_flags.contains(NodeFlags::MASTER) {
+    if sender_flags.contains(NodeFlags::MASTER) && !test_ignores_claims_of(&sender_id) {
         state.apply_peer_slot_claims(sender_id, slot_claims);
     }
     state.save_soon();
+}
+
+/// For the tests of a node that has not heard of a slot's new owner, and
+/// never set otherwise: `KIVIDB_TEST_IGNORE_CLAIMS`, a file that, while it
+/// holds a node's id, has this node take in none of that node's slot
+/// claims.
+fn test_ignores_claims_of(id: &NodeId) -> bool {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("KIVIDB_TEST_IGNORE_CLAIMS").map(Into::into))
+        .as_deref()
+    else {
+        return false;
+    };
+    std::fs::read_to_string(path).is_ok_and(|s| s.trim() == node_id_str(id))
 }
 
 /// Insert or update a node in the routing table. Clears HANDSHAKE flag if set.

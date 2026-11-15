@@ -227,6 +227,143 @@ fn test_fcall_select_does_not_leak_db() {
     assert_eq!(val.as_str(), "db0_value");
 }
 
+// ── Blocking commands in a script ────────────────────────────────────────────
+
+/// A blocking command a script calls runs as its non-blocking form, as in
+/// Redis: it takes what is there, and answers its empty reply when nothing
+/// is. It used to answer nil without running, whatever the key held (#558).
+#[test]
+fn blocking_commands_in_a_script_take_what_is_there() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmds(&["RPUSH", "l", "a", "b", "c", "d"]).as_int(), 4);
+    assert_eq!(
+        c.cmds(&["ZADD", "z", "1", "m1", "2", "m2", "3", "m3"])
+            .as_int(),
+        3
+    );
+    let mut eval = |call: &str, keys: &[&str]| {
+        let script = format!("return redis.call({call})");
+        let numkeys = keys.len().to_string();
+        let mut args = vec!["EVAL", script.as_str(), numkeys.as_str()];
+        args.extend_from_slice(keys);
+        c.cmds(&args)
+    };
+    let strings = |reply: &RespValue| match reply {
+        RespValue::Array(parts) => parts
+            .iter()
+            .map(|part| part.as_str().to_string())
+            .collect::<Vec<_>>(),
+        other => panic!("not an array: {other:?}"),
+    };
+
+    let reply = eval("'BLPOP', KEYS[1], 0", &["l"]);
+    assert_eq!(strings(&reply), ["l", "a"]);
+    let reply = eval("'BRPOP', KEYS[1], 0", &["l"]);
+    assert_eq!(strings(&reply), ["l", "d"]);
+    let reply = eval(
+        "'BLMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT', 0",
+        &["l", "dst"],
+    );
+    assert_eq!(reply.as_str(), "b");
+    let reply = eval("'BRPOPLPUSH', KEYS[1], KEYS[2], 0", &["l", "dst"]);
+    assert_eq!(reply.as_str(), "c");
+    let reply = eval("'BLMPOP', 0, 1, KEYS[1], 'RIGHT', 'COUNT', 5", &["dst"]);
+    match &reply {
+        RespValue::Array(parts) => {
+            assert_eq!(parts[0].as_str(), "dst");
+            assert_eq!(strings(&parts[1]), ["b", "c"]);
+        }
+        other => panic!("BLMPOP: {other:?}"),
+    }
+    let reply = eval("'BZPOPMIN', KEYS[1], 0", &["z"]);
+    assert_eq!(strings(&reply), ["z", "m1", "1"]);
+    let reply = eval("'BZPOPMAX', KEYS[1], 0", &["z"]);
+    assert_eq!(strings(&reply), ["z", "m3", "3"]);
+    let reply = eval("'BZMPOP', 0, 1, KEYS[1], 'MIN'", &["z"]);
+    match &reply {
+        RespValue::Array(parts) => {
+            assert_eq!(parts[0].as_str(), "z");
+            match &parts[1] {
+                RespValue::Array(members) => assert_eq!(strings(&members[0]), ["m2", "2"]),
+                other => panic!("BZMPOP members: {other:?}"),
+            }
+        }
+        other => panic!("BZMPOP: {other:?}"),
+    }
+    // Nothing there: the empty reply, which reaches Lua as false.
+    assert!(eval("'BLPOP', KEYS[1], 0", &["l"]).is_nil());
+    assert!(eval("'BZPOPMIN', KEYS[1], 0", &["z"]).is_nil());
+    assert!(
+        eval(
+            "'BLMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT', 0",
+            &["l", "dst"]
+        )
+        .is_nil()
+    );
+
+    assert_eq!(c.cmds(&["EXISTS", "l", "dst", "z"]).as_int(), 0);
+
+    // A pop in a script that takes nothing leaves a watch on its key alone;
+    // one that takes something fails it, as in Redis.
+    let mut watcher = Conn::connect(port);
+    assert_eq!(watcher.cmds(&["WATCH", "l"]).as_str(), "OK");
+    let reply = c.cmds(&["EVAL", "return redis.call('BLPOP', KEYS[1], 0)", "1", "l"]);
+    assert!(reply.is_nil(), "{reply:?}");
+    let reply = c.cmds(&["EVAL", "return redis.call('LPOP', KEYS[1])", "1", "l"]);
+    assert!(reply.is_nil(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(matches!(watcher.cmds(&["EXEC"]), RespValue::Array(ref r) if r.len() == 1));
+    assert_eq!(c.cmds(&["RPUSH", "other", "y"]).as_int(), 1);
+    assert_eq!(watcher.cmds(&["WATCH", "other"]).as_str(), "OK");
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.call('BLPOP', KEYS[1], 0)",
+        "1",
+        "other",
+    ]);
+    assert!(!reply.is_nil(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(watcher.cmds(&["EXEC"]).is_nil());
+    // A write, which a read-only script may not make.
+    assert_eq!(c.cmds(&["RPUSH", "l", "a"]).as_int(), 1);
+    let reply = c.cmds(&[
+        "EVAL_RO",
+        "return redis.call('BLPOP', KEYS[1], 0)",
+        "1",
+        "l",
+    ]);
+    assert!(reply.is_error(), "{reply:?}");
+    assert_eq!(c.cmds(&["LLEN", "l"]).as_int(), 1);
+}
+
+/// A key a script's call left as it was (a `DEL` of a key that is not
+/// there) and a later call changed (a `SET` of it) has changed: a `WATCH` on
+/// it fails (#584). What the first call said held for the next.
+#[test]
+fn a_script_that_deletes_a_missing_key_then_sets_it_fails_a_watch() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut watcher = Conn::connect(port);
+    assert_eq!(watcher.cmds(&["WATCH", "made"]).as_str(), "OK");
+    let reply = c.cmds(&[
+        "EVAL",
+        "redis.call('DEL', KEYS[1]) return redis.call('SET', KEYS[1], 'v')",
+        "1",
+        "made",
+    ]);
+    assert!(!reply.is_error(), "{reply:?}");
+    assert_eq!(watcher.cmds(&["MULTI"]).as_str(), "OK");
+    watcher.cmds(&["PING"]);
+    assert!(watcher.cmds(&["EXEC"]).is_nil());
+}
+
 // ── Nil bulk → Lua false ──────────────────────────────────────────────────────
 
 /// When a Redis command returns nil (key not found), Lua must see false, not nil.
@@ -477,6 +614,15 @@ fn redis_function_dump_payloads_restore_and_run() {
         (
             "8.10",
             &include_bytes!("fixtures/redis-8.10-function-dump.bin")[..],
+        ),
+        // Valkey 9 seals its payloads with its RDB version, 80 (#449).
+        (
+            "Valkey 9.0",
+            &include_bytes!("fixtures/valkey-9.0-function-dump.bin")[..],
+        ),
+        (
+            "Valkey 9.1",
+            &include_bytes!("fixtures/valkey-9.1-function-dump.bin")[..],
         ),
     ] {
         let restored = c.cmd(&[b"FUNCTION", b"RESTORE", payload, b"FLUSH"]);
@@ -1226,6 +1372,7 @@ fn test_scripts_from_many_clients_at_once_run_one_at_a_time() {
 /// of a millisecond that the clock it was told by kept.
 #[test]
 fn a_time_to_live_is_told_in_full_by_the_script_that_set_it() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
@@ -1381,6 +1528,46 @@ fn a_quick_function_that_turns_endless_does_not_stop_the_server() {
     assert_eq!(Conn::connect(port).cmds(&["PING"]).as_str(), "PONG");
     c.cmds(&["CONFIG", "SET", "lua-time-limit", "5000"]);
     c.cmds(&["FUNCTION", "DELETE", "turnslib"]);
+}
+
+/// A script that waits for `TIME` to move ends, as in Redis 8.10.3: `TIME`
+/// holds the script's start until the script has run past
+/// `busy-reply-threshold`, then moves. Expiry doesn't: a key's `PTTL` is
+/// the same at the end as at the start, 300 ms later by `TIME`. Before #676
+/// `TIME` never moved and the script ran until killed.
+#[test]
+fn a_script_waiting_for_time_to_move_ends_past_the_busy_threshold() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["CONFIG", "SET", "busy-reply-threshold", "200"]);
+    c.cmds(&["SET", "timemoves", "v", "PX", "5000"]);
+
+    // Ends the script if it never returns, so the server and the tests
+    // after this one aren't left BUSY.
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let watchdog = thread::spawn(move || {
+        if wait.recv_timeout(Duration::from_secs(4)).is_err() {
+            Conn::connect(port).cmds(&["SCRIPT", "KILL"]);
+        }
+    });
+    let script = "local p0 = redis.call('PTTL', KEYS[1]) \
+                  local t0 = redis.call('TIME') \
+                  local same = redis.call('TIME')[2] == t0[2] \
+                  local t \
+                  repeat t = redis.call('TIME') \
+                  until (t[1] - t0[1]) * 1000000 + (t[2] - t0[2]) >= 300000 \
+                  return {same and 1 or 0, p0 - redis.call('PTTL', KEYS[1])}";
+    let reply = c.cmds(&["EVAL", script, "1", "timemoves"]);
+    let _ = done.send(());
+    watchdog.join().unwrap();
+    c.cmds(&["CONFIG", "SET", "busy-reply-threshold", "5000"]);
+
+    assert_eq!(
+        reply,
+        RespValue::Array(vec![RespValue::Int(1), RespValue::Int(0)])
+    );
 }
 
 // ── error(): tables, the reply's tail, and acl_check_cmd's arity ─────────────
@@ -2089,4 +2276,268 @@ fn test_script_help_lists_subcommands() {
         c.cmds(&["SCRIPT", "HELP", "extra"]).as_error(),
         "ERR wrong number of arguments for 'script|help' command"
     );
+}
+
+/// From a script, a time series sample's time above `i64::MAX` is refused,
+/// as from a client (#592).
+#[test]
+fn a_ts_time_above_i64_max_is_refused_in_a_script() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let over = (i64::MAX as u64 + 1).to_string();
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.pcall('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        &over,
+    ]);
+    assert!(matches!(reply, RespValue::Error(_)), "{reply:?}");
+    let reply = c.cmds(&[
+        "EVAL",
+        "return redis.call('TS.ADD', KEYS[1], ARGV[1], 1)",
+        "1",
+        "lua:ts",
+        "5",
+    ]);
+    assert!(matches!(reply, RespValue::Int(5)), "{reply:?}");
+}
+
+/// `string.format`'s integer conversions take a number with a fraction and
+/// cut it toward zero, as Redis's Lua 5.1 does, where Lua 5.4 failed with
+/// "number has no integer representation" (#747). Scripts still run on Lua
+/// 5.4, and say so. The replies are Redis 8.10.2's for the same scripts.
+#[test]
+fn string_format_takes_fractions_for_integer_conversions_as_redis_does() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let bulk = |text: &str| RespValue::Bulk(text.as_bytes().to_vec());
+    let lowest = "-9223372036854775808";
+    let cases: Vec<(&str, RespValue)> = vec![
+        // The issue's table.
+        ("return string.format('%d', 1.5)", bulk("1")),
+        ("return string.format('%d', 3.0)", bulk("3")),
+        (
+            "return string.format('%d%03d', 1731571200, 123456 / 1000)",
+            bulk("1731571200123"),
+        ),
+        ("return string.format('%x', 255.9)", bulk("ff")),
+        ("return 7 / 2", RespValue::Int(3)),
+        // The differences that stay, and are documented.
+        ("return tostring(10 / 2)", bulk("5.0")),
+        ("return _VERSION", bulk("Lua 5.4")),
+        // Every integer conversion, flags, width and precision.
+        ("return string.format('%d', -1.5)", bulk("-1")),
+        ("return string.format('%i', 3.99)", bulk("3")),
+        ("return string.format('%o', 8.5)", bulk("10")),
+        ("return string.format('%u', 3.5)", bulk("3")),
+        ("return string.format('%X', 255.9)", bulk("FF")),
+        (
+            "return string.format('%c%c%c', 76.1, 117.9, 97)",
+            bulk("Lua"),
+        ),
+        (
+            "return string.format('%3c|%-3c|', 72.5, 72.5)",
+            bulk("  H|H  |"),
+        ),
+        ("return string.format('%+d % d', 3.5, 3.5)", bulk("+3  3")),
+        (
+            "return string.format('%#x %#o', 255.5, 8.5)",
+            bulk("0xff 010"),
+        ),
+        (
+            "return string.format('%.3d|%-6d|%06d', 7.7, 7.7, -7.7)",
+            bulk("007|7     |-00007"),
+        ),
+        ("return string.format('%08.3d', -7.5)", bulk("    -007")),
+        ("return string.format('%.0d', 0.5)", bulk("")),
+        ("return string.format('%%%d%%', 5.5)", bulk("%5%")),
+        ("return string.format('%d', '12.7')", bulk("12")),
+        ("return string.format('%d', 1.5, 'extra')", bulk("1")),
+        ("return ('%d'):format(1.5)", bulk("1")),
+        // Other conversions are Lua 5.4's, beside the integer ones.
+        (
+            "return string.format('%05.1f|%d|%s', 1.25, 2.5, 'x')",
+            bulk("001.2|2|x"),
+        ),
+        (
+            "return string.format('%5.2s|%d', 'abc', 9.9)",
+            bulk("   ab|9"),
+        ),
+        // Out of range, as Redis gives it.
+        ("return string.format('%d', 2^63)", bulk(lowest)),
+        ("return string.format('%d', 1e20)", bulk(lowest)),
+        ("return string.format('%d', -1e20)", bulk(lowest)),
+        ("return string.format('%d', 0/0)", bulk(lowest)),
+        ("return string.format('%x', 2^63)", bulk("8000000000000000")),
+        ("return string.format('%x', 1e20)", bulk("0")),
+        ("return string.format('%x', -1.5)", bulk("ffffffffffffffff")),
+        (
+            "return string.format('%u', -1.5)",
+            bulk("18446744073709551615"),
+        ),
+        ("return string.format('%c', 300.5)", bulk(",")),
+        ("return string.format('a%cb', 0.5)", bulk("ab")),
+        // affinidi-messaging-mediator's store_message: TIME's seconds and
+        // microseconds as milliseconds.
+        (
+            "local t = redis.call('TIME') \
+             local ms = string.format('%d%03d', t[1], t[2] / 1000) \
+             return #ms == #t[1] + 3 and ms:sub(1, #t[1]) == t[1]",
+            RespValue::Int(1),
+        ),
+    ];
+    for (script, expected) in cases {
+        assert_eq!(c.cmds(&["EVAL", script, "0"]), expected, "{script}");
+    }
+    // Errors stay Lua's, for the argument at fault.
+    for (script, message) in [
+        (
+            "return string.format('%d %d', 1.5)",
+            "bad argument #3 to 'format' (no value)",
+        ),
+        (
+            "return string.format('%d %d', 1.5, 'x')",
+            "bad argument #3 to 'format' (number expected, got string)",
+        ),
+    ] {
+        let reply = c.cmds(&["EVAL", script, "0"]);
+        assert!(reply.as_error().contains(message), "{script}: {reply:?}");
+    }
+
+    // The same in a function library, as the mediator loads its own.
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    let load = c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=lib747\n\
+         redis.register_function('store_time', function(keys, args)\n\
+           local time = redis.call('TIME')\n\
+           local ms = string.format('%d%03d', time[1], time[2] / 1000)\n\
+           return {ms, string.format('%d', args[1] / 1000)}\n\
+         end)",
+    ]);
+    assert_eq!(load.as_str(), "lib747");
+    let RespValue::Array(reply) = c.cmds(&["FCALL", "store_time", "0", "123456"]) else {
+        panic!("FCALL store_time");
+    };
+    assert_eq!(reply[1], bulk("123"));
+    assert!(
+        matches!(&reply[0], RespValue::Bulk(ms) if ms.len() == 13),
+        "{reply:?}"
+    );
+    c.cmds(&["FUNCTION", "FLUSH"]);
+}
+
+/// Numbers leave a script as Redis's leave one (#747): written into a
+/// command's arguments as Redis writes them, cut to the lowest integer as a
+/// reply when out of range, with 14 digits from `cjson`, and as integers or
+/// 32-bit floats from `cmsgpack` when they are those.
+#[test]
+fn numbers_leave_a_script_as_redis_s_do() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let bulk = |text: &str| RespValue::Bulk(text.as_bytes().to_vec());
+    let arguments = [
+        ("1e20", "1e+20"),
+        ("2^63", "9223372036854776000"),
+        ("2^62", "4611686018427387904"),
+        ("10 / 2", "5"),
+        ("-1e-7", "-1e-7"),
+        ("1.5e300", "1.5e+300"),
+        ("0.00001", "0.00001"),
+        ("1/3", "0.3333333333333333"),
+        ("1/0", "inf"),
+        ("-1/0", "-inf"),
+    ];
+    for (number, expected) in arguments {
+        let script =
+            format!("redis.call('SET', 'lua747', {number}) return redis.call('GET', 'lua747')");
+        assert_eq!(c.cmds(&["EVAL", &script, "0"]), bulk(expected), "{script}");
+    }
+    let cases: Vec<(&str, RespValue)> = vec![
+        (
+            "return {1.9, -1.9, 2^62, 1e30, math.huge, 0/0}",
+            RespValue::Array(vec![
+                RespValue::Int(1),
+                RespValue::Int(-1),
+                RespValue::Int(1 << 62),
+                RespValue::Int(i64::MIN),
+                RespValue::Int(i64::MIN),
+                RespValue::Int(i64::MIN),
+            ]),
+        ),
+        (
+            "return cjson.encode({a = 1/3})",
+            bulk(r#"{"a":0.33333333333333}"#),
+        ),
+        (
+            "return cjson.encode({1, 2.5, 10/2, 100/3, 1e13, 12345678901234.5})",
+            bulk("[1,2.5,5,33.333333333333,10000000000000,12345678901234]"),
+        ),
+        (
+            "return cmsgpack.pack(1.5, 10/2, 2^40, 0.1)",
+            RespValue::Bulk(vec![
+                0xca, 0x3f, 0xc0, 0, 0,    // 1.5, a 32-bit float
+                0x05, // 5, an integer
+                0xcf, 0, 0, 1, 0, 0, 0, 0, 0, // 2^40, an integer
+                0xcb, 0x3f, 0xb9, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a, // 0.1
+            ]),
+        ),
+        (
+            "return cmsgpack.unpack(cmsgpack.pack(1.5)) * 2",
+            RespValue::Int(3),
+        ),
+    ];
+    for (script, expected) in cases {
+        assert_eq!(c.cmds(&["EVAL", script, "0"]), expected, "{script}");
+    }
+}
+
+/// `string.format` keeps what it builds in Lua's memory, so that an error
+/// leaves nothing behind: no memory leak on an error path (#747). Resident
+/// memory stays put over many large calls under `pcall`.
+#[test]
+fn string_format_frees_what_it_built_when_it_fails() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let rss = |c: &mut Conn| -> u64 {
+        let info = c.cmds(&["INFO", "memory"]);
+        info.as_str()
+            .lines()
+            .find_map(|l| l.strip_prefix("used_memory_rss:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    // 600,000 `%s` and a `%d` given a fraction: a rewrite, with as many
+    // arguments kept. Ten calls per script, each under `pcall`.
+    let script = "local n = 600000 \
+         local t = {} for i = 1, n do t[i] = 'x' end t[n + 1] = 1.5 \
+         local f = string.rep('%s', n) .. '%d' \
+         local ok = 0 \
+         for i = 1, 10 do \
+           if pcall(string.format, f, table.unpack(t)) then ok = ok + 1 end \
+         end \
+         t = nil f = nil collectgarbage() \
+         return ok";
+    // Once to warm the allocator up, then measured.
+    assert!(matches!(c.cmds(&["EVAL", script, "0"]), RespValue::Int(_)));
+    let before = rss(&mut c);
+    for _ in 0..3 {
+        assert!(matches!(c.cmds(&["EVAL", script, "0"]), RespValue::Int(_)));
+    }
+    let after = rss(&mut c);
+    let grown = after.saturating_sub(before);
+    assert!(grown < 32 << 20, "resident memory grew {grown} bytes");
 }

@@ -1,13 +1,13 @@
 //! Lua scripting (`EVAL`, `SCRIPT`, …) — compiled with `--features lua`.
 
 use crate::commands::ctx::Ctx;
-use crate::commands::handler::{client_connection_resp, execute_command_from_script};
+use crate::commands::handler::execute_command_from_script;
 use crate::commands::helpers::glob_match;
 use crate::replication;
 use crate::resp::write::{
-    resp_array, resp_bignum_resp3, resp_bulk, resp_bulk_str, resp_double_bulk, resp_double_resp3,
-    resp_error, resp_integer, resp_map, resp_null_bulk, resp_null_resp3, resp_set_resp3,
-    resp_simple, resp_verbatim_resp3,
+    resp_array, resp_bignum_resp3, resp_bool_resp3, resp_bulk, resp_bulk_str, resp_double_bulk,
+    resp_double_resp3, resp_error, resp_integer, resp_map, resp_map_for, resp_null_for,
+    resp_set_for, resp_set_resp3, resp_simple, resp_verbatim_resp3,
 };
 use crate::snapshot::{crc64_digest, redis_function_dump_sources};
 use mlua::prelude::*;
@@ -874,6 +874,10 @@ struct ScriptEval {
 
 thread_local! {
     static SCRIPT_EVAL: RefCell<Option<ScriptEval>> = const { RefCell::new(None) };
+    /// The protocol of the client a script command on this thread was sent
+    /// by, when its `Ctx` says RESP2 for the commands the script calls
+    /// (`lua_vm_blocking`); 0 when the `Ctx`'s own `resp` is the client's.
+    static CLIENT_RESP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// `redis.call`s and `redis.pcall`s made on this thread, ever: what a
     /// script ran is the difference (see [`count_script_commands`]).
     static SCRIPT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -894,6 +898,20 @@ fn count_script_commands(
         registry.add_commands(client_id, ran);
     }
     reply
+}
+
+/// Run `run` (a script command) for a client that speaks `resp`: what the
+/// script returns is written in it. The connection loops know the protocol,
+/// so the reply needs no lookup in the client registry.
+pub(crate) fn with_client_resp<R>(resp: u8, run: impl FnOnce() -> R) -> R {
+    struct Restore(u8);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLIENT_RESP.set(self.0);
+        }
+    }
+    let _restore = Restore(CLIENT_RESP.replace(resp));
+    run()
 }
 
 /// When present, `redis.setresp` overrides [`crate::commands::handler::effective_resp_for_reply`].
@@ -940,7 +958,19 @@ pub(crate) fn script_min_replicas_gate(ctx: &Ctx<'_>, cmd0: &[u8]) -> Option<Vec
         let Some(s) = b.as_ref() else {
             return Some(resp_error(replication::NOREPLICAS));
         };
-        let is_write = replication::is_write_command_bytes(cmd0);
+        // A write only by argument (GEORADIUS ... STORE, MIGRATE) counts as a
+        // write for the min-replicas gate too, judged by the whole command;
+        // `SELECT` does not (`refused_without_replicas`).
+        let mut upper = [0u8; 32];
+        let name = if cmd0.len() <= 32 {
+            for (i, &b) in cmd0.iter().enumerate() {
+                upper[i] = b.to_ascii_uppercase();
+            }
+            std::str::from_utf8(&upper[..cmd0.len()]).unwrap_or("")
+        } else {
+            ""
+        };
+        let is_write = replication::refused_without_replicas(name, ctx.cmd.as_slice());
         let block = if s.had_shebang && !s.no_writes_flag {
             true
         } else {
@@ -1260,6 +1290,43 @@ const BUSY_WITH_SCRIPT: &str =
     "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
 const BUSY_WITH_FUNCTION: &str =
     "BUSY Redis is busy running a script. You can only call FUNCTION KILL or SHUTDOWN NOSAVE.";
+/// `SCRIPT KILL` or `FUNCTION KILL` with nothing running.
+const NOT_BUSY: &str = "NOTBUSY No scripts in execution right now.";
+
+/// The `BUSY` reply to a command refused while a script runs: it names the
+/// command that stops what is running, `FUNCTION KILL` for a function and
+/// `SCRIPT KILL` for a script, as Redis's does.
+pub(crate) fn busy_reply() -> Vec<u8> {
+    if RUNNING_FUNCTION.lock().is_some() {
+        resp_error(BUSY_WITH_FUNCTION)
+    } else {
+        resp_error(BUSY_WITH_SCRIPT)
+    }
+}
+
+/// Whether `source` compiles, as `SCRIPT LOAD` asks before it keeps a
+/// script: Redis compiles it there and refuses one that does not. Checked
+/// in a VM of its own, so that a script running in the shared one is not
+/// waited for. As `EVAL` runs it: an expression (`1 + 1`) is taken too.
+fn script_compiles(source: &str) -> Result<(), String> {
+    let (body, _) = preprocess_eval_script(source).map_err(|e| format!("ERR {e}"))?;
+    let lua = Lua::new();
+    if lua
+        .load(format!("return {body}"))
+        .set_name("=user_script")
+        .into_function()
+        .is_ok()
+    {
+        return Ok(());
+    }
+    match lua.load(body).set_name("=user_script").into_function() {
+        Ok(_) => Ok(()),
+        Err(LuaError::SyntaxError { message, .. }) => Err(format!(
+            "ERR Error compiling script (new function): {message}"
+        )),
+        Err(e) => Err(format!("ERR Error compiling script (new function): {e}")),
+    }
+}
 
 /// `SCRIPT KILL` (`function == false`) or `FUNCTION KILL`: each stops what
 /// its own kind of call started, and is refused while the other kind runs.
@@ -1275,7 +1342,7 @@ fn kill_running(function: bool) -> Vec<u8> {
         return resp_simple("OK");
     }
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
-        return resp_error("ERR No scripts in execution.");
+        return resp_error(NOT_BUSY);
     }
     match (function, RUNNING_FUNCTION.lock().is_some()) {
         (false, true) => resp_error(BUSY_WITH_FUNCTION),
@@ -1286,7 +1353,7 @@ fn kill_running(function: bool) -> Vec<u8> {
 
 fn dispatch_lua_script_kill() -> Vec<u8> {
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) == 0 {
-        return resp_error("ERR No scripts in execution.");
+        return resp_error(NOT_BUSY);
     }
     if LUA_HOLDER_WROTE.load(Ordering::SeqCst) {
         return resp_error(
@@ -1308,6 +1375,16 @@ fn msgpack_encode(val: &LuaValue, buf: &mut Vec<u8>, depth: u32) {
         LuaValue::Boolean(false) => buf.push(0xc2),
         LuaValue::Boolean(true) => buf.push(0xc3),
         LuaValue::Integer(n) => msgpack_encode_int(*n, buf),
+        // As Redis's cmsgpack (#747): a number with an integer value is
+        // written as an integer (`10 / 2` is 5, not 5.0), and a float a
+        // 32-bit one holds exactly as one.
+        LuaValue::Number(f) if (-TWO_TO_63..TWO_TO_63).contains(f) && f.trunc() == *f => {
+            msgpack_encode_int(*f as i64, buf)
+        }
+        LuaValue::Number(f) if f64::from(*f as f32) == *f => {
+            buf.push(0xca);
+            buf.extend_from_slice(&(*f as f32).to_bits().to_be_bytes());
+        }
         LuaValue::Number(f) => {
             buf.push(0xcb);
             buf.extend_from_slice(&f.to_bits().to_be_bytes());
@@ -2194,6 +2271,15 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
+    // `string.format` with Lua 5.1's integer conversions, as Redis's
+    // scripts have them (#747): see [`super::lua_format`].
+    // SAFETY: the state has the `string` library, and the closure leaves
+    // the stack as it found it.
+    unsafe {
+        lua.exec_raw::<()>((), |state| super::lua_format::install(state))
+            .unwrap();
+    }
+
     // A table raised by `error` is kept with its `err` and the line, as
     // Redis's error handler reads one: see [`remember_error_table`]. `pcall`
     // and `assert` are Redis's (#90).
@@ -2438,6 +2524,18 @@ end
     lua
 }
 
+/// A map key or set member must be something Lua accepts as a table index:
+/// anything but nil (a double arrives as the table `{double=...}`, so there
+/// is no NaN). It is Lua's own error, here as a clean one.
+fn table_key_check(key: &LuaValue, what: &str) -> LuaResult<()> {
+    if matches!(key, LuaValue::Nil) {
+        return Err(LuaError::RuntimeError(format!(
+            "RESP parse: {what} must not be nil"
+        )));
+    }
+    Ok(())
+}
+
 /// Find `\r\n` starting from `start`; returns index of `\r`.
 fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
     buf[start..]
@@ -2545,15 +2643,10 @@ fn parse_resp_value(lua: &Lua, buf: &[u8], pos: usize) -> LuaResult<(LuaValue, u
             for _ in 0..count {
                 let (k, next_k) = parse_resp_value(lua, buf, cur)?;
                 let (v, next_v) = parse_resp_value(lua, buf, next_k)?;
-                match k {
-                    LuaValue::String(ks) => inner.set(ks, v)?,
-                    LuaValue::Integer(i) => inner.set(i, v)?,
-                    _ => {
-                        return Err(LuaError::RuntimeError(
-                            "RESP parse: map key must be string or integer".into(),
-                        ));
-                    }
-                }
+                // Any converted value is a key, as in Redis (`lua_settable`): a
+                // status reply is the table `{ok=...}`, used by identity.
+                table_key_check(&k, "map key")?;
+                inner.set(k, v)?;
                 cur = next_v;
             }
             let outer = lua.create_table()?;
@@ -2655,15 +2748,8 @@ fn parse_resp_value(lua: &Lua, buf: &[u8], pos: usize) -> LuaResult<(LuaValue, u
             let mut cur = end + 2;
             for _ in 0..count {
                 let (elem, next) = parse_resp_value(lua, buf, cur)?;
-                match elem {
-                    LuaValue::String(s) => inner.set(s, true)?,
-                    LuaValue::Integer(i) => inner.set(i, true)?,
-                    _ => {
-                        return Err(LuaError::RuntimeError(
-                            "RESP parse: set member must be string or integer".into(),
-                        ));
-                    }
-                }
+                table_key_check(&elem, "set member")?;
+                inner.set(elem, true)?;
                 cur = next;
             }
             let outer = lua.create_table()?;
@@ -2756,7 +2842,15 @@ fn lua_to_json_value(lua: &Lua, val: &LuaValue, depth: i64) -> LuaResult<serde_j
                     "Cannot serialise number: NaN/Inf".into(),
                 ));
             }
-            Ok(serde_json::Number::from_f64(*n)
+            // As Redis's cjson writes a number, with 14 significant digits
+            // (#747): `1/3` is 0.33333333333333, and `10 / 2` is 5, not
+            // 5.0. (What `%.14g` writes with an exponent, as `1e+20`, is
+            // written here as serde_json writes it, `1e20`: the same number.)
+            let n: f64 = format!("{n:.13e}").parse().unwrap_or(*n);
+            if n.trunc() == n && n.abs() < 1e14 {
+                return Ok(serde_json::Value::Number((n as i64).into()));
+            }
+            Ok(serde_json::Number::from_f64(n)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null))
         }
@@ -2940,7 +3034,50 @@ fn json_to_lua(
 }
 
 fn lua_value_to_resp(lua: &Lua, val: LuaValue) -> LuaResult<Vec<u8>> {
-    lua_to_resp_inner(lua, val, 0)
+    lua_to_resp_inner(lua, val, 0, ReplyProtocol::current())
+}
+
+/// The protocols a script's reply is written in, as Redis's
+/// `luaReplyToRedisReply` writes it. Every kind of reply is shaped for the
+/// client's protocol: a null is `_` to a RESP3 client and `$-1` to a RESP2
+/// one, and so are doubles, maps and sets. The script's own protocol
+/// (`redis.setresp`) decides only what a Lua boolean is: under 2, `true` is
+/// the integer 1 and `false` is a null (#431); under 3, they are booleans,
+/// `#t`/`#f` to a RESP3 client and `:1`/`:0` to a RESP2 one.
+#[derive(Clone, Copy)]
+struct ReplyProtocol {
+    client: u8,
+    script: u8,
+}
+
+impl ReplyProtocol {
+    /// The running script's: the client's protocol as its connection loop
+    /// gave it (`with_client_resp`), or else the `Ctx`'s (a transaction's
+    /// `EXEC` runs a script on the connection's own `Ctx`).
+    fn current() -> Self {
+        let given = CLIENT_RESP.get();
+        SCRIPT_EVAL
+            .with(|c| {
+                c.borrow().as_ref().map(|se| {
+                    let client = if given != 0 {
+                        given
+                    } else {
+                        // SAFETY: `ctx_addr` is the running script's `Ctx`,
+                        // which outlives the script and the conversion of
+                        // its reply.
+                        unsafe { &*(se.ctx_addr as *const Ctx<'_>) }.resp
+                    };
+                    Self {
+                        client,
+                        script: se.script_resp,
+                    }
+                })
+            })
+            .unwrap_or(Self {
+                client: 2,
+                script: 2,
+            })
+    }
 }
 
 /// Matches Redis `luaReplyToRedisReply` nesting limits (stack / safeguard); cyclic tables must not
@@ -2976,6 +3113,7 @@ fn lua_try_encode_singleton_chain(
     lua: &Lua,
     start: LuaTable,
     depth: u32,
+    protocol: ReplyProtocol,
 ) -> LuaResult<Option<Vec<u8>>> {
     if !lua_table_is_pure_singleton_array(&start)? {
         return Ok(None);
@@ -3004,7 +3142,7 @@ fn lua_try_encode_singleton_chain(
                     return Ok(None);
                 }
                 out.extend_from_slice(b"*1\r\n");
-                let encoded = lua_to_resp_inner(lua, leaf, depth.saturating_add(1))?;
+                let encoded = lua_to_resp_inner(lua, leaf, depth.saturating_add(1), protocol)?;
                 out.extend_from_slice(&encoded);
                 return Ok(Some(out));
             }
@@ -3013,63 +3151,57 @@ fn lua_try_encode_singleton_chain(
 }
 
 #[allow(clippy::only_used_in_recursion)]
-fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>> {
+fn lua_to_resp_inner(
+    lua: &Lua,
+    val: LuaValue,
+    depth: u32,
+    protocol: ReplyProtocol,
+) -> LuaResult<Vec<u8>> {
     if depth > LUA_SCRIPT_RESP_ENCODE_MAX_DEPTH {
         return Err(LuaError::RuntimeError("reached lua stack limit".into()));
     }
     let next_depth = depth.saturating_add(1);
     match val {
-        LuaNil => {
-            let eff_resp: u8 = SCRIPT_EVAL
-                .with(|c| {
-                    c.borrow().as_ref().map(|se| {
-                        if se.script_resp != 2 {
-                            se.script_resp
-                        } else {
-                            let ctx = unsafe { &*(se.ctx_addr as *const Ctx<'_>) };
-                            client_connection_resp(ctx)
-                        }
-                    })
-                })
-                .unwrap_or(2);
-            if eff_resp >= 3 {
-                Ok(resp_null_resp3())
+        LuaNil => Ok(resp_null_for(protocol.client)),
+        LuaValue::Boolean(b) => Ok(if protocol.script >= 3 {
+            if protocol.client >= 3 {
+                resp_bool_resp3(b)
             } else {
-                Ok(resp_null_bulk())
+                resp_integer(i64::from(b))
             }
-        }
-        LuaValue::Boolean(b) => {
-            if b {
-                Ok(resp_integer(1))
-            } else {
-                Ok(resp_null_bulk())
-            }
-        }
+        } else if b {
+            resp_integer(1)
+        } else {
+            resp_null_for(protocol.client)
+        }),
         LuaValue::Integer(n) => Ok(resp_integer(n)),
-        LuaValue::Number(n) => Ok(resp_integer(n as i64)),
+        LuaValue::Number(n) => Ok(resp_integer(lua_number_reply(n))),
         LuaValue::String(s) => Ok(resp_bulk(s.as_bytes().as_ref())),
         LuaValue::Table(t) => {
-            // Effective RESP for nested replies: `redis.setresp` overrides the connection.
-            let eff_resp: u8 = SCRIPT_EVAL
-                .with(|c| {
-                    c.borrow().as_ref().map(|se| {
-                        if se.script_resp != 2 {
-                            se.script_resp
-                        } else {
-                            let ctx = unsafe { &*(se.ctx_addr as *const Ctx<'_>) };
-                            client_connection_resp(ctx)
-                        }
-                    })
-                })
-                .unwrap_or(2);
+            let eff_resp = protocol.client;
 
             // Match Redis `luaReplyToRedisReply` in script_lua.c: status/error/array slots use
             // `lua_rawget`, and numeric indices use `lua_rawget` in a loop. Metamethods must not
             // run during RESP conversion (otherwise empty tables with __index would error or run
-            // redis.call side effects).
+            // redis.call side effects). A status is looked for first: Redis
+            // looks for an error first, which differs only for a table with
+            // both, and costs every status reply a lookup more.
             if let Ok(LuaValue::String(ok_s)) = t.raw_get::<LuaValue>("ok") {
-                let st = ok_s.to_string_lossy();
-                return Ok(resp_simple(st.as_ref()));
+                // A status is one line: Redis sends its bytes as they are,
+                // with line breaks made spaces.
+                let text = ok_s.as_bytes();
+                let mut out = Vec::with_capacity(text.len() + 3);
+                out.push(b'+');
+                out.extend_from_slice(&text);
+                if memchr::memchr2(b'\r', b'\n', &out[1..]).is_some() {
+                    for byte in &mut out[1..] {
+                        if matches!(*byte, b'\r' | b'\n') {
+                            *byte = b' ';
+                        }
+                    }
+                }
+                out.extend_from_slice(b"\r\n");
+                return Ok(out);
             }
             if let Ok(LuaValue::String(err_s)) = t.raw_get::<LuaValue>("err") {
                 let st = err_s.to_string_lossy();
@@ -3124,14 +3256,15 @@ fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>>
                 }
                 return Ok(resp_bulk_str(body.as_str()));
             }
-            if let Some(streamed) = lua_try_encode_singleton_chain(lua, t.clone(), depth)? {
+            if let Some(streamed) = lua_try_encode_singleton_chain(lua, t.clone(), depth, protocol)?
+            {
                 return Ok(streamed);
             }
             if let Ok(LuaValue::Table(set_inner)) = t.raw_get::<LuaValue>("set") {
                 let mut parts: Vec<Vec<u8>> = Vec::new();
                 for pair in set_inner.clone().pairs::<LuaValue, LuaValue>() {
                     let (k, _) = pair?;
-                    parts.push(lua_to_resp_inner(lua, k, next_depth)?);
+                    parts.push(lua_to_resp_inner(lua, k, next_depth, protocol)?);
                 }
                 if eff_resp >= 3 {
                     return Ok(resp_set_resp3(parts));
@@ -3142,8 +3275,8 @@ fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>>
                 let mut chunks: Vec<Vec<u8>> = Vec::new();
                 for pair in map_inner.clone().pairs::<LuaValue, LuaValue>() {
                     let (k, v) = pair?;
-                    chunks.push(lua_to_resp_inner(lua, k, next_depth)?);
-                    chunks.push(lua_to_resp_inner(lua, v, next_depth)?);
+                    chunks.push(lua_to_resp_inner(lua, k, next_depth, protocol)?);
+                    chunks.push(lua_to_resp_inner(lua, v, next_depth, protocol)?);
                 }
                 if eff_resp >= 3 {
                     return Ok(resp_map(chunks));
@@ -3155,14 +3288,15 @@ fn lua_to_resp_inner(lua: &Lua, val: LuaValue, depth: u32) -> LuaResult<Vec<u8>>
             loop {
                 match t.raw_get::<LuaValue>(i) {
                     Ok(LuaNil) => break,
-                    Ok(v) => items.push(lua_to_resp_inner(lua, v, next_depth)?),
+                    Ok(v) => items.push(lua_to_resp_inner(lua, v, next_depth, protocol)?),
                     Err(e) => return Err(e),
                 }
                 i += 1;
             }
             Ok(resp_array(items))
         }
-        _ => Ok(resp_null_bulk()),
+        // Functions, coroutines and userdata: a null, as in Redis.
+        _ => Ok(resp_null_for(protocol.client)),
     }
 }
 
@@ -3217,18 +3351,65 @@ fn strip_shebang_for_lua(body: &str) -> String {
     }
 }
 
-/// Format a Lua `number` for `redis.call` argv (must preserve `0.01` for `DEBUG SLEEP`, etc.).
-#[inline]
+/// 2^63, as a float: where a float stops fitting in an `i64`.
+const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// A Lua float as `redis.call` passes it to a command, as Redis writes one
+/// (#747): an integer within 2^62 in plain digits, and anything else as its
+/// shortest round-trip digits, in plain notation while that stays short
+/// (`1000000000000000.5`, `9223372036854776000`, `0.00001`) and in
+/// exponent notation past that (`1e+20`, `1e-7`). `0.01` stays `0.01`, for
+/// sub-second sleeps. (An integer, Lua 5.4's other kind of number, is
+/// written in plain digits.)
 fn lua_float_redis_arg(n: f64) -> Vec<u8> {
-    if !n.is_finite() {
-        return b"0".to_vec();
+    const LIMIT: f64 = 4_611_686_018_427_387_904.0; // 2^62
+    if (-LIMIT..=LIMIT).contains(&n) && n.trunc() == n {
+        return (n as i64).to_string().into_bytes();
     }
-    // Redis uses integer digits when the value is integral (INCRBY args, scores as ints).
-    // Truncating every float to `i64` breaks sub-second sleeps: `0.01 as i64` → `"0"`.
-    if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-        ((n as i64).to_string()).into_bytes()
+    let sign = if n.is_sign_negative() { "-" } else { "" };
+    if n.is_nan() {
+        return format!("{sign}nan").into_bytes();
+    }
+    if n.is_infinite() {
+        return format!("{sign}inf").into_bytes();
+    }
+    // The shortest digits that read back as `n`, and the power of ten of
+    // the first: "1.5e300" is digits "15", exponent 300.
+    let scientific = format!("{:e}", n.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let count = digits.len() as i32;
+    // The power of ten of the last digit.
+    let last = exponent - (count - 1);
+    let magnitude = exponent.abs();
+    let text = if last >= 0 && magnitude < count + 7 {
+        format!("{digits}{}", "0".repeat(last as usize))
+    } else if last < 0 && (last > -7 || magnitude < 4) {
+        let point = count + last;
+        if point <= 0 {
+            format!("0.{}{digits}", "0".repeat((-point) as usize))
+        } else {
+            let (whole, fraction) = digits.split_at(point as usize);
+            format!("{whole}.{fraction}")
+        }
     } else {
-        n.to_string().into_bytes()
+        let (first, rest) = digits.split_at(1);
+        let point = if rest.is_empty() { "" } else { "." };
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        format!("{first}{point}{rest}e{exponent_sign}{magnitude}")
+    };
+    format!("{sign}{text}").into_bytes()
+}
+
+/// A Lua float as an integer reply: cut toward zero, as Redis's
+/// `(long long)` cast does on x86-64, which gives the lowest integer for
+/// what does not fit (NaN, infinity, 1e30) (#747).
+fn lua_number_reply(n: f64) -> i64 {
+    if (-TWO_TO_63..TWO_TO_63).contains(&n) {
+        n as i64
+    } else {
+        i64::MIN
     }
 }
 
@@ -3394,6 +3575,14 @@ unsafe fn run_and_push(state: *mut mlua::ffi::lua_State) -> bool {
     if resp == 2 && unsafe { push_reply(state, &reply) } {
         return true;
     }
+    // Under `redis.setresp(3)` the script is a RESP3 client: a command's
+    // whole-reply null (`$-1`, `*-1`, which the dispatcher rewrites for a
+    // RESP3 connection) is RESP3's `_`, and so a Lua nil, not false.
+    let reply = if resp >= 3 {
+        crate::resp::write::resp3_normalize_null(reply)
+    } else {
+        reply
+    };
     set_aside(SetAside::Reply(reply));
     false
 }
@@ -4236,6 +4425,12 @@ fn install_eval_timeout_hook(lua: &Lua) -> Result<(), String> {
                 }
             }
             keep_the_runtime_listening();
+            // As Redis's `scriptInterrupt` refreshing its cached time:
+            // past the threshold `TIME` moves, so a script waiting for it
+            // can end (#676).
+            if running_script_is_over_its_time_limit() {
+                crate::script_clock::let_time_move();
+            }
             // Redis: exceeding lua-time-limit makes the server BUSY for other clients; the script
             // keeps running until SCRIPT KILL (read-only) — do not abort here on time alone.
             Ok(VmState::Continue)
@@ -4321,14 +4516,7 @@ fn eval_script(
         );
     }
 
-    crate::script_clock::enter_script_execution();
-    struct ScriptClockGuard;
-    impl Drop for ScriptClockGuard {
-        fn drop(&mut self) {
-            crate::script_clock::exit_script_execution();
-        }
-    }
-    let _script_clock_guard = ScriptClockGuard;
+    let _script_clock_guard = crate::script_clock::freeze();
 
     let slot = first_key_slot(ctx, keys.first().copied());
     SCRIPT_EVAL.with(|c| {
@@ -4443,14 +4631,7 @@ fn eval_function_call(
     let ctx = unsafe { &mut *ctx_ptr };
     let saved_db = *ctx.selected_db;
 
-    crate::script_clock::enter_script_execution();
-    struct ScriptClockGuard;
-    impl Drop for ScriptClockGuard {
-        fn drop(&mut self) {
-            crate::script_clock::exit_script_execution();
-        }
-    }
-    let _script_clock_guard = ScriptClockGuard;
+    let _script_clock_guard = crate::script_clock::freeze();
 
     let slot = first_key_slot(ctx, keys.first().map(|k| k.as_slice()));
     SCRIPT_EVAL.with(|c| {
@@ -4803,7 +4984,12 @@ fn function_delete(ctx: &mut Ctx) -> Vec<u8> {
     resp_error("ERR Library not found")
 }
 
+/// `FUNCTION LIST`, shaped for the client's protocol (#476). Under RESP3 as
+/// Redis shapes it: each library and each function is a map, a missing
+/// description is `_` and `flags` is a set of simple strings. Under RESP2 as
+/// it was: flat arrays, `$-1` and each flag a bulk string.
 fn function_list(ctx: &mut Ctx) -> Vec<u8> {
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
     let mut with_code = false;
     let mut lib_filter: Option<String> = None;
     let mut args = ctx.cmd.iter().skip(2);
@@ -4837,18 +5023,32 @@ fn function_list(ctx: &mut Ctx) -> Vec<u8> {
             let registered = lib.registered.iter().find(|f| f.name == *fname);
             let description = registered
                 .and_then(|f| f.description.as_deref())
-                .map_or_else(resp_null_bulk, resp_bulk_str);
+                .map_or_else(|| resp_null_for(resp), resp_bulk_str);
             let flags = registered
-                .map(|f| f.flags.iter().map(|flag| resp_bulk_str(flag)).collect())
+                .map(|f| {
+                    f.flags
+                        .iter()
+                        .map(|flag| {
+                            if resp >= 3 {
+                                resp_simple(flag)
+                            } else {
+                                resp_bulk_str(flag)
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            fn_entries.push(resp_array(vec![
-                resp_bulk_str("name"),
-                resp_bulk_str(fname),
-                resp_bulk_str("description"),
-                description,
-                resp_bulk_str("flags"),
-                resp_array(flags),
-            ]));
+            fn_entries.push(resp_map_for(
+                resp,
+                vec![
+                    resp_bulk_str("name"),
+                    resp_bulk_str(fname),
+                    resp_bulk_str("description"),
+                    description,
+                    resp_bulk_str("flags"),
+                    resp_set_for(resp, flags),
+                ],
+            ));
         }
 
         let mut parts: Vec<Vec<u8>> = vec![
@@ -4863,7 +5063,7 @@ fn function_list(ctx: &mut Ctx) -> Vec<u8> {
             parts.push(resp_bulk_str("library_code"));
             parts.push(resp_bulk(lib.body.as_bytes()));
         }
-        rows.push(resp_array(parts));
+        rows.push(resp_map_for(resp, parts));
     }
 
     resp_array(rows)
@@ -4883,23 +5083,37 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
             );
         }
     }
-    let libraries = std::mem::take(&mut *function_store().write());
-    let names = std::mem::take(&mut *fn_name_to_library().write());
-    let vm = match lua_vms_renew_for_admin(&[Vm::Functions]) {
-        Ok(vm) => vm,
-        Err(LuaVmBusy) => {
-            return resp_error(
-                "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
-            );
-        }
-    };
+    let asynchronous = ctx.cmd.len() == 3 && ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC");
+    match flush_functions(asynchronous) {
+        Ok(()) => resp_simple("OK"),
+        Err(LuaVmBusy) => resp_error(BUSY_RUNNING_A_SCRIPT),
+    }
+}
+
+/// Drop every library, unless a script holds the VM.
+///
+/// Refused before anything is taken: a refused flush changes nothing. It
+/// used to empty the store first, and its BUSY reply then left the
+/// libraries gone here while the replicas, which are not sent a refused
+/// command, kept them (#559). The libraries are taken out under the same
+/// hold of the VM's lock as the check, so no script runs between the two.
+fn flush_functions(asynchronous: bool) -> Result<(), LuaVmBusy> {
+    // One lock at a time: the store's is let go of before the name map's is
+    // taken. Held together, in this order, they deadlocked against
+    // `rebuild_fn_name_map_from_store`, which took them the other way round
+    // (a `FUNCTION RESTORE` beside the flush).
+    let (vm, (libraries, names)) = lua_vms_renew_for_admin_and(&[Vm::Functions], || {
+        let libraries = std::mem::take(&mut *function_store().write());
+        let names = std::mem::take(&mut *fn_name_to_library().write());
+        (libraries, names)
+    })?;
     // `ASYNC`: the VM and the libraries are freed in the background, and
     // counted as Redis counts them, a function each and one for the VM.
-    if ctx.cmd.len() == 3 && ctx.cmd[2].eq_ignore_ascii_case(b"ASYNC") {
+    if asynchronous {
         let functions: u64 = libraries.values().map(|l| l.functions.len() as u64).sum();
         crate::lazyfree::free_later((vm, libraries, names), functions + 1);
     }
-    resp_simple("OK")
+    Ok(())
 }
 
 /// Take each of `vms` out under one hold of the lock, for the next script
@@ -4913,6 +5127,16 @@ fn function_flush(ctx: &Ctx) -> Vec<u8> {
 /// (with cjson, cmsgpack, bit and the read-only proxies) is about 50 KB,
 /// where Redis's suite allows a flushed functions VM 40000 bytes.
 fn lua_vms_renew_for_admin(vms: &[Vm]) -> Result<Vec<Lua>, LuaVmBusy> {
+    lua_vms_renew_for_admin_and(vms, || ()).map(|(old, ())| old)
+}
+
+/// [`lua_vms_renew_for_admin`], running `then` too before the lock is let
+/// go, and only if the VMs were renewed. The lock is taken before any of the
+/// function store's: `then` may take those, as a script does.
+fn lua_vms_renew_for_admin_and<R>(
+    vms: &[Vm],
+    then: impl FnOnce() -> R,
+) -> Result<(Vec<Lua>, R), LuaVmBusy> {
     let mut guard = LUA_VM.try_lock().ok_or(LuaVmBusy)?;
     if LUA_HOLD_DEPTH.load(Ordering::SeqCst) != 0 {
         return Err(LuaVmBusy);
@@ -4923,10 +5147,13 @@ fn lua_vms_renew_for_admin(vms: &[Vm]) -> Result<Vec<Lua>, LuaVmBusy> {
         vm.generation().fetch_add(1, Ordering::Release);
         old.extend(guard.of(vm).take());
     }
-    Ok(old)
+    let done = then();
+    drop(guard);
+    Ok((old, done))
 }
 
-fn function_stats() -> Vec<u8> {
+fn function_stats(ctx: &Ctx) -> Vec<u8> {
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
     let store = function_store().read();
     let lib_count = store.len() as i64;
     let fn_count: i64 = store.values().map(|l| l.functions.len() as i64).sum();
@@ -4937,32 +5164,66 @@ fn function_stats() -> Vec<u8> {
         Some((name, command)) if LUA_SCRIPT_BUSY_OTHERS.load(Ordering::Acquire) => {
             let duration = crate::replication::unix_ms()
                 .saturating_sub(LUA_SCRIPT_STARTED_MS.load(Ordering::Relaxed));
-            resp_array(vec![
+            Some((name, command, duration as i64))
+        }
+        _ => None,
+    };
+    function_stats_reply(
+        resp,
+        lib_count,
+        fn_count,
+        running
+            .as_ref()
+            .map(|(name, command, ms)| (name.as_str(), command.as_slice(), *ms)),
+    )
+}
+
+/// `FUNCTION STATS`' reply, shaped for `resp` as Redis shapes it (#476):
+/// maps under RESP3, flat arrays under RESP2, and a null `running_script`
+/// when nothing runs.
+fn function_stats_reply(
+    resp: u8,
+    lib_count: i64,
+    fn_count: i64,
+    running: Option<(&str, &[Vec<u8>], i64)>,
+) -> Vec<u8> {
+    let running = match running {
+        Some((name, command, duration_ms)) => resp_map_for(
+            resp,
+            vec![
                 resp_bulk_str("name"),
-                resp_bulk_str(&name),
+                resp_bulk_str(name),
                 resp_bulk_str("command"),
                 resp_array(command.iter().map(|arg| resp_bulk(arg)).collect()),
                 resp_bulk_str("duration_ms"),
-                resp_integer(duration as i64),
-            ])
-        }
-        _ => resp_null_bulk(),
+                resp_integer(duration_ms),
+            ],
+        ),
+        None => resp_null_for(resp),
     };
-    resp_array(vec![
-        resp_bulk_str("running_script"),
-        running,
-        resp_bulk_str("engines"),
-        // A map from engine to its counts, as a flat array.
-        resp_array(vec![
-            resp_bulk_str("LUA"),
-            resp_array(vec![
-                resp_bulk_str("libraries_count"),
-                resp_integer(lib_count),
-                resp_bulk_str("functions_count"),
-                resp_integer(fn_count),
-            ]),
-        ]),
-    ])
+    resp_map_for(
+        resp,
+        vec![
+            resp_bulk_str("running_script"),
+            running,
+            resp_bulk_str("engines"),
+            resp_map_for(
+                resp,
+                vec![
+                    resp_bulk_str("LUA"),
+                    resp_map_for(
+                        resp,
+                        vec![
+                            resp_bulk_str("libraries_count"),
+                            resp_integer(lib_count),
+                            resp_bulk_str("functions_count"),
+                            resp_integer(fn_count),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
 }
 
 /// Binary blob written by [`function_dump_payload`] / read by [`decode_function_dump_payload`].
@@ -5173,10 +5434,12 @@ fn merge_function_libraries(
     }
 }
 
+/// The store's lock is taken before the name map's, as everywhere both are
+/// held.
 fn rebuild_fn_name_map_from_store() {
+    let store = function_store().read();
     let mut m = fn_name_to_library().write();
     m.clear();
-    let store = function_store().read();
     for lib in store.values() {
         for fname in &lib.functions {
             m.insert(fname.clone(), lib.name.clone());
@@ -5361,7 +5624,7 @@ fn redis_function_dispatch(ctx: &mut Ctx) -> Vec<u8> {
         "DELETE" => function_delete(ctx),
         "LIST" => function_list(ctx),
         "FLUSH" => function_flush(ctx),
-        "STATS" => function_stats(),
+        "STATS" => function_stats(ctx),
         "DUMP" => function_dump(),
         "RESTORE" => function_restore(ctx),
         "HELP" => crate::commands::server::help(
@@ -5393,7 +5656,7 @@ fn redis_function_dispatch(ctx: &mut Ctx) -> Vec<u8> {
             ],
         ),
         _ => resp_error(&format!(
-            "ERR unknown subcommand '{}'",
+            "ERR unknown subcommand '{}'. Try FUNCTION HELP.",
             String::from_utf8_lossy(ctx.cmd[1])
         )),
     }
@@ -5413,6 +5676,9 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
                 Ok(s) => s,
                 Err(_) => return resp_error("ERR script is not valid UTF-8"),
             };
+            if let Err(e) = script_compiles(source) {
+                return resp_error(&e);
+            }
             let sha = sha1_hex(source);
             // Loaded again, it stays the copy that is already compiled.
             script_store()
@@ -5462,7 +5728,16 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
             ),
         },
         "KILL" => kill_running(false),
-        "DEBUG" => resp_simple("OK"),
+        "DEBUG" => match ctx.cmd.get(2) {
+            Some(mode)
+                if [&b"YES"[..], b"SYNC", b"NO"]
+                    .iter()
+                    .any(|m| mode.eq_ignore_ascii_case(m)) =>
+            {
+                resp_simple("OK")
+            }
+            _ => resp_error("ERR Use SCRIPT DEBUG YES/SYNC/NO"),
+        },
         "HELP" => resp_array(
             [
                 "SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -5488,8 +5763,8 @@ fn script_cmd(ctx: &mut Ctx) -> Vec<u8> {
             .collect(),
         ),
         _ => resp_error(&format!(
-            "ERR unknown subcommand '{}' for SCRIPT",
-            sub.to_lowercase()
+            "ERR unknown subcommand '{}'. Try SCRIPT HELP.",
+            String::from_utf8_lossy(ctx.cmd[1])
         )),
     }
 }
@@ -5506,5 +5781,130 @@ mod lua_busy_allow_tests {
         assert!(lua_command_allowed_while_busy(&[b"SCRIPT", b"KILL"]));
         assert!(!lua_command_allowed_while_busy(&[b"FUNCTION", b"LIST"]));
         assert!(!lua_command_allowed_while_busy(&[b"PING"]));
+    }
+
+    /// A flush and a rebuild of the name map (what `FUNCTION RESTORE` ends
+    /// with) at the same time never deadlock. The flush held the store's
+    /// lock while it took the name map's, and the rebuild took them the
+    /// other way round.
+    #[test]
+    fn a_flush_beside_a_rebuild_of_the_name_map_does_not_deadlock() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for flusher in [true, false] {
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                for _ in 0..200_000 {
+                    if flusher {
+                        let _ = flush_functions(false);
+                    } else {
+                        rebuild_fn_name_map_from_store();
+                    }
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a flush and a rebuild of the name map deadlocked");
+        }
+    }
+
+    /// A `FUNCTION FLUSH` refused because a script holds the VM leaves the
+    /// libraries where they were (#559).
+    #[test]
+    fn a_refused_function_flush_keeps_the_libraries() {
+        let (lib, function) = ("flush_refused_559", "flush_refused_559_f");
+        let held = LUA_VM.lock();
+        function_store().write().insert(
+            lib.to_string(),
+            FunctionLibrary {
+                name: lib.to_string(),
+                engine: "LUA".to_string(),
+                body: String::new(),
+                functions: vec![function.to_string()],
+                registered: Vec::new(),
+            },
+        );
+        fn_name_to_library()
+            .write()
+            .insert(function.to_string(), lib.to_string());
+
+        let refused = flush_functions(false);
+        let kept = function_store().read().contains_key(lib);
+        let named = fn_name_to_library().read().contains_key(function);
+        function_store().write().remove(lib);
+        fn_name_to_library().write().remove(function);
+        drop(held);
+
+        assert!(refused.is_err());
+        assert!(kept, "the library was taken out by a refused flush");
+        assert!(
+            named,
+            "the function's name was taken out by a refused flush"
+        );
+    }
+}
+
+#[cfg(test)]
+mod function_stats_reply_tests {
+    use super::function_stats_reply;
+
+    /// Redis 8.10's bytes for a function that has run for 502 ms.
+    #[test]
+    fn a_running_function_is_a_map_under_resp3_and_an_array_under_resp2() {
+        let command = [b"FCALL".to_vec(), b"spin".to_vec(), b"0".to_vec()];
+        let running = Some(("spin", &command[..], 502));
+        assert_eq!(
+            function_stats_reply(2, 1, 3, running),
+            b"*4\r\n$14\r\nrunning_script\r\n*6\r\n$4\r\nname\r\n$4\r\nspin\r\n\
+              $7\r\ncommand\r\n*3\r\n$5\r\nFCALL\r\n$4\r\nspin\r\n$1\r\n0\r\n\
+              $11\r\nduration_ms\r\n:502\r\n$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n\
+              *4\r\n$15\r\nlibraries_count\r\n:1\r\n$15\r\nfunctions_count\r\n:3\r\n"
+                .to_vec()
+        );
+        assert_eq!(
+            function_stats_reply(3, 1, 3, running),
+            b"%2\r\n$14\r\nrunning_script\r\n%3\r\n$4\r\nname\r\n$4\r\nspin\r\n\
+              $7\r\ncommand\r\n*3\r\n$5\r\nFCALL\r\n$4\r\nspin\r\n$1\r\n0\r\n\
+              $11\r\nduration_ms\r\n:502\r\n$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n\
+              %2\r\n$15\r\nlibraries_count\r\n:1\r\n$15\r\nfunctions_count\r\n:3\r\n"
+                .to_vec()
+        );
+    }
+}
+
+#[cfg(test)]
+mod resp_parse_key_tests {
+    use super::*;
+
+    /// A RESP3 map or set takes any converted value as its key, as in Redis:
+    /// a status reply (`+results`) becomes the table `{ok='results'}`.
+    #[test]
+    fn a_status_reply_is_a_map_key_or_set_member() {
+        let lua = Lua::new();
+        let (v, _) = parse_resp_value(&lua, b"%1\r\n+results\r\n:7\r\n", 0).unwrap();
+        let LuaValue::Table(outer) = v else { panic!() };
+        let map: mlua::Table = outer.get("map").unwrap();
+        let (k, n): (mlua::Table, i64) = map.pairs().next().unwrap().unwrap();
+        assert_eq!(k.get::<String>("ok").unwrap(), "results");
+        assert_eq!(n, 7);
+
+        let (v, _) = parse_resp_value(&lua, b"~1\r\n+x\r\n", 0).unwrap();
+        let LuaValue::Table(outer) = v else { panic!() };
+        let set: mlua::Table = outer.get("set").unwrap();
+        let (k, yes): (mlua::Table, bool) = set.pairs().next().unwrap().unwrap();
+        assert_eq!(k.get::<String>("ok").unwrap(), "x");
+        assert!(yes);
+    }
+
+    /// A null key, which Lua refuses, is a clean error, not a panic.
+    #[test]
+    fn a_null_key_is_an_error() {
+        let lua = Lua::new();
+        for buf in [&b"%1\r\n_\r\n:1\r\n"[..], b"~1\r\n_\r\n"] {
+            let err = parse_resp_value(&lua, buf, 0).unwrap_err().to_string();
+            assert!(err.contains("must not be nil"), "{err}");
+        }
     }
 }

@@ -1,9 +1,14 @@
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::parse_utf8;
+
+use crate::commands::memory_layout as layout;
+use crate::member_set::MemberSet;
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
+use crate::types::{HashFields, HashInner, SortedSetInner, StreamInner, ZMember};
+use ordered_float::OrderedFloat;
+use parking_lot::RwLock;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if name != "MEMORY" {
@@ -71,10 +76,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for 'memory|usage' command",
         ));
     }
-    let key = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return Some(resp_error("ERR key must be valid UTF-8")),
-    };
+    let key: &[u8] = cmd[2];
 
     // `SAMPLES count`, as Redis reads it: how many elements of a collection
     // are looked at, 5 by default; 0 is all of them. It divided by zero for
@@ -109,6 +111,11 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // unless there are more than twenty-four of them (`store::Key`).
     let key_overhead = 64 + if key.len() > 24 { key.len() } else { 0 };
 
+    // For a set or a hash, what its entry takes is counted from the entry
+    // itself: its block (header, key, time to live and the value's handle)
+    // and its share of the shard's table (`ShardMap::entry_footprint`).
+    let entry = || map.entry_footprint(key).unwrap_or(key_overhead);
+
     let bytes: usize = match value {
         // As Redis 8 counts a string: one object holding its header, the
         // key and the value, as the allocator rounds it. Redis's suite
@@ -137,86 +144,50 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::Hash(arc) => {
             let inner = arc.read();
-            let len = inner.len();
-            let (avg_k, avg_v) = if len == 0 {
-                (0, 0)
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let (tk, tv): (usize, usize) = inner
-                    .iter()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|(k, v)| (k.len(), v.len()))
-                    .fold((0, 0), |(ak, av), (k, v)| (ak + k, av + v));
-                (tk / sample_n.max(1), tv / sample_n.max(1))
-            };
-            key_overhead + (avg_k + avg_v) * len + 120
+            entry() + layout::arc_of::<RwLock<HashFields>>() + layout::hash_fields(&inner, samples)
         }
 
         ValueRef::Set(arc) => {
             let inner = arc.read();
-            let len = inner.len();
-            let avg = if len == 0 {
-                0
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let total: usize = inner
-                    .iter()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|m| m.len())
-                    .sum();
-                total / sample_n.max(1)
-            };
-            key_overhead + avg * len + 80
+            // The table's one allocation is known from its buckets; each
+            // member is a block of its own, sampled as Redis samples them:
+            // the first members the table holds, which are in no order of
+            // their own. Spreading the sample over the table walked all of
+            // it, as a hash table's iterator skips ahead one bucket at a time.
+            let members = layout::sampled(inner.len(), samples, || {
+                inner.iter().map(|m| layout::arc_slice(m.len()))
+            });
+            entry() + layout::arc_of::<RwLock<MemberSet>>() + inner.allocation_size() + members
         }
 
         ValueRef::SortedSet(arc) => {
             let inner = arc.read();
-            let len = inner.members.len();
-            let avg = if len == 0 {
-                0
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let total: usize = inner
-                    .members
-                    .keys()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|m| m.len())
-                    .sum();
-                total / sample_n.max(1)
-            };
-            // dual-indexed: BTreeMap + AHashMap, so *2
-            key_overhead + (avg + 8) * len * 2 + 120
+            // Each member is one block, held by both indexes. One whose score
+            // was changed has two: the member map keeps the block it had and
+            // the score index takes the command's, so the map's is then held
+            // by the map alone. Sampled as a set's members are.
+            let members = layout::sampled(inner.members.len(), samples, || {
+                inner.members.keys().map(|m| {
+                    let block = layout::arc_slice(m.len());
+                    if std::sync::Arc::strong_count(m) == 1 {
+                        2 * block
+                    } else {
+                        block
+                    }
+                })
+            });
+            entry()
+                + layout::arc_of::<RwLock<SortedSetInner>>()
+                + layout::std_hash_map::<ZMember, f64>(inner.members.capacity())
+                + layout::score_index::<(OrderedFloat<f64>, ZMember)>(inner.by_score.len())
+                + members
         }
 
         ValueRef::Stream(arc) => {
             let inner = arc.read();
-            let len = inner.entries.len();
-            let avg = if len == 0 {
-                0
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let total: usize = inner
-                    .entries
-                    .values()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|e| {
-                        e.fields
-                            .iter()
-                            .map(|(k, v)| k.len() + v.len())
-                            .sum::<usize>()
-                    })
-                    .sum();
-                total / sample_n.max(1)
-            };
-            key_overhead + avg * len + 200
+            // Its entries are counted exactly: a few blocks of packed
+            // entries. Its groups are not counted.
+            entry() + layout::arc_of::<RwLock<StreamInner>>() + inner.entries.heap_bytes()
         }
 
         ValueRef::Json(arc) => {
@@ -232,10 +203,20 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::VectorSet(arc) => {
             let inner = arc.read();
-            // Each entry: dim * 4 bytes (f32) + attrs string
-            let count = inner.entries.len();
-            let dim = inner.dim;
-            key_overhead + count * dim * 4 + 200
+            // Counts stored vector bytes, so quantized sets report less.
+            let elements = layout::sampled(inner.entries.len(), samples, || {
+                inner.entries.iter().map(|(name, entry)| {
+                    crate::key_bytes::KeyBytes::heap_bytes_of(name.as_bytes())
+                        + entry.vector.heap_bytes()
+                        + entry.attrs.as_ref().map_or(0, |a| a.len())
+                })
+            });
+            entry()
+                + layout::arc_of::<RwLock<crate::types::VectorSetInner>>()
+                + layout::std_hash_map::<crate::key_bytes::KeyBytes, crate::types::VSetEntry>(
+                    inner.entries.capacity(),
+                )
+                + elements
         }
 
         ValueRef::Array(arc) => {
@@ -260,27 +241,36 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // Per entry: 8-byte index key + value bytes + BTreeMap node share.
             key_overhead + len * (8 + avg + 32) + 100
         }
+
+        // What it takes: its structures and its bytes, all of them.
+        ValueRef::Sketch(arc) => {
+            key_overhead
+                + 16
+                + std::mem::size_of::<parking_lot::RwLock<crate::sketch::Sketch>>()
+                + arc.read().memory_bytes()
+        }
         ValueRef::HashEx(arc) => {
             let inner = arc.read();
-            let len = inner.fields.len();
-            let (avg_k, avg_v) = if len == 0 {
-                (0, 0)
+            let expiring = inner.expiries.len();
+            // A field with a time to live has a second copy of its name, as
+            // the key of `expiries`, and the hash is on the list of hashes
+            // whose fields expire (`field_expiry`): one entry for the hash.
+            let names = layout::sampled(expiring, samples, || {
+                inner.expiries.keys().map(String::capacity)
+            });
+            let watched = if expiring == 0 {
+                0
             } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let (tk, tv): (usize, usize) = inner
-                    .fields
-                    .iter()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|(k, v)| (k.len(), v.len()))
-                    .fold((0, 0), |(ak, av), (k, v)| (ak + k, av + v));
-                (tk / sample_n.max(1), tv / sample_n.max(1))
+                crate::field_expiry::watch_entry_size(key)
             };
-            // Each expiry entry: ~32 bytes (String + Instant on 64-bit).
-            // We add the expiries map size on top of the regular hash cost.
-            let expiry_overhead = inner.expiries.len() * 32;
-            key_overhead + (avg_k + avg_v) * len + 120 + expiry_overhead
+            entry()
+                + layout::arc_of::<RwLock<HashInner>>()
+                + layout::hash_fields(&inner.fields, samples)
+                + layout::std_hash_map::<String, crate::types::FieldDeadline>(
+                    inner.expiries.capacity(),
+                )
+                + names
+                + watched
         }
     };
 
@@ -622,8 +612,10 @@ fn doctor_says(
 ///
 /// Freeing a Rust allocation only returns it to the allocator. glibc keeps the
 /// pages mapped in its arena free lists until asked, so without this a flush
-/// shows up nowhere in `used_memory` (which is RSS). Used by `MEMORY PURGE` and
-/// by flushes big enough to be worth the walk over every arena.
+/// shows up nowhere in RSS (`used_memory_rss`). Used by `MEMORY PURGE`, by
+/// flushes big enough to be worth the walk over every arena, and by the thread
+/// that gives memory back after a large fall in what is allocated
+/// (`give_back`).
 pub(crate) fn purge_allocator() {
     #[cfg(target_os = "linux")]
     unsafe {

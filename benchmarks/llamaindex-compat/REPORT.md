@@ -6,18 +6,19 @@ model. The vector store is also driven through a `VectorStoreIndex`, and the doc
 `IngestionPipeline`, not only through the classes' own methods.
 
 **54 of 54 checks pass on KiviDB, and 54 of 54 on Redis 8.10.3.**
-No check differs between the two.
+No check differs between the two. The same checks were first recorded on 2026-11-03 against `2ed7df2`.
+They were run again on current `master` after the search score compatibility fixes; the result is unchanged.
 
 | | |
 |---|---|
-| KiviDB | `8.10.0` as the server reports it, built from `master` at `2ed7df2` (1.2.0 plus two unrelated fixes) |
-| Reference | Redis `8.10.3` (the `redis:8` image) |
+| KiviDB | `8.10.0` as the server reports it, release build from `master` at `03b7f7c4` (`kividb --version` reports 1.2.0) |
+| Reference | Redis `8.10.3` (the `redis:8` image; this run used the 8.10.3 packages with the search module loaded) |
 | `llama-index-core` | `0.14.25` |
 | `llama-index-vector-stores-redis` | `0.9.0` |
 | Docstore, index store, kv store | `llama-index-storage-docstore-redis` `0.6.0`, `llama-index-storage-index-store-redis` `0.7.0`, `llama-index-storage-kvstore-redis` `0.4.1` |
 | Other pins | see [`requirements.txt`](requirements.txt) |
 | Python | `3.12` |
-| Run | 2026-11-03; KiviDB started with only `--bind 127.0.0.1 --port 6380` |
+| Run | 2026-11-06; KiviDB started with only `--bind 127.0.0.1 --port 6380` |
 
 These packages pin an older client stack than the LangChain and LangGraph ones: `redisvl` `0.4.1` and
 `redis-py` `5.3.1`, so the connection speaks RESP2.

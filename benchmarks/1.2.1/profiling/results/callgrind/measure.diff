@@ -1,0 +1,20 @@
+21a22
+>   case " ${ONLY:- $label } " in *" $label "*) ;; *) return ;; esac
+38a40,43
+>   if [ -n "${PRELOAD2:-}" ]; then
+>     # shellcheck disable=SC2086
+>     redis-benchmark -p $PORT -q -c 1 -P $P -r 10000 -n 20000 $PRELOAD2 > /dev/null 2>&1
+>   fi
+49a55
+>   cp "$f" "/out/cg-$label.out"
+83a90,99
+>     # Hashes (added for 1.2.1): plain, and with field TTLs.
+>     HS="HSET h:__rand_int__ f $V100"
+>     FT="HSETEX h:__rand_int__ EX 1000000 FIELDS 1 f $V100"
+>     PRELOAD="$HS" DSIZE=100 one "$tag" HSET HSET h:__rand_int__ f "$V100"
+>     PRELOAD="$HS" DSIZE=100 one "$tag" HGET HGET h:__rand_int__ f
+>     PRELOAD="HSETEX h:__rand_int__ EX 1000000 FIELDS 1 t x" PRELOAD2="$HS" DSIZE=100 \
+>       one "$tag" HSET-FTTL HSET h:__rand_int__ f "$V100"
+>     PRELOAD="$FT" DSIZE=100 one "$tag" HGET-FTTL HGET h:__rand_int__ f
+>     PRELOAD="$FT" DSIZE=100 \
+>       one "$tag" HSETEX-FTTL HSETEX h:__rand_int__ EX 1000000 FIELDS 1 f "$V100"

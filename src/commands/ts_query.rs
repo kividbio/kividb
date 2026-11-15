@@ -442,8 +442,9 @@ pub(super) fn open_bucket(
     dest: &Arc<RwLock<TsInner>>,
     dest_key: &str,
 ) -> Option<(u64, f64)> {
+    // `dest_key` and the source are names (`key_bytes::text_of`).
     let source_key = dest.read().source.clone()?;
-    let source = series_at(ctx, &source_key).ok()??;
+    let source = series_at(ctx, &crate::key_bytes::bytes_of(&source_key)).ok()??;
     let source = source.read();
     let rule = source.rules.iter().find(|r| r.dest_key == dest_key)?;
     let &newest = source.samples.keys().next_back()?;
@@ -563,7 +564,28 @@ pub(super) fn value_reply(resp: u8, value: f64) -> Vec<u8> {
     if resp >= 3 {
         resp_double_resp3(value)
     } else {
-        resp_simple(&value.to_string())
+        resp_simple(&resp2_value(value))
+    }
+}
+
+/// `value` as RedisTimeSeries writes it under RESP2, with dragonbox's
+/// `to_chars` (its `deps/dragonbox/dragonbox.cpp`): the fewest digits that
+/// read back the same, written out in full while dragonbox's decimal exponent
+/// is not positive, else as `1.5E-7`. That exponent is positive below 1, from
+/// 2^56, and from 2^52 where the digits end in a zero (`1E16`).
+fn resp2_value(value: f64) -> String {
+    let plain = value.to_string();
+    let magnitude = value.abs();
+    if value.is_infinite() {
+        format!("{}Infinity", if value < 0.0 { "-" } else { "" })
+    } else if value == 0.0
+        || value.is_nan()
+        || (1.0..2f64.powi(52)).contains(&magnitude)
+        || ((2f64.powi(52)..2f64.powi(56)).contains(&magnitude) && !plain.ends_with('0'))
+    {
+        plain
+    } else {
+        format!("{value:E}")
     }
 }
 
@@ -591,7 +613,7 @@ fn reply_resp(ctx: &Ctx) -> u8 {
 }
 
 /// The series at `key`, with no lock held.
-pub(super) fn series_at(ctx: &Ctx, key: &str) -> Result<Option<Arc<RwLock<TsInner>>>, Vec<u8>> {
+pub(super) fn series_at(ctx: &Ctx, key: &[u8]) -> Result<Option<Arc<RwLock<TsInner>>>, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     match read_lock!(shard).get(key) {
         None => Ok(None),
@@ -609,9 +631,7 @@ pub(super) fn ts_range(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
             "ERR wrong number of arguments for TS.RANGE/REVRANGE",
         ));
     }
-    let Ok(key) = std::str::from_utf8(cmd[1]) else {
-        return Some(resp_error("ERR key must be valid UTF-8"));
-    };
+    let key: &[u8] = cmd[1];
 
     let parsed = (|| -> Result<_, Vec<u8>> {
         let from = parse_bound(cmd[2], b"-", "fromTimestamp")?;
@@ -636,7 +656,7 @@ pub(super) fn ts_range(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
         Err(e) => return Some(e),
     };
     let open = if opts.latest {
-        open_bucket(ctx, &series, key)
+        open_bucket(ctx, &series, &crate::key_bytes::text_of(key))
     } else {
         None
     };
@@ -834,7 +854,7 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
     // (key, labels, rows) per matching series, ascending.
     let mut results: Vec<(String, AHashMap<String, String>, Vec<Row>)> = Vec::new();
     for key in keys {
-        let Ok(Some(series)) = series_at(ctx, &key) else {
+        let Ok(Some(series)) = series_at(ctx, &crate::key_bytes::bytes_of(&key)) else {
             continue;
         };
         let open = if opts.latest {
@@ -856,7 +876,7 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
         .collect();
 
     let Some((label, reducer)) = group_by else {
-        let series: Vec<(String, Vec<Vec<u8>>)> = results
+        let series: Vec<(Vec<u8>, Vec<Vec<u8>>)> = results
             .into_iter()
             // A series whose only samples in range are NaN still has samples.
             .filter(|(_, _, rows)| !exclude_empty || !rows.is_empty())
@@ -875,7 +895,7 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
                 } else {
                     vec![labels, samples]
                 };
-                (key, body)
+                (crate::key_bytes::bytes_of(&key).into_owned(), body)
             })
             .collect();
         return Some(series_reply(resp, series));
@@ -932,7 +952,12 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
                     ]),
                     resp_map(vec![
                         resp_bulk_str("sources"),
-                        resp_array(sources.iter().map(|k| resp_bulk_str(k)).collect()),
+                        resp_array(
+                            sources
+                                .iter()
+                                .map(|k| resp_bulk(&crate::key_bytes::bytes_of(k)))
+                                .collect(),
+                        ),
                     ]),
                     samples,
                 ]
@@ -942,7 +967,19 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
                     LabelSelection::All => vec![
                         group_label,
                         ("__reducer__".to_string(), Some(reducer.name().to_string())),
-                        ("__source__".to_string(), Some(sources.join(","))),
+                        (
+                            "__source__".to_string(),
+                            Some(
+                                sources
+                                    .iter()
+                                    .map(|k| {
+                                        String::from_utf8_lossy(&crate::key_bytes::bytes_of(k))
+                                            .into_owned()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            ),
+                        ),
                     ],
                     LabelSelection::Selected(names) => names
                         .iter()
@@ -957,7 +994,7 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
                 };
                 vec![labels_reply(resp, labels), samples]
             };
-            (name, body)
+            (name.into_bytes(), body)
         })
         .collect();
     Some(series_reply(resp, series))
@@ -965,12 +1002,12 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
 
 /// The outer shape of a multi-series reply: an array of `[name, ...]` under
 /// RESP2, a map from name to the rest under RESP3.
-fn series_reply(resp: u8, series: Vec<(String, Vec<Vec<u8>>)>) -> Vec<u8> {
+fn series_reply(resp: u8, series: Vec<(Vec<u8>, Vec<Vec<u8>>)>) -> Vec<u8> {
     if resp >= 3 {
         resp_map(
             series
                 .into_iter()
-                .flat_map(|(name, body)| [resp_bulk_str(&name), resp_array(body)])
+                .flat_map(|(name, body)| [resp_bulk(&name), resp_array(body)])
                 .collect(),
         )
     } else {
@@ -978,7 +1015,7 @@ fn series_reply(resp: u8, series: Vec<(String, Vec<Vec<u8>>)>) -> Vec<u8> {
             series
                 .into_iter()
                 .map(|(name, mut body)| {
-                    body.insert(0, resp_bulk_str(&name));
+                    body.insert(0, resp_bulk(&name));
                     resp_array(body)
                 })
                 .collect(),
@@ -1032,9 +1069,7 @@ pub(super) fn ts_nrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
     // its own each time it is named.
     let mut series = Vec::with_capacity(numkeys);
     for raw in keys {
-        let Ok(key) = std::str::from_utf8(raw) else {
-            return Some(resp_error("ERR key must be valid UTF-8"));
-        };
+        let key: &[u8] = raw;
         match series_at(ctx, key) {
             Ok(Some(s)) => series.push(s),
             Ok(None) => return Some(resp_error(NO_KEY)),
@@ -1092,10 +1127,8 @@ pub(super) fn ts_read(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if ctx.cmd.len() < 3 {
         return Some(arity());
     }
-    let Ok(key) = std::str::from_utf8(ctx.cmd[1]) else {
-        return Some(resp_error("ERR key must be valid UTF-8"));
-    };
-    let key = key.to_string();
+    let key: &[u8] = ctx.cmd[1];
+    let key = key.to_vec();
     let cursor_arg = ctx.cmd[2];
 
     let mut block: Option<(u64, usize)> = None;
@@ -1159,7 +1192,7 @@ pub(super) fn ts_read(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // still wakes us.
     let rx = (block.is_some() && !timed_out).then(|| ctx.wait_table.register_signal(&key));
 
-    let series = match series_at(ctx, &key) {
+    let series = match series_at(ctx, key.as_slice()) {
         Ok(series) => series,
         Err(e) => return Some(e),
     };
@@ -1310,10 +1343,13 @@ pub(super) fn ts_querylabels(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let keys = keys_matching_filters(ctx.store, *ctx.selected_db, ctx.ts_index, &filters);
     let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for key in keys {
-        if restricted.is_some_and(|user| !crate::acl::may_read_key(user, &key)) {
+        // A name: the key it stands for is bytes_of, for the check and the
+        // read alike (two names can stand for keys that look alike).
+        let raw = crate::key_bytes::bytes_of(&key);
+        if restricted.is_some_and(|user| !crate::acl::may_read_key(user, &raw)) {
             continue;
         }
-        let Ok(Some(series)) = series_at(ctx, &key) else {
+        let Ok(Some(series)) = series_at(ctx, &raw) else {
             continue;
         };
         let series = series.read();

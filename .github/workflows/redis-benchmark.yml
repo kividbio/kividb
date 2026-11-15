@@ -70,7 +70,9 @@ concurrency:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
+    # Pinned: packages.redis.io has no Redis for a new Ubuntu until some time
+    # after it ships, and ubuntu-latest moves to it on its own.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -85,6 +87,7 @@ jobs:
       # compared with anywhere else (it reports itself as 8.10). Pinned: do not
       # float on whatever the repo's latest is on a given day.
       - name: Install redis-benchmark and redis-server (Redis 8.10.2)
+        timeout-minutes: 10
         env:
           REDIS_VERSION: "8.10.2"
         run: |
