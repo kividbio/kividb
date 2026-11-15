@@ -100,6 +100,21 @@ impl Conn {
         self.read()
     }
 
+    /// A command asked of a replica that may still be loading what its master
+    /// sent: `LOADING` is a replica that is not there yet, so it is asked
+    /// again.
+    fn cmd_when_loaded<S: AsRef<[u8]>>(&mut self, args: &[S]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.cmd(args) {
+                V::Error(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                reply => return reply,
+            }
+        }
+    }
+
     /// A command that must not fail.
     fn ok<S: AsRef<[u8]> + std::fmt::Debug>(&mut self, args: &[S]) -> V {
         let reply = self.cmd(args);
@@ -561,7 +576,7 @@ fn a_stream_of_many_blocks_comes_back_from_every_copy() {
     );
     let mut rc = replica.conn();
     let deadline = Instant::now() + Duration::from_secs(30);
-    while rc.cmd(&["XLEN", "copy"]).int() != want.0.len() as i64 {
+    while rc.cmd_when_loaded(&["XLEN", "copy"]).int() != want.0.len() as i64 {
         assert!(Instant::now() < deadline, "the replica did not sync");
         thread::sleep(Duration::from_millis(50));
     }
@@ -871,9 +886,28 @@ fn idempotent_duplicates_are_counted_again_by_an_aof_replay() {
 fn caught_up(master: &mut Conn, replica: &mut Conn, marker: &str) {
     master.ok(&["SET", marker, "1"]);
     let deadline = Instant::now() + Duration::from_secs(30);
-    while replica.cmd(&["EXISTS", marker]).int() != 1 {
+    while replica.cmd_when_loaded(&["EXISTS", marker]).int() != 1 {
         assert!(Instant::now() < deadline, "the replica did not catch up");
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits until the AOF in `dir` holds `needle`. A replica writes what it
+/// applies from its master on a thread of its own, after it has applied it:
+/// a replica that has caught up has not necessarily written it yet, and one
+/// killed at that moment restarts with the front of what it applied.
+fn wait_for_aof(dir: &Path, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let aof = std::fs::read(dir.join("appendonly.aof")).unwrap_or_default();
+        if aof.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{needle} did not reach the replica's AOF"
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -912,7 +946,9 @@ fn a_replica_keeps_the_duplicates_it_counted_in_its_own_aof() {
     };
     assert_eq!(duplicates(&mut rc), (1, 2), "replica");
 
-    // Restarted from its own AOF, on its own.
+    // Restarted from its own AOF, on its own: once it has written what it
+    // applied, which the marker, the last of it, shows.
+    wait_for_aof(rdir.path(), "marker");
     drop(rc);
     replica.kill();
     let replica = Server::start(rdir.path(), &["--aof"]);

@@ -7,7 +7,8 @@
 # sparse one.
 unit/hyperloglog | Corrupted dense HyperLogLogs are detected: Wrong length
 
-# #21: TTL, TYPE and EXISTS reset a key's idle time.
+# #21: OBJECT IDLETIME is 0 under noeviction unless key-access-tracking yes
+# is set (off by default); the test passes with it on.
 unit/introspection-2 | TTL, TYPE and EXISTS do not alter the last access time of a key
 
 # No timer shrinks an idle client's query buffer on io_uring; on Tokio both
