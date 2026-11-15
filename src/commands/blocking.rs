@@ -477,9 +477,8 @@ impl BlockingSlot {
                 // wait for each other.
                 crate::wait_table::all_done(std::mem::take(&mut self.looked), &woken);
             }
-            // Waited for before the next command that reads, and before the
-            // replies are written (`settles_before`, `settle`): with those of
-            // the commands before it in the batch.
+            // Waited for before the next command of this client that reads
+            // (`settles_before`), with those of the commands before it.
             self.woken.append(&mut woken);
         }
         parked
@@ -509,15 +508,27 @@ impl BlockingSlot {
     /// the connection's own future is compiled as it was without it.
     /// Whether the clients the commands before `cmd0` woke must have looked
     /// before it runs: it reads (or is not known to write), and so would see
-    /// what they are yet to take. A run of pipelined writes (a producer's
-    /// `LPUSH`es) does not wait command by command: the batch waits once,
-    /// for all of them together, before its replies are written. Each wait
-    /// used to be per command, and a pipeline of 200 `LPUSH`es to queues with
-    /// blocked workers waited 200 times in turn (#823: 1,960 jobs/s down to
-    /// 1,240 at 1,000 workers x 270 queues).
+    /// what they are yet to take. Writes do not wait, and replies are not
+    /// held: a producer pipelining `LPUSH`es to queues with blocked workers
+    /// would otherwise wait for every worker it woke, push by push or batch
+    /// by batch, and push at the rate the workers pop (#823: 1,960 jobs/s
+    /// down to 1,240 at 1,000 workers x 270 queues waiting per command, and
+    /// 1,400 waiting once per batch). What a client observes after its own
+    /// push, with `LLEN`, `INFO` or anything else that reads, comes after
+    /// the pops that push caused, as in Redis.
     #[inline]
     pub fn settles_before(&self, cmd0: &[u8]) -> bool {
         !self.woken.is_empty() && !crate::replication::is_write_command_bytes(cmd0)
+    }
+
+    /// Forget the looks of the clients woken before that are done: kept
+    /// only for the next command that reads, they must not pile up on a
+    /// connection that only writes.
+    #[inline]
+    pub fn forget_looked(&mut self) {
+        if !self.woken.is_empty() {
+            self.woken.retain(|look| !look.is_done());
+        }
     }
 
     #[inline]
