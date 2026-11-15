@@ -917,6 +917,15 @@ where
                 query_buffer_free,
                 private_query_buffer,
             );
+            // The clients the commands before this one woke have looked, if
+            // this one reads: it sees what they took (#42). A write does not
+            // wait for them, nor does its reply, which waits with the others
+            // for the batch to be written.
+            if blocking_slot.settles_before(cmd[0]) {
+                if let Some(settling) = blocking_slot.settle() {
+                    settling.await;
+                }
+            }
             // ── QUIT ─────────────────────────────────────────────────────────
             // Reply +OK and close the connection. Handled in the connection
             // loop rather than the dispatch table because closing the socket
@@ -1160,6 +1169,11 @@ where
                         if std::mem::take(&mut aof_wait) {
                             crate::aof::written(&aof_tx).await;
                         }
+                        // The replies so far are written before it waits: after the
+                        // clients they woke have looked (#42).
+                        if let Some(settling) = blocking_slot.settle() {
+                            settling.await;
+                        }
                         // Boxed, and so polled out of line: the wait is cold, and the
                         // connection's own future stays the size it is without it.
                         match Box::pin(park_blocking(
@@ -1192,10 +1206,6 @@ where
                         }
                     }
 
-                    // Its reply comes after the pops of the clients it woke (#42).
-                    if let Some(settling) = blocking_slot.settle() {
-                        settling.await;
-                    }
                     if interrupted.unblocked_with_error {
                         interrupted.unblocked_with_error = false;
                         response = crate::commands::blocking::UNBLOCKED.to_vec();
@@ -1256,6 +1266,11 @@ where
                     if std::mem::take(&mut aof_wait) {
                         crate::aof::written(&aof_tx).await;
                     }
+                    // The replies so far are written before it waits: after the
+                    // clients they woke have looked (#42).
+                    if let Some(settling) = blocking_slot.settle() {
+                        settling.await;
+                    }
                     // Boxed, and so polled out of line: the wait is cold, and the
                     // connection's own future stays the size it is without it.
                     match Box::pin(park_blocking(
@@ -1287,10 +1302,6 @@ where
                     }
                 }
 
-                // Its reply comes after the pops of the clients it woke (#42).
-                if let Some(settling) = blocking_slot.settle() {
-                    settling.await;
-                }
                 if interrupted.unblocked_with_error {
                     interrupted.unblocked_with_error = false;
                     response = crate::commands::blocking::UNBLOCKED.to_vec();
@@ -2686,6 +2697,11 @@ where
         // Replies to writes go out once their records are in the AOF (#147).
         if std::mem::take(&mut aof_wait) {
             crate::aof::written(&aof_tx).await;
+        }
+        // The batch's replies go out after the clients its commands woke
+        // have looked at their keys, as in Redis (#42).
+        if let Some(settling) = blocking_slot.settle() {
+            settling.await;
         }
         // `client-output-buffer-limit` (#774): replies over the hard limit,
         // or over the soft limit for longer than its seconds, end the

@@ -452,8 +452,9 @@ impl BlockingSlot {
         // After `resume_over`: a refused resume's ticket, dropped there,
         // passes its turn on, and the client that wakes is this dispatch's to
         // wait for, as the client a handler passes the turn to is.
+        let mut woken = Vec::new();
         if let Some(collected) = crate::wait_table::take_woken() {
-            self.woken = collected.woken;
+            woken = collected.woken;
             self.looked.extend(collected.owed);
         }
         if let Some(wait) = &parked {
@@ -464,17 +465,22 @@ impl BlockingSlot {
             let owed = std::mem::take(&mut self.looked);
             match &wait.state {
                 Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) => {
-                    ticket.looked_and_waits(owed, &self.woken)
+                    ticket.looked_and_waits(owed, &woken)
                 }
-                _ => crate::wait_table::all_done(owed, &self.woken),
+                _ => crate::wait_table::all_done(owed, &woken),
             }
-            self.woken.clear();
-        } else if !self.looked.is_empty() {
-            // It looked: done, with the looks of those it woke, which whoever
-            // woke it waits for too. Now, not after its own wait for them, so
-            // that two clients that woke each other never wait for each
-            // other.
-            crate::wait_table::all_done(std::mem::take(&mut self.looked), &self.woken);
+        } else {
+            if !self.looked.is_empty() {
+                // It looked: done, with the looks of those it woke, which
+                // whoever woke it waits for too. Now, not after its own wait
+                // for them, so that two clients that woke each other never
+                // wait for each other.
+                crate::wait_table::all_done(std::mem::take(&mut self.looked), &woken);
+            }
+            // Waited for before the next command that reads, and before the
+            // replies are written (`settles_before`, `settle`): with those of
+            // the commands before it in the batch.
+            self.woken.append(&mut woken);
         }
         parked
     }
@@ -501,6 +507,19 @@ impl BlockingSlot {
     /// `None`, nothing to wait for, is what nearly every command gets. The
     /// wait is boxed, so that it is polled out of line, as `until_gone` is:
     /// the connection's own future is compiled as it was without it.
+    /// Whether the clients the commands before `cmd0` woke must have looked
+    /// before it runs: it reads (or is not known to write), and so would see
+    /// what they are yet to take. A run of pipelined writes (a producer's
+    /// `LPUSH`es) does not wait command by command: the batch waits once,
+    /// for all of them together, before its replies are written. Each wait
+    /// used to be per command, and a pipeline of 200 `LPUSH`es to queues with
+    /// blocked workers waited 200 times in turn (#823: 1,960 jobs/s down to
+    /// 1,240 at 1,000 workers x 270 queues).
+    #[inline]
+    pub fn settles_before(&self, cmd0: &[u8]) -> bool {
+        !self.woken.is_empty() && !crate::replication::is_write_command_bytes(cmd0)
+    }
+
     #[inline]
     pub fn settle(&mut self) -> Option<Settling> {
         if self.woken.is_empty() {
