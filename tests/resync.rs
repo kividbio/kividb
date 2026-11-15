@@ -2497,6 +2497,177 @@ fn a_script_beside_others_may_not_be_the_first_to_leave_db_0() {
     assert_eq!(m.cmd(&["GET", "{t}a"]), V::Str("1".into()));
 }
 
+/// Every key of databases 0 to 6, with its value: what a replica, or a
+/// restarted master, must hold exactly as the master does.
+#[cfg(feature = "lua")]
+fn dataset_of_dbs(server: &Server) -> Vec<(String, String, String)> {
+    let mut all = Vec::new();
+    for db in 0..7 {
+        let mut c = server.conn();
+        for key in keys_of_db(&mut c, &db.to_string()) {
+            let value = c.cmd(&["GET", &key]).s().to_string();
+            all.push((db.to_string(), key, value));
+        }
+    }
+    all
+}
+
+/// A read-only script, a script that only selects a database, a client's
+/// `SELECT` and `SCRIPT LOAD` / `SCRIPT FLUSH` send nothing to the replica
+/// and the AOF, and the master's offset stays where it is, as in Redis
+/// 8.10 (#705). Each used to add a `SELECT n` (46 bytes for two scripts)
+/// or the `SCRIPT` command to the stream.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_writes_nothing_and_script_load_do_not_move_the_offset() {
+    let master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    // No PING of the replica to move the offset meanwhile.
+    assert!(
+        m.cmd(&["CONFIG", "SET", "repl-ping-replica-period", "3600"])
+            .ok()
+    );
+    assert!(m.cmd(&["SET", "seen", "1"]).ok());
+    let before = master_offset(&mut m);
+    wait_replica_at(&replica, before);
+    let aof = m.info("persistence", "aof_current_size");
+
+    let read_with_select = "redis.call('SELECT', 1) return redis.call('GET', KEYS[1])";
+    assert_eq!(m.cmd(&["EVAL_RO", read_with_select, "1", "seen"]), V::Nil);
+    assert_eq!(m.cmd(&["EVAL_RO", read_with_select, "1", "seen"]), V::Nil);
+    // Not declared read-only, but it writes nothing.
+    assert_eq!(m.cmd(&["EVAL", read_with_select, "1", "seen"]), V::Nil);
+    let sha = m.cmd(&["SCRIPT", "LOAD", "return 1"]).s().to_string();
+    assert_eq!(m.cmd(&["EVALSHA_RO", &sha, "0"]), V::Int(1));
+    assert!(m.cmd(&["SCRIPT", "FLUSH"]).ok());
+    assert_eq!(m.cmd(&["SCRIPT", "EXISTS", &sha]), V::Arr(vec![V::Int(0)]));
+    // A client's own SELECT; and the same in a transaction.
+    assert!(m.cmd(&["SELECT", "3"]).ok());
+    assert!(m.cmd(&["SELECT", "0"]).ok());
+    assert!(m.cmd(&["MULTI"]).ok());
+    m.cmd(&["SELECT", "2"]);
+    m.cmd(&["SCRIPT", "LOAD", "return 2"]);
+    m.cmd(&["EVAL_RO", read_with_select, "1", "seen"]);
+    m.cmd(&["EXEC"]);
+    assert!(m.cmd(&["SELECT", "0"]).ok());
+
+    assert_eq!(master_offset(&mut m), before, "{}", master.log());
+    assert_eq!(m.info("persistence", "aof_current_size"), aof);
+    // The stream is as it was: a write goes on from the same place, and the
+    // replica applies it in database 0.
+    assert!(m.cmd(&["SET", "after", "1"]).ok());
+    assert!(master_offset(&mut m) > before);
+    wait_replica_at(&replica, master_offset(&mut m));
+    assert_eq!(r.cmd(&["GET", "after"]), V::Str("1".into()));
+    assert_eq!(dataset_of_dbs(&replica), dataset_of_dbs(&master));
+    // SCRIPT LOAD did not reach the replica's script cache: its scripts are
+    // its own, as in Redis.
+    assert_eq!(r.cmd(&["SCRIPT", "EXISTS", &sha]), V::Arr(vec![V::Int(0)]));
+}
+
+/// Writes of a script in a database it selected, read-only tails and
+/// selects that write nothing, and what a connection writes next in its own
+/// database: the replica, a failed-over replica and the master restarted
+/// from its AOF all end as the master is (#705). The script's `SELECT` is no
+/// longer sent by itself: each write carries the one it needs.
+#[cfg(feature = "lua")]
+#[test]
+fn scripts_writing_in_several_databases_replicate_and_replay_with_their_own_selects() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    wait_link_up(&mut replica.conn());
+
+    // Selects db 1, writes there, and ends with reads in other databases.
+    let write_then_read_tail = "redis.call('SELECT', 1) redis.call('SET', KEYS[1], 'one') \
+         redis.call('SELECT', 2) redis.call('GET', KEYS[1]) redis.call('SELECT', 0) \
+         return redis.call('GET', KEYS[1])";
+    // Selects other databases and writes nothing.
+    let select_only = "redis.call('SELECT', 4) redis.call('GET', 'x') return 1";
+    // Two databases written, a select that writes nothing between them.
+    let two_writes = "redis.call('SELECT', 5) redis.call('SET', 'five', '5') \
+         redis.call('SELECT', 6) redis.call('GET', 'five') redis.call('SELECT', 3) \
+         redis.call('SET', 'three', '3') return 1";
+
+    // From database 0 (the server has not left it before).
+    assert!(m.cmd(&["SET", "zero", "0"]).ok());
+    assert_eq!(
+        m.cmd(&["EVAL", write_then_read_tail, "1", "a"]),
+        V::Nil,
+        "{}",
+        master.log()
+    );
+    assert!(m.cmd(&["SET", "zero2", "0"]).ok());
+    assert_eq!(m.cmd(&["EVAL", select_only, "0"]), V::Int(1));
+    // The script's own database is not the connection's: this goes in 0.
+    assert!(m.cmd(&["SET", "zero3", "0"]).ok());
+    assert_eq!(m.cmd(&["EVAL", two_writes, "0"]), V::Int(1));
+    assert!(m.cmd(&["SET", "zero4", "0"]).ok());
+
+    // From a connection of its own in database 2, with the script in a
+    // transaction.
+    let mut c = master.conn();
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(c.cmd(&["EVAL", select_only, "0"]), V::Int(1));
+    assert!(c.cmd(&["SET", "two", "2"]).ok());
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["EVAL", write_then_read_tail, "1", "b"]);
+    c.cmd(&["SET", "two-in-multi", "2"]);
+    c.cmd(&["EVAL", select_only, "0"]);
+    c.cmd(&["SET", "two-in-multi2", "2"]);
+    let exec = c.cmd(&["EXEC"]);
+    assert_eq!(exec.arr().len(), 4, "{exec:?}");
+    assert!(c.cmd(&["SET", "two-after", "2"]).ok());
+    // And a script that only selects, then this connection writes on.
+    assert_eq!(c.cmd(&["EVAL_RO", select_only, "0"]), V::Int(1));
+    assert!(c.cmd(&["SET", "two-last", "2"]).ok());
+
+    let mut other = master.conn();
+    assert!(other.cmd(&["SET", "zero5", "0"]).ok());
+    let at = master_offset(&mut m);
+    wait_replica_at(&replica, at);
+
+    let expected = dataset_of_dbs(&master);
+    for key in [
+        ("1", "a"),
+        ("1", "b"),
+        ("5", "five"),
+        ("3", "three"),
+        ("2", "two"),
+        ("2", "two-in-multi"),
+        ("2", "two-after"),
+        ("2", "two-last"),
+        ("0", "zero4"),
+    ] {
+        assert!(
+            expected
+                .iter()
+                .any(|(db, k, _)| (db.as_str(), k.as_str()) == key),
+            "{key:?} not on the master: {expected:?}"
+        );
+    }
+    assert_eq!(dataset_of_dbs(&replica), expected, "{}", replica.log());
+
+    // After a failover: the replica promoted holds the same, and goes on.
+    assert!(replica.conn().cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+    assert_eq!(dataset_of_dbs(&replica), expected);
+    let mut promoted = replica.conn();
+    assert!(promoted.cmd(&["SELECT", "1"]).ok());
+    assert!(promoted.cmd(&["SET", "after-failover", "1"]).ok());
+
+    // From the AOF alone: every write on disk, then no final save.
+    assert_eq!(other.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, c, other));
+    master.kill();
+    master.restart_master(&mut []);
+    assert_eq!(dataset_of_dbs(&master), expected, "{}", master.log());
+}
+
 /// Milliseconds since the Unix epoch, now.
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()
@@ -3022,4 +3193,183 @@ fn save_leaves_other_clients_answered() {
     let _ = child.wait();
     // The snapshot of 1.5M keys is some 100 MB: not left in /tmp.
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Time series labels keep their order (#612) ───────────────────────────────
+
+/// Label names in an order that is neither sorted nor the order of any hash.
+const LABEL_NAMES: [&str; 8] = ["zeta", "alpha", "mid", "beta", "omega", "delta", "c", "b"];
+
+/// Series `ts:<round>:<i>`, each with several labels in an order of its own,
+/// made by each of the commands that can set labels. Returns the key and the
+/// labels as they were given.
+fn write_series(c: &mut Conn, round: usize, count: usize) -> Vec<(String, Vec<String>)> {
+    (0..count)
+        .map(|i| {
+            let key = format!("ts:{round}:{i}");
+            let mut given: Vec<String> = LABEL_NAMES
+                .iter()
+                .enumerate()
+                .flat_map(|(j, name)| [name.to_string(), format!("v{}", (i + j) % 5)])
+                .collect();
+            given.rotate_left(2 * (i % LABEL_NAMES.len()));
+            let mut args: Vec<&str> = match i % 5 {
+                0 => vec!["TS.CREATE", &key, "LABELS"],
+                1 => vec!["TS.ADD", &key, "5", "1", "LABELS"],
+                2 => vec!["TS.INCRBY", &key, "3", "LABELS"],
+                3 => vec!["TS.DECRBY", &key, "3", "LABELS"],
+                _ => vec!["TS.CREATE", &key, "LABELS", "old", "1"],
+            };
+            if i % 5 == 4 {
+                assert!(c.cmd(&args).ok());
+                args = vec!["TS.ALTER", &key, "LABELS"];
+            }
+            args.extend(given.iter().map(String::as_str));
+            let reply = c.cmd(&args);
+            assert!(!matches!(reply, V::Err(_)), "{args:?}: {reply:?}");
+            (key.clone(), given)
+        })
+        .collect()
+}
+
+/// The labels `TS.INFO` gives, flat, in the order given.
+fn info_labels(c: &mut Conn, key: &str) -> Vec<String> {
+    let info = c.cmd(&["TS.INFO", key]);
+    let info = info.arr();
+    let at = info
+        .iter()
+        .position(|v| matches!(v, V::Str(s) if s == "labels"))
+        .unwrap_or_else(|| panic!("no labels in TS.INFO {key}: {info:?}"));
+    info[at + 1]
+        .arr()
+        .iter()
+        .flat_map(|pair| pair.arr().iter().map(|v| v.s().to_string()))
+        .collect()
+}
+
+fn digest_of(c: &mut Conn, key: &str) -> String {
+    c.cmd(&["DEBUG", "DIGEST-VALUE", key]).arr()[0]
+        .s()
+        .to_string()
+}
+
+/// `node` has every series with its labels in the order given, and (with
+/// `want_digests`) the digests `want_digests` holds.
+fn assert_labels(
+    c: &mut Conn,
+    series: &[(String, Vec<String>)],
+    digests: Option<&[String]>,
+    what: &str,
+) {
+    for (n, (key, given)) in series.iter().enumerate() {
+        assert_eq!(&info_labels(c, key), given, "{what}: {key}");
+        if let Some(digests) = digests {
+            assert_eq!(&digest_of(c, key), &digests[n], "{what}: {key} digest");
+        }
+    }
+}
+
+/// A replica holds a series' labels in the order they were given: after a
+/// full sync, and for the series it is sent live, by every command that can
+/// set them; and after a restart from its snapshot.
+#[test]
+fn a_replica_keeps_the_order_of_a_series_labels() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    let before = write_series(&mut m, 0, 40);
+    assert_labels(&mut m, &before, None, "master");
+    let before_digests: Vec<String> = before.iter().map(|(k, _)| digest_of(&mut m, k)).collect();
+
+    // Full sync.
+    let port = master.port.to_string();
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert_labels(&mut r, &before, Some(&before_digests), "after a full sync");
+
+    // Live: as the commands run.
+    let live = write_series(&mut m, 1, 40);
+    assert_same_dataset(&mut m, &mut r);
+    let live_digests: Vec<String> = live.iter().map(|(k, _)| digest_of(&mut m, k)).collect();
+    assert_labels(&mut r, &live, Some(&live_digests), "live");
+
+    // Restart from the snapshot.
+    drop(r);
+    replica.shutdown();
+    replica.restart();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    let all: Vec<_> = before.iter().chain(&live).cloned().collect();
+    let all_digests: Vec<String> = before_digests
+        .iter()
+        .chain(&live_digests)
+        .cloned()
+        .collect();
+    assert_labels(&mut r, &all, Some(&all_digests), "replica after a restart");
+}
+
+/// A server restarted from its snapshot, and one started from its append-only
+/// file, hold a series' labels in the order they were given.
+#[test]
+fn a_restart_keeps_the_order_of_a_series_labels() {
+    // From a snapshot.
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    let series = write_series(&mut c, 0, 40);
+    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut c, k)).collect();
+    drop(c);
+    server.shutdown();
+    assert!(server.dir.join("dump.kdb").exists());
+    server.restart();
+    let mut c = server.conn();
+    assert_labels(&mut c, &series, Some(&digests), "snapshot");
+    drop(c);
+    server.kill();
+
+    // From the AOF alone: killed, with no snapshot to read.
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let series = write_series(&mut c, 0, 40);
+    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut c, k)).collect();
+    // Written to the file before the process is killed.
+    assert!(c.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i() >= 1);
+    drop(c);
+    server.kill();
+    let _ = std::fs::remove_file(server.dir.join("dump.kdb"));
+    server.restart();
+    let mut c = server.conn();
+    assert_labels(&mut c, &series, Some(&digests), "AOF replay");
+
+    // After an AOF rewrite, which writes the series out as commands or a
+    // snapshot, and a restart.
+    assert!(!matches!(c.cmd(&["BGREWRITEAOF"]), V::Err(_)));
+    wait_until("the rewrite to finish", || {
+        !c.info("persistence", "aof_rewrite_in_progress").eq("1")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    drop(c);
+    server.kill();
+    server.restart();
+    let mut c = server.conn();
+    assert_labels(&mut c, &series, Some(&digests), "AOF rewrite");
+    drop(c);
+    server.kill();
+}
+
+/// `MIGRATE` carries a series' labels in the order they were given.
+#[test]
+fn migrate_keeps_the_order_of_a_series_labels() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let (mut f, mut t) = (from.conn(), to.conn());
+    let series = write_series(&mut f, 0, 40);
+    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut f, k)).collect();
+    let to_port = to.port.to_string();
+    for (key, _) in &series {
+        let reply = f.cmd(&["MIGRATE", "127.0.0.1", &to_port, key, "0", "5000"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_labels(&mut t, &series, Some(&digests), "after MIGRATE");
 }

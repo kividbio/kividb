@@ -7,6 +7,7 @@
 # command: read, parse, execute, reply, write.
 # Env: N (100000), P (16), MODEL (tokio), PROFILE=<tag> prints that tag's
 # hottest functions for each workload into /out/profile-<workload>.txt
+# WORKLOADS=lists adds LPUSH, RPUSH and LPOP (full adds them too).
 # WORKLOADS=full adds INCR and DEL, and GET, SET, INCR and DEL with a TTL on
 # every key and under allkeys-lru, and GET, SET and INCR under allkeys-lfu
 # (the memory redesign's matrix).
@@ -91,6 +92,13 @@ for tag in "$@"; do
   DSIZE=1024; one "$tag" GET-1K   -d 1024 -t get
   DSIZE=1024; one "$tag" SET-1K   -d 1024 -t set
   DSIZE=100;  one "$tag" MIX-100  -d 100  -t set,get
+  if [ "${WORKLOADS:-}" = full ] || [ "${WORKLOADS:-}" = lists ]; then
+    # One list (redis-benchmark's mylist), nobody blocked on it: the cost a
+    # push or a pop pays for the blocking commands' lines when none waits.
+    DSIZE=100; one "$tag" LPUSH -d 100 -t lpush
+    DSIZE=100; one "$tag" RPUSH -d 100 -t rpush
+    PRELOAD="-d 100 -t lpush" PRELOAD_N=200000 DSIZE=100 one "$tag" LPOP -d 100 -t lpop
+  fi
   if [ "${WORKLOADS:-}" = full ]; then
     # INCR's keys are counter:<n>; DEL runs on 200,000 loaded keys, so most
     # of the 60,000 it measures find their key (about four in five).

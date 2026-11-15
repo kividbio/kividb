@@ -1892,13 +1892,11 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // Stand in line on every key BEFORE the second check — closes the TOCTOU
     // gap. (A history read never gets here: its reply always names the
     // stream, so it is never empty.)
+    // One receiver for all of them, which the first to be written wakes.
     let rxs: Vec<(
         Vec<u8>,
         tokio::sync::oneshot::Receiver<crate::wait_table::Value>,
-    )> = keys
-        .iter()
-        .map(|k| (k.clone(), ctx.wait_table.enqueue_reader(k, &ticket)))
-        .collect();
+    )> = vec![(Vec::new(), ctx.wait_table.enqueue_readers(&keys, &ticket))];
     let leave = |ctx: &Ctx| {
         for key in &keys {
             ctx.wait_table.reader_done(key, &ticket);
@@ -2178,13 +2176,25 @@ fn run_xreadgroup_delivery(
                 if budget.exhausted() {
                     break;
                 }
-                let item = match entries.get(&id) {
+                let entry = entries.get(&id);
+                let item = match entry {
                     Some(entry) => format_entry(&id, entry),
                     // Still pending, but deleted from the stream since.
                     None => resp_array(vec![resp_bulk_str(&id.to_string()), resp_null_for(resp)]),
                 };
                 if !budget.admit(item.len()) {
                     break;
+                }
+                if entry.is_none() {
+                    // Reported, and left as it was: still pending, its
+                    // delivery count and time unchanged, and nothing sent,
+                    // as in Redis 8.10. It used to be counted as a delivery
+                    // and sent as the XCLAIM below, which drops an entry
+                    // that is gone: replicas and the AOF dropped what the
+                    // primary kept (#737). XCLAIM and XAUTOCLAIM drop it,
+                    // on every copy.
+                    items.push(item);
+                    continue;
                 }
                 if let Some(pending) = g.pel.get_mut(&id) {
                     pending.delivered_at = now;

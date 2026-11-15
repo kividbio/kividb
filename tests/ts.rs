@@ -2321,3 +2321,111 @@ fn hex(text: &str) -> Vec<u8> {
 }
 
 const LINKED_PAYLOAD: &str = "4b495649444230310100000001000000760f01000000010000000000000000000000000004400000000000000000001000000000000001000000010000006b0100000076040000004c41535401000000040000006c703a640300000073756d0a000000000000000000000000000000040000006c703a73000000000a0036e9b62d4fa3a05d";
+
+// ── Label order (#612) ───────────────────────────────────────────────────────
+
+/// The label names of the tests below: neither sorted nor in the order of
+/// any hash, so a series that holds them in a hash map shows another order
+/// as soon as a map is made again (a restore, a load, a replica).
+const ORDER_NAMES: [&str; 8] = ["zeta", "alpha", "mid", "beta", "omega", "delta", "c", "b"];
+
+/// `LABELS` words for the names above, from the `at`th one on.
+fn order_given(at: usize) -> Vec<String> {
+    let mut given: Vec<String> = ORDER_NAMES
+        .iter()
+        .enumerate()
+        .flat_map(|(i, n)| [n.to_string(), format!("v{i}")])
+        .collect();
+    given.rotate_left(2 * at);
+    given
+}
+
+/// `TS.INFO key`'s labels as flat text, in the order it gives them.
+fn info_labels(c: &mut Conn, key: &str) -> Vec<String> {
+    let info = c.cmds(&["TS.INFO", key]);
+    let arr = info.as_array();
+    let at = arr
+        .iter()
+        .position(|v| matches!(v, RespValue::Bulk(b) if b == b"labels"))
+        .unwrap();
+    arr[at + 1]
+        .as_array()
+        .iter()
+        .flat_map(|pair| pair.as_array().iter().map(|v| v.as_str().to_string()))
+        .collect()
+}
+
+fn digest_of(c: &mut Conn, key: &str) -> String {
+    c.cmds(&["DEBUG", "DIGEST-VALUE", key]).as_array()[0]
+        .as_str()
+        .to_string()
+}
+
+/// A series' labels come back in the order they were given, as in
+/// RedisTimeSeries: in `TS.INFO`, `TS.MGET`, `TS.MRANGE` with `WITHLABELS`
+/// (it sorted them) and after `TS.ALTER`; and a `DUMP` restored makes a
+/// series with the same labels in the same order, so the same
+/// `DEBUG DIGEST-VALUE`.
+#[test]
+fn test_ts_labels_keep_the_order_given() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for round in 0..10 {
+        let key = format!("lo:{round}");
+        let given = order_given(round % ORDER_NAMES.len());
+        let mut create = vec!["TS.CREATE", key.as_str(), "LABELS"];
+        create.extend(given.iter().map(String::as_str));
+        assert!(c.cmds(&create).is_ok());
+        assert_eq!(info_labels(&mut c, &key), given, "{key}");
+        c.cmds(&["TS.ADD", &key, "1000", "5"]);
+
+        // TS.MGET and TS.MRANGE, WITHLABELS.
+        let want = |pairs: &RespValue| -> Vec<String> {
+            pairs
+                .as_array()
+                .iter()
+                .flat_map(|p| p.as_array().iter().map(|v| v.as_str().to_string()))
+                .collect()
+        };
+        let filter = format!("{}=v{}", ORDER_NAMES[0], 0);
+        let r = c.cmds(&["TS.MGET", "WITHLABELS", "FILTER", &filter]);
+        let row = r
+            .as_array()
+            .iter()
+            .find(|row| row.as_array()[0].as_str() == key)
+            .unwrap_or_else(|| panic!("{key} not in {r:?}"));
+        assert_eq!(want(&row.as_array()[1]), given, "MGET {key}");
+        let r = c.cmds(&["TS.MRANGE", "-", "+", "WITHLABELS", "FILTER", &filter]);
+        let row = r
+            .as_array()
+            .iter()
+            .find(|row| row.as_array()[0].as_str() == key)
+            .unwrap_or_else(|| panic!("{key} not in {r:?}"));
+        assert_eq!(want(&row.as_array()[1]), given, "MRANGE {key}");
+
+        // TS.ALTER: replaces them, in the order given.
+        let altered = order_given((round + 3) % ORDER_NAMES.len());
+        let mut alter = vec!["TS.ALTER", key.as_str(), "LABELS"];
+        alter.extend(altered.iter().map(String::as_str));
+        assert!(c.cmds(&alter).is_ok());
+        assert_eq!(info_labels(&mut c, &key), altered, "ALTER {key}");
+
+        // DUMP and RESTORE: the same order, the same digest.
+        let RespValue::Bulk(payload) = c.cmds(&["DUMP", &key]) else {
+            panic!("DUMP {key}");
+        };
+        let copy = format!("{key}:copy");
+        assert!(
+            c.cmd(&[b"RESTORE", copy.as_bytes(), b"0", &payload])
+                .is_ok()
+        );
+        assert_eq!(info_labels(&mut c, &copy), altered, "RESTORE {copy}");
+        assert_eq!(digest_of(&mut c, &copy), digest_of(&mut c, &key), "{key}");
+    }
+
+    // The label index finds them: the series with alpha=v1 (the second name).
+    let r = c.cmds(&["TS.QUERYINDEX", "alpha=v1"]);
+    assert!(!r.as_array().is_empty());
+}

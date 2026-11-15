@@ -634,27 +634,30 @@ pub fn wait_for_keys(
         // Nobody is there to be given anything: out of the line, taking
         // nothing, and the turn to the client behind, which may have been
         // this one's.
-        for key in keys {
-            ctx.wait_table.dequeue(key, &ticket);
-            ctx.wait_table.pass_on(key, &ticket);
-        }
+        leave_lines(ctx, keys, &ticket);
         return empty();
     }
     let timed_out = matches!(resumed, Some(None));
-    // The key this client was woken for, if it was.
+    // The key this client was woken for, if it was: what the line's
+    // receiver is sent (`WaitTable::enqueue_all`).
     let woken_for: Option<Vec<u8>> = match &resumed {
-        Some(Some((key, _))) => Some(key.clone()),
+        Some(Some((_, key))) => Some(key.to_vec()),
         _ => None,
     };
 
     // Stand in line before looking, so a write that lands between the look
-    // and the park still wakes us.
-    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out {
+    // and the park still wakes us. One receiver for all the keys, which the
+    // first of them to be written wakes (#758).
+    //
+    // Not a caller that cannot wait (`MULTI`, a script, the replica
+    // applier): it only looks. Standing in line, it could be the head a
+    // push wakes, and then leave without passing the turn on, leaving the
+    // client behind it blocked with the element there.
+    let may_park = ctx.blocking.as_ref().is_some_and(|slot| slot.awaitable);
+    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out || !may_park {
         Vec::new()
     } else {
-        keys.iter()
-            .map(|key| (key.clone(), ctx.wait_table.enqueue(key, &ticket)))
-            .collect()
+        vec![(Vec::new(), ctx.wait_table.enqueue_all(keys, &ticket))]
     };
     // On the first look a key of the wrong type is an error. Found on
     // being woken — the key it was waiting on has been replaced by
@@ -683,24 +686,36 @@ pub fn wait_for_keys(
     // On the others it waits its turn, which comes when those ahead have
     // looked — and they are made to look.
     let can_wait = ctx.blocking.is_some() && !timed_out && remaining_time(deadline).is_some();
-    let open: Vec<Vec<u8>> = keys
-        .iter()
-        .filter(|key| {
-            let theirs = can_wait
-                && woken_for.as_deref() != Some(key.as_slice())
-                && ctx.wait_table.someone_ahead(key, &ticket)
-                && has_elements(ctx, key);
-            if theirs {
-                ctx.wait_table.wake_head(key);
+    //
+    // Whether a key has elements is asked first: it is the cheap question,
+    // and of a client blocked on many keys nearly all are empty.
+    let theirs = |ctx: &crate::commands::ctx::Ctx, key: &Vec<u8>| {
+        let theirs = can_wait
+            && woken_for.as_deref() != Some(key.as_slice())
+            && has_elements(ctx, key)
+            && ctx.wait_table.someone_ahead(key, &ticket);
+        if theirs {
+            ctx.wait_table.wake_head(key);
+        }
+        theirs
+    };
+    let attempted = match keys.iter().position(|key| theirs(&*ctx, key)) {
+        // All of them are open to it: no copy of the keys.
+        None => attempt(ctx, keys),
+        Some(first) => {
+            let mut open: Vec<Vec<u8>> = keys[..first].to_vec();
+            open.extend(
+                keys[first + 1..]
+                    .iter()
+                    .filter(|key| !theirs(&*ctx, key))
+                    .cloned(),
+            );
+            if open.is_empty() {
+                None
+            } else {
+                attempt(ctx, &open)
             }
-            !theirs
-        })
-        .cloned()
-        .collect();
-    let attempted = if open.is_empty() {
-        None
-    } else {
-        attempt(ctx, &open)
+        }
     };
     let reply = match attempted {
         Some(mut reply) if reply.first() == Some(&DEFINITE) => {
@@ -737,26 +752,19 @@ pub fn wait_for_keys(
     // there). Not when it stays and there is nothing: waking the next client
     // to look at nothing would put two of them in a race for whatever
     // arrives next, and the order they blocked in would be lost.
-    let leaving = outcome.is_ok();
-    let pass_on = |ctx: &crate::commands::ctx::Ctx, leaving: bool| {
-        for key in keys {
-            if leaving {
-                ctx.wait_table.dequeue(key, &ticket);
-                ctx.wait_table.pass_on(key, &ticket);
-            } else if has_elements(ctx, key) {
-                ctx.wait_table.pass_on(key, &ticket);
-            }
-        }
-    };
     let remaining = match outcome {
         Ok(reply) => {
             drop(rxs);
-            pass_on(ctx, leaving);
+            leave_lines(ctx, keys, &ticket);
             return reply;
         }
         Err(remaining) => remaining,
     };
-    pass_on(ctx, leaving);
+    for key in keys {
+        if has_elements(ctx, key) {
+            ctx.wait_table.pass_on(key, &ticket);
+        }
+    }
     let state = BlockState::Queued {
         deadline,
         ticket: std::sync::Arc::clone(&ticket),
@@ -767,12 +775,34 @@ pub fn wait_for_keys(
             ticket.parks_in(keys, false);
             Vec::new()
         }
+        // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
-            for key in keys {
-                ctx.wait_table.dequeue(key, &ticket);
-            }
             crate::stats::record_miss();
             empty()
+        }
+    }
+}
+
+/// A command that waited in the lines for `keys` is over: out of all of
+/// them, under one lock, and the turn to the client behind it where the
+/// turn may have been this one's — it had been woken there and had not
+/// looked, or the key has elements it has left behind.
+///
+/// Not where the key is empty and the turn was not with it: the client
+/// behind would only look, find nothing and wait again. Every client that
+/// timed out used to wake the next in each of its lines that way, and with
+/// a thousand clients blocked on the same 270 keys each timeout set off a
+/// round of a few hundred pointless wake-ups (#758).
+fn leave_lines(
+    ctx: &crate::commands::ctx::Ctx,
+    keys: &[Vec<u8>],
+    ticket: &crate::wait_table::Ticket,
+) {
+    let woken = ctx.wait_table.dequeue_all(keys, ticket);
+    ctx.wait_table.left_all(ticket);
+    for (key, woken) in keys.iter().zip(woken) {
+        if woken || has_elements(ctx, key) {
+            ctx.wait_table.pass_on(key, ticket);
         }
     }
 }
@@ -918,41 +948,43 @@ impl BlockingWait {
         self.race().await
     }
 
+    /// The receivers are raced in this future, under one timer: the first
+    /// to be sent something wins, and a receiver whose sender has gone drops
+    /// out. With none left, or the time up, there is no delivery. Each
+    /// receiver used to be raced by a task of its own, with a timer of its
+    /// own, which for `XREAD BLOCK` over many streams (and, before #758 gave
+    /// a client in the lines for many keys a single receiver, `BRPOP` over
+    /// many keys) was a task and a timer per key per wait.
     async fn race(self) -> Delivery {
-        let timeout = self.timeout;
-        let (winner_tx, mut winner_rx) = tokio::sync::mpsc::channel(1);
-        let mut handles = Vec::with_capacity(self.rxs.len());
-
-        for (key, rx) in self.rxs {
-            let tx = winner_tx.clone();
-            handles.push(tokio::spawn(async move {
-                let got = match timeout {
-                    None => rx.await.ok(),
-                    Some(d) => tokio::time::timeout(d, rx).await.ok().and_then(|r| r.ok()),
+        let mut rxs: Vec<(Vec<u8>, Option<oneshot::Receiver<Value>>)> = self
+            .rxs
+            .into_iter()
+            .map(|(key, rx)| (key, Some(rx)))
+            .collect();
+        let first = std::future::poll_fn(move |cx| {
+            let mut waiting = false;
+            for (key, slot) in rxs.iter_mut() {
+                let Some(rx) = slot.as_mut() else {
+                    continue;
                 };
-                if let Some(val) = got {
-                    let _ = tx.send((key, val)).await;
-                }
-            }));
-        }
-        // Dropping our own sender is what lets `recv()` return `None` once every
-        // racing task has finished — which, when they all timed out, is the
-        // timeout signal itself.
-        drop(winner_tx);
-
-        // Stopped when this future ends, however it ends: a task left
-        // running would go on holding its place among a key's waiters for a
-        // client that is no longer waiting.
-        struct Racers(Vec<tokio::task::JoinHandle<()>>);
-        impl Drop for Racers {
-            fn drop(&mut self) {
-                for handle in &self.0 {
-                    handle.abort();
+                match std::future::Future::poll(std::pin::Pin::new(rx), cx) {
+                    std::task::Poll::Ready(Ok(value)) => {
+                        return std::task::Poll::Ready(Some((std::mem::take(key), value)));
+                    }
+                    std::task::Poll::Ready(Err(_)) => *slot = None,
+                    std::task::Poll::Pending => waiting = true,
                 }
             }
+            if waiting {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        });
+        match self.timeout {
+            None => first.await,
+            Some(timeout) => tokio::time::timeout(timeout, first).await.ok().flatten(),
         }
-        let _racers = Racers(handles);
-        winner_rx.recv().await
     }
 }
 
@@ -1118,6 +1150,111 @@ mod gone_resume_tests {
             })
         };
         test(&run, &wait_table);
+    }
+
+    fn with_ctx(test: impl FnOnce(&mut Ctx<'_>)) {
+        // `with_server`, handing the test a `Ctx` with no blocking slot, as
+        // `MULTI`, a script and the replica applier have.
+        // The pause is the process's: a unit test pausing writes would hold
+        // these commands back (`pause::held_in_gate`).
+        let _pause = crate::pause::TEST_LOCK.lock();
+        let store = crate::store::new_store(1);
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(crate::cluster::ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        {
+            let mut ctx = Ctx {
+                cmd: Vec::new(),
+                store: &store,
+                lastsave: &lastsave,
+                selected_db: &mut selected_db,
+                aof_tx: &NoopAofSender,
+                aof_enabled: false,
+                config: &config,
+                started_at: &started_at,
+                index_store: &index_store,
+                dict_store: &dict_store,
+                wait_table: &wait_table,
+                ts_index: &ts_index,
+                pubsub: &pubsub,
+                hub_tx: &hub_tx,
+                repl_state: &repl_state,
+                watch_registry: &crate::watch::NoopWatchRegistry,
+                client_id: 0,
+                client_registry: &client_registry,
+                resp: 2,
+                acl_store: &acl_store,
+                acl_log: &acl_log,
+                slowlog: &slowlog,
+                latency: &latency,
+                compaction_tx: &compaction_tx,
+                cluster: &cluster,
+                bypass_cluster_check: false,
+                apply_replication: false,
+                skip_write_side_effects: false,
+                peer_addr: "127.0.0.1:1",
+                monitor_registry: &monitor_registry,
+                authenticated_user: "default",
+                tracking_table: &tracking_table,
+                blocking: None,
+            };
+            test(&mut ctx);
+        }
+    }
+
+    /// A blocking command that cannot wait (`MULTI`, a script, the replica
+    /// applier) only looks: it does not stand in line, so a push that lands
+    /// while it looks wakes the client blocked behind it, not it. It used to
+    /// stand in line, be the head the push woke, and leave without passing
+    /// the turn on: the client behind stayed blocked with the element there.
+    #[test]
+    fn a_command_that_cannot_wait_does_not_take_a_turn() {
+        with_ctx(|ctx| {
+            let keys = vec![b"k".to_vec()];
+            let table = Arc::clone(ctx.wait_table);
+            let mut behind = None;
+            let reply = wait_for_keys(
+                ctx,
+                &keys,
+                None,
+                |ctx, _| {
+                    // A client blocks on the key, and a push to it lands,
+                    // while this command looks.
+                    let ticket = table.new_ticket();
+                    let rx = table.enqueue_all(&keys, &ticket);
+                    ticket.parks_in(&keys, false);
+                    ctx.wait_table.notify_signal("k");
+                    behind = Some((ticket, rx));
+                    None
+                },
+                crate::resp::write::resp_null_array,
+            );
+            assert_eq!(reply, crate::resp::write::resp_null_array());
+            let (_ticket, mut rx) = behind.expect("looked");
+            assert_eq!(
+                rx.try_recv()
+                    .expect("the client behind was not woken")
+                    .as_ref(),
+                b"k"
+            );
+        });
     }
 
     #[tokio::test]

@@ -39,6 +39,8 @@ pub async fn handle_replica_connection_uring(
     psync: Option<crate::replication::PsyncRequest>,
     // It sent `REPLCONF capa vset-quant`.
     vset_quant_announced: bool,
+    // It sent `REPLCONF capa slot-imports`.
+    slot_imports_announced: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
@@ -75,6 +77,7 @@ pub async fn handle_replica_connection_uring(
         peer_port,
         tx: replica_tx,
         pending_bytes: Arc::clone(&pending_bytes),
+        slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
@@ -116,10 +119,10 @@ pub async fn handle_replica_connection_uring(
     };
 
     // ── 3. `+CONTINUE`, or `+FULLRESYNC` (omitted for legacy `SYNC`) ──────
-    let word = repl_state.vset_quant_word(vset_quant_announced);
+    let word = repl_state.psync_words(vset_quant_announced, slot_imports_announced);
     let greeting = match &full_sync {
         None => Some(format!("+CONTINUE {}{word}\r\n", repl_state.repl_id())),
-        Some(sync) if !legacy_sync => Some(sync.announcement(&repl_state.repl_id(), word)),
+        Some(sync) if !legacy_sync => Some(sync.announcement(&repl_state.repl_id(), &word)),
         Some(_) => None,
     };
     if let Some(greeting) = greeting {
@@ -482,7 +485,9 @@ async fn park_blocking_uring(
     // leaves the line it was standing in — or, its client gone or the role
     // changed, only to leave that line, taking nothing (see
     // `server::park_blocking`).
-    if interrupted.gone || interrupted.role_changed {
+    // Unblocked with an error, it takes nothing either: its reply is
+    // `-UNBLOCKED`, and an element popped for it would be lost (#758).
+    if interrupted.gone || interrupted.role_changed || interrupted.unblocked_with_error {
         slot.set_gone(block_state);
     } else {
         slot.set_pending(delivery, block_state);
@@ -1358,7 +1363,9 @@ pub async fn handle_client(
                         if std::mem::take(&mut aof_wait) {
                             crate::aof::written(&aof_tx).await;
                         }
-                        match park_blocking_uring(
+                        // Boxed, and so polled out of line: the wait is cold, and the
+                        // connection's own future stays the size it is without it.
+                        match Box::pin(park_blocking_uring(
                             wait,
                             &mut blocking_slot,
                             &stream,
@@ -1369,7 +1376,7 @@ pub async fn handle_client(
                             &mut interrupted,
                             &peer_watch,
                             &repl_state,
-                        )
+                        ))
                         .await
                         {
                             // `parse_offset` deliberately not advanced: the same
@@ -1442,7 +1449,9 @@ pub async fn handle_client(
                     if std::mem::take(&mut aof_wait) {
                         crate::aof::written(&aof_tx).await;
                     }
-                    match park_blocking_uring(
+                    // Boxed, and so polled out of line: the wait is cold, and the
+                    // connection's own future stays the size it is without it.
+                    match Box::pin(park_blocking_uring(
                         wait,
                         &mut blocking_slot,
                         &stream,
@@ -1453,7 +1462,7 @@ pub async fn handle_client(
                         &mut interrupted,
                         &peer_watch,
                         &repl_state,
-                    )
+                    ))
                     .await
                     {
                         // See the note at the non-slowlog site above.
@@ -2960,6 +2969,9 @@ pub async fn handle_client(
                 let vset_quant_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_vset_quant == Some(true));
+                let slot_imports_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_slot_imports);
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595). `CLIENT KILL` shuts its socket, as
                 // any client's, which ends the link.
@@ -2977,6 +2989,7 @@ pub async fn handle_client(
                     listening_port,
                     psync,
                     vset_quant_announced,
+                    slot_imports_announced,
                 )
                 .await?;
 

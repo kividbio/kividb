@@ -296,7 +296,14 @@ impl Node {
         if !conf.exists() {
             std::fs::write(&conf, "").unwrap();
         }
-        let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        // A test can run another release's binary (`KIVIDB_TEST_NODE_BIN`).
+        let bin = self
+            .env
+            .iter()
+            .find(|(k, _)| k == "KIVIDB_TEST_NODE_BIN")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_kividb").to_string());
+        let child = Command::new(bin)
             .current_dir(&self.dir)
             .args(bind)
             .args([
@@ -6769,6 +6776,761 @@ fn an_import_cut_short_by_a_restart_keeps_the_keys_held_before_it() {
     assert!(not_as_written(&nodes[1], &brought, "src").is_empty());
 }
 
+// ── An import whose destination dies part way (#741) ─────────────────────────
+
+/// What a replica knows of its master's imports, on disk
+/// (`<cluster-config-file>.followed-imports`), if anything.
+fn followed_file(node: &Node) -> Option<String> {
+    std::fs::read_to_string(node.dir.join("nodes.conf.followed-imports")).ok()
+}
+
+/// `cluster_import_cleanup_slots` of `INFO cluster`.
+fn import_cleanup_slots(node: &Node) -> i64 {
+    let info = node.conn().cmd(&["INFO", "cluster"]).text();
+    info_field(&info, "cluster_import_cleanup_slots")
+        .unwrap_or_else(|| panic!("no cluster_import_cleanup_slots in {info}"))
+        .parse()
+        .unwrap()
+}
+
+/// Wait for the failpoint `name` of `node` to be reached, and return its
+/// file: removed, the node goes on.
+fn reached(node: &Node, name: &str, timeout: Duration) -> PathBuf {
+    let held = node.dir.join(format!("failpoint.{name}.1"));
+    wait_until(&format!("{name} to be reached"), timeout, || held.exists());
+    held
+}
+
+/// Three masters (A, the source; B, the destination; C) and `replicas`
+/// replicas of B, each started with `replica_extra` and `replica_env`. Slot
+/// `s` was B's and was given to A by hand, B keeping its keys of it: 30
+/// orphans (`only`) and `both` (`old`, which A also has, as `src`). B has
+/// 100 keys of its own (`own`). A has 40 keys of `s` (`brought`) and 40 of
+/// slot `t` (`brought2`), of which B held none. Then B imports `t` and `s`
+/// from A, whose handoff waits `handoff_ms`; `b_env` for B. Returned once
+/// `ready` says so.
+struct CutShort {
+    nodes: Vec<Node>,
+    replicas: Vec<Node>,
+    t: u16,
+    s: u16,
+    orphans: Vec<String>,
+    both: String,
+    own: Vec<String>,
+    brought: Vec<String>,
+    brought2: Vec<String>,
+    task_id: String,
+    import: Vec<String>,
+}
+
+impl CutShort {
+    /// Every key the import brought.
+    fn all_brought(&self) -> Vec<String> {
+        self.brought.iter().chain(&self.brought2).cloned().collect()
+    }
+
+    fn import_args(&self) -> Vec<&str> {
+        self.import.iter().map(String::as_str).collect()
+    }
+
+    /// Kill B, and wait for one of its replicas to be promoted: its index.
+    fn kill_destination(&mut self) -> usize {
+        self.nodes[1].kill();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(promoted) = self.replicas.iter().position(|r| r.is_master()) {
+                // A master by its own account, but its view of the cluster may
+                // still be down for a moment: a key command then gets
+                // CLUSTERDOWN. Wait until it serves.
+                let node = &self.replicas[promoted];
+                wait_until(
+                    "the promoted replica's cluster to be ok",
+                    Duration::from_secs(60),
+                    || node.cluster_info("cluster_state") == "ok",
+                );
+                return promoted;
+            }
+            if Instant::now() > deadline {
+                let logs: Vec<String> = self.replicas.iter().map(Node::log).collect();
+                panic!(
+                    "no replica of the destination was promoted:\n{}",
+                    logs.join("\n---\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The source's migration to have ended.
+    fn wait_source_done(&self) {
+        wait_until(
+            "the source's migration to end",
+            Duration::from_secs(120),
+            || import_state(&self.nodes[0], &self.task_id) != "in_progress",
+        );
+    }
+}
+
+fn import_cut_short(
+    replicas: usize,
+    replica_extra: &[&str],
+    replica_env: &[(&str, &str)],
+    b_env: &[(&str, &str)],
+    handoff_ms: u64,
+    ready: impl Fn(&CutShort) -> bool,
+) -> CutShort {
+    let delay = handoff_ms.to_string();
+    let a = Node::start_with_env(&[], &[("KIVIDB_TEST_HANDOFF_DELAY_MS", delay.as_str())]);
+    let b = Node::start_with_env(&[], b_env);
+    let (nodes, ranges) = form_cluster_of(vec![a, b, Node::start(&[])]);
+    let replicas: Vec<Node> = (0..replicas)
+        .map(|_| add_replica_with(&nodes, &nodes[1], replica_extra, replica_env))
+        .collect();
+    let all: Vec<&Node> = nodes.iter().chain(&replicas).collect();
+    wait_cluster_ok(&all, all.len());
+
+    let s = slot_of(&key_in(ranges[1].0..=ranges[1].0 + 100, "s"));
+    let t = slot_of(&key_in(0..=100, "t"));
+    assert!(t < s);
+    let orphans = keys_of_slot(s, "orphan", 30);
+    let both = keys_of_slot(s, "both", 1).remove(0);
+    let own = keys_in(ranges[1].0 + 200..=ranges[1].1, "own", 100);
+    let mut b = nodes[1].conn();
+    set_all(&mut b, &orphans, "only");
+    set_all(&mut b, std::slice::from_ref(&both), "old");
+    set_all(&mut b, &own, "own");
+    assert_eq!(
+        b.cmd(&["WAIT", &replicas.len().to_string(), "5000"]).int(),
+        replicas.len() as i64
+    );
+    give_slots(&nodes, &[(s, &nodes[0])]);
+    // The replicas' tables too: else a promotion would claim `s` back.
+    let to_a = format!("MOVED {s} 127.0.0.1:{}", nodes[0].port);
+    for replica in &replicas {
+        let r = replica.conn().cmd(&["CLUSTER", "DELSLOTS", &s.to_string()]);
+        assert!(r.is_ok(), "{r:?}");
+        wait_until(
+            "the replica to see the source own s",
+            Duration::from_secs(30),
+            || {
+                replica
+                    .conn()
+                    .cmd(&["GET", &orphans[0]])
+                    .err()
+                    .is_some_and(|e| e.contains(&to_a))
+            },
+        );
+    }
+    // By its answer, not `CLUSTER ORPHANSLOTS`, which a 1.2 node lacks.
+    wait_until(
+        "the destination to see the source own s",
+        Duration::from_secs(30),
+        || {
+            nodes[1]
+                .conn()
+                .cmd(&["GET", &orphans[0]])
+                .err()
+                .is_some_and(|e| e.contains(&to_a))
+        },
+    );
+    wait_cluster_ok(&all, all.len());
+    let brought = keys_of_slot(s, "brought", 40);
+    let brought2 = keys_of_slot(t, "brought2", 40);
+    let mut src = nodes[0].conn();
+    set_all(&mut src, &brought, "src");
+    set_all(&mut src, &brought2, "src");
+    set_all(&mut src, std::slice::from_ref(&both), "src");
+
+    let import: Vec<String> = ["CLUSTER", "MIGRATION", "IMPORT"]
+        .iter()
+        .map(|w| w.to_string())
+        .chain([t, t, s, s].iter().map(u16::to_string))
+        .collect();
+    let args: Vec<&str> = import.iter().map(String::as_str).collect();
+    let task_id = b.cmd(&args).text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    let cut = CutShort {
+        nodes,
+        replicas,
+        t,
+        s,
+        orphans,
+        both,
+        own,
+        brought,
+        brought2,
+        task_id,
+        import,
+    };
+    wait_until(
+        "the import to get as far as the test wants",
+        Duration::from_secs(60),
+        || ready(&cut),
+    );
+    cut
+}
+
+/// Every replica has every key the import brought.
+fn brought_everywhere(cut: &CutShort) -> bool {
+    let all = cut.all_brought();
+    cut.replicas
+        .iter()
+        .all(|r| held_of(r, &all).len() == all.len())
+}
+
+/// The keys B held of `s` are on `node` (looked for by name: `s` is not
+/// its slot, and a read of them is sent on, `-MOVED`), and its own keys
+/// are as they were.
+fn assert_held_kept(cut: &CutShort, node: &Node) {
+    let mut held = cut.orphans.clone();
+    held.push(cut.both.clone());
+    let here = held_of(node, &held);
+    assert_eq!(here.len(), held.len(), "keys held before lost: {here:?}");
+    let lost = not_as_written(node, &cut.own, "own");
+    assert!(lost.is_empty(), "{} own keys lost: {lost:?}", lost.len());
+}
+
+/// [`assert_held_kept`], `s` being `node`'s now: with their values.
+fn assert_held_kept_as_written(cut: &CutShort, node: &Node) {
+    assert_held_kept(cut, node);
+    let lost = not_as_written(node, &cut.orphans, "only");
+    assert!(lost.is_empty(), "{} orphans changed: {lost:?}", lost.len());
+    assert!(
+        not_as_written(node, std::slice::from_ref(&cut.both), "src").is_empty(),
+        "both"
+    );
+}
+
+/// The source deletes one key of each slot, and `node` imports the slots
+/// again: once it completes, every key has the source's value, the deleted
+/// ones are not back, and the keys held before are kept.
+fn import_again_from(cut: &CutShort, node: &Node) {
+    let stale = [cut.brought[0].clone(), cut.brought2[0].clone()];
+    let mut src = cut.nodes[0].conn();
+    for key in &stale {
+        assert_eq!(src.cmd(&["DEL", key]).int(), 1);
+    }
+    let mut c = node.conn();
+    let mut again = None;
+    // Refused for as long as what the first import brought is still to be
+    // deleted.
+    wait_until(
+        "the import to be taken again",
+        Duration::from_secs(60),
+        || {
+            let r = c.cmd(&cut.import_args());
+            match r.err() {
+                Some(e) => {
+                    assert!(e.contains("still to be deleted"), "{e}");
+                    false
+                }
+                None => {
+                    again = Some(r.text());
+                    true
+                }
+            }
+        },
+    );
+    wait_import_completed(node, &again.unwrap());
+    assert!(held_of(node, &stale).is_empty(), "deleted keys are back");
+    assert!(not_as_written(node, &cut.brought[1..], "src").is_empty());
+    assert!(not_as_written(node, &cut.brought2[1..], "src").is_empty());
+    assert_held_kept_as_written(cut, node);
+}
+
+/// #741. The destination of an import dies once the keys it brought have
+/// reached its replicas; one of them is promoted. It used to keep those
+/// keys, of slots it does not own, for good; and an import of the slots
+/// again kept them beside what it brought, so keys the source had deleted
+/// in between were served again. Now its master told it of the import and
+/// of the keys it held before (`KIVIDB.IMPORTS`), and it deletes what the
+/// import brought: not while the source still has the slots moving, and
+/// never the keys held before. Its deletes reach the other replica, which
+/// deletes nothing on its own. The import, sent again, is refused until
+/// then, and then brings the slots with no key the source deleted.
+#[test]
+fn a_promoted_replica_of_an_import_destination_deletes_what_the_import_brought() {
+    let mut cut = import_cut_short(2, &[], &[], &[], 20_000, brought_everywhere);
+    assert!(
+        cut.replicas
+            .iter()
+            .all(|r| followed_file(r).is_some_and(|f| f.contains(&cut.task_id))),
+        "the replicas know of the import"
+    );
+    let p = cut.kill_destination();
+    let promoted = &cut.replicas[p];
+    let other = &cut.replicas[1 - p];
+    // While the source has the slots moving (its handoff is held), nothing
+    // is deleted.
+    wait_until(
+        "the promoted node to say why it waits",
+        Duration::from_secs(30),
+        || {
+            promoted
+                .log()
+                .contains("is not deleted yet: the owner of slot")
+        },
+    );
+    assert_eq!(held_of(promoted, &cut.all_brought()).len(), 80);
+    assert!(import_cleanup_slots(promoted) > 0);
+    assert_held_kept(&cut, promoted);
+
+    cut.wait_source_done();
+    wait_until(
+        "what the import brought to be deleted",
+        Duration::from_secs(60),
+        || held_of(promoted, &cut.all_brought()).is_empty(),
+    );
+    assert_held_kept(&cut, promoted);
+    assert!(
+        promoted
+            .log()
+            .contains("deleted the 80 key(s) it brought, and kept 31 this node held before it"),
+        "{}",
+        promoted.log()
+    );
+    assert_eq!(import_cleanup_slots(promoted), 0);
+    wait_until(
+        "the promoted node to forget the import",
+        Duration::from_secs(10),
+        || followed_file(promoted).is_none(),
+    );
+    // The other replica, now the promoted node's, has the same keys.
+    wait_until(
+        "the other replica to follow the promoted node",
+        Duration::from_secs(60),
+        || all_keys(other) == all_keys(promoted),
+    );
+    assert_eq!(import_cleanup_slots(other), 0);
+    assert!(!other.log().contains("deleted the 80 key(s) it brought"));
+
+    import_again_from(&cut, promoted);
+    wait_until(
+        "the other replica to have the slots as imported",
+        Duration::from_secs(30),
+        || all_keys(other) == all_keys(promoted),
+    );
+}
+
+/// A replica that does not ask for its master's imports, as one of an
+/// earlier release, and a replica of a master that does not tell of them,
+/// as one of an earlier release, know of no import: promoted, they keep
+/// what it brought, as before, and CLUSTER ORPHANSLOTS lists it.
+#[test]
+fn without_the_slot_imports_capability_a_promoted_replica_keeps_the_keys_as_before() {
+    let hide = [("KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY", "1")];
+    for (replica_env, b_env) in [(&hide[..], &[][..]), (&[][..], &hide[..])] {
+        let mut cut = import_cut_short(1, &[], replica_env, b_env, 20_000, brought_everywhere);
+        assert!(followed_file(&cut.replicas[0]).is_none());
+        let p = cut.kill_destination();
+        let promoted = &cut.replicas[p];
+        cut.wait_source_done();
+        // Long enough for a cleanup to have run.
+        std::thread::sleep(Duration::from_secs(10));
+        assert_eq!(held_of(promoted, &cut.all_brought()).len(), 80);
+        assert_held_kept(&cut, promoted);
+        assert_eq!(import_cleanup_slots(promoted), 0);
+        let a_id = cut.nodes[0].id();
+        assert_eq!(
+            orphan_slots(promoted),
+            vec![
+                (cut.t, cut.t, 40, Some(a_id.clone())),
+                (cut.s, cut.s, 71, Some(a_id))
+            ]
+        );
+        // The stream to it was not disturbed: it did not resync.
+        assert!(!promoted.log().contains("resyncing in full"));
+    }
+}
+
+/// The destination is killed once it has looked at the keys it held of the
+/// slots, before it has told its replica (failpoint `import-noting`): the
+/// replica knows only that an import began, with nothing asked of the
+/// source yet. Promoted, it deletes nothing, and the import sent again
+/// completes.
+#[test]
+fn a_destination_killed_before_its_replica_heard_it_looked_leaves_every_key() {
+    let env = [("KIVIDB_TEST_FAILPOINTS", "import-noting")];
+    let mut cut = import_cut_short(1, &[], &[], &env, 0, |cut| {
+        cut.nodes[1].dir.join("failpoint.import-noting.1").exists()
+    });
+    // The replica has heard the import begin.
+    wait_until(
+        "the replica to know of the import",
+        Duration::from_secs(10),
+        || followed_file(&cut.replicas[0]).is_some_and(|f| f.contains(&cut.task_id)),
+    );
+    let p = cut.kill_destination();
+    let promoted = &cut.replicas[p];
+    assert!(held_of(promoted, &cut.all_brought()).is_empty());
+    wait_until("it to forget the import", Duration::from_secs(60), || {
+        followed_file(promoted).is_none()
+    });
+    assert!(
+        promoted.log().contains("it had brought nothing"),
+        "{}",
+        promoted.log()
+    );
+    assert_held_kept(&cut, promoted);
+    import_again_from(&cut, promoted);
+}
+
+/// Killed once its replica knows what it held, before anything has arrived
+/// (failpoint `import-noted`): promoted, the replica deletes nothing, as
+/// nothing was brought, and the import sent again completes.
+#[test]
+fn a_destination_killed_before_any_key_arrived_leaves_every_key() {
+    let env = [("KIVIDB_TEST_FAILPOINTS", "import-noted")];
+    let mut cut = import_cut_short(1, &[], &[], &env, 0, |cut| {
+        cut.nodes[1].dir.join("failpoint.import-noted.1").exists()
+    });
+    wait_until(
+        "the replica to know of the import",
+        Duration::from_secs(10),
+        || followed_file(&cut.replicas[0]).is_some_and(|f| f.contains(&cut.task_id)),
+    );
+    let p = cut.kill_destination();
+    let promoted = &cut.replicas[p];
+    wait_until("the cleanup to end", Duration::from_secs(60), || {
+        followed_file(promoted).is_none()
+    });
+    assert!(held_of(promoted, &cut.all_brought()).is_empty());
+    assert_held_kept(&cut, promoted);
+    import_again_from(&cut, promoted);
+}
+
+/// The destination took the slots over, and told its replica the import
+/// ended, but neither its claim nor its answer went out before it was
+/// killed (`KIVIDB_TEST_TAKEOVER_LOST_MS`). The replica, promoted, does not
+/// own the slots, but deletes nothing of them: the import completed, and
+/// those keys may be the slots' only copy.
+#[test]
+fn an_import_its_replica_heard_end_is_never_cleaned_up() {
+    let env = [("KIVIDB_TEST_TAKEOVER_LOST_MS", "30000")];
+    let mut cut = import_cut_short(1, &[], &[], &env, 0, |cut| {
+        cut.nodes[1]
+            .log()
+            .contains("the TAKEOVER's reply and claim are held back")
+    });
+    wait_until(
+        "the replica to hear the import ended",
+        Duration::from_secs(20),
+        || followed_file(&cut.replicas[0]).is_none() && brought_everywhere(&cut),
+    );
+    let p = cut.kill_destination();
+    let promoted = &cut.replicas[p];
+    cut.wait_source_done();
+    std::thread::sleep(Duration::from_secs(10));
+    assert_eq!(held_of(promoted, &cut.all_brought()).len(), 80);
+    assert_held_kept(&cut, promoted);
+    assert_eq!(import_cleanup_slots(promoted), 0);
+}
+
+/// A replica that did not see the import begin: added part way (a full
+/// sync), or restarted part way. It knows the import by its slots: promoted,
+/// it deletes every key of the slot of which nothing was held before, and
+/// keeps every key of the one that had some.
+fn a_replica_that_did_not_see_the_import_begin(restart: bool) {
+    let aof = ["--aof", "--appendfsync", "always"];
+    let mut cut = import_cut_short(
+        usize::from(restart),
+        &aof,
+        &[],
+        &[],
+        40_000,
+        brought_everywhere,
+    );
+    if restart {
+        cut.replicas[0].restart();
+    } else {
+        let late = add_replica_with(&cut.nodes, &cut.nodes[1], &aof, &[]);
+        cut.replicas.push(late);
+    }
+    let replica = &cut.replicas[0];
+    wait_until("the replica to sync", Duration::from_secs(30), || {
+        replica.repl_info("master_link_status").as_deref() == Some("up")
+            && held_of(replica, &cut.all_brought()).len() == 80
+            && followed_file(replica).is_some_and(|f| f.contains(&cut.task_id))
+    });
+    // And to have streamed since, or it does not stand for election: a
+    // write it has applied, and a turn of its reader after.
+    let mut b = cut.nodes[1].conn();
+    set_all(&mut b, &cut.own[..1], "own");
+    assert_eq!(b.cmd(&["WAIT", "1", "5000"]).int(), 1);
+    std::thread::sleep(Duration::from_secs(1));
+    let p = cut.kill_destination();
+    let promoted = &cut.replicas[p];
+    cut.wait_source_done();
+    wait_until(
+        "what was brought of the slot that had no keys to be deleted",
+        Duration::from_secs(60),
+        || held_of(promoted, &cut.brought2).is_empty(),
+    );
+    wait_until("it to forget the import", Duration::from_secs(30), || {
+        followed_file(promoted).is_none()
+    });
+    assert_eq!(held_of(promoted, &cut.brought), cut.brought);
+    assert_held_kept(&cut, promoted);
+}
+
+#[test]
+fn a_replica_attached_part_way_keeps_every_key_of_a_slot_that_had_any() {
+    a_replica_that_did_not_see_the_import_begin(false);
+}
+
+#[test]
+fn a_replica_restarted_part_way_keeps_every_key_of_a_slot_that_had_any() {
+    a_replica_that_did_not_see_the_import_begin(true);
+}
+
+/// The promoted node is killed in the middle of its cleanup (failpoint
+/// `import-cleanup-deleting`, after its first batch). Its replica, the
+/// destination's other one, heard of the import from both, and promoted
+/// in turn carries the cleanup on: the keys held before stay, and what the
+/// import brought goes.
+#[test]
+fn a_second_failover_during_the_cleanup_carries_it_on() {
+    let env = [("KIVIDB_TEST_FAILPOINTS", "import-cleanup-deleting")];
+    let mut cut = import_cut_short(2, &[], &env, &[], 20_000, brought_everywhere);
+    let p = cut.kill_destination();
+    cut.wait_source_done();
+    let held = reached(
+        &cut.replicas[p],
+        "import-cleanup-deleting",
+        Duration::from_secs(60),
+    );
+    let left = held_of(&cut.replicas[p], &cut.all_brought()).len();
+    assert!(left < 80, "{left} left after the first batch");
+    let q = 1 - p;
+    // It follows the promoted node, and has its first batch.
+    wait_until(
+        "the other replica to follow",
+        Duration::from_secs(60),
+        || {
+            cut.replicas[q].repl_info("master_link_status").as_deref() == Some("up")
+                && held_of(&cut.replicas[q], &cut.all_brought()).len() == left
+        },
+    );
+    assert!(followed_file(&cut.replicas[q]).is_some_and(|f| f.contains(&cut.task_id)));
+    cut.replicas[p].kill();
+    let _ = std::fs::remove_file(&held);
+    wait_until(
+        "the other replica to be promoted",
+        Duration::from_secs(60),
+        || cut.replicas[q].is_master(),
+    );
+    let node = &cut.replicas[q];
+    // Held at its own first batch too, if it has any left: let go.
+    let again = node.dir.join("failpoint.import-cleanup-deleting.1");
+    wait_until(
+        "what the import brought to be deleted",
+        Duration::from_secs(90),
+        || {
+            let _ = std::fs::remove_file(&again);
+            held_of(node, &cut.all_brought()).is_empty()
+        },
+    );
+    assert_held_kept(&cut, node);
+    wait_until("it to forget the import", Duration::from_secs(30), || {
+        followed_file(node).is_none()
+    });
+}
+
+/// The promoted node restarts in the middle of its cleanup. It knows from
+/// its file which slots had keys before, not which keys: it keeps every key
+/// of those, and deletes what is left of the other.
+#[test]
+fn a_restart_during_the_cleanup_keeps_every_key_of_a_slot_that_had_any() {
+    let env = [("KIVIDB_TEST_FAILPOINTS", "import-cleanup-deleting")];
+    let aof = ["--aof", "--appendfsync", "always"];
+    let mut cut = import_cut_short(1, &aof, &env, &[], 20_000, brought_everywhere);
+    let p = cut.kill_destination();
+    cut.wait_source_done();
+    let held = reached(
+        &cut.replicas[p],
+        "import-cleanup-deleting",
+        Duration::from_secs(60),
+    );
+    cut.replicas[p].kill();
+    assert!(followed_file(&cut.replicas[p]).is_some_and(|f| f.contains(&cut.task_id)));
+    cut.replicas[p].spawn();
+    let node = &cut.replicas[p];
+    wait_until("it to say what it kept", Duration::from_secs(30), || {
+        node.log()
+            .contains("every key of a slot that had keys before is kept")
+    });
+    // Held at the failpoint again once it has restarted, if anything is
+    // left: let go each time.
+    wait_until(
+        "what is left of the slot that had no keys to be deleted, and the import to be \
+         forgotten",
+        Duration::from_secs(90),
+        || {
+            let _ = std::fs::remove_file(&held);
+            held_of(node, &cut.brought2).is_empty() && followed_file(node).is_none()
+        },
+    );
+    assert_held_kept(&cut, node);
+}
+
+/// The promoted node's cleanup waits (the source still has the slots
+/// moving). Meanwhile slot `t` is given to it by hand (`SETSLOT NODE`),
+/// clients write to it there, and it is given to C by hand, its keys left
+/// (#741 review). Those writes were acknowledged here, and are the only
+/// copy: `t` is left out of the cleanup for good, and none of its keys,
+/// those the import brought included, is deleted. `s` is cleaned up.
+#[test]
+fn a_slot_that_came_to_the_promoted_node_is_left_out_of_the_cleanup() {
+    let mut cut = import_cut_short(1, &[], &[], &[], 60_000, brought_everywhere);
+    let p = cut.kill_destination();
+    let node = &cut.replicas[p];
+    wait_until(
+        "the promoted node to say why it waits",
+        Duration::from_secs(30),
+        || node.log().contains("is not deleted yet"),
+    );
+    let t = cut.t.to_string();
+    let node_id = node.id();
+    let r = node
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &t, "NODE", &node_id]);
+    assert!(r.is_ok(), "{r:?}");
+    let written = keys_of_slot(cut.t, "acked", 20);
+    let mut c = node.conn();
+    set_all(&mut c, &written, "acked");
+    // `SETSLOT NODE` to another node is refused while it holds keys of the
+    // slot; `DELSLOTS` and `ADDSLOTS` are not.
+    for at in [node, &cut.nodes[2]] {
+        let r = at.conn().cmd(&["CLUSTER", "DELSLOTS", &t]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let r = cut.nodes[2].conn().cmd(&["CLUSTER", "ADDSLOTS", &t]);
+    assert!(r.is_ok(), "{r:?}");
+    // A claim at a new epoch, over the promoted node's own of `t`.
+    cut.nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]);
+    wait_until("the node to see C own t", Duration::from_secs(90), || {
+        node.conn()
+            .cmd(&["GET", &written[0]])
+            .err()
+            .is_some_and(|e| e.contains(&format!("127.0.0.1:{}", cut.nodes[2].port)))
+    });
+    cut.wait_source_done();
+    wait_until(
+        "what the import brought of s to be deleted",
+        Duration::from_secs(60),
+        || held_of(node, &cut.brought).is_empty(),
+    );
+    wait_until("it to forget the import", Duration::from_secs(30), || {
+        followed_file(node).is_none()
+    });
+    assert_eq!(held_of(node, &written), written, "acknowledged writes lost");
+    assert_eq!(held_of(node, &cut.brought2), cut.brought2);
+    assert_held_kept(&cut, node);
+    assert!(
+        node.log()
+            .contains("came to this node: left out of it for good"),
+        "{}",
+        node.log()
+    );
+}
+
+/// `CLUSTER RESET` on a replica that knows of an import of its master
+/// forgets it: the node is no one's replica, nor in that cluster. Joined to
+/// the cluster again, where the source owns the slots, it deletes nothing
+/// of them, and an import of them is not refused for them.
+#[test]
+fn cluster_reset_forgets_the_imports_of_the_old_master() {
+    let cut = import_cut_short(1, &[], &[], &[], 60_000, brought_everywhere);
+    let replica = &cut.replicas[0];
+    assert!(followed_file(replica).is_some_and(|f| f.contains(&cut.task_id)));
+    let r = replica.conn().cmd(&["CLUSTER", "RESET", "SOFT"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(followed_file(replica).is_none());
+    assert!(replica.is_master());
+    // The import ends, the source keeps the slots, and nothing is moving.
+    let mut b = cut.nodes[1].conn();
+    let canceled = b.cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &cut.task_id]);
+    assert_eq!(canceled.int(), 1);
+    cut.wait_source_done();
+    let r = replica.conn().cmd(&[
+        "CLUSTER",
+        "MEET",
+        "127.0.0.1",
+        &cut.nodes[0].port.to_string(),
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let a_id = cut.nodes[0].id();
+    wait_until(
+        "it to see the source own the slots",
+        Duration::from_secs(30),
+        || {
+            orphan_slots(replica)
+                .iter()
+                .any(|(start, _, _, owner)| *start == cut.t && owner.as_deref() == Some(&*a_id))
+        },
+    );
+    // Well past the time a cleanup takes once the source is settled.
+    std::thread::sleep(Duration::from_secs(10));
+    assert_eq!(held_of(replica, &cut.all_brought()).len(), 80);
+    assert_eq!(import_cleanup_slots(replica), 0);
+    let r = replica.conn().cmd(&cut.import_args());
+    assert!(
+        r.err().is_none_or(|e| !e.contains("still to be deleted")),
+        "{r:?}"
+    );
+}
+
+/// With a KiviDB 1.2 replica of the destination (`KIVIDB_1_2_BIN`), which
+/// does not ask for the markers: none is sent to it, its stream is not
+/// disturbed, and promoted it keeps what the import brought, as 1.2 does.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn a_1_2_replica_of_a_destination_is_sent_no_marker() {
+    let bin = std::env::var("KIVIDB_1_2_BIN").expect("KIVIDB_1_2_BIN");
+    let env = [("KIVIDB_TEST_NODE_BIN", bin.as_str())];
+    let mut cut = import_cut_short(1, &[], &env, &[], 20_000, brought_everywhere);
+    let replica = &cut.replicas[0];
+    let version = replica.conn().cmd(&["INFO", "server"]).text();
+    assert!(version.contains("kividb_version:1.2."), "{version}");
+    // In step with its master: every write came through, nothing else.
+    assert_eq!(
+        replica.conn().cmd(&["DBSIZE"]).int(),
+        cut.nodes[1].conn().cmd(&["DBSIZE"]).int()
+    );
+    assert!(
+        !replica.log().contains("KIVIDB.IMPORTS"),
+        "{}",
+        replica.log()
+    );
+    let p = cut.kill_destination();
+    let promoted = &cut.replicas[p];
+    cut.wait_source_done();
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(held_of(promoted, &cut.all_brought()).len(), 80);
+    assert_held_kept(&cut, promoted);
+}
+
+/// With a KiviDB 1.2 destination (`KIVIDB_1_2_BIN`), which sends no marker,
+/// and a replica of this release: the replica knows of no import, and
+/// promoted keeps what it brought, as before.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn a_replica_of_a_1_2_destination_knows_of_no_import() {
+    let bin = std::env::var("KIVIDB_1_2_BIN").expect("KIVIDB_1_2_BIN");
+    let env = [("KIVIDB_TEST_NODE_BIN", bin.as_str())];
+    let mut cut = import_cut_short(1, &[], &[], &env, 20_000, brought_everywhere);
+    let version = cut.nodes[1].conn().cmd(&["INFO", "server"]).text();
+    assert!(version.contains("kividb_version:1.2."), "{version}");
+    assert!(followed_file(&cut.replicas[0]).is_none());
+    let p = cut.kill_destination();
+    let promoted = &cut.replicas[p];
+    cut.wait_source_done();
+    std::thread::sleep(Duration::from_secs(10));
+    assert_eq!(held_of(promoted, &cut.all_brought()).len(), 80);
+    assert_held_kept(&cut, promoted);
+    assert_eq!(import_cleanup_slots(promoted), 0);
+}
+
 /// `n` keys of `slot`, `{tag}:prefix:i`.
 fn keys_of_slot(slot: u16, prefix: &str, n: usize) -> Vec<String> {
     let tag = (0..)
@@ -9928,4 +10690,93 @@ fn hello_reports_the_cluster_mode() {
     let reply = nodes[0].conn().cmd(&["HELLO", "2"]);
     assert_eq!(field(&reply, "role"), "master", "{reply:?}");
     assert_eq!(replica.conn().cmd(&["ROLE"]).array()[0].text(), "slave");
+}
+
+/// A time series keeps its labels in the order they were given through an
+/// atomic slot migration (#612): they were held in a hash map, whose order
+/// differs from process to process, so the destination's `TS.INFO` (and its
+/// `DEBUG DIGEST-VALUE`) showed the same pairs in another order. The labels
+/// are the ones `TS.CREATE`, `TS.ALTER` and an auto-created `TS.ADD` set,
+/// in an order that is neither sorted nor the order of any hash.
+#[test]
+fn an_atomic_import_keeps_the_order_of_a_series_labels() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let slot = ranges[0].0 + 7;
+    let slot_s = slot.to_string();
+    let tag = key_in(slot..=slot, "tsl");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+
+    let names = ["zeta", "alpha", "mid", "beta", "omega", "delta", "c", "b"];
+    let mut keys = Vec::new();
+    for i in 0..30 {
+        let key = format!("{{{tag}}}:{i}");
+        // Each series with its own rotation of the names.
+        let mut given = Vec::new();
+        for (j, name) in names.iter().enumerate() {
+            given.push(name.to_string());
+            given.push(format!("v{}", (i + j) % 5));
+        }
+        given.rotate_left(2 * (i % names.len()));
+        let mut cmd = vec!["TS.CREATE", key.as_str(), "LABELS"];
+        let mut altered = vec!["TS.ALTER", key.as_str(), "LABELS"];
+        match i % 3 {
+            // Created with them.
+            0 => {
+                cmd.extend(given.iter().map(String::as_str));
+                assert!(s.cmd(&cmd).is_ok());
+            }
+            // Altered to them.
+            1 => {
+                assert!(s.cmd(&["TS.CREATE", &key, "LABELS", "old", "1"]).is_ok());
+                altered.extend(given.iter().map(String::as_str));
+                assert!(s.cmd(&altered).is_ok());
+            }
+            // Made by an auto-creating TS.ADD.
+            _ => {
+                let mut add = vec!["TS.ADD", key.as_str(), "5", "1", "LABELS"];
+                add.extend(given.iter().map(String::as_str));
+                assert_eq!(s.cmd(&add).int(), 5);
+            }
+        }
+        keys.push((key, given));
+    }
+
+    let labels_of = |c: &mut Conn, key: &str| -> Vec<String> {
+        let info = c.cmd(&["TS.INFO", key]);
+        let info = info.array();
+        let at = info
+            .iter()
+            .position(|v| matches!(v, Resp::Bulk(b) if b == b"labels"))
+            .expect("labels in TS.INFO");
+        info[at + 1]
+            .array()
+            .iter()
+            .flat_map(|pair| pair.array().iter().map(Resp::text))
+            .collect()
+    };
+    let digests = |c: &mut Conn| -> Vec<String> {
+        keys.iter()
+            .map(|(key, _)| c.cmd(&["DEBUG", "DIGEST-VALUE", key]).array()[0].text())
+            .collect()
+    };
+    for (key, given) in &keys {
+        assert_eq!(&labels_of(&mut s, key), given, "{key} on the source");
+    }
+    let before = digests(&mut s);
+
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(dst, &task_id);
+
+    for (key, given) in &keys {
+        assert_eq!(&labels_of(&mut d, key), given, "{key} on the destination");
+    }
+    assert_eq!(digests(&mut d), before);
+    // Found by its labels there.
+    let found = d.cmd(&["TS.QUERYINDEX", "alpha=v1"]);
+    assert!(!found.array().is_empty(), "{found:?}");
 }

@@ -550,6 +550,11 @@ pub struct CompactionRule {
     pub align_timestamp: u64, // ms, default 0
 }
 
+/// Time series labels: insertion-ordered, so the order they were given in
+/// survives replication, snapshots and DUMP (it was a hash map, whose order
+/// differs per process, #612).
+pub type Labels = indexmap::IndexMap<String, String, ahash::RandomState>;
+
 #[derive(Debug, Clone)]
 pub struct TsInner {
     /// All samples: timestamp_ms → value.
@@ -565,8 +570,9 @@ pub struct TsInner {
     /// Chunk size hint (we store it but use the BTreeMap regardless).
     pub chunk_size: usize,
 
-    /// User-defined label pairs: label_name → label_value.
-    pub labels: AHashMap<String, String>,
+    /// User-defined label pairs, in the order they were given (TS.INFO,
+    /// WITHLABELS, snapshots and DUMP keep it).
+    pub labels: Labels,
 
     /// Compaction rules sourced from this series.
     pub rules: Vec<CompactionRule>,
@@ -587,7 +593,7 @@ impl TsInner {
             retention: 0,
             duplicate_policy: DuplicatePolicy::Last,
             chunk_size: 4096,
-            labels: AHashMap::new(),
+            labels: Labels::default(),
             rules: Vec::new(),
             last_ts: None,
             source: None,
@@ -738,6 +744,32 @@ pub type FieldDeadline = u64;
 #[inline]
 pub fn field_now() -> FieldDeadline {
     crate::script_clock::wall_ms_now()
+}
+
+/// The moment one query judges hash field deadlines by: [`field_now`], read
+/// the first time a document needs it and kept, so that every document of
+/// the query is seen at the same moment (one whose field ends mid-query is
+/// not shown to half of it), and so that a query over hashes with no field
+/// TTL reads no clock at all.
+#[derive(Default)]
+pub struct QueryClock(std::cell::Cell<FieldDeadline>);
+
+impl QueryClock {
+    pub const fn new() -> Self {
+        Self(std::cell::Cell::new(0))
+    }
+
+    #[inline]
+    pub fn get(&self) -> FieldDeadline {
+        match self.0.get() {
+            0 => {
+                let now = field_now();
+                self.0.set(now);
+                now
+            }
+            now => now,
+        }
+    }
 }
 
 /// Whether a field whose deadline is `at` is due at `now`: past it, not at

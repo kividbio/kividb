@@ -586,6 +586,8 @@ pub struct ClientInfo {
     pub replica_lost_data: u8,
     /// `None` until a KiviDB capa arrives; then whether it reads Q8 and BIN.
     pub replica_vset_quant: Option<bool>,
+    /// It sent `REPLCONF capa slot-imports` (#741).
+    pub replica_slot_imports: bool,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -632,6 +634,7 @@ impl ClientInfo {
             replica_takes_digest: false,
             replica_lost_data: 0,
             replica_vset_quant: None,
+            replica_slot_imports: false,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -1194,6 +1197,7 @@ impl ClientRegistryInner {
                 replica_takes_digest: c.replica_takes_digest,
                 replica_lost_data: c.replica_lost_data,
                 replica_vset_quant: c.replica_vset_quant,
+                replica_slot_imports: c.replica_slot_imports,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -1235,6 +1239,7 @@ impl ClientRegistryInner {
             replica_takes_digest: c.replica_takes_digest,
             replica_lost_data: c.replica_lost_data,
             replica_vset_quant: c.replica_vset_quant,
+            replica_slot_imports: c.replica_slot_imports,
             subscriptions: c.subscriptions,
         })
     }

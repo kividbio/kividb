@@ -1366,25 +1366,44 @@ pub struct ScanOptions {
     pub no_scores: bool,
 }
 
-/// The cursor and the options of a scan command, from `cmd[at..]`.
-/// `extra` names the options this command takes besides `MATCH` and `COUNT`.
-pub fn scan_arguments(
-    cmd: &[&[u8]],
-    at: usize,
-    extra: &[&str],
-) -> Result<(u64, ScanOptions), Vec<u8>> {
-    use crate::resp::write::resp_error;
-    let syntax = || resp_error("ERR syntax error");
-    let cursor = cmd
-        .get(at)
+/// The cursor of a scan command, at `cmd[at]`.
+///
+/// Redis reads the cursor first, then looks the key up (a missing key is an
+/// empty scan, a key of another type is `WRONGTYPE`), and only then reads the
+/// options: so the `*SCAN` commands that take a key call this, look the key
+/// up, and call `scan_options` once the key is a collection of theirs.
+pub fn scan_cursor(cmd: &[&[u8]], at: usize) -> Result<u64, Vec<u8>> {
+    cmd.get(at)
         .and_then(|raw| parse_utf8(raw))
         .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| resp_error("ERR invalid cursor"))?;
+        .ok_or_else(|| crate::resp::write::resp_error("ERR invalid cursor"))
+}
+
+/// A `COUNT` as Redis reads a 64-bit integer: no sign but `-`, no spaces, no
+/// leading zeros, no `-0`.
+fn count_integer(raw: &[u8]) -> Option<i64> {
+    let digits = raw.strip_prefix(b"-").unwrap_or(raw);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if digits[0] == b'0' && (digits.len() > 1 || raw.len() > 1) {
+        return None;
+    }
+    std::str::from_utf8(raw).ok()?.parse().ok()
+}
+
+/// `[MATCH pattern] [COUNT count]` and whatever else a scan command takes,
+/// from `cmd[from..]`, read in order as Redis does: the first fault is the
+/// one reported. `extra` names the options this command takes besides
+/// `MATCH` and `COUNT`.
+pub fn scan_options(cmd: &[&[u8]], from: usize, extra: &[&str]) -> Result<ScanOptions, Vec<u8>> {
+    use crate::resp::write::resp_error;
+    let syntax = || resp_error("ERR syntax error");
     let mut options = ScanOptions {
         count: 10,
         ..Default::default()
     };
-    let mut i = at + 1;
+    let mut i = from;
     while i < cmd.len() {
         let word = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
         let value = cmd.get(i + 1);
@@ -1394,7 +1413,7 @@ pub fn scan_arguments(
                 i += 2;
             }
             ("COUNT", Some(count)) => {
-                options.count = match parse_utf8(count).and_then(|s| s.parse::<i64>().ok()) {
+                options.count = match count_integer(count) {
                     Some(n) if n >= 1 => n as usize,
                     Some(_) => return Err(syntax()),
                     None => return Err(resp_error("ERR value is not an integer or out of range")),
@@ -1409,6 +1428,9 @@ pub fn scan_arguments(
                 options.no_values = true;
                 i += 1;
             }
+            ("NOVALUES", _) => {
+                return Err(resp_error("ERR NOVALUES option can only be used in HSCAN"));
+            }
             ("NOSCORES", _) if extra.contains(&"NOSCORES") => {
                 options.no_scores = true;
                 i += 1;
@@ -1416,7 +1438,17 @@ pub fn scan_arguments(
             _ => return Err(syntax()),
         }
     }
-    Ok((cursor, options))
+    Ok(options)
+}
+
+/// The cursor and the options of a scan command, from `cmd[at..]`.
+pub fn scan_arguments(
+    cmd: &[&[u8]],
+    at: usize,
+    extra: &[&str],
+) -> Result<(u64, ScanOptions), Vec<u8>> {
+    let cursor = scan_cursor(cmd, at)?;
+    Ok((cursor, scan_options(cmd, at + 1, extra)?))
 }
 
 #[cfg(test)]
