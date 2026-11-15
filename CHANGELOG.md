@@ -189,6 +189,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
+  of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
+  FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
+  took about 320 instructions a command: 9.9% of a pipelined 100-byte `GET`,
+  8.0% of a `SET`, 6 to 8% of `INCR`, `HGET`, `LPUSH` and `LPOP`. It takes
+  about 50 now (callgrind, Azure D4s_v5, one run, `benchmarks/1.3.0/key-access-tracking`):
+  a pipelined `GET` costs +1.01% (100 B) and +1.52% (1 KB) over master with it
+  off, a `SET` +0.73% and +1.02%, a 16-key `MGET` +0.27%; not pipelined it
+  is +0.5% to +1.5% (one +3.58% outlier, `SET` 1 KB, is noise). There is no
+  memory cost per key. It is still off by default; with it off the
+  per-command path is what it was minus one atomic load, by construction.
+  Callgrind numbers differ by about 0.7% per command between runs. Raised by
+  @Bhupendra3444 in #21 and #298.
+
 - **A grouped `FT.AGGREGATE` reports how many groups there are (#761).** The
   first element of the reply (`total_results` under RESP3) was the number of
   rows on the page, so `GROUPBY 1 @f REDUCE COUNT 0 AS n LIMIT 0 10` over a
