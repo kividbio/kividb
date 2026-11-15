@@ -1,37 +1,37 @@
-# Regression suite: pr758-d4s_v5-rerun
+# Regression suite: pr822-d4s_v5
 
 Verdict: **ok**
 
 - Machine: Standard_D4s_v5, 4 vCPU, Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, kernel 7.0.0-1017-azure, glibc 2.39
 - CPU: recorded on Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz; now Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-- calibration (indicative only): 102.8 ms for a fixed sha256 loop, 4 cores
+- calibration (indicative only): 92.7 ms for a fixed sha256 loop, 4 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`
-- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `93c24ffca5901579d7e3edf8bfadbd8a681b0ef134796655cf12980b0da9f326`
+- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `8c864a8aab10edd0c8e702c1b7b4dc84e2b704859ba09e44c2c7204000908be3`
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
-- candidate commit: `1e5faf61`
+- candidate commit: `f767a149`
 - date: 2026-11-15; FULL=0, SCALE=1
-- run time: 15-brpop-many-keys 327s
+- run time: 15-brpop-many-keys 344s
 
 ## 15-brpop-many-keys
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
 | c1000 | blocked_after | clients | 0 | 0 | 0 | 0 | bound: == 0 | pass |
-| c1000 | jobs_per_s | jobs/s | 355.2 | 1,918 | 1,558 | 1,913 | rel: >= 1,722 (10% under 1,913)<br>ratio: gain over v1.2.2 5.40x >= 3.24x (60% of recorded 5.40x)<br>vs_redis: 0.81x Redis <= 1.5x | pass<br>pass<br>pass |
+| c1000 | jobs_per_s | jobs/s | 379.5 | 1,934 | 1,567 | 1,913 | rel: >= 1,722 (10% under 1,913)<br>ratio: gain over v1.2.2 5.10x >= 3.24x (60% of recorded 5.40x)<br>vs_redis: 0.81x Redis <= 1.5x | pass<br>pass<br>pass |
 | c1000 | lost | jobs | 0 | 0 | 0 | 0 | bound: == 0 | pass |
-| c1000 | ping_max_ms | ms | 1,237 | 30.96 | 41.37 | 51.03 | info | info |
-| c1000 | ping_p99_ms | ms | 458.5 | 5.28 | 30.34 | 4.34 | info | info |
+| c1000 | ping_max_ms | ms | 972.9 | 32.19 | 37.70 | 51.03 | rel: <= 76.55 (50% over 51.03, Redis 37.70 + 10) | pass |
+| c1000 | ping_p99_ms | ms | 373.7 | 5.21 | 27.88 | 4.34 | info | info |
 | c1000x1 | blocked_after | clients | 0 | 0 | 0 | 0 | bound: == 0 | pass |
-| c1000x1 | jobs_per_s | jobs/s | 1,929 | 1,953 | 1,841 | 1,953 | rel: >= 1,758 (10% under 1,953) | pass |
+| c1000x1 | jobs_per_s | jobs/s | 1,920 | 1,950 | 1,838 | 1,953 | rel: >= 1,758 (10% under 1,953) | pass |
 | c1000x1 | lost | jobs | 0 | 0 | 0 | 0 | bound: == 0 | pass |
-| c1000x1 | ping_max_ms | ms | 8.46 | 5.16 | 10.07 | 2.8 | info | info |
-| c1000x1 | ping_p99_ms | ms | 1.06 | 0.498 | 6.28 | 0.411 | info | info |
+| c1000x1 | ping_max_ms | ms | 2.96 | 1.91 | 12.19 | 2.8 | rel: <= 22.19 (50% over 2.8, Redis 12.19 + 10) | pass |
+| c1000x1 | ping_p99_ms | ms | 0.951 | 0.407 | 5.43 | 0.411 | info | info |
 | c4000 | blocked_after | clients | 0 | 0 | 0 | 0 | bound: == 0 | pass |
-| c4000 | jobs_per_s | jobs/s | 30.50 | 1,911 | 932.8 | 1,890 | rel: >= 1,701 (10% under 1,890)<br>vs_redis: 0.49x Redis <= 1.5x | pass<br>pass |
+| c4000 | jobs_per_s | jobs/s | 7.83 | 1,924 | 949.6 | 1,890 | rel: >= 1,701 (10% under 1,890)<br>vs_redis: 0.49x Redis <= 1.5x | pass<br>pass |
 | c4000 | lost | jobs | 0 | 0 | 0 | 0 | bound: == 0 | pass |
-| c4000 | ping_max_ms | ms | 6,135 | 52.05 | 241.5 | 56.27 | info | info |
-| c4000 | ping_p99_ms | ms | 6,135 | 5.91 | 105.2 | 5.64 | info | info |
+| c4000 | ping_max_ms | ms | 20,224 | 72.41 | 215.9 | 56.27 | rel: <= 225.9 (50% over 56.27, Redis 215.9 + 10) | pass |
+| c4000 | ping_p99_ms | ms | 9,320 | 4.99 | 100.8 | 5.64 | info | info |
 
 ## Not run this time
 

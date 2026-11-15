@@ -715,35 +715,36 @@ not held up by the walk (v1.2.2 and Redis hold it for the whole command).
 ## Recorded run, suite 15
 
 Recorded 2026-11-15 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
-`--only 15 --record`; the candidate is commit `1e5faf61` of the #758 PR,
-`cargo build --release`. Runs: `pr758-d4s_v5` (recorded) and
-`pr758-d4s_v5-rerun` (the noise check: every gate passed). About 5.5 minutes:
+`--only 15 --record`; the candidate is commit `f767a149` of #822 (#758),
+`cargo build --release`. Runs: `pr822-d4s_v5` (recorded) and
+`pr822-d4s_v5-rerun` (the noise check: every gate passed). About 5.5 minutes:
 3 configurations x 3 engines, each 8 s of warm-up, 20 s measured and the
 drain.
 
 Workers are raw sockets in two processes, each sending `BRPOP <270 queues in
 an order of its own> 2` again as soon as it is answered; the producer sends
 200 `LPUSH queue:<random> job` in one pipeline every 0.1 s (at most about
-2,000 jobs/s offered, as in the issue). Jobs per second delivered during the
-20 s, recorded run (rerun in brackets):
+2,000 jobs/s offered, as in the issue). Recorded run (rerun in brackets):
 
-| workers x queues | v1.2.2 | candidate | Redis 8.10.2 | gate |
-|---|---:|---:|---:|---|
-| 1,000 x 270 | 354 (355) | 1,913 (1,918) | 1,558 (1,558) | rel 10 %; keep 60 % of the gain; <= 1.5x Redis |
-| 4,000 x 270 | 14 (31) | 1,890 (1,911) | 932 (933) | rel 10 %; <= 1.5x Redis |
-| 1,000 x 1 | 1,919 (1,929) | 1,953 (1,953) | 1,843 (1,841) | rel 10 % (guard) |
+| workers x queues | metric | v1.2.2 | candidate | Redis 8.10.2 | gate |
+|---|---|---:|---:|---:|---|
+| 1,000 x 270 | jobs/s | 380 (375) | 1,934 (1,931) | 1,567 (1,569) | rel 10 %; keep 60 % of the gain; <= 1.5x Redis |
+| 1,000 x 270 | worst PING | 973 (1,015) ms | 32 (23) | 38 (36) | max(1.5x recorded, Redis + 10 ms) |
+| 4,000 x 270 | jobs/s | 8 (39) | 1,924 (1,919) | 950 (975) | rel 10 %; <= 1.5x Redis |
+| 4,000 x 270 | worst PING | 20,224 (5,919) ms | 72 (57) | 216 (174) | max(1.5x recorded, Redis + 10 ms) |
+| 1,000 x 1 | jobs/s | 1,920 (1,935) | 1,950 (1,950) | 1,838 (1,838) | rel 10 % (guard) |
+| 1,000 x 1 | worst PING | 3.0 (2.8) ms | 1.9 (2.4) | 12.2 (11.5) | max(1.5x recorded, Redis + 10 ms) |
 
 The candidate delivers what is offered at every size: the rate is the
-producer's, which is why no gate is scaled by the host's speed. v1.2.2's
-4,000 x 270 rate is 8-31 jobs/s from run to run, so that row has no ratio
-gate (a 60 % ratio failed on the rerun with v1.2.2 at 31 against 14
-recorded, the candidate unchanged). The probe's worst `PING` during the
-window, candidate: 31-56 ms (Redis 39-242, v1.2.2 1.1-7.3 s), gated as the
-other suites' worst `PING` is, at most max(1.5x recorded, Redis + 10 ms),
-not host-scaled (`jitter()`); p99 4-6 ms (Redis 30-105), shown only. Every engine delivered every job exactly once (`lost` 0) and
-left no client blocked once the workers had gone (`blocked_after` 0; the
-issue's 469 left on 1.2.2 were not reproduced here, with workers that close
-cleanly).
+producer's, which is why no gate is scaled by the host's speed (`jitter()`),
+and the worst `PING` is scheduling, not CPU speed, so it is not scaled
+either. v1.2.2's 4,000 x 270 rate is 8-39 jobs/s from run to run, so that
+row has no ratio gate (one failed a rerun on v1.2.2's noise alone, the
+candidate unchanged). The p99 `PING` is shown, not gated: candidate 4-7 ms,
+Redis 27-101, v1.2.2 0.4-9.3 s. Every engine delivered every job exactly
+once (`lost` 0) and left no client blocked once the workers had gone
+(`blocked_after` 0; the issue's 469 left on 1.2.2 were not reproduced here,
+with workers that close cleanly).
 
 ## Not covered
 

@@ -293,12 +293,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now waits on one receiver with one timer, a key's line is an ordered map,
   and a client that leaves passes its turn on only where it had one. On a
   D4s_v5 with 200 jobs pushed every 0.1 s, 1,000 workers x 270 queues get
-  1,924 jobs/s (1.2.2: 373, Redis 8.10.2: 1,566) and 4,000 workers 1,902
-  (1.2.2: 18, Redis: 944), with the same FIFO order per key; the suite is
+  1,934 jobs/s (1.2.2: 380, Redis 8.10.2: 1,567) and 4,000 workers 1,924
+  (1.2.2: 8, Redis: 950), with the same FIFO order per key; the suite is
   `benchmarks/1.3.0/regressions/suites/15-brpop-many-keys.py`.
   Also, a client unblocked with `CLIENT UNBLOCK … ERROR` just as an element
   arrived on its key no longer pops it and then answers `-UNBLOCKED` in its
   place, losing it: it takes nothing, as in Redis.
+  And a blocking command inside `MULTI` or a script no longer stands in
+  line while it looks: a push landing then could wake it instead of the
+  client blocked behind it, which then stayed blocked with the element
+  there.
 
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
