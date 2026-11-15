@@ -2750,6 +2750,9 @@ where
                 let vset_quant_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_vset_quant == Some(true));
+                let slot_imports_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_slot_imports);
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595).
                 client_registry.update(client_id, |info| {
@@ -2781,6 +2784,7 @@ where
                     listening_port,
                     psync,
                     vset_quant_announced,
+                    slot_imports_announced,
                     kill_rx,
                 )
                 .await?;

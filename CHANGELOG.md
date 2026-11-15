@@ -285,6 +285,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica promoted after its master died part way through a slot
+  import deletes what the import brought, and an import sent again no
+  longer brings back keys the source deleted (#741).** The keys a
+  `CLUSTER MIGRATION IMPORT` had already brought stayed on the promoted
+  replica for good, in slots it does not own, and when the import was sent
+  again they were kept beside what it brought, so a key the source had
+  deleted in between was served again. A master now tells the replicas
+  that ask for it which imports it has under way, and which of their
+  slots it held keys of before each began (`REPLCONF capa slot-imports`,
+  then `KIVIDB.IMPORTS`, which is not part of the stream: no offset,
+  backlog, AOF or snapshot has it, and a replica of an earlier release is
+  never sent it). Promoted, the replica deletes what the import brought,
+  and keeps every key that was there before: only once the slot's owner,
+  asked before each batch, says it owns the slot and is not moving it, and
+  never on a replica. Meanwhile an import of those slots is refused, and
+  `INFO cluster` reports `cluster_import_cleanup_slots`. A replica that
+  did not see the import begin (attached or restarted part way) knows
+  only which slots had keys before, and keeps all of theirs. A slot that
+  comes to the promoted node meanwhile is left out of the cleanup for good,
+  and `CLUSTER RESET` forgets the imports. A replica or master of an
+  earlier release behaves as before: `CLUSTER ORPHANSLOTS` lists the keys.
+
 - **`BRPOP` across many keys keeps up with many blocked clients (#758).**
   A client blocked on 270 queues raced 270 receivers, each with a task and
   a timer of its own, and every wait, wake-up and timeout walked a sorted
