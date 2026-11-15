@@ -306,7 +306,12 @@ where
     // changed, only to leave that line, taking nothing: a look made as if
     // its time had run out could take an element, on a node that is a
     // master again by then, and the reply that carried it is not sent.
-    if waiter.interrupted.gone || waiter.interrupted.role_changed {
+    // Unblocked with an error, it takes nothing either: its reply is
+    // `-UNBLOCKED`, and an element popped for it would be lost (#758).
+    if waiter.interrupted.gone
+        || waiter.interrupted.role_changed
+        || waiter.interrupted.unblocked_with_error
+    {
         slot.set_gone(block_state);
     } else {
         slot.set_pending(delivery, block_state);
@@ -1155,7 +1160,9 @@ where
                         if std::mem::take(&mut aof_wait) {
                             crate::aof::written(&aof_tx).await;
                         }
-                        match park_blocking(
+                        // Boxed, and so polled out of line: the wait is cold, and the
+                        // connection's own future stays the size it is without it.
+                        match Box::pin(park_blocking(
                             wait,
                             &mut blocking_slot,
                             &writer,
@@ -1172,7 +1179,7 @@ where
                                 socket_fd,
                                 repl_state: &repl_state,
                             },
-                        )
+                        ))
                         .await
                         {
                             // `parse_offset` deliberately not advanced: the same
@@ -1245,7 +1252,9 @@ where
                     if std::mem::take(&mut aof_wait) {
                         crate::aof::written(&aof_tx).await;
                     }
-                    match park_blocking(
+                    // Boxed, and so polled out of line: the wait is cold, and the
+                    // connection's own future stays the size it is without it.
+                    match Box::pin(park_blocking(
                         wait,
                         &mut blocking_slot,
                         &writer,
@@ -1262,7 +1271,7 @@ where
                             socket_fd,
                             repl_state: &repl_state,
                         },
-                    )
+                    ))
                     .await
                     {
                         // See the note at the non-slowlog site above.

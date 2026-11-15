@@ -31,6 +31,7 @@ and why.
 | `12-search-fanout` | #723 / #725 | 3-master cluster on one VM: connections each other master receives for 2,000 `FT.SEARCH` calls |
 | `13-cluster-reshard` | #294 / #724 | 3-master cluster on one VM, 3M keys: `redis-cli` 7.0.15 `--cluster reshard` of 1,000 slots |
 | `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one; `SDIFFSTORE big small` as a cost guard; worst `SADD` to the small set during `SUNION big small` (Tokio, 1M) |
+| `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
 
 ## Running it
 
@@ -711,9 +712,43 @@ the round trip and redis-py building a Python set of ~2,000 members.
 are there so that cost does not grow, and so a writer of the small set is
 not held up by the walk (v1.2.2 and Redis hold it for the whole command).
 
+## Recorded run, suite 15
+
+Recorded 2026-11-15 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 15 --record`; the candidate is commit `f767a149` of #822 (#758),
+`cargo build --release`. Runs: `pr822-d4s_v5` (recorded) and
+`pr822-d4s_v5-rerun` (the noise check: every gate passed). About 5.5 minutes:
+3 configurations x 3 engines, each 8 s of warm-up, 20 s measured and the
+drain.
+
+Workers are raw sockets in two processes, each sending `BRPOP <270 queues in
+an order of its own> 2` again as soon as it is answered; the producer sends
+200 `LPUSH queue:<random> job` in one pipeline every 0.1 s (at most about
+2,000 jobs/s offered, as in the issue). Recorded run (rerun in brackets):
+
+| workers x queues | metric | v1.2.2 | candidate | Redis 8.10.2 | gate |
+|---|---|---:|---:|---:|---|
+| 1,000 x 270 | jobs/s | 380 (375) | 1,934 (1,931) | 1,567 (1,569) | rel 10 %; keep 60 % of the gain; <= 1.5x Redis |
+| 1,000 x 270 | worst PING | 973 (1,015) ms | 32 (23) | 38 (36) | max(1.5x recorded, Redis + 10 ms) |
+| 4,000 x 270 | jobs/s | 8 (39) | 1,924 (1,919) | 950 (975) | rel 10 %; <= 1.5x Redis |
+| 4,000 x 270 | worst PING | 20,224 (5,919) ms | 72 (57) | 216 (174) | max(1.5x recorded, Redis + 10 ms) |
+| 1,000 x 1 | jobs/s | 1,920 (1,935) | 1,950 (1,950) | 1,838 (1,838) | rel 10 % (guard) |
+| 1,000 x 1 | worst PING | 3.0 (2.8) ms | 1.9 (2.4) | 12.2 (11.5) | max(1.5x recorded, Redis + 10 ms) |
+
+The candidate delivers what is offered at every size: the rate is the
+producer's, which is why no gate is scaled by the host's speed (`jitter()`),
+and the worst `PING` is scheduling, not CPU speed, so it is not scaled
+either. v1.2.2's 4,000 x 270 rate is 8-39 jobs/s from run to run, so that
+row has no ratio gate (one failed a rerun on v1.2.2's noise alone, the
+candidate unchanged). The p99 `PING` is shown, not gated: candidate 4-7 ms,
+Redis 27-101, v1.2.2 0.4-9.3 s. Every engine delivered every job exactly
+once (`lost` 0) and left no client blocked once the workers had gone
+(`blocked_after` 0; the issue's 469 left on 1.2.2 were not reproduced here,
+with workers that close cleanly).
+
 ## Not covered
 
-Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759, after that table).
+Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759 and 15 is #758, after that table).
 From its costs table, these are not re-measured by this suite:
 
 - Instructions per command from callgrind (`GET`/`SET` within 0.1 % for #724,
