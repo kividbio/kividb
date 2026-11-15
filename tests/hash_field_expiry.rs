@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{free_port, restart_verified, start_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,34 +130,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`: asked with a socket that is bound and never
-/// listens (see `tests/resync.rs`).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing listens on, outside the range handed to outgoing
-/// connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(41);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn kividb(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -197,9 +172,9 @@ struct Server {
 impl Server {
     fn start(extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = kividb(&dir, port, &args, &[]);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| kividb(&dir, port, &args, &[]));
         let server = Server {
             port,
             dir,
@@ -233,7 +208,16 @@ impl Server {
     /// connection made the moment it comes up can be reset (master does the
     /// same): it is tried again.
     fn restart(&mut self) {
-        self.child = kividb(&self.dir, self.port, &self.args, &self.env);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters): `self.port` is the one it is on. Whoever was pointed at
+        // the old port has to be pointed at `self.port` again.
+        let (child, port, _) = restart_verified(
+            |port| kividb(&self.dir, port, &self.args, &self.env),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {

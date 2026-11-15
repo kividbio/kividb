@@ -14,8 +14,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
+
+mod common;
+use common::{restart_verified, start_verified};
 
 // ── RESP client, of bytes ─────────────────────────────────────────────────────
 
@@ -171,31 +173,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing listens on, outside the range handed to outgoing
-/// connections.
-fn free_port() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(43);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 struct Server {
     port: u16,
     dir: PathBuf,
@@ -237,9 +214,9 @@ impl Server {
     }
 
     fn start_in(dir: PathBuf, args: &[&str]) -> Self {
-        let port = free_port();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let child = spawn(&dir, port, &args);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| spawn(&dir, port, &args));
         let server = Server {
             port,
             dir,
@@ -293,7 +270,13 @@ impl Server {
             .cloned()
             .collect();
         self.args = args;
-        self.child = spawn(&self.dir, self.port, &self.args);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters). Nothing in this file follows a restarted server by its port.
+        let (child, port, _) =
+            restart_verified(|port| spawn(&self.dir, port, &self.args), self.port);
+        self.child = child;
+        self.port = port;
         self.wait_up();
     }
 }

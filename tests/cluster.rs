@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{Started, confirm, port_is_free};
+
 const NODE_TIMEOUT_MS: u64 = 2000;
 
 // ── Minimal RESP client ───────────────────────────────────────────────────────
@@ -195,25 +198,6 @@ impl Conn {
 
 // ── Node fixture ──────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`. It is asked with a socket that is bound and
-/// never listens. One that listened, as this used to, could be given a
-/// connection: a server another test is starting holds, between its fork and
-/// its exec, a copy of every socket this process has open, and a client that
-/// dialled the port in that moment was connected to the copy and then reset
-/// ("Connection reset by peer", at the first command of a test).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    // As the server's own socket, so that a copy of this one, while it
-    // lasts, does not keep the server from the port.
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
 /// A port whose bus port (`+10000`) is also free — and neither of them one
 /// the system hands out to outgoing connections. The wait for a node to come
 /// up dials both ports over and over; were either in the ephemeral range, one
@@ -261,11 +245,40 @@ impl Node {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         };
-        node.spawn();
-        node
+        // A new node is not known to any other yet, so if its port was taken
+        // between the pick and the bind (by another test's server), it can
+        // be started on another: see `try_spawn`.
+        for _ in 0..10 {
+            match node.try_spawn() {
+                Ok(()) => return node,
+                Err(why) => {
+                    assert!(why.contains("taken by another process"), "{why}");
+                    eprintln!("{why}");
+                    node.kill();
+                    let _ = std::fs::remove_file(node.dir.join("nodes.conf"));
+                    node.port = cluster_port();
+                }
+            }
+        }
+        panic!("no port could be had for the node");
     }
 
+    /// Start the node on its port, and wait for it. Panics if another
+    /// process has the port: see `try_spawn`.
     fn spawn(&mut self) {
+        if let Err(why) = self.try_spawn() {
+            panic!("{why}");
+        }
+    }
+
+    /// Start the node on its port (its own address, in its `nodes.conf` and
+    /// in its peers', so a restarted node cannot move to another), and wait
+    /// until it is up. `Err` if the node's port is not its own: another
+    /// process (a server of another test, started on the port in the gap
+    /// between this node's exit and its restart) answers on it, or the node
+    /// could not listen. Reading that process as the node would show an empty
+    /// or foreign dataset and report a loss that never happened.
+    fn try_spawn(&mut self) -> Result<(), String> {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -314,10 +327,36 @@ impl Node {
         // whole suite at once) that has been seen to take 9 s.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                let log = self.log();
+                return Err(if log.contains("Can't listen on") {
+                    format!(
+                        "port {} taken by another process during restart: the node could not listen ({status}):\n{log}",
+                        self.port
+                    )
+                } else {
+                    format!("the node on {} exited ({status}):\n{log}", self.port)
+                });
+            }
             let up = TcpStream::connect(("127.0.0.1", self.port)).is_ok()
                 && TcpStream::connect(("127.0.0.1", self.port + 10_000)).is_ok();
             if up {
-                return;
+                // Whose is the client port? A node that does not say who it
+                // is (INFO refused) is taken for the one started.
+                let child = self.child.as_mut().unwrap();
+                let own = child.id();
+                return match confirm(child, self.port, Duration::from_secs(60)) {
+                    Started::Ours => Ok(()),
+                    Started::Foreign(pid) => Err(format!(
+                        "port {} taken by another process during restart: process {pid} answers on it, not the node started on it (process {own})",
+                        self.port
+                    )),
+                    Started::Exited => Err(format!(
+                        "port {} taken by another process during restart, or the node failed to start:\n{}",
+                        self.port,
+                        self.log()
+                    )),
+                };
             }
             assert!(
                 Instant::now() < deadline,
