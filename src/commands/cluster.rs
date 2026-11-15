@@ -2717,6 +2717,13 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
     }
     drop(cut);
 
+    // The imports of the master this node followed are no longer its to
+    // settle: it is no one's replica, nor in that cluster (#741). Before it
+    // becomes a master, which would begin their cleanup.
+    ctx.cluster
+        .followed_imports
+        .forget_all(ctx.cluster, "CLUSTER RESET");
+
     // Drop our replica relationship if any.
     ctx.repl_state.become_master();
 
