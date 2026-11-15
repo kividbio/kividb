@@ -595,6 +595,7 @@ fn text_ranked(
     params: &AHashMap<String, Vec<u8>>,
     scorer: Scorer,
     deadline: Option<Instant>,
+    now: &crate::types::QueryClock,
 ) -> Result<(Vec<(String, f64)>, bool), String> {
     let parsed = crate::vector::filter::parse_query(query, params, def)?;
     let found = crate::commands::search::filter_search_scored(
@@ -603,6 +604,7 @@ fn text_ranked(
         &parsed.filter,
         None,
         deadline,
+        now,
         scorer,
     );
     let mut out: Vec<(String, f64)> = found
@@ -625,6 +627,7 @@ fn vsim_ranked(
     filter: Option<&str>,
     params: &AHashMap<String, Vec<u8>>,
     deadline: Option<Instant>,
+    now: &crate::types::QueryClock,
 ) -> Result<(Vec<(String, f64)>, bool), String> {
     let FieldType::Vector { metric, algo, .. } = &field.field_type else {
         return Err(format!(
@@ -654,6 +657,7 @@ fn vsim_ranked(
             &filter,
             None,
             deadline,
+            now,
             |key, fields, json| {
                 if json.is_some() || fields.get(field.name.as_str()).is_some() {
                     scorer.offer(key);
@@ -669,7 +673,7 @@ fn vsim_ranked(
                 VectorAlgo::Hnsw { ef_runtime, .. } => *ef_runtime,
                 VectorAlgo::Flat => k.saturating_mul(2),
             });
-            crate::commands::vector::nearest_shown(db, &field.name, *k, |n| match live {
+            crate::commands::vector::nearest_shown(db, &field.name, *k, now, |n| match live {
                 LiveIndex::Flat(idx) => crate::vector::knn_flat(idx, query_vec, n, metric),
                 LiveIndex::Hnsw(idx) => {
                     crate::vector::knn_hnsw(idx, query_vec, n, ef.max(n).max(50), metric)
@@ -687,7 +691,7 @@ fn vsim_ranked(
                 batch_size: None,
             };
             match crate::commands::vector::knn_planned(
-                ctx, def, &filter, None, &knn, field, deadline,
+                ctx, def, &filter, None, &knn, field, deadline, now,
             ) {
                 Some((nearest, cut)) => {
                     timed_out = cut;
@@ -781,10 +785,13 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
         )
     })?;
     let deadline = crate::commands::search::search_deadline(q.timeout_ms);
+    // One moment for the whole query to judge field deadlines by.
+    let clock = crate::types::QueryClock::new();
+    let now = &clock;
 
     // ── The two lists, each cut to the window ───────────────────────────────
     let (mut text, text_cut) =
-        text_ranked(ctx, &def, &q.search_query, &q.params, scorer, deadline)?;
+        text_ranked(ctx, &def, &q.search_query, &q.params, scorer, deadline, now)?;
     let (mut vsim, vsim_cut) = vsim_ranked(
         ctx,
         &def,
@@ -794,6 +801,7 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
         q.vsim_filter.as_deref(),
         &q.params,
         deadline,
+        now,
     )?;
     // Nearest first; at the same distance, by key.
     rank(&mut vsim, false);
@@ -833,7 +841,7 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
         // The document's fields, for the steps after fusion and for what
         // they show: only when there are any.
         if !q.tail.is_empty() {
-            crate::commands::search::with_doc(db, &def, &key, |fields, doc| {
+            crate::commands::search::with_doc(db, &def, &key, now, |fields, doc| {
                 for (name, value) in fields.iter() {
                     // Text only: a vector's bytes are not a value a row can
                     // show or a step can compute with.

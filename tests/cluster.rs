@@ -6839,6 +6839,15 @@ impl CutShort {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(promoted) = self.replicas.iter().position(|r| r.is_master()) {
+                // A master by its own account, but its view of the cluster may
+                // still be down for a moment: a key command then gets
+                // CLUSTERDOWN. Wait until it serves.
+                let node = &self.replicas[promoted];
+                wait_until(
+                    "the promoted replica's cluster to be ok",
+                    Duration::from_secs(60),
+                    || node.cluster_info("cluster_state") == "ok",
+                );
                 return promoted;
             }
             if Instant::now() > deadline {
@@ -10681,4 +10690,93 @@ fn hello_reports_the_cluster_mode() {
     let reply = nodes[0].conn().cmd(&["HELLO", "2"]);
     assert_eq!(field(&reply, "role"), "master", "{reply:?}");
     assert_eq!(replica.conn().cmd(&["ROLE"]).array()[0].text(), "slave");
+}
+
+/// A time series keeps its labels in the order they were given through an
+/// atomic slot migration (#612): they were held in a hash map, whose order
+/// differs from process to process, so the destination's `TS.INFO` (and its
+/// `DEBUG DIGEST-VALUE`) showed the same pairs in another order. The labels
+/// are the ones `TS.CREATE`, `TS.ALTER` and an auto-created `TS.ADD` set,
+/// in an order that is neither sorted nor the order of any hash.
+#[test]
+fn an_atomic_import_keeps_the_order_of_a_series_labels() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let slot = ranges[0].0 + 7;
+    let slot_s = slot.to_string();
+    let tag = key_in(slot..=slot, "tsl");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+
+    let names = ["zeta", "alpha", "mid", "beta", "omega", "delta", "c", "b"];
+    let mut keys = Vec::new();
+    for i in 0..30 {
+        let key = format!("{{{tag}}}:{i}");
+        // Each series with its own rotation of the names.
+        let mut given = Vec::new();
+        for (j, name) in names.iter().enumerate() {
+            given.push(name.to_string());
+            given.push(format!("v{}", (i + j) % 5));
+        }
+        given.rotate_left(2 * (i % names.len()));
+        let mut cmd = vec!["TS.CREATE", key.as_str(), "LABELS"];
+        let mut altered = vec!["TS.ALTER", key.as_str(), "LABELS"];
+        match i % 3 {
+            // Created with them.
+            0 => {
+                cmd.extend(given.iter().map(String::as_str));
+                assert!(s.cmd(&cmd).is_ok());
+            }
+            // Altered to them.
+            1 => {
+                assert!(s.cmd(&["TS.CREATE", &key, "LABELS", "old", "1"]).is_ok());
+                altered.extend(given.iter().map(String::as_str));
+                assert!(s.cmd(&altered).is_ok());
+            }
+            // Made by an auto-creating TS.ADD.
+            _ => {
+                let mut add = vec!["TS.ADD", key.as_str(), "5", "1", "LABELS"];
+                add.extend(given.iter().map(String::as_str));
+                assert_eq!(s.cmd(&add).int(), 5);
+            }
+        }
+        keys.push((key, given));
+    }
+
+    let labels_of = |c: &mut Conn, key: &str| -> Vec<String> {
+        let info = c.cmd(&["TS.INFO", key]);
+        let info = info.array();
+        let at = info
+            .iter()
+            .position(|v| matches!(v, Resp::Bulk(b) if b == b"labels"))
+            .expect("labels in TS.INFO");
+        info[at + 1]
+            .array()
+            .iter()
+            .flat_map(|pair| pair.array().iter().map(Resp::text))
+            .collect()
+    };
+    let digests = |c: &mut Conn| -> Vec<String> {
+        keys.iter()
+            .map(|(key, _)| c.cmd(&["DEBUG", "DIGEST-VALUE", key]).array()[0].text())
+            .collect()
+    };
+    for (key, given) in &keys {
+        assert_eq!(&labels_of(&mut s, key), given, "{key} on the source");
+    }
+    let before = digests(&mut s);
+
+    let task_id = d
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &slot_s, &slot_s])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(dst, &task_id);
+
+    for (key, given) in &keys {
+        assert_eq!(&labels_of(&mut d, key), given, "{key} on the destination");
+    }
+    assert_eq!(digests(&mut d), before);
+    // Found by its labels there.
+    let found = d.cmd(&["TS.QUERYINDEX", "alpha=v1"]);
+    assert!(!found.array().is_empty(), "{found:?}");
 }
