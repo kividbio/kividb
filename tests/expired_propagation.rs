@@ -19,6 +19,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+use common::{free_port, restart_verified};
+
 #[derive(Debug, Clone, PartialEq)]
 enum V {
     Simple(String),
@@ -150,29 +153,6 @@ impl Conn {
     }
 }
 
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(41);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 /// A server process in a directory of its own, which outlives it, for a
 /// restart to replay.
 struct Server {
@@ -214,38 +194,36 @@ impl Server {
 
     fn run(&mut self) {
         let io_model = std::env::var("KIVIDB_TEST_IO_MODEL").ok();
-        let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
-            .current_dir(&self.dir)
-            .args([
-                "--port",
-                &self.port.to_string(),
-                "--bind",
-                "127.0.0.1",
-                "--threads",
-                "4",
-                "--configfile",
-                "kividb.conf",
-            ])
-            .args(io_model.iter().flat_map(|m| ["--io-model", m.as_str()]))
-            .args(&self.extra)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(self.dir.join("server.log")).unwrap())
-            .spawn()
-            .expect("could not start kividb");
+        let (dir, extra) = (self.dir.clone(), self.extra.clone());
+        // Accepted only when the server answering on the port is the process
+        // started (it can be another test's, started on the port while it was
+        // free); if not, started again on another port. See tests/common/mod.rs.
+        let (child, port, _) = restart_verified(
+            |port| {
+                Command::new(env!("CARGO_BIN_EXE_kividb"))
+                    .current_dir(&dir)
+                    .args([
+                        "--port",
+                        &port.to_string(),
+                        "--bind",
+                        "127.0.0.1",
+                        "--threads",
+                        "4",
+                        "--configfile",
+                        "kividb.conf",
+                    ])
+                    .args(io_model.iter().flat_map(|m| ["--io-model", m.as_str()]))
+                    .args(&extra)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(std::fs::File::create(dir.join("server.log")).unwrap())
+                    .spawn()
+                    .expect("could not start kividb")
+            },
+            self.port,
+        );
         self.child = Some(child);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while TcpStream::connect(("127.0.0.1", self.port)).is_err() {
-            let exited = self.child.as_mut().unwrap().try_wait().unwrap();
-            if exited.is_some() || Instant::now() > deadline {
-                let log = std::fs::read_to_string(self.dir.join("server.log")).unwrap_or_default();
-                panic!(
-                    "the server on {} did not start ({exited:?}):\n{log}",
-                    self.port
-                );
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+        self.port = port;
         assert_eq!(self.conn().cmd(&["PING"]), V::Simple("PONG".into()));
     }
 

@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{port_is_free, restart_verified, start_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,34 +127,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`, asked with a socket that is bound and never
-/// listens (see tests/backup.rs).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on, outside the range the system hands out
-/// to outgoing connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(37);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 /// The I/O models to run each test on: both, where io_uring exists.
 fn io_models() -> &'static [&'static str] {
     if cfg!(target_os = "linux") {
@@ -208,8 +183,8 @@ struct Server {
 impl Server {
     fn start(io: &'static str, failpoints: &str) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
-        let child = launch(&dir, port, io, failpoints, true);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| launch(&dir, port, io, failpoints, true));
         let server = Server {
             port,
             dir,
@@ -243,7 +218,15 @@ impl Server {
     }
 
     fn restart(&mut self) -> Conn {
-        self.child = launch(&self.dir, self.port, self.io, &self.failpoints, self.aof);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters; nothing in this file keeps the port).
+        let (child, port, _) = restart_verified(
+            |port| launch(&self.dir, port, self.io, &self.failpoints, self.aof),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         self.conn()
     }
 

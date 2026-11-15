@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{free_port, restart_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,42 +154,6 @@ struct Server {
     child: Child,
 }
 
-/// Whether nothing has `port`. It is asked with a socket that is bound and
-/// never listens. One that listened, as this used to, could be given a
-/// connection: a server another test is starting holds, between its fork and
-/// its exec, a copy of every socket this process has open, and a client that
-/// dialled the port in that moment was connected to the copy and then reset
-/// ("Connection reset by peer", at the first command of a test).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    // As the server's own socket, so that a copy of this one, while it
-    // lasts, does not keep the server from the port.
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on — and not one the system hands out to
-/// outgoing connections. A client that starts dialling before its server is
-/// listening can otherwise be given, as its own end, the very port it is
-/// dialling: it is then connected to itself and reads back what it writes.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(31);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn kividb(dir: &Path, port: u16, extra: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kividb"));
     cmd.current_dir(dir)
@@ -224,6 +191,25 @@ impl Server {
 
     fn conn(&self) -> Conn {
         Conn::connect(self.port)
+    }
+
+    /// Started again on the same directory, with `extra` as its arguments.
+    /// On the same port if it is still free, and on another if a test of
+    /// another process has taken it in the gap (the data directory is what
+    /// matters): `self.port` is the one it is on, and a client has to be given
+    /// that one. Verified to be the process started: see tests/common/mod.rs.
+    fn restart_with(&mut self, extra: &[&str]) {
+        let (child, port, _) = restart_verified(
+            |port| {
+                kividb(&self.dir, port, extra)
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("could not restart kividb")
+            },
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
     }
 }
 
@@ -703,7 +689,6 @@ fn lastsave_starts_at_the_start_and_moves_with_every_save() {
 #[test]
 fn a_killed_server_keeps_every_acknowledged_write() {
     let mut server = Server::start(&["--aof"]);
-    let port = server.port;
     // The default; `no` gives up the guarantee for speed (1.1.2's way).
     let mut c = server.conn();
     let setting = c.cmd(&["CONFIG", "GET", "aof-ack-after-write"]);
@@ -716,6 +701,7 @@ fn a_killed_server_keeps_every_acknowledged_write() {
     );
     drop(c);
     for round in 0..3 {
+        let port = server.port;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writers: Vec<_> = (0..6)
             .map(|w| {
@@ -740,10 +726,7 @@ fn a_killed_server_keeps_every_acknowledged_write() {
         server.child.wait().unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let acked: Vec<(String, i64)> = writers.into_iter().map(|w| w.join().unwrap()).collect();
-        server.child = kividb(&server.dir, port, &["--aof"])
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("could not restart kividb");
+        server.restart_with(&["--aof"]);
         let mut c = server.conn();
         for (key, acked) in acked {
             let kept: i64 = match c.cmd(&["GET", &key]) {
@@ -976,10 +959,7 @@ fn appendfsync_always_stops_at_a_failed_sync() {
     let said = said.join().unwrap();
     assert!(said.contains("failed under appendfsync always"), "{said}");
 
-    server.child = kividb(&server.dir, port, &args)
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&args);
     let mut c = server.conn();
     assert_eq!(c.cmd(&["GET", "before"]).s(), "1");
     for (key, acked) in acked {
@@ -1006,10 +986,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
     server.child.kill().unwrap();
     server.child.wait().unwrap();
 
-    server.child = kividb(&server.dir, server.port, &[])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&[]);
     let mut c = server.conn();
     assert_eq!(status(&mut c).0, "sealed");
     assert_eq!(c.cmd(&["BACKUP", "LIST"]).strings(), listed);
@@ -1022,10 +999,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
     // Cut short by the restart: a failed backup, which the next one clears.
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &[])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&[]);
     let mut c = server.conn();
     assert_eq!(status(&mut c).0, "failed");
     assert!(c.cmd(&["BACKUP", "START"]).ok());
@@ -1047,10 +1021,7 @@ fn a_sealed_backup_from_before_a_restart_still_runs_out() {
     drop(c);
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "10"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--backup-sealed-ttl", "10"]);
     let mut c = server.conn();
     assert_eq!(status(&mut c).0, "sealed");
     wait_for_state(&mut c, "idle");
@@ -1110,10 +1081,7 @@ fn hashes_loaded_from_a_snapshot_lose_their_expired_fields_and_go() {
     drop(c);
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &[])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&[]);
 
     let mut c = server.conn();
     assert!(
@@ -1221,10 +1189,7 @@ fn ttls_survive_an_aof_replay_unchanged() {
     server.child.kill().unwrap();
     server.child.wait().unwrap();
     std::thread::sleep(Duration::from_millis(1500));
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
 
     let mut c = server.conn();
     assert_same_expiries(&before, &expiry_times(&mut c));
@@ -1315,10 +1280,7 @@ fn a_truncated_aof_tail_is_cut_off_and_the_log_stays_usable() {
     torn.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$4\r\nhalf");
     std::fs::write(&aof, &torn).unwrap();
 
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
     let mut c = server.conn();
     assert_eq!(c.cmd(&["DBSIZE"]).i(), 20);
     assert_eq!(c.cmd(&["EXISTS", "half"]).i(), 0);
@@ -1334,10 +1296,7 @@ fn a_truncated_aof_tail_is_cut_off_and_the_log_stays_usable() {
     );
 
     // The record written after the tear follows whole records, so this loads.
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
     let mut c = server.conn();
     assert_eq!(c.cmd(&["DBSIZE"]).i(), 21);
     assert_eq!(c.cmd(&["GET", "after"]).s(), "v");
@@ -1494,10 +1453,7 @@ fn checkpointed_then_written(server: &mut Server) {
 }
 
 fn restart_with_aof(server: &mut Server) -> Conn {
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
     server.conn()
 }
 
