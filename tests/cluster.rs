@@ -6769,6 +6769,124 @@ fn an_import_cut_short_by_a_restart_keeps_the_keys_held_before_it() {
     assert!(not_as_written(&nodes[1], &brought, "src").is_empty());
 }
 
+/// #741 reproduction. Three masters and a replica of the second. The second
+/// imports slot t (it held no keys of it) and slot s (it held 31 orphans of
+/// it) from the first, whose handoff is held; once the keys have reached the
+/// replica the second is killed and the replica promoted. On master the 80
+/// keys the import brought stay on the promoted node, reported as orphans
+/// only; and the import retried from it completes with a key of each slot
+/// that the source deleted between the attempts back as live data.
+#[test]
+fn a_promoted_replica_of_an_import_destination_that_died_mid_import() {
+    let a = Node::start_with_env(&[], &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "60000")]);
+    let (mut nodes, ranges) = form_cluster_of(vec![a, Node::start(&[]), Node::start(&[])]);
+    let replica = add_replica_with(&nodes, &nodes[1], &[], &[]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
+    let a_id = nodes[0].id();
+
+    // Orphans of slot s on the destination: s was the destination's, and
+    // was given to the source by hand, its keys left.
+    let s = slot_of(&key_in(ranges[1].0..=ranges[1].0 + 100, "s"));
+    let t = slot_of(&key_in(0..=100, "t"));
+    assert!(t < s);
+    let orphans = keys_of_slot(s, "orphan", 30);
+    let both = keys_of_slot(s, "both", 1).remove(0);
+    let own = keys_in(ranges[1].0 + 200..=ranges[1].1, "own", 100);
+    let mut b = nodes[1].conn();
+    set_all(&mut b, &orphans, "only");
+    set_all(&mut b, std::slice::from_ref(&both), "old");
+    set_all(&mut b, &own, "own");
+    give_slots(&nodes, &[(s, &nodes[0])]);
+    wait_until(
+        "the destination to see the source own s",
+        Duration::from_secs(30),
+        || orphan_slots(&nodes[1]) == vec![(s, s, 31, Some(a_id.clone()))],
+    );
+    // The replica's table too: else its promotion would claim s back.
+    let r = replica
+        .conn()
+        .cmd(&["CLUSTER", "DELSLOTS", &s.to_string()]);
+    assert!(r.is_ok(), "{r:?}");
+    let to_a = format!("MOVED {s} 127.0.0.1:{}", nodes[0].port);
+    wait_until(
+        "the replica to see the source own s",
+        Duration::from_secs(30),
+        || {
+            replica
+                .conn()
+                .cmd(&["GET", &orphans[0]])
+                .err()
+                .is_some_and(|e| e.contains(&to_a))
+        },
+    );
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
+    let brought = keys_of_slot(s, "brought", 40);
+    let brought2 = keys_of_slot(t, "brought2", 40);
+    let mut src = nodes[0].conn();
+    set_all(&mut src, &brought, "src");
+    set_all(&mut src, &brought2, "src");
+    set_all(&mut src, std::slice::from_ref(&both), "src");
+
+    let range = [t.to_string(), t.to_string(), s.to_string(), s.to_string()];
+    let mut import = vec!["CLUSTER", "MIGRATION", "IMPORT"];
+    import.extend(range.iter().map(String::as_str));
+    let task_id = b.cmd(&import).text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    let all_brought: Vec<String> = brought.iter().chain(&brought2).cloned().collect();
+    wait_until(
+        "the import's keys to reach the destination's replica",
+        Duration::from_secs(30),
+        || held_of(&replica, &all_brought).len() == all_brought.len(),
+    );
+    assert_eq!(held_of(&replica, &orphans), orphans);
+
+    nodes[1].kill();
+    wait_until(
+        "the replica to be promoted",
+        Duration::from_secs(60),
+        || replica.is_master(),
+    );
+    wait_until(
+        "the source's migration to end",
+        Duration::from_secs(90),
+        || import_state(&nodes[0], &task_id) != "in_progress",
+    );
+    std::thread::sleep(Duration::from_secs(15));
+    eprintln!(
+        "AFTER PROMOTION: orphanslots={:?} brought={} brought2={} orphans={} both={} own={} dbsize={}",
+        orphan_slots(&replica),
+        held_of(&replica, &brought).len(),
+        held_of(&replica, &brought2).len(),
+        held_of(&replica, &orphans).len(),
+        held_of(&replica, std::slice::from_ref(&both)).len(),
+        held_of(&replica, &own).len(),
+        replica.conn().cmd(&["DBSIZE"]).int()
+    );
+    eprintln!("REPLICA LOG:\n{}", replica.log());
+
+    // The import, retried from the promoted node, after the source deleted
+    // one key of each slot.
+    let stale = [brought[0].clone(), brought2[0].clone()];
+    for k in &stale {
+        assert_eq!(src.cmd(&["DEL", k]).int(), 1);
+    }
+    let mut r = replica.conn();
+    let again = r.cmd(&import);
+    eprintln!("RETRY: {again:?}");
+    let again = again.text();
+    wait_import_completed(&replica, &again);
+    eprintln!(
+        "AFTER RETRY: stale_present={:?} brought_wrong={:?} brought2_wrong={:?} orphans_wrong={:?} both={:?} own_wrong={}",
+        held_of(&replica, &stale),
+        not_as_written(&replica, &brought[1..], "src"),
+        not_as_written(&replica, &brought2[1..], "src"),
+        not_as_written(&replica, &orphans, "only"),
+        r.cmd(&["GET", &both]),
+        not_as_written(&replica, &own, "own").len()
+    );
+    assert!(held_of(&replica, &stale).is_empty(), "stale keys resurfaced");
+}
+
 /// `n` keys of `slot`, `{tag}:prefix:i`.
 fn keys_of_slot(slot: u16, prefix: &str, n: usize) -> Vec<String> {
     let tag = (0..)
