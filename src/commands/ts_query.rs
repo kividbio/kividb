@@ -12,7 +12,6 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::{TsAggregation, TsInner};
-use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -714,16 +713,15 @@ fn labels_reply(resp: u8, pairs: Vec<(String, Option<String>)>) -> Vec<u8> {
 
 fn selected_labels(
     selection: &LabelSelection,
-    labels: &AHashMap<String, String>,
+    labels: &crate::types::Labels,
 ) -> Vec<(String, Option<String>)> {
     match selection {
         LabelSelection::None => Vec::new(),
         LabelSelection::All => {
-            let mut pairs: Vec<_> = labels
+            let pairs: Vec<_> = labels
                 .iter()
                 .map(|(k, v)| (k.clone(), Some(v.clone())))
                 .collect();
-            pairs.sort();
             pairs
         }
         LabelSelection::Selected(names) => names
@@ -852,7 +850,7 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
     keys.sort_unstable();
 
     // (key, labels, rows) per matching series, ascending.
-    let mut results: Vec<(String, AHashMap<String, String>, Vec<Row>)> = Vec::new();
+    let mut results: Vec<(String, crate::types::Labels, Vec<Row>)> = Vec::new();
     for key in keys {
         let Ok(Some(series)) = series_at(ctx, &crate::key_bytes::bytes_of(&key)) else {
             continue;
