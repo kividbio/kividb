@@ -299,6 +299,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clients do for Redis. A script's writes always reached a replica as the
   commands it made, never as `EVALSHA`, so a replica did not need it.
 
+- **A time series keeps its labels in the order they were given
+  (#612).** They were held in a hash map, whose order differs from one
+  process to the next, so `TS.INFO` and `WITHLABELS` showed the pairs in an
+  order of the server's own choosing, and a replica after a full sync, a
+  restart, a `DUMP` and `RESTORE`, or a slot migration showed them in
+  another: `DEBUG DIGEST-VALUE` of the same series then differed between
+  nodes. As in RedisTimeSeries, `TS.INFO`, `TS.MGET`, `TS.MRANGE` and
+  `TS.MREVRANGE` give them as given (the last two sorted them by name).
+  Nothing in a snapshot, a `DUMP` payload or the append-only file changes:
+  they were written as a list of pairs, and are read in the order written,
+  so files move between this release and 1.2.x either way.
+
 - **A replica promoted after its master died part way through a slot
   import deletes what the import brought, and an import sent again no
   longer brings back keys the source deleted (#741).** The keys a
@@ -320,6 +332,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   comes to the promoted node meanwhile is left out of the cleanup for good,
   and `CLUSTER RESET` forgets the imports. A replica or master of an
   earlier release behaves as before: `CLUSTER ORPHANSLOTS` lists the keys.
+
+- **`BRPOP` across many keys keeps up with many blocked clients (#758).**
+  A client blocked on 270 queues raced 270 receivers, each with a task and
+  a timer of its own, and every wait, wake-up and timeout walked a sorted
+  line of every client on each of those keys; a client that timed out also
+  woke the next client in every one of its lines, for nothing. Each client
+  now waits on one receiver with one timer, a key's line is an ordered map,
+  and a client that leaves passes its turn on only where it had one. On a
+  D4s_v5 with 200 jobs pushed every 0.1 s, 1,000 workers x 270 queues get
+  1,934 jobs/s (1.2.2: 380, Redis 8.10.2: 1,567) and 4,000 workers 1,924
+  (1.2.2: 8, Redis: 950), with the same FIFO order per key; the suite is
+  `benchmarks/1.3.0/regressions/suites/15-brpop-many-keys.py`.
+  Also, a client unblocked with `CLIENT UNBLOCK … ERROR` just as an element
+  arrived on its key no longer pops it and then answers `-UNBLOCKED` in its
+  place, losing it: it takes nothing, as in Redis.
+  And a blocking command inside `MULTI` or a script no longer stands in
+  line while it looks: a push landing then could wake it instead of the
+  client blocked behind it, which then stayed blocked with the element
+  there.
 
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,

@@ -3194,3 +3194,182 @@ fn save_leaves_other_clients_answered() {
     // The snapshot of 1.5M keys is some 100 MB: not left in /tmp.
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Time series labels keep their order (#612) ───────────────────────────────
+
+/// Label names in an order that is neither sorted nor the order of any hash.
+const LABEL_NAMES: [&str; 8] = ["zeta", "alpha", "mid", "beta", "omega", "delta", "c", "b"];
+
+/// Series `ts:<round>:<i>`, each with several labels in an order of its own,
+/// made by each of the commands that can set labels. Returns the key and the
+/// labels as they were given.
+fn write_series(c: &mut Conn, round: usize, count: usize) -> Vec<(String, Vec<String>)> {
+    (0..count)
+        .map(|i| {
+            let key = format!("ts:{round}:{i}");
+            let mut given: Vec<String> = LABEL_NAMES
+                .iter()
+                .enumerate()
+                .flat_map(|(j, name)| [name.to_string(), format!("v{}", (i + j) % 5)])
+                .collect();
+            given.rotate_left(2 * (i % LABEL_NAMES.len()));
+            let mut args: Vec<&str> = match i % 5 {
+                0 => vec!["TS.CREATE", &key, "LABELS"],
+                1 => vec!["TS.ADD", &key, "5", "1", "LABELS"],
+                2 => vec!["TS.INCRBY", &key, "3", "LABELS"],
+                3 => vec!["TS.DECRBY", &key, "3", "LABELS"],
+                _ => vec!["TS.CREATE", &key, "LABELS", "old", "1"],
+            };
+            if i % 5 == 4 {
+                assert!(c.cmd(&args).ok());
+                args = vec!["TS.ALTER", &key, "LABELS"];
+            }
+            args.extend(given.iter().map(String::as_str));
+            let reply = c.cmd(&args);
+            assert!(!matches!(reply, V::Err(_)), "{args:?}: {reply:?}");
+            (key.clone(), given)
+        })
+        .collect()
+}
+
+/// The labels `TS.INFO` gives, flat, in the order given.
+fn info_labels(c: &mut Conn, key: &str) -> Vec<String> {
+    let info = c.cmd(&["TS.INFO", key]);
+    let info = info.arr();
+    let at = info
+        .iter()
+        .position(|v| matches!(v, V::Str(s) if s == "labels"))
+        .unwrap_or_else(|| panic!("no labels in TS.INFO {key}: {info:?}"));
+    info[at + 1]
+        .arr()
+        .iter()
+        .flat_map(|pair| pair.arr().iter().map(|v| v.s().to_string()))
+        .collect()
+}
+
+fn digest_of(c: &mut Conn, key: &str) -> String {
+    c.cmd(&["DEBUG", "DIGEST-VALUE", key]).arr()[0]
+        .s()
+        .to_string()
+}
+
+/// `node` has every series with its labels in the order given, and (with
+/// `want_digests`) the digests `want_digests` holds.
+fn assert_labels(
+    c: &mut Conn,
+    series: &[(String, Vec<String>)],
+    digests: Option<&[String]>,
+    what: &str,
+) {
+    for (n, (key, given)) in series.iter().enumerate() {
+        assert_eq!(&info_labels(c, key), given, "{what}: {key}");
+        if let Some(digests) = digests {
+            assert_eq!(&digest_of(c, key), &digests[n], "{what}: {key} digest");
+        }
+    }
+}
+
+/// A replica holds a series' labels in the order they were given: after a
+/// full sync, and for the series it is sent live, by every command that can
+/// set them; and after a restart from its snapshot.
+#[test]
+fn a_replica_keeps_the_order_of_a_series_labels() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    let before = write_series(&mut m, 0, 40);
+    assert_labels(&mut m, &before, None, "master");
+    let before_digests: Vec<String> = before.iter().map(|(k, _)| digest_of(&mut m, k)).collect();
+
+    // Full sync.
+    let port = master.port.to_string();
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert_labels(&mut r, &before, Some(&before_digests), "after a full sync");
+
+    // Live: as the commands run.
+    let live = write_series(&mut m, 1, 40);
+    assert_same_dataset(&mut m, &mut r);
+    let live_digests: Vec<String> = live.iter().map(|(k, _)| digest_of(&mut m, k)).collect();
+    assert_labels(&mut r, &live, Some(&live_digests), "live");
+
+    // Restart from the snapshot.
+    drop(r);
+    replica.shutdown();
+    replica.restart();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    let all: Vec<_> = before.iter().chain(&live).cloned().collect();
+    let all_digests: Vec<String> = before_digests
+        .iter()
+        .chain(&live_digests)
+        .cloned()
+        .collect();
+    assert_labels(&mut r, &all, Some(&all_digests), "replica after a restart");
+}
+
+/// A server restarted from its snapshot, and one started from its append-only
+/// file, hold a series' labels in the order they were given.
+#[test]
+fn a_restart_keeps_the_order_of_a_series_labels() {
+    // From a snapshot.
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    let series = write_series(&mut c, 0, 40);
+    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut c, k)).collect();
+    drop(c);
+    server.shutdown();
+    assert!(server.dir.join("dump.kdb").exists());
+    server.restart();
+    let mut c = server.conn();
+    assert_labels(&mut c, &series, Some(&digests), "snapshot");
+    drop(c);
+    server.kill();
+
+    // From the AOF alone: killed, with no snapshot to read.
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let series = write_series(&mut c, 0, 40);
+    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut c, k)).collect();
+    // Written to the file before the process is killed.
+    assert!(c.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i() >= 1);
+    drop(c);
+    server.kill();
+    let _ = std::fs::remove_file(server.dir.join("dump.kdb"));
+    server.restart();
+    let mut c = server.conn();
+    assert_labels(&mut c, &series, Some(&digests), "AOF replay");
+
+    // After an AOF rewrite, which writes the series out as commands or a
+    // snapshot, and a restart.
+    assert!(!matches!(c.cmd(&["BGREWRITEAOF"]), V::Err(_)));
+    wait_until("the rewrite to finish", || {
+        !c.info("persistence", "aof_rewrite_in_progress").eq("1")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    drop(c);
+    server.kill();
+    server.restart();
+    let mut c = server.conn();
+    assert_labels(&mut c, &series, Some(&digests), "AOF rewrite");
+    drop(c);
+    server.kill();
+}
+
+/// `MIGRATE` carries a series' labels in the order they were given.
+#[test]
+fn migrate_keeps_the_order_of_a_series_labels() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let (mut f, mut t) = (from.conn(), to.conn());
+    let series = write_series(&mut f, 0, 40);
+    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut f, k)).collect();
+    let to_port = to.port.to_string();
+    for (key, _) in &series {
+        let reply = f.cmd(&["MIGRATE", "127.0.0.1", &to_port, key, "0", "5000"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_labels(&mut t, &series, Some(&digests), "after MIGRATE");
+}
