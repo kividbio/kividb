@@ -761,7 +761,12 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
     drop(map);
 
     let labels = options.labels.unwrap_or_default();
-    update_label_index(ctx.ts_index, &key, &crate::types::Labels::default(), &labels);
+    update_label_index(
+        ctx.ts_index,
+        &key,
+        &crate::types::Labels::default(),
+        &labels,
+    );
     Some(resp_simple("OK"))
 }
 
@@ -898,7 +903,12 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     if created {
         let labels = options.labels.unwrap_or_default();
-        update_label_index(ctx.ts_index, &key, &crate::types::Labels::default(), &labels);
+        update_label_index(
+            ctx.ts_index,
+            &key,
+            &crate::types::Labels::default(),
+            &labels,
+        );
     }
 
     match result {
@@ -1059,7 +1069,12 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
     };
     if created {
         let labels = options.labels.unwrap_or_default();
-        update_label_index(ctx.ts_index, &key, &crate::types::Labels::default(), &labels);
+        update_label_index(
+            ctx.ts_index,
+            &key,
+            &crate::types::Labels::default(),
+            &labels,
+        );
     }
     match added {
         Ok(stored_ts) => {

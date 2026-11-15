@@ -2417,7 +2417,10 @@ fn test_ts_labels_keep_the_order_given() {
             panic!("DUMP {key}");
         };
         let copy = format!("{key}:copy");
-        assert!(c.cmd(&[b"RESTORE", copy.as_bytes(), b"0", &payload]).is_ok());
+        assert!(
+            c.cmd(&[b"RESTORE", copy.as_bytes(), b"0", &payload])
+                .is_ok()
+        );
         assert_eq!(info_labels(&mut c, &copy), altered, "RESTORE {copy}");
         assert_eq!(digest_of(&mut c, &copy), digest_of(&mut c, &key), "{key}");
     }
@@ -2425,34 +2428,4 @@ fn test_ts_labels_keep_the_order_given() {
     // The label index finds them: the series with alpha=v1 (the second name).
     let r = c.cmds(&["TS.QUERYINDEX", "alpha=v1"]);
     assert!(!r.as_array().is_empty());
-}
-
-/// `MIGRATE` carries a series' labels in the order they were given.
-#[test]
-fn test_ts_labels_keep_the_order_through_migrate() {
-    let (from_port, to_port) = (free_port(), free_port());
-    start_server(from_port);
-    start_server(to_port);
-    let mut from = Conn::connect(from_port);
-    let mut to = Conn::connect(to_port);
-
-    let mut series = Vec::new();
-    for i in 0..10 {
-        let key = format!("mig:{i}");
-        let given = order_given(i % ORDER_NAMES.len());
-        let mut create = vec!["TS.CREATE", key.as_str(), "LABELS"];
-        create.extend(given.iter().map(String::as_str));
-        assert!(from.cmds(&create).is_ok());
-        series.push((key, given));
-    }
-    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut from, k)).collect();
-    let to_port_s = to_port.to_string();
-    for (key, _) in &series {
-        let r = from.cmds(&["MIGRATE", "127.0.0.1", &to_port_s, key, "0", "5000"]);
-        assert!(r.is_ok(), "MIGRATE {key}: {r:?}");
-    }
-    for ((key, given), digest) in series.iter().zip(&digests) {
-        assert_eq!(&info_labels(&mut to, key), given, "{key}");
-        assert_eq!(&digest_of(&mut to, key), digest, "{key}");
-    }
 }

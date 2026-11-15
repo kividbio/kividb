@@ -555,7 +555,6 @@ pub struct CompactionRule {
 /// differs per process, #612).
 pub type Labels = indexmap::IndexMap<String, String, ahash::RandomState>;
 
-
 #[derive(Debug, Clone)]
 pub struct TsInner {
     /// All samples: timestamp_ms → value.

@@ -3077,7 +3077,9 @@ fn info_labels(c: &mut Conn, key: &str) -> Vec<String> {
 }
 
 fn digest_of(c: &mut Conn, key: &str) -> String {
-    c.cmd(&["DEBUG", "DIGEST-VALUE", key]).arr()[0].s().to_string()
+    c.cmd(&["DEBUG", "DIGEST-VALUE", key]).arr()[0]
+        .s()
+        .to_string()
 }
 
 /// `node` has every series with its labels in the order given, and (with
@@ -3129,7 +3131,11 @@ fn a_replica_keeps_the_order_of_a_series_labels() {
     wait_link_up(&mut r);
     assert_same_dataset(&mut m, &mut r);
     let all: Vec<_> = before.iter().chain(&live).cloned().collect();
-    let all_digests: Vec<String> = before_digests.iter().chain(&live_digests).cloned().collect();
+    let all_digests: Vec<String> = before_digests
+        .iter()
+        .chain(&live_digests)
+        .cloned()
+        .collect();
     assert_labels(&mut r, &all, Some(&all_digests), "replica after a restart");
 }
 
@@ -3179,4 +3185,20 @@ fn a_restart_keeps_the_order_of_a_series_labels() {
     assert_labels(&mut c, &series, Some(&digests), "AOF rewrite");
     drop(c);
     server.kill();
+}
+
+/// `MIGRATE` carries a series' labels in the order they were given.
+#[test]
+fn migrate_keeps_the_order_of_a_series_labels() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let (mut f, mut t) = (from.conn(), to.conn());
+    let series = write_series(&mut f, 0, 40);
+    let digests: Vec<String> = series.iter().map(|(k, _)| digest_of(&mut f, k)).collect();
+    let to_port = to.port.to_string();
+    for (key, _) in &series {
+        let reply = f.cmd(&["MIGRATE", "127.0.0.1", &to_port, key, "0", "5000"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_labels(&mut t, &series, Some(&digests), "after MIGRATE");
 }
