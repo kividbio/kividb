@@ -25,10 +25,9 @@
 //! key's own entry, in one 32-bit word of its header, as Redis keeps it in
 //! the object's `lru` field: see [`Access`]. It is written while a policy
 //! that asks for it is selected, and whatever the policy while
-//! `key-access-tracking` is on, which it is by default (as in Redis, so that
-//! `OBJECT IDLETIME` answers under `noeviction`); with `key-access-tracking
-//! no` and a policy that does not ask for it, a command pays one atomic load
-//! for all of this, and each of its lookups one thread-local load. The word
+//! `key-access-tracking yes` is set (as in Redis, so that `OBJECT IDLETIME`
+//! answers under `noeviction`); by default, with a policy that does not ask
+//! for it, a command pays one atomic load for all of this, and each of its lookups one thread-local load. The word
 //! is written only when it changes, so a key read again and again within
 //! the same second dirties its cache line once.
 //!
@@ -193,11 +192,12 @@ pub fn set_policy(policy: Policy) {
 
 /// `key-access-tracking`: whether a key's use is recorded under every
 /// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
-/// `noeviction` too, as Redis does (#21). On by default: recording costs
+/// `noeviction` too, as Redis does (#21). Off by default: recording costs
 /// every command a clock reading (kept for the second it is read in) and a
 /// scope for its lookups, and each lookup a store to the key's entry when
-/// its word changes. It costs a key nothing: the word is in every entry
-/// anyway. Under an LRU or LFU policy it is recorded either way.
+/// its word changes: about 50 instructions, 1 to 1.5% of a pipelined `GET`
+/// or `SET` (`benchmarks/1.3.0/key-access-tracking`). It costs a key nothing:
+/// the word is in every entry anyway. Under an LRU or LFU policy it is recorded either way.
 pub fn key_access_tracking() -> bool {
     TRACK_ALWAYS.load(Ordering::Relaxed)
 }

@@ -1,4 +1,4 @@
-# `key-access-tracking yes` by default (#21)
+# `key-access-tracking yes`: what it costs (#21)
 
 What it costs a command, and a key, to keep when each key was last used (or
 how often) under every `maxmemory-policy`, so that `OBJECT IDLETIME`,
@@ -11,7 +11,7 @@ callgrind, 40,000 commands per workload, built with `LTO=fat` (the release
 profile as shipped). Pipelined is `redis-benchmark -P 16`, not pipelined `-P 1`;
 the keys are loaded first. `MGET16` is an `MGET` of 16 keys.
 
-| command | master, tracking off (today's default) | branch, tracking off | branch, tracking on (new default) | new default vs today |
+| command | master, tracking off (today's default) | branch, tracking off | branch, tracking on | tracking on vs today |
 |---|---:|---:|---:|---:|
 | GET 100 B, pipelined | 3234 | 3230 (-0.12%) | 3284 | +50 (+1.55%) |
 | SET 100 B, pipelined | 3960 | 3945 (-0.38%) | 4001 | +41 (+1.04%) |

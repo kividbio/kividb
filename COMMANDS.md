@@ -894,7 +894,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `MEMORY MALLOC-STATS` | `MEMORY MALLOC-STATS` | Allocator statistics (minimal) |
 | `MEMORY PURGE` | `MEMORY PURGE` | Ask the allocator to return free memory; replies `OK` |
 | `MEMORY HELP` | `MEMORY HELP` | List the `MEMORY` subcommands |
-| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 only with `key-access-tracking no` under a policy that does not go by use. `ERR no such key` for a missing key |
+| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 unless an LRU or LFU policy (or `key-access-tracking yes`) is on. `ERR no such key` for a missing key |
 | `DEBUG SET-ACTIVE-EXPIRE` | `DEBUG SET-ACTIVE-EXPIRE 0\|1` | Stop or restart the background expiry of keys and hash fields. Keys past their time still go when read. Process-wide, and on again after a restart |
 | `DEBUG PAUSE-CRON` | `DEBUG PAUSE-CRON 0\|1` | Pause or resume the background expiry, as in Redis, where it runs inside the cron |
 | `DEBUG SLEEP` | `DEBUG SLEEP seconds` | Block this connection's worker thread for `seconds` |

@@ -824,18 +824,17 @@ fn restore_keeps_a_keys_idle_time_or_frequency() {
     }
 }
 
-/// By default a key's idle time is kept under `noeviction` too, and only a
-/// use of the key resets it: not `TTL`, `TYPE`, `EXISTS` or `OBJECT` (#21).
-/// `key-access-tracking no` stops keeping it: 0.
+/// By default (`key-access-tracking no`) a key's idle time is not kept under
+/// `noeviction`: 0. `CONFIG SET` can turn it on and off, and only a value that
+/// is yes or no is taken.
 #[test]
-fn key_access_tracking_keeps_idle_time_under_noeviction() {
+fn key_access_tracking_is_off_by_default() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
     let get = |c: &mut Conn, name: &str| match c.cmd(&["CONFIG", "GET", name]) {
         V::Arr(row) => row[1].s().to_string(),
         other => panic!("{other:?}"),
     };
-
-    let server = Server::start(&["--key-access-tracking", "no"]);
-    let mut c = server.conn();
     assert_eq!(get(&mut c, "maxmemory-policy"), "noeviction");
     assert_eq!(get(&mut c, "key-access-tracking"), "no");
     assert!(c.cmd(&["SET", "untracked", "bar"]).ok());
@@ -845,16 +844,23 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
         c.cmd(&["CONFIG", "SET", "key-access-tracking", "maybe"])
             .is_err()
     );
-    // Switched on at run time, it keeps the standing of keys from then on.
     assert!(c.cmd(&["CONFIG", "SET", "key-access-tracking", "yes"]).ok());
     assert_eq!(get(&mut c, "key-access-tracking"), "yes");
     assert!(c.cmd(&["CONFIG", "SET", "key-access-tracking", "no"]).ok());
     assert_eq!(get(&mut c, "key-access-tracking"), "no");
-    drop(c);
-    drop(server);
+}
 
-    // The default: on.
-    let server = Server::start(&[]);
+/// With `key-access-tracking yes`, a key's idle time is kept under
+/// `noeviction` too, and only a use of the key resets it: not `TTL`, `TYPE`,
+/// `EXISTS` or `OBJECT` (#21).
+#[test]
+fn key_access_tracking_keeps_idle_time_under_noeviction() {
+    let get = |c: &mut Conn, name: &str| match c.cmd(&["CONFIG", "GET", name]) {
+        V::Arr(row) => row[1].s().to_string(),
+        other => panic!("{other:?}"),
+    };
+
+    let server = Server::start(&["--key-access-tracking", "yes"]);
     let mut c = server.conn();
     assert_eq!(get(&mut c, "maxmemory-policy"), "noeviction");
     assert_eq!(get(&mut c, "key-access-tracking"), "yes");
@@ -889,12 +895,12 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
 }
 
 /// `RESTORE ... IDLETIME` and `FREQ`, and what `OBJECT IDLETIME` and `FREQ`
-/// then say, with the default settings: `noeviction`, as Redis 8.10.2 answers
+/// then say, with `key-access-tracking yes` under `noeviction`, as Redis 8.10.2 answers
 /// them (#21). `IDLETIME` is kept; `FREQ` is a count, and there is none
 /// without an LFU policy, so it is ignored, as Redis ignores it.
 #[test]
-fn restore_idle_time_and_frequency_under_the_default_settings() {
-    let server = Server::start(&[]);
+fn restore_idle_time_and_frequency_under_noeviction_with_tracking_on() {
+    let server = Server::start(&["--key-access-tracking", "yes"]);
     let mut c = server.conn();
     assert!(c.cmd(&["SET", "foo", "bar"]).ok());
     let payload = c.dump("foo");

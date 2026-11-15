@@ -172,7 +172,7 @@ need action or attention:
 
 ## What still fails
 
-Twenty-eight tests, in three groups.
+Twenty-nine tests, in three groups.
 
 **Things KiviDB does not have (17).**
 
@@ -189,13 +189,15 @@ produced by Redis itself; KiviDB's `DUMP` format is its own and it does not
 read Redis's. `hyperloglog` (1): the test reads the cache-valid bit of
 Redis's HyperLogLog header with `GETRANGE`.
 
-**Behaviour that differs (8).**
+**Behaviour that differs (9).**
 
 - `pause` (2): keys go on expiring while clients are paused; Redis stops
   expiry for the length of the pause.
 - `introspection` (2): `CONFIG SET maxmemory-clients` and `CONFIG SET port`
   are accepted and remembered without being applied, so the tests'
   out-of-range value and unusable port are not refused.
+- `introspection-2` (1): `TTL`, `TYPE` and `EXISTS` reset a key's idle time
+  unless `key-access-tracking yes` is set (the test passes with it).
 - `pubsub` (2): a RESP3 client that publishes to a channel it is subscribed
   to, from inside a script or a transaction, gets the message before the
   reply to the script; Redis sends the reply first.
