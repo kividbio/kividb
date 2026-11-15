@@ -468,6 +468,18 @@ impl BlockingSlot {
         if parked.is_none() && self.in_resume {
             self.resume_over();
         }
+        // Nearly every command: ran while nobody stood in any line, owes
+        // nobody a look, and did not wait.
+        if !self.collecting && parked.is_none() && self.looked.is_empty() {
+            return None;
+        }
+        self.looked_or_waits(parked)
+    }
+
+    /// [`take_parked`](Self::take_parked) for a command that may have woken
+    /// someone, owes a look, or waits.
+    #[cold]
+    fn looked_or_waits(&mut self, parked: Option<BlockingWait>) -> Option<BlockingWait> {
         // After `resume_over`: a refused resume's ticket, dropped there,
         // passes its turn on, and the client that wakes is this dispatch's to
         // wait for, as the client a handler passes the turn to is.
@@ -476,21 +488,6 @@ impl BlockingSlot {
         } else {
             None
         };
-        // Nearly every command: woke nobody, owes nobody a look, did not wait.
-        if collected.is_none() && parked.is_none() && self.looked.is_empty() {
-            return parked;
-        }
-        self.looked_or_waits(parked, collected)
-    }
-
-    /// [`take_parked`](Self::take_parked) for a command that woke someone,
-    /// owes a look, or waits.
-    #[cold]
-    fn looked_or_waits(
-        &mut self,
-        parked: Option<BlockingWait>,
-        collected: Option<crate::wait_table::Woken>,
-    ) -> Option<BlockingWait> {
         let mut woken = Vec::new();
         if let Some(collected) = collected {
             woken = collected.woken;
