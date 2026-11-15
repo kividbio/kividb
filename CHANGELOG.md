@@ -189,6 +189,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
+  of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
+  FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
+  took about 320 instructions a command: 9.9% of a pipelined 100-byte `GET`,
+  8.0% of a `SET`, 6 to 8% of `INCR`, `HGET`, `LPUSH` and `LPOP`. It takes
+  about 50 now (callgrind, Azure D4s_v5, one run, `benchmarks/1.3.0/key-access-tracking`):
+  a pipelined `GET` costs +1.01% (100 B) and +1.52% (1 KB) over master with it
+  off, a `SET` +0.73% and +1.02%, a 16-key `MGET` +0.27%; not pipelined it
+  is +0.5% to +1.5% (one +3.58% outlier, `SET` 1 KB, is noise). There is no
+  memory cost per key. It is still off by default; with it off the
+  per-command path is what it was minus one atomic load, by construction.
+  Callgrind numbers differ by about 0.7% per command between runs. Raised by
+  @Bhupendra3444 in #21 and #298.
+
 - **A grouped `FT.AGGREGATE` reports how many groups there are (#761).** The
   first element of the reply (`total_results` under RESP3) was the number of
   rows on the page, so `GROUPBY 1 @f REDUCE COUNT 0 AS n LIMIT 0 10` over a
@@ -270,6 +284,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   string or integer").
 
 ### Fixed
+
+- **A replica promoted after its master died part way through a slot
+  import deletes what the import brought, and an import sent again no
+  longer brings back keys the source deleted (#741).** The keys a
+  `CLUSTER MIGRATION IMPORT` had already brought stayed on the promoted
+  replica for good, in slots it does not own, and when the import was sent
+  again they were kept beside what it brought, so a key the source had
+  deleted in between was served again. A master now tells the replicas
+  that ask for it which imports it has under way, and which of their
+  slots it held keys of before each began (`REPLCONF capa slot-imports`,
+  then `KIVIDB.IMPORTS`, which is not part of the stream: no offset,
+  backlog, AOF or snapshot has it, and a replica of an earlier release is
+  never sent it). Promoted, the replica deletes what the import brought,
+  and keeps every key that was there before: only once the slot's owner,
+  asked before each batch, says it owns the slot and is not moving it, and
+  never on a replica. Meanwhile an import of those slots is refused, and
+  `INFO cluster` reports `cluster_import_cleanup_slots`. A replica that
+  did not see the import begin (attached or restarted part way) knows
+  only which slots had keys before, and keeps all of theirs. A slot that
+  comes to the promoted node meanwhile is left out of the cleanup for good,
+  and `CLUSTER RESET` forgets the imports. A replica or master of an
+  earlier release behaves as before: `CLUSTER ORPHANSLOTS` lists the keys.
+
+- **`BRPOP` across many keys keeps up with many blocked clients (#758).**
+  A client blocked on 270 queues raced 270 receivers, each with a task and
+  a timer of its own, and every wait, wake-up and timeout walked a sorted
+  line of every client on each of those keys; a client that timed out also
+  woke the next client in every one of its lines, for nothing. Each client
+  now waits on one receiver with one timer, a key's line is an ordered map,
+  and a client that leaves passes its turn on only where it had one. On a
+  D4s_v5 with 200 jobs pushed every 0.1 s, 1,000 workers x 270 queues get
+  1,934 jobs/s (1.2.2: 380, Redis 8.10.2: 1,567) and 4,000 workers 1,924
+  (1.2.2: 8, Redis: 950), with the same FIFO order per key; the suite is
+  `benchmarks/1.3.0/regressions/suites/15-brpop-many-keys.py`.
+  Also, a client unblocked with `CLIENT UNBLOCK … ERROR` just as an element
+  arrived on its key no longer pops it and then answers `-UNBLOCKED` in its
+  place, losing it: it takes nothing, as in Redis.
+  And a blocking command inside `MULTI` or a script no longer stands in
+  line while it looks: a push landing then could wake it instead of the
+  client blocked behind it, which then stayed blocked with the element
+  there.
 
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,

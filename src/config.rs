@@ -177,8 +177,9 @@ pub struct Config {
     pub lfu_log_factor: u32,
 
     /// Record every key's use whatever the eviction policy, so that `OBJECT
-    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too. Costs
-    /// every command a little: see `eviction::key_access_tracking`.
+    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too, as
+    /// Redis's do. Off by default: it costs every command about 50
+    /// instructions, see `eviction::key_access_tracking`.
     #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args = 1)]
     pub key_access_tracking: bool,
 

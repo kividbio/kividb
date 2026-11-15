@@ -65,6 +65,10 @@ thread_local! {
     static STAMP: Cell<u32> = const { Cell::new(0) };
     static COUNTED_KEYS: Cell<Seen> = const { Cell::new(Seen::NONE) };
     static NAMED: RefCell<Named> = const { RefCell::new(Vec::new()) };
+    /// What the scopes that count (LFU) found open when they opened, to put
+    /// back when they go: kept here, not in the scope, so that the scope a
+    /// command carries is a few bytes.
+    static OUTER: RefCell<Vec<(Seen, Named)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// What a lookup on this thread writes to the access word of the entry it
@@ -78,15 +82,30 @@ pub(super) fn stamp() -> u32 {
 /// what a command's dispatcher opens around it.
 pub struct AccessScope {
     before: u32,
-    seen: Option<(Seen, Named)>,
+    /// Whether it counts (LFU): then what was open before is in `OUTER`.
+    counting: bool,
 }
 
 impl AccessScope {
     /// Lookups write `stamp`. A scope inside another (a command that runs
     /// others) puts the outer one back when it goes.
-    #[inline]
+    #[inline(always)]
     pub fn open(stamp: u32) -> Self {
+        if stamp & COUNTED == 0 {
+            // No key is counted, so nothing is remembered: only the stamp.
+            return AccessScope {
+                before: STAMP.with(|s| s.replace(stamp)),
+                counting: false,
+            };
+        }
         Self::open_naming(stamp, Vec::new())
+    }
+
+    /// Whether this scope counts uses (LFU), so that a key a command names
+    /// more than once has to be looked at when it is done.
+    #[inline(always)]
+    pub fn is_counting(&self) -> bool {
+        self.counting
     }
 
     /// [`AccessScope::open`], for a command that names the keys in `named`
@@ -95,13 +114,15 @@ impl AccessScope {
     #[inline]
     pub fn open_naming(stamp: u32, named: Named) -> Self {
         let before = STAMP.with(|s| s.replace(stamp));
-        let seen = (stamp & COUNTED != 0).then(|| {
-            (
+        let counting = stamp & COUNTED != 0;
+        if counting {
+            let outer = (
                 COUNTED_KEYS.with(|s| s.replace(Seen::NONE)),
                 NAMED.with(|n| n.replace(named)),
-            )
-        });
-        AccessScope { before, seen }
+            );
+            OUTER.with(|stack| stack.borrow_mut().push(outer));
+        }
+        AccessScope { before, counting }
     }
 
     /// The keys this thread's command names more than once, and how many
@@ -141,7 +162,9 @@ impl Drop for AccessScope {
     #[inline]
     fn drop(&mut self) {
         STAMP.with(|s| s.set(self.before));
-        if let Some((seen, named)) = self.seen.take() {
+        if self.counting
+            && let Some((seen, named)) = OUTER.with(|stack| stack.borrow_mut().pop())
+        {
             COUNTED_KEYS.with(|s| s.set(seen));
             NAMED.with(|n| *n.borrow_mut() = named);
         }

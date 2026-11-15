@@ -406,12 +406,14 @@ pub struct BlockingSlot {
     /// True while the current dispatch *is* a resume. Guards against a handler
     /// that parks again after being resumed, which would spin the loop forever.
     in_resume: bool,
-    /// Held from the end of a wait until this client has looked at its keys
-    /// and either replied or waited again: whoever woke it is holding its own
-    /// reply until then. See [`crate::wait_table::take_woken`].
-    looked: Vec<oneshot::Sender<()>>,
-    /// The clients the last dispatch woke. See [`settle`](Self::settle).
-    woken: Vec<oneshot::Receiver<()>>,
+    /// The looks this client owes whoever woke it, from the end of its wait
+    /// until it has looked at its keys and either replied or waited again:
+    /// they hold their replies until then. Done at the end of the dispatch
+    /// that looks. See [`crate::wait_table::Look`].
+    looked: Vec<std::sync::Arc<crate::wait_table::Look>>,
+    /// The looks of the clients the last dispatch woke. See
+    /// [`settle`](Self::settle).
+    woken: Vec<std::sync::Arc<crate::wait_table::Look>>,
 }
 
 impl BlockingSlot {
@@ -452,21 +454,27 @@ impl BlockingSlot {
         // wait for, as the client a handler passes the turn to is.
         if let Some(collected) = crate::wait_table::take_woken() {
             self.woken = collected.woken;
-            self.looked.extend(collected.looked);
+            self.looked.extend(collected.owed);
         }
         if let Some(wait) = &parked {
-            // It looked, found nothing and waits again: release whoever woke
-            // it, and whoever has since — or they would wait out this wait —
-            // but not a write that woke it again after it stood back in line:
-            // that one it has not seen yet. A command that waits has no reply
-            // to hold for those it woke.
-            self.looked.clear();
-            self.woken.clear();
-            if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
-                &wait.state
-            {
-                ticket.looked_and_waits();
+            // It looked, found nothing and waits again: whoever woke it has
+            // its look, unless a write woke it again once it stood back in
+            // line (that one it has not seen yet). A command that waits has
+            // no reply to hold for those it woke.
+            let owed = std::mem::take(&mut self.looked);
+            match &wait.state {
+                Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) => {
+                    ticket.looked_and_waits(owed, &self.woken)
+                }
+                _ => crate::wait_table::all_done(owed, &self.woken),
             }
+            self.woken.clear();
+        } else if !self.looked.is_empty() {
+            // It looked: done, with the looks of those it woke, which whoever
+            // woke it waits for too. Now, not after its own wait for them, so
+            // that two clients that woke each other never wait for each
+            // other.
+            crate::wait_table::all_done(std::mem::take(&mut self.looked), &self.woken);
         }
         parked
     }
@@ -487,16 +495,15 @@ impl BlockingSlot {
     /// clients a dispatch woke together (a `FLUSHALL` wakes one on every key
     /// waited on), not for each.
     ///
-    /// A client that has gone does not hold it: its ticket and this slot
-    /// hold the only senders, and a client that goes drops them, or passes
-    /// them on to its own `settle` once its dispatch has left the line.
+    /// A client that has gone does not hold it: the looks it owes are done
+    /// when its ticket goes, or with the dispatch that leaves its lines.
     ///
     /// `None`, nothing to wait for, is what nearly every command gets. The
     /// wait is boxed, so that it is polled out of line, as `until_gone` is:
     /// the connection's own future is compiled as it was without it.
     #[inline]
     pub fn settle(&mut self) -> Option<Settling> {
-        if self.woken.is_empty() && self.looked.is_empty() {
+        if self.woken.is_empty() {
             return None;
         }
         self.settle_woken()
@@ -504,18 +511,9 @@ impl BlockingSlot {
 
     #[cold]
     fn settle_woken(&mut self) -> Option<Settling> {
-        let looked = std::mem::take(&mut self.looked);
-        if self.woken.is_empty() {
-            return None;
-        }
         let woken = std::mem::take(&mut self.woken);
-        Some(Box::pin(async move {
-            let deadline = tokio::time::Instant::now() + WOKEN_BOUND;
-            for woken in woken {
-                let _ = tokio::time::timeout_at(deadline, woken).await;
-            }
-            drop(looked);
-        }))
+        let deadline = tokio::time::Instant::now() + WOKEN_BOUND;
+        Some(Box::pin(crate::wait_table::all_looked(woken, deadline)))
     }
 
     /// A dispatch that resumed a command is over and did not park again:
@@ -564,7 +562,7 @@ impl BlockingSlot {
         if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
             &state
         {
-            self.looked = ticket.take_looked();
+            self.looked.extend(ticket.take_looked());
         }
         self.pending = Some((delivery, state, false));
     }
@@ -578,7 +576,7 @@ impl BlockingSlot {
         if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
             &state
         {
-            self.looked = ticket.take_looked();
+            self.looked.extend(ticket.take_looked());
         }
         self.pending = Some((None, state, true));
     }
@@ -732,27 +730,30 @@ pub fn wait_for_keys(
         // Nobody is there to be given anything: out of the line, taking
         // nothing, and the turn to the client behind, which may have been
         // this one's.
-        for key in keys {
-            ctx.wait_table.dequeue(key, &ticket);
-            ctx.wait_table.pass_on(key, &ticket);
-        }
+        leave_lines(ctx, keys, &ticket);
         return empty();
     }
     let timed_out = matches!(resumed, Some(None));
-    // The key this client was woken for, if it was.
+    // The key this client was woken for, if it was: what the line's
+    // receiver is sent (`WaitTable::enqueue_all`).
     let woken_for: Option<Vec<u8>> = match &resumed {
-        Some(Some((key, _))) => Some(key.clone()),
+        Some(Some((_, key))) => Some(key.to_vec()),
         _ => None,
     };
 
     // Stand in line before looking, so a write that lands between the look
-    // and the park still wakes us.
-    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out {
+    // and the park still wakes us. One receiver for all the keys, which the
+    // first of them to be written wakes (#758).
+    //
+    // Not a caller that cannot wait (`MULTI`, a script, the replica
+    // applier): it only looks. Standing in line, it could be the head a
+    // push wakes, and then leave without passing the turn on, leaving the
+    // client behind it blocked with the element there.
+    let may_park = ctx.blocking.as_ref().is_some_and(|slot| slot.awaitable);
+    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out || !may_park {
         Vec::new()
     } else {
-        keys.iter()
-            .map(|key| (key.clone(), ctx.wait_table.enqueue(key, &ticket)))
-            .collect()
+        vec![(Vec::new(), ctx.wait_table.enqueue_all(keys, &ticket))]
     };
     // On the first look a key of the wrong type is an error. Found on
     // being woken — the key it was waiting on has been replaced by
@@ -781,24 +782,36 @@ pub fn wait_for_keys(
     // On the others it waits its turn, which comes when those ahead have
     // looked — and they are made to look.
     let can_wait = ctx.blocking.is_some() && !timed_out && remaining_time(deadline).is_some();
-    let open: Vec<Vec<u8>> = keys
-        .iter()
-        .filter(|key| {
-            let theirs = can_wait
-                && woken_for.as_deref() != Some(key.as_slice())
-                && ctx.wait_table.someone_ahead(key, &ticket)
-                && has_elements(ctx, key);
-            if theirs {
-                ctx.wait_table.wake_head(key);
+    //
+    // Whether a key has elements is asked first: it is the cheap question,
+    // and of a client blocked on many keys nearly all are empty.
+    let theirs = |ctx: &crate::commands::ctx::Ctx, key: &Vec<u8>| {
+        let theirs = can_wait
+            && woken_for.as_deref() != Some(key.as_slice())
+            && has_elements(ctx, key)
+            && ctx.wait_table.someone_ahead(key, &ticket);
+        if theirs {
+            ctx.wait_table.wake_head(key);
+        }
+        theirs
+    };
+    let attempted = match keys.iter().position(|key| theirs(&*ctx, key)) {
+        // All of them are open to it: no copy of the keys.
+        None => attempt(ctx, keys),
+        Some(first) => {
+            let mut open: Vec<Vec<u8>> = keys[..first].to_vec();
+            open.extend(
+                keys[first + 1..]
+                    .iter()
+                    .filter(|key| !theirs(&*ctx, key))
+                    .cloned(),
+            );
+            if open.is_empty() {
+                None
+            } else {
+                attempt(ctx, &open)
             }
-            !theirs
-        })
-        .cloned()
-        .collect();
-    let attempted = if open.is_empty() {
-        None
-    } else {
-        attempt(ctx, &open)
+        }
     };
     let reply = match attempted {
         Some(mut reply) if reply.first() == Some(&DEFINITE) => {
@@ -835,26 +848,19 @@ pub fn wait_for_keys(
     // there). Not when it stays and there is nothing: waking the next client
     // to look at nothing would put two of them in a race for whatever
     // arrives next, and the order they blocked in would be lost.
-    let leaving = outcome.is_ok();
-    let pass_on = |ctx: &crate::commands::ctx::Ctx, leaving: bool| {
-        for key in keys {
-            if leaving {
-                ctx.wait_table.dequeue(key, &ticket);
-                ctx.wait_table.pass_on(key, &ticket);
-            } else if has_elements(ctx, key) {
-                ctx.wait_table.pass_on(key, &ticket);
-            }
-        }
-    };
     let remaining = match outcome {
         Ok(reply) => {
             drop(rxs);
-            pass_on(ctx, leaving);
+            leave_lines(ctx, keys, &ticket);
             return reply;
         }
         Err(remaining) => remaining,
     };
-    pass_on(ctx, leaving);
+    for key in keys {
+        if has_elements(ctx, key) {
+            ctx.wait_table.pass_on(key, &ticket);
+        }
+    }
     let state = BlockState::Queued {
         deadline,
         ticket: std::sync::Arc::clone(&ticket),
@@ -865,12 +871,34 @@ pub fn wait_for_keys(
             ticket.parks_in(keys, false);
             Vec::new()
         }
+        // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
-            for key in keys {
-                ctx.wait_table.dequeue(key, &ticket);
-            }
             crate::stats::record_miss();
             empty()
+        }
+    }
+}
+
+/// A command that waited in the lines for `keys` is over: out of all of
+/// them, under one lock, and the turn to the client behind it where the
+/// turn may have been this one's — it had been woken there and had not
+/// looked, or the key has elements it has left behind.
+///
+/// Not where the key is empty and the turn was not with it: the client
+/// behind would only look, find nothing and wait again. Every client that
+/// timed out used to wake the next in each of its lines that way, and with
+/// a thousand clients blocked on the same 270 keys each timeout set off a
+/// round of a few hundred pointless wake-ups (#758).
+fn leave_lines(
+    ctx: &crate::commands::ctx::Ctx,
+    keys: &[Vec<u8>],
+    ticket: &crate::wait_table::Ticket,
+) {
+    let woken = ctx.wait_table.dequeue_all(keys, ticket);
+    ctx.wait_table.left_all(ticket);
+    for (key, woken) in keys.iter().zip(woken) {
+        if woken || has_elements(ctx, key) {
+            ctx.wait_table.pass_on(key, ticket);
         }
     }
 }
@@ -1016,41 +1044,43 @@ impl BlockingWait {
         self.race().await
     }
 
+    /// The receivers are raced in this future, under one timer: the first
+    /// to be sent something wins, and a receiver whose sender has gone drops
+    /// out. With none left, or the time up, there is no delivery. Each
+    /// receiver used to be raced by a task of its own, with a timer of its
+    /// own, which for `XREAD BLOCK` over many streams (and, before #758 gave
+    /// a client in the lines for many keys a single receiver, `BRPOP` over
+    /// many keys) was a task and a timer per key per wait.
     async fn race(self) -> Delivery {
-        let timeout = self.timeout;
-        let (winner_tx, mut winner_rx) = tokio::sync::mpsc::channel(1);
-        let mut handles = Vec::with_capacity(self.rxs.len());
-
-        for (key, rx) in self.rxs {
-            let tx = winner_tx.clone();
-            handles.push(tokio::spawn(async move {
-                let got = match timeout {
-                    None => rx.await.ok(),
-                    Some(d) => tokio::time::timeout(d, rx).await.ok().and_then(|r| r.ok()),
+        let mut rxs: Vec<(Vec<u8>, Option<oneshot::Receiver<Value>>)> = self
+            .rxs
+            .into_iter()
+            .map(|(key, rx)| (key, Some(rx)))
+            .collect();
+        let first = std::future::poll_fn(move |cx| {
+            let mut waiting = false;
+            for (key, slot) in rxs.iter_mut() {
+                let Some(rx) = slot.as_mut() else {
+                    continue;
                 };
-                if let Some(val) = got {
-                    let _ = tx.send((key, val)).await;
-                }
-            }));
-        }
-        // Dropping our own sender is what lets `recv()` return `None` once every
-        // racing task has finished — which, when they all timed out, is the
-        // timeout signal itself.
-        drop(winner_tx);
-
-        // Stopped when this future ends, however it ends: a task left
-        // running would go on holding its place among a key's waiters for a
-        // client that is no longer waiting.
-        struct Racers(Vec<tokio::task::JoinHandle<()>>);
-        impl Drop for Racers {
-            fn drop(&mut self) {
-                for handle in &self.0 {
-                    handle.abort();
+                match std::future::Future::poll(std::pin::Pin::new(rx), cx) {
+                    std::task::Poll::Ready(Ok(value)) => {
+                        return std::task::Poll::Ready(Some((std::mem::take(key), value)));
+                    }
+                    std::task::Poll::Ready(Err(_)) => *slot = None,
+                    std::task::Poll::Pending => waiting = true,
                 }
             }
+            if waiting {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        });
+        match self.timeout {
+            None => first.await,
+            Some(timeout) => tokio::time::timeout(timeout, first).await.ok().flatten(),
         }
-        let _racers = Racers(handles);
-        winner_rx.recv().await
     }
 }
 
@@ -1058,7 +1088,6 @@ impl BlockingWait {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::sync::oneshot::error::TryRecvError;
 
     fn wait_on(
         rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)>,
@@ -1129,41 +1158,41 @@ mod tests {
 
     /// A woken client that never looks at its keys — paused, killed, or gone —
     /// must not hold the reply past the bound: for all of them together.
+    /// Looks that name each other end.
     #[test]
     fn a_woken_client_that_never_looks_holds_the_reply_only_to_the_bound() {
+        use crate::wait_table::Look;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // Held, never sent: woken, and never looked.
-        let (keep, woken): (Vec<_>, Vec<_>) = (0..5).map(|_| oneshot::channel::<()>()).unzip();
-        let (looked, mut waker) = oneshot::channel();
+        let woken = Look::new_for_tests(5);
         let mut slot = BlockingSlot {
-            woken,
-            looked: vec![looked],
+            woken: woken.clone(),
             ..Default::default()
         };
         let started = Instant::now();
         rt.block_on(slot.settle().expect("something to wait for"));
         let waited = started.elapsed();
-        assert!(
-            matches!(waker.try_recv(), Err(TryRecvError::Closed)),
-            "whoever woke it was not released"
-        );
-        drop(keep);
         assert!(waited >= WOKEN_BOUND, "gave up early: {waited:?}");
         assert!(
             waited < WOKEN_BOUND * 3,
             "waited past the bound: {waited:?}"
         );
-        // Nothing woken, nothing to wait for; whoever woke it is released.
-        let (looked, mut waker) = oneshot::channel();
+        // Done, and done with each other: no wait.
+        woken[0].done(&woken[1..]);
+        for (n, look) in woken.iter().enumerate().skip(1) {
+            look.done(&woken[..n]);
+        }
         let mut slot = BlockingSlot {
-            looked: vec![looked],
+            woken,
             ..Default::default()
         };
-        assert!(slot.settle().is_none());
-        assert!(matches!(waker.try_recv(), Err(TryRecvError::Closed)));
+        let started = Instant::now();
+        rt.block_on(slot.settle().expect("something to wait for"));
+        assert!(started.elapsed() < WOKEN_BOUND / 2);
+        // Nothing woken, nothing to wait for.
+        assert!(BlockingSlot::default().settle().is_none());
     }
 
     /// Every registration being cancelled must not hang a `timeout 0` wait
@@ -1186,7 +1215,6 @@ mod gone_resume_tests {
     use super::*;
     use crate::commands::ctx::{Ctx, NoopAofSender};
     use std::sync::Arc;
-    use tokio::sync::oneshot::error::TryRecvError;
 
     type Run<'r> = &'r dyn Fn(&[&str], Option<&mut BlockingCtl>) -> Vec<u8>;
     /// What gives the key an element, the command, what reads the key, and
@@ -1259,6 +1287,111 @@ mod gone_resume_tests {
         test(&run, &wait_table);
     }
 
+    fn with_ctx(test: impl FnOnce(&mut Ctx<'_>)) {
+        // `with_server`, handing the test a `Ctx` with no blocking slot, as
+        // `MULTI`, a script and the replica applier have.
+        // The pause is the process's: a unit test pausing writes would hold
+        // these commands back (`pause::held_in_gate`).
+        let _pause = crate::pause::TEST_LOCK.lock();
+        let store = crate::store::new_store(1);
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(crate::cluster::ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        {
+            let mut ctx = Ctx {
+                cmd: Vec::new(),
+                store: &store,
+                lastsave: &lastsave,
+                selected_db: &mut selected_db,
+                aof_tx: &NoopAofSender,
+                aof_enabled: false,
+                config: &config,
+                started_at: &started_at,
+                index_store: &index_store,
+                dict_store: &dict_store,
+                wait_table: &wait_table,
+                ts_index: &ts_index,
+                pubsub: &pubsub,
+                hub_tx: &hub_tx,
+                repl_state: &repl_state,
+                watch_registry: &crate::watch::NoopWatchRegistry,
+                client_id: 0,
+                client_registry: &client_registry,
+                resp: 2,
+                acl_store: &acl_store,
+                acl_log: &acl_log,
+                slowlog: &slowlog,
+                latency: &latency,
+                compaction_tx: &compaction_tx,
+                cluster: &cluster,
+                bypass_cluster_check: false,
+                apply_replication: false,
+                skip_write_side_effects: false,
+                peer_addr: "127.0.0.1:1",
+                monitor_registry: &monitor_registry,
+                authenticated_user: "default",
+                tracking_table: &tracking_table,
+                blocking: None,
+            };
+            test(&mut ctx);
+        }
+    }
+
+    /// A blocking command that cannot wait (`MULTI`, a script, the replica
+    /// applier) only looks: it does not stand in line, so a push that lands
+    /// while it looks wakes the client blocked behind it, not it. It used to
+    /// stand in line, be the head the push woke, and leave without passing
+    /// the turn on: the client behind stayed blocked with the element there.
+    #[test]
+    fn a_command_that_cannot_wait_does_not_take_a_turn() {
+        with_ctx(|ctx| {
+            let keys = vec![b"k".to_vec()];
+            let table = Arc::clone(ctx.wait_table);
+            let mut behind = None;
+            let reply = wait_for_keys(
+                ctx,
+                &keys,
+                None,
+                |ctx, _| {
+                    // A client blocks on the key, and a push to it lands,
+                    // while this command looks.
+                    let ticket = table.new_ticket();
+                    let rx = table.enqueue_all(&keys, &ticket);
+                    ticket.parks_in(&keys, false);
+                    ctx.wait_table.notify_signal("k");
+                    behind = Some((ticket, rx));
+                    None
+                },
+                crate::resp::write::resp_null_array,
+            );
+            assert_eq!(reply, crate::resp::write::resp_null_array());
+            let (_ticket, mut rx) = behind.expect("looked");
+            assert_eq!(
+                rx.try_recv()
+                    .expect("the client behind was not woken")
+                    .as_ref(),
+                b"k"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn a_list_or_zset_command_whose_client_went_takes_nothing_and_passes_the_turn() {
         with_server(|run, wait_table| {
@@ -1321,11 +1454,12 @@ mod gone_resume_tests {
         });
     }
 
-    /// The client woken for an element has gone: whoever woke it is
-    /// released once the client its gone dispatch passed the turn to has
-    /// looked, which takes the element — or when its connection ends.
+    /// The client woken for an element has gone: whoever woke it has its
+    /// look once its gone dispatch has left the line and passed the turn
+    /// on, and that look carries the look of the client it passed the turn
+    /// to, which takes the element.
     #[tokio::test]
-    async fn a_gone_resume_holds_its_waker_for_the_client_it_passes_to() {
+    async fn a_gone_resume_hands_its_waker_the_client_it_passes_to() {
         with_server(|run, wait_table| {
             run(&["RPUSH", "g", "e"], None);
             let gone = wait_table.new_ticket();
@@ -1337,8 +1471,9 @@ mod gone_resume_tests {
             // The push's dispatch, which wakes the client at the head.
             crate::wait_table::collect_woken();
             wait_table.notify_signal("g");
-            let mut waker = crate::wait_table::take_woken().expect("woke one").woken;
+            let waker = crate::wait_table::take_woken().expect("woke one").woken;
             assert_eq!(waker.len(), 1);
+            assert!(!waker[0].is_done());
 
             let mut slot = BlockingSlot::default();
             slot.set_gone(Some(BlockState::Queued {
@@ -1348,11 +1483,11 @@ mod gone_resume_tests {
             run(&["BLPOP", "g", "0"], Some(slot.prime()));
             assert!(slot.take_parked().is_none());
             assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
-            assert!(matches!(waker[0].try_recv(), Err(TryRecvError::Empty)));
-            assert!(!slot.woken.is_empty(), "the one behind is not waited for");
-            // The connection ends without waiting: released all the same.
-            drop(slot);
-            assert!(matches!(waker[0].try_recv(), Err(TryRecvError::Closed)));
+            assert!(waker[0].is_done(), "the gone client's look is not done");
+            assert_eq!(slot.woken.len(), 1, "the one behind is not waited for");
+            assert!(!slot.woken[0].is_done());
+            drop(behind);
+            assert!(slot.woken[0].is_done(), "a client that went owes nothing");
         });
     }
 

@@ -947,7 +947,7 @@ fn by_owner<T: Copy>(items: impl IntoIterator<Item = (NodeId, T)>) -> Vec<(NodeI
 /// whether it owns the slot in its own table and is not moving it. Any slot
 /// it does not, or an owner that cannot be asked (unreachable, or of a
 /// version without the command), refuses the lot.
-fn confirm_with_owners(
+pub(crate) fn confirm_with_owners(
     env: &Env,
     asker: &mut migration::NodeAsker,
     owners: &[(u16, NodeId)],
@@ -986,7 +986,7 @@ fn confirm_with_owners(
 /// owner in this node's slot table is no longer the one asked at the start
 /// (`owner_of`), when the owner no longer owns one of the slots or is
 /// moving it, or cannot be asked.
-fn confirm_keys(
+pub(crate) fn confirm_keys(
     env: &Env,
     asker: &mut migration::NodeAsker,
     owner_of: &ahash::AHashMap<u16, NodeId>,

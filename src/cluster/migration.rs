@@ -200,17 +200,17 @@ const HELD_BEFORE_MAX_BYTES: usize = 64 << 20;
 /// of which the owner may not have (#517).
 #[derive(Default)]
 pub struct HeldBefore {
-    keys: std::collections::HashSet<crate::store::Key>,
+    pub(super) keys: std::collections::HashSet<crate::store::Key>,
     /// The slots of those keys, in order.
-    slots: Vec<u16>,
+    pub(super) slots: Vec<u16>,
     /// There were too many to note by name ([`HELD_BEFORE_MAX_KEYS`]):
     /// `keys` is empty, and every key of `slots` is kept.
-    whole: bool,
+    pub(super) whole: bool,
 }
 
 impl HeldBefore {
     /// The keys `store` holds of `ranges` now.
-    fn note(store: &crate::store::Store, ranges: &[(u16, u16)]) -> Self {
+    pub(super) fn note(store: &crate::store::Store, ranges: &[(u16, u16)]) -> Self {
         Self::note_at_most(store, ranges, HELD_BEFORE_MAX_KEYS, HELD_BEFORE_MAX_BYTES)
     }
 
@@ -255,7 +255,7 @@ impl HeldBefore {
         held
     }
 
-    fn has_slot(&self, slot: u16) -> bool {
+    pub(super) fn has_slot(&self, slot: u16) -> bool {
         self.slots.binary_search(&slot).is_ok()
     }
 }
@@ -553,12 +553,12 @@ fn ranges_overlap(a: &[(u16, u16)], b: &[(u16, u16)]) -> bool {
         .any(|(a0, a1)| b.iter().any(|(b0, b1)| a0 <= b1 && b0 <= a1))
 }
 
-fn slots_of(ranges: &[(u16, u16)]) -> impl Iterator<Item = u16> + '_ {
+pub(super) fn slots_of(ranges: &[(u16, u16)]) -> impl Iterator<Item = u16> + '_ {
     ranges.iter().flat_map(|(start, end)| *start..=*end)
 }
 
 /// `slots`, in order and once each, as ranges.
-fn slot_runs(slots: impl IntoIterator<Item = u16>) -> Ranges {
+pub(super) fn slot_runs(slots: impl IntoIterator<Item = u16>) -> Ranges {
     let mut runs: Ranges = Vec::new();
     for slot in slots {
         match runs.last_mut() {
@@ -1012,6 +1012,17 @@ impl SlotDeletions {
             let came = &mut counts.came[slot as usize];
             *came = came.wrapping_add(1);
         }
+    }
+
+    /// Per slot of `slots`, how many times it has come to this node (see
+    /// [`Self::came_here`]). Taken holding no lock of `ClusterState` but
+    /// `slots`, `migrations` and the followed imports (see there).
+    pub(crate) fn came_counts(&self, slots: &[u16]) -> Vec<(u16, u32)> {
+        let counts = self.counts.lock();
+        slots
+            .iter()
+            .map(|&slot| (slot, counts.came.get(slot as usize).copied().unwrap_or(0)))
+            .collect()
     }
 
     /// Whether the keys of one of `slots` are being deleted.
@@ -1519,6 +1530,31 @@ pub(crate) fn drop_orphans_confirmed(
     slots: &[u16],
     confirm: Confirm<'_>,
 ) -> Result<DroppedOrphans, String> {
+    drop_confirmed_as(
+        cluster,
+        store,
+        repl_state,
+        hub_tx,
+        slots,
+        confirm,
+        "CLUSTER DROPORPHANS",
+        "orphan-keys-deleting",
+    )
+}
+
+/// [`drop_orphans_confirmed`], for `what` (in the log), held after its
+/// first batch at the failpoint `stall` in tests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drop_confirmed_as(
+    cluster: &ClusterState,
+    store: &crate::store::Store,
+    repl_state: &Arc<ReplState>,
+    hub_tx: &HubTx,
+    slots: &[u16],
+    confirm: Confirm<'_>,
+    what: &str,
+    stall: &'static str,
+) -> Result<DroppedOrphans, String> {
     let own = match OwnDataset::now(repl_state) {
         Some(own) if cluster.my_master_id().is_none() => own,
         _ => return Err(super::orphans::ON_A_REPLICA.into()),
@@ -1543,11 +1579,11 @@ pub(crate) fn drop_orphans_confirmed(
         || {},
         // Out of the write gate and every lock: a test holds the deletion
         // here, after its first batch.
-        stall_once_for_test("orphan-keys-deleting"),
+        stall_once_for_test(stall),
         Some(confirm),
     );
     drop(run);
-    log_deletion("CLUSTER DROPORPHANS", &deleted);
+    log_deletion(what, &deleted);
     let halted = match (&deleted.halted, deleted.stopped) {
         (Some(why), _) => Some(why.clone()),
         (None, true) => Some(
@@ -2312,6 +2348,10 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
         return Err("slots can only be imported by a master".into());
     }
     let source = single_owner(cluster, &ranges)?;
+    // The keys an import into this node's old master brought of these slots
+    // go first: kept beside what this one brings, those the source deleted
+    // since would be back (#741).
+    super::followed_imports::refuse_while_cleaning(cluster, &ranges)?;
     let id = super::node_id_str(&super::generate_node_id()).to_string();
     env.registry().add_unless(
         Task {
@@ -2452,32 +2492,26 @@ fn imports_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
 /// deleted at the next startup), as two writes of the temporary file at
 /// once could leave half a line. The file is on disk before it replaces
 /// the old one.
-fn save_imports(cluster: &ClusterState) {
+///
+/// And tell this node's replicas, in the same order, which imports are
+/// under way: see [`super::followed_imports`] (#741).
+pub(super) fn save_imports(cluster: &ClusterState) {
     static WRITING: Mutex<()> = Mutex::new(());
+    let _one = WRITING.lock();
+    let under_way = imports_under_way(cluster);
+    super::followed_imports::send_markers(cluster, &under_way);
     let Some(path) = imports_path(cluster) else {
         return;
     };
-    let _one = WRITING.lock();
-    let lines: Vec<String> = cluster
-        .slot_migrations
-        .all()
+    let lines: Vec<String> = under_way
         .iter()
-        .filter(|t| t.operation == Operation::Import && t.state == TaskState::InProgress)
-        .map(|t| {
-            // Released: the task ended since the look; all kept meanwhile.
-            let keep = match t.held() {
-                Held::Noted(held) => slot_runs(held.slots.iter().copied()),
-                Held::NotYet | Held::Released => t.ranges.clone(),
-            };
+        .map(|(id, ranges, kept)| {
+            // Not noted yet: every key is one this node had.
+            let keep = kept.clone().unwrap_or_else(|| ranges.clone());
             if keep.is_empty() {
-                format!("{} {}", t.id, ranges_text(&t.ranges))
+                format!("{id} {}", ranges_text(ranges))
             } else {
-                format!(
-                    "{} {} keep {}",
-                    t.id,
-                    ranges_text(&t.ranges),
-                    ranges_text(&keep)
-                )
+                format!("{id} {} keep {}", ranges_text(ranges), ranges_text(&keep))
             }
         })
         .collect();
@@ -2507,6 +2541,27 @@ fn save_imports(cluster: &ClusterState) {
             path.display()
         );
     }
+}
+
+/// The imports into this node under way: per import its id, its slots, and
+/// those of them it held keys of before it began, `None` while it has not
+/// looked (the source has been asked for nothing yet).
+fn imports_under_way(cluster: &ClusterState) -> Vec<(String, Ranges, Option<Ranges>)> {
+    cluster
+        .slot_migrations
+        .all()
+        .iter()
+        .filter(|t| t.operation == Operation::Import && t.state == TaskState::InProgress)
+        .map(|t| {
+            let kept = match t.held() {
+                Held::NotYet => None,
+                Held::Noted(held) => Some(slot_runs(held.slots.iter().copied())),
+                // The task ended since the look: all kept meanwhile.
+                Held::Released => Some(t.ranges.clone()),
+            };
+            (t.id.clone(), t.ranges.clone(), kept)
+        })
+        .collect()
 }
 
 /// `bytes` written to a new `path`, and on disk.
@@ -2687,7 +2742,13 @@ fn run_import(env: Env, task_id: String) {
                             *slot = Held::Noted(Arc::new(held));
                         }
                     }
+                    // Tests: killed here, its replicas were never told it
+                    // looked (#741).
+                    crate::aof::failpoint("import-noting");
                     save_imports(&env.cluster);
+                    // Tests: killed here, its replicas know what it held,
+                    // and nothing has arrived.
+                    crate::aof::failpoint("import-noted");
                 }
                 import_attempt(&env, &task, source)
             }

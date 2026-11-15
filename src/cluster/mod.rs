@@ -20,6 +20,7 @@
 
 pub mod bus;
 pub mod ddl;
+pub(crate) mod followed_imports;
 pub(crate) mod migrate_conns;
 pub mod migration;
 pub mod node;
@@ -290,6 +291,10 @@ pub struct ClusterState {
     /// The keys this master holds of slots it does not serve, as last
     /// counted, and the thread that counts them (#517). See `orphans`.
     pub(crate) orphans: std::sync::Arc<orphans::Orphans>,
+    /// The atomic slot imports of the master this node follows, or of its
+    /// old master once promoted, until what they brought is deleted (#741).
+    /// See `followed_imports`.
+    pub(crate) followed_imports: followed_imports::FollowedImports,
     /// Slots assigned with `SETSLOT NODE` or removed with `DELSLOTS` here,
     /// and when: for
     /// [`BY_HAND_GRACE`] a peer's claim does not change them (see
@@ -411,6 +416,7 @@ impl ClusterState {
             slot_migrations: migration::Registry::default(),
             slot_deletions: Default::default(),
             orphans: Default::default(),
+            followed_imports: Default::default(),
             by_hand: parking_lot::Mutex::new(AHashMap::new()),
             forgotten: RwLock::new(AHashMap::new()),
             last_vote_for: parking_lot::Mutex::new(AHashMap::new()),
@@ -625,6 +631,7 @@ impl ClusterState {
                     .upgrade()
                     .is_some_and(|state| state.take_over_from(master, why))
             }),
+            slot_imports: followed_imports::hook(self),
         });
         // A replica that started on a saved resync point holds the stream of
         // the master nodes.conf names.
@@ -634,6 +641,9 @@ impl ClusterState {
         // The keys of an import this node was receiving when it went down,
         // which never completed (#108).
         migration::drop_unfinished_imports(self);
+        // Those of its master, or of its old master, that it knew of (#741).
+        followed_imports::start(self, &repl_state);
+        migration::save_imports(self);
         // Keys of slots this node does not serve are reported, from a
         // moment after startup on (#517).
         orphans::start_watching(self);
