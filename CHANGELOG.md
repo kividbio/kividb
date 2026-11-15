@@ -285,6 +285,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A time series keeps its labels in the order they were given
+  (#612).** They were held in a hash map, whose order differs from one
+  process to the next, so `TS.INFO` and `WITHLABELS` showed the pairs in an
+  order of the server's own choosing, and a replica after a full sync, a
+  restart, a `DUMP` and `RESTORE`, or a slot migration showed them in
+  another: `DEBUG DIGEST-VALUE` of the same series then differed between
+  nodes. As in RedisTimeSeries, `TS.INFO`, `TS.MGET`, `TS.MRANGE` and
+  `TS.MREVRANGE` give them as given (the last two sorted them by name).
+  Nothing in a snapshot, a `DUMP` payload or the append-only file changes:
+  they were written as a list of pairs, and are read in the order written,
+  so files move between this release and 1.2.x either way.
+
 - **A replica promoted after its master died part way through a slot
   import deletes what the import brought, and an import sent again no
   longer brings back keys the source deleted (#741).** The keys a

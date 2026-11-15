@@ -80,7 +80,7 @@ impl LabelFilter {
         None
     }
 
-    pub(super) fn matches(&self, labels: &ahash::AHashMap<String, String>) -> bool {
+    pub(super) fn matches(&self, labels: &crate::types::Labels) -> bool {
         match self {
             LabelFilter::Eq(l, v) => labels.get(l).map(|s| s == v).unwrap_or(false),
             LabelFilter::Ne(l, v) => labels.get(l).map(|s| s != v).unwrap_or(true),
@@ -402,7 +402,7 @@ pub(crate) fn incrby_timestamp_options(cmd: &[&[u8]]) -> Vec<usize> {
 fn update_label_index(
     ts_index: &SharedTsIndex,
     key: &[u8],
-    old_labels: &ahash::AHashMap<String, String>,
+    old_labels: &crate::types::Labels,
     new_labels: &[(String, String)],
 ) {
     if old_labels.is_empty() && new_labels.is_empty() {
@@ -603,7 +603,7 @@ pub(crate) fn renamed(ctx: &Ctx, from: &[u8], to: &[u8]) {
     update_label_index(
         ctx.ts_index,
         &crate::key_bytes::bytes_of(&to),
-        &ahash::AHashMap::new(),
+        &crate::types::Labels::default(),
         &labels,
     );
 }
@@ -621,7 +621,7 @@ pub(crate) fn copied(ctx: &Ctx, to: &[u8], series: &Arc<RwLock<TsInner>>) {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     };
-    update_label_index(ctx.ts_index, to, &ahash::AHashMap::new(), &labels);
+    update_label_index(ctx.ts_index, to, &crate::types::Labels::default(), &labels);
 }
 
 /// What follows every sample written to `series`: its compactions are brought
@@ -761,7 +761,7 @@ fn ts_create(ctx: &mut Ctx) -> Option<Vec<u8>> {
     drop(map);
 
     let labels = options.labels.unwrap_or_default();
-    update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);
+    update_label_index(ctx.ts_index, &key, &crate::types::Labels::default(), &labels);
     Some(resp_simple("OK"))
 }
 
@@ -898,7 +898,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     if created {
         let labels = options.labels.unwrap_or_default();
-        update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);
+        update_label_index(ctx.ts_index, &key, &crate::types::Labels::default(), &labels);
     }
 
     match result {
@@ -1059,7 +1059,7 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
     };
     if created {
         let labels = options.labels.unwrap_or_default();
-        update_label_index(ctx.ts_index, &key, &ahash::AHashMap::new(), &labels);
+        update_label_index(ctx.ts_index, &key, &crate::types::Labels::default(), &labels);
     }
     match added {
         Ok(stored_ts) => {

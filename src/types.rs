@@ -550,6 +550,12 @@ pub struct CompactionRule {
     pub align_timestamp: u64, // ms, default 0
 }
 
+/// Time series labels: insertion-ordered, so the order they were given in
+/// survives replication, snapshots and DUMP (it was a hash map, whose order
+/// differs per process, #612).
+pub type Labels = indexmap::IndexMap<String, String, ahash::RandomState>;
+
+
 #[derive(Debug, Clone)]
 pub struct TsInner {
     /// All samples: timestamp_ms → value.
@@ -565,8 +571,9 @@ pub struct TsInner {
     /// Chunk size hint (we store it but use the BTreeMap regardless).
     pub chunk_size: usize,
 
-    /// User-defined label pairs: label_name → label_value.
-    pub labels: AHashMap<String, String>,
+    /// User-defined label pairs, in the order they were given (TS.INFO,
+    /// WITHLABELS, snapshots and DUMP keep it).
+    pub labels: Labels,
 
     /// Compaction rules sourced from this series.
     pub rules: Vec<CompactionRule>,
@@ -587,7 +594,7 @@ impl TsInner {
             retention: 0,
             duplicate_policy: DuplicatePolicy::Last,
             chunk_size: 4096,
-            labels: AHashMap::new(),
+            labels: Labels::default(),
             rules: Vec::new(),
             last_ts: None,
             source: None,
