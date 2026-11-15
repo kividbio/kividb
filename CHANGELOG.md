@@ -347,10 +347,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `BLPOP` could land after the `LPUSH` that woke it had replied: `INFO` or
   `LLEN` sent right behind the push could see one change fewer and the
   element still there, which made Redis's `BLPOP/BLMOVE should increase
-  dirty` and `Circular BRPOPLPUSH` fail now and then. As in Redis, a command
-  now replies once the clients it woke have looked at their keys, for a
-  chain of them too, waiting at most 100 ms for a client that cannot look
-  at once (paused, killed). Thanks to @willgitdata for the fix.
+  dirty` and `Circular BRPOPLPUSH` fail now and then. As in Redis, a
+  command's reply now goes out once the clients it woke have looked at their
+  keys, for a chain of them too, and a command that reads runs only after
+  the clients woken by the commands before it have; waiting at most 100 ms
+  for a client that cannot look at once (paused, killed). A pipeline of
+  writes waits once, before its replies are written, not write by write, so
+  a producer's pipelined pushes keep their rate; one difference from Redis
+  is left there: the reply of a push pipelined behind another to the same
+  key may count an element the first push's woken client has yet to take.
+  Thanks to @willgitdata for the fix.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,
