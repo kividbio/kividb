@@ -1484,10 +1484,16 @@ mod gone_resume_tests {
             assert!(slot.take_parked().is_none());
             assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
             assert!(waker[0].is_done(), "the gone client's look is not done");
-            assert_eq!(slot.woken.len(), 1, "the one behind is not waited for");
-            assert!(!slot.woken[0].is_done());
+            // The one behind is waited for (twice, perhaps: the dispatch's
+            // write to `g` wakes the head of its line again, and that is the
+            // same client, yet to look).
+            assert!(!slot.woken.is_empty(), "the one behind is not waited for");
+            assert!(slot.woken.iter().all(|look| !look.is_done()));
             drop(behind);
-            assert!(slot.woken[0].is_done(), "a client that went owes nothing");
+            assert!(
+                slot.woken.iter().all(|look| look.is_done()),
+                "a client that went owes nothing"
+            );
         });
     }
 
