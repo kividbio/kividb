@@ -88,15 +88,24 @@ impl Bell {
         }
     }
 
-    /// The command running on this thread waits for this client to look
-    /// (see [`collect_woken`]): a look it owes, unless it has gone.
-    fn owe(&self, look: &Arc<Look>) -> bool {
+    /// The command running on this thread, of connection `owner`, waits
+    /// for this client to look (see [`collect_woken`]): a new look it owes,
+    /// unless it has gone, or owes that connection one already that is not
+    /// done (the connection is waiting for that one: a producer pushing to
+    /// queues whose workers lag behind would otherwise give the same
+    /// worker a look for every push).
+    fn owe(&self, owner: u64) -> Option<Arc<Look>> {
         let mut owed = self.owed.lock();
-        if !self.alive() {
-            return false;
+        if !self.alive()
+            || owed
+                .iter()
+                .any(|look| look.owner == owner && !look.is_done())
+        {
+            return None;
         }
-        owed.push(Arc::clone(look));
-        true
+        let look = Look::new(owner);
+        owed.push(Arc::clone(&look));
+        Some(look)
     }
 }
 
@@ -114,6 +123,8 @@ impl Bell {
 /// for each other, and a client that woke itself (its own `BLMOVE k k`) has
 /// done its look by the time it waits.
 pub struct Look {
+    /// The connection waiting for it (see [`collect_woken_for`]).
+    owner: u64,
     /// The looks it was done with, once it is done.
     then: std::sync::OnceLock<Vec<Arc<Look>>>,
     /// Whether anyone waits on it: a look nobody waits for (that of a
@@ -123,8 +134,9 @@ pub struct Look {
 }
 
 impl Look {
-    fn new() -> Arc<Self> {
+    fn new(owner: u64) -> Arc<Self> {
         Arc::new(Self {
+            owner,
             then: std::sync::OnceLock::new(),
             waited: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
@@ -134,7 +146,7 @@ impl Look {
     /// `n` looks nobody will finish, for tests.
     #[cfg(test)]
     pub fn new_for_tests(n: usize) -> Vec<Arc<Look>> {
-        (0..n).map(|_| Look::new()).collect()
+        (0..n).map(|_| Look::new(0)).collect()
     }
 
     /// The client has looked, and woke `then` doing so. Once: a look done
@@ -204,6 +216,8 @@ thread_local! {
     /// A byte of its own, with nothing to drop, so that a command that wakes
     /// nobody only sets it and swaps it back.
     static COLLECT: std::cell::Cell<u8> = const { std::cell::Cell::new(IDLE) };
+    /// The connection whose command collects (see [`collect_woken_for`]).
+    static OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// What it has collected, once it is [`COLLECTED`].
     static WOKEN: std::cell::RefCell<Woken> = const {
         std::cell::RefCell::new(Woken {
@@ -243,7 +257,15 @@ fn collecting() -> bool {
 /// else (a script's own thread) is not collected, so nothing piles up there.
 #[inline]
 pub fn collect_woken() {
+    collect_woken_for(0);
+}
+
+/// [`collect_woken`] for the command of connection `owner`: a client woken
+/// again before it has looked owes a connection one look, not one per wake.
+#[inline]
+pub fn collect_woken_for(owner: u64) {
     COLLECT.set(COLLECTING);
+    OWNER.set(owner);
 }
 
 /// The clients the command since [`collect_woken`] woke — `None` if it
@@ -276,8 +298,7 @@ fn collect(bell: &Bell) {
         if woken.bells.contains(&at) {
             return;
         }
-        let look = Look::new();
-        if bell.owe(&look) {
+        if let Some(look) = bell.owe(OWNER.get()) {
             woken.bells.push(at);
             woken.woken.push(look);
             COLLECT.set(COLLECTED);
@@ -1360,7 +1381,7 @@ mod signal_tests {
 
         let bell = Arc::clone(&ticket.bell);
         drop(ticket);
-        assert!(!bell.owe(&Look::new()));
+        assert!(bell.owe(1).is_none());
         assert!(bell.owed.lock().is_empty());
     }
 }

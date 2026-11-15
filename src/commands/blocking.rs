@@ -414,13 +414,19 @@ pub struct BlockingSlot {
     /// The looks of the clients the last dispatch woke. See
     /// [`settle`](Self::settle).
     woken: Vec<std::sync::Arc<crate::wait_table::Look>>,
+    /// This connection, to the looks it waits for: one per woken client.
+    owner: u64,
 }
 
 impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
-        crate::wait_table::collect_woken();
+        if self.owner == 0 {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            self.owner = NEXT.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::wait_table::collect_woken_for(self.owner);
         self.ctl.awaitable = true;
         self.ctl.parked = None;
         match self.pending.take() {
