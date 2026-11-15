@@ -2521,23 +2521,29 @@ fn string_format_frees_what_it_built_when_it_fails() {
             .unwrap()
     };
     // 600,000 `%s` and a `%d` given a fraction: a rewrite, with as many
-    // arguments kept. Ten calls per script, each under `pcall`.
+    // arguments kept. One call per script, under `pcall`: the client reads
+    // each reply for 5 s, and ten calls in one script outlasted that on a
+    // machine busy with other tests. 10 calls to warm the allocator up, then
+    // 60 measured.
     let script = "local n = 600000 \
          local t = {} for i = 1, n do t[i] = 'x' end t[n + 1] = 1.5 \
          local f = string.rep('%s', n) .. '%d' \
-         local ok = 0 \
-         for i = 1, 10 do \
-           if pcall(string.format, f, table.unpack(t)) then ok = ok + 1 end \
-         end \
+         local ok = pcall(string.format, f, table.unpack(t)) and 1 or 0 \
          t = nil f = nil collectgarbage() \
          return ok";
-    // Once to warm the allocator up, then measured.
-    assert!(matches!(c.cmds(&["EVAL", script, "0"]), RespValue::Int(_)));
+    for _ in 0..10 {
+        assert!(matches!(c.cmds(&["EVAL", script, "0"]), RespValue::Int(_)));
+    }
     let before = rss(&mut c);
-    for _ in 0..3 {
+    for _ in 0..60 {
         assert!(matches!(c.cmds(&["EVAL", script, "0"]), RespValue::Int(_)));
     }
     let after = rss(&mut c);
     let grown = after.saturating_sub(before);
-    assert!(grown < 32 << 20, "resident memory grew {grown} bytes");
+    // Measured on a 4-core VM busy with other tests, some 50 runs: 0 to
+    // 43 MB of growth with the leak fixed (the allocator's own slack, which
+    // moves the resident size about as much before the calls as after them,
+    // so 32 MB was too tight); the leak as first written (#747) grew it by
+    // some 5 MB a call, 300 MB over the 60 here.
+    assert!(grown < 96 << 20, "resident memory grew {grown} bytes");
 }
