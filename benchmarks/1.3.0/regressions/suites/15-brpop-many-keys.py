@@ -30,10 +30,12 @@ Metrics:
   blocked_after    `INFO clients` blocked_clients 2 s after every worker has
                    disconnected (1.2.2 left hundreds: #758)
 
-Gates: jobs_per_s keeps 60 % of the gain over v1.2.2, stays within 10 % of
-the recorded value (host-scaled), and is at most 1.5x worse than Redis 8.10
-measured in the same session (c1000x1 only rel 10 %: it is a guard, not an
-improvement). lost and blocked_after are exact (0).
+Gates: jobs_per_s stays within 10 % of the recorded value and at most 1.5x
+worse than Redis 8.10 measured in the same session; c1000 also keeps 60 % of
+its gain over v1.2.2. c4000 has no ratio gate: v1.2.2 delivers 8-20 jobs/s
+there, too noisy a denominator; c1000x1 has only the 10 % (a guard, not an
+improvement). None is scaled by the host's speed (`jitter()`): the rate is
+capped by what the producer offers. lost and blocked_after are exact (0).
 
 The offered rate is the cap: an engine that keeps up delivers about 1,900
 jobs/s whatever the client count, so the gain over v1.2.2 is bounded by it.
@@ -197,10 +199,14 @@ def run(ctx):
                     "drained_after_s": drained_at, "pings": len(pings), "ping_top": pr.top(10)})
     ctx.log("pushed %d, received %d (%d in window), left %d, timeouts %d, drained after %s s"
             % (pushed, len(got), in_window, left, timeouts, drained_at))
-    if ctx.config.name == "c1000x1":
-        gate = [THROUGHPUT]
-    else:
-        gate = [THROUGHPUT, KEEP_IMPROVEMENT, vs_redis(1.5)]
+    # Not scaled by the host's speed (`jitter()`): the rate is capped by
+    # what the producer offers, not by the CPU, and v1.2.2's c4000 rate
+    # (8-20 jobs/s) is too noisy to be a speed factor or a ratio's
+    # denominator.
+    gate = {"c1000": [THROUGHPUT, KEEP_IMPROVEMENT, vs_redis(1.5)],
+            "c4000": [THROUGHPUT, vs_redis(1.5)],
+            "c1000x1": [THROUGHPUT]}[ctx.config.name]
+    gate = jitter(gate)
     ctx.emit("jobs_per_s", in_window / (t1 - t0), "jobs/s", "higher", gate=gate)
     ctx.emit("ping_p99_ms", p99, "ms", "lower", gate=jitter(info()))
     ctx.emit("ping_max_ms", pr.worst(t0, t1), "ms", "lower", gate=jitter(info()))
