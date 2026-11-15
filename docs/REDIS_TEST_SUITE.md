@@ -196,8 +196,10 @@ Redis's HyperLogLog header with `GETRANGE`.
 - `introspection` (2): `CONFIG SET maxmemory-clients` and `CONFIG SET port`
   are accepted and remembered without being applied, so the tests'
   out-of-range value and unusable port are not refused.
-- `introspection-2` (1): `TTL`, `TYPE` and `EXISTS` reset a key's idle time
-  unless `key-access-tracking yes` is set (the test passes with it).
+- `introspection-2` (1): `OBJECT IDLETIME` is 0 under `noeviction` unless
+  `key-access-tracking yes` is set (off by default), so the test of `TTL`,
+  `TYPE` and `EXISTS` leaving a key's idle time alone fails; it passes with it
+  on.
 - `pubsub` (2): a RESP3 client that publishes to a channel it is subscribed
   to, from inside a script or a transaction, gets the message before the
   reply to the script; Redis sends the reply first.

@@ -101,12 +101,24 @@ measured.
 
 ## What counts as a regression
 
-Instruction counts are the same from run to run for a given binary; two
-builds differ by up to 1 to 2% in a command nothing changed in (code layout),
-which is why the table is built with `LTO=fat`.
+Callgrind numbers differ from run to run by about 0.7% per cell (master
+against master: 3234 and 3258 for the same pipelined 100 B `GET`; the keys
+redis-benchmark picks and the hash seeds differ), and builds of different
+code by about as much again (layout). One cell of one run proves little.
 
-- Tracking off: more than 0.3% above master's on a pipelined `GET` or `SET`
-  averaged over two runs, or more than 1% on any command here in one.
-- Tracking on: more than 1.6% above master's tracking-off count on a pipelined
-  `GET`, or 2% on any other command here, over two runs.
+- **Tracking on against tracking off**, the same binary in the same run (this
+  cancels most of the noise): the median over the pipelined `GET` and `SET`
+  cells of N=3 runs must be at most 2.5% (the committed run: +1.05%). Above it is a
+  regression; the 9 to 10% before the optimisation is what this protects.
+  `check.py` computes it and exits non-zero above the threshold.
+- **Tracking off against master** cannot be resolved by this measurement
+  (the final run read +0.55% and +0.68% on pipelined 100 B `GET` and `SET`, an
+  earlier run -0.12% and -0.38%, both inside the noise). It is guaranteed by
+  construction: with tracking off a command does one load of `RECORDING`
+  and branches on it, and touches no thread-local. A change to that path is
+  reviewed by reading it, not by this benchmark.
 - Bytes per key: any difference between the two settings beyond 1 B.
+
+```
+python3 benchmarks/1.3.0/key-access-tracking/check.py run1/raw.txt run2/raw.txt run3/raw.txt
+```
