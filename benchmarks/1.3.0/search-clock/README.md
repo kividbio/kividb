@@ -43,7 +43,7 @@ far deadline on one field of every hash (nothing expires).
 | aggregate-filter-knn | 0 | 5,521,313 | 5,516,411 | -0.1% |
 | aggregate-filter-knn | 1 | 10,662,963 | 10,359,379 | -2.8% |
 
-The raw output is `results/raw.log`: `old` is master, `new` a first build of the
+The raw output is `results/raw.md`: `old` is master, `new` a first build of the
 change that read the clock up front (it was +1.4% to +1.8% on the `ttl=0`
 rows, which is why the clock is read when first needed), `new2` the change
 measured above. Instruction counts leave out what a clock read costs in
