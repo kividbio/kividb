@@ -302,9 +302,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory go over the limit by at most what the writes checked at that
   moment add, and nothing waits. On a 4-vCPU VM (master and replica with
   AOF, memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists,
-  sets and sorted sets, `maxmemory 512mb`, ~55M writes in ten minutes),
-  SOAK_NUMBERS Keys that only a snapshot holds are still not evicted for
-  nothing. The soak is `benchmarks/1.3.0/eviction-soak/soak.sh`.
+  sets and sorted sets, `maxmemory 512mb`, ~53M writes in ten minutes),
+  master refused 2 writes under `allkeys-lfu` and 3 under `allkeys-lru`,
+  the fix none; memory use was never over the limit by more than 0.23 MB
+  for 100 ms or longer (master: 0.18 MB). Keys that only a snapshot holds are
+  still not evicted for nothing. The soak is
+  `benchmarks/1.3.0/eviction-soak/soak.sh`.
 
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
