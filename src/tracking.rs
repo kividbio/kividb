@@ -46,6 +46,11 @@ pub struct TrackingTableInner {
     /// Key → the clients that have read it and are to be told when it
     /// changes. (Not the `BCAST` clients: they are told by prefix.)
     table: RwLock<AHashMap<Key, AHashSet<u64>>>,
+    /// The clients of every key of `table` added up: `tracking_total_items`.
+    /// Changed only under `table`'s write lock, with it. `INFO` added it
+    /// up over every key, holding the table, which every read of a tracking
+    /// client waits for to register its key (#622).
+    items: AtomicUsize,
     broadcast: RwLock<AHashMap<u64, Broadcast>>,
     /// Number of `BCAST` clients: a write looks no further when it is zero.
     broadcasting: AtomicUsize,
@@ -75,6 +80,7 @@ impl TrackingTableInner {
     pub fn new() -> Self {
         Self {
             table: RwLock::new(AHashMap::new()),
+            items: AtomicUsize::new(0),
             broadcast: RwLock::new(AHashMap::new()),
             broadcasting: AtomicUsize::new(0),
             pending: parking_lot::Mutex::new(Vec::new()),
@@ -90,15 +96,37 @@ impl TrackingTableInner {
     #[must_use]
     pub fn register(&self, key: &[u8], client_id: u64) -> Vec<Dropped> {
         let mut table = self.table.write();
-        table.entry(Key::new(key)).or_default().insert(client_id);
-        Self::trim(&mut table, self.max_keys.load(Ordering::Relaxed), Some(key))
+        if table.entry(Key::new(key)).or_default().insert(client_id) {
+            self.items_changed(1, 0);
+        }
+        let dropped = Self::trim(&mut table, self.max_keys.load(Ordering::Relaxed), Some(key));
+        self.items_dropped(&dropped);
+        dropped
+    }
+
+    /// `items` up by `more` and down by `fewer`. The caller holds `table`
+    /// for writing: nobody else changes it meanwhile.
+    #[inline]
+    fn items_changed(&self, more: usize, fewer: usize) {
+        let items = self.items.load(Ordering::Relaxed);
+        self.items.store(items + more - fewer, Ordering::Relaxed);
+    }
+
+    /// `items` less the clients of keys let go of, with `table` held.
+    fn items_dropped(&self, dropped: &[Dropped]) {
+        if !dropped.is_empty() {
+            self.items_changed(0, dropped.iter().map(|(_, c)| c.len()).sum());
+        }
     }
 
     /// `tracking-table-max-keys`. Returns what no longer fits.
     #[must_use]
     pub fn set_max_keys(&self, max_keys: usize) -> Vec<Dropped> {
         self.max_keys.store(max_keys, Ordering::Relaxed);
-        Self::trim(&mut self.table.write(), max_keys, None)
+        let mut table = self.table.write();
+        let dropped = Self::trim(&mut table, max_keys, None);
+        self.items_dropped(&dropped);
+        dropped
     }
 
     pub fn max_keys(&self) -> usize {
@@ -130,12 +158,17 @@ impl TrackingTableInner {
     /// Removal is correct — after invalidation is sent, clients will
     /// re-register on their next read if they still care about the key.
     pub fn take_clients(&self, key: &[u8]) -> Option<AHashSet<u64>> {
-        self.table.write().remove(key)
+        let mut table = self.table.write();
+        let clients = table.remove(key)?;
+        self.items_changed(0, clients.len());
+        Some(clients)
     }
 
     /// Forget every key: the keyspace was flushed.
     pub fn clear(&self) {
-        self.table.write().clear();
+        let mut table = self.table.write();
+        table.clear();
+        self.items.store(0, Ordering::Relaxed);
     }
 
     /// `(keys, clients across all keys, prefixes)`, for `INFO`.
@@ -143,7 +176,7 @@ impl TrackingTableInner {
         let table = self.table.read();
         (
             table.len(),
-            table.values().map(|clients| clients.len()).sum(),
+            self.items.load(Ordering::Relaxed),
             self.broadcast
                 .read()
                 .values()
@@ -210,10 +243,12 @@ impl TrackingTableInner {
     /// turns tracking off).
     pub fn unregister_client(&self, client_id: u64) {
         let mut table = self.table.write();
+        let mut removed = 0;
         table.retain(|_, clients| {
-            clients.remove(&client_id);
+            removed += usize::from(clients.remove(&client_id));
             !clients.is_empty()
         });
+        self.items_changed(0, removed);
         drop(table);
         let mut broadcast = self.broadcast.write();
         if broadcast.remove(&client_id).is_some() {
@@ -662,6 +697,41 @@ mod invalidation_frame_tests {
 
         let r2 = build_invalidation_message(&keys, 2);
         assert!(r2.ends_with(expected_tail), "RESP2 key array malformed");
+    }
+
+    /// `tracking_total_items` is kept as clients come and go, and is what
+    /// adding up the table says (#622).
+    #[test]
+    fn the_count_of_items_follows_the_table() {
+        let t = TrackingTableInner::new();
+        let recount = |t: &TrackingTableInner| {
+            let table = t.table.read();
+            let items: usize = table.values().map(|c| c.len()).sum();
+            assert_eq!(t.totals().1, items);
+            items
+        };
+        let _ = t.register(b"a", 1);
+        let _ = t.register(b"a", 1);
+        let _ = t.register(b"a", 2);
+        let _ = t.register(b"b", 1);
+        assert_eq!(recount(&t), 3);
+        assert_eq!(t.take_clients(b"a").map(|c| c.len()), Some(2));
+        assert!(t.take_clients(b"a").is_none());
+        assert_eq!(recount(&t), 1);
+        for k in 0..10u8 {
+            let _ = t.register(&[k], 7);
+            let _ = t.register(&[k], 8);
+        }
+        assert_eq!(recount(&t), 21);
+        t.unregister_client(7);
+        assert_eq!(recount(&t), 11);
+        let dropped = t.set_max_keys(4);
+        assert_eq!(dropped.len(), 7);
+        assert_eq!(recount(&t), 4);
+        let _ = t.register(b"new", 9);
+        assert_eq!((t.totals().0, recount(&t)), (4, 4));
+        t.clear();
+        assert_eq!(recount(&t), 0);
     }
 
     #[test]

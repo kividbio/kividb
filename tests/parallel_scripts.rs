@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{restart_verified, start_verified};
+
 #[derive(Debug, Clone, PartialEq)]
 enum V {
     Str(String),
@@ -107,40 +110,6 @@ struct Server {
     args: Vec<String>,
 }
 
-/// Whether nothing has `port`. It is asked with a socket that is bound and
-/// never listens. One that listened, as this used to, could be given a
-/// connection: a server another test is starting holds, between its fork and
-/// its exec, a copy of every socket this process has open, and a client that
-/// dialled the port in that moment was connected to the copy and then reset
-/// ("Connection reset by peer", at the first command of a test).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    // As the server's own socket, so that a copy of this one, while it
-    // lasts, does not keep the server from the port.
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on, and not one the system hands out to
-/// outgoing connections (see tests/eviction.rs).
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(37);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 /// `kividb` on `port`, in `dir`.
 fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
     let log = std::fs::OpenOptions::new()
@@ -173,9 +142,9 @@ fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
 impl Server {
     fn start(extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = spawn(&dir, port, &args);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| spawn(&dir, port, &args));
         let server = Server {
             port,
             child,
@@ -196,7 +165,13 @@ impl Server {
     fn kill_and_restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.child = spawn(&self.dir, self.port, &self.args);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters): `self.port` is the one it is on.
+        let (child, port, _) =
+            restart_verified(|port| spawn(&self.dir, port, &self.args), self.port);
+        self.child = child;
+        self.port = port;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
@@ -797,4 +772,39 @@ fn a_tagged_script_may_not_sort_by_a_pattern_outside_its_tag() {
     let mut m = master.conn();
     let replayed: Vec<String> = keys.iter().map(|key| m.state(key)).collect();
     assert_eq!(replayed, before, "AOF replay: {keys:?}");
+}
+
+/// A script that runs beside others may not create the first search index
+/// (#570): other commands run meanwhile, and the first index waits until
+/// every write already under way is done, which a script holding its keys'
+/// order cannot. Once an index exists, nothing has to be waited for, and it
+/// may.
+#[test]
+fn a_script_beside_others_may_not_create_the_first_index() {
+    const CREATES: &str = "if ARGV[1] == '' then return redis.call('SET', KEYS[1], 'v') end \
+                           return redis.call('FT.CREATE', ARGV[1], 'ON', 'HASH', \
+                           'PREFIX', '1', '{q}:', 'SCHEMA', 'f', 'TEXT')";
+    let server = Server::start(&["--lua-parallel-scripts", "true"]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", CREATES]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // Seen to be quick, so that it is run beside others.
+    for _ in 0..4 {
+        assert!(c.cmd(&["EVALSHA", &sha, "1", "{q}:k", ""]).ok());
+    }
+    let refused = c.cmd(&["EVALSHA", &sha, "1", "{q}:k", "first"]);
+    assert!(
+        refused.is_err() && refused.s().contains("first search index"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        c.cmd(&["FT._LIST"]),
+        V::Arr(Vec::new()),
+        "an index was made"
+    );
+
+    assert!(c.cmd(&["FT.CREATE", "outside", "SCHEMA", "f", "TEXT"]).ok());
+    let second = c.cmd(&["EVALSHA", &sha, "1", "{q}:k", "second"]);
+    assert!(second.ok(), "{second:?}");
 }

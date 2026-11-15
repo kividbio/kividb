@@ -171,17 +171,73 @@ pub fn command_events(name: &str, cmd: &[&[u8]], reply: &[u8]) -> Vec<CommandEve
         "JSON.DEL" | "JSON.FORGET" | "JSON.CLEAR" | "VREM" | "VSETATTR" if int() == Some(0) => {
             Vec::new()
         }
+        // A JSON write that changed nothing announces nothing, as in
+        // RedisJSON (#575).
+        _ if name.starts_with("JSON.") && json_changed_nothing(name, reply) => Vec::new(),
         _ if name.starts_with("JSON.")
             || name.starts_with("TS.")
             || matches!(name, "VADD" | "VREM" | "VSETATTR") =>
         {
-            let event = name.to_ascii_lowercase();
+            // `JSON.FORGET` is RedisJSON's `JSON.DEL`, event and all.
+            let event = match name {
+                "JSON.FORGET" => "json.del".to_string(),
+                _ => name.to_ascii_lowercase(),
+            };
             crate::keyspec::key_positions(name, cmd)
                 .iter()
                 .flat_map(|key| one(KS_MODULE, &event, key))
                 .collect()
         }
         _ => Vec::new(),
+    }
+}
+
+/// Whether the reply of the JSON write `name` says it changed nothing: nil
+/// (`JSON.SET`'s `NX` or `XX` not met, a key that is not there), or nil for
+/// every value its JSONPath matched (none of the type the command works on,
+/// or no match at all), as a RESP array or, for `JSON.NUMINCRBY` and
+/// `JSON.NUMMULTBY` in RESP2, as a JSON array. RedisJSON announces an event
+/// only once a value was changed.
+fn json_changed_nothing(name: &str, reply: &[u8]) -> bool {
+    const NILS: [&[u8]; 3] = [b"$-1\r\n", b"_\r\n", b"*-1\r\n"];
+    if NILS.contains(&reply) {
+        return true;
+    }
+    let line = |bytes: &[u8]| -> Option<(usize, usize)> {
+        let end = bytes.windows(2).position(|w| w == b"\r\n")?;
+        let n = std::str::from_utf8(&bytes[1..end]).ok()?.parse().ok()?;
+        Some((n, end + 2))
+    };
+    match reply.first() {
+        Some(b'*') => {
+            let Some((count, mut at)) = line(reply) else {
+                return false;
+            };
+            for _ in 0..count {
+                let Some(nil) = NILS.iter().find(|nil| reply[at..].starts_with(nil)) else {
+                    return false;
+                };
+                at += nil.len();
+            }
+            at == reply.len()
+        }
+        Some(b'$') if matches!(name, "JSON.NUMINCRBY" | "JSON.NUMMULTBY") => {
+            let Some((len, at)) = line(reply) else {
+                return false;
+            };
+            let Some(text) = reply
+                .get(at..at + len)
+                .and_then(|text| std::str::from_utf8(text).ok())
+            else {
+                return false;
+            };
+            text.strip_prefix('[')
+                .and_then(|text| text.strip_suffix(']'))
+                .is_some_and(|inner| {
+                    inner.is_empty() || inner.split(',').all(|v| v.trim() == "null")
+                })
+        }
+        _ => false,
     }
 }
 
@@ -533,6 +589,33 @@ pub fn notify_subkeys<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nil_replies_change_nothing() {
+        for reply in [&b"$-1\r\n"[..], b"_\r\n", b"*0\r\n", b"*2\r\n$-1\r\n_\r\n"] {
+            assert!(json_changed_nothing("JSON.TOGGLE", reply), "{reply:?}");
+        }
+        assert!(json_changed_nothing("JSON.NUMINCRBY", b"$6\r\n[null]\r\n"));
+        assert!(json_changed_nothing("JSON.NUMINCRBY", b"$2\r\n[]\r\n"));
+    }
+
+    #[test]
+    fn a_change_is_a_change() {
+        for reply in [
+            &b"+OK\r\n"[..],
+            b":3\r\n",
+            b"*2\r\n$-1\r\n:1\r\n",
+            b"$4\r\nnull\r\n",
+            b"$6\r\n[null]\r\n",
+        ] {
+            assert!(!json_changed_nothing("JSON.ARRPOP", reply), "{reply:?}");
+        }
+        assert!(!json_changed_nothing(
+            "JSON.NUMINCRBY",
+            b"$8\r\n[null,2]\r\n"
+        ));
+        assert!(!json_changed_nothing("JSON.NUMINCRBY", b"$1\r\n3\r\n"));
+    }
 
     fn messages(flags: &str, event: &str, key: &str, subkeys: &[&str]) -> Vec<(String, String)> {
         let subkeys: Vec<&[u8]> = subkeys.iter().map(|s| s.as_bytes()).collect();

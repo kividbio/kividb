@@ -118,12 +118,7 @@ fn field_ttl_ms(value: &KiviDBValue, field: &str) -> Option<u64> {
         return None;
     };
     let h = h.read();
-    let at = h.expiries.get(field)?;
-    Some(
-        now_ms()
-            + at.saturating_duration_since(std::time::Instant::now())
-                .as_millis() as u64,
-    )
+    h.expiries.get(field).copied()
 }
 
 // KeyDB writes the TTL `EXPIREMEMBER` gives a hash field after the hash: it
@@ -165,7 +160,7 @@ fn keydb_hash_field_ttls_load_as_field_ttls() {
             .read()
             .expiries
             .get(field)
-            .is_some_and(|at| *at <= std::time::Instant::now()),
+            .is_some_and(|at| *at < now_ms()),
         _ => false,
     };
     let KiviDBValue::HashEx(h) = &db["h"] else {

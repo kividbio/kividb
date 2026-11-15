@@ -27,6 +27,20 @@ def _decode(v):
     return v.decode() if isinstance(v, bytes) else v
 
 
+def _spellcheck_words(raw):
+    """The suggested words of each misspelled term of a raw FT.SPELLCHECK
+    reply, in either of RediSearch's shapes: RESP2
+    ``[["TERM", term, [[score, word], ...]], ...]`` or RESP3
+    ``{"results": {term: [{word: score}, ...]}}``."""
+    if isinstance(raw, dict):
+        results = {_decode(k): v for k, v in raw.items()}["results"]
+        return {
+            _decode(term): [_decode(w) for s in suggestions for w in s]
+            for term, suggestions in results.items()
+        }
+    return {_decode(e[1]): [_decode(s[1]) for s in e[2]] for e in raw}
+
+
 def _ft_search_knn(client, index, query_vec, k, field="embedding", extra_params=None):
     """
     Issue FT.SEARCH KNN and return (total: int, results: list[tuple[str, dict[str,str]]]).
@@ -486,39 +500,36 @@ def ft_hybrid_index(rb):
         pass
 
 
+def _pairs(raw):
+    """A RESP3 map, or a RESP2 flat list of names and values, as a dict."""
+    if isinstance(raw, dict):
+        return {_decode(k): v for k, v in raw.items()}
+    return {_decode(raw[i]): raw[i + 1] for i in range(0, len(raw), 2)}
+
+
+def _hybrid(raw):
+    """
+    FT.HYBRID replies as Redis 8.4+ does: total_results, results (one row of
+    names and values per result), warnings, execution_time. Returns
+    (total_results, [row dict, ...]).
+    """
+    top = _pairs(raw)
+    rows = [
+        {name: _decode(value) for name, value in _pairs(row).items()}
+        for row in top["results"]
+    ]
+    return top["total_results"], rows
+
+
 def _parse_hybrid(raw):
-    """
-    FT.HYBRID returns [count, key1, [fields1], key2, [fields2], ...]
-    after fusion (no GROUPBY). Returns (count, [(key, fields_dict), ...]).
-    """
-    count = raw[0]
-    rows = []
-    i = 1
-    while i + 1 < len(raw):
-        key = _decode(raw[i])
-        flat = raw[i + 1]
-        fields = {}
-        for j in range(0, len(flat), 2):
-            fields[_decode(flat[j])] = _decode(flat[j + 1])
-        rows.append((key, fields))
-        i += 2
-    return count, rows
+    """(total_results, [(key, fields), ...]); the key if the row shows it."""
+    total, rows = _hybrid(raw)
+    return total, [(row.get("__key"), row) for row in rows]
 
 
 def _parse_hybrid_grouped(raw):
-    """
-    FT.HYBRID with a GROUPBY tail emits [count, [fields1], [fields2], ...]
-    — flat field arrays without per-row keys.
-    """
-    count = raw[0]
-    rows = []
-    for entry in raw[1:]:
-        flat = entry
-        fields = {}
-        for j in range(0, len(flat), 2):
-            fields[_decode(flat[j])] = _decode(flat[j + 1])
-        rows.append(fields)
-    return count, rows
+    """(total_results, [fields, ...]) of an FT.HYBRID with a GROUPBY."""
+    return _hybrid(raw)
 
 
 class TestFtHybrid:
@@ -564,11 +575,9 @@ class TestFtHybrid:
         top_keys = {rows[0][0], rows[1][0]}
         assert top_keys == {"h:1", "h:3"}
 
-        # Default field names are present
+        # Without LOAD a row is the key and the fused score
         for _, fields in rows[:2]:
-            assert "hybrid_score" in fields
-            assert "text_score"   in fields
-            assert "vsim_score"   in fields
+            assert set(fields) == {"__key", "__score"}
 
     def test_linear_alpha_text_heavy(self, ft_hybrid_index):
         r = ft_hybrid_index
@@ -722,9 +731,9 @@ class TestFtHybrid:
 
         raw = r.execute_command(
             "FT.HYBRID", "h_idx",
-            "SEARCH", "@title:rust",
+            "SEARCH", "@title:rust", "YIELD_SCORE_AS", "text_score",
             "VSIM", "@v", "$q",
-            "SORTBY", "2", "text_score", "DESC",
+            "SORTBY", "2", "@text_score", "DESC",
             "PARAMS", "2", "q", v,
         )
         count, rows = _parse_hybrid(raw)
@@ -749,7 +758,8 @@ class TestFtHybrid:
             "PARAMS", "2", "q", v,
         )
         count, rows = _parse_hybrid(raw)
-        assert count == 2  # LIMIT bounds the returned rows
+        assert count == 5  # every result, before LIMIT
+        assert len(rows) == 2  # LIMIT bounds the returned rows
 
     def test_pipeline_groupby_reduce(self, ft_hybrid_index):
         r = ft_hybrid_index
@@ -1084,10 +1094,7 @@ class TestFtSpellcheckIncremental:
             raw = rb.execute_command(
                 "FT.SPELLCHECK", idx, "helo", "DISTANCE", "1"
             )
-            entry = raw[0]
-            suggestions = entry[2]
-            words = [_decode(s[1]) for s in suggestions]
-            assert "hello" in words
+            assert "hello" in _spellcheck_words(raw)["helo"]
 
             # Brand-new word added — should be queryable right away
             rb.hset(b"sp:2", mapping={b"body": b"zephyr"})
@@ -1096,10 +1103,7 @@ class TestFtSpellcheckIncremental:
             raw2 = rb.execute_command(
                 "FT.SPELLCHECK", idx, "zephir", "DISTANCE", "1"
             )
-            entry2 = raw2[0]
-            suggestions2 = entry2[2]
-            words2 = [_decode(s[1]) for s in suggestions2]
-            assert "zephyr" in words2
+            assert "zephyr" in _spellcheck_words(raw2)["zephir"]
         finally:
             try:
                 rb.execute_command("FT.DROPINDEX", idx)
@@ -1127,11 +1131,52 @@ class TestFtSpellcheckIncremental:
             raw = rb.execute_command(
                 "FT.SPELLCHECK", idx, "delt", "DISTANCE", "1"
             )
-            entry = raw[0]
-            suggestions = entry[2]
-            words = [_decode(s[1]) for s in suggestions]
-            assert "delta" in words, \
+            assert "delta" in _spellcheck_words(raw)["delt"], \
                 "vocab should aggregate across all TEXT fields"
+        finally:
+            try:
+                rb.execute_command("FT.DROPINDEX", idx)
+            except Exception:
+                pass
+
+    def test_redis_py_parses_spellcheck_in_both_protocols(self, rb):
+        """redis-py's own parser (``ft().spellcheck``) reads the reply the
+        same way over RESP2 and RESP3, as it does RediSearch's: scores are
+        the share of documents holding the word, and a word no document
+        holds any more is not offered."""
+        idx = "sp_rpy_idx"
+        rb.execute_command(
+            "FT.CREATE", idx,
+            "ON", "HASH", "PREFIX", "1", "sprp:",
+            "SCHEMA", "body", "TEXT",
+        )
+        try:
+            for i, body in enumerate([b"hello world", b"hello there", b"held", b"other", b"help"]):
+                rb.hset(f"sprp:{i}".encode(), mapping={b"body": body})
+            rb.delete(b"sprp:4")  # "help": in no document any more
+            time.sleep(0.02)
+
+            got = rb.ft(idx).spellcheck("helo")
+            if b"results" in got or "results" in got:
+                # redis-py's default (legacy) responses hand RESP3's map
+                # back as it came, as they do from RediSearch.
+                results = got.get(b"results", got.get("results"))
+                got = {
+                    _decode(term): [
+                        (repr(score), _decode(word))
+                        for s in suggestions
+                        for word, score in s.items()
+                    ]
+                    for term, suggestions in results.items()
+                }
+            else:
+                got = {
+                    _decode(term): [
+                        (_decode(s["score"]), _decode(s["suggestion"])) for s in suggestions
+                    ]
+                    for term, suggestions in got.items()
+                }
+            assert got == {"helo": [("0.5", "hello"), ("0.25", "held")]}, got
         finally:
             try:
                 rb.execute_command("FT.DROPINDEX", idx)

@@ -41,7 +41,7 @@ impl std::error::Error for Unrepresentable {}
 
 /// The refusal of what the source holds and KiviDB can't, worded as
 /// `rdb_invalid` words its errors.
-fn unrepresentable(what: impl std::fmt::Display) -> io::Error {
+pub(super) fn unrepresentable(what: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         Unrepresentable(format!("RDB: {what}")),
@@ -102,6 +102,12 @@ pub(super) fn read_dragonfly_value(
             let text = rdb_read_string(r)?;
             let json = serde_json::from_slice(&text)
                 .map_err(|e| rdb_invalid(format!("Dragonfly JSON{}: {e}", named())))?;
+            if crate::commands::json::value_depth(&json) >= crate::commands::json::MAX_DEPTH {
+                return Err(rdb_invalid(format!(
+                    "Dragonfly JSON{} nested too deeply",
+                    named()
+                )));
+            }
             Ok(Some(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(
                 json,
             )))))
@@ -235,17 +241,13 @@ fn member_seconds_to_unix_ms(text: &[u8]) -> io::Result<Option<u64>> {
 fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Option<KiviDBValue>> {
     let mut inner = crate::types::HashInner::new();
     let mut names = std::collections::HashSet::with_capacity(fields.len());
-    // Read once for the hash (see `FieldClock`, #448).
-    let clock = crate::commands::helpers::FieldClock::now();
     for (field, value, expires_at) in fields {
         let field = String::from_utf8_lossy(&field).into_owned();
         if !names.insert(field.clone()) {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            inner
-                .expiries
-                .insert(field.clone(), field_deadline(&clock, at)?);
+            inner.expiries.insert(field.clone(), field_deadline(at));
         }
         inner.fields.insert(field, Arc::from(value.as_slice()));
     }
@@ -315,8 +317,7 @@ pub(super) fn apply_keydb_subexpiry(
     };
     let mut inner = inner;
     if inner.fields.contains_key(field.as_str()) {
-        let deadline = field_deadline(&crate::commands::helpers::FieldClock::now(), at)?;
-        inner.expiries.insert(field, deadline);
+        inner.expiries.insert(field, field_deadline(at));
     }
     let emptied = inner.fields.is_empty();
     *value = KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)));

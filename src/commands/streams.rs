@@ -12,14 +12,14 @@ use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin}
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{ConsumerGroup, KiviDBValue, PelEntry, StreamEntry, StreamId, StreamInner};
+use crate::types::{
+    ConsumerGroup, EntryRef, KiviDBValue, PelEntry, StreamEntries, StreamId, StreamInner,
+};
 use crate::{read_lock, write_lock};
 use ahash::AHashMap;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── RESP3 shaping for XREAD / XREADGROUP ─────────────────────────────────────
 //
@@ -157,7 +157,7 @@ fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR no such key"),
     };
     let mut inner = stream.write();
-    if !inner.entries.contains_key(&id) {
+    if !inner.entries.contains(&id) {
         return resp_error("ERR No such message in stream");
     }
     let recorded = inner
@@ -179,11 +179,19 @@ fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
     resp_simple("OK")
 }
 
+/// The command's time in milliseconds, as Redis's `commandTimeSnapshot()`,
+/// which `t_stream.c` reads for `XADD *` IDs (`streamNextID`), delivery
+/// times, idle times and consumers' seen and active times. Inside a script,
+/// a function or an `EXEC` it is the time the unit began
+/// (`script_clock::freeze`), as `TIME` is: two `XADD *` in one `EXEC` get
+/// IDs of the same millisecond, the second with the next sequence number,
+/// and an entry delivered in it is 0 ms idle for the rest of it. It read the
+/// clock for each command (#667). An ID still never goes back: when the time
+/// is not past the stream's last ID, the next one is that ID's next
+/// sequence number (`xadd`).
+#[inline]
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::script_clock::wall_ms_now()
 }
 
 fn get_or_create_stream(ctx: &mut Ctx, key: &[u8]) -> Result<Arc<RwLock<StreamInner>>, Vec<u8>> {
@@ -282,11 +290,10 @@ fn id_interval(start: &str, end: &str) -> Result<Option<(StreamId, StreamId)>, V
 
 /// Format a stream entry as the nested RESP array Redis uses:
 /// ["id", ["field", "value", "field", "value", ...]]
-fn format_entry(id: &StreamId, entry: &StreamEntry) -> Vec<u8> {
+fn format_entry(id: &StreamId, entry: EntryRef<'_>) -> Vec<u8> {
     let field_values: Vec<Vec<u8>> = entry
-        .fields
-        .iter()
-        .flat_map(|(f, v)| vec![resp_bulk(f.as_ref()), resp_bulk(v.as_ref())])
+        .fields()
+        .flat_map(|(f, v)| vec![resp_bulk(f), resp_bulk(v)])
         .collect();
     resp_array(vec![
         resp_bulk_str(&id.to_string()),
@@ -511,13 +518,17 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
         if (cmd.len() - i) < 2 || !(cmd.len() - i).is_multiple_of(2) {
             return resp_error("ERR wrong number of arguments: field-value pairs required");
         }
-        type FieldsType = Vec<(Arc<[u8]>, Arc<[u8]>)>;
-        let fields: FieldsType = cmd[i..]
+        // Borrowed from the command's arguments, which outlive `ctx`'s
+        // borrows below: the stream copies the bytes it keeps.
+        let fields: Vec<(&[u8], &[u8])> = cmd[i..]
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|chunk| (Arc::from(chunk[0]), Arc::from(chunk[1])))
+            .map(|&[field, value]| (field, value))
             .collect();
+        if !StreamEntries::fits(&fields) {
+            return resp_error("ERR Elements are too large to be stored");
+        }
 
         // Owned (producer, idempotent ID): the borrow of `ctx.cmd` ends here.
         let idmp: Option<(Vec<u8>, Arc<[u8]>)> =
@@ -590,13 +601,36 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
     // A retry of a message this producer already delivered: reply with the
     // entry it produced the first time and add nothing. A replica does not
     // second-guess its master, which has already made this decision.
-    if let Some((producer, iid)) = &idmp
-        && !ctx.apply_replication
-        && !ctx.bypass_cluster_check
-        && let Some(existing) =
-            stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
-    {
-        return resp_bulk_str(&existing.to_string());
+    //
+    // The duplicate is propagated all the same, as Redis propagates it, so
+    // that replicas and an AOF replay count it in `iids-duplicates` too
+    // (#655): under the entry's own ID, which a replica or a replay takes
+    // for the duplicate it is rather than for a new entry. Only while that
+    // ID is not past the stream's last ID: after `XTRIM … MAXLEN 0` and an
+    // `XSETID` below it, a build that does not know duplicates would take
+    // it for a new entry, so then nothing is propagated, as before.
+    if let Some((producer, iid)) = &idmp {
+        if !ctx.apply_replication && !ctx.bypass_cluster_check {
+            if let Some(existing) =
+                stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
+            {
+                let reply = existing.to_string();
+                if existing <= inner.last_id {
+                    let mut parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
+                    parts[id_index] = reply.clone().into_bytes();
+                    effect(parts);
+                }
+                return resp_bulk_str(&reply);
+            }
+        } else if let NewId::Explicit(id) = &new_id
+            && stream_extra::idmp_applied_duplicate(&mut inner, producer, iid, id)
+        {
+            // Into a replica's own AOF and to a backup tap, as it came: a
+            // replica restarted from its AOF, or promoted, keeps the count.
+            // An AOF replay records nothing.
+            effect(ctx.cmd.iter().map(|b| b.to_vec()).collect());
+            return resp_bulk_str(&id.to_string());
+        }
     }
 
     // The next ID is worked out without ever adding to a sequence number
@@ -634,9 +668,7 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
 
     let id_str_out = entry_id.to_string();
     stream_extra::record_append(&mut inner, &fields);
-    inner
-        .entries
-        .insert(entry_id.clone(), StreamEntry { fields });
+    inner.entries.push_tail(entry_id.clone(), &fields);
     inner.last_id = entry_id.clone();
     inner.entries_added += 1;
 
@@ -753,7 +785,7 @@ pub fn xrange(ctx: &mut Ctx) -> Vec<u8> {
                 .entries
                 .range(lo..=hi)
                 .take(count)
-                .map(|(id, entry)| format_entry(id, entry))
+                .map(|(id, entry)| format_entry(&id, entry))
                 .collect();
             resp_array(items)
         }
@@ -805,13 +837,11 @@ pub fn xrevrange(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_array(vec![]),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();
-            // BTreeMap::range gives ascending; rev() flips it
             let items: Vec<Vec<u8>> = inner
                 .entries
-                .range(lo..=hi)
-                .rev()
+                .range_rev(lo..=hi)
                 .take(count)
-                .map(|(id, entry)| format_entry(id, entry))
+                .map(|(id, entry)| format_entry(&id, entry))
                 .collect();
             resp_array(items)
         }
@@ -857,7 +887,7 @@ fn read_streams(
         let mut entries: Vec<Vec<u8>> = Vec::new();
         let newer = (Bound::Excluded(after_id.clone()), Bound::Unbounded);
         for (id, entry) in inner.entries.range(newer).take(count) {
-            let item = format_entry(id, entry);
+            let item = format_entry(&id, entry);
             if !budget.admit(item.len()) {
                 break;
             }
@@ -981,8 +1011,8 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
                     if *id_str == "$" {
                         inner.last_id.clone()
                     } else {
-                        match inner.entries.keys().next_back() {
-                            Some(last) => id_before(last),
+                        match inner.entries.last_id() {
+                            Some(last) => id_before(&last),
                             None => inner.last_id.clone(),
                         }
                     }
@@ -1079,7 +1109,7 @@ pub fn xdel(ctx: &mut Ctx) -> Vec<u8> {
             for id_bytes in &cmd[2..] {
                 let id_str = std::str::from_utf8(id_bytes).unwrap_or("");
                 if let Some(id) = StreamId::parse(id_str)
-                    && inner.entries.remove(&id).is_some()
+                    && inner.entries.remove(&id)
                 {
                     removed += 1;
                     if id > inner.max_deleted_id {
@@ -1255,8 +1285,8 @@ pub fn xsetid(ctx: &mut Ctx) -> Vec<u8> {
             "ERR The ID specified in XSETID is smaller than current max_deleted_entry_id",
         );
     }
-    if let Some(top) = inner.entries.keys().next_back() {
-        if new_last_id < *top {
+    if let Some(top) = inner.entries.last_id() {
+        if new_last_id < top {
             return resp_error(
                 "ERR The ID specified in XSETID is smaller than the target stream top item",
             );
@@ -1301,6 +1331,30 @@ fn entries_read_arg(raw: &[u8]) -> Result<u64, Vec<u8>> {
     }
 }
 
+/// Redis's reply to an `XGROUP` subcommand on a key that does not exist.
+const XGROUP_NO_KEY: &str = "ERR The XGROUP subcommand requires the key to exist. \
+     Note that for CREATE you may want to use the MKSTREAM option to create an \
+     empty stream automatically.";
+
+/// A `HELP` reply: the lines given, between Redis's first and last lines.
+fn help_reply(command: &str, lines: &[&str]) -> Vec<u8> {
+    let mut out = vec![resp_simple(&format!(
+        "{command} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"
+    ))];
+    out.extend(lines.iter().map(|line| resp_simple(line)));
+    out.push(resp_simple("HELP"));
+    out.push(resp_simple("    Print this help."));
+    resp_array(out)
+}
+
+/// Redis's reply to a subcommand a command does not have.
+fn unknown_subcommand(command: &str, sub: &[u8]) -> Vec<u8> {
+    resp_error(&format!(
+        "ERR unknown subcommand '{}'. Try {command} HELP.",
+        String::from_utf8_lossy(sub)
+    ))
+}
+
 pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
     let (key, group, id_str, mkstream, entries_read) = {
         let cmd = &ctx.cmd;
@@ -1310,25 +1364,35 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
 
         let key: Vec<u8> = cmd[2].to_vec();
         let group = crate::types::StreamName::from(cmd[3]);
-        let id_str = std::str::from_utf8(cmd[4]).unwrap_or("$").to_string();
+        // An ID that is not UTF-8 is no ID, and is refused as one; it was
+        // taken as `$` (#576).
+        let id_str = std::str::from_utf8(cmd[4]).unwrap_or_default().to_string();
 
-        let mkstream = cmd.iter().any(|b| {
-            std::str::from_utf8(b)
-                .map(|s| s.eq_ignore_ascii_case("MKSTREAM"))
-                .unwrap_or(false)
-        });
-        let entries_read = match cmd[5..]
-            .windows(2)
-            .find(|w| w[0].eq_ignore_ascii_case(b"ENTRIESREAD"))
-        {
-            // Not said: not known. It is worked out, where it can be, when
-            // the group first reads. See `stream_extra::Shape`.
-            None => ConsumerGroup::NO_COUNT,
-            Some(w) => match entries_read_arg(w[1]) {
-                Ok(n) => n,
-                Err(e) => return e,
-            },
-        };
+        // The options come after the ID, and are all options, as Redis
+        // parses them: a key or group called `mkstream` was taken for the
+        // option, and an unknown word was ignored (#576).
+        let mut mkstream = false;
+        // Not said: not known. It is worked out, where it can be, when the
+        // group first reads. See `stream_extra::Shape`.
+        let mut entries_read = ConsumerGroup::NO_COUNT;
+        let mut at = 5;
+        while at < cmd.len() {
+            if cmd[at].eq_ignore_ascii_case(b"MKSTREAM") {
+                mkstream = true;
+                at += 1;
+            } else if cmd[at].eq_ignore_ascii_case(b"ENTRIESREAD") && at + 1 < cmd.len() {
+                match entries_read_arg(cmd[at + 1]) {
+                    Ok(n) => entries_read = n,
+                    Err(e) => return e,
+                }
+                at += 2;
+            } else {
+                return resp_error(&format!(
+                    "ERR unknown subcommand or wrong number of arguments for '{}'. Try XGROUP HELP.",
+                    String::from_utf8_lossy(cmd[1])
+                ));
+            }
+        }
 
         (key, group, id_str, mkstream, entries_read)
         // ← &ctx.cmd borrow ends here
@@ -1339,9 +1403,24 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db_ref, &key);
         let map = read_lock!(shard);
         if !map.contains_key(key.as_slice()) && !mkstream {
-            return resp_error("ERR The XGROUP subcommand requires the key to exist");
+            return resp_error(XGROUP_NO_KEY);
         }
     }
+
+    // Before MKSTREAM makes the stream: an ID that is no ID fails the
+    // command, and a failed command must leave no key behind. One that did
+    // was not sent to replicas or the AOF (an error is not), so only this
+    // node had it.
+    let given_id = if id_str == "$" {
+        None
+    } else {
+        match parse_range_id_lo(&id_str) {
+            Some(id) => Some(id),
+            None => {
+                return resp_error("ERR Invalid stream ID specified as stream command argument");
+            }
+        }
+    };
 
     let stream = match get_or_create_stream(ctx, &key) {
         Ok(s) => s,
@@ -1353,16 +1432,7 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("BUSYGROUP Consumer Group name already exists");
     }
 
-    let last_id = if id_str == "$" {
-        inner.last_id.clone()
-    } else {
-        match parse_range_id_lo(&id_str) {
-            Some(id) => id,
-            None => {
-                return resp_error("ERR Invalid stream ID specified as stream command argument");
-            }
-        }
-    };
+    let last_id = given_id.unwrap_or_else(|| inner.last_id.clone());
 
     let entries_read = capped_entries_read(entries_read, inner.entries_added);
     inner.groups.insert(
@@ -1371,7 +1441,7 @@ pub fn xgroup_create(ctx: &mut Ctx) -> Vec<u8> {
             name: group,
             last_id,
             entries_read,
-            pel: BTreeMap::new(),
+            pel: Default::default(),
             consumers: AHashMap::new(),
             active: AHashMap::new(),
         },
@@ -1394,7 +1464,7 @@ pub fn xgroup_destroy(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_integer(0),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             resp_integer(inner.groups.remove(group).is_some() as i64)
@@ -1429,7 +1499,7 @@ pub fn xgroup_setid(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error("ERR no such key"),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             let added = inner.entries_added;
@@ -1485,7 +1555,7 @@ pub fn xgroup_createconsumer(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error("ERR no such key"),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
@@ -1528,7 +1598,7 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_error("ERR no such key"),
+        None => resp_error(XGROUP_NO_KEY),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
             match inner.groups.get_mut(&group) {
@@ -1554,10 +1624,7 @@ pub fn xgroup_delconsumer(ctx: &mut Ctx) -> Vec<u8> {
                     }
                     g.active.remove(&consumer);
                     // Remove all PEL entries for this consumer
-                    let pending: i64 =
-                        g.pel.values().filter(|p| p.consumer == consumer).count() as i64;
-                    g.pel.retain(|_, p| p.consumer != consumer);
-                    resp_integer(pending)
+                    resp_integer(g.pel.remove_consumer(&consumer) as i64)
                 }
             }
         }
@@ -1585,14 +1652,13 @@ struct GroupRead<'a> {
 /// how long ago it was last delivered and how many times it had been.
 fn format_claimed_entry(
     id: &StreamId,
-    entry: &StreamEntry,
+    entry: EntryRef<'_>,
     idle_ms: u64,
     deliveries: u64,
 ) -> Vec<u8> {
     let field_values: Vec<Vec<u8>> = entry
-        .fields
-        .iter()
-        .flat_map(|(f, v)| vec![resp_bulk(f.as_ref()), resp_bulk(v.as_ref())])
+        .fields()
+        .flat_map(|(f, v)| vec![resp_bulk(f), resp_bulk(v)])
         .collect();
     resp_array(vec![
         resp_bulk_str(&id.to_string()),
@@ -1771,6 +1837,9 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // order they blocked — the entry goes to the one that has waited longest
     // — and each gives the turn to the one behind it once it has looked,
     // which may be reading for another group.
+    // One record for the whole command: the consumer the first look creates
+    // is propagated even when the command then parks (#654).
+    effects_begin();
     let gone = blocking::client_gone(ctx);
     let resumed = blocking::take_resume(ctx);
     let timed_out = matches!(resumed, Some(None));
@@ -1934,7 +2003,8 @@ fn next_claimable_in(
 ///
 /// Every pending-list change made here is recorded as an effect (see
 /// `script_feed::effects_begin`) and that record — not the command — is what
-/// replicas and the AOF receive.
+/// replicas and the AOF receive. The caller begins the record, once for the
+/// command: a second look before parking must not drop what the first did.
 fn run_xreadgroup_delivery(
     ctx: &mut Ctx,
     keys: &[Vec<u8>],
@@ -1945,7 +2015,6 @@ fn run_xreadgroup_delivery(
     // `stream_results_reply`, so both protocols share this code path.
     let resp = reply_resp(ctx);
     let now = now_ms();
-    effects_begin();
 
     // Find every stream and group before delivering from any of them, so a
     // missing key or group fails the command with nothing half-delivered.
@@ -2030,7 +2099,7 @@ fn run_xreadgroup_delivery(
                     let Some(entry) = entries.get(&id) else {
                         continue;
                     };
-                    let Some(pending) = g.pel.get_mut(&id) else {
+                    let Some(pending) = g.pel.get(&id) else {
                         continue;
                     };
                     let idle = if pending.delivered_at < stream_extra::NACKED_BELOW {
@@ -2042,7 +2111,9 @@ fn run_xreadgroup_delivery(
                     if !budget.admit(item.len()) {
                         break;
                     }
-                    pending.consumer = crate::types::StreamName::from(spec.consumer);
+                    let Some(pending) = g.pel.assign(&id, spec.consumer) else {
+                        continue;
+                    };
                     pending.delivered_at = now;
                     pending.delivery_count = pending.delivery_count.saturating_add(1);
                     effect(claim_effect(
@@ -2068,9 +2139,9 @@ fn run_xreadgroup_delivery(
                 // can parse the reply uniformly; a new entry has never been
                 // delivered, hence 0 and 0.
                 let item = if spec.claim_min_idle.is_some() {
-                    format_claimed_entry(id, entry, 0, 0)
+                    format_claimed_entry(&id, entry, 0, 0)
                 } else {
-                    format_entry(id, entry)
+                    format_entry(&id, entry)
                 };
                 // Checked before the entry is delivered: one that does not
                 // fit is neither sent nor added to the pending list.
@@ -2078,17 +2149,10 @@ fn run_xreadgroup_delivery(
                     break;
                 }
                 if !spec.noack {
-                    g.pel.insert(
-                        id.clone(),
-                        PelEntry {
-                            consumer: crate::types::StreamName::from(spec.consumer),
-                            delivered_at: now,
-                            delivery_count: 1,
-                        },
-                    );
-                    effect(claim_effect(key, spec.group, spec.consumer, id, now, 1));
+                    g.pel.insert(id.clone(), spec.consumer, now, 1);
+                    effect(claim_effect(key, spec.group, spec.consumer, &id, now, 1));
                 }
-                shape.deliver(g, id);
+                shape.deliver(g, &id);
                 delivered += 1;
                 items.push(item);
             }
@@ -2103,10 +2167,10 @@ fn run_xreadgroup_delivery(
             } else {
                 Bound::Excluded(from)
             };
+            // Only this consumer's entries are walked, not the group's (#637).
             let pending_ids: Vec<StreamId> = g
                 .pel
-                .range((after, Bound::Unbounded))
-                .filter(|(_, p)| p.consumer == spec.consumer)
+                .consumer_range(spec.consumer, (after, Bound::Unbounded))
                 .take(spec.count)
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -2224,22 +2288,20 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                 let count = g.pel.len() as i64;
                 let min_id = g
                     .pel
-                    .keys()
-                    .next()
+                    .first_id()
                     .map(|id| id.to_string())
                     .unwrap_or_default();
-                let max_id = g
-                    .pel
-                    .keys()
-                    .next_back()
-                    .map(|id| id.to_string())
-                    .unwrap_or_default();
+                let max_id = g.pel.last_id().map(|id| id.to_string()).unwrap_or_default();
 
-                // Consumer → pending count
-                let mut per_consumer: AHashMap<&[u8], i64> = AHashMap::new();
-                for pel in g.pel.values() {
-                    *per_consumer.entry(pel.consumer.as_bytes()).or_insert(0) += 1;
-                }
+                // Consumer → pending count, from the per-consumer index
+                // rather than a walk of the list (#637). By name, as Redis
+                // lists them (#564).
+                let mut per_consumer: Vec<(&[u8], usize)> = g
+                    .pel
+                    .owners()
+                    .map(|(name, count)| (name.as_bytes(), count))
+                    .collect();
+                per_consumer.sort_unstable();
                 let consumer_list: Vec<Vec<u8>> = per_consumer
                     .iter()
                     .map(|(name, cnt)| {
@@ -2288,8 +2350,7 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                     .and_then(|b| std::str::from_utf8(b).ok())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(10);
-                let filter_consumer: Option<&str> =
-                    cmd.get(i + 3).and_then(|b| std::str::from_utf8(b).ok());
+                let filter_consumer: Option<&[u8]> = cmd.get(i + 3).copied();
 
                 let (lo, hi, count) = match id_interval(start_str, end_str) {
                     Ok(Some((lo, hi))) => (lo, hi, count),
@@ -2298,16 +2359,13 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                 };
                 let now = now_ms();
 
-                let items: Vec<Vec<u8>> = g
-                    .pel
-                    .range(lo..=hi)
-                    .filter(|(_, p)| {
-                        if let Some(fc) = filter_consumer {
-                            p.consumer == fc
-                        } else {
-                            true
-                        }
-                    })
+                // With a consumer, only its own entries are walked (#637).
+                let in_range: Box<dyn Iterator<Item = (&StreamId, &PelEntry)>> =
+                    match filter_consumer {
+                        Some(consumer) => Box::new(g.pel.consumer_range(consumer, lo..=hi)),
+                        None => Box::new(g.pel.range(lo..=hi)),
+                    };
+                let items: Vec<Vec<u8>> = in_range
                     .filter(|(_, p)| {
                         if let Some(idle) = min_idle {
                             now.saturating_sub(p.delivered_at) >= idle
@@ -2328,7 +2386,7 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                         };
                         resp_array(vec![
                             resp_bulk_str(&id.to_string()),
-                            resp_bulk(&p.consumer),
+                            resp_bulk(p.consumer()),
                             resp_integer(idle),
                             resp_integer(p.delivery_count as i64),
                         ])
@@ -2491,7 +2549,7 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
 
             let mut claimed: Vec<Vec<u8>> = Vec::new();
             for id in &ids {
-                let exists = entries.contains_key(id);
+                let exists = entries.contains(id);
                 match g.pel.get(id) {
                     // Pending, but the entry itself is gone: drop the
                     // reference rather than hand out nothing.
@@ -2514,12 +2572,11 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
 
                 // An entry FORCE makes starts as one delivery, as Redis's
                 // `streamCreateNACK` makes it (JUSTID then leaves it at 1).
-                let pending = g.pel.entry(id.clone()).or_insert(PelEntry {
-                    consumer: new_consumer.clone(),
-                    delivered_at,
-                    delivery_count: 1,
-                });
-                pending.consumer = new_consumer.clone();
+                let pending = if g.pel.contains_key(id) {
+                    g.pel.assign(id, &new_consumer).expect("pending")
+                } else {
+                    g.pel.insert(id.clone(), &new_consumer, delivered_at, 1)
+                };
                 pending.delivered_at = delivered_at;
                 pending.delivery_count = match retry_count {
                     Some(n) => n,
@@ -2673,10 +2730,9 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
                 if now.saturating_sub(last_delivered) < min_idle {
                     continue;
                 }
-                let Some(pending) = g.pel.get_mut(&id) else {
+                let Some(pending) = g.pel.assign(&id, &new_consumer) else {
                     continue;
                 };
-                pending.consumer = new_consumer.clone();
                 pending.delivered_at = now;
                 if !justid {
                     pending.delivery_count = pending.delivery_count.saturating_add(1);
@@ -2723,6 +2779,19 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
 
 pub fn xinfo(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
+    if cmd.len() == 2 && cmd[1].eq_ignore_ascii_case(b"HELP") {
+        return help_reply(
+            "XINFO",
+            &[
+                "CONSUMERS <key> <groupname>",
+                "    Show consumers of <groupname>.",
+                "GROUPS <key>",
+                "    Show the stream consumer groups.",
+                "STREAM <key> [FULL [COUNT <count>]",
+                "    Show information about the stream.",
+            ],
+        );
+    }
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'xinfo' command");
     }
@@ -2733,7 +2802,7 @@ pub fn xinfo(ctx: &mut Ctx) -> Vec<u8> {
         "STREAM" => xinfo_stream(ctx),
         "GROUPS" => xinfo_groups(ctx),
         "CONSUMERS" => xinfo_consumers(ctx),
-        _ => resp_error("ERR unknown subcommand for XINFO"),
+        _ => unknown_subcommand("XINFO", cmd[1]),
     }
 }
 
@@ -2780,15 +2849,13 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
             }
             let first_entry = inner
                 .entries
-                .iter()
-                .next()
-                .map(|(id, e)| format_entry(id, e))
+                .first()
+                .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
             let last_entry = inner
                 .entries
-                .iter()
-                .next_back()
-                .map(|(id, e)| format_entry(id, e))
+                .last()
+                .map(|(id, e)| format_entry(&id, e))
                 .unwrap_or_else(|| resp_null_for(resp));
 
             let (idmp_duration, idmp_maxsize) =
@@ -2850,12 +2917,7 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
 
 /// The ID of the stream's first entry; `0-0` if it has none.
 fn first_entry_id(stream: &StreamInner) -> StreamId {
-    stream
-        .entries
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(StreamId::min)
+    stream.entries.first_id().unwrap_or_else(StreamId::min)
 }
 
 /// A group's `entries-read` and `lag`, as `XINFO` shows them: nil where
@@ -2904,7 +2966,7 @@ fn xinfo_stream_full(
         .entries
         .iter()
         .take(count)
-        .map(|(id, e)| format_entry(id, e))
+        .map(|(id, e)| format_entry(&id, e))
         .collect();
     let groups: Vec<Vec<u8>> = groups_in_order(inner)
         .into_iter()
@@ -2917,7 +2979,7 @@ fn xinfo_stream_full(
                 .map(|(id, p)| {
                     resp_array(vec![
                         resp_bulk_str(&id.to_string()),
-                        resp_bulk(&p.consumer),
+                        resp_bulk(p.consumer()),
                         resp_integer(shown_delivery_time(p.delivered_at)),
                         resp_integer(p.delivery_count as i64),
                     ])
@@ -2926,8 +2988,9 @@ fn xinfo_stream_full(
             let consumers: Vec<Vec<u8>> = consumers_in_order(g)
                 .into_iter()
                 .map(|(name, seen)| {
-                    let own = || g.pel.iter().filter(|(_, p)| p.consumer == *name);
-                    let pel: Vec<Vec<u8>> = own()
+                    let pel: Vec<Vec<u8>> = g
+                        .pel
+                        .consumer_range(name, ..)
                         .take(count)
                         .map(|(id, p)| {
                             resp_array(vec![
@@ -2947,7 +3010,7 @@ fn xinfo_stream_full(
                             resp_bulk_str("active-time"),
                             resp_integer(g.active.get(name).map_or(-1, |at| *at as i64)),
                             resp_bulk_str("pel-count"),
-                            resp_integer(own().count() as i64),
+                            resp_integer(g.pel.consumer_len(name) as i64),
                             resp_bulk_str("pending"),
                             resp_array(pel),
                         ],
@@ -2969,7 +3032,7 @@ fn xinfo_stream_full(
                     resp_integer(g.pel.len() as i64),
                     // Entries `XNACK` released: pending, and no one's.
                     resp_bulk_str("nacked-count"),
-                    resp_integer(g.pel.values().filter(|p| p.consumer.is_empty()).count() as i64),
+                    resp_integer(g.pel.consumer_len(b"") as i64),
                     // Redis 8.10's name for the pending entries, here and
                     // for each consumer (it was `pel`).
                     resp_bulk_str("pending"),
@@ -3090,7 +3153,8 @@ fn xinfo_consumers(ctx: &mut Ctx) -> Vec<u8> {
             let consumers: Vec<Vec<u8>> = consumers_in_order(g)
                 .into_iter()
                 .map(|(name, last_seen)| {
-                    let pending = g.pel.values().filter(|p| p.consumer == *name).count() as i64;
+                    // From the per-consumer index: no walk of the list (#637).
+                    let pending = g.pel.consumer_len(name) as i64;
                     let idle = now.saturating_sub(last_seen);
                     // Since it was last handed entries; -1 if it never was.
                     let inactive = g
@@ -3135,7 +3199,26 @@ pub fn xgroup(ctx: &mut Ctx) -> Vec<u8> {
         "SETID" => xgroup_setid(ctx),
         "CREATECONSUMER" => xgroup_createconsumer(ctx),
         "DELCONSUMER" => xgroup_delconsumer(ctx),
-        _ => resp_error("ERR unknown subcommand for XGROUP"),
+        "HELP" if cmd.len() == 2 => help_reply(
+            "XGROUP",
+            &[
+                "CREATE <key> <groupname> <id|$> [option]",
+                "    Create a new consumer group. Options are:",
+                "    * MKSTREAM",
+                "      Create the empty stream if it does not exist.",
+                "    * ENTRIESREAD entries_read",
+                "      Set the group's entries_read counter (internal use).",
+                "CREATECONSUMER <key> <groupname> <consumer>",
+                "    Create a new consumer in the specified group.",
+                "DELCONSUMER <key> <groupname> <consumer>",
+                "    Remove the specified consumer.",
+                "DESTROY <key> <groupname>",
+                "    Remove the specified group.",
+                "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
+                "    Set the current group ID and entries_read counter.",
+            ],
+        ),
+        _ => unknown_subcommand("XGROUP", cmd[1]),
     }
 }
 
@@ -3189,7 +3272,7 @@ pub fn xdelex(ctx: &mut Ctx) -> Vec<u8> {
     let replies = ids
         .iter()
         .map(|id| {
-            if !inner.entries.contains_key(id) {
+            if !inner.entries.contains(id) {
                 // DELREF still clears references left behind by an entry
                 // that was deleted some other way.
                 if refs == TrimRefs::DelRef {
@@ -3430,7 +3513,7 @@ pub fn xcfgset(ctx: &mut Ctx) -> Vec<u8> {
         // Trim immediately if the current length already exceeds the new limit.
         if let Some(max) = inner.max_entries {
             while inner.entries.len() as u64 > max {
-                if let Some((id, _)) = inner.entries.pop_first()
+                if let Some(id) = inner.entries.pop_first()
                     && id > inner.max_deleted_id
                 {
                     inner.max_deleted_id = id;
@@ -3588,9 +3671,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
             // FORCE needs to know which IDs exist in the stream; take that set
             // before borrowing `groups` mutably.
             let existing_ids: Vec<bool> = if force {
-                ids.iter()
-                    .map(|id| inner.entries.contains_key(id))
-                    .collect()
+                ids.iter().map(|id| inner.entries.contains(id)).collect()
             } else {
                 Vec::new()
             };
@@ -3601,7 +3682,9 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
 
             let mut released = 0i64;
             for (pos, id) in ids.iter().enumerate() {
-                match g.pel.get_mut(id) {
+                // Unowned, and immediately claimable, after what was
+                // released before it.
+                match g.pel.assign(id, b"") {
                     Some(entry) => {
                         entry.delivery_count = match retrycount {
                             // RETRYCOUNT overrides the mode-based adjustment.
@@ -3615,9 +3698,6 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                                 Mode::Fatal => i64::MAX as u64,
                             },
                         };
-                        // Unowned, and immediately claimable, after what
-                        // was released before it.
-                        entry.consumer = crate::types::StreamName::default();
                         entry.delivered_at = stream_extra::nack_time();
                         released += 1;
                     }
@@ -3632,14 +3712,8 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                             (None, Mode::Fatal) => i64::MAX as u64,
                             (None, _) => 0,
                         };
-                        g.pel.insert(
-                            id.clone(),
-                            PelEntry {
-                                consumer: crate::types::StreamName::default(),
-                                delivered_at: stream_extra::nack_time(),
-                                delivery_count,
-                            },
-                        );
+                        g.pel
+                            .insert(id.clone(), b"", stream_extra::nack_time(), delivery_count);
                         released += 1;
                     }
                     // Not pending and no FORCE — ignored, not counted.

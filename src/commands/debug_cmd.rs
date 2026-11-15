@@ -4,11 +4,8 @@ use crate::commands::ctx::Ctx;
 use crate::commands::handler::{client_connection_resp, effective_resp_for_reply};
 use crate::resp::write::*;
 
-fn parse_sleep_seconds(cmd: &Ctx) -> Option<f64> {
-    if cmd.cmd.len() != 3 {
-        return None;
-    }
-    std::str::from_utf8(cmd.cmd[2]).ok()?.parse().ok()
+fn parse_sleep_seconds(raw: &[u8]) -> Option<f64> {
+    std::str::from_utf8(raw).ok()?.parse().ok()
 }
 
 /// `DEBUG ...` — protocol helpers and sleep match Redis `debug.c` for scripting tests.
@@ -20,9 +17,9 @@ pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let sub = String::from_utf8_lossy(ctx.cmd[1]).to_ascii_lowercase();
     match sub.as_str() {
-        "sleep" => {
-            let Some(secs) = parse_sleep_seconds(ctx) else {
-                return Some(resp_error("ERR wrong number of arguments for DEBUG sleep"));
+        "sleep" if ctx.cmd.len() == 3 => {
+            let Some(secs) = parse_sleep_seconds(ctx.cmd[2]) else {
+                return Some(resp_error("ERR value is not a valid float"));
             };
             // Negative, infinite or not a number: not a length of time.
             let Ok(duration) = std::time::Duration::try_from_secs_f64(secs) else {

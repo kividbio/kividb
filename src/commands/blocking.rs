@@ -49,6 +49,7 @@
 //! what Redis does: a blocking command inside `MULTI` never blocks, it returns
 //! its empty-handed reply.
 
+use crate::resp::write::resp_error;
 use crate::wait_table::Value;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -68,6 +69,12 @@ pub struct BlockingWait {
     timeout: Option<Duration>,
     /// Carried across the park and handed back on resume. See [`BlockState`].
     state: Option<BlockState>,
+    /// [`role_changes`] when the command parked: see
+    /// [`ended_by_role_change`].
+    role_epoch: u64,
+    /// Not a wait: a write that got past a `CLIENT PAUSE` before it was set
+    /// is to be read again and held by the pause ([`hold_for_pause`]).
+    held_by_pause: bool,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -134,10 +141,70 @@ pub enum Unblock {
     Timeout,
     /// With `-UNBLOCKED`.
     Error,
+    /// This node has become a replica (`REPLICAOF`, `CLUSTER REPLICATE`, a
+    /// failover that demotes it): with [`ROLE_CHANGED`], and the connection
+    /// is then closed, as Redis's `disconnectAllBlockedClients` ends every
+    /// blocked client.
+    RoleChange,
 }
 
 /// The reply to a client unblocked with `ERROR`.
 pub const UNBLOCKED: &[u8] = b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n";
+
+/// The reply to a client whose wait is ended because this node became a
+/// replica. Its connection is closed once this is written (#591). The
+/// same reply `WAIT` gives then.
+pub const ROLE_CHANGED: &[u8] = crate::replication::UNBLOCKED_ROLE_CHANGE;
+
+/// This node has become a replica (or been pointed at another master):
+/// its count of role changes (`ReplState::role_changes`) goes up. Called
+/// with the role already changed, before the blocked clients are swept.
+///
+/// The count is the node's own, not the process's: several servers run in
+/// one test process, and a role change of one must end nothing on another.
+pub fn note_role_change(repl_state: &crate::replication::ReplState) {
+    repl_state.role_changes.fetch_add(1, Ordering::SeqCst);
+}
+
+/// How many times this node has become a replica, or been pointed at
+/// another master. Read when a command parks, and again once its client is
+/// listed as blocked: a role change between the two, which the sweep that
+/// ends the blocked clients (`ClientRegistry::end_blocked_for_role_change`)
+/// cannot have seen, ends the wait as the sweep would have.
+#[inline]
+pub fn role_changes(repl_state: &crate::replication::ReplState) -> u64 {
+    repl_state.role_changes.load(Ordering::Relaxed)
+}
+
+/// Whether a parked wait ends because this node became a replica: the
+/// role changed since the command parked (`park_epoch`), or the command is
+/// one a replica refuses and this node is a replica now (it was let through
+/// by the look at the role just before a demotion). Asked once the client
+/// is listed as blocked, and again when the wait ends, however it ended: a
+/// wake-up at the moment of the change must not hand the client what it
+/// waited for and leave it connected.
+pub fn ended_by_role_change(
+    park_epoch: u64,
+    refused_on_replica: bool,
+    repl_state: &crate::replication::ReplState,
+) -> bool {
+    role_changes(repl_state) != park_epoch || (refused_on_replica && repl_state.is_slave())
+}
+
+/// Test builds only: `KIVIDB_TEST_PARK_DELAY_MS` holds every parked command
+/// this long before its client is listed as blocked, so that a test can
+/// change the role in between.
+#[cfg(debug_assertions)]
+pub fn test_park_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_PARK_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
 
 /// How a wait ended, when it was not by what was waited for or by its
 /// timeout. Kept by the connection loop across the dispatch that resumes
@@ -149,15 +216,27 @@ pub struct Interrupted {
     pub gone: bool,
     /// `CLIENT UNBLOCK … ERROR`: the reply is [`UNBLOCKED`].
     pub unblocked_with_error: bool,
+    /// This node became a replica while the command waited: the reply is
+    /// [`ROLE_CHANGED`], and the connection is closed after it.
+    pub role_changed: bool,
 }
 
 /// The timeout of a blocking command, in seconds, as Redis reads one: any
 /// float (hexadecimal included), not negative, and not so large that the
 /// deadline in milliseconds would overflow.
+///
+/// Redis reads the number as a `long double` and rounds it up to whole
+/// milliseconds, so a timeout too small for an `f64` (`1e-343`) is still a
+/// real one and waits 1 ms; only a text that no `long double` can hold
+/// (`1e-5000`, `1e5000`) is "not a float". `parse_score` refuses such texts
+/// and [`parse_rounded_away_timeout`] sorts them out.
 pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
-    use crate::resp::write::resp_error;
-    let Some(secs) = crate::commands::zset::parse_score(raw).filter(|t| t.is_finite()) else {
-        return Err(resp_error("ERR timeout is not a float or out of range"));
+    let parsed = crate::commands::zset::parse_score(raw);
+    // `parse_score` reads `1e-330` as 0.0 (as `fast_float` does), which is
+    // no zero as written: such a text goes the same way as one it refuses.
+    let secs = match parsed {
+        Some(secs) if secs != 0.0 => secs,
+        _ => return parse_rounded_away_timeout(raw, parsed),
     };
     if secs < 0.0 {
         return Err(resp_error("ERR timeout is negative"));
@@ -169,6 +248,107 @@ pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
         return Err(resp_error("ERR timeout is out of range"));
     }
     Ok(secs)
+}
+
+/// The cut-offs of a `long double`, as a power of ten and the first 22
+/// digits: half the smallest subnormal (2^-16446, below which a text rounds
+/// to 0 and is no number) and the value where `strtold` overflows (2^16384 -
+/// 2^16319). Texts are compared with these to 22 significant digits, not
+/// exactly: a text that differs only past the 22nd digit may land on the
+/// wrong side.
+const LONG_DOUBLE_TINY: (i64, &[u8; DIGITS]) = (-4951, b"1822599765941237301264");
+const LONG_DOUBLE_HUGE: (i64, &[u8; DIGITS]) = (4932, b"1189731495357231765053");
+const DIGITS: usize = 22;
+
+/// The power of ten of a number's first non-zero digit, and its digits.
+type Magnitude = (i64, [u8; DIGITS]);
+
+/// A timeout that `parse_score` did not take or read as 0.0: one that an
+/// `f64` rounds to 0 or to infinity, or that is no number at all. `parsed` is
+/// what `parse_score` made of it.
+fn parse_rounded_away_timeout(raw: &[u8], parsed: Option<f64>) -> Result<f64, Vec<u8>> {
+    let not_a_float = || resp_error("ERR timeout is not a float or out of range");
+    let Some((negative, magnitude)) = std::str::from_utf8(raw).ok().and_then(split_timeout_parts)
+    else {
+        // A hexadecimal zero (`0x0`) is a zero all the same.
+        return if parsed.is_some() {
+            Ok(0.0)
+        } else {
+            Err(not_a_float())
+        };
+    };
+    // A zero as written is a timeout that never ends, and `parse_score`
+    // has read it already.
+    let Some(magnitude) = magnitude else {
+        return Ok(0.0);
+    };
+    // Redis tells these apart from a number of any size before it looks at
+    // the sign: `-1e-5000` is not a float, but `-1e-343` is negative.
+    if magnitude <= (LONG_DOUBLE_TINY.0, *LONG_DOUBLE_TINY.1)
+        || magnitude >= (LONG_DOUBLE_HUGE.0, *LONG_DOUBLE_HUGE.1)
+    {
+        return Err(not_a_float());
+    }
+    if negative {
+        return Err(resp_error("ERR timeout is negative"));
+    }
+    if magnitude.0 > 0 {
+        return Err(resp_error("ERR timeout is out of range"));
+    }
+    // A tiny timeout, but not zero: the shortest wait there is.
+    Ok(0.001)
+}
+
+/// Split a decimal number, `[+-]digits[.digits][e[+-]digits]` with at least
+/// one digit before the `e`, into its sign and its magnitude: the power of
+/// ten of its first non-zero digit and its first [`DIGITS`] digits from
+/// there (the rest zeros), or `None` for the magnitude of a zero. `None` if
+/// the text is no number. The power saturates, so `1e-99999999999999999999`
+/// is read at once.
+fn split_timeout_parts(text: &str) -> Option<(bool, Option<Magnitude>)> {
+    let (negative, unsigned) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut all = whole.bytes().chain(fraction.bytes()).peekable();
+    if all.peek().is_none() || !all.clone().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let exponent = match exponent {
+        None => 0,
+        Some(exponent) => {
+            let (negative, digits) = match exponent.as_bytes().first() {
+                Some(b'-') => (true, &exponent[1..]),
+                Some(b'+') => (false, &exponent[1..]),
+                _ => (false, exponent),
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let value = digits.bytes().fold(0i64, |acc, b| {
+                acc.saturating_mul(10)
+                    .saturating_add(i64::from(b - b'0'))
+                    .min(1 << 40)
+            });
+            if negative { -value } else { value }
+        }
+    };
+    let zeros = all.clone().take_while(|&b| b == b'0').count();
+    if zeros == whole.len() + fraction.len() {
+        return Some((negative, None));
+    }
+    let power = whole.len() as i64 - 1 - zeros as i64 + exponent;
+    let mut digits = [b'0'; DIGITS];
+    for (slot, b) in digits.iter_mut().zip(all.skip(zeros)) {
+        *slot = b;
+    }
+    Some((negative, Some((power, digits))))
 }
 
 /// Mark an error reply as one a woken client is told even though it says
@@ -275,6 +455,19 @@ impl BlockingSlot {
         self.pending.is_some()
     }
 
+    /// The dispatch just completed was sent back to be held by a pause
+    /// ([`hold_for_pause`]): the command is dispatched again once the pause
+    /// lets it, as it was dispatched this time. A resume is a resume again,
+    /// with what its wait produced: the handler had not yet taken it.
+    pub fn held_by_pause(&mut self) {
+        if self.in_resume {
+            if let Some(delivery) = self.ctl.resume.take() {
+                self.pending = Some((delivery, self.ctl.state.take(), self.ctl.gone));
+            }
+            self.in_resume = false;
+        }
+    }
+
     /// Clear the resume flag after the guard has fired.
     pub fn clear_resume(&mut self) {
         self.in_resume = false;
@@ -352,6 +545,8 @@ pub fn park_with_state(
                 rxs,
                 timeout,
                 state,
+                role_epoch: role_changes(ctx.repl_state),
+                held_by_pause: false,
             });
             ParkOutcome::Parked
         }
@@ -360,6 +555,29 @@ pub fn park_with_state(
             ParkOutcome::CannotWait
         }
     }
+}
+
+/// The reply of a write that has found, inside the write gate, that a
+/// `CLIENT PAUSE` was set after it passed the pause check
+/// (`pause::held_in_gate`): it does not run now. A connection that can
+/// park a command is asked to read it again, its pause check holding it
+/// until the pause ends: parked, with nothing to wait for
+/// ([`BlockingWait::held_by_pause`]). Any other caller takes the reply,
+/// `pause::HELD_IN_GATE`, the same way: a script, a command on the slow
+/// path. It is never sent.
+pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
+    if let Some(slot) = ctx.blocking.as_mut()
+        && slot.awaitable
+    {
+        slot.parked = Some(BlockingWait {
+            rxs: Vec::new(),
+            timeout: None,
+            state: None,
+            role_epoch: 0,
+            held_by_pause: true,
+        });
+    }
+    crate::pause::HELD_IN_GATE.to_vec()
 }
 
 /// Run a command that waits until one of `keys` has something for it.
@@ -640,6 +858,29 @@ impl BlockingWait {
         self.timeout.is_some()
     }
 
+    /// [`role_changes`] when the command parked.
+    pub fn role_epoch(&self) -> u64 {
+        self.role_epoch
+    }
+
+    /// Whether this is no wait, but a write sent back to be held by a
+    /// pause ([`hold_for_pause`]): the connection reads the command again,
+    /// as it is, and its pause check holds it.
+    pub fn held_by_pause(&self) -> bool {
+        self.held_by_pause
+    }
+
+    /// Whether the command is one a replica refuses (`READONLY`): the
+    /// blocking list and sorted-set commands and `XREADGROUP`, which write.
+    /// `XREAD BLOCK` and `TS.READ BLOCK` may wait on a replica. Asked before
+    /// [`take_state`](Self::take_state).
+    pub fn refused_on_replica(&self) -> bool {
+        matches!(
+            self.state,
+            Some(BlockState::Queued { .. } | BlockState::GroupRead { .. })
+        )
+    }
+
     /// Whether parking this from a resume dispatch is intended rather than a
     /// handler that forgot its resume check. Each such park awaits a new
     /// signal, so it cannot spin.
@@ -733,6 +974,8 @@ mod tests {
                 rxs,
                 timeout,
                 state: None,
+                role_epoch: 0,
+                held_by_pause: false,
             }
             .wait(),
         )
@@ -813,6 +1056,9 @@ mod gone_resume_tests {
 
     /// A server's shared state, and `run`, which dispatches one command on it.
     fn with_server(test: impl FnOnce(Run<'_>, &Arc<crate::wait_table::WaitTable>)) {
+        // The pause is the process's: a unit test pausing writes would hold
+        // these commands back (`pause::held_in_gate`).
+        let _pause = crate::pause::TEST_LOCK.lock();
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
         let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -977,5 +1223,80 @@ mod gone_resume_tests {
             );
             assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
         });
+    }
+
+    #[test]
+    fn parse_timeout_reads_a_long_double() {
+        let err = |raw: &[u8]| String::from_utf8(parse_timeout(raw).unwrap_err()).unwrap();
+        // Too small for an f64 but not for a long double: the shortest wait.
+        for raw in [
+            "1e-343",
+            "1e-400",
+            "+1e-343",
+            ".5e-343",
+            "5.e-343",
+            "1e-4950",
+            "1000e-4953",
+            "1.83e-4951",
+            "3e-4951",
+            "1e-330",
+            "1e-325",
+            "2e-324",
+            "0.000001e-320",
+        ] {
+            assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.001, "{raw}");
+        }
+        // Zero in any spelling never ends.
+        for raw in ["0", "0.0", "0e10", "-0", "-0.0", "-0e10", "0x0"] {
+            assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.0, "{raw}");
+        }
+        for raw in [
+            "1e-4951",
+            "1.8e-4951",
+            "0.001e-4948",
+            "1e-5000",
+            "-1e-5000",
+            "1e-99999999999999999999",
+            "1e99999999999999999999",
+            "1.2e4932",
+            "1e4933",
+            "xe-5",
+            "1.2.3e-400",
+            "1e2e3",
+            "e999",
+            "1e",
+            "1e-",
+            ".",
+            "",
+            " 1",
+            "1 ",
+            "1abc",
+            "--1",
+            "nan",
+        ] {
+            assert_eq!(
+                err(raw.as_bytes()),
+                "-ERR timeout is not a float or out of range\r\n",
+                "{raw}"
+            );
+        }
+        for raw in [
+            "inf",
+            "+inf",
+            "2e308",
+            "1e309",
+            "1e4000",
+            "1.1e4932",
+            "1.18973149535723176503e4932",
+        ] {
+            assert_eq!(
+                err(raw.as_bytes()),
+                "-ERR timeout is out of range\r\n",
+                "{raw}"
+            );
+        }
+        for raw in ["-1", "-inf", "-2e308", "-1e-343", "-1e-4950", "-1e-330"] {
+            assert_eq!(err(raw.as_bytes()), "-ERR timeout is negative\r\n", "{raw}");
+        }
     }
 }

@@ -14,8 +14,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
+
+mod common;
+use common::{restart_verified, start_verified};
 
 // ── RESP client, of bytes ─────────────────────────────────────────────────────
 
@@ -71,7 +73,23 @@ impl Conn {
         }
     }
 
+    /// One command. A server that answers `LOADING` (its dataset or indexes
+    /// are still being loaded after a start or restart) did not run it, so it
+    /// is asked again, for at most 10 seconds.
     fn cmd(&mut self, args: &[&[u8]]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_once(args);
+            match &reply {
+                V::Err(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return reply,
+            }
+        }
+    }
+
+    fn cmd_once(&mut self, args: &[&[u8]]) -> V {
         let mut buf = format!("*{}\r\n", args.len()).into_bytes();
         for a in args {
             buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
@@ -155,31 +173,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing listens on, outside the range handed to outgoing
-/// connections.
-fn free_port() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(43);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 struct Server {
     port: u16,
     dir: PathBuf,
@@ -221,9 +214,9 @@ impl Server {
     }
 
     fn start_in(dir: PathBuf, args: &[&str]) -> Self {
-        let port = free_port();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let child = spawn(&dir, port, &args);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| spawn(&dir, port, &args));
         let server = Server {
             port,
             dir,
@@ -239,10 +232,12 @@ impl Server {
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
                 s.set_read_timeout(Some(Duration::from_secs(10)))?;
-                s.write_all(b"*1\r\n$4\r\nPING\r\n")?;
-                let mut reply = [0u8; 7];
+                // DBSIZE, not PING: PING is answered while the dataset is
+                // still loading, and the tests read the data straight away.
+                s.write_all(b"*1\r\n$6\r\nDBSIZE\r\n")?;
+                let mut reply = [0u8; 1];
                 s.read_exact(&mut reply)?;
-                Ok(&reply == b"+PONG\r\n")
+                Ok(reply[0] == b':')
             });
             if up.unwrap_or(false) {
                 return;
@@ -275,7 +270,13 @@ impl Server {
             .cloned()
             .collect();
         self.args = args;
-        self.child = spawn(&self.dir, self.port, &self.args);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters). Nothing in this file follows a restarted server by its port.
+        let (child, port, _) =
+            restart_verified(|port| spawn(&self.dir, port, &self.args), self.port);
+        self.child = child;
+        self.port = port;
         self.wait_up();
     }
 }
@@ -1067,6 +1068,16 @@ fn write_every_type(c: &mut Conn) {
         b"\xff\x00f",
     ]));
     ok(c.cmd(&[b"XADD", b"s\xff", b"1-1", b"f", b"v"]));
+    ok(c.cmd(&[
+        b"XADD",
+        b"s\xff",
+        b"IDMP",
+        b"p\xfe",
+        b"i\xff\x00",
+        b"*",
+        b"f",
+        b"w",
+    ]));
     ok(c.cmd(&[b"XGROUP", b"CREATE", b"s\xff", b"g\xff", b"0"]));
     ok(c.cmd(&[
         b"XREADGROUP",
@@ -1177,19 +1188,14 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
         b"OK"
     );
     write_every_type(&mut a);
-    // A stream's digest changes across an AOF replay whatever its names
-    // (its consumers' times are those of the replay; text names do the
-    // same): compare the stream by its names (the last row), not its digest.
-    let aof_view = |rows: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
-        rows.into_iter()
-            .filter(|row| !row.starts_with(b"s\xff stream"))
-            .collect()
-    };
-    let want = aof_view(dataset(&mut a));
+    // The stream's digest too: its consumers' times and when its
+    // idempotent IDs were recorded, which the replay sets to its own clock,
+    // are not part of it (#505).
+    let want = dataset(&mut a);
     drop(a);
     aof.restart();
     let mut a = aof.conn();
-    assert_eq!(aof_view(dataset(&mut a)), want, "after replaying the AOF");
+    assert_eq!(dataset(&mut a), want, "after replaying the AOF");
     assert!(!matches!(a.cmd(&[b"BGREWRITEAOF"]), V::Err(_)));
     eventually(30, "the AOF rewrite", || {
         a.info("persistence", "aof_rewrite_in_progress") == "0"
@@ -1198,9 +1204,5 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
     drop(a);
     aof.restart();
     let mut a = aof.conn();
-    assert_eq!(
-        aof_view(dataset(&mut a)),
-        want,
-        "after loading the rewritten AOF"
-    );
+    assert_eq!(dataset(&mut a), want, "after loading the rewritten AOF");
 }

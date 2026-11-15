@@ -3,6 +3,7 @@ mod aggregate_pipeline;
 pub(crate) mod arity;
 mod array;
 pub(crate) mod backup;
+pub(crate) mod bf;
 mod bitmap;
 pub mod blocking;
 pub(crate) mod cluster;
@@ -22,7 +23,7 @@ pub mod helpers;
 pub(crate) mod hotkeys;
 mod hybrid;
 pub(crate) mod hyperloglog;
-mod json;
+pub(crate) mod json;
 pub(crate) mod json_fpha;
 pub(crate) mod json_path;
 mod key_spec_table;
@@ -30,8 +31,12 @@ pub(crate) mod key_specs;
 pub mod latency;
 mod list_move;
 mod lists;
+pub(crate) mod login;
+pub(crate) mod long_double;
 #[cfg(feature = "lua")]
 mod lua;
+#[cfg(feature = "lua")]
+mod lua_format;
 #[cfg(feature = "lua")]
 pub(crate) use lua::{
     cached_script_declares_no_writes, cached_script_declares_writes, function_declares_no_writes,
@@ -73,7 +78,9 @@ pub(crate) mod streams;
 mod strftime;
 mod strings;
 pub mod transaction;
-mod ts;
+// `pub(crate)` only so `replication::script_feed` finds where a
+// `TS.INCRBY` has its `TIMESTAMP`, as the command reads it.
+pub(crate) mod ts;
 mod ts_query;
 mod vector;
 mod vset;

@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+mod common;
+use common::restart_verified;
+
 // ── Helpers (same as string-json.rs) ─────────────────────────────────────────
 
 /// Whether nothing has `port`. It is asked with a socket that is bound and
@@ -533,7 +536,15 @@ fn hll_write_format_from_config_file_survives_restart_and_aof_replay() {
     server.kill().unwrap();
     let _ = server.wait();
 
-    let mut server = spawn(&redis_conf);
+    // On the port of the config file if it is still free, and on another (the
+    // file rewritten) if a test of another process has taken it in the gap.
+    let (mut server, redis_port, _) = restart_verified(
+        |port| {
+            write_config(&redis_conf, port, &slash(&redis_dir), Some("redis"));
+            spawn(&redis_conf)
+        },
+        redis_port,
+    );
     let mut c = Conn::connect(redis_port);
     assert_eq!(format_of(&mut c), "redis", "setting lost across restart");
     assert_eq!(c.get_bytes("hll")[4], 0, "replayed value kept its format");
@@ -871,7 +882,10 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
     ] {
         assert!(c.cmds(&["CONFIG", "SET", name, "512mb"]).is_ok(), "{name}");
         assert_eq!(get(&mut c, name).as_deref(), Some("536870912"), "{name}");
-        let reply = c.cmds(&["CONFIG", "SET", name, "0"]);
+        // 0 is no limit, as in Redis (#774).
+        assert!(c.cmds(&["CONFIG", "SET", name, "0"]).is_ok(), "{name}");
+        assert_eq!(get(&mut c, name).as_deref(), Some("0"), "{name}");
+        let reply = c.cmds(&["CONFIG", "SET", name, "-1"]);
         assert!(reply.is_error(), "{name}: {reply:?}");
     }
     // One refused takes the others back with it.

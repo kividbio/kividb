@@ -6,9 +6,9 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
+use crate::types::{FieldDeadline, field_due, field_now};
 use crate::{read_lock, write_lock};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if matches!(name, "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT") {
@@ -485,27 +485,32 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
             let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
-            let incr: f64 = match parse_utf8(cmd[3]).and_then(|s| s.parse::<f64>().ok()) {
-                Some(n) if n.is_finite() => n,
-                Some(_) => return Some(resp_error("ERR value is NaN or Infinity")),
+            // In `long double`, as `INCRBYFLOAT` (#387).
+            use crate::commands::long_double::{self, Increment, LongDouble, Parsed};
+            let incr = match LongDouble::parse(cmd[3]) {
+                Some(Parsed::Infinite) => {
+                    return Some(resp_error("ERR value is NaN or Infinity"));
+                }
+                Some(n) => n,
                 None => return Some(resp_error("ERR value is not a valid float")),
             };
 
             // As `HINCRBY`.
             lazy_expire_key(ctx.store, *ctx.selected_db, key);
             let result = match write_hash(ctx, key, |fields, _expiries| {
-                let current: f64 = match fields.get(&field) {
-                    None => 0.0,
-                    Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                let current = match fields.get(&field) {
+                    None => long_double::ZERO,
+                    Some(v) => match LongDouble::parse(v) {
                         Some(n) => n,
                         None => return Err(resp_error("ERR hash value is not a float")),
                     },
                 };
-                let next = current + incr;
-                if !next.is_finite() {
-                    return Err(resp_error("ERR increment would produce NaN or Infinity"));
-                }
-                let s = format!("{}", next);
+                let s = match long_double::increment(current, incr) {
+                    Increment::Sum(s) => s,
+                    Increment::NotFinite => {
+                        return Err(resp_error("ERR increment would produce NaN or Infinity"));
+                    }
+                };
                 fields.insert(field.clone(), Arc::from(s.as_bytes()));
                 Ok(resp_bulk_str(&s))
             }) {
@@ -745,12 +750,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         1024,
                     );
                     let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
+                    let pattern = options
+                        .pattern
+                        .as_deref()
+                        .map(crate::commands::glob_redis::Glob::new);
                     for (f, v) in page {
-                        if options.pattern.as_deref().is_some_and(|pat| {
-                            !crate::commands::helpers::glob_match_bytes(
-                                pat,
-                                &crate::commands::helpers::name_to_bytes(f),
-                            )
+                        if pattern.as_ref().is_some_and(|glob| {
+                            !glob.matches(&crate::commands::helpers::name_to_bytes(f))
                         }) {
                             continue;
                         }
@@ -805,9 +811,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if secs < 0 {
                 return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
-            if field_deadline_ms(secs, true, now_ms() as i64).is_none() {
+            let Some(at_ms) = field_deadline_after(secs, true) else {
                 return Some(invalid_field_expire_time("HEXPIRE"));
-            }
+            };
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -815,9 +821,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(t) => t,
                 Err(e) => return Some(e),
             };
-            let new_exp = Instant::now() + Duration::from_secs(secs as u64);
-            let at_ms = now_ms().saturating_add((secs as u64).saturating_mul(1000));
-            let results = apply_field_expire(ctx, &key, &fields, new_exp, at_ms, flag, secs == 0);
+            let results = apply_field_expire(ctx, &key, &fields, at_ms, flag, secs == 0);
             // results is already a Vec<Vec<u8>> of resp_integer / resp_error.
             // If a single WRONGTYPE error was returned, surface that directly.
             if results.len() == 1 && results[0].starts_with(b"-") {
@@ -844,9 +848,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if ms < 0 {
                 return Some(resp_error("ERR invalid expire time, must be >= 0"));
             }
-            if field_deadline_ms(ms, false, now_ms() as i64).is_none() {
+            let Some(at_ms) = field_deadline_after(ms, false) else {
                 return Some(invalid_field_expire_time("HPEXPIRE"));
-            }
+            };
             let (flag, fields) = match parse_hfe_tail(
                 &cmd.iter().map(|v| v.to_vec()).collect::<Vec<Vec<u8>>>(),
                 3,
@@ -854,9 +858,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(t) => t,
                 Err(e) => return Some(e),
             };
-            let new_exp = Instant::now() + Duration::from_millis(ms as u64);
-            let at_ms = now_ms().saturating_add(ms as u64);
-            let results = apply_field_expire(ctx, &key, &fields, new_exp, at_ms, flag, ms == 0);
+            let results = apply_field_expire(ctx, &key, &fields, at_ms, flag, ms == 0);
             if results.len() == 1 && results[0].starts_with(b"-") {
                 return Some(results.into_iter().next().unwrap());
             }
@@ -901,8 +903,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     None => return Some(invalid_field_expire_time("HEXPIREAT")),
                 }
             };
-            let (new_exp, is_past) = absolute_deadline(at_ms, unix_secs <= 0);
-            let results = apply_field_expire(ctx, &key, &fields, new_exp, at_ms, flag, is_past);
+            let is_past = has_come(at_ms, unix_secs <= 0);
+            let results = apply_field_expire(ctx, &key, &fields, at_ms, flag, is_past);
             if results.len() == 1 && results[0].starts_with(b"-") {
                 return Some(results.into_iter().next().unwrap());
             }
@@ -941,8 +943,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     None => return Some(invalid_field_expire_time("HPEXPIREAT")),
                 }
             };
-            let (new_exp, is_past) = absolute_deadline(at_ms, unix_ms <= 0);
-            let results = apply_field_expire(ctx, &key, &fields, new_exp, at_ms, flag, is_past);
+            let is_past = has_come(at_ms, unix_ms <= 0);
+            let results = apply_field_expire(ctx, &key, &fields, at_ms, flag, is_past);
             if results.len() == 1 && results[0].starts_with(b"-") {
                 return Some(results.into_iter().next().unwrap());
             }
@@ -981,7 +983,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 /// command goes on: once, and only where this node removes them
 /// (`field_expiry::policy`).
 #[inline]
-fn expire_first(ctx: &Ctx, hash: &crate::types::HashInner, now: Instant, tried: &mut bool) -> bool {
+fn expire_first(
+    ctx: &Ctx,
+    hash: &crate::types::HashInner,
+    now: FieldDeadline,
+    tried: &mut bool,
+) -> bool {
     if *tried || !hash.has_due(now) {
         return false;
     }
@@ -993,7 +1000,7 @@ fn expire_first(ctx: &Ctx, hash: &crate::types::HashInner, now: Instant, tried: 
 /// the hash held, before the command looks at the hash again.
 #[cold]
 #[inline(never)]
-fn expire_fields(ctx: &Ctx, key: &[u8], now: Instant) {
+fn expire_fields(ctx: &Ctx, key: &[u8], now: FieldDeadline) {
     crate::field_expiry::expire_due(ctx.store, ctx.index_store, *ctx.selected_db, key, now);
 }
 
@@ -1003,7 +1010,7 @@ fn expire_fields(ctx: &Ctx, key: &[u8], now: Instant) {
 fn visible<'a>(
     ctx: &Ctx,
     hash: &'a crate::types::HashInner,
-    now: Instant,
+    now: FieldDeadline,
 ) -> std::borrow::Cow<'a, crate::types::HashFields> {
     if hash.has_due(now)
         && crate::field_expiry::policy(ctx.store) != crate::field_expiry::Policy::Keep
@@ -1017,8 +1024,8 @@ fn visible<'a>(
 /// For a command that looks at the hash at `key` under locks of its own:
 /// its fields due now removed first, where this node removes them. Returns
 /// the `now` they were due at, for the command to hide by.
-fn expire_before(ctx: &Ctx, key: &[u8]) -> Instant {
-    let now = Instant::now();
+fn expire_before(ctx: &Ctx, key: &[u8]) -> FieldDeadline {
+    let now = field_now();
     let due = match read_lock!(store::get_shard(&ctx.store[*ctx.selected_db], key)).get(key) {
         Some(ValueRef::HashEx(hx)) => expire_first(ctx, &hx.read(), now, &mut false),
         _ => false,
@@ -1063,14 +1070,14 @@ struct FieldsShown<'a> {
     fields: &'a crate::types::HashFields,
     /// The deadlines and the moment by which fields due are hidden, when
     /// some are due and this node is not to see them.
-    hide: Option<(&'a crate::types::Expiries, Instant)>,
+    hide: Option<(&'a crate::types::Expiries, FieldDeadline)>,
 }
 
 impl<'a> FieldsShown<'a> {
     fn get(&self, field: &str) -> Option<&'a Arc<[u8]>> {
         let value = self.fields.get(field)?;
         match self.hide {
-            Some((times, now)) if times.get(field).is_some_and(|at| *at <= now) => None,
+            Some((times, now)) if times.get(field).is_some_and(|at| field_due(*at, now)) => None,
             _ => Some(value),
         }
     }
@@ -1088,14 +1095,14 @@ impl<'a> FieldsShown<'a> {
 fn read_hash<R>(
     ctx: &Ctx,
     key: &[u8],
-    f: impl FnOnce(&crate::types::HashFields, Option<(&crate::types::HashInner, Instant)>) -> R,
+    f: impl FnOnce(&crate::types::HashFields, Option<(&crate::types::HashInner, FieldDeadline)>) -> R,
 ) -> Option<Result<R, Vec<u8>>> {
     if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return None;
     }
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
-    let mut now: Option<Instant> = None;
+    let mut now: Option<FieldDeadline> = None;
     let mut tried = false;
     loop {
         let map = read_lock!(shard);
@@ -1106,7 +1113,7 @@ fn read_hash<R>(
                 Some(Ok(f(&inner, None)))
             }
             Some(ValueRef::HashEx(hx)) => {
-                let now = *now.get_or_insert_with(Instant::now);
+                let now = *now.get_or_insert_with(field_now);
                 let inner = hx.read();
                 if !inner.has_due(now) {
                     return Some(Ok(f(&inner.fields, None)));
@@ -1142,7 +1149,7 @@ where
     }
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
-    let mut now: Option<Instant> = None;
+    let mut now: Option<FieldDeadline> = None;
     let mut tried = false;
     loop {
         let map = read_lock!(shard);
@@ -1153,7 +1160,7 @@ where
                 Some(Ok(f(&mut inner, None)))
             }
             Some(ValueRef::HashEx(hx)) => {
-                let now = *now.get_or_insert_with(Instant::now);
+                let now = *now.get_or_insert_with(field_now);
                 let mut inner = hx.write();
                 if expire_first(ctx, &inner, now, &mut tried) {
                     drop(inner);
@@ -1189,13 +1196,13 @@ fn write_hash<R>(
     mut write: impl FnMut(&mut crate::types::HashFields, Option<&mut crate::types::Expiries>) -> R,
 ) -> Result<R, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
-    let mut now: Option<Instant> = None;
+    let mut now: Option<FieldDeadline> = None;
     let mut tried = false;
     loop {
         let absent = match read_lock!(shard).get(key) {
             Some(ValueRef::Hash(h)) => return Ok(write(&mut h.write(), None)),
             Some(ValueRef::HashEx(hx)) => {
-                let now = *now.get_or_insert_with(Instant::now);
+                let now = *now.get_or_insert_with(field_now);
                 if let Some(out) = write_hash_ex(ctx, hx, now, &mut tried, &mut write) {
                     return Ok(out);
                 }
@@ -1210,7 +1217,7 @@ fn write_hash<R>(
             match map.get(key) {
                 Some(ValueRef::Hash(h)) => return Ok(write(&mut h.write(), None)),
                 Some(ValueRef::HashEx(hx)) => {
-                    let now = *now.get_or_insert_with(Instant::now);
+                    let now = *now.get_or_insert_with(field_now);
                     if let Some(out) = write_hash_ex(ctx, hx, now, &mut tried, &mut write) {
                         return Ok(out);
                     }
@@ -1228,7 +1235,7 @@ fn write_hash<R>(
             }
         }
         // Fields were due: removed with the shard let go of, then again.
-        expire_fields(ctx, key, *now.get_or_insert_with(Instant::now));
+        expire_fields(ctx, key, *now.get_or_insert_with(field_now));
     }
 }
 
@@ -1237,7 +1244,7 @@ fn write_hash<R>(
 fn write_hash_ex<R>(
     ctx: &Ctx,
     hash: &parking_lot::RwLock<crate::types::HashInner>,
-    now: Instant,
+    now: FieldDeadline,
     tried: &mut bool,
     write: &mut impl FnMut(&mut crate::types::HashFields, Option<&mut crate::types::Expiries>) -> R,
 ) -> Option<R> {
@@ -1357,7 +1364,11 @@ fn parse_hfe_tail(cmd: &[Vec<u8>], start_idx: usize) -> Result<(HfeFlag, Vec<Str
 ///
 /// `current` is the existing per-field expiry (None = field has no TTL).
 /// `new_exp` is the proposed new expiry.
-fn should_set_field_expiry(current: Option<Instant>, new_exp: Instant, flag: HfeFlag) -> bool {
+fn should_set_field_expiry(
+    current: Option<FieldDeadline>,
+    new_exp: FieldDeadline,
+    flag: HfeFlag,
+) -> bool {
     match flag {
         HfeFlag::None => true,
         HfeFlag::Nx => current.is_none(),
@@ -1383,7 +1394,8 @@ fn should_set_field_expiry(current: Option<Instant>, new_exp: Instant, flag: Hfe
 ///      pointlessly upgrading a hash that nobody is going to use TTLs on.
 ///   4. For each requested field, check existence + condition + apply.
 ///
-/// `new_exp` is the proposed expiry as an Instant.
+/// `new_exp` is the proposed deadline, Unix milliseconds: what the field
+/// keeps and what is sent on, the same number (#489).
 /// `is_past` indicates whether the user-supplied absolute time was already in
 /// the past (only relevant for HEXPIREAT / HPEXPIREAT). When true, an OK set
 /// translates to immediate deletion + return code 2.
@@ -1391,12 +1403,11 @@ fn apply_field_expire(
     ctx: &mut Ctx,
     key: &[u8],
     fields: &[String],
-    new_exp: Instant,
-    at_ms: u64,
+    new_exp: FieldDeadline,
     flag: HfeFlag,
     is_past: bool,
 ) -> Vec<Vec<u8>> {
-    crate::replication::script_feed::effects_begin();
+    crate::replication::script_feed::effects_begin_if_read(ctx);
     let results = apply_field_expire_inner(ctx, key, fields, new_exp, flag, is_past);
     // One result per field when the command ran; a lone error otherwise.
     if results.len() == fields.len() {
@@ -1416,7 +1427,7 @@ fn apply_field_expire(
         // Sent as what it did, its condition decided here: a replica that
         // weighed `XX` or `GT` again against its own fields could decide
         // otherwise. A field it found missing, or left alone, is not sent.
-        record_field_effect(b"HPEXPIREAT", key, Some(at_ms), &expiring);
+        record_field_effect(b"HPEXPIREAT", key, Some(new_exp), &expiring);
         record_field_effect(b"HDEL", key, None, &deleted);
         if !expiring.is_empty() {
             notify(ctx.pubsub, db, KS_HASH, "hexpire", key);
@@ -1434,7 +1445,7 @@ fn apply_field_expire_inner(
     ctx: &mut Ctx,
     key: &[u8],
     fields: &[String],
-    new_exp: Instant,
+    new_exp: FieldDeadline,
     flag: HfeFlag,
     is_past: bool,
 ) -> Vec<Vec<u8>> {
@@ -1519,23 +1530,20 @@ fn fields_are_held() -> bool {
     crate::expiry::replaying() || crate::expiry::fields_held()
 }
 
-/// The deadline `at_ms` (milliseconds since the Unix epoch) as an `Instant`,
-/// and whether it has passed (`past`: a time of zero or less, which has).
-/// Converted to the nanosecond (`FieldClock`, #448); one that has passed is
-/// kept as the moment it was, for where fields are held.
-fn absolute_deadline(at_ms: u64, past: bool) -> (Instant, bool) {
-    let clock = FieldClock::now();
-    match clock.instant_of(at_ms) {
-        Some(at) if !past => (at, false),
-        _ => (clock.instant_or_past_of(at_ms), true),
-    }
+/// Whether the deadline `at_ms` (milliseconds since the Unix epoch), given
+/// as a Unix time, has come, so that the field goes at once: `past` (a time
+/// of zero or less, which has), or not after now, as Redis's
+/// `checkAlreadyExpired` has it. Where fields are held it is set all the
+/// same, as it came.
+fn has_come(at_ms: u64, past: bool) -> bool {
+    past || at_ms <= now_ms()
 }
 
 /// Record, as the running command's effect for replicas and the AOF,
 /// `command key [at] FIELDS n field…`, or `HDEL key field…`. `fields` are
 /// names as a hash keeps them. Nothing for no fields.
 fn record_field_effect(command: &[u8], key: &[u8], at_ms: Option<u64>, fields: &[&[u8]]) {
-    if fields.is_empty() {
+    if fields.is_empty() || !crate::replication::script_feed::recording() {
         return;
     }
     let name = |f: &&[u8]| {
@@ -1559,7 +1567,7 @@ fn record_field_effect(command: &[u8], key: &[u8], at_ms: Option<u64>, fields: &
 fn apply_to_hashex(
     hx: &Arc<parking_lot::RwLock<crate::types::HashInner>>,
     fields: &[String],
-    new_exp: Instant,
+    new_exp: FieldDeadline,
     flag: HfeFlag,
     is_past: bool,
 ) -> Vec<Vec<u8>> {
@@ -1665,34 +1673,24 @@ fn negative_unix_time(ctx: &Ctx, n: i64) -> Option<Vec<u8>> {
         .then(|| resp_error("ERR invalid expire time, must be >= 0"))
 }
 
-/// Convert a stored Instant expiry to the requested unit.
-/// Past Instants saturate to 0; the lazy-eviction sweep already removed the
-/// field by the time we reach this helper, but we still handle it defensively.
+/// A field's deadline `at` in the requested unit, at `now`. One due and
+/// still shown (where it is kept, not hidden) has 0 left.
 ///
-/// What is left is rounded up, as a key's is: a field given ten seconds is
-/// said, asked at once, to have ten, where cutting the part of a unit that
-/// has gone by since said nine (and 249 of 250 ms). A time of day is rounded
-/// to the nearest millisecond for the same reason: it is worked out from two
-/// clocks read one after the other, and `HPEXPIREAT t` must read back as `t`.
-fn instant_to_hfe_value(exp: Instant, mode: HfeReadMode) -> i64 {
-    let now_mono = Instant::now();
-    let now_sys = std::time::SystemTime::now();
-    let delta = exp.saturating_duration_since(now_mono);
-    let at_ms = || {
-        let unix_now = now_sys
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        // Saturated, not cut to 64 bits, which made a far deadline negative.
-        i64::try_from((unix_now + delta + Duration::from_micros(500)).as_millis())
-            .unwrap_or(i64::MAX)
-    };
-    let saturated = |n: u128| i64::try_from(n).unwrap_or(i64::MAX);
-
+/// What is left is rounded up, as Redis's `httlGenericCommand` does for a
+/// field (`(expire + 999 - now) / 1000`), not to the nearest second as it
+/// does for a key's `TTL`: a field given ten seconds is said, asked at once,
+/// to have ten, where cutting the part of a unit that has gone by since said
+/// nine. `HEXPIRETIME` rounds the time of day up for the same reason, as
+/// Redis does (#557). `HPEXPIRETIME` is the deadline as it is kept: the
+/// very number `HPEXPIREAT` was given (#594).
+fn deadline_to_hfe_value(at: FieldDeadline, now: FieldDeadline, mode: HfeReadMode) -> i64 {
+    let saturated = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    let left = at.saturating_sub(now);
     match mode {
-        HfeReadMode::RemainingSecs => saturated(delta.as_micros().div_ceil(1_000_000)),
-        HfeReadMode::RemainingMillis => saturated(delta.as_micros().div_ceil(1_000)),
-        HfeReadMode::AbsoluteSecs => at_ms() / 1000,
-        HfeReadMode::AbsoluteMillis => at_ms(),
+        HfeReadMode::RemainingSecs => saturated(left.div_ceil(1_000)),
+        HfeReadMode::RemainingMillis => saturated(left),
+        HfeReadMode::AbsoluteSecs => saturated(at.div_ceil(1_000)),
+        HfeReadMode::AbsoluteMillis => saturated(at),
     }
 }
 
@@ -1750,7 +1748,7 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
                     }
                     match inner.expiries.get(f) {
                         None => resp_integer(-1),
-                        Some(exp) => resp_integer(instant_to_hfe_value(*exp, mode)),
+                        Some(at) => resp_integer(deadline_to_hfe_value(*at, now, mode)),
                     }
                 })
                 .collect();
@@ -1775,7 +1773,7 @@ fn run_hpersist(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Err(e) => return Some(e),
     };
 
-    crate::replication::script_feed::effects_begin();
+    crate::replication::script_feed::effects_begin_if_read(ctx);
     expire_before(ctx, &key);
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, &key);
@@ -1935,8 +1933,8 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
 enum HgetexAction {
     None,
     Persist,
-    /// The deadline, and the same as milliseconds since the Unix epoch.
-    SetExpiry(Instant, u64),
+    /// The deadline, milliseconds since the Unix epoch.
+    SetExpiry(FieldDeadline),
     /// An absolute time already in the past, in milliseconds since the Unix
     /// epoch.
     SetExpiryPast(u64),
@@ -1990,46 +1988,33 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 };
                 // Past the latest deadline Redis allows: refused, as by Redis.
                 let relative = matches!(tok.as_str(), "EX" | "PX");
-                if n > 0
-                    && field_deadline_ms(
-                        n,
-                        matches!(tok.as_str(), "EX" | "EXAT"),
-                        if relative { now_ms() as i64 } else { 0 },
-                    )
-                    .is_none()
-                {
+                let secs = matches!(tok.as_str(), "EX" | "EXAT");
+                if !relative && n > 0 && field_deadline_ms(n, secs, 0).is_none() {
                     return Some(invalid_field_expire_time("HGETEX"));
                 }
                 if !relative && let Some(refused) = negative_unix_time(ctx, n) {
                     return Some(refused);
                 }
-                let now_ms = now_ms();
                 let act = match tok.as_str() {
                     "EX" | "PX" if n < 0 => {
                         return Some(resp_error("ERR invalid expire time, must be >= 0"));
                     }
                     // 0 is now: the fields go, as in Redis 8.10.
-                    "EX" | "PX" if n == 0 => HgetexAction::SetExpiryPast(now_ms),
-                    "EX" | "PX" => {
-                        let ms = if tok == "EX" {
-                            (n as u64).saturating_mul(1000)
-                        } else {
-                            n as u64
-                        };
-                        HgetexAction::SetExpiry(
-                            Instant::now() + Duration::from_millis(ms),
-                            now_ms.saturating_add(ms),
-                        )
-                    }
+                    "EX" | "PX" if n == 0 => HgetexAction::SetExpiryPast(now_ms()),
+                    "EX" | "PX" => match field_deadline_after(n, secs) {
+                        Some(at_ms) => HgetexAction::SetExpiry(at_ms),
+                        None => return Some(invalid_field_expire_time("HGETEX")),
+                    },
                     _ => {
                         let at_ms = if tok == "EXAT" {
                             (n.max(0) as u64).saturating_mul(1000)
                         } else {
                             n.max(0) as u64
                         };
-                        match absolute_deadline(at_ms, n <= 0) {
-                            (at, false) => HgetexAction::SetExpiry(at, at_ms),
-                            (_, true) => HgetexAction::SetExpiryPast(at_ms),
+                        if has_come(at_ms, n <= 0) {
+                            HgetexAction::SetExpiryPast(at_ms)
+                        } else {
+                            HgetexAction::SetExpiry(at_ms)
                         }
                     }
                 };
@@ -2047,12 +2032,10 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Where fields are held, a moment that has come is set (see
     // `apply_to_hashex`).
     let action = match action {
-        HgetexAction::SetExpiryPast(at_ms) if fields_are_held() => {
-            HgetexAction::SetExpiry(absolute_deadline(at_ms, false).0, at_ms)
-        }
+        HgetexAction::SetExpiryPast(at_ms) if fields_are_held() => HgetexAction::SetExpiry(at_ms),
         other => other,
     };
-    crate::replication::script_feed::effects_begin();
+    crate::replication::script_feed::effects_begin_if_read(ctx);
     let now = expire_before(ctx, &key);
 
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -2062,7 +2045,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // needed. Otherwise we may need to upgrade.
     let needs_upgrade = matches!(
         action,
-        HgetexAction::SetExpiry(..) | HgetexAction::SetExpiryPast(_)
+        HgetexAction::SetExpiry(_) | HgetexAction::SetExpiryPast(_)
     );
 
     if needs_upgrade {
@@ -2156,7 +2139,7 @@ fn hgetex_apply(
     fields: &[String],
     action: HgetexAction,
     resp: u8,
-    now: Instant,
+    now: FieldDeadline,
 ) -> Vec<Vec<u8>> {
     let mut inner = hx.write();
     // A field due and not removed here (see `field_expiry::policy`) is not
@@ -2168,7 +2151,7 @@ fn hgetex_apply(
     let mut affected: Vec<&[u8]> = Vec::new();
 
     for f in fields {
-        let due = hide && inner.expiries.get(f).is_some_and(|at| *at <= now);
+        let due = hide && inner.expiries.get(f).is_some_and(|at| field_due(*at, now));
         let value = match inner.fields.get(f).cloned() {
             Some(v) if !due => v,
             _ => {
@@ -2184,7 +2167,7 @@ fn hgetex_apply(
                     affected.push(f.as_bytes());
                 }
             }
-            HgetexAction::SetExpiry(exp, _) => {
+            HgetexAction::SetExpiry(exp) => {
                 inner.expiries.insert(f.clone(), exp);
                 affected.push(f.as_bytes());
             }
@@ -2203,7 +2186,7 @@ fn hgetex_apply(
     match action {
         HgetexAction::None => {}
         HgetexAction::Persist => record_field_effect(b"HPERSIST", key, None, &affected),
-        HgetexAction::SetExpiry(_, at_ms) => {
+        HgetexAction::SetExpiry(at_ms) => {
             record_field_effect(b"HPEXPIREAT", key, Some(at_ms), &affected)
         }
         HgetexAction::SetExpiryPast(_) => record_field_effect(b"HDEL", key, None, &affected),
@@ -2211,7 +2194,7 @@ fn hgetex_apply(
     let event = match action {
         HgetexAction::None => None,
         HgetexAction::Persist => Some("hpersist"),
-        HgetexAction::SetExpiry(..) => Some("hexpire"),
+        HgetexAction::SetExpiry(_) => Some("hexpire"),
         HgetexAction::SetExpiryPast(_) => Some("hdel"),
     };
     if let Some(event) = event
@@ -2248,12 +2231,12 @@ enum HsetexTtl {
     Clear,
     /// `KEEPTTL`: whatever TTL the field has stays.
     Keep,
-    /// The deadline, and the same in milliseconds since the Unix epoch.
-    Set(Instant, u64),
+    /// The deadline, milliseconds since the Unix epoch.
+    Set(FieldDeadline),
     /// An absolute time already in the past: the field expires on the spot.
     Past(u64),
     /// The legacy form with `KEEPTTL`: keep an existing TTL, else set this one.
-    KeepOrSet(Instant, u64),
+    KeepOrSet(FieldDeadline),
 }
 
 /// Which of the hash field commands whose arguments Redis 8.10 takes in any
@@ -2440,14 +2423,11 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Legacy form: the TTL in seconds comes straight after the key.
     let legacy_expiry = match integer(cmd[2]) {
         Some(secs) if secs > 0 => {
-            if field_deadline_ms(secs, true, now_ms() as i64).is_none() {
+            let Some(deadline) = field_deadline_after(secs, true) else {
                 return Some(invalid_field_expire_time("HSETEX"));
-            }
+            };
             idx = 3;
-            Some((
-                Instant::now() + Duration::from_secs(secs as u64),
-                now_ms().saturating_add((secs as u64).saturating_mul(1000)),
-            ))
+            Some(deadline)
         }
         Some(_) => return Some(resp_error("ERR invalid expire time, must be > 0")),
         None => None,
@@ -2456,7 +2436,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut fnx = false;
     let mut fxx = false;
     let mut keepttl = false;
-    let mut ttl: Option<HsetexTtl> = legacy_expiry.map(|(at, at_ms)| HsetexTtl::Set(at, at_ms));
+    let mut ttl: Option<HsetexTtl> = legacy_expiry.map(HsetexTtl::Set);
     const ONE_TTL_OPTION: &str =
         "ERR Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified";
 
@@ -2492,48 +2472,34 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 };
                 // Past the latest deadline Redis allows: refused, as by Redis.
                 let relative = matches!(tok.as_str(), "EX" | "PX");
-                if n > 0
-                    && field_deadline_ms(
-                        n,
-                        matches!(tok.as_str(), "EX" | "EXAT"),
-                        if relative { now_ms() as i64 } else { 0 },
-                    )
-                    .is_none()
-                {
+                let secs = matches!(tok.as_str(), "EX" | "EXAT");
+                if !relative && n > 0 && field_deadline_ms(n, secs, 0).is_none() {
                     return Some(invalid_field_expire_time("HSETEX"));
                 }
                 if !relative && let Some(refused) = negative_unix_time(ctx, n) {
                     return Some(refused);
                 }
-                let now_ms = now_ms();
                 ttl = Some(match tok.as_str() {
                     "EX" | "PX" if n < 0 => {
                         return Some(resp_error("ERR invalid expire time, must be >= 0"));
                     }
                     // 0 is now: the fields are set and go, as in Redis 8.10.
-                    "EX" | "PX" if n == 0 => HsetexTtl::Past(now_ms),
-                    "EX" | "PX" => {
-                        let ms = if tok == "EX" {
-                            (n as u64).saturating_mul(1000)
-                        } else {
-                            n as u64
-                        };
-                        HsetexTtl::Set(
-                            Instant::now() + Duration::from_millis(ms),
-                            now_ms.saturating_add(ms),
-                        )
-                    }
-                    // A Unix time, to the nanosecond (#448): cutting the
-                    // time now to a millisecond made the deadline later.
+                    "EX" | "PX" if n == 0 => HsetexTtl::Past(now_ms()),
+                    "EX" | "PX" => match field_deadline_after(n, secs) {
+                        Some(at_ms) => HsetexTtl::Set(at_ms),
+                        None => return Some(invalid_field_expire_time("HSETEX")),
+                    },
+                    // A Unix time, kept as it came (#594).
                     _ => {
                         let at_ms = if tok == "EXAT" {
                             (n.max(0) as u64).saturating_mul(1000)
                         } else {
                             n.max(0) as u64
                         };
-                        match absolute_deadline(at_ms, n <= 0) {
-                            (at, false) => HsetexTtl::Set(at, at_ms),
-                            (_, true) => HsetexTtl::Past(at_ms),
+                        if has_come(at_ms, n <= 0) {
+                            HsetexTtl::Past(at_ms)
+                        } else {
+                            HsetexTtl::Set(at_ms)
                         }
                     }
                 });
@@ -2544,13 +2510,11 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
     let ttl = match (ttl, keepttl, legacy_expiry) {
-        (_, true, Some((at, at_ms))) => HsetexTtl::KeepOrSet(at, at_ms),
+        (_, true, Some(at_ms)) => HsetexTtl::KeepOrSet(at_ms),
         (_, true, None) => HsetexTtl::Keep,
         // Where fields are held, a moment that has come is set (see
         // `apply_to_hashex`).
-        (Some(HsetexTtl::Past(at_ms)), false, _) if fields_are_held() => {
-            HsetexTtl::Set(absolute_deadline(at_ms, false).0, at_ms)
-        }
+        (Some(HsetexTtl::Past(at_ms)), false, _) if fields_are_held() => HsetexTtl::Set(at_ms),
         (Some(ttl), false, _) => ttl,
         (None, false, _) => HsetexTtl::Clear,
     };
@@ -2584,83 +2548,101 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         i += 2;
     }
 
-    crate::replication::script_feed::effects_begin();
-    expire_before(ctx, &key);
+    let fields_at = idx;
+    let record = crate::replication::script_feed::effects_begin_if_read(ctx);
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, &key);
-    let mut map = write_lock!(shard);
+    // The fields of the hash due now go first, where this node removes them
+    // ([`expire_first`]): found under the same lookup as the write, not by
+    // one of their own before it (#543). The write holds its key's order
+    // throughout, so nothing else writes the hash between the two.
+    let mut now: Option<FieldDeadline> = None;
+    let mut tried = false;
+    let expiring: Vec<&[u8]> = loop {
+        let mut map = write_lock!(shard);
 
-    // Get or upgrade-or-create a HashEx for this key.
-    let hx = match map.get(key.as_slice()) {
-        Some(ValueRef::HashEx(h)) => Arc::clone(h),
-        Some(ValueRef::Hash(plain)) => {
-            // Upgrade in place
-            let plain = Arc::clone(plain);
-            let mut plain_w = plain.write();
-            let mut new_inner = crate::types::HashInner::new();
-            new_inner.fields = std::mem::take(&mut *plain_w);
-            drop(plain_w);
-            let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
-            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
-            new_arc
-        }
-        Some(_) => {
-            return Some(resp_error(
-                "WRONGTYPE Operation against a key holding the wrong kind of value",
-            ));
-        }
-        None => {
-            // FXX can never be satisfied on a key that does not exist; do not
-            // leave an empty hash behind for having asked.
-            if fxx {
-                return Some(resp_integer(0));
+        // Get or upgrade-or-create a HashEx for this key.
+        let (hx, had_ttls) = match map.get(key.as_slice()) {
+            Some(ValueRef::HashEx(h)) => (Arc::clone(h), true),
+            Some(ValueRef::Hash(plain)) => {
+                // Upgrade in place
+                let plain = Arc::clone(plain);
+                let mut plain_w = plain.write();
+                let mut new_inner = crate::types::HashInner::new();
+                new_inner.fields = std::mem::take(&mut *plain_w);
+                drop(plain_w);
+                let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
+                map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
+                (new_arc, false)
             }
-            let new_arc = Arc::new(parking_lot::RwLock::new(crate::types::HashInner::new()));
-            map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
-            new_arc
+            Some(_) => {
+                return Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+            None => {
+                // FXX can never be satisfied on a key that does not exist; do not
+                // leave an empty hash behind for having asked.
+                if fxx {
+                    return Some(resp_integer(0));
+                }
+                let new_arc = Arc::new(parking_lot::RwLock::new(crate::types::HashInner::new()));
+                map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
+                (new_arc, false)
+            }
+        };
+        drop(map);
+
+        let mut inner = hx.write();
+        if had_ttls {
+            let now = *now.get_or_insert_with(field_now);
+            if expire_first(ctx, &inner, now, &mut tried) {
+                drop(inner);
+                expire_fields(ctx, &key, now);
+                continue;
+            }
         }
-    };
-    drop(map);
 
-    let mut inner = hx.write();
+        // FNX / FXX precheck (atomic: all-or-nothing).
+        if fnx && pairs.iter().any(|(f, _)| inner.fields.contains_key(f)) {
+            return Some(resp_integer(0));
+        }
+        if fxx && !pairs.iter().all(|(f, _)| inner.fields.contains_key(f)) {
+            return Some(resp_integer(0));
+        }
 
-    // FNX / FXX precheck (atomic: all-or-nothing).
-    if fnx && pairs.iter().any(|(f, _)| inner.fields.contains_key(f)) {
-        return Some(resp_integer(0));
-    }
-    if fxx && !pairs.iter().all(|(f, _)| inner.fields.contains_key(f)) {
-        return Some(resp_integer(0));
-    }
-
-    // Apply all writes.
-    let mut expiring: Vec<&[u8]> = Vec::new();
-    for (f, v) in &pairs {
-        inner.fields.insert(f.clone(), Arc::clone(v));
-        match ttl {
-            HsetexTtl::Clear => {
-                inner.expiries.remove(f);
-            }
-            HsetexTtl::Keep => {}
-            HsetexTtl::Set(at, _) => {
-                inner.expiries.insert(f.clone(), at);
-                expiring.push(f.as_bytes());
-            }
-            HsetexTtl::KeepOrSet(at, _) => {
-                if !inner.expiries.contains_key(f) {
+        // Apply all writes.
+        let mut expiring: Vec<&[u8]> = Vec::new();
+        for (f, v) in &pairs {
+            inner.fields.insert(f.clone(), Arc::clone(v));
+            match ttl {
+                HsetexTtl::Clear => {
+                    inner.expiries.remove(f);
+                }
+                HsetexTtl::Keep => {}
+                HsetexTtl::Set(at) => {
                     inner.expiries.insert(f.clone(), at);
                     expiring.push(f.as_bytes());
                 }
-            }
-            HsetexTtl::Past(_) => {
-                inner.evict_field(f);
+                HsetexTtl::KeepOrSet(at) => {
+                    if !inner.expiries.contains_key(f) {
+                        inner.expiries.insert(f.clone(), at);
+                        expiring.push(f.as_bytes());
+                    }
+                }
+                HsetexTtl::Past(_) => {
+                    inner.evict_field(f);
+                }
             }
         }
-    }
-    drop(inner);
+        break expiring;
+    };
 
     let db = *ctx.selected_db;
     let all_fields = || pairs.iter().map(|(f, _)| f.as_bytes());
-    record_hsetex_effect(&key, &pairs, ttl, &expiring);
+    if record {
+        record_hsetex_effect(&key, &cmd[fields_at..], &pairs, ttl, &expiring);
+    }
     if matches!(ttl, HsetexTtl::Past(_)) {
         // Set and expired in one step: the set, then the deletion, as Redis
         // 8.10 announces them.
@@ -2690,34 +2672,39 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
 /// `HSETEX`'s effect, its `FNX`/`FXX` decided here: the fields set, with
 /// the deadline they were given as a moment; or, for a moment already past,
 /// their deletion.
+///
+/// Only when the record is read (`script_feed::effects_begin_if_read`).
+/// `args` are the command's own field-value pairs, as the client sent them:
+/// copied once, straight into the record, not from the names the hash
+/// keeps them under.
 fn record_hsetex_effect(
     key: &[u8],
+    args: &[&[u8]],
     pairs: &[(String, Arc<[u8]>)],
     ttl: HsetexTtl,
     expiring: &[&[u8]],
 ) {
-    let names: Vec<&[u8]> = pairs.iter().map(|(f, _)| f.as_bytes()).collect();
     if let HsetexTtl::Past(_) = ttl {
+        let names: Vec<&[u8]> = pairs.iter().map(|(f, _)| f.as_bytes()).collect();
         record_field_effect(b"HDEL", key, None, &names);
         return;
     }
-    let mut parts = vec![b"HSETEX".to_vec(), key.to_vec()];
+    let mut parts: Vec<Vec<u8>> = Vec::with_capacity(6 + args.len());
+    parts.push(b"HSETEX".to_vec());
+    parts.push(key.to_vec());
     match ttl {
-        HsetexTtl::Set(_, at_ms) => {
+        HsetexTtl::Set(at_ms) => {
             parts.push(b"PXAT".to_vec());
             parts.push(at_ms.to_string().into_bytes());
         }
-        HsetexTtl::Keep | HsetexTtl::KeepOrSet(..) => parts.push(b"KEEPTTL".to_vec()),
+        HsetexTtl::Keep | HsetexTtl::KeepOrSet(_) => parts.push(b"KEEPTTL".to_vec()),
         HsetexTtl::Clear | HsetexTtl::Past(_) => {}
     }
     parts.push(b"FIELDS".to_vec());
     parts.push(pairs.len().to_string().into_bytes());
-    for (field, value) in pairs {
-        parts.push(crate::commands::helpers::name_to_bytes(field).into_owned());
-        parts.push(value.to_vec());
-    }
+    parts.extend(args.iter().map(|arg| arg.to_vec()));
     crate::replication::script_feed::effect(parts);
-    if let HsetexTtl::KeepOrSet(_, at_ms) = ttl {
+    if let HsetexTtl::KeepOrSet(at_ms) = ttl {
         record_field_effect(b"HPEXPIREAT", key, Some(at_ms), expiring);
     }
 }

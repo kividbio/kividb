@@ -12,9 +12,13 @@
 //   PONG <sender_id> <sender_endpoint> <gossip_array>
 //     "Reply to your PING/MEET. Same gossip payload as PING."
 //
-//   FAILOVER_AUTH_REQUEST <sender_id> <endpoint> <master_id> [force]
+//   FAILOVER_AUTH_REQUEST <sender_id> <endpoint> <master_id> [force | <slot_claims>]
 //   FAILOVER_AUTH_ACK <sender_id> <epoch>
-//     Replica election. `force` marks a manual failover.
+//     Replica election. `force` marks a manual failover. An automatic one
+//     carries instead the slots the candidate's master owns in its view, at
+//     that master's config epoch, as a PING's are (#524). A node of an
+//     earlier version takes any fifth field that is not `force` for an
+//     automatic failover, and reads no further.
 //
 //   FAIL <sender_id> <failed_id>
 //     "A majority of masters agree this node is down."
@@ -129,6 +133,11 @@ pub enum BusMessage {
         master_id: NodeId,
         /// A manual failover: grant the vote although the master is healthy.
         force: bool,
+        /// The slots the candidate would take over: its master's, in its
+        /// view, at the master's config epoch. Sent with an automatic
+        /// failover only; `None` from a node of an earlier version, or
+        /// with `force`. See `ClusterState::cast_vote`.
+        claims: Option<Vec<SlotClaim>>,
     },
 
     /// "Yes, you can take over." Sent by a master in response to a valid
@@ -287,6 +296,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             request_epoch,
             master_id,
             force,
+            claims,
         } => {
             let mut fields = vec![
                 resp_bulk_str("FAILOVER_AUTH_REQUEST"),
@@ -303,6 +313,8 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             // four-field form that nodes running an older build accept.
             if *force {
                 fields.push(resp_bulk_str("force"));
+            } else if let Some(claims) = claims {
+                fields.push(encode_slot_claims(claims));
             }
             resp_array(fields)
         }
@@ -567,6 +579,13 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                 ));
             }
             let force = parts.get(4).is_some_and(|f| f.as_slice() == b"force");
+            // Anything else in the fifth field is the candidate's claims; a
+            // field that does not parse as them is left out, as a node of an
+            // earlier version leaves it.
+            let claims = match parts.get(4) {
+                Some(f) if !force && f.first() == Some(&b'*') => parse_slot_claims(f).ok(),
+                _ => None,
+            };
             let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
             let endpoint = std::str::from_utf8(&parts[2]).map_err(|_| "bad endpoint utf8")?;
             let (ip, cp, busp, ep) = parse_endpoint(endpoint)?;
@@ -580,6 +599,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     request_epoch: ep,
                     master_id,
                     force,
+                    claims,
                 },
                 consumed,
             )))
@@ -1288,6 +1308,7 @@ mod tests {
             request_epoch: 7,
             master_id: master,
             force: false,
+            claims: None,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1318,13 +1339,95 @@ mod tests {
             request_epoch: 9,
             master_id: generate_node_id(),
             force: true,
+            // Not sent with `force`.
+            claims: Some(vec![SlotClaim {
+                start: 0,
+                end: 1,
+                epoch: 1,
+            }]),
         };
-        let (decoded, _) = decode(&encode(&msg)).unwrap().unwrap();
+        let bytes = encode(&msg);
+        let (decoded, _) = decode(&bytes).unwrap().unwrap();
         assert!(matches!(
             decoded,
             BusMessage::FailoverAuthRequest {
                 force: true,
                 request_epoch: 9,
+                claims: None,
+                ..
+            }
+        ));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 5);
+    }
+
+    /// An automatic failover's request carries the candidate's claims in
+    /// its fifth field (#524). A node of an earlier version, which takes a
+    /// fifth field that is not `force` for an automatic failover and reads
+    /// nothing else of it, reads it as it reads the four-field form; a
+    /// request without the field, as such a node sends it, decodes with no
+    /// claims.
+    #[test]
+    fn auth_request_claims_round_trip_and_read_as_before() {
+        let claims = vec![
+            SlotClaim {
+                start: 0,
+                end: 100,
+                epoch: 4,
+            },
+            SlotClaim {
+                start: 7000,
+                end: 7000,
+                epoch: 4,
+            },
+        ];
+        let msg = BusMessage::FailoverAuthRequest {
+            sender_id: generate_node_id(),
+            sender_ip: "127.0.0.1".into(),
+            sender_client_port: 6390,
+            sender_cluster_port: 16390,
+            request_epoch: 11,
+            master_id: generate_node_id(),
+            force: false,
+            claims: Some(claims),
+        };
+        let bytes = encode(&msg);
+        match decode(&bytes).unwrap().unwrap().0 {
+            BusMessage::FailoverAuthRequest {
+                force: false,
+                request_epoch: 11,
+                claims: Some(got),
+                ..
+            } => {
+                let got: Vec<(u16, u16, u64)> =
+                    got.iter().map(|c| (c.start, c.end, c.epoch)).collect();
+                assert_eq!(got, vec![(0, 100, 4), (7000, 7000, 4)]);
+            }
+            other => panic!("expected FailoverAuthRequest with claims, got {other:?}"),
+        }
+        // What a 1.2 node checks of it: four or five fields, the fifth not
+        // `force`.
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 5);
+        assert_ne!(parts[4].as_slice(), b"force");
+
+        let without = BusMessage::FailoverAuthRequest {
+            sender_id: generate_node_id(),
+            sender_ip: "127.0.0.1".into(),
+            sender_client_port: 6390,
+            sender_cluster_port: 16390,
+            request_epoch: 12,
+            master_id: generate_node_id(),
+            force: false,
+            claims: None,
+        };
+        let bytes = encode(&without);
+        assert_eq!(parse_resp_array(&bytes).unwrap().unwrap().0.len(), 4);
+        assert!(matches!(
+            decode(&bytes).unwrap().unwrap().0,
+            BusMessage::FailoverAuthRequest {
+                force: false,
+                claims: None,
                 ..
             }
         ));

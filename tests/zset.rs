@@ -2062,3 +2062,90 @@ fn zcount_and_zremrangebyscore_match_a_reference_on_random_sets() {
         }
     }
 }
+
+/// Scores at the edges of a double's range are read as Redis 8.10.2 reads
+/// them, and a new member's increment of `-0` is replied as `-0` and stored
+/// as 0 (#422). The expected replies are Redis's.
+#[test]
+fn scores_past_the_range_of_a_double_are_read_as_redis_reads_them() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let score = |c: &mut Conn, text: &str| -> Result<String, String> {
+        match c.cmds(&["ZADD", "z", text, "m"]) {
+            RespValue::Error(e) => Err(e),
+            _ => Ok(c.cmds(&["ZSCORE", "z", "m"]).as_str().to_string()),
+        }
+    };
+    for (text, expected) in [
+        // At most 19 digits: infinite or zero as long as the power of ten is
+        // from -342 to 308.
+        ("2e308", "inf"),
+        ("-2e308", "-inf"),
+        ("1.7976931348623159e308", "inf"),
+        ("10e308", "inf"),
+        ("9999999999999999999e290", "inf"),
+        ("1e-342", "0"),
+        ("2.4703282292062327e-324", "0"),
+        ("3e-324", "5e-324"),
+        ("0e-400", "0"),
+        ("0e400", "0"),
+        // More digits: correctly rounded, and refused if that is infinite
+        // or zero.
+        (
+            "123456789012345678901234567890e279",
+            "1.2345678901234567e+308",
+        ),
+        ("30000000000000000000e-343", "5e-324"),
+        ("12345678901234567890e-330", "1.2345678901233e-311"),
+        // Hexadecimal, rounded once.
+        ("0x1p-1030", "8.691694759794e-311"),
+        ("0x0.4p1025", "8.98846567431158e+307"),
+        ("0x1.000000000000081p0", "1.0000000000000002"),
+        ("0x1.00000000000008p0", "1"),
+        ("0x1.00000000000018p0", "1.0000000000000004"),
+        ("0x1p-1074", "5e-324"),
+        ("0x1.8p-1075", "5e-324"),
+        ("0x.1", "0.0625"),
+    ] {
+        assert_eq!(score(&mut c, text), Ok(expected.to_string()), "{text}");
+    }
+    for text in [
+        "1e309",
+        "0.1e310",
+        "-1e309",
+        "1e400",
+        "1e-343",
+        "1.5e-342",
+        "1e-400",
+        "-1e-400",
+        "20000000000000000000e289",
+        "2.0000000000000000000e308",
+        "99999999999999999999e290",
+        "20000000000000000000e-343",
+        "0x1p99999999999",
+        "0x1p1024",
+        "0x1p-1075",
+        "0x1p-99999999999",
+        "0xp1",
+        "0x1p",
+        "nan",
+        "--1",
+    ] {
+        assert_eq!(
+            score(&mut c, text),
+            Err("ERR value is not a valid float".to_string()),
+            "{text}"
+        );
+    }
+
+    // -0: the increment of a new member is replied as it is, and stored
+    // as 0, as Redis's listpack stores it.
+    assert_eq!(c.cmds(&["ZINCRBY", "z2", "-0", "new"]).as_str(), "-0");
+    assert_eq!(c.cmds(&["ZSCORE", "z2", "new"]).as_str(), "0");
+    assert_eq!(c.cmds(&["ZINCRBY", "z2", "-0", "new"]).as_str(), "0");
+    assert_eq!(c.cmds(&["ZADD", "z2", "INCR", "-0", "n"]).as_str(), "-0");
+    assert_eq!(c.cmds(&["ZSCORE", "z2", "n"]).as_str(), "0");
+    c.cmds(&["ZADD", "z3", "-0", "m"]);
+    assert_eq!(c.cmds(&["ZSCORE", "z3", "m"]).as_str(), "0");
+}

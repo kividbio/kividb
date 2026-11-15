@@ -661,8 +661,8 @@ class TestLatencyHistory:
             proc.terminate()
             proc.wait(timeout=5)
 
-    def test_history_capped_at_180_samples(self):
-        """LATENCY HISTORY must not return more than 180 samples per event."""
+    def test_history_capped_at_160_samples(self):
+        """LATENCY HISTORY must not return more than 160 samples per event."""
         port = free_port()
         proc = start_custom_server(port, [])
         r = redis.Redis(host=KIVI_HOST, port=port, decode_responses=True)
@@ -673,8 +673,8 @@ class TestLatencyHistory:
                 r.set(f"cap180_{i}", i)
             for event in ("command", "fast-command"):
                 history = r.execute_command("LATENCY", "HISTORY", event)
-                assert len(history) <= 180, (
-                    f"HISTORY for '{event}' returned {len(history)} samples; cap is 180"
+                assert len(history) <= 160, (
+                    f"HISTORY for '{event}' returned {len(history)} samples; cap is 160"
                 )
         finally:
             r.close()

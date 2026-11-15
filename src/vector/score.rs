@@ -334,6 +334,15 @@ impl<'q> Scoring<'q> {
         let mut tags = Vec::new();
         let patterns = named_terms(filter, &mut words, &mut tags);
         let mut wanted = Bits::new();
+        // What is queued for the postings applied first (`PostingsLock::
+        // read`): a document's removal queued there, while a query held
+        // them, takes its words out of the TEXT index when it is applied.
+        // Read before it, the statistics below still counted a document
+        // that the postings read after them, and the query's count, left
+        // out: the full path scored with it, the page from postings (which
+        // reads the postings first) without, and the next query without
+        // (#421).
+        drop(def.postings.read());
         let (term_ids, doc_count, total_len) = {
             let text = def.text.read();
             let ids: AHashMap<String, (u32, usize)> = words
@@ -846,5 +855,65 @@ mod tests {
         assert_eq!(Scorer::parse("bm25std"), Some(Scorer::Bm25Std));
         assert_eq!(Scorer::parse("TFIDF.DOCNORM"), Some(Scorer::TfidfDocNorm));
         assert_eq!(Scorer::parse("nope"), None);
+    }
+
+    /// A document whose removal was queued, while a query held the
+    /// postings, is out of the next query's statistics as it is out of its
+    /// count (#421). The statistics were read before the queue was applied:
+    /// that query scored with the document still counted, and the one after
+    /// it without.
+    #[test]
+    fn statistics_are_read_after_a_queued_removal_is_applied() {
+        use super::super::{
+            FieldOptions, FieldType, IndexOn, IndexSchema, SchemaField, Write, index_fields,
+        };
+        let def = IndexSchema {
+            name: "idx".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["doc:".into()],
+            fields: vec![SchemaField {
+                name: "t".into(),
+                field_type: FieldType::Text,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        }
+        .into_def();
+        for (i, words) in [
+            "apple pear",
+            "apple",
+            "apple plum fig",
+            "kiwi lime lemon date",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let fields = [("t".to_string(), std::sync::Arc::from(words.as_bytes()))];
+            index_fields(&def, &format!("doc:{i}"), &fields, Write::Whole);
+        }
+        let filter = super::super::filter::parse_query("apple", &Default::default(), &def)
+            .unwrap()
+            .filter;
+        let before = Scoring::new(&def, &filter, Scorer::Bm25Std);
+        assert_eq!(before.n, 4);
+        {
+            // A query holds the postings: the removal is queued.
+            let _query = def.postings.peek();
+            def.postings.remove("doc:3", def.text_removal());
+        }
+        let first = Scoring::new(&def, &filter, Scorer::Bm25Std);
+        let next = Scoring::new(&def, &filter, Scorer::Bm25Std);
+        assert_eq!(next.n, 3);
+        assert_eq!(
+            (first.n, first.avgdl),
+            (next.n, next.avgdl),
+            "the first query after the removal scored with the document"
+        );
     }
 }

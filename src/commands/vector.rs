@@ -298,7 +298,6 @@ fn ft_dropindex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 continue;
             }
             deleted += 1;
-            crate::vector::maybe_unindex(ctx.index_store, db, key);
             crate::stats::record_rdb_change();
             crate::keyspace_events::notify(
                 ctx.pubsub,
@@ -533,7 +532,18 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             _ => {}
         }
     }
+    let kept_keys = !def.gives_ids();
     def.fields.extend(new_fields);
+    // An index of vectors alone that is given its first TEXT, TAG or
+    // NUMERIC field counts its documents by their ids from here on: each
+    // is given one below, whatever was added and with SKIPINITIALSCAN too.
+    // Its keys are let go of, not emptied: a walk that began before this
+    // (of an `FT.CREATE` or another `FT.ALTER`) goes on adding to the ones
+    // it holds, which go with it, not to ones nothing reads or frees.
+    let now_gives_ids = kept_keys && def.gives_ids();
+    if now_gives_ids {
+        def.docs = Arc::default();
+    }
     let altered = def.clone();
 
     // We need to drop the write lock before backfilling — backfill takes
@@ -557,7 +567,7 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             &newly_added_text_fields,
         );
     }
-    if !added_filter_fields.is_empty() {
+    if !added_filter_fields.is_empty() || now_gives_ids {
         crate::vector::backfill_postings(
             &ctx.store[altered.db_index],
             &altered,
@@ -793,7 +803,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if not_served(key) {
                 return;
             }
-            let Some(inner) = crate::vector::doc_fields(&def.on, &def.fields, value) else {
+            let Some(inner) = crate::vector::query_doc_fields(&def.on, &def.fields, value) else {
                 return;
             };
             // The filter on the raw fields, before anything is turned into
@@ -824,7 +834,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         };
         let candidates = rows
             .iter()
-            .filter_map(|row| row.get("__key").map(String::as_str));
+            .filter_map(|row| row.get("__key").map(String::as_str))
+            .filter(|key| !crate::commands::search::field_hidden(db_ref, key, &knn.field));
         let (nearest, cut) = knn_filtered(live, &knn.vector, knn.k, metric, candidates, deadline);
         timed_out |= cut;
         let rank: ahash::AHashMap<String, (usize, f32)> = nearest
@@ -883,7 +894,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // ── Parse and execute pipeline clauses ────────────────────────────────────
     // To the same deadline: GROUPBY, APPLY, FILTER and SORTBY over a large
     // scan cost as much as the scan.
-    let (rows, cut) = crate::commands::aggregate_pipeline::run_within(rows, cmd, 3, deadline);
+    let (rows, cut, groups) =
+        crate::commands::aggregate_pipeline::run_counted(rows, cmd, 3, deadline);
     timed_out |= cut;
     if cut && crate::commands::search::on_timeout_fails() {
         return Some(resp_error("Timeout limit was reached"));
@@ -1005,17 +1017,21 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // `WITHCURSOR`: the first rows now, the rest as they are asked for.
     if let Some((count, max_idle)) = cursor {
         return Some(crate::commands::search_tools::open_cursor(
-            ctx.resp,
+            crate::commands::handler::effective_resp_for_reply(ctx),
             &index_name,
             rows_out,
             count,
             max_idle,
             timed_out,
+            groups,
         ));
     }
+    // A grouped aggregation reports how many groups there were, not how many
+    // are on this page; any other reports the page.
+    let total = groups.unwrap_or(rows_out.len());
     Some(crate::commands::search_tools::rows_reply(
-        ctx.resp,
-        rows_out.len(),
+        crate::commands::handler::effective_resp_for_reply(ctx),
+        total,
         &rows_out,
         timed_out,
     ))
@@ -1072,7 +1088,7 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // Resolve the index and the field: where its value is stored, and how it
     // is split into tags. Cloned out, so the store lock is not held while the
     // shards are scanned.
-    let (prefixes, tag_field, doc_on, doc_schema) = {
+    let (prefixes, tag_field, doc_on, doc_schema, db) = {
         let store = ctx.index_store.read();
         let def = match store.get(index_name) {
             Some(d) => d,
@@ -1097,6 +1113,7 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
             tag_field,
             def.on.clone(),
             def.fields.clone(),
+            def.db_index,
         )
     };
     let Some((stored_as, separator, case_sensitive)) = tag_field else {
@@ -1105,9 +1122,9 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     };
 
-    // Scan all shards and collect distinct tag values.
+    // Scan all shards of the index's database and collect distinct tag values.
     let mut distinct: ahash::AHashSet<String> = ahash::AHashSet::new();
-    let db_ref = &ctx.store[*ctx.selected_db];
+    let db_ref = &ctx.store[db];
 
     for shard in db_ref.iter() {
         let map = shard.read();
@@ -1399,40 +1416,14 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
 
-    // ── Read the per-index vocabulary ─────────────────────────────────────
-    //
-    // The vocab is maintained incrementally by maybe_index and backfill_index.
-    // We clone the Arc to drop the IndexStore lock before doing the lookup
-    // loop — keeps the fast path uncontended.
-    let text_arc = {
-        let store = ctx.index_store.read();
-        let def = match store.get(&index_name) {
-            Some(d) => d,
-            None => {
-                return Some(resp_error(&crate::commands::search::no_such_index(
-                    &index_name,
-                )));
-            }
-        };
-        Arc::clone(&def.text)
+    // The index first, as RediSearch looks it up before the rest.
+    let Some(def) = ctx.index_store.read().get(&index_name).cloned() else {
+        return Some(resp_error(&crate::commands::search::no_such_index(
+            &index_name,
+        )));
     };
 
-    // Take a read lock on the vocab itself. We need to convert it into a
-    // BTreeSet<String> we can mutate (for INCLUDE/EXCLUDE dicts), so clone
-    // the contents. For a typical 100k-word vocab this is a few MB — cheap
-    // compared to the avoided shard walk.
-    //
-    // The vocab is then a local owned BTreeSet; we drop the read lock before
-    // any further work so concurrent HSETs can keep updating the index.
-    let mut vocab: BTreeSet<String> = text_arc.read().words().map(str::to_string).collect();
-
-    // AFTER the vocab-building loop over shards,
-    // this block is used to merge in any INCLUDE dicts and remove EXCLUDE dicts.
-    // First, re-parse TERMS INCLUDE/EXCLUDE from the command:
-
-    // Parse TERMS INCLUDE|EXCLUDE dict clauses
-    // These appear after DISTANCE in the command args.
-    // We re-scan cmd here since we already consumed i above.
+    // The TERMS INCLUDE|EXCLUDE clauses.
     let mut include_dicts: Vec<String> = Vec::new();
     let mut exclude_dicts: Vec<String> = Vec::new();
     let mut j = 3usize;
@@ -1476,82 +1467,143 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
 
-    // Merge INCLUDE dicts into vocabulary
+    // The dictionaries, each of which must exist, the INCLUDE ones first,
+    // as RediSearch checks them (before anything else is read). A query word
+    // in an EXCLUDE dictionary is spelled right and gets no entry. The words
+    // of an INCLUDE dictionary are offered as suggestions too, but a query
+    // word that is only in one is still misspelled.
+    let mut included: BTreeSet<String> = BTreeSet::new();
+    let mut excluded: BTreeSet<String> = BTreeSet::new();
     {
         let dict_store = ctx.dict_store.read();
-        for dict_name in &include_dicts {
-            if let Some(dict) = dict_store.get(dict_name) {
-                vocab.extend(dict.iter().cloned());
-            }
-        }
-        // Remove EXCLUDE dict words from vocabulary
-        for dict_name in &exclude_dicts {
-            if let Some(dict) = dict_store.get(dict_name) {
-                for word in dict.iter() {
-                    vocab.remove(word);
+        for (names, into) in [
+            (&include_dicts, &mut included),
+            (&exclude_dicts, &mut excluded),
+        ] {
+            for dict_name in names {
+                match dict_store.get(dict_name) {
+                    Some(dict) => into.extend(dict.iter().cloned()),
+                    None => {
+                        return Some(resp_error(&format!("Dict does not exist: {dict_name}")));
+                    }
                 }
             }
         }
     }
 
-    // For each token in the query, check if it's in the vocabulary.
-    // If not, find all vocab words within max_distance edits.
-    //
-    // Redis response format per term:
-    //   ["TERM", term, [[score, suggestion], [score, suggestion], ...]]
-    // Score = 1.0 - (edit_distance / max(len_a, len_b)) — higher is better.
+    // The words some document holds, each with how many do, read in one
+    // pass and cloned, so that the lock is let go of before the edit
+    // distances are measured. A word no document holds any more is neither
+    // spelled right nor offered, as in RediSearch once its GC has run.
+    let vocab: std::collections::BTreeMap<String, usize> = {
+        let text = def.text.read();
+        text.live_words()
+            .map(|(id, word)| (word.to_string(), text.df(id)))
+            .collect()
+    };
 
+    // What RediSearch divides a word's document count by: every document of
+    // the index (`docs.size - 1`), as `FT.INFO`'s `num_docs` counts them.
+    let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
+    let total_docs = crate::commands::search::count_docs(&def, cluster).max(1) as f64;
+
+    // RediSearch's reply per misspelled word, RESP2:
+    //   ["TERM", word, [[score, suggestion], ...]]
+    // and RESP3: {"results": {word: [{suggestion: score}, ...], ...}}.
+    // `TERM` and `results` are simple strings there, and so here.
+    // A suggestion's score is the share of the index's documents that hold
+    // it (`spell_check.c`), best first, written as Redis writes a double; a
+    // word only in an INCLUDE dictionary scores 0.
+    let resp3 = crate::commands::handler::effective_resp_for_reply(ctx) == 3;
+    let score = |docs: usize| -> Vec<u8> {
+        let digits = crate::commands::helpers::format_score(docs as f64 / total_docs);
+        if resp3 {
+            format!(",{digits}\r\n").into_bytes()
+        } else {
+            resp_bulk_str(&digits)
+        }
+    };
     let mut out: Vec<Vec<u8>> = Vec::new();
 
     // The query's words as the index has them, so that `world_x` and
     // `users\.u_1` are the words the vocabulary holds.
     for token_clean in crate::vector::tokenize_for_vocab(&query) {
-        if token_clean.is_empty() || vocab.contains(&token_clean) {
+        if token_clean.is_empty()
+            || vocab.contains_key(&token_clean)
+            || excluded.contains(&token_clean)
+        {
             continue; // correctly spelled — skip
         }
 
-        // Find candidates within edit distance
-        let mut candidates: Vec<(f64, &str)> = vocab
+        let near = |word: &str| levenshtein(&token_clean, word) <= max_distance;
+        let mut candidates: Vec<(usize, &str)> = vocab
             .iter()
-            .filter_map(|word| {
-                let dist = levenshtein(&token_clean, word);
-                if dist <= max_distance && dist > 0 {
-                    // Normalize score: 1.0 = identical, lower = more edits needed
-                    let max_len = token_clean.len().max(word.len()) as f64;
-                    let score = 1.0 - (dist as f64 / max_len);
-                    Some((score, word.as_str()))
+            .filter(|(word, _)| near(word))
+            .map(|(word, &docs)| (docs, word.as_str()))
+            .collect();
+        for word in &included {
+            if !vocab.contains_key(word) && near(word) {
+                candidates.push((0, word.as_str()));
+            }
+        }
+        // Best first; words of one score in order, to be the same each time.
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+
+        let suggestions: Vec<Vec<u8>> = candidates
+            .iter()
+            .map(|&(docs, word)| {
+                if resp3 {
+                    resp_map(vec![resp_bulk_str(word), score(docs)])
                 } else {
-                    None
+                    resp_array(vec![score(docs), resp_bulk_str(word)])
                 }
             })
             .collect();
 
-        // Sort by score descending (best suggestions first)
-        candidates.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-
-        // Build the suggestion sub-array: [[score, word], ...]
-        let suggestions: Vec<Vec<u8>> = candidates
-            .iter()
-            .map(|(score, word)| {
-                resp_array(vec![
-                    resp_bulk_str(&format!("{:.4}", score)),
-                    resp_bulk_str(word),
-                ])
-            })
-            .collect();
-
-        // Each term result: ["TERM", token, [suggestions]]
-        out.push(resp_array(vec![
-            resp_bulk_str("TERM"),
-            resp_bulk_str(&token_clean),
-            resp_array(suggestions),
-        ]));
+        if resp3 {
+            out.push(resp_bulk_str(&token_clean));
+            out.push(resp_array(suggestions));
+        } else {
+            out.push(resp_array(vec![
+                resp_simple("TERM"),
+                resp_bulk_str(&token_clean),
+                resp_array(suggestions),
+            ]));
+        }
     }
 
+    if resp3 {
+        return Some(resp_map(vec![resp_simple("results"), resp_map(out)]));
+    }
     Some(resp_array(out))
 }
 
 // ── Helpers for filtered search ──────────────────────────────────────────────
+
+/// The nearest `k` an index search finds, less the documents whose `field`
+/// a query is not to see ([`crate::commands::search::field_hidden`]).
+/// `search(n)` is the nearest `n`; while hits were left out and the search
+/// found all it was asked for, it is asked for more.
+pub(crate) fn nearest_shown(
+    db: &crate::store::Db,
+    field: &str,
+    k: usize,
+    mut search: impl FnMut(usize) -> Vec<crate::vector::KnnResult>,
+) -> Vec<crate::vector::KnnResult> {
+    let mut want = k;
+    loop {
+        let mut found = search(want);
+        let all = found.len() >= want;
+        let before = found.len();
+        found.retain(|hit| !crate::commands::search::field_hidden(db, &hit.key, field));
+        let hidden = before - found.len();
+        if hidden == 0 || found.len() >= k || !all {
+            found.truncate(k);
+            return found;
+        }
+        want = want.saturating_add(hidden.max(want));
+    }
+}
 
 /// The nearest `k` of the documents offered to it, measured as they come:
 /// what a filtered KNN keeps while the filter runs.
@@ -1759,8 +1811,22 @@ pub(crate) fn knn_planned(
                     .is_some_and(|v| crate::vector::is_document(&def.on, v))
             })
             .collect();
-        if gone.is_empty() || cut {
+        // A hit whose vector the query is not to see is left out of this
+        // query's plan, not out of the index.
+        let hidden: Vec<String> = nearest
+            .iter()
+            .filter(|r| crate::commands::search::field_hidden(db, &r.key, &knn.field))
+            .map(|r| r.key.clone())
+            .collect();
+        if (gone.is_empty() && hidden.is_empty()) || cut {
+            let mut nearest = nearest;
+            nearest.retain(|r| !hidden.contains(&r.key));
             return Some((nearest, cut));
+        }
+        for key in &hidden {
+            if let Some(id) = def.postings.peek().id(key) {
+                plan.ids.unset(id);
+            }
         }
         for key in gone {
             if let Some(id) = def.postings.peek().id(key) {
@@ -1993,7 +2059,15 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
     // `vector::walk_documents` (#275). The walk used to index the fields as
     // it found them, and a write to the key meanwhile, which indexed what it
     // wrote, could be overwritten in the index by the walk's older copy.
+    //
+    // An index that gives its documents no ids counts each one the walk
+    // meets: made with `SKIPINITIALSCAN`, it has not met them before, and
+    // a search of the new field finds them from here on.
+    let keeps_keys = !def.gives_ids();
     crate::vector::walk_documents(&ctx.store[def.db_index], &def, |key, inner| {
+        if keeps_keys {
+            def.docs.add(key);
+        }
         for w in &work {
             let raw_bytes = match inner.get(&w.name) {
                 Some(b) => b,

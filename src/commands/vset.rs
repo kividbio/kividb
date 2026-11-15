@@ -13,6 +13,7 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, VSetEntry, VectorSetInner};
+use crate::vector::quant::{Quant, StoredVector};
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -38,51 +39,103 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Get or create a VectorSet at `key` with a given dimension.
-/// Returns Err(resp bytes) on type mismatch or dim mismatch, or when
-/// `asked` names a `DISTANCE` other than the existing set's.
-fn get_or_create_vset(
-    ctx: &mut Ctx,
-    key: &[u8],
-    dim: usize,
-    asked: Option<crate::vector::DistanceMetric>,
-) -> Result<Arc<RwLock<VectorSetInner>>, Vec<u8>> {
-    let metric = asked
-        .clone()
-        .unwrap_or(crate::vector::DistanceMetric::Cosine);
-    let db_ref = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db_ref, key);
-    let mut map = write_lock!(shard);
+/// One `VADD`'s element and the options it gave.
+struct Addition {
+    element: crate::key_bytes::KeyBytes,
+    vector: Vec<f32>,
+    attrs: Option<Box<str>>,
+    metric: Option<crate::vector::DistanceMetric>,
+    quant: Option<Quant>,
+}
 
-    match map.get(key) {
-        Some(ValueRef::VectorSet(vs)) => {
-            let inner = vs.read();
-            if inner.dim != dim {
-                // Redis's words.
-                return Err(resp_error(&format!(
-                    "ERR Vector dimension mismatch - got {} but set has {}",
-                    dim, inner.dim
-                )));
-            }
-            // A `DISTANCE` the set was not made with is refused, as Redis
-            // refuses a quantization the set was not made with. One not
-            // given takes the set's.
-            if asked.as_ref().is_some_and(|m| *m != inner.metric) {
+fn quantize(quant: Quant, vector: Vec<f32>) -> Result<StoredVector, Vec<u8>> {
+    StoredVector::quantize(quant, vector)
+        .map_err(|_| resp_error("ERR invalid vector specification"))
+}
+
+/// Adds to `key`'s set, never blocking on the set while holding its shard.
+fn add_to_vset(db: &store::Db, key: &[u8], lenient: bool, add: Addition) -> Result<bool, Vec<u8>> {
+    let shard = store::get_shard(db, key);
+    loop {
+        let mut map = write_lock!(shard);
+        let vs = match map.get(key) {
+            Some(ValueRef::VectorSet(vs)) => Arc::clone(vs),
+            Some(_) => {
                 return Err(resp_error(
-                    "ERR asked distance mismatch with existing vector set",
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
                 ));
             }
-            Ok(Arc::clone(vs))
+            None => {
+                let metric = add.metric.unwrap_or(crate::vector::DistanceMetric::Cosine);
+                let mut inner = VectorSetInner::with_metric(add.vector.len(), metric);
+                // Default stays f32; Redis defaults to Q8.
+                inner.quant = add.quant.unwrap_or(Quant::F32);
+                inner.quant_chosen = add.quant.is_some();
+                // Quantized first, so a rejected vector leaves no empty set.
+                let stored = quantize(inner.quant, add.vector)?;
+                inner.entries.insert(
+                    add.element,
+                    VSetEntry {
+                        vector: stored,
+                        attrs: add.attrs,
+                    },
+                );
+                map.insert(key, KiviDBValue::VectorSet(Arc::new(RwLock::new(inner))));
+                return Ok(true);
+            }
+        };
+        if let Some(mut inner) = vs.try_write() {
+            return insert_into(&mut inner, lenient, add);
         }
-        Some(_) => Err(resp_error(
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
-        None => {
-            let vs = Arc::new(RwLock::new(VectorSetInner::with_metric(dim, metric)));
-            map.insert(key, KiviDBValue::VectorSet(Arc::clone(&vs)));
-            Ok(vs)
+        // A reader (`VSIM`) holds the set: wait for it with the shard free.
+        drop(map);
+        // Right before the wait, so a shard still held here is seen.
+        #[cfg(test)]
+        lock_tests::about_to_wait(&vs);
+        let mut inner = vs.write();
+        // Not `read()`: a shard writer may be waiting for this set.
+        let Some(map) = shard.try_read() else {
+            continue;
+        };
+        // Held until the insert is done, so no delete comes between.
+        if matches!(map.get(key), Some(ValueRef::VectorSet(now)) if Arc::ptr_eq(now, &vs)) {
+            return insert_into(&mut inner, lenient, add);
         }
+        // Deleted, replaced or expired meanwhile: look again.
     }
+}
+
+/// `add` into an existing set, checked against it as Redis checks it.
+fn insert_into(inner: &mut VectorSetInner, lenient: bool, add: Addition) -> Result<bool, Vec<u8>> {
+    let dim = add.vector.len();
+    if inner.dim != dim {
+        // Redis's words.
+        return Err(resp_error(&format!(
+            "ERR Vector dimension mismatch - got {} but set has {}",
+            dim, inner.dim
+        )));
+    }
+    // A `DISTANCE` the set was not made with is refused, as Redis
+    // refuses a quantization the set was not made with. One not
+    // given takes the set's.
+    if add.metric.as_ref().is_some_and(|m| *m != inner.metric) {
+        return Err(resp_error(
+            "ERR asked distance mismatch with existing vector set",
+        ));
+    }
+    // Unchosen sets, replays and replicated writes accept any option.
+    let strict = inner.quant_chosen && !lenient;
+    if strict && add.quant.is_some_and(|q| q != inner.quant) {
+        return Err(resp_error(
+            "ERR asked quantization mismatch with existing vector set",
+        ));
+    }
+    let stored = quantize(inner.quant, add.vector)?;
+    let entry = VSetEntry {
+        vector: stored,
+        attrs: add.attrs,
+    };
+    Ok(inner.entries.insert(add.element, entry).is_none())
 }
 
 /// An integer written as Redis reads one: digits with an optional `-`, no
@@ -149,7 +202,8 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     // Walk arguments to find vector encoding and element name
     let mut i = 2usize;
-    let mut attrs: Option<String> = None;
+    let mut attrs: Option<Box<str>> = None;
+    let mut asked_quant: Option<Quant> = None;
 
     // REDUCE projects the vectors to fewer dimensions, at random, with a
     // projection kept with the set for every query after. It was taken and
@@ -229,8 +283,6 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return bad_vector();
     }
 
-    let dim = vec.len();
-
     // Next: element name
     // Any bytes, as in Redis: a name that was not UTF-8 was taken for a
     // missing one.
@@ -252,9 +304,14 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let tok = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
         let value = cmd.get(i + 1);
         match tok.as_str() {
-            // Kept at full precision whichever is asked for: `VINFO` says
-            // so (`f32`).
-            "NOQUANT" | "Q8" | "BIN" | "CAS" => {
+            // Last one wins, as in Redis.
+            "NOQUANT" | "Q8" | "BIN" => {
+                asked_quant = Quant::parse_option(cmd[i]);
+                i += 1;
+                continue;
+            }
+            // Threading hint in Redis; no effect here.
+            "CAS" => {
                 i += 1;
                 continue;
             }
@@ -273,7 +330,7 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
             }
             "SETATTR" => {
-                attrs = value.map(|a| String::from_utf8_lossy(a).into_owned());
+                attrs = value.map(|a| String::from_utf8_lossy(a).into());
             }
             "DISTANCE" => match metric_of(value) {
                 Ok(metric) => parsed_metric = Some(metric),
@@ -284,21 +341,18 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         i += 2;
     }
 
-    // Get or create the VectorSet
-    let vs = match get_or_create_vset(ctx, &key, dim, parsed_metric) {
-        Ok(v) => v,
-        Err(e) => return Some(e),
+    let add = Addition {
+        element,
+        vector: vec,
+        attrs,
+        metric: parsed_metric,
+        quant: asked_quant,
     };
-
-    let mut inner = vs.write();
-    let is_new = !inner.entries.contains_key(&element);
-    inner
-        .entries
-        .insert(element, VSetEntry { vector: vec, attrs });
-
-    let result = resp_integer(if is_new { 1 } else { 0 });
-
-    Some(result)
+    let db = &ctx.store[*ctx.selected_db];
+    match add_to_vset(db, &key, ctx.apply_replication, add) {
+        Ok(is_new) => Some(resp_integer(is_new as i64)),
+        Err(e) => Some(e),
+    }
 }
 
 // ── VREM ──────────────────────────────────────────────────────────────────────
@@ -410,11 +464,12 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let key: &[u8] = cmd[1];
     let element: &[u8] = cmd[2];
-    let raw = cmd
-        .get(3)
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.eq_ignore_ascii_case("RAW"))
-        .unwrap_or(false);
+    // As the vector-sets module: RAW, as often as given, and nothing else.
+    if cmd[3..].iter().any(|opt| !opt.eq_ignore_ascii_case(b"RAW")) {
+        return Some(resp_error("ERR invalid option"));
+    }
+    let raw = cmd.len() > 3;
+    let resp = crate::commands::handler::effective_resp_for_reply(ctx);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -423,24 +478,46 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key) {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
-            match inner.entries.get(element) {
-                None => Some(resp_null_bulk()),
-                Some(entry) => {
-                    if raw {
-                        // Return raw little-endian FP32 bytes
-                        let bytes: Vec<u8> =
-                            entry.vector.iter().flat_map(|f| f.to_le_bytes()).collect();
-                        Some(resp_bulk(&bytes))
-                    } else {
-                        // Return as array of float strings — easier to read in redis-cli
-                        let items: Vec<Vec<u8>> = entry
-                            .vector
-                            .iter()
-                            .map(|f| resp_bulk_str(&f.to_string()))
-                            .collect();
-                        Some(resp_array(items))
+            let entry = match inner.entries.get(element) {
+                None => return Some(resp_null_bulk()),
+                Some(entry) => entry,
+            };
+            if raw {
+                // Redis shape: type, stored bytes, norm, and range for int8.
+                let mut out = vec![resp_simple(entry.vector.quant().name())];
+                match &entry.vector {
+                    StoredVector::F32(v) => {
+                        let (norm, unit) = StoredVector::f32_unit(v);
+                        let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
+                        out.push(resp_bulk(&bytes));
+                        out.push(resp_double_for(resp, norm as f64));
+                    }
+                    StoredVector::Q8 {
+                        norm,
+                        range,
+                        values,
+                    } => {
+                        let bytes: Vec<u8> = values.iter().map(|&q| q as u8).collect();
+                        out.push(resp_bulk(&bytes));
+                        out.push(resp_double_for(resp, *norm as f64));
+                        out.push(resp_double_for(resp, *range as f64));
+                    }
+                    StoredVector::Bin { norm, bits } => {
+                        let bytes: Vec<u8> = bits.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        out.push(resp_bulk(&bytes));
+                        out.push(resp_double_for(resp, *norm as f64));
                     }
                 }
+                Some(resp_array(out))
+            } else {
+                // Redis replies with doubles, not strings.
+                let mut values = Vec::with_capacity(inner.dim);
+                entry.vector.to_f32(inner.dim, &mut values);
+                let items: Vec<Vec<u8>> = values
+                    .iter()
+                    .map(|&f| resp_double_for(resp, f as f64))
+                    .collect();
+                Some(resp_array(items))
             }
         }
         Some(_) => Some(resp_error(
@@ -539,22 +616,24 @@ fn vsetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key.as_slice()) {
         Some(ValueRef::VectorSet(vs)) => {
             let mut inner = vs.write();
+            // 1 when set, 0 when there is no such element or key, as the
+            // vector-sets module replies (#561).
             match inner.entries.get_mut(element.as_slice()) {
-                None => Some(resp_error("ERR no such element")),
+                None => Some(resp_integer(0)),
                 Some(entry) => {
                     entry.attrs = if attr_str.is_empty() {
                         None
                     } else {
-                        Some(attr_str)
+                        Some(attr_str.into_boxed_str())
                     };
-                    Some(resp_simple("OK"))
+                    Some(resp_integer(1))
                 }
             }
         }
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
-        None => Some(resp_error("ERR no such key")),
+        None => Some(resp_integer(0)),
     }
 }
 
@@ -587,9 +666,8 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 resp_integer(dim as i64),
                 resp_bulk_str("vector-count"),
                 resp_integer(count as i64),
-                // Redis's name for vectors kept unquantized.
                 resp_bulk_str("quant-type"),
-                resp_bulk_str("f32"),
+                resp_bulk_str(inner.quant.name()),
                 resp_bulk_str("index-type"),
                 resp_bulk_str("FLAT"),
                 resp_bulk_str("max-level"),
@@ -621,6 +699,11 @@ fn similarity(metric: &crate::vector::DistanceMetric, distance: f32) -> f32 {
     }
 }
 
+/// Ties are common with BIN; names keep the order stable across processes.
+fn by_distance_then_name(a: &(f32, &[u8]), b: &(f32, &[u8])) -> std::cmp::Ordering {
+    a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1))
+}
+
 // VLINKS key element [WITHSCORES]
 // Returns the HNSW graph neighbours of an element.
 // Since we use brute-force, every other element is a "neighbour".
@@ -650,7 +733,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let inner = vs.read();
             let query_vec = match inner.entries.get(element) {
                 None => return Some(resp_null_bulk()),
-                Some(e) => e.vector.clone(),
+                Some(e) => &e.vector,
             };
 
             // Brute-force: find 16 nearest neighbours
@@ -660,12 +743,12 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .filter(|(name, _)| *name != element)
                 .map(|(name, entry)| {
                     (
-                        crate::vector::distance(&inner.metric, &query_vec, &entry.vector),
+                        query_vec.distance(&entry.vector, &inner.metric, inner.dim),
                         name.as_bytes(),
                     )
                 })
                 .collect();
-            scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            scored.sort_unstable_by(by_distance_then_name);
             scored.truncate(16);
 
             // VLINKS returns an array of arrays (one per HNSW layer).
@@ -698,17 +781,21 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
-    if cmd.len() < 2 {
+    if cmd.len() != 2 && cmd.len() != 3 {
         return Some(resp_error(
             "ERR wrong number of arguments for 'vrandmember' command",
         ));
     }
     let key: &[u8] = cmd[1];
 
-    let count: Option<i64> = cmd
-        .get(2)
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.parse().ok());
+    let count: Option<i64> = match cmd.get(2) {
+        None => None,
+        Some(arg) => match std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok()) {
+            Some(i64::MIN) => return Some(resp_error("ERR COUNT value is out of range")),
+            Some(n) => Some(n),
+            None => return Some(resp_error("ERR COUNT value is not an integer")),
+        },
+    };
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1002,21 +1089,34 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let inner = vs.read();
 
-    // Resolve ELE query — look up from the VectorSet
-    let query_vec: Vec<f32> = match query_vec {
-        Ok(v) => v,
+    // Quantize the query like the set, as Redis does, so scores match.
+    let given;
+    let query: &StoredVector = match query_vec {
+        Ok(v) => {
+            if v.len() != inner.dim {
+                return Some(resp_error(&format!(
+                    "ERR Vector dimension mismatch - got {} but set has {}",
+                    v.len(),
+                    inner.dim
+                )));
+            }
+            given = match StoredVector::quantize(inner.quant, v) {
+                Ok(q) => q,
+                Err(_) => return Some(resp_error("ERR invalid vector specification")),
+            };
+            &given
+        }
         Err(elem_name) => match inner.entries.get(elem_name.as_slice()) {
-            Some(e) => e.vector.clone(),
+            Some(e) => &e.vector,
             None => return Some(resp_error("ERR element not found in vector set")),
         },
     };
 
-    // Brute-force cosine similarity search
+    // Brute-force search
     // Using select_nth_unstable: O(n) average, same trick as FT flat search
     let mut scored: Vec<(f32, &[u8])> = inner
         .entries
         .iter()
-        .filter(|(_, entry)| entry.vector.len() == query_vec.len())
         .filter(|(_, entry)| {
             filter
                 .as_ref()
@@ -1024,17 +1124,17 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
         })
         .map(|(name, entry)| {
             (
-                crate::vector::distance(&inner.metric, &query_vec, &entry.vector),
+                query.distance(&entry.vector, &inner.metric, inner.dim),
                 name.as_bytes(),
             )
         })
         .collect();
 
     if scored.len() > count {
-        scored.select_nth_unstable_by(count, |a, b| a.0.total_cmp(&b.0));
+        scored.select_nth_unstable_by(count, by_distance_then_name);
         scored.truncate(count);
     }
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    scored.sort_unstable_by(by_distance_then_name);
 
     // Build response
     // Redis VSIM returns: [element, [score?, attribs?], ...]
@@ -1059,4 +1159,341 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     Some(resp_array(out))
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    type Set = Arc<RwLock<VectorSetInner>>;
+
+    fn add(element: &str, vector: &[f32], quant: Option<Quant>) -> Addition {
+        Addition {
+            element: crate::key_bytes::KeyBytes::from(element.as_bytes()),
+            vector: vector.to_vec(),
+            attrs: None,
+            metric: None,
+            quant,
+        }
+    }
+
+    fn set_at(db: &store::Db, key: &str) -> Option<Set> {
+        match store::get_shard(db, key).read().get(key) {
+            Some(ValueRef::VectorSet(vs)) => Some(Arc::clone(vs)),
+            _ => None,
+        }
+    }
+
+    fn names(vs: &Set) -> Vec<String> {
+        let mut names: Vec<String> = vs
+            .read()
+            .entries
+            .keys()
+            .map(|k| String::from_utf8_lossy(k.as_bytes()).into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn stored(vs: &Set, element: &str) -> &'static str {
+        match vs.read().entries.get(element.as_bytes()).map(|e| &e.vector) {
+            Some(StoredVector::F32(_)) => "f32",
+            Some(StoredVector::Q8 { .. }) => "int8",
+            Some(StoredVector::Bin { .. }) => "bin",
+            None => "none",
+        }
+    }
+
+    /// A set at `key` holding `a`, made with `quant`.
+    fn made(db: &store::Db, key: &str, quant: Option<Quant>) -> Set {
+        assert_eq!(
+            add_to_vset(db, key.as_bytes(), false, add("a", &[1.0, 2.0, 3.0], quant)),
+            Ok(true)
+        );
+        set_at(db, key).unwrap()
+    }
+
+    /// Bounded: until a writer queues on `vs`, which a held read keeps out.
+    fn until_a_writer_waits(vs: &Set) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !vs.is_locked_exclusive() {
+            assert!(
+                Instant::now() < deadline,
+                "no writer ever waited for the set"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// How many `VADD`s came to wait for each set, by its address. Tests
+    /// run at once, each with its own set.
+    static WAITING: parking_lot::Mutex<Vec<(usize, usize)>> = parking_lot::const_mutex(Vec::new());
+
+    fn address(vs: &Set) -> usize {
+        Arc::as_ptr(vs) as usize
+    }
+
+    /// Called by `add_to_vset` just before it blocks on `vs`.
+    pub(super) fn about_to_wait(vs: &Set) {
+        let at = address(vs);
+        let mut waiting = WAITING.lock();
+        match waiting.iter_mut().find(|(a, _)| *a == at) {
+            Some((_, n)) => *n += 1,
+            None => waiting.push((at, 1)),
+        }
+    }
+
+    fn waiting_for(vs: &Set) -> usize {
+        let at = address(vs);
+        let waiting = WAITING.lock();
+        waiting
+            .iter()
+            .find(|(a, _)| *a == at)
+            .map_or(0, |(_, n)| *n)
+    }
+
+    /// Forgets what was counted for an earlier set at `vs`'s address.
+    fn count_from_zero(vs: &Set) {
+        let at = address(vs);
+        WAITING.lock().retain(|(a, _)| *a != at);
+    }
+
+    /// Whether `n` `VADD`s let go of the shard to wait for `vs` within 10 s.
+    /// Returns rather than panics, so the caller can let go of the set first.
+    fn came_to_wait(vs: &Set, n: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while waiting_for(vs) < n {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    /// Another key that lives in `key`'s shard.
+    fn neighbour(db: &store::Db, key: &str) -> String {
+        let shard = store::get_shard(db, key);
+        (0..100_000)
+            .map(|i| format!("other{i}"))
+            .find(|k| std::ptr::eq(store::get_shard(db, k), shard))
+            .unwrap()
+    }
+
+    fn string(s: &str) -> KiviDBValue {
+        KiviDBValue::String(crate::types::SharedBytes::from(s))
+    }
+
+    /// Runs `meanwhile` with the shard held, while `VADD` waits behind a `VSIM`.
+    fn while_vadd_waits(
+        db: &store::Db,
+        key: &str,
+        vs: &Set,
+        addition: Addition,
+        meanwhile: impl FnOnce(&mut store::ShardWrite<'_>),
+    ) -> Result<bool, Vec<u8>> {
+        let reading = vs.read();
+        std::thread::scope(|s| {
+            let vadd = s.spawn(|| add_to_vset(db, key.as_bytes(), false, addition));
+            until_a_writer_waits(vs);
+            // Not `write()`: holding the shard there would hang this test.
+            let shard = store::get_shard(db, key).try_write();
+            let free = shard.is_some();
+            // Its panic is raised after the set is let go of, not before.
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(mut map) = shard {
+                    meanwhile(&mut map);
+                }
+            }));
+            drop(reading);
+            let result = vadd.join().unwrap();
+            assert!(free, "VADD held the shard while it waited for the set");
+            if let Err(panic) = done {
+                std::panic::resume_unwind(panic);
+            }
+            result
+        })
+    }
+
+    #[test]
+    fn a_waiting_vadd_leaves_the_shard_to_other_keys() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        let vs = made(db, "k", None);
+        let other = neighbour(db, "k");
+        let r = while_vadd_waits(db, "k", &vs, add("b", &[4.0, 5.0, 6.0], None), |map| {
+            map.insert(&other, string("v"));
+        });
+        assert_eq!(r, Ok(true));
+        assert!(Arc::ptr_eq(&set_at(db, "k").unwrap(), &vs));
+        assert_eq!(names(&vs), ["a", "b"]);
+        assert!(store::get_shard(db, &other).read().get(&other).is_some());
+    }
+
+    #[test]
+    fn a_set_deleted_meanwhile_is_made_again() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        let old = made(db, "k", Some(Quant::Q8));
+        let r = while_vadd_waits(db, "k", &old, add("b", &[4.0, 5.0, 6.0], None), |map| {
+            map.remove("k");
+        });
+        assert_eq!(r, Ok(true));
+        let now = set_at(db, "k").unwrap();
+        assert!(!Arc::ptr_eq(&now, &old));
+        assert_eq!(names(&now), ["b"]);
+        assert_eq!(stored(&now, "b"), "f32");
+        // Nothing went into the set no key holds.
+        assert_eq!(names(&old), ["a"]);
+    }
+
+    #[test]
+    fn a_set_replaced_meanwhile_gets_the_element() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        let old = made(db, "k", None);
+        let mut inner = VectorSetInner::with_metric(3, crate::vector::DistanceMetric::Cosine);
+        inner.quant = Quant::Bin;
+        inner.quant_chosen = true;
+        let replacement: Set = Arc::new(RwLock::new(inner));
+        let r = while_vadd_waits(db, "k", &old, add("b", &[4.0, -5.0, 6.0], None), |map| {
+            map.insert("k", KiviDBValue::VectorSet(Arc::clone(&replacement)));
+        });
+        assert_eq!(r, Ok(true));
+        assert!(Arc::ptr_eq(&set_at(db, "k").unwrap(), &replacement));
+        assert_eq!(names(&replacement), ["b"]);
+        assert_eq!(stored(&replacement, "b"), "bin");
+        assert_eq!(names(&old), ["a"]);
+    }
+
+    #[test]
+    fn a_set_replaced_by_a_string_meanwhile_is_wrongtype() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        let old = made(db, "k", None);
+        let r = while_vadd_waits(db, "k", &old, add("b", &[4.0, 5.0, 6.0], None), |map| {
+            map.insert("k", string("s"));
+        });
+        assert!(r.unwrap_err().starts_with(b"-WRONGTYPE"));
+        assert!(set_at(db, "k").is_none());
+        assert_eq!(names(&old), ["a"]);
+    }
+
+    #[test]
+    fn a_set_expired_meanwhile_is_made_again() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        let old = made(db, "k", None);
+        let r = while_vadd_waits(db, "k", &old, add("b", &[4.0, 5.0, 6.0], None), |map| {
+            assert!(map.set_expires("k", 1));
+            assert!(map.get("k").is_none());
+        });
+        assert_eq!(r, Ok(true));
+        let now = set_at(db, "k").unwrap();
+        assert!(!Arc::ptr_eq(&now, &old));
+        assert_eq!(names(&now), ["b"]);
+        assert_eq!(names(&old), ["a"]);
+    }
+
+    #[test]
+    fn a_vrem_meanwhile_and_the_vadd_both_apply() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        let vs = made(db, "k", None);
+        let reading = vs.read();
+        std::thread::scope(|s| {
+            let vadd = s.spawn(|| add_to_vset(db, b"k", false, add("b", &[4.0, 5.0, 6.0], None)));
+            until_a_writer_waits(&vs);
+            // As `VREM` removes: the shard let go of, then the set's lock.
+            let vrem = s.spawn(|| vs.write().entries.remove(b"a".as_slice()).is_some());
+            drop(reading);
+            assert_eq!(vadd.join().unwrap(), Ok(true));
+            assert!(vrem.join().unwrap());
+        });
+        assert_eq!(names(&vs), ["b"]);
+        assert!(Arc::ptr_eq(&set_at(db, "k").unwrap(), &vs));
+    }
+
+    #[test]
+    fn concurrent_vadds_all_land_in_the_one_set() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        let vs = made(db, "k", Some(Quant::Q8));
+        count_from_zero(&vs);
+        let reading = vs.read();
+        std::thread::scope(|s| {
+            let vadds: Vec<_> = (0..8)
+                .map(|n| {
+                    s.spawn(move || {
+                        let name = format!("e{n}");
+                        add_to_vset(db, b"k", false, add(&name, &[n as f32, 1.0, 2.0], None))
+                    })
+                })
+                .collect();
+            // Every one, not only the first: one still looking the set up
+            // holds the shard for a moment, which is not waiting with it.
+            // A VADD that waits with the shard held keeps the rest from
+            // coming, and the shard from being free.
+            let all_came = came_to_wait(&vs, 8);
+            let free = store::get_shard(db, "k").try_write().is_some();
+            drop(reading);
+            for vadd in vadds {
+                assert_eq!(vadd.join().unwrap(), Ok(true));
+            }
+            assert!(free, "a VADD held the shard while it waited for the set");
+            assert!(
+                all_came,
+                "only {} of 8 VADDs came to wait",
+                waiting_for(&vs)
+            );
+        });
+        let mut want: Vec<String> = (0..8).map(|n| format!("e{n}")).collect();
+        want.insert(0, "a".into());
+        assert_eq!(names(&vs), want);
+        assert!((0..8).all(|n| stored(&vs, &format!("e{n}")) == "int8"));
+        assert!(Arc::ptr_eq(&set_at(db, "k").unwrap(), &vs));
+    }
+
+    #[test]
+    fn a_rejected_vadd_changes_nothing() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        // A new set whose first vector is refused is not made.
+        let inf = add("a", &[f32::INFINITY, 1.0, 2.0], Some(Quant::Q8));
+        assert!(add_to_vset(db, b"new", false, inf).is_err());
+        assert!(store::get_shard(db, "new").read().get("new").is_none());
+        // Refused after waiting: the dimension, then the quantization.
+        let vs = made(db, "k", Some(Quant::Q8));
+        let r = while_vadd_waits(db, "k", &vs, add("b", &[1.0, 2.0], None), |_| {});
+        assert!(String::from_utf8_lossy(&r.unwrap_err()).contains("dimension mismatch"));
+        let bin = add("b", &[1.0, 2.0, 3.0], Some(Quant::Bin));
+        let r = while_vadd_waits(db, "k", &vs, bin, |_| {});
+        assert!(String::from_utf8_lossy(&r.unwrap_err()).contains("quantization mismatch"));
+        assert_eq!(names(&vs), ["a"]);
+    }
+
+    #[test]
+    fn each_quantization_is_kept_after_waiting() {
+        let st = store::new_store(1);
+        let db = &st[0];
+        for (key, quant, want) in [
+            ("d", None, "f32"),
+            ("q", Some(Quant::Q8), "int8"),
+            ("b", Some(Quant::Bin), "bin"),
+            ("n", Some(Quant::F32), "f32"),
+        ] {
+            let vs = made(db, key, quant);
+            let r = while_vadd_waits(db, key, &vs, add("b", &[4.0, -5.0, 6.0], quant), |_| {});
+            assert_eq!(r, Ok(true), "{key}");
+            assert_eq!(stored(&vs, "a"), want, "{key}");
+            assert_eq!(stored(&vs, "b"), want, "{key}");
+            assert_eq!(vs.read().quant_chosen, quant.is_some(), "{key}");
+        }
+        // A replayed write takes any option, as before.
+        let vs = set_at(db, "q").unwrap();
+        let bin = add("c", &[1.0, 2.0, 3.0], Some(Quant::Bin));
+        assert_eq!(add_to_vset(db, b"q", true, bin), Ok(true));
+        assert_eq!(stored(&vs, "c"), "int8");
+    }
 }

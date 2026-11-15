@@ -39,6 +39,12 @@ pub struct ReplState {
     pub repl_offset: AtomicU64,
     /// Number of currently connected replicas.
     pub connected_replicas: AtomicI64,
+    /// How many times this node has become a replica: see
+    /// `commands::blocking::role_changes`.
+    pub role_changes: AtomicU64,
+    /// Woken when a replica acknowledges, connects or goes: what a `WAIT`
+    /// sleeps on between looks at its replicas.
+    pub replicas_changed: tokio::sync::Notify,
     /// The dataset's fingerprint when this node started as a master, at
     /// offset 0 of its stream: see [`Self::fingerprint_at_start`].
     pub startup_digest: parking_lot::Mutex<Option<u64>>,
@@ -66,6 +72,11 @@ pub struct ReplState {
     /// documents on the master. Set at each connection to a master, from the
     /// release it says it is (`INFO server`); see [`dd_deleted_by`].
     pub master_dd_deletes: AtomicBool,
+    /// Whether the current master stores `VADD` quantization; false until its `PSYNC` reply.
+    pub master_keeps_vset_quant: AtomicBool,
+    /// Master offset after the last stripped `VADD`; earlier continuations
+    /// would re-apply its options.
+    pub vset_quant_dropped_until: AtomicU64,
     /// Whether this replica's master sends a `DEL` (or `UNLINK`) for every
     /// key it expires, as KiviDB does since 1.1.3 and Redis always has. Then
     /// the replica deletes no expired key itself and waits for that `DEL`
@@ -101,6 +112,9 @@ pub struct ReplState {
     /// at an exact point in the stream by a thread that cannot wait for the
     /// hub task to be scheduled.
     pub taps: RwLock<Vec<(u64, std::sync::mpsc::Sender<ReplPayload>)>>,
+    /// What this node's hub last reported as held for its replicas and not
+    /// counted against `maxmemory` (`memory_use::set_replica_queued`).
+    pub replica_queued_memory: AtomicU64,
     /// Monotonic replication epoch. Bumped every time this node's replication
     /// *intent* changes — a new `REPLICAOF <host> <port>` (via
     /// [`Self::begin_replication_epoch`], called by `start_replica` itself) or a
@@ -211,6 +225,13 @@ pub struct ReplState {
     /// during its full sync (#305). See [`start_hub`].
     pub replica_max_backlog_bytes: AtomicU64,
     pub replica_sync_max_backlog_bytes: AtomicU64,
+    /// `client-output-buffer-limit replica`'s soft limit and its seconds: a
+    /// streaming replica with this much queued for longer than that is
+    /// dropped, as in Redis (#774), once its queue has been under it since
+    /// its full sync or partial resync. 0, the default, for none. Its hard
+    /// limit is `replica_max_backlog_bytes`, 0 for none.
+    pub replica_soft_limit_bytes: AtomicU64,
+    pub replica_soft_limit_secs: AtomicU64,
     /// Master side: what `INFO` reports about the backlog. Written by the hub.
     pub backlog_first_offset: AtomicU64,
     pub backlog_histlen: AtomicU64,
@@ -415,10 +436,10 @@ pub struct ReplicaProgress {
     /// Where the replica is between asking for a sync and following the
     /// stream ([`ReplicaState`] as a `u8`).
     state: AtomicU8,
-    /// The bytes queued for it and not yet taken by its forwarder, shared
+    /// What is queued for it and not yet taken by its forwarder, shared
     /// with the hub (`HubMsg::RegisterChannel::pending_bytes`). Set once the
     /// hub feeds it.
-    queue: std::sync::OnceLock<Arc<AtomicU64>>,
+    queue: std::sync::OnceLock<Arc<ReplicaQueue>>,
 }
 
 impl ReplicaProgress {
@@ -436,9 +457,7 @@ impl ReplicaProgress {
     /// Bytes queued for this replica that its connection has not taken yet:
     /// `queued` in `INFO replication`.
     pub fn queued(&self) -> u64 {
-        self.queue
-            .get()
-            .map_or(0, |queue| queue.load(Ordering::Relaxed))
+        self.queue.get().map_or(0, |queue| queue.bytes())
     }
 
     pub fn state(&self) -> ReplicaState {
@@ -486,6 +505,8 @@ impl ReplState {
             slave_mode: AtomicBool::new(false),
             repl_offset: AtomicU64::new(0),
             connected_replicas: AtomicI64::new(0),
+            role_changes: AtomicU64::new(0),
+            replicas_changed: tokio::sync::Notify::new(),
             repl_id: RwLock::new(generate_repl_id()),
             startup_digest: parking_lot::Mutex::new(None),
             replica_acks: parking_lot::Mutex::new(std::collections::HashMap::new()), // NEW
@@ -495,12 +516,15 @@ impl ReplState {
             repl_stream_last_db: AtomicU64::new(u64::MAX),
             several_databases: AtomicBool::new(false),
             master_dd_deletes: AtomicBool::new(false),
+            master_keeps_vset_quant: AtomicBool::new(false),
+            vset_quant_dropped_until: AtomicU64::new(0),
             master_propagates_expiry: AtomicBool::new(true),
             expiry_sweep_owed: AtomicBool::new(true),
             master_propagates_field_expiry: AtomicBool::new(true),
             field_expiry_sweep_owed: AtomicBool::new(true),
             stream_taps: std::sync::atomic::AtomicUsize::new(0),
             taps: RwLock::new(Vec::new()),
+            replica_queued_memory: AtomicU64::new(0),
             repl_generation: AtomicU64::new(0),
             dataset_commit: parking_lot::Mutex::new(()),
             master_addr: RwLock::new(None),
@@ -529,6 +553,9 @@ impl ReplState {
             backlog_ttl_secs: AtomicU64::new(3600),
             replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
             replica_sync_max_backlog_bytes: AtomicU64::new(1024 * 1024 * 1024),
+            // Off by default, unlike Redis: see `output_limits`.
+            replica_soft_limit_bytes: AtomicU64::new(0),
+            replica_soft_limit_secs: AtomicU64::new(0),
             backlog_first_offset: AtomicU64::new(0),
             backlog_histlen: AtomicU64::new(0),
             sync_full: AtomicU64::new(0),
@@ -605,6 +632,17 @@ impl ReplState {
     #[inline]
     pub fn note_local_write(&self) {
         if self.has_resync_point.load(Ordering::Relaxed) {
+            self.set_resync_point(None);
+        }
+    }
+
+    /// [`note_local_write`](Self::note_local_write) for the command `name`
+    /// a client sent, which is propagated: not for a `SELECT` or a `SCRIPT`,
+    /// which change no data (`writes_the_dataset`). Looked at only when
+    /// there is a point to lose.
+    #[inline]
+    pub fn note_local_write_of(&self, name: &str) {
+        if self.has_resync_point.load(Ordering::Relaxed) && !matches!(name, "SELECT" | "SCRIPT") {
             self.set_resync_point(None);
         }
     }
@@ -764,6 +802,15 @@ impl ReplState {
             config.repl_replica_sync_max_backlog_bytes,
             Ordering::Relaxed,
         );
+        let replica = config
+            .client_output_buffer_limit
+            .get(crate::output_limits::Class::Replica);
+        state
+            .replica_soft_limit_bytes
+            .store(replica.soft, Ordering::Relaxed);
+        state
+            .replica_soft_limit_secs
+            .store(replica.soft_seconds, Ordering::Relaxed);
         state.hll_write_redis.store(
             config.hll_write_format.eq_ignore_ascii_case("redis"),
             Ordering::Relaxed,
@@ -801,21 +848,33 @@ impl ReplState {
         std::time::Duration::from_secs(self.repl_timeout_secs.load(Ordering::Relaxed).max(1))
     }
 
-    /// Whether replica `replica_id` is online and has sent no `REPLCONF ACK`
-    /// for longer than `repl-timeout`.
-    fn replica_is_silent(&self, replica_id: u64) -> bool {
+    /// Whether replica `replica_id`'s connection is to be closed: it is
+    /// online and has sent no `REPLCONF ACK` for longer than `repl-timeout`
+    /// (`Some(true)`), or the hub has let go of it (`Some(false)`).
+    fn replica_is_done(&self, replica_id: u64) -> Option<bool> {
         let timeout_ms = self.repl_timeout().as_millis() as u64;
-        self.replica_progress
-            .lock()
-            .get(&replica_id)
-            .is_some_and(|p| {
-                p.state() == ReplicaState::Online
-                    && unix_ms().saturating_sub(p.last_ack_ms.load(Ordering::Relaxed)) > timeout_ms
-            })
+        match self.replica_progress.lock().get(&replica_id) {
+            None => Some(false),
+            Some(p)
+                if p.state() == ReplicaState::Online
+                    && unix_ms().saturating_sub(p.last_ack_ms.load(Ordering::Relaxed))
+                        > timeout_ms =>
+            {
+                Some(true)
+            }
+            Some(_) => None,
+        }
     }
 
-    /// Resolves once replica `replica_id` has gone silent (see
-    /// [`Self::replica_is_silent`]); its connection is then to be closed.
+    /// Resolves once replica `replica_id` has gone silent (`true`), or once
+    /// the hub has let go of it (`false`): its connection is then to be
+    /// closed.
+    ///
+    /// Let go of, for its queue limit, a replica that reads nothing (a
+    /// stopped process, whose kernel still answers) kept its connection, and
+    /// its queue, for good: its forwarder waited on a write that never
+    /// finished, and the hub, having forgotten it, no longer timed it out
+    /// (#542).
     ///
     /// A replica sends an ACK every second. One whose host is gone without
     /// closing the connection (a terminated VM, a lost network path, a paused
@@ -826,11 +885,11 @@ impl ReplState {
     /// `connected_slaves`, until the master restarted. Redis drops it after
     /// `repl-timeout`, as this does. Only once online: a replica sends no ACK
     /// while it loads the dataset.
-    pub async fn replica_timed_out(&self, replica_id: u64) {
+    pub async fn replica_timed_out(&self, replica_id: u64) -> bool {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if self.replica_is_silent(replica_id) {
-                return;
+            if let Some(silent) = self.replica_is_done(replica_id) {
+                return silent;
             }
         }
     }
@@ -935,15 +994,50 @@ impl ReplState {
         peer_port: u16,
         base: u64,
     ) -> Arc<ReplicaProgress> {
+        self.register_replica_at(
+            replica_id,
+            peer_ip,
+            peer_port,
+            base,
+            0,
+            ReplicaState::WaitBgsave,
+        )
+    }
+
+    /// [`Self::register_replica`], for a replica that has already been sent
+    /// `sent` bytes and is in `replica_state`: a partial resync, sent its
+    /// backlog and online at once. Both are set before anything can see the
+    /// replica, so that a `WAIT` never takes it for one that has been sent
+    /// nothing.
+    pub fn register_replica_at(
+        &self,
+        replica_id: u64,
+        peer_ip: String,
+        peer_port: u16,
+        base: u64,
+        sent: u64,
+        replica_state: ReplicaState,
+    ) -> Arc<ReplicaProgress> {
         let mut acks = self.replica_acks.lock();
         if acks.contains_key(&replica_id)
             && let Some(existing) = self.replica_progress.lock().get(&replica_id)
         {
+            // Only the registrations that send nothing first (a full sync's)
+            // are ever repeated: one that comes with a backlog (a partial
+            // resync's) is a new connection, with an id of its own. Its
+            // `sent` would be lost here.
+            debug_assert_eq!(
+                sent, 0,
+                "replica {replica_id} registered again with a backlog"
+            );
             return Arc::clone(existing);
         }
         self.repl_stream_last_db.store(u64::MAX, Ordering::Relaxed);
         acks.insert(replica_id, base);
-        let progress = Arc::new(ReplicaProgress::new(base));
+        let progress = ReplicaProgress::new(base);
+        progress.sent.store(sent, Ordering::Relaxed);
+        progress.set_state(replica_state);
+        let progress = Arc::new(progress);
         self.replica_progress
             .lock()
             .insert(replica_id, Arc::clone(&progress));
@@ -951,6 +1045,7 @@ impl ReplState {
             .lock()
             .push((replica_id, peer_ip, peer_port));
         self.connected_replicas.fetch_add(1, Ordering::Relaxed);
+        self.replicas_changed.notify_waiters();
         progress
     }
 
@@ -965,12 +1060,13 @@ impl ReplState {
             .collect()
     }
 
-    /// How many of `targets` have acknowledged everything they had been sent
-    /// when the snapshot was taken.
+    /// How many of `targets` are online and have acknowledged everything they
+    /// had been sent when the snapshot was taken. As in Redis, a replica that
+    /// is not online yet is not counted.
     pub fn count_reached(targets: &[(Arc<ReplicaProgress>, u64)]) -> i64 {
         targets
             .iter()
-            .filter(|(p, target)| p.delivered() >= *target)
+            .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
             .count() as i64
     }
 
@@ -1169,7 +1265,12 @@ impl ReplState {
             }
         }
         self.slave_mode.store(true, Ordering::Release);
+        // Unknown until this replica's handshake reads its master's INFO.
+        self.master_keeps_vset_quant.store(false, Ordering::Relaxed);
         *self.role.write() = "slave".into();
+        // A `WAIT` waiting on this master's replicas ends now (see
+        // `wait_for_replicas`).
+        self.replicas_changed.notify_waiters();
         // Its own replicas would get nothing from here on: a replica does
         // not pass its master's stream on.
         if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
@@ -1221,7 +1322,11 @@ impl ReplState {
         registry: &crate::client_registry::ClientRegistry,
         client_id: u64,
         cmd: &[&[u8]],
+        store: &crate::store::Store,
     ) -> Option<Vec<u8>> {
+        if let Some(refusal) = self.vset_quant_refusal(registry, client_id, cmd, store) {
+            return Some(refusal);
+        }
         if cluster.lost_dataset() && !self.is_slave() {
             let (mut stage, mut addr, mut port) = (0u8, String::new(), 0u16);
             registry.update(client_id, |info| {
@@ -1259,6 +1364,39 @@ impl ReplState {
             }
         }
         self.digest_offer(registry, client_id, cmd)
+    }
+
+    /// 1.2 replicas refuse Q8/BIN snapshots and retry forever; tell them why instead.
+    fn vset_quant_refusal(
+        &self,
+        registry: &crate::client_registry::ClientRegistry,
+        client_id: u64,
+        cmd: &[&[u8]],
+        store: &crate::store::Store,
+    ) -> Option<Vec<u8>> {
+        if self.is_slave() {
+            return None;
+        }
+        let mut reads = None;
+        registry.update(client_id, |info| reads = info.replica_vset_quant);
+        if reads != Some(false) {
+            return None;
+        }
+        let dropped = self.vset_quant_dropped_until.load(Ordering::Relaxed);
+        let continued = PsyncRequest::parse(cmd)
+            .is_some_and(|p| self.continues_stream(&p.repl_id, p.offset) && p.offset > dropped);
+        if continued || !crate::vector::quant::store_holds_quantized_set(store) {
+            return None;
+        }
+        let mut addr = String::new();
+        registry.update(client_id, |info| addr.clone_from(&info.addr));
+        log_throttled!(
+            60,
+            crate::loglevel::WARN,
+            "Replication: Not syncing replica {addr}: it is an older KiviDB, which cannot read \
+             the Q8 or BIN vector sets this master holds. Upgrade replicas before masters"
+        );
+        Some(VSET_QUANT_REFUSAL.as_bytes().to_vec())
     }
 
     /// The answer to a `PSYNC` that cannot be continued, from a replica that
@@ -1305,6 +1443,21 @@ impl ReplState {
     #[inline]
     pub fn is_slave(&self) -> bool {
         self.slave_mode.load(Ordering::Relaxed)
+    }
+
+    /// A master's stream keeps `VADD` quantization; a replica's only if its master's does.
+    pub fn keeps_vset_quant(&self) -> bool {
+        !hides_vset_quant_capability()
+            && (!self.is_slave() || self.master_keeps_vset_quant.load(Ordering::Relaxed))
+    }
+
+    /// What ends `+FULLRESYNC` or `+CONTINUE` for a replica that announced `vset-quant`.
+    pub fn vset_quant_word(&self, announced: bool) -> &'static str {
+        if announced && self.keeps_vset_quant() {
+            VSET_QUANT_WORD
+        } else {
+            ""
+        }
     }
 }
 
@@ -1475,7 +1628,8 @@ pub fn load_dump(
     let (loaded, reader) = crate::snapshot::load_snapshot_with(|| {
         let file = std::fs::File::open(path)?;
         Ok(std::io::BufReader::new(FingerprintReader::new(file)))
-    })?;
+    })
+    .map_err(|e| crate::snapshot::refusal_of_file(e, path))?;
     // What the buffer holds beyond what was parsed has been fingerprinted.
     let fingerprint = reader.into_inner().finish()?;
     Ok((loaded, fingerprint))
@@ -1536,12 +1690,7 @@ fn save_dataset_with(
             let _cut = crate::write_gate::cut();
             crate::snapshot::freeze_dataset_for_disk(store, Some(index_store))
         }?;
-        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp = format!(
-            "dump.kdb.{}.{}.tmp",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
+        let tmp = crate::aof::temp_dump_name();
         // With a save number of its own, as a checkpoint's: put in place
         // without one, the dump kept the number of the log beside it, and a
         // start with the AOF on replayed that log over it (#354).
@@ -1811,24 +1960,6 @@ pub fn is_write_command_bytes(cmd0: &[u8]) -> bool {
     is_write_command(name)
 }
 
-/// Whether `name` (upper case) changes the dataset, as Redis's `write` flag
-/// has it: [`is_write_command`] but `SELECT`. `SELECT` is propagated, so that
-/// a replica and the AOF follow the switch of database, but it writes
-/// nothing. So the checks that refuse or hold a write let it through, as
-/// Redis does: `min-replicas-to-write`, `CLIENT PAUSE WRITE` and the ACL's
-/// `write` category (#411, #392). (`maxmemory` has a list of its own,
-/// `eviction::allowed_when_out_of_memory`.)
-#[inline]
-pub fn is_data_write(name: &str) -> bool {
-    name != "SELECT" && is_write_command(name)
-}
-
-/// [`is_data_write`] of a command name as the client sent it.
-#[inline]
-pub fn is_data_write_bytes(cmd0: &[u8]) -> bool {
-    !cmd0.eq_ignore_ascii_case(b"SELECT") && is_write_command_bytes(cmd0)
-}
-
 fn generate_repl_id() -> String {
     // 40 hex digits of randomness. A replica decides whether it can continue
     // from its master's history by comparing this ID, so two masters must not
@@ -1839,6 +1970,154 @@ fn generate_repl_id() -> String {
 }
 
 // ── Hub ────────────────────────────────────────────────────────────────────
+
+/// What is queued for one replica and not yet taken by its connection's
+/// forwarder. The hub adds each payload before it hands it over; the
+/// forwarder takes away what it takes off the queue, a batch at a time.
+#[derive(Debug, Default)]
+pub struct ReplicaQueue {
+    /// Bytes of the stream: `queued` in `INFO replication`, and what
+    /// `repl-replica-max-backlog-bytes` and `repl-replica-sync-max-backlog-bytes`
+    /// hold a replica to.
+    bytes: AtomicU64,
+    /// The memory those bytes take while they wait ([`ReplicaQueue::held_for`]):
+    /// what is not counted against `maxmemory` for the replica.
+    held: AtomicU64,
+    /// Set by the hub when it lets the replica go for falling too far
+    /// behind ([`ReplicaQueue::abandon`]).
+    abandoned: AtomicBool,
+    /// Set once the forwarder's end of the queue has been dropped, and with
+    /// it everything still in the queue ([`QueueRx`]).
+    receiver_gone: AtomicBool,
+}
+
+impl ReplicaQueue {
+    /// The memory a payload of `len` bytes takes while it is queued: its
+    /// allocation, an `Arc<[u8]>` (two counts ahead of the bytes, the whole
+    /// rounded up to their alignment), and its slot in the queue. The
+    /// queue's blocks hold 32 slots and four words besides: those words are
+    /// left out.
+    ///
+    /// Only the bytes used to be taken off what is counted (#542). A
+    /// replica's queue is mostly small writes: a `SET` of a 100-byte value is
+    /// a payload of about 140 bytes in an allocation of 160, and its slot is
+    /// 16 more. With a replica gigabytes behind, the rest came to hundreds
+    /// of megabytes, counted against `maxmemory`: the master evicted nearly
+    /// every key for it, and then refused writes.
+    #[inline]
+    pub fn held_for(len: usize) -> u64 {
+        let counts = 2 * std::mem::size_of::<usize>();
+        let allocation = (counts + len).next_multiple_of(std::mem::align_of::<usize>());
+        (allocation + std::mem::size_of::<ReplPayload>()) as u64
+    }
+
+    /// The hub queues `len` bytes. Returns the bytes queued now.
+    #[inline]
+    pub fn add(&self, len: usize) -> u64 {
+        self.held.fetch_add(Self::held_for(len), Ordering::Relaxed);
+        self.bytes
+            .fetch_add(len as u64, Ordering::Relaxed)
+            .saturating_add(len as u64)
+    }
+
+    /// The forwarder took payloads of `bytes` bytes off the queue, which
+    /// held `held` ([`ReplicaQueue::held_for`] of each).
+    #[inline]
+    pub fn taken(&self, bytes: usize, held: u64) {
+        self.bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+        self.held.fetch_sub(held, Ordering::Relaxed);
+    }
+
+    /// Bytes of the stream queued.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// The memory they take.
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// The memory the queue holds, not counted against `maxmemory`:
+    /// [`ReplicaQueue::held`], or nothing once the forwarder's end of the
+    /// queue has been dropped, which freed what was in it. Read that way,
+    /// a payload the hub queues as the queue is dropped is not left counted
+    /// out for good.
+    pub fn memory(&self) -> u64 {
+        if self.receiver_gone.load(Ordering::Acquire) {
+            0
+        } else {
+            self.held()
+        }
+    }
+
+    /// The hub has let the replica go: its queue passed its limit. What is
+    /// in it is not to be sent (the replica resyncs: from the backlog, which
+    /// holds the same stream, or in full) but let go of, at once: its
+    /// forwarder, seeing this, ends, and its end of the queue is dropped
+    /// ([`QueueRx`]), and the connection with it.
+    ///
+    /// The forwarder used to send it all first, at the replica's pace, a
+    /// gigabyte or two. The hub had forgotten the replica, so none of it
+    /// was taken off what is counted against `maxmemory` any more, and the
+    /// master evicted every key and refused writes until it was sent (#542).
+    pub fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+
+    /// Whether the hub has let the replica go ([`ReplicaQueue::abandon`]).
+    /// Everything the hub queued for it is then counted here.
+    pub fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
+    /// The forwarder's end of the queue has been dropped: nothing is held.
+    fn receiver_dropped(&self) {
+        self.receiver_gone.store(true, Ordering::Release);
+        self.bytes.store(0, Ordering::Relaxed);
+        self.held.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The forwarder's end of a replica's queue. However the connection ends
+/// (the forwarder sees it was let go of, its write fails, it is aborted at
+/// `repl-timeout`, the payload or the greeting could not be written and it
+/// never ran), dropping this frees what is queued and tells the hub
+/// ([`ReplicaQueue::memory`]). Only some of those ways used to say so, and a
+/// queue let go of the others stayed counted out of `maxmemory` for good,
+/// up to the queue limit each time.
+pub struct QueueRx {
+    rx: Option<mpsc::UnboundedReceiver<ReplPayload>>,
+    queue: Arc<ReplicaQueue>,
+}
+
+impl QueueRx {
+    pub fn new(rx: mpsc::UnboundedReceiver<ReplPayload>, queue: Arc<ReplicaQueue>) -> Self {
+        Self {
+            rx: Some(rx),
+            queue,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<ReplPayload> {
+        self.rx.as_mut()?.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<ReplPayload, mpsc::error::TryRecvError> {
+        match self.rx.as_mut() {
+            Some(rx) => rx.try_recv(),
+            None => Err(mpsc::error::TryRecvError::Disconnected),
+        }
+    }
+}
+
+impl Drop for QueueRx {
+    fn drop(&mut self) {
+        // The queue's contents first, then the word that they are gone.
+        drop(self.rx.take());
+        self.queue.receiver_dropped();
+    }
+}
 
 /// A connected replica's write socket, registered with the hub.
 pub struct ReplicaConn {
@@ -1856,11 +2135,11 @@ pub enum HubMsg {
         peer_port: u16,
         tx: mpsc::UnboundedSender<ReplPayload>,
         replica_id: u64,
-        /// Shared with the replica's forwarder task: hub increments on enqueue,
-        /// forwarder decrements after each successful flush. Lets the hub evict a
+        /// Shared with the replica's forwarder task: hub adds on enqueue,
+        /// forwarder takes away what it takes off the queue. Lets the hub evict a
         /// replica whose outbound queue has grown past the configured limit instead
         /// of buffering an unbounded backlog for a replica that never catches up.
-        pending_bytes: Arc<AtomicU64>,
+        pending_bytes: Arc<ReplicaQueue>,
         /// The offset this replica's `+FULLRESYNC` announced. Its ACKs count
         /// from here; see [`ReplicaProgress`].
         base: u64,
@@ -2074,6 +2353,51 @@ pub fn expiry_propagated_by(info: Option<&str>) -> bool {
     }
 }
 
+/// What a replica that cannot read quantized sets is told (see
+/// [`ReplState::vset_quant_refusal`]).
+pub const VSET_QUANT_REFUSAL: &str = "-ERR this master holds Q8 or BIN vector sets, which this \
+     replica's KiviDB release cannot read: upgrade the replica to KiviDB 1.3 or later\r\n";
+
+/// Says this node's stream keeps the quantization `VADD` asks for.
+pub const VSET_QUANT_INFO: &str = "kividb_vset_quantization:1";
+
+/// The capability a replica announces, and its master's `PSYNC` reply repeats.
+pub const VSET_QUANT_CAPA: &str = "vset-quant";
+
+/// Added to a `PSYNC` reply only for replicas announcing [`VSET_QUANT_CAPA`].
+const VSET_QUANT_WORD: &str = " vset-quant";
+
+/// Whether a `+FULLRESYNC` or `+CONTINUE` line says the stream keeps the options.
+pub fn psync_reply_keeps_vset_quant(reply: &str) -> bool {
+    // After the id and offset: neither can be this word.
+    reply
+        .split_whitespace()
+        .skip(1)
+        .any(|word| word == VSET_QUANT_CAPA)
+}
+
+/// Test only: `KIVIDB_TEST_NO_VSET_QUANT_CAPABILITY` acts as an older master.
+pub fn hides_vset_quant_capability() -> bool {
+    static HIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIDES.get_or_init(|| std::env::var_os("KIVIDB_TEST_NO_VSET_QUANT_CAPABILITY").is_some())
+}
+
+/// Without the `PSYNC` word: Redis keeps options; KiviDB 1.2, or no answer, drops them.
+pub fn vset_quant_kept_by(info: Option<&str>) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    let mut kividb = false;
+    for line in info.lines() {
+        let line = line.trim();
+        if line == VSET_QUANT_INFO {
+            return true;
+        }
+        kividb |= line.starts_with("kividb_version:");
+    }
+    !kividb
+}
+
 /// The line of `INFO server` by which a KiviDB master says it sends an
 /// `HDEL` (or a `DEL`) for every hash field it expires.
 pub const FIELD_EXPIRY_PROPAGATED_INFO: &str = "kividb_expired_fields_propagated:1";
@@ -2167,6 +2491,41 @@ mod expiry_version_tests {
         assert!(expiry_propagated_by(Some(&kividb("garbage"))));
         assert_eq!(uptime_in(redis), Some(5));
         assert_eq!(uptime_in(&kividb("1.1.2")), None);
+    }
+}
+
+#[cfg(test)]
+mod vset_quant_version_tests {
+    use super::{VSET_QUANT_INFO, psync_reply_keeps_vset_quant, vset_quant_kept_by};
+
+    #[test]
+    fn only_older_kividb_masters_drop_quantization() {
+        let old = "# Server\r\nredis_version:8.10.0\r\nkividb_version:1.2.1\r\n";
+        assert!(!vset_quant_kept_by(Some(old)));
+        assert!(vset_quant_kept_by(Some(&format!(
+            "{old}{VSET_QUANT_INFO}\r\n"
+        ))));
+        // Redis keeps what it is asked for.
+        assert!(vset_quant_kept_by(Some(
+            "# Server\r\nredis_version:8.10.3\r\n"
+        )));
+        // No answer: taken as an older master, which loses nothing.
+        assert!(!vset_quant_kept_by(None));
+    }
+
+    #[test]
+    fn the_psync_word_is_read_after_the_id() {
+        let id = "a".repeat(40);
+        for (reply, keeps) in [
+            (format!("+FULLRESYNC {id} 1234 vset-quant"), true),
+            (format!("+FULLRESYNC {id} 1234"), false),
+            (format!("+CONTINUE {id} vset-quant"), true),
+            (format!("+CONTINUE {id}"), false),
+            ("+CONTINUE".to_string(), false),
+            ("+vset-quant".to_string(), false),
+        ] {
+            assert_eq!(psync_reply_keeps_vset_quant(&reply), keeps, "{reply}");
+        }
     }
 }
 
@@ -2271,6 +2630,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_ping = tokio::time::Instant::now();
         let mut backlog = Backlog::new();
+        // Queues of replicas let go of for falling too far behind, until
+        // their forwarders have let go of what is in them (see
+        // `ReplicaQueue::abandon`): memory still held for a replica.
+        let mut leaving: Vec<Arc<ReplicaQueue>> = Vec::new();
         // When the last replica went away, while the backlog is being kept.
         let mut without_replicas: Option<tokio::time::Instant> = None;
 
@@ -2279,16 +2642,23 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             // forwarders is not counted against `maxmemory`, as Redis does not
             // count its replicas' output buffers: a full sync queues every
             // write made while its payload is laid out and sent, and evicting
-            // keys for it gives nothing back (#284). Each replica is queued
-            // the same writes, shared: the longest queue is what they hold.
-            // Taken again after every message and every second.
-            crate::memory_use::set_replica_queued(
-                channel_replicas
-                    .iter()
-                    .map(|r| r.pending_bytes.load(Ordering::Relaxed))
-                    .max()
-                    .unwrap_or(0) as usize,
-            );
+            // keys for it gives nothing back (#284). All of the memory it
+            // takes, not only the stream's bytes (#542). Each replica is
+            // queued the same writes, shared: the longest queue is what they
+            // hold. Taken again after every message and every second.
+            if !leaving.is_empty() {
+                leaving.retain(|queue| queue.memory() > 0);
+            }
+            let queued = channel_replicas
+                .iter()
+                .map(|r| r.pending_bytes.memory())
+                .chain(leaving.iter().map(|queue| queue.memory()))
+                .max()
+                .unwrap_or(0);
+            crate::memory_use::set_replica_queued(queued as usize);
+            if state.replica_queued_memory.load(Ordering::Relaxed) != queued {
+                state.replica_queued_memory.store(queued, Ordering::Relaxed);
+            }
             let msg = tokio::select! {
                 msg = hub_rx.recv() => match msg {
                     Some(m) => m,
@@ -2296,6 +2666,20 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                 },
                 _ = tick.tick() => {
                     backlog.report(&state);
+                    // A queue under the soft limit now is no longer over it,
+                    // though nothing was written to find that out: its clock
+                    // starts again. Without this, a replica that went over,
+                    // drained, and stayed idle was dropped by the first
+                    // large write after, as over it ever since (#774).
+                    let soft = state.replica_soft_limit_bytes.load(Ordering::Relaxed);
+                    if soft != 0 {
+                        for replica in channel_replicas.iter_mut().filter(|r| !r.syncing) {
+                            if replica.pending_bytes.bytes() < soft {
+                                replica.soft_armed = true;
+                                replica.over_soft_since = 0;
+                            }
+                        }
+                    }
                     // Give the backlog up once no replica has been attached
                     // for `repl-backlog-ttl`: keeping it means encoding every
                     // write for a replica that is not coming back.
@@ -2371,7 +2755,16 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             };
             match msg {
                 HubMsg::AckOffset { replica_id, offset } => {
-                    state.replica_acks.lock().insert(replica_id, offset);
+                    // Only for a replica the hub still has. A replica let go
+                    // of for its queue limit can still have an ACK on the
+                    // way: inserted, it brought back the row `forget_replica`
+                    // had taken away, without the count, and its
+                    // connection's `Deregister` took the count down a second
+                    // time: `connected_slaves` went one lower at every such
+                    // drop (#542).
+                    if let Some(acked) = state.replica_acks.lock().get_mut(&replica_id) {
+                        *acked = offset;
+                    }
                     if let Some(p) = state.replica_progress.lock().get(&replica_id) {
                         p.acked.store(offset, Ordering::Relaxed);
                         p.last_ack_ms.store(unix_ms(), Ordering::Relaxed);
@@ -2379,6 +2772,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // loaded: this is what "online" means.
                         p.set_state(ReplicaState::Online);
                     }
+                    state.replicas_changed.notify_waiters();
                 }
 
                 HubMsg::Continue {
@@ -2400,26 +2794,28 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         let _ = reply.send(Err(registration));
                     }
                     Some(missed) => {
-                        let progress = state.register_replica(
+                        let missed_len = missed.len() as u64;
+                        // Online, and sent the backlog, from the moment it is
+                        // seen: a `WAIT` must not count it before it has
+                        // acknowledged the backlog, which may hold the very
+                        // writes the `WAIT` is for.
+                        let progress = state.register_replica_at(
                             registration.replica_id,
                             registration.peer_ip.clone(),
                             registration.peer_port,
                             offset,
+                            missed_len,
+                            ReplicaState::Online,
                         );
-                        progress.set_state(ReplicaState::Online);
                         let _ = progress.queue.set(Arc::clone(&registration.pending_bytes));
-                        let missed_len = missed.len() as u64;
                         let delivered = missed.is_empty() || {
-                            registration
-                                .pending_bytes
-                                .fetch_add(missed_len, Ordering::Relaxed);
+                            registration.pending_bytes.add(missed.len());
                             registration.tx.send(Arc::from(missed)).is_ok()
                         };
                         if !delivered {
                             forget_replica(&state, registration.replica_id);
                             continue;
                         }
-                        progress.sent.fetch_add(missed_len, Ordering::Relaxed);
                         state.sync_partial_ok.fetch_add(1, Ordering::Relaxed);
                         log_info!(
                             "Replication: Partial resync for {}: continuing from offset {offset} \
@@ -2434,6 +2830,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             progress,
                             syncing: false,
                             peak: missed_len,
+                            over_soft_since: 0,
+                            // What it missed is queued: not held to the soft
+                            // limit until it has drained it.
+                            soft_armed: false,
                         });
                         if reply.send(Ok(())).is_err() {
                             // The connection went away while it was asking.
@@ -2571,6 +2971,8 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // and drained what was queued meanwhile.
                         syncing: true,
                         peak: 0,
+                        over_soft_since: 0,
+                        soft_armed: false,
                     });
                     log_info!("Replication: Channel replica registered: {addr}");
                 }
@@ -2606,11 +3008,21 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // an unbounded amount of undelivered data in master memory).
                     let mut alive_channels = Vec::with_capacity(channel_replicas.len());
                     // Read for each write, so that `CONFIG SET` applies at once.
-                    let streaming_limit = state.replica_max_backlog_bytes.load(Ordering::Relaxed);
-                    let sync_limit = state
-                        .replica_sync_max_backlog_bytes
-                        .load(Ordering::Relaxed)
-                        .max(streaming_limit);
+                    // 0: no limit, as `client-output-buffer-limit replica 0 0 0`
+                    // means in Redis (#774). The sync's limit is never under the
+                    // streaming one, so no streaming limit lifts it too.
+                    let unlimited_if_0 = |limit: u64| if limit == 0 { u64::MAX } else { limit };
+                    let streaming_limit =
+                        unlimited_if_0(state.replica_max_backlog_bytes.load(Ordering::Relaxed));
+                    let soft = crate::output_limits::Limit {
+                        hard: 0,
+                        soft: state.replica_soft_limit_bytes.load(Ordering::Relaxed),
+                        soft_seconds: state.replica_soft_limit_secs.load(Ordering::Relaxed),
+                    };
+                    let sync_limit = unlimited_if_0(
+                        state.replica_sync_max_backlog_bytes.load(Ordering::Relaxed),
+                    )
+                    .max(streaming_limit);
                     for mut replica in channel_replicas.drain(..) {
                         // Account for the payload *before* handing it over. The
                         // forwarder subtracts as soon as it has the payload, and
@@ -2618,10 +3030,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // subtract first, wrapping the counter below zero. A
                         // debug build then panicked on the addition here, which
                         // killed the hub and with it all replication.
-                        let now_pending = replica
-                            .pending_bytes
-                            .fetch_add(payload.len() as u64, Ordering::Relaxed)
-                            .saturating_add(payload.len() as u64);
+                        let now_pending = replica.pending_bytes.add(payload.len());
                         if let Err(_closed) = replica.tx.send(Arc::clone(&payload)) {
                             forget_replica(&state, replica.id);
                             log_warn!(
@@ -2641,14 +3050,55 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         } else {
                             streaming_limit
                         };
-                        if now_pending > limit {
+                        // Streaming, it is held to the soft limit too: more
+                        // than its seconds over it, without a break, and it
+                        // is dropped. Not in its full sync, whose queue
+                        // grows by design (#305), nor until its queue has
+                        // been under the soft limit once since then: what
+                        // queued up during a full sync, or before a partial
+                        // resync, is still being drained (with a raised hard
+                        // limit, a replica streams again with up to a
+                        // quarter of it queued). The clock is read only over
+                        // the limit.
+                        let over_soft_too_long = if replica.syncing || soft.soft == 0 {
+                            false
+                        } else if now_pending < soft.soft {
+                            replica.soft_armed = true;
+                            replica.over_soft_since = 0;
+                            false
+                        } else {
+                            replica.soft_armed
+                                && soft.exceeded(
+                                    now_pending,
+                                    &mut replica.over_soft_since,
+                                    crate::output_limits::now_secs(),
+                                )
+                        };
+                        if now_pending > limit || over_soft_too_long {
+                            crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS
+                                .fetch_add(1, Ordering::Relaxed);
                             // Replica isn't draining its queue fast enough — evict rather than
                             // let the backlog grow without bound. Dropping `tx` here (by not
                             // pushing it back into `channel_replicas`) closes its forwarder's
                             // channel; the owning connection task treats "forwarder ended" as
                             // a disconnect and tears the rest of the connection down. It will
-                            // need a full resync to catch back up.
+                            // need a full resync to catch back up. What is in its
+                            // queue is let go of rather than sent: see
+                            // `ReplicaQueue::abandon`.
+                            replica.pending_bytes.abandon();
+                            leaving.push(Arc::clone(&replica.pending_bytes));
                             forget_replica(&state, replica.id);
+                            if over_soft_too_long && now_pending <= limit {
+                                log_warn!(
+                                    "Replication: Channel replica {} has had {now_pending} bytes \
+                                     queued, over the soft limit of {} bytes, for more than {} \
+                                     seconds (client-output-buffer-limit replica) — evicting",
+                                    replica.addr,
+                                    soft.soft,
+                                    soft.soft_seconds
+                                );
+                                continue;
+                            }
                             log_warn!(
                                 "Replication: Channel replica {} exceeded backlog limit \
                                  ({now_pending} > {limit} bytes{}) — evicting",
@@ -2702,7 +3152,7 @@ pub struct ReplicaRegistration {
     pub peer_ip: String,
     pub peer_port: u16,
     pub tx: mpsc::UnboundedSender<ReplPayload>,
-    pub pending_bytes: Arc<AtomicU64>,
+    pub pending_bytes: Arc<ReplicaQueue>,
 }
 
 /// Take the cut for a full resync: register the replica with the hub and
@@ -2807,9 +3257,9 @@ pub struct FullSync {
 }
 
 impl FullSync {
-    /// The line that announces it.
-    pub fn announcement(&self, repl_id: &str) -> String {
-        format!("+FULLRESYNC {repl_id} {}\r\n", self.base)
+    /// The line that announces it; `word` from [`ReplState::vset_quant_word`].
+    pub fn announcement(&self, repl_id: &str, word: &str) -> String {
+        format!("+FULLRESYNC {repl_id} {}{word}\r\n", self.base)
     }
 }
 
@@ -2829,6 +3279,17 @@ pub async fn request_continuation(
     };
     if !repl_state.continues_stream(&psync.repl_id, psync.offset) {
         // It followed some other master.
+        repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
+        return Err(registration);
+    }
+    let dropped = repl_state.vset_quant_dropped_until.load(Ordering::Relaxed);
+    if psync.offset <= dropped {
+        // The backlog holds a `VADD` whose quantization was not applied here.
+        log_info!(
+            "Replication: Not continuing a replica from offset {}: the stream up to {dropped} \
+             holds a VADD whose quantization an older master ignored — syncing it in full",
+            psync.offset
+        );
         repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
         return Err(registration);
     }
@@ -2856,13 +3317,19 @@ struct ChannelReplica {
     id: u64,
     addr: String,
     tx: mpsc::UnboundedSender<ReplPayload>,
-    pending_bytes: Arc<AtomicU64>,
+    pending_bytes: Arc<ReplicaQueue>,
     progress: Arc<ReplicaProgress>,
     /// In its full sync: held to `repl-replica-sync-max-backlog-bytes`
     /// rather than `repl-replica-max-backlog-bytes`. See [`start_hub`].
     syncing: bool,
     /// The most that has been queued for it at once.
     peak: u64,
+    /// When it went over the soft limit, on `output_limits::now_secs`'s
+    /// clock; 0 while it is under it.
+    over_soft_since: u64,
+    /// Its queue has been under the soft limit since its full sync or
+    /// partial resync: from then on it is held to it. See [`start_hub`].
+    soft_armed: bool,
 }
 
 /// Drop every trace of a replica from the shared state. Idempotent: the
@@ -2878,6 +3345,7 @@ fn forget_replica(state: &ReplState, replica_id: u64) {
         // Pairs with fetch_add on successful RegisterChannel in the hub task.
         state.connected_replicas.fetch_sub(1, Ordering::Relaxed);
     }
+    state.replicas_changed.notify_waiters();
 }
 
 /// Shutdown: end the write stream here. A master restarted from its final
@@ -3211,7 +3679,10 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
         note_group_write(ctx.aof_enabled);
     }
 
-    for payload_bytes in payloads {
+    // The command is the last payload; a `SELECT` may come first.
+    let marked = ctx.aof_enabled && crate::vector::quant::carries_quant_option(parts);
+    let count = payloads.len();
+    for (n, payload_bytes) in payloads.into_iter().enumerate() {
         if tapped {
             ctx.repl_state.feed_taps(&payload_bytes);
         }
@@ -3238,8 +3709,14 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
             }
         }
         if ctx.aof_enabled {
-            crate::aof::AOF_WRITTEN.fetch_add(enc_len, std::sync::atomic::Ordering::Relaxed);
-            crate::aof::queue_record(ctx.aof_tx, raw_opt.take().expect("encoded for AOF path"));
+            let mut record = raw_opt.take().expect("encoded for AOF path");
+            // In the same record, so no crash separates them. AOF only.
+            if marked && n + 1 == count {
+                record.extend_from_slice(crate::aof::VSET_QUANT_MARKER);
+            }
+            crate::aof::AOF_WRITTEN
+                .fetch_add(record.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::aof::queue_record(ctx.aof_tx, record);
         }
     }
     // Only advance after bytes are emitted: writes that ran with no replicas must not
@@ -3565,6 +4042,10 @@ fn append_to_own_aof(
     for p in payloads {
         combined.extend_from_slice(&p);
     }
+    // `parts` as applied: options a non-keeping master sent are gone already.
+    if crate::vector::quant::carries_quant_option(parts) {
+        combined.extend_from_slice(crate::aof::VSET_QUANT_MARKER);
+    }
     crate::aof::AOF_WRITTEN.fetch_add(combined.len() as u64, Ordering::Relaxed);
     crate::aof::queue_record(ctx.aof_tx, combined);
     advance_stream_db(ctx, cmd0, parts);
@@ -3664,6 +4145,7 @@ pub fn is_write_command(name: &str) -> bool {
         6 => matches!(
             name,
             "APPEND"
+                | "BF.ADD"
                 | "ARMSET"
                 | "ARRING"
                 | "ARSEEK"
@@ -3700,7 +4182,8 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         7 => matches!(
             name,
-            "FLUSHDB"
+            "BF.MADD"
+                | "FLUSHDB"
                 | "HEXPIRE"
                 | "HGETDEL"
                 | "HINCRBY"
@@ -3739,7 +4222,8 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         9 => matches!(
             name,
-            "FT.CREATE"
+            "BF.INSERT"
+                | "FT.CREATE"
                 | "HEXPIREAT"
                 | "JSON.MSET"
                 | "PEXPIREAT"
@@ -3751,6 +4235,7 @@ pub fn is_write_command(name: &str) -> bool {
         10 => matches!(
             name,
             "ARDELRANGE"
+                | "BF.RESERVE"
                 | "BRPOPLPUSH"
                 | "FT.DICTADD"
                 | "FT.DICTDEL"
@@ -3780,7 +4265,7 @@ pub fn is_write_command(name: &str) -> bool {
         ),
         12 => matches!(
             name,
-            "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
+            "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
         13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
         14 => matches!(
@@ -3813,6 +4298,11 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "ARRING",
     "ARSEEK",
     "ARSET",
+    "BF.ADD",
+    "BF.INSERT",
+    "BF.LOADCHUNK",
+    "BF.MADD",
+    "BF.RESERVE",
     "BITFIELD",
     "BITOP",
     "BLMOVE",
@@ -3970,6 +4460,8 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
 fn is_write_command_reference(name: &str) -> bool {
     matches!(
         name,
+        // Bloom filters
+        "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |
@@ -4029,6 +4521,161 @@ fn is_write_command_reference(name: &str) -> bool {
     )
 }
 
+/// Redis's reply to `WAIT` on a replica.
+pub const WAIT_ON_REPLICA: &[u8] = b"-ERR WAIT cannot be used with replica instances. Please also \
+    note that since Redis 4.0 if a replica is configured to be writable (which is not the \
+    default) writes to replicas are just local and are not propagated.\r\n";
+
+/// `WAIT numreplicas timeout`'s arguments, or the error Redis gives for
+/// them (#561): both integers, the timeout in milliseconds and not negative
+/// (0 waits for ever). Each used to read as 0 when it was not a number, and
+/// a negative timeout as 0, which waited for ever.
+///
+/// On a replica, `WAIT` is refused before its arguments are looked at, as
+/// Redis refuses it: there is nothing it could wait for (it used to wait for
+/// ever).
+pub fn wait_args(cmd: &[&[u8]], on_replica: bool) -> Result<(i64, u64), Vec<u8>> {
+    if cmd.len() != 3 {
+        return Err(b"-ERR wrong number of arguments for 'wait' command\r\n".to_vec());
+    }
+    if on_replica {
+        return Err(WAIT_ON_REPLICA.to_vec());
+    }
+    let int = |arg: &[u8]| std::str::from_utf8(arg).ok()?.parse::<i64>().ok();
+    let replicas =
+        int(cmd[1]).ok_or_else(|| b"-ERR value is not an integer or out of range\r\n".to_vec())?;
+    let timeout = int(cmd[2])
+        .ok_or_else(|| b"-ERR timeout is not an integer or out of range\r\n".to_vec())?;
+    if timeout < 0 {
+        return Err(b"-ERR timeout is negative\r\n".to_vec());
+    }
+    Ok((replicas, timeout as u64))
+}
+
+/// Redis's reply to a client blocked in `WAIT` when this master becomes a
+/// replica; the connection is then closed, as Redis closes it
+/// (`disconnectAllBlockedClients`).
+pub const UNBLOCKED_ROLE_CHANGE: &[u8] =
+    b"-UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)\r\n";
+
+/// How a `WAIT` ended: its reply, and whether the connection is to be closed
+/// once it is written.
+pub struct WaitEnd {
+    pub reply: Vec<u8>,
+    pub close: bool,
+}
+
+/// What each replica has to have acknowledged for a `WAIT`, by replica id.
+///
+/// A replica counts only while it is connected (its id still registered: one
+/// that reconnects comes back under a new id, and is not counted twice) and
+/// online, and once it has acknowledged everything it had been sent when the
+/// `WAIT` first saw it: for one there when the `WAIT` began, everything
+/// written before the `WAIT`; for one that connected since, its full sync or
+/// its partial resync's backlog (registered with `sent` already counting
+/// it) covers those writes, and the rest is what was sent after.
+#[derive(Default)]
+pub struct WaitTargets(std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64)>);
+
+impl WaitTargets {
+    /// Bring the targets up to date with the replicas connected now, and
+    /// count those that have reached theirs.
+    pub fn count(&mut self, state: &ReplState) -> i64 {
+        let live = state.replica_progress.lock();
+        self.0.retain(|id, _| live.contains_key(id));
+        for (id, p) in live.iter() {
+            self.0
+                .entry(*id)
+                .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed)));
+        }
+        self.0
+            .values()
+            .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
+            .count() as i64
+    }
+}
+
+/// `WAIT` once its arguments are taken: the number of replicas that have
+/// acknowledged everything written before it (see [`WaitTargets`]), once
+/// `wanted` have, or at `timeout_ms` (0: no timeout), or when `CLIENT
+/// UNBLOCK` ends it (with that number, counted then, or `-UNBLOCKED` if asked
+/// for an error), as Redis answers. `wanted` of 0 or less answers at once,
+/// with the number there is. Each connection loop runs this beside its own
+/// watch on the client going.
+///
+/// The targets are made exact by a hub barrier: every write handed to the
+/// hub before it has been fanned out. Between looks it sleeps until a
+/// replica acknowledges, connects or goes, or this master becomes a replica
+/// (which ends the wait as Redis ends it), or the time is up: nothing is
+/// polled.
+pub async fn wait_for_replicas(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    wanted: i64,
+    timeout_ms: u64,
+    mut unblocked: tokio::sync::oneshot::Receiver<crate::commands::blocking::Unblock>,
+) -> WaitEnd {
+    let reply = |n: i64| WaitEnd {
+        reply: crate::resp::write::resp_integer(n).to_vec(),
+        close: false,
+    };
+    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+    if hub_tx.send(HubMsg::Barrier(barrier_tx)).is_ok() {
+        let _ = barrier_rx.await;
+    }
+    let mut targets = WaitTargets::default();
+    let deadline = (timeout_ms > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+    let mut unblockable = true;
+    loop {
+        // Before looking, so that a change made while looking still wakes it.
+        let changed = state.replicas_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+
+        if state.is_slave() {
+            return WaitEnd {
+                reply: UNBLOCKED_ROLE_CHANGE.to_vec(),
+                close: true,
+            };
+        }
+        let acked = targets.count(state);
+        if acked >= wanted {
+            return reply(acked);
+        }
+        let time_up = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = &mut changed => {}
+            () = time_up => return reply(targets.count(state)),
+            how = &mut unblocked, if unblockable => match how {
+                Ok(crate::commands::blocking::Unblock::Error) => {
+                    return WaitEnd {
+                        reply: crate::commands::blocking::UNBLOCKED.to_vec(),
+                        close: false,
+                    };
+                }
+                Ok(crate::commands::blocking::Unblock::Timeout) => {
+                    return reply(targets.count(state));
+                }
+                // The sweep of a role change (#591), which may come before
+                // the look at `is_slave` above: either ends the wait, once.
+                Ok(crate::commands::blocking::Unblock::RoleChange) => {
+                    return WaitEnd {
+                        reply: UNBLOCKED_ROLE_CHANGE.to_vec(),
+                        close: true,
+                    };
+                }
+                Err(_) => unblockable = false,
+            },
+        }
+    }
+}
+
 /// True if this command may not run on a read-only replica (READONLY reply).
 #[inline]
 pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
@@ -4048,7 +4695,9 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         // before it runs. Every script was, the ones that only read too
         // (#145).
         "EVAL" | "EVALSHA" | "FCALL" => script_may_write(name, cmd),
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        // Write commands in Redis, refused on a replica whether or not they
+        // store: `GEORADIUS_RO` and `GEORADIUSBYMEMBER_RO` are the reads.
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => true,
         // Only TODENSE and RESET rewrite the value; GETREG, DECODE and
         // ENCODING are diagnostics, deliberately read-only here.
         "PFDEBUG" => pfdebug_mutates(cmd),
@@ -4056,16 +4705,12 @@ pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
         "MIGRATE" => true,
         // Only HIMPORT SET writes; PREPARE / DISCARD are session state.
         "HIMPORT" => crate::commands::hash_import::is_write(cmd),
-        "SCRIPT" if cmd.len() >= 2 => {
-            let sub = cmd[1];
-            matches!(
-                std::str::from_utf8(sub)
-                    .ok()
-                    .map(|s| s.to_ascii_uppercase())
-                    .as_deref(),
-                Some("LOAD") | Some("FLUSH") | Some("RESET")
-            )
-        }
+        // The script cache is not the dataset, and a replica's is its own:
+        // clients load their scripts on a replica before they run them there
+        // by their SHA. Redis runs `SCRIPT LOAD` and `SCRIPT FLUSH` on a
+        // read-only replica (they are not flagged writes), and so does
+        // KiviDB now (#527). `FUNCTION LOAD` and the rest are writes there.
+        "SCRIPT" => false,
         "FUNCTION" if cmd.len() >= 2 => {
             matches!(
                 std::str::from_utf8(cmd[1])
@@ -4102,9 +4747,15 @@ fn script_may_write(name: &str, cmd: &[&[u8]]) -> bool {
 
 /// `GEORADIUS` / `GEORADIUSBYMEMBER` are reads unless they carry `STORE` or
 /// `STOREDIST`, which write the result set to another key.
-fn georadius_stores(cmd: &[&[u8]]) -> bool {
+fn georadius_stores(name: &str, cmd: &[&[u8]]) -> bool {
+    // The STORE / STOREDIST options follow the fixed arguments
+    // (`key lon lat radius unit`, or `key member radius unit` for
+    // GEORADIUSBYMEMBER). Scanning from there, not from argument 1, keeps a
+    // member or key literally named "store" from being taken for the option,
+    // using the same fixed-argument count as `keyspec::geo_radius_keys`.
+    let options = if name == "GEORADIUSBYMEMBER" { 5 } else { 6 };
     cmd.iter()
-        .skip(1)
+        .skip(options)
         .any(|a| a.eq_ignore_ascii_case(b"STORE") || a.eq_ignore_ascii_case(b"STOREDIST"))
 }
 
@@ -4125,7 +4776,7 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
         "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => false,
         // Writes replicate as inner `redis.call` commands, not as `EVAL` / `EVALSHA` / `FCALL`.
         "EVAL" | "EVALSHA" | "FCALL" => false,
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(name, cmd),
         "PFDEBUG" => pfdebug_mutates(cmd),
         // Propagated as the `DEL` of whatever it moved away; see
         // `script_feed::commands_for_propagation`.
@@ -4154,16 +4805,40 @@ pub fn command_mutates_for_replication(name: &str, cmd: &[&[u8]]) -> bool {
     }
 }
 
+/// Whether `min-replicas-to-write` refuses a command: one that changes the
+/// dataset, judged by its arguments ([`command_mutates_for_replication`]),
+/// as Redis judges it by its `write` flag. Not `SELECT` (#411) or `SCRIPT`:
+/// both are propagated, but neither is flagged a write in Redis, which runs
+/// them without good replicas.
+#[inline]
+pub fn refused_without_replicas(name: &str, cmd: &[&[u8]]) -> bool {
+    writes_the_dataset(name, cmd)
+}
+
+/// Whether a command changes the dataset: one that is propagated
+/// ([`command_mutates_for_replication`]) other than `SELECT`, which changes
+/// the connection's database, and `SCRIPT`, which changes the script cache.
+/// Neither is flagged a write in Redis. What a script has written, and
+/// whether a node's dataset is still a position in its master's stream, go
+/// by this (#424).
+#[inline]
+pub fn writes_the_dataset(name: &str, cmd: &[&[u8]]) -> bool {
+    !matches!(name, "SELECT" | "SCRIPT") && command_mutates_for_replication(name, cmd)
+}
+
 /// Write commands blocked inside an `EVAL_RO` / `EVALSHA_RO` script (`redis.call`).
 #[inline]
 pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bool {
     match name {
         "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO" => true,
+        // Changes the script's database, not the dataset: a read-only script
+        // may, as in Redis (#424).
+        "SELECT" => false,
         // Not writes to the dataset, but to the replication stream — or,
         // `PFCOUNT`, possibly to its key: not what a script that has said it
         // writes nothing may do.
         "PUBLISH" | "SPUBLISH" | "PFCOUNT" => true,
-        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(cmd),
+        "GEORADIUS" | "GEORADIUSBYMEMBER" => georadius_stores(name, cmd),
         "PFDEBUG" => pfdebug_mutates(cmd),
         "MIGRATE" => true,
         "HIMPORT" => crate::commands::hash_import::is_write(cmd),
@@ -4193,10 +4868,11 @@ pub fn inner_command_blocked_in_readonly_script(name: &str, cmd: &[&[u8]]) -> bo
 #[cfg(test)]
 mod replication_invariants_tests {
     use super::{
-        HubMsg, ReplPayload, ReplState, propagate, slave_command_allowed_during_loading, start_hub,
+        HubMsg, QueueRx, ReplPayload, ReplState, ReplicaQueue, ReplicaState, propagate,
+        slave_command_allowed_during_loading, start_hub,
     };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     async fn await_connected(state: &ReplState, want: i64) {
         for _ in 0..5000 {
@@ -4224,7 +4900,7 @@ mod replication_invariants_tests {
             peer_port: 9_001,
             tx,
             replica_id: 9001,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4247,7 +4923,7 @@ mod replication_invariants_tests {
             peer_port: 9_002,
             tx,
             replica_id: 9002,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4276,7 +4952,7 @@ mod replication_invariants_tests {
             peer_port: 9_003,
             tx,
             replica_id: 9003,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4316,7 +4992,7 @@ mod replication_invariants_tests {
             peer_port: 9_004,
             tx,
             replica_id: 9004,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
@@ -4333,6 +5009,18 @@ mod replication_invariants_tests {
             state.replica_acks.lock().get(&9004).is_none(),
             "evicted replica's ACK row should be removed"
         );
+
+        // Its connection is still up for a moment: an ACK on the way, and
+        // then its teardown, count it out once only.
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9004,
+            offset: 100,
+        })
+        .unwrap();
+        hub.send(HubMsg::Deregister(9004)).unwrap();
+        barrier(&hub).await;
+        assert!(state.replica_acks.lock().get(&9004).is_none());
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 0);
     }
 
     async fn barrier(hub: &super::HubTx) {
@@ -4341,7 +5029,7 @@ mod replication_invariants_tests {
         wait.await.unwrap();
     }
 
-    fn register_syncing(hub: &super::HubTx, id: u64, pending: &Arc<AtomicU64>) -> ReplRx {
+    fn register_syncing(hub: &super::HubTx, id: u64, pending: &Arc<ReplicaQueue>) -> ReplRx {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
         hub.send(HubMsg::RegisterChannel {
             addr: format!("replica-{id}"),
@@ -4373,7 +5061,7 @@ mod replication_invariants_tests {
             .replica_sync_max_backlog_bytes
             .store(1000, Ordering::Relaxed);
         let hub = start_hub(Arc::clone(&state));
-        let pending = Arc::new(AtomicU64::new(0));
+        let pending = Arc::new(ReplicaQueue::default());
         let mut rx = register_syncing(&hub, 9005, &pending);
         await_connected(&state, 1).await;
 
@@ -4384,6 +5072,9 @@ mod replication_invariants_tests {
         barrier(&hub).await;
         assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
         assert_eq!(state.replica(9005).unwrap().queued(), 500);
+        // And the memory they take, each payload's allocation and slot.
+        assert_eq!(pending.held(), 10 * ReplicaQueue::held_for(50));
+        assert!(pending.held() > 500 + 10 * 16);
 
         // Loaded and acknowledged; its connection takes what was queued.
         hub.send(HubMsg::AckOffset {
@@ -4392,7 +5083,8 @@ mod replication_invariants_tests {
         })
         .unwrap();
         while rx.try_recv().is_ok() {}
-        pending.store(0, Ordering::Relaxed);
+        pending.taken(500, 10 * ReplicaQueue::held_for(50));
+        assert_eq!((pending.bytes(), pending.held()), (0, 0));
         // The next write finds it streaming (its queue is a quarter of the
         // streaming limit or less)...
         propagate(&hub, vec![0u8; 20]);
@@ -4403,6 +5095,141 @@ mod replication_invariants_tests {
             propagate(&hub, vec![0u8; 50]);
         }
         await_connected(&state, 0).await;
+    }
+
+    /// Take everything queued for a replica, as its connection would.
+    fn drain(rx: &mut ReplRx, pending: &ReplicaQueue) {
+        let (mut bytes, mut held) = (0, 0);
+        while let Ok(payload) = rx.try_recv() {
+            bytes += payload.len();
+            held += ReplicaQueue::held_for(payload.len());
+        }
+        pending.taken(bytes, held);
+    }
+
+    /// A replica streaming again after its full sync still has what queued
+    /// up meanwhile to drain: up to a quarter of the hard limit, far over a
+    /// soft limit when the hard one is raised. It is not dropped for that,
+    /// which would start the sync again and again (#305); it is held to the
+    /// soft limit once its queue has been under it (#774).
+    #[tokio::test]
+    async fn a_replica_draining_after_its_sync_is_held_to_the_soft_limit_only_after() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(10_000, Ordering::Relaxed);
+        state.replica_soft_limit_bytes.store(100, Ordering::Relaxed);
+        state.replica_soft_limit_secs.store(0, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9010, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..20 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        // Loaded; 200 of the 1000 bytes left to drain.
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9010,
+            offset: 0,
+        })
+        .unwrap();
+        for _ in 0..16 {
+            rx.try_recv().unwrap();
+        }
+        pending.taken(800, 16 * ReplicaQueue::held_for(50));
+        // Streaming again from this write (220 bytes, under a quarter of
+        // 1000), over the soft limit from the next, and for longer than its
+        // seconds: still there.
+        propagate(&hub, vec![0u8; 20]);
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+
+        // Drained once: from now on, over the soft limit for longer than its
+        // seconds and it is dropped.
+        drain(&mut rx, &pending);
+        propagate(&hub, vec![0u8; 20]);
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        propagate(&hub, vec![0u8; 50]);
+        await_connected(&state, 0).await;
+        assert!(pending.abandoned());
+    }
+
+    /// A replica that went over the soft limit and then drained, with nothing
+    /// written meanwhile, is not over it any more: a large write after a
+    /// quiet spell starts its clock again, and does not drop it at once.
+    #[tokio::test]
+    async fn the_soft_limit_clock_starts_again_after_a_drain() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        state.replica_soft_limit_bytes.store(100, Ordering::Relaxed);
+        state.replica_soft_limit_secs.store(0, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9011, &pending);
+        await_connected(&state, 1).await;
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9011,
+            offset: 0,
+        })
+        .unwrap();
+        // Streaming, under the soft limit, then over it.
+        propagate(&hub, vec![0u8; 20]);
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        // Drained, and quiet for longer than the soft limit's seconds.
+        drain(&mut rx, &pending);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        propagate(&hub, vec![0u8; 150]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+    }
+
+    /// 0 for the hard limit is no limit, as `client-output-buffer-limit
+    /// replica 0 0 0` is in Redis; and no streaming limit lifts the sync's.
+    #[tokio::test]
+    async fn no_hard_limit_keeps_a_replica_however_far_behind() {
+        let state = Arc::new(ReplState::new_master());
+        state.replica_max_backlog_bytes.store(0, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9012, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..100 {
+            propagate(&hub, vec![0u8; 1000]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9012,
+            offset: 0,
+        })
+        .unwrap();
+        drain(&mut rx, &pending);
+        for _ in 0..100 {
+            propagate(&hub, vec![0u8; 1000]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
     }
 
     /// The sync's allowance is a bound too: the master's memory stays bounded
@@ -4417,7 +5244,7 @@ mod replication_invariants_tests {
             .replica_sync_max_backlog_bytes
             .store(1000, Ordering::Relaxed);
         let hub = start_hub(Arc::clone(&state));
-        let pending = Arc::new(AtomicU64::new(0));
+        let pending = Arc::new(ReplicaQueue::default());
         let _rx = register_syncing(&hub, 9006, &pending);
         await_connected(&state, 1).await;
         for _ in 0..19 {
@@ -4431,6 +5258,102 @@ mod replication_invariants_tests {
             .store(500, Ordering::Relaxed);
         propagate(&hub, vec![0u8; 50]);
         await_connected(&state, 0).await;
+        // What is queued for it is to be let go of, not sent.
+        assert!(pending.abandoned());
+    }
+
+    /// A queue let go of for its limit stays out of what is counted against
+    /// `maxmemory` only while it holds anything. However its connection
+    /// ends, dropping the forwarder's end of the queue says it is empty:
+    /// here without a single `recv`, as when the forwarder is aborted at
+    /// `repl-timeout` while stuck writing, or never started (#542).
+    #[tokio::test]
+    async fn a_queue_let_go_of_is_counted_again_once_its_receiver_is_dropped() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let rx = QueueRx::new(register_syncing(&hub, 9007, &pending), Arc::clone(&pending));
+        await_connected(&state, 1).await;
+        for _ in 0..21 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        await_connected(&state, 0).await;
+        assert!(pending.abandoned());
+        // Let go of, and still held: not counted.
+        barrier(&hub).await;
+        barrier(&hub).await;
+        assert_eq!(
+            state.replica_queued_memory.load(Ordering::Relaxed),
+            21 * ReplicaQueue::held_for(50)
+        );
+
+        drop(rx);
+        // The hub reads it again before each message it takes.
+        barrier(&hub).await;
+        barrier(&hub).await;
+        assert_eq!(state.replica_queued_memory.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.memory(), 0);
+    }
+
+    /// The watch on a replica's connection ends once the hub has let go of
+    /// it for its queue limit, not only once it is silent for
+    /// `repl-timeout`: one let go of while it read nothing kept its
+    /// connection, and its queue, for good (#542).
+    #[tokio::test]
+    async fn the_watch_on_a_replica_ends_once_it_is_let_go_of_for_its_queue_limit() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let _rx = register_syncing(&hub, 9008, &pending);
+        await_connected(&state, 1).await;
+        // Registered, in its full sync and reading nothing: the watch goes on.
+        let watch = tokio::time::timeout(
+            std::time::Duration::from_millis(2500),
+            state.replica_timed_out(9008),
+        );
+        assert!(watch.await.is_err());
+        // Its queue passes the full sync's limit.
+        for _ in 0..21 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        await_connected(&state, 0).await;
+        assert!(pending.abandoned());
+        // Let go of: it ends, and not as silent.
+        let watch = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.replica_timed_out(9008),
+        );
+        assert_eq!(watch.await, Ok(false));
+    }
+
+    /// A queue's memory stops being counted out as soon as its receiver is
+    /// gone, even if the hub queued one more payload for it meanwhile.
+    #[test]
+    fn a_dropped_receiver_holds_nothing() {
+        let queue = Arc::new(ReplicaQueue::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
+        let rx = QueueRx::new(rx, Arc::clone(&queue));
+        queue.add(50);
+        tx.send(Arc::from(&[0u8; 50][..])).unwrap();
+        assert_eq!(queue.memory(), ReplicaQueue::held_for(50));
+        drop(rx);
+        assert_eq!(queue.memory(), 0);
+        // A payload queued as the receiver went: not counted out.
+        queue.add(50);
+        assert!(tx.send(Arc::from(&[0u8; 50][..])).is_err());
+        assert_eq!(queue.memory(), 0);
     }
 
     #[test]
@@ -4645,7 +5568,8 @@ mod replication_invariants_tests {
         }
     }
 
-    /// GEORADIUS is a read until it is asked to store its result.
+    /// GEORADIUS replicates only when it stores its result, but is refused on
+    /// a replica either way, as in Redis.
     #[test]
     fn georadius_is_a_write_only_with_store() {
         let read: Vec<&[u8]> = vec![b"GEORADIUS", b"k", b"0", b"0", b"1", b"km"];
@@ -4660,12 +5584,26 @@ mod replication_invariants_tests {
             b"d",
         ];
         assert!(!super::command_mutates_for_replication("GEORADIUS", &read));
-        assert!(!super::is_denied_on_readonly_replica("GEORADIUS", &read));
+        assert!(super::is_denied_on_readonly_replica("GEORADIUS", &read));
         assert!(super::command_mutates_for_replication("GEORADIUS", &store));
         assert!(super::is_denied_on_readonly_replica("GEORADIUS", &store));
         assert!(super::command_mutates_for_replication(
             "GEORADIUSBYMEMBER",
             &storedist
+        ));
+        // A member or key literally named "store" is not the STORE option:
+        // the scan starts after the fixed arguments.
+        let member_named_store: Vec<&[u8]> =
+            vec![b"GEORADIUSBYMEMBER", b"k", b"store", b"1", b"km"];
+        assert!(!super::command_mutates_for_replication(
+            "GEORADIUSBYMEMBER",
+            &member_named_store
+        ));
+        // A replica refuses it all the same, as Redis does: GEORADIUS and
+        // GEORADIUSBYMEMBER are write commands, `_RO` are the reads.
+        assert!(super::is_denied_on_readonly_replica(
+            "GEORADIUSBYMEMBER",
+            &member_named_store
         ));
     }
 
@@ -4757,11 +5695,17 @@ mod replication_invariants_tests {
             peer_port: 9_005,
             tx,
             replica_id: 9005,
-            pending_bytes: Arc::new(AtomicU64::new(0)),
+            pending_bytes: Arc::default(),
             base: 0,
         })
         .unwrap();
         await_connected(&state, 1).await;
+        // Online, as its first acknowledgement would make it: only an online
+        // replica is counted.
+        state
+            .replica(9005)
+            .unwrap()
+            .set_state(crate::replication::ReplicaState::Online);
 
         // Nothing sent yet: the replica is already at its target.
         let targets = state.wait_targets();
@@ -4789,6 +5733,161 @@ mod replication_invariants_tests {
         hub.send(HubMsg::Barrier(done_tx)).unwrap();
         done_rx.await.unwrap();
         assert_eq!(ReplState::count_reached(&targets), 1);
+    }
+
+    /// The hub has handled every message sent before this.
+    async fn settle(hub: &super::HubTx) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done_tx)).unwrap();
+        done_rx.await.unwrap();
+    }
+
+    /// A replica's registration, and its connection's end of the queue.
+    fn registration(id: u64, port: u16) -> (super::ReplicaRegistration, QueueRx) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
+        let queue = Arc::new(ReplicaQueue::default());
+        (
+            super::ReplicaRegistration {
+                replica_id: id,
+                addr: format!("replica-{id}"),
+                peer_ip: "127.0.0.1".into(),
+                peer_port: port,
+                tx,
+                pending_bytes: Arc::clone(&queue),
+            },
+            QueueRx::new(rx, queue),
+        )
+    }
+
+    /// A replica back by partial resync with an N-byte backlog is counted by
+    /// `WAIT` only once it has acknowledged the N bytes: not at the offset it
+    /// continued from, and at that offset plus N.
+    #[tokio::test]
+    async fn a_partial_resync_counts_once_its_backlog_is_acknowledged() {
+        let state = Arc::new(ReplState::new_master());
+        let hub = start_hub(Arc::clone(&state));
+        hub.send(HubMsg::Resume { offset: 100 }).unwrap();
+        let write = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".to_vec();
+        let n = write.len() as u64;
+        propagate(&hub, write);
+        settle(&hub).await;
+
+        let mut targets = super::WaitTargets::default();
+        assert_eq!(targets.count(&state), 0);
+        let (registration, mut rx) = registration(7001, 7001);
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Continue {
+            registration,
+            offset: 100,
+            reply,
+        })
+        .unwrap();
+        assert!(
+            answer.await.unwrap().is_ok(),
+            "the backlog holds offset 100"
+        );
+        assert_eq!(rx.recv().await.unwrap().len() as u64, n);
+
+        let progress = state.replica(7001).unwrap();
+        assert_eq!(progress.sent.load(Ordering::Relaxed), n);
+        assert_eq!(targets.count(&state), 0, "acknowledged nothing yet");
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7001,
+            offset: 100,
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(targets.count(&state), 0, "acknowledged none of the backlog");
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7001,
+            offset: 100 + n - 1,
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(targets.count(&state), 0, "acknowledged part of the backlog");
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7001,
+            offset: 100 + n,
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(targets.count(&state), 1);
+    }
+
+    /// A replica that goes is dropped from a `WAIT`'s targets, and no longer
+    /// counted.
+    #[tokio::test]
+    async fn a_replica_that_goes_leaves_the_wait_targets() {
+        let state = Arc::new(ReplState::new_master());
+        let hub = start_hub(Arc::clone(&state));
+        let (r, _rx) = registration(7002, 7002);
+        hub.send(HubMsg::RegisterChannel {
+            addr: r.addr,
+            peer_ip: r.peer_ip,
+            peer_port: r.peer_port,
+            tx: r.tx,
+            replica_id: 7002,
+            pending_bytes: r.pending_bytes,
+            base: 0,
+        })
+        .unwrap();
+        await_connected(&state, 1).await;
+        hub.send(HubMsg::AckOffset {
+            replica_id: 7002,
+            offset: 0,
+        })
+        .unwrap();
+        settle(&hub).await;
+
+        let mut targets = super::WaitTargets::default();
+        assert_eq!(targets.count(&state), 1);
+        assert!(targets.0.contains_key(&7002));
+        hub.send(HubMsg::Deregister(7002)).unwrap();
+        await_connected(&state, 0).await;
+        assert_eq!(targets.count(&state), 0);
+        assert!(!targets.0.contains_key(&7002));
+    }
+
+    /// A replica still loading its full sync is not counted, however far it
+    /// has acknowledged, until it is online.
+    #[test]
+    fn a_replica_not_online_is_not_counted() {
+        let state = ReplState::new_master();
+        let progress = state.register_replica(7003, "127.0.0.1".into(), 7003, 0);
+        let mut targets = super::WaitTargets::default();
+        for not_yet in [ReplicaState::WaitBgsave, ReplicaState::SendBulk] {
+            progress.set_state(not_yet);
+            progress.acked.store(1_000, Ordering::Relaxed);
+            assert_eq!(targets.count(&state), 0, "{not_yet:?}");
+            assert_eq!(
+                ReplState::count_reached(&state.wait_targets()),
+                0,
+                "{not_yet:?}"
+            );
+        }
+        progress.set_state(ReplicaState::Online);
+        assert_eq!(targets.count(&state), 1);
+        assert_eq!(ReplState::count_reached(&state.wait_targets()), 1);
+    }
+
+    /// `register_replica_at` registers a replica with the `sent` and state
+    /// it is given, and wakes the waiters: a `WAIT` counts it once it has
+    /// acknowledged that much.
+    #[tokio::test]
+    async fn a_replica_registered_with_a_backlog_wakes_waiters_and_counts_after_it() {
+        let state = Arc::new(ReplState::new_master());
+        let woken = state.replicas_changed.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        state.register_replica_at(7004, "127.0.0.1".into(), 7004, 50, 37, ReplicaState::Online);
+        woken.await;
+        let seen = state.replica(7004).unwrap();
+        assert_eq!(seen.sent.load(Ordering::Relaxed), 37);
+        assert_eq!(seen.state(), ReplicaState::Online);
+        let mut targets = super::WaitTargets::default();
+        assert_eq!(targets.count(&state), 0);
+        seen.acked.store(50 + 37, Ordering::Relaxed);
+        assert_eq!(targets.count(&state), 1);
     }
 
     /// A master that becomes a replica keeps where its own stream stands as

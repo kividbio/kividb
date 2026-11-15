@@ -6,7 +6,7 @@ use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{HashFields, HashInner, SortedSetInner, ZMember};
+use crate::types::{HashFields, HashInner, SortedSetInner, StreamInner, ZMember};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
@@ -185,27 +185,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::Stream(arc) => {
             let inner = arc.read();
-            let len = inner.entries.len();
-            let avg = if len == 0 {
-                0
-            } else {
-                let sample_n = samples.min(len);
-                let step = (len / sample_n).max(1);
-                let total: usize = inner
-                    .entries
-                    .values()
-                    .step_by(step)
-                    .take(sample_n)
-                    .map(|e| {
-                        e.fields
-                            .iter()
-                            .map(|(k, v)| k.len() + v.len())
-                            .sum::<usize>()
-                    })
-                    .sum();
-                total / sample_n.max(1)
-            };
-            key_overhead + avg * len + 200
+            // Its entries are counted exactly: a few blocks of packed
+            // entries. Its groups are not counted.
+            entry() + layout::arc_of::<RwLock<StreamInner>>() + inner.entries.heap_bytes()
         }
 
         ValueRef::Json(arc) => {
@@ -221,10 +203,20 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::VectorSet(arc) => {
             let inner = arc.read();
-            // Each entry: dim * 4 bytes (f32) + attrs string
-            let count = inner.entries.len();
-            let dim = inner.dim;
-            key_overhead + count * dim * 4 + 200
+            // Counts stored vector bytes, so quantized sets report less.
+            let elements = layout::sampled(inner.entries.len(), samples, || {
+                inner.entries.iter().map(|(name, entry)| {
+                    crate::key_bytes::KeyBytes::heap_bytes_of(name.as_bytes())
+                        + entry.vector.heap_bytes()
+                        + entry.attrs.as_ref().map_or(0, |a| a.len())
+                })
+            });
+            entry()
+                + layout::arc_of::<RwLock<crate::types::VectorSetInner>>()
+                + layout::std_hash_map::<crate::key_bytes::KeyBytes, crate::types::VSetEntry>(
+                    inner.entries.capacity(),
+                )
+                + elements
         }
 
         ValueRef::Array(arc) => {
@@ -249,6 +241,14 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // Per entry: 8-byte index key + value bytes + BTreeMap node share.
             key_overhead + len * (8 + avg + 32) + 100
         }
+
+        // What it takes: its structures and its bytes, all of them.
+        ValueRef::Sketch(arc) => {
+            key_overhead
+                + 16
+                + std::mem::size_of::<parking_lot::RwLock<crate::sketch::Sketch>>()
+                + arc.read().memory_bytes()
+        }
         ValueRef::HashEx(arc) => {
             let inner = arc.read();
             let expiring = inner.expiries.len();
@@ -261,12 +261,14 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let watched = if expiring == 0 {
                 0
             } else {
-                crate::field_expiry::watch_entry_size(key.len())
+                crate::field_expiry::watch_entry_size(key)
             };
             entry()
                 + layout::arc_of::<RwLock<HashInner>>()
                 + layout::hash_fields(&inner.fields, samples)
-                + layout::std_hash_map::<String, std::time::Instant>(inner.expiries.capacity())
+                + layout::std_hash_map::<String, crate::types::FieldDeadline>(
+                    inner.expiries.capacity(),
+                )
                 + names
                 + watched
         }
@@ -610,8 +612,10 @@ fn doctor_says(
 ///
 /// Freeing a Rust allocation only returns it to the allocator. glibc keeps the
 /// pages mapped in its arena free lists until asked, so without this a flush
-/// shows up nowhere in `used_memory` (which is RSS). Used by `MEMORY PURGE` and
-/// by flushes big enough to be worth the walk over every arena.
+/// shows up nowhere in RSS (`used_memory_rss`). Used by `MEMORY PURGE`, by
+/// flushes big enough to be worth the walk over every arena, and by the thread
+/// that gives memory back after a large fall in what is allocated
+/// (`give_back`).
 pub(crate) fn purge_allocator() {
     #[cfg(target_os = "linux")]
     unsafe {

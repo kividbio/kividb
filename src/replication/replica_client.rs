@@ -148,6 +148,15 @@ impl ReplicaStarter {
         self.repl_state.set_master_addr(&host, port);
         self.repl_state.become_slave();
         self.repl_state.set_link_state(LinkState::Connect);
+        // As Redis ends them: a client blocked on a master waits for what
+        // only a master is written (#591). Counted first: a command that
+        // parks from here on, before it is listed as blocked, sees the
+        // count change and ends as the sweep would have ended it.
+        crate::commands::blocking::note_role_change(&self.repl_state);
+        let ended = self.client_registry.end_blocked_for_role_change();
+        if ended > 0 {
+            log_info!("Replication: ended {ended} blocked client(s): this node is now a replica");
+        }
 
         let starter = self.clone();
         let spawned = std::thread::Builder::new()
@@ -173,6 +182,8 @@ enum SessionEnd {
     MasterClosed,
     /// A newer `REPLICAOF` or a promotion took over; this task must stop.
     Superseded,
+    /// `CLIENT KILL` ended the link to the master; it is made again.
+    Killed,
 }
 
 #[derive(Debug)]
@@ -287,6 +298,14 @@ pub async fn start_replica(
             }
             Ok(SessionEnd::MasterClosed) => {
                 log_warn!("Replication: Master closed the connection — reconnecting");
+                failures = 0;
+                unfollowable = 0;
+                RECONNECT_DELAY
+            }
+            Ok(SessionEnd::Killed) => {
+                log_warn!(
+                    "Replication: The link to the master was killed (CLIENT KILL) — reconnecting"
+                );
                 failures = 0;
                 unfollowable = 0;
                 RECONNECT_DELAY
@@ -482,6 +501,16 @@ async fn run_replication_session(
     .await?;
     stream.set_nodelay(true)?;
     tune_replication_socket(&stream, timeout);
+    // How the link is listed among this node's clients, once it streams.
+    let link_addrs = (
+        stream
+            .peer_addr()
+            .map_or_else(|_| addr.clone(), |a| a.to_string()),
+        stream
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
+    );
 
     // Over TLS with `tls-replication` (or `tls-cluster`): see `node_tls`.
     type Reader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
@@ -640,6 +669,12 @@ async fn run_replication_session(
             .find_map(|line| line.strip_prefix("kividb_version:"))
             .map(|version| version.trim().to_string())
     });
+    // Asked only of a master whose `PSYNC` reply does not say.
+    let info_keeps_vset_quant = crate::replication::vset_quant_kept_by(master_info.as_deref());
+    // Unknown again until this master's `PSYNC` reply.
+    repl_state
+        .master_keeps_vset_quant
+        .store(false, Ordering::Relaxed);
     repl_state.master_dd_deletes.store(
         master_version
             .as_deref()
@@ -706,7 +741,15 @@ async fn run_replication_session(
     // of offering a sync: see `ClusterState::check_dataset_at_start`.
     send_command(
         &mut writer,
-        &["REPLCONF", "capa", "dataset-digest", "capa", "lost-data"],
+        &[
+            "REPLCONF",
+            "capa",
+            "dataset-digest",
+            "capa",
+            "lost-data",
+            "capa",
+            "vset-quant",
+        ],
     )
     .await?;
     let _ = guarded(
@@ -815,6 +858,25 @@ async fn run_replication_session(
         .first()
         .map(|s| s.trim_start_matches('+').to_ascii_uppercase())
         .unwrap_or_default();
+    // Before any of the stream is applied, logged or recorded.
+    let keeps_vset_quant = if crate::replication::psync_reply_keeps_vset_quant(&fullresync) {
+        true
+    } else {
+        let syncs = cmd0 == "FULLRESYNC" || cmd0 == "CONTINUE";
+        if syncs && !info_keeps_vset_quant {
+            log_info!(
+                "Replication: The master (KiviDB {}) did not offer vset-quant: this replica \
+                 stores its vector sets as f32, as an older master did",
+                master_version
+                    .as_deref()
+                    .unwrap_or("?, no INFO server answer")
+            );
+        }
+        info_keeps_vset_quant
+    };
+    repl_state
+        .master_keeps_vset_quant
+        .store(keeps_vset_quant, Ordering::Relaxed);
 
     // The stream as it will be read below: what has arrived and is not yet
     // applied, how many bytes have arrived in all, and which database the
@@ -1042,10 +1104,12 @@ async fn run_replication_session(
             if local_keys > 0 && is_kdb && repl_state.flush_before_load.load(Ordering::Relaxed) {
                 Some(
                     crate::snapshot::verify_snapshot(rdb_bytes.as_slice()).map_err(|e| {
-                        SessionError::Link(format!(
-                            "full-sync payload is not a valid KDB image ({e}); the local dataset \
-                         is untouched"
-                        ))
+                        payload_refusal(e, |e| {
+                            format!(
+                                "full-sync payload is not a valid KDB image ({e}); the local \
+                                 dataset is untouched"
+                            )
+                        })
                     })?,
                 )
             } else {
@@ -1064,6 +1128,7 @@ async fn run_replication_session(
                 {
                     let _cut = crate::write_gate::cut();
                     let empty = store::new_store(config.databases);
+                    touch_watches_of_replaced(store, &empty);
                     store::swap_kv_with_staging(store, &empty);
                     crate::aof::log_superseded();
                     index_store.write().clear();
@@ -1102,6 +1167,7 @@ async fn run_replication_session(
             // Stop the world for the swap, the same way a checkpoint does, so a
             // local AOF record cannot straddle it.
             let _cut = crate::write_gate::cut();
+            touch_watches_of_replaced(store, &staged.store);
             store::swap_kv_with_staging(store, &staged.store);
             // The open log is of the dataset this replaced (#350).
             crate::aof::log_superseded();
@@ -1143,6 +1209,10 @@ async fn run_replication_session(
             offset: master_offset,
             db: 0,
         }));
+        // Nothing before this offset is continuable; an older watermark is another numbering.
+        repl_state
+            .vset_quant_dropped_until
+            .store(master_offset, Ordering::Relaxed);
         repl_state.set_stream_origin(repl_state.cluster_master_node());
         // Every key in it that this master expires is sent as a `DEL`, if
         // it sends them at all: nothing is left for a sweep.
@@ -1269,7 +1339,13 @@ async fn run_replication_session(
     send_ack(&mut writer, applied, timeout).await?;
     let mut last_ack = Instant::now();
 
-    // The link is up from here: synced, and about to stream.
+    // The link is up from here: synced, and about to stream. Listed among
+    // the clients as the master (`flags=M`), as Redis lists it.
+    let mut master_link = crate::client_registry::MasterLink::register(
+        &starter.client_registry,
+        link_addrs.0,
+        link_addrs.1,
+    );
     upstream.mark_synced();
     repl_state.note_master_io();
     log_info!("Replication: Synced with {addr}. Entering command stream.");
@@ -1322,6 +1398,12 @@ async fn run_replication_session(
             let read_n = tokio::select! {
                 res = inner.read(&mut temp) => Some(res?),
                 _ = tokio::time::sleep(EPOCH_CHECK_INTERVAL) => None,
+                // `CLIENT KILL` of the master link: dropped where it stands,
+                // between commands, and continued from there.
+                () = master_link.killed() => {
+                    log_info!("Replication: Link to {addr} killed by CLIENT KILL");
+                    return Ok(SessionEnd::Killed);
+                }
             };
             match read_n {
                 Some(0) => {
@@ -1332,6 +1414,7 @@ async fn run_replication_session(
                     offset += n as u64;
                     last_io = Instant::now();
                     repl_state.note_master_io();
+                    master_link.touch();
                     pending_input = true;
                     drained = n < temp.len();
                 }
@@ -1352,12 +1435,22 @@ async fn run_replication_session(
         let mut applied_commands = false;
         if pending_input {
             pending_input = false;
+            // Stored as the older master did; the backlog keeps raw bytes for offsets.
+            let keeps_vset_quant = repl_state.master_keeps_vset_quant.load(Ordering::Relaxed);
+            let mut dropped_vset_quant = false;
             // One command, a write the master sent as it is.
             macro_rules! apply {
                 ($cmd:expr) => {
                     repl_apply
                         .apply_command(
-                            $cmd,
+                            if keeps_vset_quant {
+                                $cmd
+                            } else {
+                                let (cmd, dropped) =
+                                    crate::vector::quant::without_quant_options($cmd);
+                                dropped_vset_quant |= dropped;
+                                cmd
+                            },
                             store,
                             repl_state,
                             index_store,
@@ -1476,11 +1569,7 @@ async fn run_replication_session(
                             // goes on as long as the commands want it alone,
                             // and no further.
                             let wants_alone =
-                                crate::commands::handler::applied_takes_the_gate_alone(
-                                    store,
-                                    selected_db,
-                                    &cmd,
-                                );
+                                crate::commands::handler::applied_takes_the_gate_alone(&cmd);
                             if wants_alone && !alone {
                                 next_alone = true;
                                 break;
@@ -1513,6 +1602,11 @@ async fn run_replication_session(
                 head += parse_pos;
                 transaction_scanned = 0;
                 applied = offset - (repl_buf.len() - head) as u64;
+                if std::mem::take(&mut dropped_vset_quant) {
+                    repl_state
+                        .vset_quant_dropped_until
+                        .fetch_max(applied, Ordering::Relaxed);
+                }
                 repl_state.repl_offset.store(applied, Ordering::Relaxed);
                 if let Some(point) = repl_state.resync_point.lock().as_mut() {
                     point.offset = applied;
@@ -1701,6 +1795,30 @@ struct StagedSync {
     keys_with_ttl: usize,
 }
 
+/// The refusal of a KDB full-sync payload, for `e`. One read whole and
+/// refused for its databases (#482), or for keys outside database 0 of a
+/// cluster node (#484), is [`SessionError::Unfollowable`]: the same master
+/// sends the same again. Anything else is a broken link. `what` words it.
+fn payload_refusal(
+    e: std::io::Error,
+    what: impl FnOnce(&std::io::Error) -> String,
+) -> SessionError {
+    let refused = crate::snapshot::is_past_databases(&e);
+    let e = crate::snapshot::refusal_of_payload(e);
+    if !refused {
+        return SessionError::Link(what(&e));
+    }
+    if e.to_string()
+        .contains(crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0)
+    {
+        return SessionError::Unfollowable(format!(
+            "full-sync payload refused ({e}); the local dataset is untouched. {}",
+            crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_SYNC
+        ));
+    }
+    SessionError::Unfollowable(what(&e))
+}
+
 /// Parse a full-sync payload into fresh staging stores.
 ///
 /// The master sends a native KDB image (`KIVIDB01`); a Redis master sends an
@@ -1718,7 +1836,9 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
         let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
-            SessionError::Link(format!("full-sync payload is not a valid KDB image: {e}"))
+            payload_refusal(e, |e| {
+                format!("full-sync payload is not a valid KDB image: {e}")
+            })
         })?;
         (
             loaded.dbs,
@@ -1733,10 +1853,17 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
                 let what = format!("full-sync payload is not a valid RDB: {e}");
                 // Refused for what it holds (it would be refused again), not
                 // cut short or corrupt: see `SessionError::Unfollowable`.
-                if crate::snapshot::is_unrepresentable(&e) {
-                    SessionError::Unfollowable(what)
-                } else {
-                    SessionError::Link(what)
+                // Its checksum decides where it has one: a wrong one is
+                // damage on the way, whatever the reading made of it; a
+                // right one is what the master holds, whatever refused it
+                // (#483).
+                match crate::snapshot::rdb_payload_checksum(payload) {
+                    Some(false) => SessionError::Link(what),
+                    Some(true) => SessionError::Unfollowable(what),
+                    None if crate::snapshot::is_unrepresentable(&e) => {
+                        SessionError::Unfollowable(what)
+                    }
+                    None => SessionError::Link(what),
                 }
             })?;
         (dbs, expiries, Vec::new(), Vec::new(), functions)
@@ -1752,6 +1879,27 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
         keys,
         keys_with_ttl,
     })
+}
+
+/// Before the dataset `store` holds is replaced by `incoming` (a full sync):
+/// a watch on a key that is in either is broken, as a flush or a `SWAPDB`
+/// breaks it, and one on a key in neither holds (Redis touches every watched
+/// key when a replica loads its master's data, `touchAllWatchedKeysInDb`).
+/// The watches stayed: a client that had watched a key on the replica ran
+/// its `EXEC` over a dataset that had been replaced under it (#673). Called
+/// with the write gate cut, so nothing writes to either meanwhile.
+fn touch_watches_of_replaced(store: &Store, incoming: &Store) {
+    use crate::watch::WatchNotifier;
+    let watches = crate::watch::ForStore(store);
+    if !watches.has_watchers() {
+        return;
+    }
+    watches.notify_replaced(None, &|db, key| {
+        (
+            crate::watch::presence(store, db, key),
+            crate::watch::presence(incoming, db, key),
+        )
+    });
 }
 
 fn count_keys(store: &Store) -> usize {
@@ -2302,6 +2450,10 @@ pub async fn handle_replica_connection<R, W>(
     listening_port: Option<u16>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
+    // It sent `REPLCONF capa vset-quant`.
+    vset_quant_announced: bool,
+    // The connection's `CLIENT KILL` signal: it ends the link (#595).
+    mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -2316,12 +2468,14 @@ where
     // ── 1. The stream queue. The hub starts filling it at the cut below.
     // Must be **unbounded**: the forwarding task doesn't drain until the payload is sent; a bounded
     // queue hits capacity during long dumps and evicts the replica (connected_slaves goes to 0).
-    let (replica_tx, mut replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
+    let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let (rdb_enqueued_tx, rdb_enqueued_rx) = tokio::sync::oneshot::channel();
     // Shared with the hub: it increments this on enqueue, we decrement it after each
     // successful flush. Lets the hub evict us if we fall far enough behind instead of
     // queueing an unbounded backlog — see `replication::mod::start_hub`.
-    let pending_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_bytes = Arc::new(crate::replication::ReplicaQueue::default());
+    // Frees what is queued however the forwarder ends, and says so.
+    let mut replica_rx = crate::replication::QueueRx::new(replica_rx, Arc::clone(&pending_bytes));
 
     // The forwarder writes to the socket itself, one batch at a time, as the
     // io_uring loop's does. Handed to the writer task, the replica's queue
@@ -2351,26 +2505,40 @@ where
                 Some(p) => p,
                 None => break,
             };
+            if pending_bytes_fwd.abandoned() {
+                // Let go of for falling too far behind: what is queued is
+                // freed now, as `replica_rx` is dropped, not sent (see
+                // `ReplicaQueue::abandon`).
+                return;
+            }
 
             let mut batch = Vec::with_capacity(first.len().min(BATCH_MAX_BYTES));
             batch.extend_from_slice(first.as_ref());
+            // The memory the payloads took while queued (see `ReplicaQueue`).
+            let mut held = crate::replication::ReplicaQueue::held_for(first.len());
+            drop(first);
 
             loop {
                 if batch.len() >= BATCH_MAX_BYTES {
                     break;
                 }
                 match replica_rx.try_recv() {
-                    Ok(p) => batch.extend_from_slice(p.as_ref()),
+                    Ok(p) => {
+                        batch.extend_from_slice(p.as_ref());
+                        held += crate::replication::ReplicaQueue::held_for(p.len());
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
-                        write_batch(batch).await;
+                        pending_bytes_fwd.taken(batch.len(), held);
+                        if !pending_bytes_fwd.abandoned() {
+                            write_batch(batch).await;
+                        }
                         return;
                     }
                 }
             }
 
-            pending_bytes_fwd.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+            pending_bytes_fwd.taken(batch.len(), held);
             if !write_batch(batch).await {
                 break;
             }
@@ -2437,11 +2605,13 @@ where
     // The payload is not counted against `maxmemory` until it is written
     // (#284).
     let mut payload_not_counted = None;
+    // Outside the stream: offsets do not count it.
+    let word = repl_state.vset_quant_word(vset_quant_announced);
     match full_sync {
-        None => frames.push(format!("+CONTINUE {}\r\n", repl_state.repl_id()).into_bytes()),
+        None => frames.push(format!("+CONTINUE {}{word}\r\n", repl_state.repl_id()).into_bytes()),
         Some(sync) => {
             if !legacy_sync {
-                frames.push(sync.announcement(&repl_state.repl_id()).into_bytes());
+                frames.push(sync.announcement(&repl_state.repl_id(), word).into_bytes());
             }
             frames.push(format!("${}\r\n", sync.payload.len()).into_bytes());
             frames.push(sync.payload);
@@ -2458,17 +2628,37 @@ where
     // counted against `maxmemory`, rather than in the writer's behind the
     // payload, which was; and the payload is let go of once it is written.
     // Nothing is queued for the writer task before these.
-    {
+    //
+    // Raced against the replica going silent or being let go of: one that
+    // stops reading during its full sync is let go of once its queue passes
+    // its limit, and the write is given up then, rather than waited on for
+    // good with its queue and the payload held (#542).
+    let sent = {
         use tokio::io::AsyncWriteExt;
         let mut out = writer.lock().await;
-        for frame in frames {
-            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(frame.len() as u64, Ordering::Relaxed);
-            if out.write_all(&frame).await.is_err() {
-                rollback_hub(&hub_tx, replica_id);
-                drop(rdb_enqueued_tx);
-                return Ok(());
+        let write_frames = async {
+            for frame in frames {
+                crate::stats::TOTAL_NET_OUTPUT_BYTES
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                if out.write_all(&frame).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        };
+        tokio::select! {
+            sent = write_frames => sent,
+            _ = repl_state.replica_timed_out(replica_id) => {
+                log_warn!("Replication: replica {endpoint} let go of during its full sync");
+                false
             }
         }
+    };
+    if !sent {
+        rollback_hub(&hub_tx, replica_id);
+        drop(rdb_enqueued_tx);
+        forward_task.abort();
+        return Ok(());
     }
     drop(payload_not_counted);
 
@@ -2537,16 +2727,30 @@ where
         _ = &mut forward_task => {
             drop(resp_tx);
         }
-        // A replica that has gone silent: see `ReplState::replica_timed_out`.
-        _ = repl_state.replica_timed_out(replica_id) => {
-            log_warn!(
-                "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
-                repl_state.repl_timeout().as_secs()
-            );
+        // `CLIENT KILL`: the link ends here, as on the io_uring loop, where
+        // the kill shuts the socket. The replica connects again and is
+        // continued from the backlog.
+        Ok(()) = &mut kill_rx => {
+            log_info!("Replication: Link to replica {endpoint} killed by CLIENT KILL");
+            forward_task.abort();
+            write_task.abort();
+        }
+        // A replica that has gone silent, or that the hub has let go of:
+        // see `ReplState::replica_timed_out`.
+        silent = repl_state.replica_timed_out(replica_id) => {
+            if silent {
+                log_warn!(
+                    "Replication: disconnecting timedout replica {endpoint}: no REPLCONF ACK for {} s (repl-timeout)",
+                    repl_state.repl_timeout().as_secs()
+                );
+            }
             forward_task.abort();
             write_task.abort();
         }
     }
+    // However the connection ended, its forwarder ends with it: left
+    // running, it held the replica's queue after the hub had forgotten it.
+    forward_task.abort();
     ack_reader_task.abort();
 
     // Hub drops channel list + ACK + connected_slaves (paired with hub RegisterChannel fetch_add).
@@ -2822,6 +3026,65 @@ mod full_sync_guard_tests {
 
         // Not a KDB image and not an RDB either.
         assert!(load_full_sync_payload(b"definitely not a dataset", 16).is_err());
+    }
+
+    /// A Redis payload refused for what it holds is unfollowable: tried
+    /// again later and later, its reason shown, as KeyDB's and Dragonfly's
+    /// are. Before, the refusals of Redis's own content (module values and
+    /// data, opcodes 0xF2/0xF3/0xF6, an unknown type) were link errors,
+    /// retried every second, each a full sync on the master (#483). A wrong
+    /// checksum says the payload was damaged on the way: a link error, as
+    /// before, whatever the reading made of it.
+    #[test]
+    fn a_redis_payload_refused_for_what_it_holds_is_unfollowable() {
+        let with_checksum = |body: &[u8], sum: Option<u64>| {
+            let mut payload = body.to_vec();
+            let sum = sum.unwrap_or_else(|| crate::snapshot::redis_crc64(body));
+            payload.extend_from_slice(&sum.to_le_bytes());
+            payload
+        };
+        let unfollowable = |payload: &[u8]| {
+            matches!(
+                load_full_sync_payload(payload, 16),
+                Err(super::SessionError::Unfollowable(_))
+            )
+        };
+        let link = |payload: &[u8]| {
+            matches!(
+                load_full_sync_payload(payload, 16),
+                Err(super::SessionError::Link(_))
+            )
+        };
+        // A key of RDB type 30, which no Redis writes yet.
+        let mut unknown_type = b"REDIS0012\xfe\x00".to_vec();
+        unknown_type.extend_from_slice(&[30, 1, b'k', 0, 0xff]);
+        // A hash template (opcode 0xF2).
+        let template = b"REDIS0012\xfe\x00\xf2\x00\xff".to_vec();
+        for body in [&unknown_type, &template] {
+            assert!(unfollowable(&with_checksum(body, None)), "{body:?}");
+            // No checksum (`rdbchecksum no`): refused by what it is.
+            assert!(unfollowable(&with_checksum(body, Some(0))), "{body:?}");
+            // A wrong one: damaged on the way.
+            assert!(link(&with_checksum(body, Some(12345))), "{body:?}");
+        }
+        // A payload cut short: no checksum to vouch for it, and nothing
+        // refused for what it is.
+        assert!(link(b"REDIS0012\xfe\x00\x00\x01k"));
+    }
+
+    /// A 1.2.0 master's payload that reads more than one way (#441) is an
+    /// error, with no staged dataset, and says what to do about the master.
+    #[test]
+    fn a_payload_that_reads_more_than_one_way_is_an_error() {
+        let payload = crate::snapshot::readings_tests::two_ways();
+        match load_full_sync_payload(&payload, 16) {
+            Err(super::SessionError::Link(why)) => {
+                assert!(why.contains("can be read more than one way"), "{why}");
+                assert!(why.contains("upgrade the master"), "{why}");
+            }
+            Err(_) => panic!("refused for something else"),
+            Ok(_) => panic!("a dataset was staged"),
+        }
     }
 
     /// Values, expiries and the key count all survive the payload round trip.

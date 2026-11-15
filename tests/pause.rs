@@ -447,3 +447,21 @@ fn a_pause_of_writers_holds_georadius_store() {
     assert_eq!(store_alone.read(), V::Int(1));
     assert_eq!(c.cmd(&["EXISTS", "near", "dist"]), V::Int(2));
 }
+
+/// `CLIENT REPLY SKIP` before a command that waits is for that command's
+/// reply, given when it is dispatched again, and is not used up by the
+/// dispatch that parked it: the `BLPOP`'s reply is skipped, the `PING`
+/// after it is answered. The same for a write a `CLIENT PAUSE` sends back
+/// to be held (#629), which is dispatched again in the same way.
+#[test]
+fn client_reply_skip_is_for_a_command_that_parked() {
+    let _one = one_pause_at_a_time();
+    let mut c = start_server();
+    let port = c.stream.peer_addr().unwrap().port();
+    let mut skipping = Conn::connect(port);
+    skipping.send(&["CLIENT", "REPLY", "SKIP"]);
+    skipping.send(&["BLPOP", "skiplist", "0"]);
+    wait_blocked(&mut c, 1);
+    assert_eq!(c.cmd(&["LPUSH", "skiplist", "x"]), V::Int(1));
+    assert_eq!(skipping.cmd(&["PING"]), V::Simple("PONG".into()));
+}

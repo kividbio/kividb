@@ -602,6 +602,11 @@ pub(crate) async fn broadcast_auth_request(
         })
     };
 
+    // An automatic failover's request says which slots this node would
+    // take over, so that a master that knows a newer owner of one refuses
+    // its vote (#524). Not a manual one's, whose fifth field is `force`.
+    let claims =
+        (!force && !test_auth_request_without_claims()).then(|| state.slot_claims_of(master_id));
     let msg = BusMessage::FailoverAuthRequest {
         sender_id: state.myself(),
         sender_ip: state.advertised_ip(&me.ip),
@@ -610,6 +615,7 @@ pub(crate) async fn broadcast_auth_request(
         request_epoch: epoch,
         master_id,
         force,
+        claims,
     };
 
     for (peer_id, ip, bus_port) in masters {
@@ -653,6 +659,14 @@ pub(crate) async fn broadcast_auth_request(
             }
         });
     }
+}
+
+/// For the tests of a cluster of mixed versions, and never set otherwise:
+/// `KIVIDB_TEST_AUTH_REQUEST_WITHOUT_CLAIMS`, set, has this node ask for
+/// votes as an earlier version does, without its claims (#524).
+fn test_auth_request_without_claims() -> bool {
+    static WITHOUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WITHOUT.get_or_init(|| std::env::var_os("KIVIDB_TEST_AUTH_REQUEST_WITHOUT_CLAIMS").is_some())
 }
 
 /// For the tests of an election that runs long, and never set otherwise:

@@ -12,7 +12,8 @@
 #   build     release binary with lua,tls
 #   matrix    traffic through both I/O models: pub/sub, blocking, replication
 #             determinism, AOF durability, e2e under RESP2 and RESP3
-#   compat    Redis's own Tcl suite (a measurement, never fails the gate)
+#   compat    Redis's own Tcl suite: fails on a failure not known
+#             (scripts/redis_compat_known_failures.txt)
 #
 # Every stage runs even if an earlier one failed; the summary at the end says
 # which did, and the exit status is 1 if any did.
@@ -107,9 +108,8 @@ for stage in "${STAGES[@]}"; do
         git clone -q --depth 1 --branch 8.10.2 https://github.com/redis/redis.git "$suite"
       fi
       (cd "$suite" && git checkout -q .)
-      bash scripts/redis_compat.sh "$CARGO_TARGET_DIR/release/kividb" "$suite" "$LOGDIR/redis-compat"
-      ORDER+=("redis compat")
-      RESULT["redis compat"]="measured: $LOGDIR/redis-compat/summary.md (not a gate)"
+      run "redis compat gate test" bash scripts/redis_compat_check_test.sh
+      run "redis compat" bash scripts/redis_compat.sh "$CARGO_TARGET_DIR/release/kividb" "$suite" "$LOGDIR/redis-compat"
       ;;
     *)
       echo "unknown stage: $stage" >&2
