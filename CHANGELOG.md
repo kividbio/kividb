@@ -271,6 +271,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
+  the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
+  `DISCARD`, `RESET` and `AUTH` were counted with 0 microseconds; they, and
+  now `WAIT` and `WAITAOF`, report the time they took. For the two, as in
+  Redis, that is the work of the call and not the time the client was
+  blocked, so `usec_per_call` stays in microseconds however long a `WAIT`
+  waits. Inside `MULTI` they are counted once, when `EXEC` runs them.
+  Thanks to @matheussilvano.
+
 - **`HELLO` says `mode: cluster` on a node in cluster mode (#502).** It said
   `standalone` on every node, so a client that reads it to decide whether to
   route by slot took a cluster for a single node. On a replica `role` is now
