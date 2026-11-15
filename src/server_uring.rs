@@ -1130,10 +1130,10 @@ pub async fn handle_client(
             // this one reads: it sees what they took (#42). A write does not
             // wait for them, nor does its reply, which waits with the others
             // for the batch to be written.
-            if blocking_slot.settles_before(cmd[0]) {
-                if let Some(settling) = blocking_slot.settle() {
-                    settling.await;
-                }
+            if blocking_slot.settles_before(cmd[0])
+                && let Some(settling) = blocking_slot.settle()
+            {
+                settling.await;
             }
             // ── QUIT ─────────────────────────────────────────────────────────
             // Reply +OK and close the connection. Handled in the connection
