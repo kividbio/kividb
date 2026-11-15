@@ -739,19 +739,22 @@ async fn run_replication_session(
     // And a master that came back without its dataset says so
     // (`+LOSTDATA <its node id>`) to a replica that takes that word, instead
     // of offering a sync: see `ClusterState::check_dataset_at_start`.
-    send_command(
-        &mut writer,
-        &[
-            "REPLCONF",
-            "capa",
-            "dataset-digest",
-            "capa",
-            "lost-data",
-            "capa",
-            "vset-quant",
-        ],
-    )
-    .await?;
+    //
+    // And the imports a cluster master has under way (`slot-imports`,
+    // #741), unless a test has this node act as an earlier release.
+    let mut capas = vec![
+        "REPLCONF",
+        "capa",
+        "dataset-digest",
+        "capa",
+        "lost-data",
+        "capa",
+        "vset-quant",
+    ];
+    if !crate::replication::hides_slot_imports_capability() {
+        capas.extend(["capa", crate::replication::SLOT_IMPORTS_CAPA]);
+    }
+    send_command(&mut writer, &capas).await?;
     let _ = guarded(
         read_line(&mut reader),
         timeout,
@@ -877,6 +880,16 @@ async fn run_replication_session(
     repl_state
         .master_keeps_vset_quant
         .store(keeps_vset_quant, Ordering::Relaxed);
+    // What this node knew of its master's slot imports holds for this
+    // session only if the master tells of them, and the dataset is not
+    // replaced (#741).
+    if cmd0 == "FULLRESYNC" || cmd0 == "CONTINUE" {
+        repl_state.slot_imports_event(crate::replication::SlotImportsEvent::Session {
+            marked: !crate::replication::hides_slot_imports_capability()
+                && crate::replication::psync_reply_has_slot_imports(&fullresync),
+            full: cmd0 == "FULLRESYNC",
+        });
+    }
 
     // The stream as it will be read below: what has arrived and is not yet
     // applied, how many bytes have arrived in all, and which database the
@@ -1530,6 +1543,8 @@ async fn run_replication_session(
                     );
                     return Ok(SessionEnd::Superseded);
                 }
+                // A slot-imports marker at the front of what is left (#741).
+                let mut marker: Option<usize> = None;
                 let parse_pos = match transaction {
                     Some(whole) => {
                         // As `EXEC` runs on the master: alone, so that no
@@ -1559,6 +1574,16 @@ async fn run_replication_session(
                                 heartbeats_seen = true;
                                 parse_pos += consumed;
                                 continue;
+                            }
+                            if cmd.first().is_some_and(|name| {
+                                name.eq_ignore_ascii_case(crate::replication::SLOT_IMPORTS_MARKER)
+                            }) {
+                                // Not part of the stream: on a turn of its
+                                // own, below, at the front.
+                                if parse_pos == 0 {
+                                    marker = Some(consumed);
+                                }
+                                break;
                             }
                             if heartbeats {
                                 // The rest, on a turn with the gate.
@@ -1591,6 +1616,20 @@ async fn run_replication_session(
                         parse_pos
                     }
                 };
+                if let Some(consumed) = marker {
+                    // Told the cluster layer here, every command before it
+                    // applied and none after, under the lock a promotion
+                    // takes; then taken out of the stream: no offset counts
+                    // it, no backlog keeps it, nothing applies it.
+                    if let Some((_, cmd)) = parse_resp_command(&repl_buf[head..head + consumed]) {
+                        repl_state
+                            .slot_imports_event(crate::replication::SlotImportsEvent::Marker(&cmd));
+                    }
+                    repl_buf.drain(head..head + consumed);
+                    offset -= consumed as u64;
+                    transaction_scanned = 0;
+                    continue;
+                }
                 if parse_pos == 0 {
                     if next_alone {
                         continue;
@@ -2452,6 +2491,8 @@ pub async fn handle_replica_connection<R, W>(
     psync: Option<crate::replication::PsyncRequest>,
     // It sent `REPLCONF capa vset-quant`.
     vset_quant_announced: bool,
+    // It sent `REPLCONF capa slot-imports`.
+    slot_imports_announced: bool,
     // The connection's `CLIENT KILL` signal: it ends the link (#595).
     mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -2558,6 +2599,7 @@ where
         peer_port,
         tx: replica_tx,
         pending_bytes,
+        slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
@@ -2606,12 +2648,12 @@ where
     // (#284).
     let mut payload_not_counted = None;
     // Outside the stream: offsets do not count it.
-    let word = repl_state.vset_quant_word(vset_quant_announced);
+    let word = repl_state.psync_words(vset_quant_announced, slot_imports_announced);
     match full_sync {
         None => frames.push(format!("+CONTINUE {}{word}\r\n", repl_state.repl_id()).into_bytes()),
         Some(sync) => {
             if !legacy_sync {
-                frames.push(sync.announcement(&repl_state.repl_id(), word).into_bytes());
+                frames.push(sync.announcement(&repl_state.repl_id(), &word).into_bytes());
             }
             frames.push(format!("${}\r\n", sync.payload.len()).into_bytes());
             frames.push(sync.payload);

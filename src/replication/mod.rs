@@ -74,6 +74,11 @@ pub struct ReplState {
     pub master_dd_deletes: AtomicBool,
     /// Whether the current master stores `VADD` quantization; false until its `PSYNC` reply.
     pub master_keeps_vset_quant: AtomicBool,
+    /// Whether this node, as a master, tells the replicas that ask for it
+    /// (`REPLCONF capa slot-imports`) which atomic slot imports it has
+    /// under way (#741). Set by the cluster layer at startup, in cluster
+    /// mode only. See [`SLOT_IMPORTS_MARKER`].
+    pub sends_slot_imports: AtomicBool,
     /// Master offset after the last stripped `VADD`; earlier continuations
     /// would re-apply its options.
     pub vset_quant_dropped_until: AtomicU64,
@@ -282,12 +287,33 @@ pub struct ClusterLink {
     /// `why`: an election that does not wait for the master to be failed.
     /// False when it cannot (it is not that master's replica).
     pub take_over: TakeOverFn,
+    /// What the replication client learns of its master's atomic slot
+    /// imports, and a promotion: see [`SlotImportsEvent`] (#741).
+    pub slot_imports: SlotImportsFn,
 }
 
 /// See [`ClusterLink::master_node`].
 pub type MasterNodeFn = Box<dyn Fn() -> Option<String> + Send + Sync>;
 /// See [`ClusterLink::take_over`].
 pub type TakeOverFn = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+/// See [`ClusterLink::slot_imports`].
+pub type SlotImportsFn = Box<dyn Fn(SlotImportsEvent<'_>) + Send + Sync>;
+
+/// What the cluster layer is told of the imports of the master this node
+/// follows (#741).
+pub enum SlotImportsEvent<'a> {
+    /// A session with a master has begun: whether the master said it sends
+    /// [`SLOT_IMPORTS_MARKER`]s (the `slot-imports` word of its `PSYNC`
+    /// reply), and whether it sends the dataset in full (what this node
+    /// knew of the imports was of the dataset it replaces).
+    Session { marked: bool, full: bool },
+    /// A marker, as read from the stream, in its place there: every command
+    /// before it has been applied, none after it.
+    Marker(&'a [&'a [u8]]),
+    /// This node has become a master, and applies nothing more of the old
+    /// master's stream.
+    Promoted,
+}
 
 impl std::fmt::Debug for ClusterLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -517,6 +543,7 @@ impl ReplState {
             several_databases: AtomicBool::new(false),
             master_dd_deletes: AtomicBool::new(false),
             master_keeps_vset_quant: AtomicBool::new(false),
+            sends_slot_imports: AtomicBool::new(false),
             vset_quant_dropped_until: AtomicU64::new(0),
             master_propagates_expiry: AtomicBool::new(true),
             expiry_sweep_owed: AtomicBool::new(true),
@@ -588,6 +615,29 @@ impl ReplState {
         self.cluster_link
             .get()
             .is_some_and(|l| (l.take_over)(node, why))
+    }
+
+    /// Tell the cluster layer `event` (#741); nothing outside cluster mode.
+    pub fn slot_imports_event(&self, event: SlotImportsEvent<'_>) {
+        if let Some(link) = self.cluster_link.get() {
+            (link.slot_imports)(event);
+        }
+    }
+
+    /// Master side: the imports this node has under way, as a
+    /// [`SLOT_IMPORTS_MARKER`] in its two forms, for the replicas that take
+    /// them (#741): `live` at once, to those attached, in its place among
+    /// the writes; `sync` to each that attaches from now on.
+    pub fn send_slot_imports(&self, live: Vec<u8>, sync: Vec<u8>) {
+        if !self.sends_slot_imports.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::SlotImports {
+                live: Arc::from(live),
+                sync: Arc::from(sync),
+            });
+        }
     }
 
     /// The node whose stream this replica's dataset is from, if known.
@@ -1159,6 +1209,12 @@ impl ReplState {
             let _applying = self.apply_lock.lock();
             self.resync_point.lock().clone()
         });
+        // The old master's imports this node knew of are this one's to
+        // settle now (#741); and its replicas, the moment one can attach,
+        // are to be told of them.
+        if followed.is_some() {
+            self.slot_imports_event(SlotImportsEvent::Promoted);
+        }
         self.slave_mode.store(false, Ordering::Release);
         *self.master_addr.write() = None;
         *self.role.write() = "master".into();
@@ -1458,6 +1514,23 @@ impl ReplState {
         } else {
             ""
         }
+    }
+
+    /// Whether a replica that did (`announced`) or did not ask for them is
+    /// sent [`SLOT_IMPORTS_MARKER`]s.
+    pub fn sends_slot_imports_to(&self, announced: bool) -> bool {
+        announced && self.sends_slot_imports.load(Ordering::Relaxed)
+    }
+
+    /// What ends `+FULLRESYNC` or `+CONTINUE` for a replica: the
+    /// `vset-quant` word ([`Self::vset_quant_word`]), and the
+    /// `slot-imports` one for a replica sent the markers.
+    pub fn psync_words(&self, vset_quant: bool, slot_imports: bool) -> String {
+        let mut words = self.vset_quant_word(vset_quant).to_string();
+        if self.sends_slot_imports_to(slot_imports) {
+            words.push_str(SLOT_IMPORTS_WORD);
+        }
+        words
     }
 }
 
@@ -2143,6 +2216,8 @@ pub enum HubMsg {
         /// The offset this replica's `+FULLRESYNC` announced. Its ACKs count
         /// from here; see [`ReplicaProgress`].
         base: u64,
+        /// It is sent [`SLOT_IMPORTS_MARKER`]s.
+        slot_imports: bool,
     },
     Propagate(ReplPayload),
     /// Replica side: bytes of the master's stream this node has read and
@@ -2180,6 +2255,14 @@ pub enum HubMsg {
     /// does not pass its master's stream on (#144). Their connections close,
     /// and when they connect again they are told why.
     DropReplicas,
+    /// The atomic slot imports this master has under way changed: `live`
+    /// goes to each replica that takes [`SLOT_IMPORTS_MARKER`]s, here among
+    /// the writes; `sync` is kept, for each that attaches from now on. Not
+    /// in the backlog, nor counted in any offset (#741).
+    SlotImports {
+        live: ReplPayload,
+        sync: ReplPayload,
+    },
 }
 
 /// What a replica answers a node that asks to replicate from it: KiviDB does
@@ -2374,6 +2457,46 @@ pub fn psync_reply_keeps_vset_quant(reply: &str) -> bool {
         .split_whitespace()
         .skip(1)
         .any(|word| word == VSET_QUANT_CAPA)
+}
+
+/// The capability by which a replica asks to be told of its master's atomic
+/// slot imports, and a master's `PSYNC` reply says it tells (#741).
+pub const SLOT_IMPORTS_CAPA: &str = "slot-imports";
+
+/// Added to a `PSYNC` reply only for replicas announcing [`SLOT_IMPORTS_CAPA`].
+const SLOT_IMPORTS_WORD: &str = " slot-imports";
+
+/// The command by which a master tells a replica that took
+/// [`SLOT_IMPORTS_CAPA`] which atomic slot imports it has under way (#741):
+///
+/// `KIVIDB.IMPORTS LIVE|SYNC [<task-id> <slots> <kept>] ...`
+///
+/// `<slots>` is the import's slot ranges, `a-b,c-d`; `<kept>` the ranges
+/// of those of its slots of which the master held keys before it began, or
+/// `-` for none, or `*` while it has not looked yet (the source has been
+/// asked for nothing). `LIVE` is sent in its place among the writes, when
+/// the list changes; `SYNC` once to each such replica as it attaches, ahead
+/// of everything else it is sent.
+///
+/// It is not part of the stream: never in the backlog, the AOF or a
+/// snapshot, never counted in an offset, and never sent to a replica that
+/// did not ask for it, such as one of an earlier release.
+pub const SLOT_IMPORTS_MARKER: &[u8] = b"KIVIDB.IMPORTS";
+
+/// Whether a `+FULLRESYNC` or `+CONTINUE` line says markers follow.
+pub fn psync_reply_has_slot_imports(reply: &str) -> bool {
+    reply
+        .split_whitespace()
+        .skip(1)
+        .any(|word| word == SLOT_IMPORTS_CAPA)
+}
+
+/// Test only: `KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY` makes this node act
+/// as one of an earlier release: as a replica it does not ask for the
+/// markers, as a master it does not send them.
+pub fn hides_slot_imports_capability() -> bool {
+    static HIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIDES.get_or_init(|| std::env::var_os("KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY").is_some())
 }
 
 /// Test only: `KIVIDB_TEST_NO_VSET_QUANT_CAPABILITY` acts as an older master.
@@ -2630,6 +2753,9 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_ping = tokio::time::Instant::now();
         let mut backlog = Backlog::new();
+        // What a replica that takes them is told of this master's slot
+        // imports as it attaches (#741): the last `SYNC` form.
+        let mut slot_imports_sync: Option<ReplPayload> = None;
         // Queues of replicas let go of for falling too far behind, until
         // their forwarders have let go of what is in them (see
         // `ReplicaQueue::abandon`): memory still held for a replica.
@@ -2808,10 +2934,21 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             ReplicaState::Online,
                         );
                         let _ = progress.queue.set(Arc::clone(&registration.pending_bytes));
-                        let delivered = missed.is_empty() || {
-                            registration.pending_bytes.add(missed.len());
-                            registration.tx.send(Arc::from(missed)).is_ok()
-                        };
+                        // The imports under way first, as they stand at the
+                        // end of what it missed (#741): what it knew of
+                        // those that ended meanwhile goes, and those begun
+                        // meanwhile it did not see begin.
+                        let told = !registration.slot_imports
+                            || queue_marker(
+                                &registration.tx,
+                                &registration.pending_bytes,
+                                slot_imports_sync.get_or_insert_with(no_slot_imports),
+                            );
+                        let delivered = told
+                            && (missed.is_empty() || {
+                                registration.pending_bytes.add(missed.len());
+                                registration.tx.send(Arc::from(missed)).is_ok()
+                            });
                         if !delivered {
                             forget_replica(&state, registration.replica_id);
                             continue;
@@ -2834,6 +2971,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             // What it missed is queued: not held to the soft
                             // limit until it has drained it.
                             soft_armed: false,
+                            slot_imports: registration.slot_imports,
                         });
                         if reply.send(Ok(())).is_err() {
                             // The connection went away while it was asking.
@@ -2927,6 +3065,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     replica_id,
                     pending_bytes,
                     base,
+                    slot_imports,
                 } => {
                     // Everything queued before this message is in the
                     // dataset the replica was sent; the backlog records what
@@ -2961,6 +3100,18 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // through it.
                     let progress = state.register_replica(replica_id, peer_ip, peer_port, base);
                     let _ = progress.queue.set(Arc::clone(&pending_bytes));
+                    // The imports under way as the dataset it is sent has
+                    // them, ahead of the writes that follow it (#741).
+                    if slot_imports
+                        && !queue_marker(
+                            &tx,
+                            &pending_bytes,
+                            slot_imports_sync.get_or_insert_with(no_slot_imports),
+                        )
+                    {
+                        forget_replica(&state, replica_id);
+                        continue;
+                    }
                     channel_replicas.push(ChannelReplica {
                         id: replica_id,
                         addr: addr.clone(),
@@ -2973,8 +3124,22 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         peak: 0,
                         over_soft_since: 0,
                         soft_armed: false,
+                        slot_imports,
                     });
                     log_info!("Replication: Channel replica registered: {addr}");
+                }
+
+                HubMsg::SlotImports { live, sync } => {
+                    slot_imports_sync = Some(sync);
+                    channel_replicas.retain(|replica| {
+                        if !replica.slot_imports
+                            || queue_marker(&replica.tx, &replica.pending_bytes, &live)
+                        {
+                            return true;
+                        }
+                        forget_replica(&state, replica.id);
+                        false
+                    });
                 }
 
                 HubMsg::Propagate(payload) => {
@@ -3153,6 +3318,9 @@ pub struct ReplicaRegistration {
     pub peer_port: u16,
     pub tx: mpsc::UnboundedSender<ReplPayload>,
     pub pending_bytes: Arc<ReplicaQueue>,
+    /// It asked for [`SLOT_IMPORTS_MARKER`]s, and this node sends them
+    /// ([`ReplState::sends_slot_imports_to`]).
+    pub slot_imports: bool,
 }
 
 /// Take the cut for a full resync: register the replica with the hub and
@@ -3209,6 +3377,7 @@ pub fn begin_full_sync(
             replica_id: registration.replica_id,
             pending_bytes: registration.pending_bytes,
             base,
+            slot_imports: registration.slot_imports,
         })
         .is_err()
     {
@@ -3330,6 +3499,28 @@ struct ChannelReplica {
     /// Its queue has been under the soft limit since its full sync or
     /// partial resync: from then on it is held to it. See [`start_hub`].
     soft_armed: bool,
+    /// It is sent [`SLOT_IMPORTS_MARKER`]s.
+    slot_imports: bool,
+}
+
+/// `KIVIDB.IMPORTS SYNC` with no import: what a replica that takes the
+/// markers is sent on attaching to a master that has never had any.
+fn no_slot_imports() -> ReplPayload {
+    Arc::from(crate::resp::write::encode_resp_command(&[
+        SLOT_IMPORTS_MARKER.to_vec(),
+        b"SYNC".to_vec(),
+    ]))
+}
+
+/// Queue a [`SLOT_IMPORTS_MARKER`] for a replica: memory it takes while
+/// queued, as a write's, but not in what it has been sent of the stream.
+fn queue_marker(
+    tx: &mpsc::UnboundedSender<ReplPayload>,
+    pending: &ReplicaQueue,
+    marker: &ReplPayload,
+) -> bool {
+    pending.add(marker.len());
+    tx.send(Arc::clone(marker)).is_ok()
 }
 
 /// Drop every trace of a replica from the shared state. Idempotent: the
@@ -4902,6 +5093,7 @@ mod replication_invariants_tests {
             replica_id: 9001,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
 
@@ -4925,6 +5117,7 @@ mod replication_invariants_tests {
             replica_id: 9002,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
 
@@ -4954,6 +5147,7 @@ mod replication_invariants_tests {
             replica_id: 9003,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
 
@@ -4994,6 +5188,7 @@ mod replication_invariants_tests {
             replica_id: 9004,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         await_connected(&state, 1).await;
@@ -5039,6 +5234,7 @@ mod replication_invariants_tests {
             replica_id: id,
             pending_bytes: Arc::clone(pending),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         rx
@@ -5697,6 +5893,7 @@ mod replication_invariants_tests {
             replica_id: 9005,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         await_connected(&state, 1).await;
@@ -5754,6 +5951,7 @@ mod replication_invariants_tests {
                 peer_port: port,
                 tx,
                 pending_bytes: Arc::clone(&queue),
+                slot_imports: false,
             },
             QueueRx::new(rx, queue),
         )
@@ -5829,6 +6027,7 @@ mod replication_invariants_tests {
             replica_id: 7002,
             pending_bytes: r.pending_bytes,
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         await_connected(&state, 1).await;

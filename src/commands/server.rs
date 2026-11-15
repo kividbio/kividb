@@ -4492,6 +4492,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     out.push_str(&format!(
                         "cluster_orphan_slots:{slots}\r\ncluster_orphan_keys:{keys}\r\n"
                     ));
+                    // And of those, the slots of which an unfinished import
+                    // into its old master brought keys, still to be
+                    // deleted (#741).
+                    out.push_str(&format!(
+                        "cluster_import_cleanup_slots:{}\r\n",
+                        crate::cluster::followed_imports::slots_to_clean(ctx.cluster)
+                    ));
                 }
                 out.push_str("\r\n");
             }
@@ -5731,6 +5738,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_lost_data = 1;
                         info.replica_vset_quant.get_or_insert(false);
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1]
+                        .eq_ignore_ascii_case(crate::replication::SLOT_IMPORTS_CAPA.as_bytes())
+                    && !crate::replication::hides_slot_imports_capability()
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_slot_imports = true;
                     });
                 }
                 if cmd[i].eq_ignore_ascii_case(b"capa")

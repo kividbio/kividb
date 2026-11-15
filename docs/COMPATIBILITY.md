@@ -258,6 +258,15 @@ other files:
   are KiviDB's own: Valkey's `CLUSTER FLUSHSLOT` deletes any slot's keys,
   the node's own included, and Redis's `SFLUSH` only those of slots the
   node owns. See [COMMANDS.md](../COMMANDS.md#keys-of-slots-a-master-does-not-serve).
+- A replica promoted after its master died part way through an atomic slot
+  import deletes what the import brought, as Redis 8 does, which tells its
+  replicas of the import in the stream (`CLUSTER SYNCSLOTS CONF ASM-TASK`).
+  Unlike Redis, which deletes every key of the import's slots the node does
+  not own (and does so too when an import begins), KiviDB keeps the keys
+  that were there before the import, and deletes only once the slot's
+  owner, asked directly, says it owns the slot and is not moving it. The
+  message (`KIVIDB.IMPORTS`) is KiviDB's own, sent only to replicas that ask
+  for it with `REPLCONF capa slot-imports`, and is not part of the stream.
 
 **Performance**
 - Many clients writing to **one key** are slower while something follows the
