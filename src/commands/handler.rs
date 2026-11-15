@@ -2595,24 +2595,20 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
         return;
     }
     let db = *ctx.selected_db;
-    let notify = || {
-        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-            let key = ctx.cmd[pos];
-            if may_be_empty && drop_if_empty(ctx, db, key) {
-                continue;
-            }
-            if waiters {
-                ctx.wait_table.notify_signal(key);
-            }
-        }
-    };
     // A blocking pop's own keys gained nothing from it: what it wakes there
-    // is no client the reply waits for (#42). What it pushes (`BLMOVE`'s
+    // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
     // destination) its handler wakes, and that is waited for.
-    if waiters && pops_blocking(name) {
-        crate::wait_table::without_collecting(notify);
-    } else {
-        notify();
+    let quiet = waiters && pops_blocking(name);
+    for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+        let key = ctx.cmd[pos];
+        if may_be_empty && drop_if_empty(ctx, db, key) {
+            continue;
+        }
+        if quiet {
+            crate::wait_table::without_collecting(|| ctx.wait_table.notify_signal(key));
+        } else if waiters {
+            ctx.wait_table.notify_signal(key);
+        }
     }
 }
 

@@ -423,8 +423,7 @@ impl BlockingSlot {
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
         if self.owner == 0 {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            self.owner = NEXT.fetch_add(1, Ordering::Relaxed);
+            self.owner = new_owner();
         }
         crate::wait_table::collect_woken_for(self.owner);
         self.ctl.awaitable = true;
@@ -458,8 +457,24 @@ impl BlockingSlot {
         // After `resume_over`: a refused resume's ticket, dropped there,
         // passes its turn on, and the client that wakes is this dispatch's to
         // wait for, as the client a handler passes the turn to is.
+        let collected = crate::wait_table::take_woken();
+        // Nearly every command: woke nobody, owes nobody a look, did not wait.
+        if collected.is_none() && parked.is_none() && self.looked.is_empty() {
+            return parked;
+        }
+        self.looked_or_waits(parked, collected)
+    }
+
+    /// [`take_parked`](Self::take_parked) for a command that woke someone,
+    /// owes a look, or waits.
+    #[cold]
+    fn looked_or_waits(
+        &mut self,
+        parked: Option<BlockingWait>,
+        collected: Option<crate::wait_table::Woken>,
+    ) -> Option<BlockingWait> {
         let mut woken = Vec::new();
-        if let Some(collected) = crate::wait_table::take_woken() {
+        if let Some(collected) = collected {
             woken = collected.woken;
             self.looked.extend(collected.owed);
         }
@@ -623,6 +638,14 @@ impl BlockingSlot {
             *gone = true;
         }
     }
+}
+
+/// A number for a connection, to the looks it waits for
+/// (`wait_table::collect_woken_for`).
+#[cold]
+fn new_owner() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Outcome of asking to park.
