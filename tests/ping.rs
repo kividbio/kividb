@@ -9,7 +9,7 @@ use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::free_port;
+use common::{free_port, port_is_free};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kividb");
 
