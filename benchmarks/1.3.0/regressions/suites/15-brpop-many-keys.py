@@ -20,8 +20,10 @@ to answer the pipeline. A PING probe (lib/probe.py) runs throughout.
 Metrics:
 
   jobs_per_s       jobs the workers received during the MEASURE window / MEASURE
-  ping_p99_ms, ping_max_ms  the probe's PINGs during the window (`jitter()`:
-                   scheduling, not CPU speed; shown, not gated)
+  ping_p99_ms      the probe's p99 PING during the window (shown, not gated)
+  ping_max_ms      its worst PING: max(1.5x recorded, Redis + 10 ms), the
+                   suites' WORST_PING (`jitter()`: scheduling, not CPU speed,
+                   so never host-scaled); v1.2.2's was 1-7 s
   lost             jobs pushed - jobs received - jobs still in the queues, once
                    the producer has stopped and the queues have drained (up
                    to DRAIN s): must be 0 on every engine (a job popped for a
@@ -49,7 +51,7 @@ import time
 import multiprocessing as mp
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, KEEP_IMPROVEMENT, THROUGHPUT, bound, info, jitter, vs_redis, scaled)  # noqa: E402
+from suite import (Suite, Config, KEEP_IMPROVEMENT, THROUGHPUT, WORST_PING, bound, info, jitter, vs_redis, scaled)  # noqa: E402
 from probe import Probe  # noqa: E402
 
 WARMUP = 8.0
@@ -209,7 +211,7 @@ def run(ctx):
     gate = jitter(gate)
     ctx.emit("jobs_per_s", in_window / (t1 - t0), "jobs/s", "higher", gate=gate)
     ctx.emit("ping_p99_ms", p99, "ms", "lower", gate=jitter(info()))
-    ctx.emit("ping_max_ms", pr.worst(t0, t1), "ms", "lower", gate=jitter(info()))
+    ctx.emit("ping_max_ms", pr.worst(t0, t1), "ms", "lower", gate=jitter(WORST_PING))
     ctx.emit("lost", lost, "jobs", "lower", gate=bound(eq=0))
     ctx.emit("blocked_after", blocked, "clients", "lower", gate=bound(eq=0))
 

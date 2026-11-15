@@ -5136,7 +5136,9 @@
       },
       "gate": [
         {
-          "kind": "info",
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10,
           "speed": false
         }
       ]
@@ -5252,7 +5254,9 @@
       },
       "gate": [
         {
-          "kind": "info",
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10,
           "speed": false
         }
       ]
@@ -5373,7 +5377,9 @@
       },
       "gate": [
         {
-          "kind": "info",
+          "kind": "rel",
+          "pct": 50,
+          "redis_plus": 10,
           "speed": false
         }
       ]

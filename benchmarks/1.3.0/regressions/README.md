@@ -738,8 +738,9 @@ producer's, which is why no gate is scaled by the host's speed. v1.2.2's
 4,000 x 270 rate is 8-31 jobs/s from run to run, so that row has no ratio
 gate (a 60 % ratio failed on the rerun with v1.2.2 at 31 against 14
 recorded, the candidate unchanged). The probe's worst `PING` during the
-window, candidate: 31-56 ms (Redis 39-242, v1.2.2 1.1-7.3 s); p99 4-6 ms
-(Redis 30-105). Every engine delivered every job exactly once (`lost` 0) and
+window, candidate: 31-56 ms (Redis 39-242, v1.2.2 1.1-7.3 s), gated as the
+other suites' worst `PING` is, at most max(1.5x recorded, Redis + 10 ms),
+not host-scaled (`jitter()`); p99 4-6 ms (Redis 30-105), shown only. Every engine delivered every job exactly once (`lost` 0) and
 left no client blocked once the workers had gone (`blocked_after` 0; the
 issue's 469 left on 1.2.2 were not reproduced here, with workers that close
 cleanly).

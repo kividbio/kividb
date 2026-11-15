@@ -648,7 +648,13 @@ pub fn wait_for_keys(
     // Stand in line before looking, so a write that lands between the look
     // and the park still wakes us. One receiver for all the keys, which the
     // first of them to be written wakes (#758).
-    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out {
+    //
+    // Not a caller that cannot wait (`MULTI`, a script, the replica
+    // applier): it only looks. Standing in line, it could be the head a
+    // push wakes, and then leave without passing the turn on, leaving the
+    // client behind it blocked with the element there.
+    let may_park = ctx.blocking.as_ref().is_some_and(|slot| slot.awaitable);
+    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out || !may_park {
         Vec::new()
     } else {
         vec![(Vec::new(), ctx.wait_table.enqueue_all(keys, &ticket))]
@@ -769,8 +775,8 @@ pub fn wait_for_keys(
             ticket.parks_in(keys, false);
             Vec::new()
         }
+        // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
-            ctx.wait_table.dequeue_all(keys, &ticket);
             crate::stats::record_miss();
             empty()
         }
@@ -1144,6 +1150,109 @@ mod gone_resume_tests {
             })
         };
         test(&run, &wait_table);
+    }
+
+    fn with_ctx(test: impl FnOnce(&mut Ctx<'_>)) {
+        // `with_server`, handing the test a `Ctx` with no blocking slot, as
+        // `MULTI`, a script and the replica applier have.
+        // The pause is the process's: a unit test pausing writes would hold
+        // these commands back (`pause::held_in_gate`).
+        let _pause = crate::pause::TEST_LOCK.lock();
+        let store = crate::store::new_store(1);
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(crate::cluster::ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        {
+            let mut ctx = Ctx {
+                cmd: Vec::new(),
+                store: &store,
+                lastsave: &lastsave,
+                selected_db: &mut selected_db,
+                aof_tx: &NoopAofSender,
+                aof_enabled: false,
+                config: &config,
+                started_at: &started_at,
+                index_store: &index_store,
+                dict_store: &dict_store,
+                wait_table: &wait_table,
+                ts_index: &ts_index,
+                pubsub: &pubsub,
+                hub_tx: &hub_tx,
+                repl_state: &repl_state,
+                watch_registry: &crate::watch::NoopWatchRegistry,
+                client_id: 0,
+                client_registry: &client_registry,
+                resp: 2,
+                acl_store: &acl_store,
+                acl_log: &acl_log,
+                slowlog: &slowlog,
+                latency: &latency,
+                compaction_tx: &compaction_tx,
+                cluster: &cluster,
+                bypass_cluster_check: false,
+                apply_replication: false,
+                skip_write_side_effects: false,
+                peer_addr: "127.0.0.1:1",
+                monitor_registry: &monitor_registry,
+                authenticated_user: "default",
+                tracking_table: &tracking_table,
+                blocking: None,
+            };
+            test(&mut ctx);
+        }
+    }
+
+    /// A blocking command that cannot wait (`MULTI`, a script, the replica
+    /// applier) only looks: it does not stand in line, so a push that lands
+    /// while it looks wakes the client blocked behind it, not it. It used to
+    /// stand in line, be the head the push woke, and leave without passing
+    /// the turn on: the client behind stayed blocked with the element there.
+    #[test]
+    fn a_command_that_cannot_wait_does_not_take_a_turn() {
+        with_ctx(|ctx| {
+            let keys = vec![b"k".to_vec()];
+            let table = Arc::clone(ctx.wait_table);
+            let mut behind = None;
+            let reply = wait_for_keys(
+                ctx,
+                &keys,
+                None,
+                |ctx, _| {
+                    // A client blocks on the key, and a push to it lands,
+                    // while this command looks.
+                    let ticket = table.new_ticket();
+                    let rx = table.enqueue_all(&keys, &ticket);
+                    ticket.parks_in(&keys, false);
+                    ctx.wait_table.notify_signal("k");
+                    behind = Some((ticket, rx));
+                    None
+                },
+                crate::resp::write::resp_null_array,
+            );
+            assert_eq!(reply, crate::resp::write::resp_null_array());
+            let (_ticket, mut rx) = behind.expect("looked");
+            assert_eq!(
+                rx.try_recv().expect("the client behind was not woken").as_ref(),
+                b"k"
+            );
+        });
     }
 
     #[tokio::test]

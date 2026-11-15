@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,32 +117,6 @@ fn request(args: &[&str]) -> Vec<u8> {
 
 // ── The server: one for each test and I/O model ───────────────────────────────
 
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing listens on, outside the range handed to outgoing
-/// connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(43);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn io_models() -> &'static [&'static str] {
     match std::env::var("KIVIDB_TEST_IO_MODEL").as_deref() {
         Ok("tokio") => &["tokio"],
@@ -159,27 +135,30 @@ struct Server {
 impl Server {
     fn start(io: &str) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
-        let log = std::fs::File::create(dir.join("server.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_kividb"))
-            .current_dir(&dir)
-            .args([
-                "--port",
-                &port.to_string(),
-                "--bind",
-                "127.0.0.1",
-                "--io-model",
-                io,
-                "--threads",
-                "4",
-                "--configfile",
-                "kividb.conf",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("could not start kividb");
+        // Verified: the server answering on the port is the one started
+        // (`tests/common`).
+        let (child, port) = common::start_verified(|port| {
+            let log = std::fs::File::create(dir.join("server.log")).unwrap();
+            Command::new(env!("CARGO_BIN_EXE_kividb"))
+                .current_dir(&dir)
+                .args([
+                    "--port",
+                    &port.to_string(),
+                    "--bind",
+                    "127.0.0.1",
+                    "--io-model",
+                    io,
+                    "--threads",
+                    "4",
+                    "--configfile",
+                    "kividb.conf",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .expect("could not start kividb")
+        });
         let server = Server { port, child, dir };
         assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
         if io == "uring" {
@@ -529,7 +508,7 @@ fn a_client_that_times_out_leaves_every_line() {
             request(&args)
         };
         let mut early = server.conn();
-        early.writer.write_all(&block("0.1")).unwrap();
+        early.writer.write_all(&block("2")).unwrap();
         wait_blocked(&mut ctl, 1);
         let mut late = server.conn();
         late.writer.write_all(&block("0")).unwrap();
