@@ -1249,7 +1249,9 @@ mod gone_resume_tests {
             assert_eq!(reply, crate::resp::write::resp_null_array());
             let (_ticket, mut rx) = behind.expect("looked");
             assert_eq!(
-                rx.try_recv().expect("the client behind was not woken").as_ref(),
+                rx.try_recv()
+                    .expect("the client behind was not woken")
+                    .as_ref(),
                 b"k"
             );
         });
