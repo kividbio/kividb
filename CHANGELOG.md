@@ -44,6 +44,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Redis-style command-line directives: `kividb --appendonly yes --save 900 1
+  --maxmemory 256mb ...` (#390).** Every directive a config file or `CONFIG
+  SET` takes is now taken on the command line, in the form `redis-server`
+  takes it, with the same checks, so Compose files, Helm charts and platform
+  templates written for Redis start KiviDB unchanged. Values may be several
+  (`--save 900 1 --save 300 10`), empty (`--save ""`) or start with a dash;
+  a config file may be named first, and `-` reads config text from standard
+  input (so a `-` as the last argument is never a value). A flag KiviDB has wins over a directive, a directive wins over the
+  config file, and one KiviDB accepts but ignores logs one warning. A name
+  that is not known stops the server and names the closest one (a mistyped
+  flag such as `--prot` too), where it used to print clap's usage and exit 2;
+  it now exits 1. `--name=value` is taken too, with spaces in the value
+  (`--dir=/my dir`), which Redis does not accept. `--bind a b` lists two
+  addresses and warns that KiviDB listens on one, as the config file does.
+  No message prints the value of a password. `kividb --ping` reads them too.
+  Thanks to @mikak94 for the first implementation.
 - **`kividb --ping`, a health check that needs no shell (#433).** The images
   are distroless, so Compose files and platform templates could not run
   `redis-cli ping` and had no health check. `["CMD", "kividb", "--ping"]`
@@ -316,6 +332,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in Redis 8.10.2 and 8.10.3. Lua's implicit `arg` table in vararg functions
   is not part of this fix; it comes with the move to Lua 5.1 (#756) and is
   listed in docs/SCRIPTS.md.
+
+- **A consumer's history read of a pending entry that is gone from the
+  stream no longer makes its replicas and the AOF drop the entry (#737).**
+  `XREADGROUP ... STREAMS key 0` reports an entry removed by `XDEL`, `XTRIM`
+  or `MAXLEN` as `[id, nil]` and keeps it pending, but counted it as a
+  delivery and sent that as an `XCLAIM`, which removes an entry that is gone.
+  The primary kept it while its replicas and an AOF replay dropped it, so
+  `XPENDING` changed after a failover or a restart. Such an entry is now
+  left as it was: still pending, its delivery count and time unchanged, and
+  nothing sent, as in Redis 8.10.2. `XCLAIM` and `XAUTOCLAIM` drop it, on
+  every copy.
 
 - **A script that writes nothing, a `SELECT` and `SCRIPT LOAD` no longer
   move the master's replication offset (#705).** A read-only script that

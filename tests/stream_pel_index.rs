@@ -378,12 +378,10 @@ fn some_id(c: &mut Conn, r: &mut Rng, key: &str, group: &str, top: u64) -> Strin
 }
 
 /// One random change of the pending list, through any command that adds,
-/// moves or removes a pending entry. Without `history`, no history reads:
-/// a history read of an entry still pending but deleted from the stream
-/// reaches replicas and the AOF as an `XCLAIM`, which drops the entry there
-/// and not on the primary. Redis 8.10.2 does the same, so a copy is
-/// compared only after changes that leave no such difference.
-fn random_change(c: &mut Conn, r: &mut Rng, top: &mut u64, history: bool) {
+/// moves or removes a pending entry. History reads among them: one that
+/// finds an entry still pending but deleted from the stream leaves it as it
+/// was, on every copy (#737).
+fn random_change(c: &mut Conn, r: &mut Rng, top: &mut u64) {
     let consumer = CONSUMERS[r.below(CONSUMERS.len() as u64) as usize];
     let group = if r.below(4) == 0 { "h" } else { "g" };
     let policy = ["KEEPREF", "DELREF", "ACKED"][r.below(3) as usize];
@@ -397,7 +395,7 @@ fn random_change(c: &mut Conn, r: &mut Rng, top: &mut u64, history: bool) {
             args.extend(["STREAMS", "s", ">"]);
             c.ok(&args);
         }
-        2 if history => {
+        2 => {
             // A consumer's own history, from the start or from an ID.
             let from = if r.below(2) == 0 {
                 "0".to_string()
@@ -531,7 +529,7 @@ fn every_change_of_the_pending_list_keeps_each_consumers_share_in_step() {
     c.ok(&["XGROUP", "CREATE", "s", "h", "0"]);
     let mut r = Rng(0x2545_F491_4F6C_DD1D);
     for _ in 0..1500 {
-        random_change(&mut c, &mut r, &mut top, true);
+        random_change(&mut c, &mut r, &mut top);
         view(&mut c, "s", "g");
         view(&mut c, "s", "h");
     }
@@ -602,7 +600,7 @@ fn the_index_comes_back_from_every_copy_of_a_group() {
     let mut top = 400;
     c.ok(&["XGROUP", "CREATE", "s", "h", "0"]);
     for _ in 0..300 {
-        random_change(&mut c, &mut r, &mut top, false);
+        random_change(&mut c, &mut r, &mut top);
     }
     let want = view(&mut c, "s", "g");
     let want_h = view(&mut c, "s", "h");
@@ -824,4 +822,294 @@ fn a_consumer_made_by_a_read_that_delivered_nothing_is_kept_by_the_aof_and_a_rep
     let server = Server::start(dir.path(), &["--aof"]);
     let mut c = server.conn();
     assert_eq!(names(&mut c), want, "AOF");
+}
+
+// ── A history read of an entry that is gone from the stream (#737) ──────────
+
+/// The pending entries of every group of `key` as `XINFO STREAM FULL` shows
+/// them, the group's list and each consumer's, with delivery times and
+/// counts.
+fn full_pending(c: &mut Conn, key: &str) -> Vec<V> {
+    let full = c.ok(&["XINFO", "STREAM", key, "FULL", "COUNT", "0"]);
+    full.field("groups")
+        .arr()
+        .iter()
+        .map(|g| {
+            let consumers = g
+                .field("consumers")
+                .arr()
+                .iter()
+                .map(|one| {
+                    V::Array(vec![
+                        one.field("name").clone(),
+                        one.field("pel-count").clone(),
+                        one.field("pending").clone(),
+                    ])
+                })
+                .collect();
+            V::Array(vec![
+                g.field("name").clone(),
+                g.field("pel-count").clone(),
+                g.field("pending").clone(),
+                V::Array(consumers),
+            ])
+        })
+        .collect()
+}
+
+/// What a copy holds of each key's group `g`: `XPENDING`, checked against
+/// the per-consumer index (`view`), and `XINFO STREAM FULL`.
+fn pending_state(c: &mut Conn, keys: &[&str]) -> Vec<(GroupView, Vec<V>)> {
+    keys.iter()
+        .map(|key| (view(c, key, "g"), full_pending(c, key)))
+        .collect()
+}
+
+/// A consumer's own history in `key`: each entry's ID, and whether the
+/// stream still has it (`[id, nil]` when it does not).
+fn history(c: &mut Conn, key: &str, extra: &[&str]) -> Vec<(String, bool)> {
+    history_after(c, key, "0", extra)
+}
+
+/// [`history`], of the entries after `from`.
+fn history_after(c: &mut Conn, key: &str, from: &str, extra: &[&str]) -> Vec<(String, bool)> {
+    let mut args = vec!["XREADGROUP", "GROUP", "g", "c"];
+    args.extend_from_slice(extra);
+    args.extend(["STREAMS", key, from]);
+    history_of(&c.ok(&args))
+}
+
+fn history_of(reply: &V) -> Vec<(String, bool)> {
+    reply.arr()[0].arr()[1]
+        .arr()
+        .iter()
+        .map(|e| (e.arr()[0].str(), e.arr()[1] != V::Nil))
+        .collect()
+}
+
+/// `key` with entries `from..from + n`, all delivered to consumer `c` of
+/// group `g`, so all pending.
+fn delivered(c: &mut Conn, key: &str, from: u64, n: u64) {
+    add_entries(c, key, from, n);
+    c.ok(&["XGROUP", "CREATE", key, "g", "0"]);
+    c.ok(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", key, ">"]);
+}
+
+fn entries(list: &[(u64, bool)]) -> Vec<(String, bool)> {
+    list.iter()
+        .map(|(ms, there)| (format!("{ms}-0"), *there))
+        .collect()
+}
+
+/// Pending entries removed from the stream in every way, then read back
+/// by their consumer; returns the keys.
+fn read_back_removed_entries(c: &mut Conn) -> Vec<&'static str> {
+    // XDEL.
+    delivered(c, "del", 101, 5);
+    c.ok(&["XDEL", "del", "102-0", "104-0"]);
+    // XTRIM MAXLEN.
+    delivered(c, "trim", 201, 5);
+    c.ok(&["XTRIM", "trim", "MAXLEN", "2"]);
+    // XADD with MAXLEN.
+    delivered(c, "cap", 301, 3);
+    c.ok(&["XADD", "cap", "MAXLEN", "2", "304-0", "f", "v"]);
+    // XTRIM MINID, read back one at a time.
+    delivered(c, "min", 401, 4);
+    c.ok(&["XTRIM", "min", "MINID", "403-0"]);
+
+    // The read that finds them reports them, as Redis does.
+    let t = true;
+    let f = false;
+    assert_eq!(
+        history(c, "del", &[]),
+        entries(&[(101, t), (102, f), (103, t), (104, f), (105, t)])
+    );
+    assert_eq!(
+        history(c, "trim", &[]),
+        entries(&[(201, f), (202, f), (203, f), (204, t), (205, t)])
+    );
+    assert_eq!(
+        history(c, "cap", &[]),
+        entries(&[(301, f), (302, f), (303, t)])
+    );
+    // COUNT counts an entry that is gone, and the read stops there.
+    assert_eq!(
+        history(c, "min", &["COUNT", "2"]),
+        entries(&[(401, f), (402, f)])
+    );
+    assert_eq!(
+        history_after(c, "min", "402-0", &["COUNT", "1"]),
+        entries(&[(403, t)])
+    );
+
+    // Inside MULTI, with another change of the pending list.
+    delivered(c, "tx", 501, 3);
+    c.ok(&["XDEL", "tx", "502-0"]);
+    c.ok(&["MULTI"]);
+    c.ok(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "tx", "0"]);
+    c.ok(&["XACK", "tx", "g", "501-0"]);
+    let exec = c.ok(&["EXEC"]);
+    assert_eq!(
+        history_of(&exec.arr()[0]),
+        entries(&[(501, t), (502, f), (503, t)])
+    );
+
+    #[cfg_attr(not(feature = "lua"), allow(unused_mut))]
+    let mut keys = vec!["del", "trim", "cap", "min", "tx"];
+    #[cfg(feature = "lua")]
+    {
+        // From a script.
+        delivered(c, "lua", 601, 2);
+        c.ok(&["XDEL", "lua", "601-0"]);
+        let reply = c.ok(&[
+            "EVAL",
+            "return redis.call('XREADGROUP', 'GROUP', 'g', 'c', 'STREAMS', KEYS[1], '0')",
+            "1",
+            "lua",
+        ]);
+        assert_eq!(history_of(&reply), entries(&[(601, f), (602, t)]));
+        keys.push("lua");
+    }
+
+    // They are still pending, as in Redis 8.10.2, and the reads left their
+    // delivery counts alone: they were not delivered again.
+    let pending = |c: &mut Conn, key: &str| -> Vec<(String, i64)> {
+        c.ok(&["XPENDING", key, "g", "-", "+", "100"])
+            .arr()
+            .iter()
+            .map(|row| (row.arr()[0].str(), row.arr()[3].int()))
+            .collect()
+    };
+    let counts = |list: &[(u64, i64)]| -> Vec<(String, i64)> {
+        list.iter().map(|(ms, n)| (format!("{ms}-0"), *n)).collect()
+    };
+    assert_eq!(
+        history(c, "del", &[]),
+        entries(&[(101, t), (102, f), (103, t), (104, f), (105, t)])
+    );
+    assert_eq!(
+        pending(c, "del"),
+        counts(&[(101, 3), (102, 1), (103, 3), (104, 1), (105, 3)])
+    );
+    assert_eq!(
+        pending(c, "trim"),
+        counts(&[(201, 1), (202, 1), (203, 1), (204, 2), (205, 2)])
+    );
+    assert_eq!(pending(c, "cap"), counts(&[(301, 1), (302, 1), (303, 2)]));
+    assert_eq!(
+        pending(c, "min"),
+        counts(&[(401, 1), (402, 1), (403, 2), (404, 1)])
+    );
+    assert_eq!(pending(c, "tx"), counts(&[(502, 1), (503, 2)]));
+    #[cfg(feature = "lua")]
+    assert_eq!(pending(c, "lua"), counts(&[(601, 1), (602, 2)]));
+    // XCLAIM drops one, on every copy.
+    c.ok(&["XCLAIM", "del", "g", "c", "0", "102-0"]);
+    assert_eq!(c.ok(&["XPENDING", "del", "g"]).arr()[0].int(), 4);
+    keys
+}
+
+#[test]
+fn a_history_read_of_entries_gone_from_the_stream_leaves_every_copy_the_same() {
+    // A pending entry deleted or trimmed from the stream, then read back by
+    // its consumer: the read used to keep it pending on the primary and
+    // reach replicas and the AOF as an XCLAIM, which drops it there: the
+    // copies disagreed (#737). Redis 8.10.2 keeps it on every copy.
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let rdir = tempfile::tempdir().unwrap();
+    let replica = Server::start(
+        rdir.path(),
+        &["--replicaof", "127.0.0.1", &server.port.to_string()],
+    );
+    let mut c = server.conn();
+    let mut rc = replica.conn();
+    caught_up(&mut c, &mut rc, "synced");
+
+    let keys = read_back_removed_entries(&mut c);
+    let want = pending_state(&mut c, &keys);
+
+    caught_up(&mut c, &mut rc, "marker");
+    assert_eq!(pending_state(&mut rc, &keys), want, "replica stream");
+    drop(rc);
+    replica.kill();
+
+    // A replica that syncs afterwards.
+    let rdir = tempfile::tempdir().unwrap();
+    let replica = Server::start(
+        rdir.path(),
+        &["--replicaof", "127.0.0.1", &server.port.to_string()],
+    );
+    let mut rc = replica.conn();
+    caught_up(&mut c, &mut rc, "marker2");
+    assert_eq!(pending_state(&mut rc, &keys), want, "replica full sync");
+    drop(rc);
+    replica.kill();
+
+    drop(c);
+    server.kill();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(pending_state(&mut c, &keys), want, "AOF");
+}
+
+/// Every file under `dir`, read whole, one after another.
+fn files_under(dir: &Path) -> Vec<u8> {
+    let mut all = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            all.extend(files_under(&path));
+        } else {
+            all.extend(std::fs::read(&path).unwrap_or_default());
+        }
+    }
+    all
+}
+
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+fn resp_args(args: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+    }
+    out
+}
+
+#[test]
+fn a_history_read_sends_nothing_for_an_entry_gone_from_the_stream() {
+    // The read used to send its delivery as an XCLAIM, which drops an
+    // entry that is gone: an AOF replay dropped what the primary kept
+    // (#737). Now it sends the deliveries of the entries still there, and
+    // nothing for one that is gone.
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), &["--aof", "--appendfsync", "always"]);
+    let mut c = server.conn();
+    delivered(&mut c, "s", 7001, 3);
+    c.ok(&["XDEL", "s", "7002-0"]);
+    c.ok(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", "0"]);
+    c.ok(&["SET", "after", "1"]);
+
+    // An XCLAIM of an entry to `c`: its first delivery, then the history
+    // read's, for an entry still in the stream.
+    let claim = |id: &str| resp_args(&["XCLAIM", "s", "g", "c", "0", id]);
+    let marker = resp_args(&["SET", "after", "1"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let aof = loop {
+        let aof = files_under(dir.path());
+        if occurrences(&aof, &marker) > 0 {
+            break aof;
+        }
+        assert!(Instant::now() < deadline, "the AOF was not written");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(occurrences(&aof, &claim("7001-0")), 2, "both deliveries");
+    assert_eq!(occurrences(&aof, &claim("7002-0")), 1, "the first only");
+    assert_eq!(occurrences(&aof, b"XACK"), 0);
 }
