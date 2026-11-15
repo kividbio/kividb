@@ -90,6 +90,21 @@ impl Conn {
         self.read()
     }
 
+    /// Several commands in one write, and their replies in order.
+    fn pipeline(&mut self, commands: &[Vec<String>]) -> Vec<V> {
+        let mut buf = Vec::new();
+        for args in commands {
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        self.writer.write_all(&buf).unwrap();
+        commands.iter().map(|_| self.read()).collect()
+    }
+
     fn read(&mut self) -> V {
         let mut line = String::new();
         self.reader.read_line(&mut line).expect("reply");
@@ -384,17 +399,43 @@ fn assert_same_keys(master: &mut Conn, replica: &mut Conn, kinds: &[&str], n: us
 
 /// `HSET {kind}:{i} f 5 keep 1` and `HPEXPIREAT … at FIELDS 1 f`, of each
 /// kind, `i` below `n`.
+///
+/// In one pipeline: every `HPEXPIREAT` has to reach its hash before `at`,
+/// and on a busy machine 2 * kinds * n round trips can outlast a short
+/// margin.
 fn hashes_with_f_due_at(c: &mut Conn, kinds: &[&str], n: usize, at: u64) {
+    let at = at.to_string();
+    let mut commands = Vec::new();
     for kind in kinds {
         for i in 0..n {
             let key = format!("{kind}:{i}");
-            assert_eq!(c.cmd(&["HSET", &key, "f", "5", "keep", "1"]).i(), 2);
-            assert_eq!(
-                c.cmd(&["HPEXPIREAT", &key, &at.to_string(), "FIELDS", "1", "f"]),
-                V::Arr(vec![V::Int(1)])
+            commands.push(
+                ["HSET", &key, "f", "5", "keep", "1"]
+                    .map(String::from)
+                    .to_vec(),
+            );
+            commands.push(
+                ["HPEXPIREAT", &key, &at, "FIELDS", "1", "f"]
+                    .map(String::from)
+                    .to_vec(),
             );
         }
     }
+    for (i, pair) in c.pipeline(&commands).chunks(2).enumerate() {
+        assert_eq!(pair[0], V::Int(2), "write {i}");
+        assert_eq!(
+            pair[1],
+            V::Arr(vec![V::Int(1)]),
+            "write {i}: the field was past its time already"
+        );
+    }
+}
+
+/// Sleep until `extra` ms past `at` (unix ms), not at all if that has gone
+/// by: a plain `at - now` underflows when the setup took longer than planned.
+fn sleep_past(at: u64, extra: u64) {
+    let wait = (at + extra).saturating_sub(unix_ms_now());
+    std::thread::sleep(Duration::from_millis(wait));
 }
 
 /// Until no field of `{kind}:{i}` is past its time on the master: each gone,
@@ -435,7 +476,7 @@ fn writes_made_just_before_a_field_deadline_reach_a_lagging_replica_as_made() {
     let (mut m, mut r) = (master.conn(), replica.conn());
     wait_link_up(&mut r);
     let (kinds, n) = (["incr", "float", "nx", "persist"], 30);
-    let at = unix_ms_now() + 1_500;
+    let at = unix_ms_now() + 3_000;
     hashes_with_f_due_at(&mut m, &kinds, n, at);
     wait_caught_up(&mut m, &mut r);
     replica.signal(libc::SIGSTOP);
@@ -453,7 +494,7 @@ fn writes_made_just_before_a_field_deadline_reach_a_lagging_replica_as_made() {
         );
     }
     assert!(unix_ms_now() < at, "the writes came after the deadline");
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 500));
+    sleep_past(at, 500);
     replica.signal(libc::SIGCONT);
     wait_fields_expired(&mut m, &kinds, n);
     assert_same_keys(&mut m, &mut r, &kinds, n);
@@ -492,9 +533,9 @@ fn a_write_that_finds_a_field_past_its_time_takes_it_as_gone_on_both() {
     let (kinds, n) = (["incr", "float", "nx", "xx", "gt"], 30);
     // The master's sweep held off: each write finds its field itself.
     assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
-    let at = unix_ms_now() + 300;
+    let at = unix_ms_now() + 2_000;
     hashes_with_f_due_at(&mut m, &kinds, n, at);
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
+    sleep_past(at, 300);
     for i in 0..n {
         assert_eq!(m.cmd(&["HINCRBY", &format!("incr:{i}"), "f", "1"]).i(), 1);
         assert_eq!(
@@ -560,7 +601,7 @@ fn a_hash_emptied_by_its_last_field_expiring_reaches_a_lagging_replica_before_a_
     }
     wait_caught_up(&mut m, &mut r);
     replica.signal(libc::SIGSTOP);
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 200));
+    sleep_past(at, 200);
     wait_until("the master's sweep to take the hashes", 30, || {
         m.cmd(&["DBSIZE"]).i() == 0
     });
@@ -601,9 +642,9 @@ fn writes_after_field_deadlines_replay_as_made_after_a_kill() {
     // The others, each write finding its field itself.
     assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
     let kinds = ["incr", "float", "nx", "persist", "xx"];
-    let at = unix_ms_now() + 300;
+    let at = unix_ms_now() + 2_000;
     hashes_with_f_due_at(&mut c, &kinds, 1, at);
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
+    sleep_past(at, 300);
     // What each answers is the business of the test above; here, only
     // that the replay leaves what they left.
     c.cmd(&["HINCRBY", "incr:0", "f", "1"]);
@@ -751,7 +792,7 @@ fn a_sort_store_by_a_hash_field_reaches_a_lagging_replica_as_sorted() {
             )
         )
     );
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
+    sleep_past(at, 300);
     replica.signal(libc::SIGCONT);
     wait_caught_up(&mut m, &mut r);
     assert_eq!(r.cmd(&["LRANGE", "before", "0", "-1"]), sorted);
@@ -791,7 +832,7 @@ fn a_sort_store_by_a_hash_field_replays_as_sorted_after_a_kill() {
     assert_eq!(sort_store(&mut c, "before"), 6);
     assert!(unix_ms_now() < at, "the sort came after the deadline");
 
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 100));
+    sleep_past(at, 100);
     assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
     assert_eq!(c.cmd(&["HSET", "obj:1", "w", "35"]).i(), 0);
     assert_eq!(
