@@ -2497,6 +2497,177 @@ fn a_script_beside_others_may_not_be_the_first_to_leave_db_0() {
     assert_eq!(m.cmd(&["GET", "{t}a"]), V::Str("1".into()));
 }
 
+/// Every key of databases 0 to 6, with its value: what a replica, or a
+/// restarted master, must hold exactly as the master does.
+#[cfg(feature = "lua")]
+fn dataset_of_dbs(server: &Server) -> Vec<(String, String, String)> {
+    let mut all = Vec::new();
+    for db in 0..7 {
+        let mut c = server.conn();
+        for key in keys_of_db(&mut c, &db.to_string()) {
+            let value = c.cmd(&["GET", &key]).s().to_string();
+            all.push((db.to_string(), key, value));
+        }
+    }
+    all
+}
+
+/// A read-only script, a script that only selects a database, a client's
+/// `SELECT` and `SCRIPT LOAD` / `SCRIPT FLUSH` send nothing to the replica
+/// and the AOF, and the master's offset stays where it is, as in Redis
+/// 8.10 (#705). Each used to add a `SELECT n` (46 bytes for two scripts)
+/// or the `SCRIPT` command to the stream.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_writes_nothing_and_script_load_do_not_move_the_offset() {
+    let master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    // No PING of the replica to move the offset meanwhile.
+    assert!(
+        m.cmd(&["CONFIG", "SET", "repl-ping-replica-period", "3600"])
+            .ok()
+    );
+    assert!(m.cmd(&["SET", "seen", "1"]).ok());
+    let before = master_offset(&mut m);
+    wait_replica_at(&replica, before);
+    let aof = m.info("persistence", "aof_current_size");
+
+    let read_with_select = "redis.call('SELECT', 1) return redis.call('GET', KEYS[1])";
+    assert_eq!(m.cmd(&["EVAL_RO", read_with_select, "1", "seen"]), V::Nil);
+    assert_eq!(m.cmd(&["EVAL_RO", read_with_select, "1", "seen"]), V::Nil);
+    // Not declared read-only, but it writes nothing.
+    assert_eq!(m.cmd(&["EVAL", read_with_select, "1", "seen"]), V::Nil);
+    let sha = m.cmd(&["SCRIPT", "LOAD", "return 1"]).s().to_string();
+    assert_eq!(m.cmd(&["EVALSHA_RO", &sha, "0"]), V::Int(1));
+    assert!(m.cmd(&["SCRIPT", "FLUSH"]).ok());
+    assert_eq!(m.cmd(&["SCRIPT", "EXISTS", &sha]), V::Arr(vec![V::Int(0)]));
+    // A client's own SELECT; and the same in a transaction.
+    assert!(m.cmd(&["SELECT", "3"]).ok());
+    assert!(m.cmd(&["SELECT", "0"]).ok());
+    assert!(m.cmd(&["MULTI"]).ok());
+    m.cmd(&["SELECT", "2"]);
+    m.cmd(&["SCRIPT", "LOAD", "return 2"]);
+    m.cmd(&["EVAL_RO", read_with_select, "1", "seen"]);
+    m.cmd(&["EXEC"]);
+    assert!(m.cmd(&["SELECT", "0"]).ok());
+
+    assert_eq!(master_offset(&mut m), before, "{}", master.log());
+    assert_eq!(m.info("persistence", "aof_current_size"), aof);
+    // The stream is as it was: a write goes on from the same place, and the
+    // replica applies it in database 0.
+    assert!(m.cmd(&["SET", "after", "1"]).ok());
+    assert!(master_offset(&mut m) > before);
+    wait_replica_at(&replica, master_offset(&mut m));
+    assert_eq!(r.cmd(&["GET", "after"]), V::Str("1".into()));
+    assert_eq!(dataset_of_dbs(&replica), dataset_of_dbs(&master));
+    // SCRIPT LOAD did not reach the replica's script cache: its scripts are
+    // its own, as in Redis.
+    assert_eq!(r.cmd(&["SCRIPT", "EXISTS", &sha]), V::Arr(vec![V::Int(0)]));
+}
+
+/// Writes of a script in a database it selected, read-only tails and
+/// selects that write nothing, and what a connection writes next in its own
+/// database: the replica, a failed-over replica and the master restarted
+/// from its AOF all end as the master is (#705). The script's `SELECT` is no
+/// longer sent by itself: each write carries the one it needs.
+#[cfg(feature = "lua")]
+#[test]
+fn scripts_writing_in_several_databases_replicate_and_replay_with_their_own_selects() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    wait_link_up(&mut replica.conn());
+
+    // Selects db 1, writes there, and ends with reads in other databases.
+    let write_then_read_tail = "redis.call('SELECT', 1) redis.call('SET', KEYS[1], 'one') \
+         redis.call('SELECT', 2) redis.call('GET', KEYS[1]) redis.call('SELECT', 0) \
+         return redis.call('GET', KEYS[1])";
+    // Selects other databases and writes nothing.
+    let select_only = "redis.call('SELECT', 4) redis.call('GET', 'x') return 1";
+    // Two databases written, a select that writes nothing between them.
+    let two_writes = "redis.call('SELECT', 5) redis.call('SET', 'five', '5') \
+         redis.call('SELECT', 6) redis.call('GET', 'five') redis.call('SELECT', 3) \
+         redis.call('SET', 'three', '3') return 1";
+
+    // From database 0 (the server has not left it before).
+    assert!(m.cmd(&["SET", "zero", "0"]).ok());
+    assert_eq!(
+        m.cmd(&["EVAL", write_then_read_tail, "1", "a"]),
+        V::Nil,
+        "{}",
+        master.log()
+    );
+    assert!(m.cmd(&["SET", "zero2", "0"]).ok());
+    assert_eq!(m.cmd(&["EVAL", select_only, "0"]), V::Int(1));
+    // The script's own database is not the connection's: this goes in 0.
+    assert!(m.cmd(&["SET", "zero3", "0"]).ok());
+    assert_eq!(m.cmd(&["EVAL", two_writes, "0"]), V::Int(1));
+    assert!(m.cmd(&["SET", "zero4", "0"]).ok());
+
+    // From a connection of its own in database 2, with the script in a
+    // transaction.
+    let mut c = master.conn();
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(c.cmd(&["EVAL", select_only, "0"]), V::Int(1));
+    assert!(c.cmd(&["SET", "two", "2"]).ok());
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["EVAL", write_then_read_tail, "1", "b"]);
+    c.cmd(&["SET", "two-in-multi", "2"]);
+    c.cmd(&["EVAL", select_only, "0"]);
+    c.cmd(&["SET", "two-in-multi2", "2"]);
+    let exec = c.cmd(&["EXEC"]);
+    assert_eq!(exec.arr().len(), 4, "{exec:?}");
+    assert!(c.cmd(&["SET", "two-after", "2"]).ok());
+    // And a script that only selects, then this connection writes on.
+    assert_eq!(c.cmd(&["EVAL_RO", select_only, "0"]), V::Int(1));
+    assert!(c.cmd(&["SET", "two-last", "2"]).ok());
+
+    let mut other = master.conn();
+    assert!(other.cmd(&["SET", "zero5", "0"]).ok());
+    let at = master_offset(&mut m);
+    wait_replica_at(&replica, at);
+
+    let expected = dataset_of_dbs(&master);
+    for key in [
+        ("1", "a"),
+        ("1", "b"),
+        ("5", "five"),
+        ("3", "three"),
+        ("2", "two"),
+        ("2", "two-in-multi"),
+        ("2", "two-after"),
+        ("2", "two-last"),
+        ("0", "zero4"),
+    ] {
+        assert!(
+            expected
+                .iter()
+                .any(|(db, k, _)| (db.as_str(), k.as_str()) == key),
+            "{key:?} not on the master: {expected:?}"
+        );
+    }
+    assert_eq!(dataset_of_dbs(&replica), expected, "{}", replica.log());
+
+    // After a failover: the replica promoted holds the same, and goes on.
+    assert!(replica.conn().cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+    assert_eq!(dataset_of_dbs(&replica), expected);
+    let mut promoted = replica.conn();
+    assert!(promoted.cmd(&["SELECT", "1"]).ok());
+    assert!(promoted.cmd(&["SET", "after-failover", "1"]).ok());
+
+    // From the AOF alone: every write on disk, then no final save.
+    assert_eq!(other.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, c, other));
+    master.kill();
+    master.restart_master(&mut []);
+    assert_eq!(dataset_of_dbs(&master), expected, "{}", master.log());
+}
+
 /// Milliseconds since the Unix epoch, now.
 fn unix_ms_now() -> u64 {
     std::time::SystemTime::now()

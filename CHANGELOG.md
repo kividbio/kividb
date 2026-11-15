@@ -283,6 +283,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key is the table `{ok='results'}`. It was an error ("map key must be
   string or integer").
 
+- **A search query reads the clock once, and `FT.AGGREGATE` with a KNN
+  clause reads each hash once (part of #670).** A query over hashes with
+  field TTLs read the clock for every document it looked at, so one query
+  could judge two documents at different moments: a field ending while the
+  query ran was shown by half of it. It reads the clock once, when the first
+  document needs it, and none at all over hashes with no field TTL. The KNN
+  of an `FT.AGGREGATE` looked each row's hash up a second time to see
+  whether its vector was past its deadline; it uses the first read. Results
+  are the same. Instructions per query (callgrind, Azure D4s_v5, 2,000
+  hashes with a TTL on a field of each, `benchmarks/1.3.0/search-clock`):
+  `FT.AGGREGATE` with `*=>[KNN 10 @vec $q]` -3.5%, with a tag filter
+  -2.8%; `FT.SEARCH` over a tag filter -1.2%, `KNN` with a filter -1.1%, an
+  unfiltered `KNN` -0.5%; hashes with no field TTL within 0.2% either way.
+  The search of `FT.SEARCH` and hybrid `KNN` still asks the index for more
+  neighbours, up to the whole index, while hits are left out, and does not
+  stop at the query's `TIMEOUT` (#670).
+
 ### Fixed
 
 - **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
@@ -299,6 +316,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in Redis 8.10.2 and 8.10.3. Lua's implicit `arg` table in vararg functions
   is not part of this fix; it comes with the move to Lua 5.1 (#756) and is
   listed in docs/SCRIPTS.md.
+
+- **A script that writes nothing, a `SELECT` and `SCRIPT LOAD` no longer
+  move the master's replication offset (#705).** A read-only script that
+  ran `SELECT`, and every `SELECT` a client sent, added a `SELECT n` to the
+  replication stream and the AOF (23 bytes each), and `SCRIPT LOAD` and
+  `SCRIPT FLUSH` added the command itself; in Redis 8.10 `master_repl_offset`
+  stays where it is for all of them. A write already carries the `SELECT`
+  it needs, so nothing is lost: scripts that write in several databases,
+  also in a transaction, reach the replica and the AOF in the same databases
+  as before. One difference you can see: a script loaded on the master is
+  no longer loaded on its replicas, as in Redis since 7.0, so a client that
+  runs `EVALSHA` there gets `NOSCRIPT` and loads the script, which is what
+  clients do for Redis. A script's writes always reached a replica as the
+  commands it made, never as `EVALSHA`, so a replica did not need it.
 
 - **A time series keeps its labels in the order they were given
   (#612).** They were held in a hash map, whose order differs from one
