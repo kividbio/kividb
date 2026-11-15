@@ -1484,3 +1484,127 @@ fn replica_priority_and_announced_reach_info_replication() {
     assert_eq!(replica_info(&mut c, "slave_priority"), "3");
     assert_eq!(replica_info(&mut c, "replica_announced"), "1");
 }
+
+/// `client-output-buffer-limit` is configurable at runtime and reported by `CONFIG GET`.
+#[test]
+fn config_client_output_buffer_limit() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let get = |c: &mut Conn| {
+        c.cmds(&["CONFIG", "GET", "client-output-buffer-limit"])
+            .as_array()[1]
+            .as_str()
+            .to_string()
+    };
+
+    // Default configuration matches Redis's defaults
+    assert_eq!(
+        get(&mut c),
+        "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"
+    );
+
+    // Update pubsub limits alone
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "pubsub 64mb 16mb 120"
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        get(&mut c),
+        "normal 0 0 0 slave 268435456 67108864 60 pubsub 67108864 16777216 120"
+    );
+
+    // Multi-class configuration string
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "normal 0 0 0 slave 512mb 64mb 60 pubsub 128mb 32mb 90"
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        get(&mut c),
+        "normal 0 0 0 slave 536870912 67108864 60 pubsub 134217728 33554432 90"
+    );
+
+    // Replicas backlog bytes updated by slave class
+    let repl_backlog = c
+        .cmds(&["CONFIG", "GET", "repl-replica-max-backlog-bytes"])
+        .as_array()[1]
+        .as_str()
+        .to_string();
+    assert_eq!(repl_backlog, "536870912");
+
+    // Zero limits (disabled)
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "pubsub 0 0 0"
+        ])
+        .is_ok()
+    );
+    assert_eq!(
+        get(&mut c),
+        "normal 0 0 0 slave 536870912 67108864 60 pubsub 0 0 0"
+    );
+
+    // Error cases:
+    // 1. Incomplete 4-tuple
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "pubsub 64mb 16mb"
+        ])
+        .is_error()
+    );
+
+    // 2. Unknown client class
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "bogusclass 0 0 0"
+        ])
+        .is_error()
+    );
+
+    // 3. Invalid memory value
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "pubsub notamemory 8mb 60"
+        ])
+        .is_error()
+    );
+
+    // 4. Invalid seconds integer
+    assert!(
+        c.cmds(&[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "pubsub 32mb 8mb notanint"
+        ])
+        .is_error()
+    );
+
+    // Previous valid configuration was untouched
+    assert_eq!(
+        get(&mut c),
+        "normal 0 0 0 slave 536870912 67108864 60 pubsub 0 0 0"
+    );
+}

@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Configurable Pub/Sub output-buffer limits.** `client-output-buffer-limit`
+  can now be configured in the configuration file, with `CONFIG SET`, and
+  read with `CONFIG GET` (and written back by `CONFIG REWRITE`). It supports
+  the `pubsub` subscriber class with `<hard-limit> <soft-limit> <soft-seconds>`
+  (where `0` disables the limit), accepts `normal` for compatibility, and
+  synchronises `slave`/`replica` hard limits with `repl-replica-max-backlog-bytes`.
+
+
 - **Data moves in from Valkey 9.** KiviDB reads Valkey 9.0's and 9.1's
   RDB format (RDB 80, a `VALKEY080` header): a `dump.rdb` loaded at
   startup or with `--preload-file`, a full sync as a replica of a Valkey 9

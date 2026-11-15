@@ -364,6 +364,11 @@ pub struct Config {
     #[arg(long, default_value_t = 268_435_456)]
     pub repl_replica_max_backlog_bytes: u64,
 
+    /// Output buffer limits for pub/sub subscribers: (hard limit, soft limit, soft seconds).
+    /// Defaults to Redis's (32mb, 8mb, 60).
+    #[arg(skip)]
+    pub client_output_buffer_limit_pubsub: (usize, usize, u64),
+
     /// Max bytes a master will queue for a replica during its full sync, from
     /// the cut until the replica has loaded the dataset and drained its queue
     /// to a quarter of `repl-replica-max-backlog-bytes`. The replica reads nothing of the
@@ -671,6 +676,11 @@ impl Default for Config {
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
             appendfsync: "everysec".into(),
+            client_output_buffer_limit_pubsub: (
+                crate::pubsub::DEFAULT_HARD_LIMIT,
+                crate::pubsub::DEFAULT_SOFT_LIMIT,
+                crate::pubsub::DEFAULT_SOFT_SECONDS,
+            ),
         }
     }
 }
@@ -796,6 +806,11 @@ impl Config {
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
             appendfsync: "everysec".into(),
+            client_output_buffer_limit_pubsub: (
+                crate::pubsub::DEFAULT_HARD_LIMIT,
+                crate::pubsub::DEFAULT_SOFT_LIMIT,
+                crate::pubsub::DEFAULT_SOFT_SECONDS,
+            ),
         }
     }
 
@@ -1289,6 +1304,11 @@ impl Config {
                 crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
             ))
         ));
+        let (ps_hard, ps_soft, ps_secs) = self.client_output_buffer_limit_pubsub;
+        out.push_str(&format!(
+            "client-output-buffer-limit normal 0 0 0 slave {} 67108864 60 pubsub {} {} {}\n",
+            self.repl_replica_max_backlog_bytes, ps_hard, ps_soft, ps_secs
+        ));
         if let Some(parts) = &self.replicaof
             && parts.len() == 2
         {
@@ -1597,6 +1617,35 @@ impl Config {
             ),
             "repl-replica-max-backlog-bytes" => {
                 set!(repl_replica_max_backlog_bytes, parse_memory(key, one()?)?)
+            }
+            "client-output-buffer-limit" => {
+                if args.is_empty() || !args.len().is_multiple_of(4) {
+                    return Err(format!(
+                        "'{key}' takes arguments in groups of 4: <class> <hard-limit> <soft-limit> <soft-seconds>"
+                    ));
+                }
+                for chunk in args.as_chunks::<4>().0 {
+                    let class = chunk[0].to_ascii_lowercase();
+                    let hard = parse_memory(key, &chunk[1])? as usize;
+                    let soft = parse_memory(key, &chunk[2])? as usize;
+                    let seconds = number::<u64>(key, &chunk[3])?;
+                    match class.as_str() {
+                        "pubsub" => {
+                            set!(client_output_buffer_limit_pubsub, (hard, soft, seconds));
+                        }
+                        "normal" => {}
+                        "slave" | "replica" => {
+                            if hard > 0 {
+                                set!(repl_replica_max_backlog_bytes, hard as u64);
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "invalid client class '{other}' for '{key}': expected normal, slave, replica, or pubsub"
+                            ));
+                        }
+                    }
+                }
             }
             "repl-replica-sync-max-backlog-bytes" => {
                 set!(

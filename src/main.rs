@@ -288,8 +288,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let matches = <Config as clap::CommandFactory>::command().get_matches();
     let mut cfg =
         <Config as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    let from_cli =
-        |option: &str| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine);
+    let from_cli = |option: &str| {
+        matches.try_contains_id(option).unwrap_or(false)
+            && matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine)
+    };
     cfg.bind_explicit =
         matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
     match cfg.apply_config_file(&from_cli) {
@@ -737,7 +739,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::from_config(&config);
     let shutdown = Arc::new(AtomicBool::new(false));
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
@@ -1614,7 +1616,7 @@ async fn async_main_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::from_config(&config);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be

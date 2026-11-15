@@ -56,7 +56,7 @@ The ones that behave differently:
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
 | `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
-| `client-output-buffer-limit` | Not supported: remove it. Pub/Sub subscribers get Redis's default limits. |
+| `client-output-buffer-limit` | Supported for pub/sub subscribers, with `normal` accepted and `slave` setting `repl-replica-max-backlog-bytes`. |
 | `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`) and vector sets are built in. |
 | Sentinel | No Sentinel. Use replication with your own failover, or cluster mode (`--cluster-enabled yes`), which fails over by itself. |
 

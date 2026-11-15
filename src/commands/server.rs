@@ -730,6 +730,73 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                  'repl-timeout') - argument must be a positive integer",
                 )),
             },
+            "client-output-buffer-limit" => {
+                let args: Vec<&str> = value.split_whitespace().collect();
+                if args.is_empty() || !args.len().is_multiple_of(4) {
+                    return Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument 'client-output-buffer-limit') - \
+                         argument(s) must be in the format: <class> <hard-limit> <soft-limit> <soft-seconds>",
+                    ));
+                }
+                let mut pubsub_limits = None;
+                let mut slave_limit = None;
+                for chunk in args.as_chunks::<4>().0 {
+                    let class = chunk[0].to_ascii_lowercase();
+                    let hard = match memory_size(chunk[1]) {
+                        Some(b) => b,
+                        None => {
+                            return Some(resp_error(
+                                "ERR CONFIG SET failed (possibly related to argument 'client-output-buffer-limit') - \
+                                 argument must be a memory value",
+                            ));
+                        }
+                    };
+                    let soft = match memory_size(chunk[2]) {
+                        Some(b) => b,
+                        None => {
+                            return Some(resp_error(
+                                "ERR CONFIG SET failed (possibly related to argument 'client-output-buffer-limit') - \
+                                 argument must be a memory value",
+                            ));
+                        }
+                    };
+                    let secs = match chunk[3].parse::<u64>() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return Some(resp_error(
+                                "ERR CONFIG SET failed (possibly related to argument 'client-output-buffer-limit') - \
+                                 argument couldn't be parsed into an integer",
+                            ));
+                        }
+                    };
+                    match class.as_str() {
+                        "pubsub" => {
+                            pubsub_limits = Some((hard, soft, secs));
+                        }
+                        "normal" => {}
+                        "slave" | "replica" => {
+                            if hard > 0 {
+                                slave_limit = Some(hard as u64);
+                            }
+                        }
+                        other => {
+                            return Some(resp_error(&format!(
+                                "ERR CONFIG SET failed (possibly related to argument 'client-output-buffer-limit') - \
+                                 Unknown client class '{other}'",
+                            )));
+                        }
+                    }
+                }
+                if let Some((hard, soft, secs)) = pubsub_limits {
+                    ctx.pubsub.set_limits(hard, soft, secs);
+                }
+                if let Some(limit) = slave_limit {
+                    ctx.repl_state
+                        .replica_max_backlog_bytes
+                        .store(limit, Ordering::Relaxed);
+                }
+                Some(resp_simple("OK"))
+            }
             // Read for each write the hub queues: a change applies to the
             // replicas already attached (#305).
             "repl-replica-max-backlog-bytes" | "repl-replica-sync-max-backlog-bytes" => {
@@ -2041,6 +2108,17 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             }
             .to_string(),
         ),
+        {
+            let (ps_hard, ps_soft, ps_secs) = ctx.pubsub.limits();
+            let slave_hard = ctx.repl_state.replica_max_backlog_bytes.load(Relaxed);
+            (
+                "client-output-buffer-limit",
+                format!(
+                    "normal 0 0 0 slave {} 67108864 60 pubsub {} {} {}",
+                    slave_hard, ps_hard, ps_soft, ps_secs
+                ),
+            )
+        },
     ];
     for (name, value) in in_effect {
         if !rows.iter().any(|(known, _)| known == name) {

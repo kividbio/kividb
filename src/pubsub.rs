@@ -21,11 +21,37 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Notify, mpsc};
 
-/// A subscriber with more than this queued is disconnected.
-const HARD_LIMIT: usize = 32 << 20;
-/// So is one that has had more than this queued for `SOFT_SECONDS`.
-const SOFT_LIMIT: usize = 8 << 20;
-const SOFT_SECONDS: u64 = 60;
+/// Default limits for a subscriber's output buffer: Redis's `32mb 8mb 60`.
+pub const DEFAULT_HARD_LIMIT: usize = 32 << 20;
+pub const DEFAULT_SOFT_LIMIT: usize = 8 << 20;
+pub const DEFAULT_SOFT_SECONDS: u64 = 60;
+/// Backward-compatible constants.
+#[allow(dead_code)]
+pub const HARD_LIMIT: usize = DEFAULT_HARD_LIMIT;
+#[allow(dead_code)]
+pub const SOFT_LIMIT: usize = DEFAULT_SOFT_LIMIT;
+#[allow(dead_code)]
+pub const SOFT_SECONDS: u64 = DEFAULT_SOFT_SECONDS;
+
+/// Output buffer limits for pub/sub subscribers.
+/// A limit of 0 means disabled / unlimited.
+#[derive(Debug)]
+pub struct PubSubLimits {
+    pub hard_limit: AtomicUsize,
+    pub soft_limit: AtomicUsize,
+    pub soft_seconds: AtomicU64,
+}
+
+impl Default for PubSubLimits {
+    fn default() -> Self {
+        Self {
+            hard_limit: AtomicUsize::new(DEFAULT_HARD_LIMIT),
+            soft_limit: AtomicUsize::new(DEFAULT_SOFT_LIMIT),
+            soft_seconds: AtomicU64::new(DEFAULT_SOFT_SECONDS),
+        }
+    }
+}
+
 /// How much the forwarder takes from the queue for one write.
 const BATCH_BYTES: usize = 256 << 10;
 
@@ -88,6 +114,7 @@ struct Subscriber {
     /// comes after the reply to the command that published it (#23).
     hold: AtomicBool,
     released: Notify,
+    limits: Arc<PubSubLimits>,
 }
 
 enum Offer {
@@ -106,11 +133,26 @@ impl Subscriber {
         }
         let weight = delivery.weight();
         let pending = self.pending.fetch_add(weight, Ordering::Relaxed) + weight;
-        if pending > SOFT_LIMIT {
-            if pending > HARD_LIMIT || self.over_soft_limit_too_long() {
-                self.closed.store(true, Ordering::Relaxed);
-                return Offer::Overflow;
-            }
+        let hard_limit = self.limits.hard_limit.load(Ordering::Relaxed);
+        let soft_limit = self.limits.soft_limit.load(Ordering::Relaxed);
+        let soft_seconds = self.limits.soft_seconds.load(Ordering::Relaxed);
+
+        let hard_overflow = hard_limit > 0 && pending > hard_limit;
+        let soft_overflow = soft_limit > 0
+            && soft_seconds > 0
+            && pending > soft_limit
+            && self.over_soft_limit_too_long(soft_seconds);
+
+        if hard_overflow || soft_overflow {
+            self.closed.store(true, Ordering::Relaxed);
+            return Offer::Overflow;
+        }
+
+        if soft_limit > 0 && pending > soft_limit {
+            let now = uptime_secs();
+            let _ =
+                self.over_soft_since
+                    .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
         } else if self.over_soft_since.load(Ordering::Relaxed) != 0 {
             self.over_soft_since.store(0, Ordering::Relaxed);
         }
@@ -128,14 +170,17 @@ impl Subscriber {
         }
     }
 
-    fn over_soft_limit_too_long(&self) -> bool {
+    fn over_soft_limit_too_long(&self, soft_seconds: u64) -> bool {
+        if soft_seconds == 0 {
+            return false;
+        }
         let now = uptime_secs();
         match self
             .over_soft_since
             .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
         {
             Ok(_) => false,
-            Err(since) => now.saturating_sub(since) >= SOFT_SECONDS,
+            Err(since) => now.saturating_sub(since) >= soft_seconds,
         }
     }
 
@@ -162,6 +207,7 @@ struct Shared {
     /// Subscriptions of every kind, so that a publish with nobody listening
     /// — every keyspace event on most servers — takes no lock.
     subscriptions: AtomicUsize,
+    limits: Arc<PubSubLimits>,
 }
 
 #[derive(Clone)]
@@ -177,12 +223,45 @@ impl Default for PubSubHub {
 
 impl PubSubHub {
     pub fn new() -> Self {
+        Self::from_limits(DEFAULT_HARD_LIMIT, DEFAULT_SOFT_LIMIT, DEFAULT_SOFT_SECONDS)
+    }
+
+    pub fn from_limits(hard_limit: usize, soft_limit: usize, soft_seconds: u64) -> Self {
         let inner = Arc::new(Shared {
             tables: RwLock::new([Table::new(), Table::new(), Table::new()]),
             subscriptions: AtomicUsize::new(0),
+            limits: Arc::new(PubSubLimits {
+                hard_limit: AtomicUsize::new(hard_limit),
+                soft_limit: AtomicUsize::new(soft_limit),
+                soft_seconds: AtomicU64::new(soft_seconds),
+            }),
         });
         watch_soft_limit(Arc::downgrade(&inner));
         Self { inner }
+    }
+
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        let (hard, soft, secs) = config.client_output_buffer_limit_pubsub;
+        Self::from_limits(hard, soft, secs)
+    }
+
+    /// Update output buffer limits at runtime.
+    pub fn set_limits(&self, hard: usize, soft: usize, seconds: u64) {
+        self.inner.limits.hard_limit.store(hard, Ordering::Relaxed);
+        self.inner.limits.soft_limit.store(soft, Ordering::Relaxed);
+        self.inner
+            .limits
+            .soft_seconds
+            .store(seconds, Ordering::Relaxed);
+    }
+
+    /// Read the current output buffer limits: `(hard_limit, soft_limit, soft_seconds)`.
+    pub fn limits(&self) -> (usize, usize, u64) {
+        (
+            self.inner.limits.hard_limit.load(Ordering::Relaxed),
+            self.inner.limits.soft_limit.load(Ordering::Relaxed),
+            self.inner.limits.soft_seconds.load(Ordering::Relaxed),
+        )
     }
 
     fn add(&self, kind: usize, name: &Name, subscriber: &Arc<Subscriber>) {
@@ -384,13 +463,18 @@ fn watch_soft_limit(shared: std::sync::Weak<Shared>) {
 /// The subscribers over the soft limit for `SOFT_SECONDS` at `now`, marked
 /// closed, for the caller to disconnect.
 fn cut_off_late(shared: &Shared, now: u64) -> Vec<Arc<Subscriber>> {
+    let soft_limit = shared.limits.soft_limit.load(Ordering::Relaxed);
+    let soft_seconds = shared.limits.soft_seconds.load(Ordering::Relaxed);
+    if soft_limit == 0 || soft_seconds == 0 {
+        return Vec::new();
+    }
     let mut late: Vec<Arc<Subscriber>> = Vec::new();
     for table in shared.tables.read().iter() {
         for subscriber in table.values().flatten() {
             let since = subscriber.over_soft_since.load(Ordering::Relaxed);
             if since != 0
-                && now.saturating_sub(since) >= SOFT_SECONDS
-                && subscriber.pending.load(Ordering::Relaxed) > SOFT_LIMIT
+                && now.saturating_sub(since) >= soft_seconds
+                && subscriber.pending.load(Ordering::Relaxed) > soft_limit
                 && !late.iter().any(|seen| Arc::ptr_eq(seen, subscriber))
                 && !subscriber.closed.swap(true, Ordering::Relaxed)
             {
@@ -545,6 +629,7 @@ pub fn connect(
         live: Mutex::new([AHashSet::new(), AHashSet::new(), AHashSet::new()]),
         hold: AtomicBool::new(false),
         released: Notify::new(),
+        limits: Arc::clone(&hub.inner.limits),
     });
     let subscriptions = Subscriptions {
         hub: hub.clone(),
@@ -728,7 +813,8 @@ impl Outbox {
             }
         }
         let pending = self.me.pending.fetch_sub(weight, Ordering::Relaxed) - weight;
-        if pending <= SOFT_LIMIT {
+        let soft_limit = self.me.limits.soft_limit.load(Ordering::Relaxed);
+        if soft_limit == 0 || pending <= soft_limit {
             self.me.over_soft_since.store(0, Ordering::Relaxed);
         }
         // The reply to a SUBSCRIBE goes first: see `Subscriber::hold`. What
@@ -1005,5 +1091,51 @@ mod tests {
                 .unwrap()
                 .starts_with("-ERR Can't execute 'get': only (P|S)SUBSCRIBE")
         );
+    }
+
+    #[test]
+    fn configurable_pubsub_limits_dynamic() {
+        let hub = PubSubHub::new();
+        assert_eq!(
+            hub.limits(),
+            (DEFAULT_HARD_LIMIT, DEFAULT_SOFT_LIMIT, DEFAULT_SOFT_SECONDS)
+        );
+        hub.set_limits(2 << 20, 1 << 20, 30);
+        assert_eq!(hub.limits(), (2 << 20, 1 << 20, 30));
+
+        let (mut subs, _outbox) = subscriber(&hub, 2);
+        subs.handle(&[b"SUBSCRIBE", b"chan"], 2);
+        let chunk: Arc<[u8]> = Arc::from(vec![0u8; 512 << 10]); // 512 KB
+        // Under 2 MB limit:
+        let taken: usize = (0..3)
+            .map(|_| hub.publish("chan", Arc::clone(&chunk)))
+            .sum();
+        assert_eq!(taken, 3);
+        assert!(!subs.me.closed.load(Ordering::Relaxed));
+        // Crossing 2 MB cut-off:
+        let taken_extra: usize = (0..2)
+            .map(|_| hub.publish("chan", Arc::clone(&chunk)))
+            .sum();
+        assert_eq!(taken_extra, 0);
+        assert!(subs.me.closed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pubsub_limits_can_be_disabled_with_zero() {
+        let hub = PubSubHub::from_limits(0, 0, 0);
+        assert_eq!(hub.limits(), (0, 0, 0));
+
+        let (mut subs, _outbox) = subscriber(&hub, 3);
+        subs.handle(&[b"SUBSCRIBE", b"unlimited"], 2);
+        let big: Arc<[u8]> = Arc::from(vec![0u8; 1 << 20]); // 1 MB
+        // Publish 40 MB without being cut off since hard_limit is 0:
+        let taken: usize = (0..40)
+            .map(|_| hub.publish("unlimited", Arc::clone(&big)))
+            .sum();
+        assert_eq!(taken, 40);
+        assert!(!subs.me.closed.load(Ordering::Relaxed));
+        // Soft limit is 0, so timer also never cuts it off:
+        subs.me.over_soft_since.store(100, Ordering::Relaxed);
+        assert!(cut_off_late(&hub.inner, 200).is_empty());
     }
 }

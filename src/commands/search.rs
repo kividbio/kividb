@@ -362,7 +362,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                     .trim_matches(|c: char| c.is_ascii_whitespace())
                     .parse::<f64>()
                     .map_err(|_| "Invalid score".to_string())?;
-                if score > 1.0 || score < 0.0 {
+                if !(0.0..=1.0).contains(&score) {
                     return Err("Invalid score".into());
                 }
                 default_score = score;
