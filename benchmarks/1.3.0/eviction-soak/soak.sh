@@ -18,6 +18,15 @@
 # Needs memtier_benchmark, redis-cli and redis-benchmark on the PATH. Prints
 # and writes to $OUT/result.txt one line:
 #   <label> oom=<n> fruitless_logs=<n> evicted=<n> writes=<n> oom_per_million=<x>
+#           peak_over=<bytes> peak_over_held=<bytes>
+# peak_over: the most that used_memory less mem_not_counted_for_evict (what
+# maxmemory is measured against) was over maxmemory, sampled every 100 ms
+# from 30 s after the limit is set. peak_over_held: the same, of the lower
+# of each two samples in a row, so over the limit for 100 ms at least. A
+# sample alone can catch the two counts apart (a snapshot's buffers freed,
+# and only then taken back from what is not counted): a spike that is gone
+# 100 ms later is no write let in, which eviction would take seconds to
+# take back out.
 set -u
 BIN=${1:?usage: soak.sh <kividb binary> [label]}
 LABEL=${2:-$(basename "$BIN")}
@@ -79,6 +88,26 @@ redis-cli -p "$PORT" config set maxmemory "$MAXMEMORY" >/dev/null
 redis-cli -p "$PORT" config resetstat >/dev/null
 echo "t used_memory evicted_keys oom keys" > "$OUT/samples.txt"
 t0=$SECONDS
+LIMIT=$(redis-cli -p "$PORT" config get maxmemory | tail -1)
+# Overshoot over the limit, sampled every 100 ms from 30 s on (before, the
+# dataset is still being evicted down to the new limit): the highest goes
+# to peak_over.txt.
+(peak=0 held=0 last=0
+sleep 30
+while [ $((SECONDS - t0)) -lt "$DURATION" ]; do
+  over=$(redis-cli -p "$PORT" info memory | tr -d '\r' | awk -F: -v l="$LIMIT" \
+    '$1 == "used_memory" { u = $2 } $1 == "mem_not_counted_for_evict" { n = $2 }
+     END { print u - n - l }')
+  over=${over:-0}
+  [ "$over" -gt "$peak" ] && peak=$over && echo "$peak" > "$OUT/peak_over.txt"
+  low=$(( over < last ? over : last ))
+  [ "$low" -gt "$held" ] && held=$low && echo "$held" > "$OUT/peak_over_held.txt"
+  last=$over
+  # Each sample more than 4 MB over, with the time, to set beside the log.
+  [ "$over" -gt 4194304 ] && echo "$(date -u +%H:%M:%S.%N | cut -c1-12) $over" >> "$OUT/over_4mb.txt"
+  sleep 0.1
+done) &
+pids+=($!)
 while [ $((SECONDS - t0)) -lt "$DURATION" ]; do
   sleep 10
   echo "$((SECONDS - t0)) $(info memory used_memory) $(info stats evicted_keys)" \
@@ -92,5 +121,6 @@ writes=$(redis-cli -p "$PORT" info commandstats | tr -d '\r' |
   awk -F'[:=,]' '/^cmdstat_(set|hset|hexpire|lpush|rpush|sadd|zadd):/ { n += $3 } END { print n + 0 }')
 fruitless=$(grep -c "did not go down" "$OUT/master/server.log")
 line="$LABEL oom=$oom fruitless_logs=$fruitless evicted=$evicted writes=$writes \
-oom_per_million=$(awk -v o="$oom" -v w="$writes" 'BEGIN { printf "%.3f", w ? o * 1e6 / w : 0 }')"
+oom_per_million=$(awk -v o="$oom" -v w="$writes" 'BEGIN { printf "%.3f", w ? o * 1e6 / w : 0 }') \
+peak_over=$(cat "$OUT/peak_over.txt" 2>/dev/null || echo 0) peak_over_held=$(cat "$OUT/peak_over_held.txt" 2>/dev/null || echo 0)"
 echo "$line" | tee "$OUT/result.txt"

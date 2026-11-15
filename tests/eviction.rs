@@ -1579,40 +1579,75 @@ fn eviction_goes_on_while_other_writers_keep_memory_use_up() {
     );
 }
 
-/// The last key evicted, a list of 100,000 elements, and still being freed
-/// (here held a second before it is, `eviction-frees-slowly`): a write from
-/// another client meanwhile finds nothing left to evict and memory still
-/// over the limit. It is let through, as Redis lets a command through while
-/// its lazy frees from eviction are under way, not refused with OOM (#520).
-#[test]
-fn a_write_while_the_last_key_evicted_is_being_freed_is_let_through() {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let server = Server::start_in_env(
-        dir,
-        &["--maxmemory-policy", "allkeys-lru"],
-        &[("KIVIDB_TEST_FAILPOINTS", "eviction-frees-slowly")],
-    );
-    let mut c = server.conn();
-    // About 10 MB, freed element by element once the key is gone.
-    let element = "e".repeat(100);
-    let mut push = vec!["RPUSH", "big"];
-    push.extend(std::iter::repeat_n(element.as_str(), 2000));
-    for _ in 0..50 {
-        c.cmd(&push);
+impl Server {
+    /// One whose evictions hold a collection a second before freeing it
+    /// (`eviction-frees-slowly`), under `policy`.
+    fn start_freeing_slowly(policy: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Self::start_in_env(
+            dir,
+            &["--maxmemory-policy", policy],
+            &[("KIVIDB_TEST_FAILPOINTS", "eviction-frees-slowly")],
+        )
     }
-    assert_eq!(c.cmd(&["LLEN", "big"]).i(), 100_000);
-    // Connected, and served, before: a connection made while a thread of
-    // the server is held may wait to be accepted.
-    let mut conns: Vec<Conn> = (0..6).map(|_| server.conn()).collect();
+}
+
+impl Conn {
+    /// A list `key` of 100,000 elements of 100 bytes: about 14 MB, freed
+    /// element by element once it is evicted, and at least 3.2 MB as
+    /// eviction reckons it before it frees it.
+    fn big_list(&mut self, key: &str) {
+        let element = "e".repeat(100);
+        let mut push = vec!["RPUSH", key];
+        push.extend(std::iter::repeat_n(element.as_str(), 2000));
+        for _ in 0..50 {
+            self.cmd(&push);
+        }
+        assert_eq!(self.cmd(&["LLEN", key]).i(), 100_000);
+    }
+
+    /// `used_memory` less `mem_not_counted_for_evict`: what is measured
+    /// against `maxmemory`.
+    fn counted(&mut self) -> i64 {
+        self.used_memory() - self.not_counted()
+    }
+}
+
+/// Connections made and served before a test holds a thread of the server:
+/// one made while it is held may wait to be accepted.
+fn ready_conns(server: &Server, n: usize) -> Vec<Conn> {
+    let mut conns: Vec<Conn> = (0..n).map(|_| server.conn()).collect();
     for conn in &mut conns {
         assert_eq!(conn.cmd(&["PING"]).s(), "PONG");
     }
-    // A limit 4 MB under what is used: `CONFIG SET` evicts `big` at once,
-    // and frees it a second on.
-    let limit = (c.used_memory() - 4 * MB).to_string();
+    conns
+}
+
+/// Lower the limit to `limit` from another client: `CONFIG SET` evicts at
+/// once, here the one big list, which it frees a second on.
+fn lower_limit(server: &Server, limit: i64) -> std::thread::JoinHandle<V> {
     let mut setter = server.conn();
+    let limit = limit.to_string();
     let lowered = std::thread::spawn(move || setter.cmd(&["CONFIG", "SET", "maxmemory", &limit]));
     std::thread::sleep(Duration::from_millis(300));
+    lowered
+}
+
+/// The last key evicted, a list of 100,000 elements, and still being freed
+/// (here held a second before it is, `eviction-frees-slowly`): a write from
+/// another client meanwhile finds nothing left to evict and memory still
+/// over the limit. Under `allkeys-lru`, with what is being freed enough to
+/// bring memory under the limit, it is let through, not refused with OOM
+/// (#520).
+#[test]
+fn a_write_while_the_last_key_evicted_is_being_freed_is_let_through() {
+    let server = Server::start_freeing_slowly("allkeys-lru");
+    let mut c = server.conn();
+    c.big_list("big");
+    let conns = ready_conns(&server, 6);
+    // 2 MB under what is used: the list's 3.2 MB at least make the room.
+    let limit = c.used_memory() - 2 * MB;
+    let lowered = lower_limit(&server, limit);
     // From several clients, so that some are served by another thread than
     // the one freeing.
     let value = big_value('v');
@@ -1633,6 +1668,152 @@ fn a_write_while_the_last_key_evicted_is_being_freed_is_let_through() {
     // the list was still being freed.
     assert!(c.evicted() >= 1);
     assert_eq!(c.cmd(&["EXISTS", "big"]).i(), 0);
+    let counted = c.counted();
+    assert!(
+        counted <= limit,
+        "{counted} counted once freed, limit {limit}"
+    );
+}
+
+/// What is being freed is not enough to bring memory under the limit: the
+/// writes meanwhile are refused, as before.
+#[test]
+fn a_write_while_too_little_is_being_freed_is_refused() {
+    let server = Server::start_freeing_slowly("allkeys-lru");
+    let mut c = server.conn();
+    c.big_list("big");
+    let mut conn = ready_conns(&server, 1).pop().unwrap();
+    // 8 MB under what is used: more than the 3.2 MB reckoned to be freed.
+    let lowered = lower_limit(&server, c.used_memory() - 8 * MB);
+    let reply = conn.cmd(&["SET", "w", &big_value('v')]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("OOM"),
+        "a write meanwhile: {reply:?}"
+    );
+    assert!(lowered.join().unwrap().ok());
+}
+
+/// Under `volatile-lru`, nothing left to evict means no key with a time to
+/// live: a key written without one could never be evicted. While the last
+/// one evicted, a list, is still being freed, writes from many clients at
+/// once, of keys with a time to live and of keys without, are all refused
+/// with OOM, and memory use goes no higher than it was.
+#[test]
+fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
+    let server = Server::start_freeing_slowly("volatile-lru");
+    let mut c = server.conn();
+    c.big_list("big");
+    assert_eq!(c.cmd(&["EXPIRE", "big", "100000"]).i(), 1);
+    // Keys without a time to live, that `volatile-lru` leaves alone.
+    let value = big_value('p');
+    for i in 0..200 {
+        assert!(c.cmd(&["SET", &format!("user:{i}"), &value]).ok());
+    }
+    let conns = ready_conns(&server, 10);
+    let before = c.counted();
+    let limit = c.used_memory() - 2 * MB;
+    let lowered = lower_limit(&server, limit);
+    let writes: Vec<_> = conns
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut conn)| {
+            let value = value.clone();
+            std::thread::spawn(move || {
+                let mut refused = 0;
+                for n in 0..50 {
+                    let key = format!("{}:{i}:{n}", if i % 2 == 0 { "user" } else { "sess" });
+                    let mut args = vec!["SET", key.as_str(), value.as_str()];
+                    if i % 2 == 1 {
+                        args.extend(["EX", "100000"]);
+                    }
+                    let reply = conn.cmd(&args);
+                    if reply.is_err() {
+                        assert!(reply.s().starts_with("OOM"), "{reply:?}");
+                        refused += 1;
+                    }
+                }
+                refused
+            })
+        })
+        .collect();
+    let mut peak = 0;
+    while writes.iter().any(|w| !w.is_finished()) {
+        peak = peak.max(c.counted());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let refused: i32 = writes.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(lowered.join().unwrap().ok());
+    // Those that came while the list was still being freed, at least: what
+    // came after it was freed found room.
+    assert!(refused > 0, "no write was refused");
+    // Not a key without a time to live let in over the limit: memory use
+    // no higher than before the writes, and a write's worth.
+    assert!(
+        peak <= before + 64 * KB,
+        "{peak} counted at most, {before} before the writes"
+    );
+}
+
+/// `UNLINK` hands a big collection to the background to free. A client
+/// that builds one big list after another and unlinks each, while the
+/// background frees fall behind (`lazyfree-slowly`), does not let writes
+/// past the limit: once nothing is left to evict, they are refused with
+/// OOM, the list being built too, and memory use stays within a few
+/// megabytes of the limit however many lists wait to be freed.
+#[test]
+fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(
+        dir,
+        &["--maxmemory-policy", "allkeys-lru"],
+        &[("KIVIDB_TEST_FAILPOINTS", "lazyfree-slowly")],
+    );
+    let mut c = server.conn();
+    let value = big_value('k');
+    for i in 0..500 {
+        assert!(c.cmd(&["SET", &format!("k{i}"), &value]).ok());
+    }
+    let limit = c.limit_to(4 * MB);
+    let mut builder = server.conn();
+    let built = std::thread::spawn(move || {
+        let element = "e".repeat(100);
+        let mut refused = 0;
+        for i in 0..30 {
+            let key = format!("tmp{i}");
+            let mut push = vec!["RPUSH", key.as_str()];
+            push.extend(std::iter::repeat_n(element.as_str(), 2000));
+            for _ in 0..15 {
+                if builder.cmd(&push).is_err() {
+                    refused += 1;
+                }
+            }
+            builder.cmd(&["UNLINK", &key]);
+        }
+        refused
+    });
+    let mut writer = server.conn();
+    let mut peak = 0;
+    let mut refused = 0;
+    let mut n = 0;
+    while !built.is_finished() {
+        if writer.cmd(&["SET", &format!("w{n}"), &value]).is_err() {
+            refused += 1;
+        }
+        n += 1;
+        peak = peak.max(c.counted());
+    }
+    let refused_builds = built.join().unwrap();
+    assert!(
+        refused + refused_builds > 0,
+        "nothing was refused: {n} writes"
+    );
+    // 30 lists of 3 MB were built and unlinked: over the limit by no more
+    // than a list being built and what was queued to be freed before the
+    // limit was reached.
+    assert!(
+        peak <= limit + 16 * MB,
+        "{peak} counted at most, limit {limit}"
+    );
 }
 
 /// A full sync lays the whole dataset out in memory for the replica, and

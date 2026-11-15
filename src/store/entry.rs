@@ -875,6 +875,13 @@ impl Drop for EntryRef {
 pub struct Taken(Entry);
 
 impl Taken {
+    /// Whether the value is a string kept in the entry itself, freed with
+    /// it at once.
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        self.0.form() == INLINE
+    }
+
     /// # Safety
     /// The caller gives this the table's hold.
     pub(super) unsafe fn new(entry: Entry) -> Self {

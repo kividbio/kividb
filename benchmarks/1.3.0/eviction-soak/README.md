@@ -6,8 +6,9 @@ guard that stops eviction when it gives no memory back (#284) judged that by
 memory use alone, and other threads' writes kept memory use as high while
 the keys evicted were freed. The guard now asks what the evicting thread itself gave back (see
 `fruitless` in `src/eviction.rs`). And a write that found nothing left to
-evict while another thread was still freeing the last key it evicted (a
-large list) was refused; it is now let through (`freeing_elsewhere`).
+evict while another thread was still freeing a large collection it had
+evicted was refused; under `allkeys-*` it is now let through when what is
+being freed brings memory under the limit by itself (`room_on_its_way`).
 
 `soak.sh` runs the shape of the report on one VM: a master with AOF
 `everysec` and a replica with AOF, memtier `SET`/`GET` pipelined (1:2) and

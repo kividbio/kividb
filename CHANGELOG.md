@@ -294,16 +294,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   thread itself gave back (what it freed, and what it counted as held by a
   snapshot), and stops only when that is under a quarter of what it
   evicted. And a write that found nothing left to evict while another
-  thread was still freeing the last key it evicted (a large list takes a
-  while) was refused: it is now let through, as Redis lets a command
-  through while its lazy frees from eviction are under way, without
-  waiting for anything. On a 4-vCPU VM (master and replica with AOF,
-  memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists, sets and
-  sorted sets, `maxmemory 512mb` under `allkeys-lfu`, ~55M writes in ten
-  minutes), master refused 13 writes and its guard tripped at least 6
-  times; the fix refused none and never tripped (`allkeys-lru`: 2 and 4
-  against 0 and 0). Keys that only a snapshot holds are still not evicted
-  for nothing. The soak is `benchmarks/1.3.0/eviction-soak/soak.sh`.
+  thread was still freeing a large collection it had evicted was refused.
+  Under an `allkeys-*` policy only, such a write is now let through when
+  the collections being freed at that moment (reckoned low: 32 bytes an
+  element) bring memory use under `maxmemory` by themselves; otherwise, and
+  under every `volatile-*` policy, it is refused as before. That lets
+  memory go over the limit by at most what the writes checked at that
+  moment add, and nothing waits. On a 4-vCPU VM (master and replica with
+  AOF, memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists,
+  sets and sorted sets, `maxmemory 512mb`, ~55M writes in ten minutes),
+  SOAK_NUMBERS Keys that only a snapshot holds are still not evicted for
+  nothing. The soak is `benchmarks/1.3.0/eviction-soak/soak.sh`.
 
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
