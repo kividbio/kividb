@@ -1002,15 +1002,40 @@ fn is_script(name: &str) -> bool {
 }
 
 /// What the lookups of the command `name`, started at `now`, write to the
-/// keys they find: see `store::AccessScope`.
-#[cold]
-#[inline(never)]
-fn access_scope(name: &str, now: std::time::Instant, cmd: &[&[u8]]) -> crate::store::AccessScope {
+/// keys they find: see `store::AccessScope`. And whether the keys have their
+/// use written after the command, by `eviction::used`: a script's declared
+/// keys, and a modification under the LRM policies.
+#[inline(always)]
+fn access_scope(
+    name: &str,
+    now: std::time::Instant,
+    cmd: &[&[u8]],
+) -> (crate::store::AccessScope, bool) {
     use crate::store::AccessScope;
-    if asks_only(name) || is_script(name) {
-        return AccessScope::none();
+    // Names that start with another letter than these are neither, and are
+    // not compared to them (GET, SET, ...).
+    if matches!(
+        name.as_bytes().first(),
+        Some(b'O' | b'T' | b'P' | b'E' | b'D' | b'R' | b'F')
+    ) {
+        if asks_only(name) {
+            return (AccessScope::none(), false);
+        }
+        if is_script(name) {
+            return (AccessScope::none(), true);
+        }
     }
     let stamp = crate::eviction::stamp(now);
+    // A stamp of 0 under a policy that records: the LRM policies, where only
+    // a modification is a use, and the command's outcome tells.
+    let after = stamp == 0;
+    (access_scope_counting(name, cmd, stamp), after)
+}
+
+/// [`access_scope`] once the stamp is known.
+#[inline(always)]
+fn access_scope_counting(name: &str, cmd: &[&[u8]], stamp: u32) -> crate::store::AccessScope {
+    use crate::store::AccessScope;
     // Under LFU, a key the command names twice (`MGET a a`) is counted
     // twice, as Redis counts each lookup. Only a command of more than one
     // argument can, and the hot ones find their keys without the long
@@ -1655,7 +1680,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     // Under an eviction policy that goes by use, the command's own lookups
     // write it (see `eviction`): one atomic load when there is none.
-    let access = crate::eviction::recording().then(|| access_scope(name, started, &ctx.cmd));
+    let (access, used_after) = if crate::eviction::recording() {
+        let (scope, after) = access_scope(name, started, &ctx.cmd);
+        (Some(scope), after)
+    } else {
+        (None, false)
+    };
     let result = dispatch_command_handlers(ctx, name)
         .or_else(|| lua::handle(ctx, name))
         .unwrap_or_else(|| unknown_command(&ctx.cmd));
@@ -1663,14 +1693,14 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // refused before it looks its keys up; those keys are used all the
     // same, as they were when the use was written after every command. Only
     // on an error: a key it did look up is not counted again.
-    if access.is_some() && result.starts_with(b"-") {
+    if access.is_some() && result.first() == Some(&b'-') {
         used_on_error(ctx, name);
     }
     // Under LFU, a key the command names more than once is counted as many
     // times as it is named, as when its use was written after the command,
     // a lookup for each place it is named. Its own lookups count up to that
     // many; these make up the rest.
-    if access.is_some()
+    if access.as_ref().is_some_and(|scope| scope.is_counting())
         && let Some(named) = crate::store::AccessScope::named_more_than_once()
     {
         let db = *ctx.selected_db;
@@ -1747,10 +1777,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // policies, and the keys a script declares (see `eviction`). Not by the
     // commands that only ask about a key: Redis does not count those as a
     // use of it either.
-    if crate::eviction::recording()
-        && crate::eviction::used_after(is_script(name))
-        && !asks_only(name)
-    {
+    if used_after {
         let wrote = writes_operation && !result.starts_with(b"-");
         for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
             crate::eviction::used(ctx.store, *ctx.selected_db, ctx.cmd[pos], wrote);

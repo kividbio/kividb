@@ -65,6 +65,7 @@ list.
 | `--aof` | off | Append-only file persistence |
 | `--maxmemory <bytes>` | `0` (unlimited) | Memory limit |
 | `--maxmemory-policy` | `noeviction` | What happens at the limit: `noeviction`, or the `allkeys-*` / `volatile-*` eviction policies (`kividb --help` lists them) |
+| `--key-access-tracking <yes\|no>` | `yes` | Keep when each key was last used, and how often, under every `maxmemory-policy`, so that `OBJECT IDLETIME`, `OBJECT FREQ` and `RESTORE ... IDLETIME` work under `noeviction` as in Redis. `no` stops recording unless an LRU, LFU or LRM policy is selected, and saves each command one clock reading. Changeable with `CONFIG SET` |
 | `--loglevel` | `info` | `debug`, `verbose`, `notice` (or `info`), `warning`, `nothing` |
 | `--logfile <path>` | standard error | Write the log to a file |
 | `--log-format <text\|json>` | `text` | Log line format |

@@ -179,6 +179,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`key-access-tracking` is `yes` by default (#21).** `OBJECT IDLETIME`,
+  `OBJECT FREQ` and `RESTORE ... IDLETIME` now work under `noeviction`, as in
+  Redis: before, a key's last use was kept only under an LRU, LFU or LRM
+  policy and `OBJECT IDLETIME` said 0. `TTL`, `TYPE`, `EXISTS` and `OBJECT`
+  still do not count as a use. It costs a key no memory (the access word is in
+  every entry already) and a command about 40 to 50 instructions, 1 to 1.5% of
+  a pipelined `GET` or `SET` (0.1 to 0.5% when not pipelined; 0.1% for a
+  16-key `MGET`). Set `key-access-tracking no` to go back to the old cost.
+  Proposed by @Bhupendra3444.
+
 - **A grouped `FT.AGGREGATE` reports how many groups there are (#761).** The
   first element of the reply (`total_results` under RESP3) was the number of
   rows on the page, so `GROUPBY 1 @f REDUCE COUNT 0 AS n LIMIT 0 10` over a

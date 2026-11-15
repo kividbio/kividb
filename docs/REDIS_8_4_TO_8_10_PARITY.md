@@ -349,8 +349,8 @@ Beyond the report:
   later element than Redis would give it. Order of service is unaffected, and
   nothing is lost or delivered twice.
 * `OBJECT IDLETIME` is `0` under `noeviction` and the policies that do not go
-  by use: keys are watched only when a policy needs it, so that the default
-  costs a command nothing. Redis always tracks one of idle time or frequency.
+  by use only with `key-access-tracking no` (the default is `yes`: Redis
+  always tracks one of idle time or frequency, and so does KiviDB now).
 * A replica waits for its master's `DEL` of a key that expires, as in Redis,
   except under a KiviDB master older than 1.1.3, which sends none: there it
   expires keys by its own clock, as every replica did before 1.1.3. Both hold

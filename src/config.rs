@@ -177,9 +177,10 @@ pub struct Config {
     pub lfu_log_factor: u32,
 
     /// Record every key's use whatever the eviction policy, so that `OBJECT
-    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too. Costs
-    /// every command a little: see `eviction::key_access_tracking`.
-    #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args = 1)]
+    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too, as
+    /// Redis's do. On by default; `no` saves every command a clock reading:
+    /// see `eviction::key_access_tracking`.
+    #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
     pub key_access_tracking: bool,
 
     /// Minutes for a key's use count to fall by one, for the LFU policies
@@ -638,7 +639,7 @@ impl Default for Config {
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,
-            key_access_tracking: false,
+            key_access_tracking: true,
             lfu_decay_time: 1,
             activedefrag: true,
             allocator_give_back: true,
@@ -767,7 +768,7 @@ impl Config {
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,
-            key_access_tracking: false,
+            key_access_tracking: true,
             lfu_decay_time: 1,
             activedefrag: true,
             allocator_give_back: true,

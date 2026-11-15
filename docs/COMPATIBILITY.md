@@ -212,7 +212,9 @@ other files:
   caches need Redis 7.4 or later. KiviDB's own release is `kividb_version`,
   in `HELLO` and in `INFO`.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
-- `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set.
+- `OBJECT IDLETIME` is kept under every `maxmemory-policy`, as in Redis,
+  unless `key-access-tracking no` is set: then it is `0` unless a policy
+  that uses it is.
 - `client-output-buffer-limit`'s replica hard limit is
   `repl-replica-max-backlog-bytes` (0: no limit, which lifts
   `repl-replica-sync-max-backlog-bytes` too); during a full sync a replica
