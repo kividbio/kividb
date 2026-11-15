@@ -285,6 +285,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Under an `allkeys-*` policy a write is no longer refused with OOM while
+  eviction is working (#520).** Two things refused one. Eviction stopped
+  once it had evicted about 1 MB of keys with memory use no lower (the
+  guard against evicting keys a snapshot still holds, #284), and with many
+  clients writing at once the other threads' writes kept memory use as high
+  while every key evicted was freed: the guard now asks what the evicting
+  thread itself gave back (what it freed, and what it counted as held by a
+  snapshot), and stops only when that is under a quarter of what it
+  evicted. And a write that found nothing left to evict while another
+  thread was still freeing the last key it evicted (a large list takes a
+  while) was refused: it is now let through, as Redis lets a command
+  through while its lazy frees from eviction are under way, without
+  waiting for anything. On a 4-vCPU VM (master and replica with AOF,
+  memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists, sets and
+  sorted sets, `maxmemory 512mb` under `allkeys-lfu`, ~55M writes in ten
+  minutes), master refused 13 writes and its guard tripped at least 6
+  times; the fix refused none and never tripped (`allkeys-lru`: 2 and 4
+  against 0 and 0). Keys that only a snapshot holds are still not evicted
+  for nothing. The soak is `benchmarks/1.3.0/eviction-soak/soak.sh`.
+
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
   `DISCARD`, `RESET` and `AUTH` were counted with 0 microseconds; they, and

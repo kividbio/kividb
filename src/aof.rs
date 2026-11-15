@@ -3920,6 +3920,12 @@ fn injected_failure(name: &str) -> bool {
     failpoint_named(name)
 }
 
+/// A fault a test injects, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to be.
+pub(crate) fn injected(name: &str) -> bool {
+    failpoint_named(name)
+}
+
 /// What a node did before, that a test has it do again, named in
 /// `KIVIDB_TEST_FAILPOINTS` as a [`failpoint`] is: whether it is to.
 pub(crate) fn test_behaves_as_before(name: &str) -> bool {

@@ -950,6 +950,36 @@ thread_local! {
     static DBS: std::cell::RefCell<Dbs> = std::cell::RefCell::new(Dbs::default());
 }
 
+/// Evictions under way: keys being deleted and freed (see [`evict`]).
+static FREEING: AtomicUsize = AtomicUsize::new(0);
+
+/// An eviction under way, counted in [`FREEING`] while this lives.
+struct Freeing;
+
+impl Freeing {
+    fn start() -> Self {
+        FREEING.fetch_add(1, Ordering::AcqRel);
+        Freeing
+    }
+}
+
+impl Drop for Freeing {
+    fn drop(&mut self) {
+        FREEING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Whether memory is being given back that eviction cannot see yet: a key
+/// another thread is evicting, gone from the keyspace and not yet freed
+/// (a list of millions of elements takes a while), or values handed to the
+/// background to be freed (`lazyfree`). With nothing left to evict, the
+/// write is let through rather than refused: memory is on its way down, as
+/// Redis lets a command through while its lazy frees from eviction are
+/// still under way. Nothing waits for them.
+fn freeing_elsewhere() -> bool {
+    FREEING.load(Ordering::Acquire) > 0 || crate::lazyfree::pending_objects() > 0
+}
+
 /// Delete `key` to make room, with everything a deletion entails. Returns
 /// about how much memory that gives back (see `store::Taken::footprint`),
 /// or None if the key was gone already.
@@ -959,9 +989,18 @@ fn evict(ctx: &mut Ctx, db: usize, key: &[u8], ordered: bool) -> Option<usize> {
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
         .then(|| crate::write_order::lock_keys(db, std::iter::once(key)));
 
+    // From before the key goes until it is freed (see `freeing_elsewhere`).
+    let _freeing = Freeing::start();
     // A document left its indexes when the shard was let go of
     // (`ShardMap::remove`).
-    let given = crate::commands::helpers::delete_key_sized(ctx.store, db, key)?;
+    let taken = crate::commands::helpers::take_entry(ctx.store, db, key)?;
+    let given = taken.footprint();
+    if crate::aof::injected("eviction-frees-slowly") {
+        // A large value, slow to free: a test's other clients write
+        // meanwhile.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    drop(taken);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
     crate::stats::record_rdb_change();
@@ -987,7 +1026,8 @@ fn evict(ctx: &mut Ctx, db: usize, key: &[u8], ordered: bool) -> Option<usize> {
 }
 
 /// Delete keys until memory use is at most `limit`. False if the policy has
-/// nothing more to delete and it is still over: the write is refused.
+/// nothing more to delete, nothing evicted is still being freed
+/// ([`freeing_elsewhere`]) and it is still over: the write is refused.
 ///
 /// Memory use is what `maxmemory` is measured against: what is allocated,
 /// less what deleting keys would not give back (`memory_use::counted`), such
@@ -1042,10 +1082,43 @@ pub fn limit_changed() {
 
 /// Whether keys that took `given` bytes have been evicted to no effect:
 /// twice what memory use was over the limit by (`over`), and a megabyte
-/// more for what other threads allocate meanwhile, and memory use (`used`)
-/// is no lower than when it began (`began`).
-fn fruitless(given: usize, over: usize, used: usize, began: usize) -> bool {
-    given > over.saturating_mul(2).saturating_add(1 << 20) && used >= began
+/// more, memory use (`used`) no lower than when it began (`began`), and
+/// less than a quarter of it given back by the evicting itself (`freed`:
+/// what this thread's own share of memory use came down by meanwhile, what
+/// it freed and what it counted as held by a snapshot, `None` if it has no
+/// count of its own).
+///
+/// Memory use alone does not say: other threads' writes add to it while
+/// this one evicts (each makes room before it writes, and many write at
+/// once), and so does what stops being left out of it, such as a queue
+/// for a replica let go of. It can stay as high while every key evicted
+/// here is freed, and a write was refused with keys to spare (#520). What
+/// does say is a key deleted and its memory still allocated and counted:
+/// held by something eviction does not know of. Deleting more of those would empty
+/// the keyspace for nothing (#284).
+fn fruitless(given: usize, over: usize, used: usize, began: usize, freed: Option<isize>) -> bool {
+    given > over.saturating_mul(2).saturating_add(1 << 20)
+        && used >= began
+        && freed.is_none_or(|freed| freed < (given / 4) as isize)
+}
+
+/// What this thread has added to memory use, if it has a count of its
+/// own: see [`fruitless`].
+fn mine() -> Option<isize> {
+    crate::memory_use::counted_by_this_thread()
+}
+
+/// `KIVIDB_TEST_FAILPOINTS` names `eviction-others-allocate`: as each key is
+/// evicted, other threads are taken to allocate twice what it took, 8 MB
+/// at most in all. Writers that outpace one thread's evicting for a while,
+/// for a test to see that eviction goes on (#520).
+fn others_allocate(given: usize) {
+    static SO_FAR: AtomicUsize = AtomicUsize::new(0);
+    const AT_MOST: usize = 8 << 20;
+    let more = given.saturating_mul(2);
+    if SO_FAR.fetch_add(more, Ordering::Relaxed) < AT_MOST {
+        crate::memory_use::note_by_another_thread(more as isize);
+    }
 }
 
 fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs: &mut Dbs) -> bool {
@@ -1057,18 +1130,26 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
     let mut misses = 0;
     // Nor is an eviction that gives nothing back, now and then; but keys
     // that took far more than memory use was over by, evicted with memory
-    // use no lower, are memory that evicting keys does not give back: the
-    // keyspace was emptied that way (#284). Rather than lose every key,
-    // stop, and refuse writes while memory use stays that high.
+    // use no lower and their memory still allocated, are memory that
+    // evicting keys does not give back: the keyspace was emptied that way
+    // (#284). Rather than lose every key, stop, and refuse writes while
+    // memory use stays that high. Whether it was given back is told by
+    // this thread's own count, which other threads' writes do not move (see
+    // `fruitless`).
     let began = crate::memory_use::counted();
+    let began_here = mine();
     let over = began.saturating_sub(limit);
     let mut given = 0usize;
+    let others_allocating = crate::aof::injected("eviction-others-allocate");
     loop {
         let used = crate::memory_use::counted();
         if used <= limit {
             return true;
         }
-        if fruitless(given, over, used, began) {
+        let freed = began_here
+            .zip(mine())
+            .map(|(then, now)| then.wrapping_sub(now));
+        if fruitless(given, over, used, began, freed) {
             STALLED_AT.store(used, Ordering::Relaxed);
             log_throttled!(
                 60,
@@ -1083,7 +1164,9 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
         let (list, weights) = dbs.get(ctx, volatile, fresh);
         let Some((db, key)) = choose(ctx, policy, list, weights, &mut rng) else {
             if fresh {
-                return false;
+                // Nothing left to evict: refused, unless what was evicted
+                // elsewhere is still being freed (#520).
+                return freeing_elsewhere();
             }
             // Nothing where there were keys: ask again where they are.
             fresh = true;
@@ -1094,11 +1177,16 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             Some(size) => {
                 misses = 0;
                 given = given.saturating_add(size);
+                if others_allocating {
+                    others_allocate(size);
+                }
             }
             None => {
                 misses += 1;
                 if misses > 64 {
-                    return false;
+                    // Gone before this thread could evict them: evicted or
+                    // deleted by others, and being freed, it may be.
+                    return freeing_elsewhere();
                 }
             }
         }
@@ -1111,19 +1199,43 @@ mod tests {
     use std::sync::Arc;
 
     /// Eviction stops only once keys well past what memory use was over by
-    /// have gone with memory use no lower: not for a deletion or two that
-    /// give nothing back, nor while memory use comes down.
+    /// have gone with memory use no lower and their memory not given back:
+    /// not for a deletion or two that give nothing back, nor while memory
+    /// use comes down, nor while what is evicted is freed (#520).
     #[test]
     fn eviction_stops_when_it_gives_nothing_back() {
         const MB: usize = 1 << 20;
+        const KB: usize = 1 << 10;
+        // Nothing freed here.
+        let stops = |given, over, used, began| fruitless(given, over, used, began, Some(0));
         // 8 KB over; 1.1 MB of keys evicted, memory use as it was.
-        assert!(fruitless(MB + 17 * 1024, 8 * 1024, 100 * MB, 100 * MB));
-        assert!(!fruitless(MB, 8 * 1024, 100 * MB, 100 * MB));
+        assert!(stops(MB + 17 * KB, 8 * KB, 100 * MB, 100 * MB));
+        assert!(!stops(MB, 8 * KB, 100 * MB, 100 * MB));
         // Lower than when it began: the evictions are working.
-        assert!(!fruitless(50 * MB, 8 * 1024, 100 * MB - 1, 100 * MB));
+        assert!(!stops(50 * MB, 8 * KB, 100 * MB - 1, 100 * MB));
         // Far over: twice that is evicted first.
-        assert!(!fruitless(40 * MB, 20 * MB, 120 * MB, 120 * MB));
-        assert!(fruitless(42 * MB, 20 * MB, 121 * MB, 120 * MB));
+        assert!(!stops(40 * MB, 20 * MB, 120 * MB, 120 * MB));
+        assert!(stops(42 * MB, 20 * MB, 121 * MB, 120 * MB));
+        // No count of its own: memory use alone says.
+        assert!(fruitless(MB + 17 * KB, 8 * KB, 100 * MB, 100 * MB, None));
+    }
+
+    /// What was evicted was freed, here: other threads' writes kept memory
+    /// use as high (#520), and eviction goes on. Freed in part (a value
+    /// something else still has a handle on), it goes on while a quarter of
+    /// it is; and stops once less is.
+    #[test]
+    fn eviction_goes_on_while_what_it_evicts_is_freed() {
+        const MB: usize = 1 << 20;
+        const GIVEN: usize = 2 * MB;
+        // 2 MB evicted, 8 KB over, memory use 1 MB higher than it began,
+        // and `freed` of it freed here.
+        let stops = |freed: isize| fruitless(GIVEN, 8 << 10, 101 * MB, 100 * MB, Some(freed));
+        assert!(!stops(GIVEN as isize));
+        assert!(!stops(GIVEN as isize / 4));
+        assert!(stops(GIVEN as isize / 4 - 1));
+        // This thread allocated meanwhile more than it freed.
+        assert!(stops(-(MB as isize)));
     }
 
     #[test]

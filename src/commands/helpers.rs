@@ -1023,18 +1023,16 @@ pub fn delete_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -
     take_key(store, db, key).is_some()
 }
 
-/// [`delete_key`], saying about how much memory the key took: what
-/// deleting it gives back, or leaves to a snapshot that still holds it
-/// (`store::Taken::footprint`). For eviction to see that it gets anywhere.
-pub fn delete_key_sized(
+/// [`delete_key`], handing back the key's entry, for eviction to say about
+/// how much memory it took (`store::Taken::footprint`) and then free it, or
+/// leave it to a snapshot that still holds it, with the shard unlocked.
+pub fn take_entry(
     store: &Store,
     db: usize,
     key: &(impl AsRef<[u8]> + ?Sized),
-) -> Option<usize> {
+) -> Option<store::Taken> {
     let value_shard = store::get_shard(&store[db], key);
-    let removed = write_lock!(value_shard).remove(key)?;
-    // Freed (or left to what holds it) with the shard unlocked.
-    Some(removed.footprint())
+    write_lock!(value_shard).remove(key)
 }
 
 /// [`delete_key`], handing back the value, for `UNLINK` to free: after the

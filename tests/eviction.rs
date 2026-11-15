@@ -1480,6 +1480,161 @@ fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
     c.snapshot_let_go(limit);
 }
 
+/// Memory that evicting keys does not give back, here what a snapshot
+/// holds counted as it was before #284 (`snapshot-held-counted`), with the
+/// snapshot's keys the only ones to evict (`volatile-lru`, and only they
+/// have a time to live): eviction stops after a little and writes are
+/// refused with OOM, rather than every key being evicted to no effect.
+/// Once the snapshot lets go, writes are let through again.
+#[test]
+fn eviction_that_gives_nothing_back_stops_and_writes_are_refused() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(
+        dir,
+        &["--maxmemory-policy", "volatile-lru"],
+        &[(
+            "KIVIDB_TEST_FAILPOINTS",
+            "snapshot-writing,snapshot-held-counted",
+        )],
+    );
+    let mut c = server.conn();
+    let value = big_value('a');
+    for i in 0..SNAPSHOT_KEYS {
+        let reply = c.cmd(&["SET", &format!("s{i}"), &value, "EX", "100000"]);
+        assert!(reply.ok(), "{reply:?}");
+    }
+    c.limit_to(4 * MB);
+    assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+    let held = server.snapshot_held(1);
+    // 8 MB of keys with no time to live: half fit, and for the rest only
+    // the snapshot's keys can be evicted, which gives nothing back.
+    let mut refused = 0;
+    for i in 0..1000 {
+        let reply = c.cmd(&["SET", &format!("n{i}"), &value]);
+        if reply.is_err() {
+            assert!(
+                reply.s().starts_with("OOM command not allowed"),
+                "{reply:?}"
+            );
+            refused += 1;
+        }
+    }
+    let evicted = c.evicted();
+    assert!(
+        refused > 300,
+        "{refused} of 1000 writes refused, {evicted} keys evicted"
+    );
+    assert!(
+        evicted < SNAPSHOT_KEYS as i64 / 10,
+        "{evicted} keys evicted for memory that evicting does not give back"
+    );
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let reply = c.cmd(&["SET", "after", &value]);
+        if reply.ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still refused: {reply:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Other threads' writes can keep memory use as high while one thread
+/// evicts key after key and frees each (#520). Here they are taken to
+/// allocate twice what each evicted key took, 8 MB in all
+/// (`eviction-others-allocate`): eviction goes on until memory use is under
+/// the limit, and no write is refused. Under an allkeys policy, as in
+/// Redis, a write is refused only when nothing is left to evict.
+#[test]
+fn eviction_goes_on_while_other_writers_keep_memory_use_up() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(
+        dir,
+        &["--maxmemory-policy", "allkeys-lru"],
+        &[("KIVIDB_TEST_FAILPOINTS", "eviction-others-allocate")],
+    );
+    let mut c = server.conn();
+    let value = big_value('a');
+    for i in 0..SNAPSHOT_KEYS {
+        assert!(c.cmd(&["SET", &format!("s{i}"), &value]).ok());
+    }
+    c.limit_to(4 * MB);
+    for i in 0..1000 {
+        let reply = c.cmd(&["SET", &format!("n{i}"), &value]);
+        assert!(
+            reply.ok(),
+            "write {i} was refused with {} keys evicted: {reply:?}",
+            c.evicted()
+        );
+    }
+    let evicted = c.evicted();
+    assert!(evicted > 0, "nothing was evicted");
+    // 4 MB of room, 8 MB of new keys and 8 MB the others allocated.
+    let kept = c.cmd(&["DBSIZE"]).i();
+    assert!(
+        kept > SNAPSHOT_KEYS as i64 / 2,
+        "{kept} keys kept, {evicted} evicted"
+    );
+}
+
+/// The last key evicted, a list of 100,000 elements, and still being freed
+/// (here held a second before it is, `eviction-frees-slowly`): a write from
+/// another client meanwhile finds nothing left to evict and memory still
+/// over the limit. It is let through, as Redis lets a command through while
+/// its lazy frees from eviction are under way, not refused with OOM (#520).
+#[test]
+fn a_write_while_the_last_key_evicted_is_being_freed_is_let_through() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(
+        dir,
+        &["--maxmemory-policy", "allkeys-lru"],
+        &[("KIVIDB_TEST_FAILPOINTS", "eviction-frees-slowly")],
+    );
+    let mut c = server.conn();
+    // About 10 MB, freed element by element once the key is gone.
+    let element = "e".repeat(100);
+    let mut push = vec!["RPUSH", "big"];
+    push.extend(std::iter::repeat_n(element.as_str(), 2000));
+    for _ in 0..50 {
+        c.cmd(&push);
+    }
+    assert_eq!(c.cmd(&["LLEN", "big"]).i(), 100_000);
+    // Connected, and served, before: a connection made while a thread of
+    // the server is held may wait to be accepted.
+    let mut conns: Vec<Conn> = (0..6).map(|_| server.conn()).collect();
+    for conn in &mut conns {
+        assert_eq!(conn.cmd(&["PING"]).s(), "PONG");
+    }
+    // A limit 4 MB under what is used: `CONFIG SET` evicts `big` at once,
+    // and frees it a second on.
+    let limit = (c.used_memory() - 4 * MB).to_string();
+    let mut setter = server.conn();
+    let lowered = std::thread::spawn(move || setter.cmd(&["CONFIG", "SET", "maxmemory", &limit]));
+    std::thread::sleep(Duration::from_millis(300));
+    // From several clients, so that some are served by another thread than
+    // the one freeing.
+    let value = big_value('v');
+    let writes: Vec<_> = conns
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut conn)| {
+            let value = value.clone();
+            std::thread::spawn(move || conn.cmd(&["SET", &format!("w{i}"), &value]))
+        })
+        .collect();
+    for write in writes {
+        let reply = write.join().unwrap();
+        assert!(reply.ok(), "a write meanwhile: {reply:?}");
+    }
+    assert!(lowered.join().unwrap().ok());
+    // A write let through may itself have been evicted for the next, while
+    // the list was still being freed.
+    assert!(c.evicted() >= 1);
+    assert_eq!(c.cmd(&["EXISTS", "big"]).i(), 0);
+}
+
 /// A full sync lays the whole dataset out in memory for the replica, and
 /// queues for it every write made meanwhile: neither is given back by
 /// evicting keys, and neither is counted (Redis does not count what it

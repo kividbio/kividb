@@ -657,6 +657,11 @@ impl Entry {
     #[cold]
     #[inline(never)]
     fn left_held(self, bytes: bool) {
+        // A test that has a snapshot's hold counted, as before #284: memory
+        // evicting keys does not give back, for eviction to stop at.
+        if crate::aof::test_behaves_as_before("snapshot-held-counted") {
+            return;
+        }
         let bytes = bytes && self.string_bytes().is_some_and(SharedBytes::is_unique);
         crate::memory_use::not_counted_add(self.held_size(bytes));
         let flags = LEFT_HELD | if bytes { LEFT_HELD_BYTES } else { 0 };
