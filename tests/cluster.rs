@@ -7364,6 +7364,113 @@ fn a_restart_during_the_cleanup_keeps_every_key_of_a_slot_that_had_any() {
     assert_held_kept(&cut, node);
 }
 
+/// The promoted node's cleanup waits (the source still has the slots
+/// moving). Meanwhile slot `t` is given to it by hand (`SETSLOT NODE`),
+/// clients write to it there, and it is given to C by hand, its keys left
+/// (#741 review). Those writes were acknowledged here, and are the only
+/// copy: `t` is left out of the cleanup for good, and none of its keys,
+/// those the import brought included, is deleted. `s` is cleaned up.
+#[test]
+fn a_slot_that_came_to_the_promoted_node_is_left_out_of_the_cleanup() {
+    let mut cut = import_cut_short(1, &[], &[], &[], 60_000, brought_everywhere);
+    let p = cut.kill_destination();
+    let node = &cut.replicas[p];
+    wait_until(
+        "the promoted node to say why it waits",
+        Duration::from_secs(30),
+        || node.log().contains("is not deleted yet"),
+    );
+    let t = cut.t.to_string();
+    let node_id = node.id();
+    let r = node
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &t, "NODE", &node_id]);
+    assert!(r.is_ok(), "{r:?}");
+    let written = keys_of_slot(cut.t, "acked", 20);
+    let mut c = node.conn();
+    set_all(&mut c, &written, "acked");
+    // `SETSLOT NODE` to another node is refused while it holds keys of the
+    // slot; `DELSLOTS` and `ADDSLOTS` are not.
+    for at in [node, &cut.nodes[2]] {
+        let r = at.conn().cmd(&["CLUSTER", "DELSLOTS", &t]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let r = cut.nodes[2].conn().cmd(&["CLUSTER", "ADDSLOTS", &t]);
+    assert!(r.is_ok(), "{r:?}");
+    // A claim at a new epoch, over the promoted node's own of `t`.
+    cut.nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]);
+    wait_until("the node to see C own t", Duration::from_secs(90), || {
+        node.conn()
+            .cmd(&["GET", &written[0]])
+            .err()
+            .is_some_and(|e| e.contains(&format!("127.0.0.1:{}", cut.nodes[2].port)))
+    });
+    cut.wait_source_done();
+    wait_until(
+        "what the import brought of s to be deleted",
+        Duration::from_secs(60),
+        || held_of(node, &cut.brought).is_empty(),
+    );
+    wait_until("it to forget the import", Duration::from_secs(30), || {
+        followed_file(node).is_none()
+    });
+    assert_eq!(held_of(node, &written), written, "acknowledged writes lost");
+    assert_eq!(held_of(node, &cut.brought2), cut.brought2);
+    assert_held_kept(&cut, node);
+    assert!(
+        node.log()
+            .contains("came to this node: left out of it for good"),
+        "{}",
+        node.log()
+    );
+}
+
+/// `CLUSTER RESET` on a replica that knows of an import of its master
+/// forgets it: the node is no one's replica, nor in that cluster. Joined to
+/// the cluster again, where the source owns the slots, it deletes nothing
+/// of them, and an import of them is not refused for them.
+#[test]
+fn cluster_reset_forgets_the_imports_of_the_old_master() {
+    let cut = import_cut_short(1, &[], &[], &[], 60_000, brought_everywhere);
+    let replica = &cut.replicas[0];
+    assert!(followed_file(replica).is_some_and(|f| f.contains(&cut.task_id)));
+    let r = replica.conn().cmd(&["CLUSTER", "RESET", "SOFT"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(followed_file(replica).is_none());
+    assert!(replica.is_master());
+    // The import ends, the source keeps the slots, and nothing is moving.
+    let mut b = cut.nodes[1].conn();
+    let canceled = b.cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &cut.task_id]);
+    assert_eq!(canceled.int(), 1);
+    cut.wait_source_done();
+    let r = replica.conn().cmd(&[
+        "CLUSTER",
+        "MEET",
+        "127.0.0.1",
+        &cut.nodes[0].port.to_string(),
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let a_id = cut.nodes[0].id();
+    wait_until(
+        "it to see the source own the slots",
+        Duration::from_secs(30),
+        || {
+            orphan_slots(replica)
+                .iter()
+                .any(|(start, _, _, owner)| *start == cut.t && owner.as_deref() == Some(&*a_id))
+        },
+    );
+    // Well past the time a cleanup takes once the source is settled.
+    std::thread::sleep(Duration::from_secs(10));
+    assert_eq!(held_of(replica, &cut.all_brought()).len(), 80);
+    assert_eq!(import_cleanup_slots(replica), 0);
+    let r = replica.conn().cmd(&cut.import_args());
+    assert!(
+        r.err().is_none_or(|e| !e.contains("still to be deleted")),
+        "{r:?}"
+    );
+}
+
 /// With a KiviDB 1.2 replica of the destination (`KIVIDB_1_2_BIN`), which
 /// does not ask for the markers: none is sent to it, its stream is not
 /// disturbed, and promoted it keeps what the import brought, as 1.2 does.

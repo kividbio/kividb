@@ -1211,10 +1211,9 @@ impl ReplState {
         });
         // The old master's imports this node knew of are this one's to
         // settle now (#741); and its replicas, the moment one can attach,
-        // are to be told of them.
-        if followed.is_some() {
-            self.slot_imports_event(SlotImportsEvent::Promoted);
-        }
+        // are to be told of them. At every promotion, with a resync point
+        // or not: the markers its hub has kept must be this node's own.
+        self.slot_imports_event(SlotImportsEvent::Promoted);
         self.slave_mode.store(false, Ordering::Release);
         *self.master_addr.write() = None;
         *self.role.write() = "master".into();
@@ -6249,5 +6248,127 @@ mod backlog_tests {
         assert_eq!(flush_before_load("on-empty-db"), Some(true));
         assert_eq!(flush_before_load("swapdb"), Some(false));
         assert_eq!(flush_before_load("sometimes"), None);
+    }
+}
+
+#[cfg(test)]
+mod slot_imports_tests {
+    use super::*;
+
+    fn link(promotions: Arc<AtomicU64>) -> ClusterLink {
+        ClusterLink {
+            master_node: Box::new(|| None),
+            take_over: Box::new(|_, _| false),
+            slot_imports: Box::new(move |event| {
+                if matches!(event, SlotImportsEvent::Promoted) {
+                    promotions.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        }
+    }
+
+    /// The cluster layer is told of every promotion, with a resync point or
+    /// not: it re-sends its markers then (#741 review).
+    #[test]
+    fn every_promotion_tells_the_cluster_layer() {
+        let promotions = Arc::new(AtomicU64::new(0));
+        let state = ReplState::new_master();
+        state.install_cluster_link(link(Arc::clone(&promotions)));
+        state.become_master();
+        assert_eq!(promotions.load(Ordering::SeqCst), 1);
+        state.become_master();
+        assert_eq!(promotions.load(Ordering::SeqCst), 2);
+    }
+
+    async fn barrier(hub: &HubTx) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done)).unwrap();
+        wait.await.unwrap();
+    }
+
+    fn drained(rx: &mut mpsc::UnboundedReceiver<ReplPayload>) -> Vec<Vec<u8>> {
+        let mut got = Vec::new();
+        while let Ok(payload) = rx.try_recv() {
+            got.push(payload.to_vec());
+        }
+        got
+    }
+
+    /// Markers go to the replicas that asked for them only, the `SYNC` form
+    /// first, and are not part of the stream: no backlog keeps them, and
+    /// what a replica has been sent of the stream does not count them. A
+    /// replica that did not ask (one of an earlier release) is sent the
+    /// stream alone, byte for byte.
+    #[tokio::test]
+    async fn markers_go_only_to_replicas_that_asked_and_outside_the_stream() {
+        let state = Arc::new(ReplState::new_master());
+        state.sends_slot_imports.store(true, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        state.send_slot_imports(b"LIVE-1".to_vec(), b"SYNC-1".to_vec());
+        let mut rxs = Vec::new();
+        for (id, takes) in [(31_u64, true), (32, false)] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            hub.send(HubMsg::RegisterChannel {
+                addr: format!("replica-{id}"),
+                peer_ip: "127.0.0.1".into(),
+                peer_port: id as u16,
+                tx,
+                replica_id: id,
+                pending_bytes: Arc::default(),
+                base: 0,
+                slot_imports: takes,
+            })
+            .unwrap();
+            rxs.push(rx);
+        }
+        let write = b"*1\r\n$4\r\nPING\r\n".to_vec();
+        propagate(&hub, write.clone());
+        state.send_slot_imports(b"LIVE-2".to_vec(), b"SYNC-2".to_vec());
+        propagate(&hub, write.clone());
+        barrier(&hub).await;
+        assert_eq!(
+            drained(&mut rxs[0]),
+            vec![
+                b"SYNC-1".to_vec(),
+                write.clone(),
+                b"LIVE-2".to_vec(),
+                write.clone()
+            ]
+        );
+        assert_eq!(drained(&mut rxs[1]), vec![write.clone(), write.clone()]);
+        for id in [31, 32] {
+            let sent = state.replica(id).unwrap().sent.load(Ordering::Relaxed);
+            assert_eq!(sent, 2 * write.len() as u64, "replica {id}");
+        }
+        // A replica attached later is sent the last `SYNC` form first.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.send(HubMsg::RegisterChannel {
+            addr: "replica-33".into(),
+            peer_ip: "127.0.0.1".into(),
+            peer_port: 33,
+            tx,
+            replica_id: 33,
+            pending_bytes: Arc::default(),
+            base: 0,
+            slot_imports: true,
+        })
+        .unwrap();
+        barrier(&hub).await;
+        assert_eq!(drained(&mut rx), vec![b"SYNC-2".to_vec()]);
+    }
+
+    /// A master that does not send markers (outside cluster mode, or acting
+    /// as an earlier release) sends none, whatever a replica asked.
+    #[test]
+    fn a_master_that_does_not_send_markers_adds_no_word() {
+        let state = ReplState::new_master();
+        assert!(!state.sends_slot_imports_to(true));
+        assert_eq!(state.psync_words(false, true), "");
+        state.sends_slot_imports.store(true, Ordering::Relaxed);
+        assert!(!state.sends_slot_imports_to(false));
+        assert!(state.psync_words(false, true).ends_with(" slot-imports"));
+        assert!(psync_reply_has_slot_imports(
+            "+CONTINUE 0123456789012345678901234567890123456789 slot-imports"
+        ));
     }
 }

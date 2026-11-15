@@ -1329,8 +1329,21 @@ key names). Promoted with an import still listed:
 - A replica that did not see the import begin (attached part way, sent the
   dataset in full, or restarted) knows only which slots had keys before,
   and keeps every key of those.
-- An import its master completed is not cleaned up, whatever the promoted
-  node's slot table says: its keys may be the slots' only copy.
+- An import its master completed is not cleaned up once the replica has
+  heard it end (the master's next marker no longer lists it), whatever the
+  promoted node's slot table says: its keys may be the slots' only copy. If
+  the master died after taking the slots but before that marker reached the
+  replica, the owner check protects them: the source, told the slots were
+  taken, no longer owns them and says so, and nothing is deleted; if it was
+  never told, it still has them all.
+- A slot that comes to the promoted node (`CLUSTER ADDSLOTS`, `SETSLOT
+  IMPORTING` or `NODE`, an import, a failover) is left out of the cleanup
+  for good, even once it leaves again: keys written to it meanwhile are
+  acknowledged writes. After a restart, whether a slot was the node's
+  before it is not known, so of an import read back from disk only the
+  keys the owner has are deleted.
+- `CLUSTER RESET` forgets the imports: the node is no longer that master's
+  replica, nor in that cluster, and their keys are left as they are.
 - If the owner runs an earlier release, which cannot be asked, or the
   replica or its master does, the keys are left as an earlier release
   left them, for `CLUSTER DROPORPHANS`.

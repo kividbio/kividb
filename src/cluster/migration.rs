@@ -1014,6 +1014,17 @@ impl SlotDeletions {
         }
     }
 
+    /// Per slot of `slots`, how many times it has come to this node (see
+    /// [`Self::came_here`]). Taken holding no lock of `ClusterState` but
+    /// `slots`, `migrations` and the followed imports (see there).
+    pub(crate) fn came_counts(&self, slots: &[u16]) -> Vec<(u16, u32)> {
+        let counts = self.counts.lock();
+        slots
+            .iter()
+            .map(|&slot| (slot, counts.came.get(slot as usize).copied().unwrap_or(0)))
+            .collect()
+    }
+
     /// Whether the keys of one of `slots` are being deleted.
     pub fn running(&self, mut slots: impl Iterator<Item = u16>) -> bool {
         let counts = self.counts.lock();

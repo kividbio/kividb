@@ -278,9 +278,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   never on a replica. Meanwhile an import of those slots is refused, and
   `INFO cluster` reports `cluster_import_cleanup_slots`. A replica that
   did not see the import begin (attached or restarted part way) knows
-  only which slots had keys before, and keeps all of theirs. A replica or
-  master of an earlier release behaves as before: `CLUSTER ORPHANSLOTS`
-  lists the keys.
+  only which slots had keys before, and keeps all of theirs. A slot that
+  comes to the promoted node meanwhile is left out of the cleanup for good,
+  and `CLUSTER RESET` forgets the imports. A replica or master of an
+  earlier release behaves as before: `CLUSTER ORPHANSLOTS` lists the keys.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,

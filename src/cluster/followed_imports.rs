@@ -39,7 +39,11 @@
 //   delete those keys.
 // * Promoted, this node deletes what the imports still listed brought:
 //   every key of a slot of which nothing was held before, and in the others
-//   the keys not held before. Never a slot that is its own. Only once
+//   the keys not held before. Never a slot that is its own, nor one that
+//   has come to it since it first looked, even and gone again (keys
+//   written to it meanwhile are acknowledged writes): such a slot is left
+//   out of the import for good. Of an import read back from disk, whose
+//   slots' past here is not known, only keys the owner has. Only once
 //   nothing here is importing, migrating or deleting the slot, and the
 //   slot's owner, a master that is up, says it owns it and is not moving
 //   it (`CLUSTER SYNCSLOTS ORPHANCHECK`), which it is asked again before
@@ -52,6 +56,7 @@
 //   lists them, and `CLUSTER DROPORPHANS` deletes those the owner has.
 // * Until the deletion is done, the imports stay listed in this node's own
 //   markers, so that a replica of it promoted next carries on with it.
+// * `CLUSTER RESET` forgets them all.
 //
 // Redis 8 does the same with `CLUSTER SYNCSLOTS CONF ASM-TASK`, which a
 // destination sends its replicas in the stream (and keeps in its RDB); a
@@ -86,6 +91,17 @@ pub(crate) struct Followed {
     /// its own, seen in the stream's order: the keys held before, or more.
     /// `None` if it did not see that moment.
     pub(crate) held: Option<Arc<HeldBefore>>,
+    /// Per slot, how many times it had come to this node
+    /// (`SlotDeletions::came_here`) when this node first looked: a slot
+    /// that has come here since is left out of the import for good
+    /// ([`settle`]). `None` until then.
+    came: Option<Vec<(u16, u32)>>,
+    /// Known since this process started, so that whether a slot came here
+    /// meanwhile is known. Read back from disk after a restart it is not: a
+    /// slot may have been this node's, taken writes, and gone again before
+    /// the restart, and of such an import only the keys the owner has are
+    /// deleted.
+    pub(crate) seen_since_start: bool,
 }
 
 /// What a promoted node deletes of a slot of an import.
@@ -138,18 +154,66 @@ impl Followed {
 
 /// The imports of this node's master, or of its old master once promoted.
 /// See the top of this file.
+///
+/// Locks: `imports` after `ClusterState::slots` and `migrations`, before
+/// `SlotDeletions::counts`; nothing else is taken holding it.
 #[derive(Default)]
 pub(crate) struct FollowedImports {
     imports: Mutex<Vec<Followed>>,
     /// Wakes the cleanup at once, after a promotion.
     wake: Condvar,
     woken: Mutex<bool>,
+    /// Each look at `imports` to be written down is numbered, holding its
+    /// lock; the file is written out of the lock, and never with an older
+    /// look than the last one written (see [`write_down`]).
+    looks: std::sync::atomic::AtomicU64,
+    written: Mutex<u64>,
 }
 
 impl FollowedImports {
     /// The imports known, as they stand.
     pub(crate) fn list(&self) -> Vec<Followed> {
         self.imports.lock().clone()
+    }
+
+    /// What to write down of `imports`, taken holding their lock: its
+    /// number, and the file's text (`None`: no import, no file).
+    fn look(&self, imports: &[Followed]) -> (u64, Option<String>) {
+        let n = self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let text = (!imports.is_empty()).then(|| {
+            imports
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {} {}\n",
+                        f.id,
+                        ranges_word(&f.ranges),
+                        kept_word(&f.kept_on_disk())
+                    )
+                })
+                .collect()
+        });
+        (n, text)
+    }
+
+    /// Forget every import (`CLUSTER RESET`): this node is no longer
+    /// anyone's replica, nor in the cluster whose slots they were.
+    pub(crate) fn forget_all(&self, cluster: &ClusterState, why: &str) {
+        let look = {
+            let mut imports = self.imports.lock();
+            if imports.is_empty() {
+                return;
+            }
+            log_info!(
+                "Cluster: forgetting the {} import(s) into this node's master it knew of ({}): \
+                 {why}; their keys are left as they are",
+                imports.len(),
+                listed_ranges(&imports)
+            );
+            imports.clear();
+            self.look(&imports)
+        };
+        write_down(cluster, look);
     }
 
     fn wake(&self) {
@@ -275,36 +339,58 @@ fn union(a: &Option<Ranges>, b: &Option<Ranges>) -> Option<Ranges> {
     Some(slot_runs(slots))
 }
 
-/// What this node now knows, given what it knew (`before`) and a marker
-/// (`live`, `listed`); `store` is its dataset at the marker's place in the
-/// stream. An import seen to be looked at in a `LIVE` marker is noted with
-/// this node's own keys of its slots, once.
+/// The imports a marker (`live`, `listed`) shows its master has just looked
+/// at, which this node, knowing them as `before`, is to note its own keys
+/// of now: once each, in a `LIVE` marker only (one sent in its place among
+/// the writes).
+fn to_note(before: &[Followed], live: bool, listed: &[Listed]) -> Vec<(String, Ranges)> {
+    if !live {
+        return Vec::new();
+    }
+    listed
+        .iter()
+        .filter(|(id, _, kept)| {
+            kept.is_some()
+                && before
+                    .iter()
+                    .any(|k| k.id == *id && k.kept.is_none() && k.held.is_none())
+        })
+        .map(|(id, ranges, _)| (id.clone(), ranges.clone()))
+        .collect()
+}
+
+/// What this node now knows, given what it knew (`before`), a marker
+/// (`listed`), and what it noted for it (`noted`, see [`to_note`]). The
+/// slots of an import known already are only ever fewer: one that came to
+/// this node was left out for good ([`settle`]).
 fn reconcile(
     before: &[Followed],
-    live: bool,
     listed: Vec<Listed>,
-    store: &crate::store::Store,
+    noted: &[(String, Arc<HeldBefore>)],
 ) -> Vec<Followed> {
     listed
         .into_iter()
         .map(|(id, ranges, kept)| {
             let known = before.iter().find(|f| f.id == id);
-            let noted_now = live
-                && kept.is_some()
-                && known.is_some_and(|k| k.kept.is_none() && k.held.is_none());
-            let held = if noted_now {
-                Some(Arc::new(HeldBefore::note(store, &ranges)))
-            } else {
-                known.and_then(|k| k.held.clone())
+            let held = noted
+                .iter()
+                .find(|(n, _)| *n == id)
+                .map(|(_, held)| Arc::clone(held))
+                .or_else(|| known.and_then(|k| k.held.clone()));
+            let ranges = match known {
+                Some(k) => slot_runs(slots_of(&ranges).filter(|&s| in_ranges(&k.ranges, s))),
+                None => ranges,
             };
-            let kept = union(&known.and_then(|k| k.kept.clone()), &kept);
             Followed {
                 id,
                 ranges,
-                kept,
+                kept: union(&known.and_then(|k| k.kept.clone()), &kept),
                 held,
+                came: known.and_then(|k| k.came.clone()),
+                seen_since_start: known.is_none_or(|k| k.seen_since_start),
             }
         })
+        .filter(|f| !f.ranges.is_empty())
         .collect()
 }
 
@@ -334,7 +420,9 @@ pub(crate) fn on_event(
                 }
             );
             imports.clear();
-            persist(cluster, &imports);
+            let look = followed.look(&imports);
+            drop(imports);
+            write_down(cluster, look);
         }
         SlotImportsEvent::Marker(args) => {
             let Some((live, listed)) = parse_marker(args) else {
@@ -344,8 +432,20 @@ pub(crate) fn on_event(
                 );
                 return;
             };
+            // Noted here, at the marker's place in the stream: the caller
+            // applies nothing until this returns (it holds the apply lock),
+            // so this node's keys of the slots are those it had as its
+            // master looked. Not holding the list's lock. This walks the
+            // import's slots only (their shards), as the master's own look
+            // does, at most `HELD_BEFORE_MAX_KEYS` names or 64 MiB; the
+            // replica applies and acknowledges nothing meanwhile.
+            let wanted = to_note(&followed.imports.lock(), live, &listed);
+            let noted: Vec<(String, Arc<HeldBefore>)> = wanted
+                .into_iter()
+                .map(|(id, ranges)| (id, Arc::new(HeldBefore::note(store, &ranges))))
+                .collect();
             let mut imports = followed.imports.lock();
-            let now = reconcile(&imports, live, listed, store);
+            let now = reconcile(&imports, listed, &noted);
             for f in now.iter().filter(|f| f.kept.is_some() && f.held.is_none()) {
                 if !imports.iter().any(|k| k.id == f.id) {
                     log_info!(
@@ -363,10 +463,16 @@ pub(crate) fn on_event(
                 });
             *imports = now;
             if changed {
-                persist(cluster, &imports);
+                // Written out of the list's lock (in order: see `look`).
+                let look = followed.look(&imports);
+                drop(imports);
+                write_down(cluster, look);
             }
         }
         SlotImportsEvent::Promoted => {
+            // Each slot's count of comings as of now, the promotion's
+            // claim included: one that comes later is left out.
+            settle(cluster);
             let left: Vec<Followed> = followed
                 .imports
                 .lock()
@@ -483,34 +589,30 @@ fn path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
     })
 }
 
-/// Write `imports` down (none: remove the file): one line each, `<id>
-/// <slots> <kept>`, the slots of which every key stays after a restart.
-/// Called holding the list's lock, so that writes are in its order.
-fn persist(cluster: &ClusterState, imports: &[Followed]) {
+/// Write a [`FollowedImports::look`] down (no import: remove the file): one
+/// line each, `<id> <slots> <kept>`, the slots of which every key stays
+/// after a restart. Out of the list's lock; a look older than the last one
+/// written is not written.
+fn write_down(cluster: &ClusterState, (n, text): (u64, Option<String>)) {
     let Some(path) = path(cluster) else {
         return;
     };
-    let written = if imports.is_empty() {
-        match std::fs::remove_file(&path) {
+    let mut written = cluster.followed_imports.written.lock();
+    if *written >= n {
+        return;
+    }
+    *written = n;
+    let written = match text {
+        None => match std::fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
+        },
+        Some(text) => {
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            let tmp = std::path::PathBuf::from(tmp);
+            write_synced(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path))
         }
-    } else {
-        let text: String = imports
-            .iter()
-            .map(|f| {
-                format!(
-                    "{} {} {}\n",
-                    f.id,
-                    ranges_word(&f.ranges),
-                    kept_word(&f.kept_on_disk())
-                )
-            })
-            .collect();
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = std::path::PathBuf::from(tmp);
-        write_synced(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path))
     };
     if let Err(e) = written {
         log_warn!(
@@ -541,12 +643,14 @@ fn parse_line(line: &str) -> Option<Followed> {
         ranges,
         kept,
         held: None,
+        came: None,
+        seen_since_start: false,
     })
 }
 
 /// At startup: what this node knew when it stopped. A line it cannot read
-/// keeps every key of the slots it names, if any can be made out: none is
-/// deleted for it.
+/// is left out, and with it that import: nothing of it is deleted, its
+/// keys stay as an earlier release left them (`CLUSTER ORPHANSLOTS`).
 fn load(cluster: &ClusterState) {
     let Some(path) = path(cluster) else {
         return;
@@ -631,6 +735,9 @@ fn run(cluster: &Weak<ClusterState>) {
         let Some(hooks) = cluster.hooks.get() else {
             continue;
         };
+        if cluster.followed_imports.imports.lock().is_empty() {
+            continue;
+        }
         let starter = &hooks.replica_starter;
         let env = Env {
             store: Arc::clone(&starter.store),
@@ -648,8 +755,11 @@ fn run(cluster: &Weak<ClusterState>) {
         };
         if !master() {
             waiting.clear();
+            settle(&cluster);
             continue;
         }
+        // On a replica too: a slot that comes here is left out for good.
+        settle(&cluster);
         let imports = cluster.followed_imports.list();
         if imports.is_empty() {
             continue;
@@ -686,7 +796,7 @@ fn run(cluster: &Weak<ClusterState>) {
         if done.is_empty() {
             continue;
         }
-        {
+        let look = {
             let mut list = cluster.followed_imports.imports.lock();
             // Not if this node has been a replica since: the list is its
             // new master's.
@@ -694,10 +804,65 @@ fn run(cluster: &Weak<ClusterState>) {
                 continue;
             }
             list.retain(|f| !done.contains(&f.id));
-            persist(&cluster, &list);
-        }
+            cluster.followed_imports.look(&list)
+        };
+        write_down(&cluster, look);
         migration::save_imports(&cluster);
     }
+}
+
+/// Leave out of every import, for good, each slot that is this node's or
+/// has come to it (`SlotDeletions::came_here`: assigned, imported, taken
+/// over) since this node first looked: keys written to it meanwhile are
+/// acknowledged writes, and after it leaves again they would look like what
+/// the import brought (#741 review). Also notes the counts of an import not
+/// looked at yet. Written down, and the replicas told, at once.
+fn settle(cluster: &ClusterState) {
+    let me = cluster.myself();
+    let mut gone: Vec<(String, Vec<u16>)> = Vec::new();
+    let look = {
+        // In the documented order: `slots`, `migrations`, the list, the
+        // counts. Whatever gives this node a slot counts it holding one of
+        // the first two, so the counts read here are as of the table read.
+        let table = cluster.slots.read();
+        let _migrations = cluster.migrations.read();
+        let mut imports = cluster.followed_imports.imports.lock();
+        if imports.is_empty() {
+            return;
+        }
+        for f in imports.iter_mut() {
+            let slots: Vec<u16> = slots_of(&f.ranges).collect();
+            let now = cluster.slot_deletions.came_counts(&slots);
+            let base = f.came.get_or_insert_with(|| now.clone());
+            let left: Vec<u16> = now
+                .iter()
+                .filter(|(slot, count)| {
+                    table[*slot as usize] == Some(me)
+                        || base.iter().any(|(s, c)| s == slot && c != count)
+                })
+                .map(|&(slot, _)| slot)
+                .collect();
+            if left.is_empty() {
+                continue;
+            }
+            f.ranges = slot_runs(slots.into_iter().filter(|s| !left.contains(s)));
+            gone.push((f.id.clone(), left));
+        }
+        if gone.is_empty() {
+            return;
+        }
+        imports.retain(|f| !f.ranges.is_empty());
+        cluster.followed_imports.look(&imports)
+    };
+    for (id, slots) in &gone {
+        log_info!(
+            "Cluster: {} of the unfinished import {id} into this node's old master came to this \
+             node: left out of it for good; none of their keys is deleted for it",
+            migration::ranges_text(&slot_runs(slots.iter().copied()))
+        );
+    }
+    write_down(cluster, look);
+    migration::save_imports(cluster);
 }
 
 /// One round of the cleanup of import `f`, on a master.
@@ -752,16 +917,39 @@ fn clean(env: &Env, asker: &mut migration::NodeAsker, f: &Followed) -> Outcome {
     }
     let owner_of: ahash::AHashMap<u16, NodeId> = owners.iter().copied().collect();
     let held = f.held.clone();
+    let Some(came) = f.came.clone() else {
+        return Outcome::Wait("its slots' counts are not noted yet".into());
+    };
     let mut confirm = |keys: &[crate::store::Key]| -> Result<Vec<bool>, String> {
+        // None of the batch's slots has come to this node since it first
+        // looked (`settle`), even and gone again: such a slot's keys may
+        // be acknowledged writes. One that comes during the batch is left
+        // by the deletion itself (`DeleteRun`).
+        let mut batch: Vec<u16> = keys.iter().map(|k| key_hash_slot(k.as_bytes())).collect();
+        batch.sort_unstable();
+        batch.dedup();
+        for (slot, count) in cluster.slot_deletions.came_counts(&batch) {
+            if !came.iter().any(|&(s, c)| s == slot && c == count) {
+                return Err(format!(
+                    "slot {slot} came to this node since it first looked: it is left out"
+                ));
+            }
+        }
         // The owners once more, for this batch: each still owns its slots
-        // and is not moving them.
-        orphans::confirm_keys(env, asker, &owner_of, keys)?;
+        // and is not moving them. And, of an import read back from disk
+        // (whether a slot was this node's before the restart is not known),
+        // only the keys the owner has.
+        let has = orphans::confirm_keys(env, asker, &owner_of, keys)?;
         Ok(keys
             .iter()
-            .map(|key| match f.plan(key_hash_slot(key.as_bytes())) {
-                Plan::All => true,
-                Plan::Unheld => held.as_ref().is_some_and(|held| !held.keys.contains(key)),
-                Plan::Keep => false,
+            .zip(has)
+            .map(|(key, has)| {
+                let brought = match f.plan(key_hash_slot(key.as_bytes())) {
+                    Plan::All => true,
+                    Plan::Unheld => held.as_ref().is_some_and(|held| !held.keys.contains(key)),
+                    Plan::Keep => false,
+                };
+                brought && (f.seen_since_start || has)
             })
             .collect())
     };
@@ -865,6 +1053,20 @@ mod tests {
         (0..n).map(|i| format!("{{{tag}}}:{prefix}:{i}")).collect()
     }
 
+    /// A marker as `on_event` takes it: what to note, noted, reconciled.
+    fn step(
+        before: &[Followed],
+        live: bool,
+        listed: Vec<Listed>,
+        store: &crate::store::Store,
+    ) -> Vec<Followed> {
+        let noted: Vec<(String, Arc<HeldBefore>)> = to_note(before, live, &listed)
+            .into_iter()
+            .map(|(id, ranges)| (id, Arc::new(HeldBefore::note(store, &ranges))))
+            .collect();
+        reconcile(before, listed, &noted)
+    }
+
     fn listed(kept: Option<Ranges>) -> Vec<Listed> {
         vec![("t".repeat(40), vec![(96, 96), (5461, 5461)], kept)]
     }
@@ -874,12 +1076,12 @@ mod tests {
         let held = keys_of(5461, "held", 3);
         let refs: Vec<&str> = held.iter().map(String::as_str).collect();
         let store = store_with(&refs);
-        let begun = reconcile(&[], true, listed(None), &store);
+        let begun = step(&[], true, listed(None), &store);
         assert_eq!(begun.len(), 1);
         assert!(begun[0].held.is_none());
         assert_eq!(begun[0].plan(96), Plan::Keep);
         // Seen to look, in the stream's order: noted now.
-        let noted = reconcile(&begun, true, listed(Some(vec![(5461, 5461)])), &store);
+        let noted = step(&begun, true, listed(Some(vec![(5461, 5461)])), &store);
         let f = &noted[0];
         let h = f.held.as_ref().expect("noted");
         assert_eq!(h.keys.len(), 3);
@@ -890,12 +1092,12 @@ mod tests {
         for k in &brought {
             set(&store, k);
         }
-        let later = reconcile(&noted, true, listed(Some(vec![(5461, 5461)])), &store);
+        let later = step(&noted, true, listed(Some(vec![(5461, 5461)])), &store);
         assert_eq!(later[0].held.as_ref().unwrap().keys.len(), 3);
         // Once on disk, the slots that had keys keep them all.
         assert_eq!(f.kept_on_disk(), Some(vec![(5461, 5461)]));
         // Ended: no longer listed, forgotten.
-        assert!(reconcile(&later, true, vec![], &store).is_empty());
+        assert!(step(&later, true, vec![], &store).is_empty());
     }
 
     #[test]
@@ -903,21 +1105,21 @@ mod tests {
         let store = store_with(&[]);
         // Attached part way, or sent the dataset in full.
         for live in [false, true] {
-            let late = reconcile(&[], live, listed(Some(vec![(5461, 5461)])), &store);
+            let late = step(&[], live, listed(Some(vec![(5461, 5461)])), &store);
             assert!(late[0].held.is_none());
             assert_eq!(late[0].plan(96), Plan::All);
             assert_eq!(late[0].plan(5461), Plan::Keep);
         }
         // Known before, by a SYNC after a partial resync: what was noted
         // stays.
-        let begun = reconcile(&[], true, listed(None), &store);
-        let noted = reconcile(&begun, true, listed(Some(vec![])), &store);
+        let begun = step(&[], true, listed(None), &store);
+        let noted = step(&begun, true, listed(Some(vec![])), &store);
         assert!(noted[0].held.is_some());
-        let again = reconcile(&noted, false, listed(Some(vec![])), &store);
+        let again = step(&noted, false, listed(Some(vec![])), &store);
         assert!(again[0].held.is_some());
         // A master that says it has not looked, of an import known to have
         // been: kept as looked at.
-        let back = reconcile(&noted, false, listed(None), &store);
+        let back = step(&noted, false, listed(None), &store);
         assert_eq!(back[0].kept, Some(vec![]));
     }
 
@@ -933,9 +1135,33 @@ mod tests {
             ranges: vec![(96, 96), (5461, 5461)],
             kept: Some(vec![]),
             held: Some(held),
+            came: None,
+            seen_since_start: true,
         };
         assert_eq!(f.plan(5461), Plan::Keep);
         assert_eq!(f.plan(96), Plan::All);
+    }
+
+    /// A slot left out of an import (it came to this node) stays out,
+    /// whatever the master's markers list; an import left with none is
+    /// forgotten. And an import read back from disk stays one whose past
+    /// here is not known.
+    #[test]
+    fn a_slot_left_out_of_an_import_stays_out() {
+        let store = store_with(&[]);
+        let begun = step(&[], true, listed(None), &store);
+        assert!(begun[0].seen_since_start);
+        let mut fewer = begun.clone();
+        fewer[0].ranges = vec![(5461, 5461)];
+        let again = step(&fewer, true, listed(Some(vec![])), &store);
+        assert_eq!(again[0].ranges, vec![(5461, 5461)]);
+        fewer[0].ranges = vec![];
+        assert!(step(&fewer, false, listed(Some(vec![])), &store).is_empty());
+        let mut read_back = parse_line(&format!("{} 96-96 -", "t".repeat(40))).unwrap();
+        assert!(!read_back.seen_since_start);
+        read_back.ranges = vec![(96, 96), (5461, 5461)];
+        let still = step(&[read_back], false, listed(Some(vec![])), &store);
+        assert!(!still[0].seen_since_start);
     }
 
     #[test]
@@ -946,18 +1172,24 @@ mod tests {
                 ranges: vec![(1, 2), (7, 7)],
                 kept: None,
                 held: None,
+                came: None,
+                seen_since_start: true,
             },
             Followed {
                 id: "b".repeat(40),
                 ranges: vec![(96, 96)],
                 kept: Some(vec![]),
                 held: None,
+                came: None,
+                seen_since_start: true,
             },
             Followed {
                 id: "c".repeat(40),
                 ranges: vec![(96, 96), (5461, 5461)],
                 kept: Some(vec![(5461, 5461)]),
                 held: None,
+                came: None,
+                seen_since_start: true,
             },
         ] {
             let line = format!(
