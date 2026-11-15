@@ -746,6 +746,32 @@ pub fn field_now() -> FieldDeadline {
     crate::script_clock::wall_ms_now()
 }
 
+/// The moment one query judges hash field deadlines by: [`field_now`], read
+/// the first time a document needs it and kept, so that every document of
+/// the query is seen at the same moment (one whose field ends mid-query is
+/// not shown to half of it), and so that a query over hashes with no field
+/// TTL reads no clock at all.
+#[derive(Default)]
+pub struct QueryClock(std::cell::Cell<FieldDeadline>);
+
+impl QueryClock {
+    pub const fn new() -> Self {
+        Self(std::cell::Cell::new(0))
+    }
+
+    #[inline]
+    pub fn get(&self) -> FieldDeadline {
+        match self.0.get() {
+            0 => {
+                let now = field_now();
+                self.0.set(now);
+                now
+            }
+            now => now,
+        }
+    }
+}
+
 /// Whether a field whose deadline is `at` is due at `now`: past it, not at
 /// it. A field lives through the millisecond it ends in, as a key does
 /// (`helpers::is_past`) and as Redis's `hashTypeGetValue` has it, so never
