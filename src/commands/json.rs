@@ -25,7 +25,7 @@ use std::sync::Arc;
 // They are visited last to first, so that removing or replacing one cannot
 // move another that is still to be visited.
 
-const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const WRONG_KEY_TYPE: &str = "Existing key has wrong Redis type";
 const NEW_AT_ROOT: &str = "ERR new objects must be created at the root";
 const NOT_A_SELECTION: &str = "ERR the path must select values, not compute one";
 const PATH_MISSING: &str = "ERR Path does not exist";
@@ -128,9 +128,12 @@ fn parse_path(path: &str) -> Result<Query, Vec<u8>> {
     Query::parse(path).map_err(|e| resp_error(&format!("ERR {e}")))
 }
 
-fn parse_json(text: Option<&str>) -> Result<Value, Vec<u8>> {
-    text.and_then(|text| serde_json::from_str(text).ok())
-        .ok_or_else(|| resp_error("ERR invalid JSON value"))
+/// A JSON argument (`None` if it is not UTF-8), or RedisJSON's error for it:
+/// serde_json's own text, after `prefix`, which is `ERR ` for some commands
+/// and nothing for others.
+fn parse_json(text: Option<&str>, prefix: &str) -> Result<Value, Vec<u8>> {
+    let text = text.ok_or_else(|| resp_error("Couldn't parse as UTF-8 string"))?;
+    serde_json::from_str(text).map_err(|e| resp_error(&format!("{prefix}{e}")))
 }
 
 /// JSON as RedisJSON writes it: serde_json's text, with no `+` in an
@@ -190,7 +193,7 @@ fn read_doc(ctx: &Ctx, key: &[u8], missing: Vec<u8>, f: impl FnOnce(&Value) -> V
     let map = read_lock!(shard);
     match map.get(key) {
         Some(ValueRef::Json(tree)) => f(&tree.read()),
-        Some(_) => resp_error(WRONGTYPE),
+        Some(_) => resp_error(WRONG_KEY_TYPE),
         None => missing,
     }
 }
@@ -207,7 +210,7 @@ fn write_doc(
     let map = read_lock!(shard);
     match map.get(key) {
         Some(ValueRef::Json(tree)) => f(&mut tree.write()),
-        Some(_) => resp_error(WRONGTYPE),
+        Some(_) => resp_error(WRONG_KEY_TYPE),
         None => missing,
     }
 }
@@ -418,7 +421,7 @@ fn set_key(
     let mut map = write_lock!(shard);
     match map.get(key) {
         Some(ValueRef::Json(tree)) => set_in(&mut tree.write(), query, value, nx, xx),
-        Some(_) => Err(resp_error(WRONGTYPE)),
+        Some(_) => Err(resp_error(WRONG_KEY_TYPE)),
         None if !query.is_root() => Err(resp_error(NEW_AT_ROOT)),
         None if xx => Ok(false),
         None => {
@@ -507,7 +510,7 @@ fn mset(ctx: &Ctx, writes: &[(&[u8], Query, Value)]) -> Result<(), Vec<u8>> {
                 Entry::Occupied(doc) => doc.into_mut(),
                 Entry::Vacant(slot) => slot.insert(match map.get(*key) {
                     Some(ValueRef::Json(tree)) => Some(tree.read().clone()),
-                    Some(_) => return Err(resp_error(WRONGTYPE)),
+                    Some(_) => return Err(resp_error(WRONG_KEY_TYPE)),
                     None => None,
                 }),
             };
@@ -515,7 +518,7 @@ fn mset(ctx: &Ctx, writes: &[(&[u8], Query, Value)]) -> Result<(), Vec<u8>> {
         } else {
             match map.get(*key) {
                 Some(ValueRef::Json(tree)) => check_set_in(&tree.read(), query, value)?,
-                Some(_) => return Err(resp_error(WRONGTYPE)),
+                Some(_) => return Err(resp_error(WRONG_KEY_TYPE)),
                 None if !query.is_root() => return Err(resp_error(NEW_AT_ROOT)),
                 None => {}
             }
@@ -660,9 +663,10 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
     let Some(path) = arg(cmd, 2) else {
         return resp_error("ERR path must be valid UTF-8");
     };
-    let operand = match arg(cmd, 3).and_then(|text| serde_json::from_str::<Value>(text).ok()) {
-        Some(Value::Number(n)) => n,
-        _ => return resp_error("ERR value must be a number"),
+    let operand = match parse_json(arg(cmd, 3), "ERR ") {
+        Ok(Value::Number(n)) => n,
+        Ok(_) => return resp_error("bad input number"),
+        Err(e) => return e,
     };
     let query = match parse_path(path) {
         Ok(query) => query,
@@ -850,9 +854,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
-            let mut value: Value = match arg(cmd, 3).and_then(|s| serde_json::from_str(s).ok()) {
-                Some(value) => value,
-                None => return Some(resp_error("ERR invalid JSON")),
+            let mut value = match parse_json(arg(cmd, 3), "") {
+                Ok(value) => value,
+                Err(e) => return Some(e),
             };
             let (mut nx, mut xx) = (false, false);
             let mut i = 4;
@@ -901,7 +905,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(Err(e)) => return Some(e),
                     None => return Some(resp_error("ERR path must be valid UTF-8")),
                 };
-                let value = match parse_json(parse_utf8(triple[2])) {
+                let value = match parse_json(parse_utf8(triple[2]), "") {
                     Ok(value) => value,
                     Err(e) => return Some(e),
                 };
@@ -1141,11 +1145,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let has_path = cmd.len() > 3;
             let (key, query) = key_and_path!(if has_path { 2 } else { usize::MAX });
-            let suffix = match arg(cmd, if has_path { 3 } else { 2 })
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            {
-                Some(Value::String(suffix)) => suffix,
-                _ => return Some(resp_error("ERR value must be a JSON string")),
+            let suffix = match parse_json(arg(cmd, if has_path { 3 } else { 2 }), "ERR ") {
+                Ok(Value::String(suffix)) => suffix,
+                Ok(_) => {
+                    return Some(resp_error(
+                        "WRONGTYPE wrong type of path value - expected string",
+                    ));
+                }
+                Err(e) => return Some(e),
             };
             write_doc(ctx, key, resp_null_bulk(), |root| {
                 each_node(resp, &query, root, |node| match node {
@@ -1196,7 +1203,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Parse every value before touching the document.
             let values: Vec<Value> = match cmd[3..]
                 .iter()
-                .map(|raw| parse_json(parse_utf8(raw)))
+                .map(|raw| parse_json(parse_utf8(raw), ""))
                 .collect()
             {
                 Ok(values) => values,
@@ -1229,7 +1236,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             let values: Vec<Value> = match cmd[4..]
                 .iter()
-                .map(|raw| parse_json(parse_utf8(raw)))
+                .map(|raw| parse_json(parse_utf8(raw), ""))
                 .collect()
             {
                 Ok(values) => values,
@@ -1327,9 +1334,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
-            let needle = match parse_json(arg(cmd, 3)) {
+            let needle = match parse_json(arg(cmd, 3), "ERR ") {
                 Ok(needle) => needle,
-                Err(_) => return Some(resp_error("ERR invalid JSON scalar")),
+                Err(e) => return Some(e),
             };
             let bound = |at: usize| arg(cmd, at).and_then(|s| s.parse::<i64>().ok());
             let (start, stop) = (bound(4).unwrap_or(0), bound(5).unwrap_or(0));
@@ -1409,7 +1416,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(wrong_args());
             }
             let (key, query) = key_and_path!(2);
-            let patch = match parse_json(arg(cmd, 3)) {
+            let patch = match parse_json(arg(cmd, 3), "") {
                 Ok(patch) => patch,
                 Err(e) => return Some(e),
             };

@@ -3254,9 +3254,9 @@ fn test_json_mset_that_fails_writes_nothing() {
             .contains("new objects must be created at the root"),
         "{r:?}"
     );
-    // WRONGTYPE on a later key.
+    // A later key of another type.
     let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "s", "$", "1"]);
-    assert!(r.error_str().starts_with("WRONGTYPE"), "{r:?}");
+    assert_eq!(r.error_str(), "Existing key has wrong Redis type", "{r:?}");
     // A legacy path whose parent is not there.
     let r = c.cmds(&["JSON.MSET", "a", "$.n", "10", "a", ".no.such", "1"]);
     assert!(r.error_str().contains("path does not exist"), "{r:?}");
