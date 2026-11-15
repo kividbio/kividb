@@ -360,6 +360,13 @@ pub fn definite(mut reply: Vec<u8>) -> Vec<u8> {
 
 const DEFINITE: u8 = 0x01;
 
+/// How long a reply waits on the clients its command woke. See
+/// [`BlockingSlot::settle`].
+const WOKEN_BOUND: Duration = Duration::from_millis(100);
+
+/// The wait [`BlockingSlot::settle`] gives a reply.
+pub type Settling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 /// What a resumed blocking command was handed: the key that fired and the value
 /// delivered through the handoff, or `None` if the wait timed out.
 ///
@@ -399,12 +406,41 @@ pub struct BlockingSlot {
     /// True while the current dispatch *is* a resume. Guards against a handler
     /// that parks again after being resumed, which would spin the loop forever.
     in_resume: bool,
+    /// The looks this client owes whoever woke it, from the end of its wait
+    /// until it has looked at its keys and either replied or waited again:
+    /// they hold their replies until then. Done at the end of the dispatch
+    /// that looks. See [`crate::wait_table::Look`].
+    looked: Vec<std::sync::Arc<crate::wait_table::Look>>,
+    /// The looks of the clients the last dispatch woke. See
+    /// [`settle`](Self::settle).
+    woken: Vec<std::sync::Arc<crate::wait_table::Look>>,
+    /// This connection, to the looks it waits for: one per woken client.
+    owner: u64,
+    /// Whether the dispatch under way collects the clients it wakes.
+    collecting: bool,
+}
+
+impl Drop for BlockingSlot {
+    /// A connection that ends before its resume dispatch has run still owes
+    /// its looks: they are marked done here, so that whoever woke it does
+    /// not wait out the bound for a client that has gone.
+    fn drop(&mut self) {
+        if !self.looked.is_empty() {
+            crate::wait_table::all_done(std::mem::take(&mut self.looked), &[]);
+        }
+    }
 }
 
 impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
+        // Nobody stands in any line (nearly always): nothing this command
+        // does can wake anyone, and there is nothing to collect.
+        self.collecting = crate::wait_table::anyone_in_line();
+        if self.collecting {
+            self.collect();
+        }
         self.ctl.awaitable = true;
         self.ctl.parked = None;
         match self.pending.take() {
@@ -423,13 +459,140 @@ impl BlockingSlot {
         &mut self.ctl
     }
 
+    /// Collect what the dispatch about to run wakes, for this connection.
+    #[inline(never)]
+    fn collect(&mut self) {
+        if self.owner == 0 {
+            self.owner = new_owner();
+        }
+        crate::wait_table::collect_woken_for(self.owner);
+    }
+
     /// Take the wait a handler parked during the dispatch just completed.
+    ///
+    /// Called straight after every dispatch and before anything is awaited:
+    /// what it woke is in a thread-local, which another connection on this
+    /// thread would overwrite.
+    #[inline]
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
+        // Looked at in place: moving the wait out of the slot to look at it
+        // copied it on every command.
+        if self.ctl.parked.is_none() {
+            if self.in_resume {
+                self.resume_over();
+            }
+            // Nearly every command: ran while nobody stood in any line,
+            // owes nobody a look, and did not wait.
+            if !self.collecting && self.looked.is_empty() {
+                return None;
+            }
+            return self.looked_or_waits(None);
+        }
         let parked = self.ctl.parked.take();
-        if parked.is_none() && self.in_resume {
-            self.resume_over();
+        self.looked_or_waits(parked)
+    }
+
+    /// [`take_parked`](Self::take_parked) for a command that may have woken
+    /// someone, owes a look, or waits.
+    #[cold]
+    fn looked_or_waits(&mut self, parked: Option<BlockingWait>) -> Option<BlockingWait> {
+        // After `resume_over`: a refused resume's ticket, dropped there,
+        // passes its turn on, and the client that wakes is this dispatch's to
+        // wait for, as the client a handler passes the turn to is.
+        let collected = if self.collecting {
+            crate::wait_table::take_woken()
+        } else {
+            None
+        };
+        let mut woken = Vec::new();
+        if let Some(collected) = collected {
+            woken = collected.woken;
+            self.looked.extend(collected.owed);
+        }
+        if let Some(wait) = &parked {
+            // It looked, found nothing and waits again: whoever woke it has
+            // its look, unless a write woke it again once it stood back in
+            // line (that one it has not seen yet). A command that waits has
+            // no reply to hold for those it woke.
+            let owed = std::mem::take(&mut self.looked);
+            match &wait.state {
+                Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) => {
+                    ticket.looked_and_waits(owed, &woken)
+                }
+                _ => crate::wait_table::all_done(owed, &woken),
+            }
+        } else {
+            if !self.looked.is_empty() {
+                // It looked: done, with the looks of those it woke, which
+                // whoever woke it waits for too. Now, not after its own wait
+                // for them, so that two clients that woke each other never
+                // wait for each other.
+                crate::wait_table::all_done(std::mem::take(&mut self.looked), &woken);
+            }
+            // Waited for before the next command of this client that reads
+            // (`settles_before`), with those of the commands before it.
+            self.woken.append(&mut woken);
         }
         parked
+    }
+
+    /// Whether the clients the commands before `cmd0` woke must have looked
+    /// before it runs: it reads (or is not known to write), and so would see
+    /// what they are yet to take. Writes do not wait, and replies are not
+    /// held: a producer pipelining `LPUSH`es to queues with blocked workers
+    /// would otherwise wait for every worker it woke, push by push or batch
+    /// by batch, and push at the rate the workers pop (#823: 1,960 jobs/s
+    /// down to 1,240 at 1,000 workers x 270 queues waiting per command, and
+    /// 1,400 waiting once per batch). What a client observes after its own
+    /// push, with `LLEN`, `INFO` or anything else that reads, comes after
+    /// the pops that push caused, as in Redis.
+    #[inline]
+    pub fn settles_before(&self, cmd0: &[u8]) -> bool {
+        !self.woken.is_empty() && !crate::replication::is_write_command_bytes(cmd0)
+    }
+
+    /// Forget the looks of the clients woken before that are done: kept
+    /// only for the next command that reads, they must not pile up on a
+    /// connection that only writes.
+    #[inline]
+    pub fn forget_looked(&mut self) {
+        if !self.woken.is_empty() {
+            self.woken.retain(|look| !look.is_done());
+        }
+    }
+
+    /// Wait for the clients the commands before this one woke to have
+    /// looked at their keys, so that what it reads comes after their pops,
+    /// as in Redis (#42); a chain (`BRPOPLPUSH a b` woken by a push to `a`,
+    /// whose push to `b` wakes `BRPOPLPUSH b c`) is waited for whole.
+    ///
+    /// Bounded: a woken client cannot always look at once — a paused server
+    /// holds its resume dispatch, and `CLIENT KILL` or a timeout can take it
+    /// away mid-flight. At the bound the command runs without waiting any
+    /// longer, and may not see that client's pop. A hundred milliseconds is
+    /// far longer than a dispatch, which only has to finish what it was
+    /// already running, and far shorter than any `CLIENT PAUSE` someone
+    /// would set. The bound is for all of them together, not for each.
+    ///
+    /// A client that has gone does not hold it: the looks it owes are done
+    /// when its ticket goes, or with the dispatch that leaves its lines.
+    ///
+    /// `None`, nothing to wait for, is what nearly every command gets. The
+    /// wait is boxed, so that it is polled out of line, as `until_gone` is:
+    /// the connection's own future is compiled as it was without it.
+    #[inline]
+    pub fn settle(&mut self) -> Option<Settling> {
+        if self.woken.is_empty() {
+            return None;
+        }
+        self.settle_woken()
+    }
+
+    #[cold]
+    fn settle_woken(&mut self) -> Option<Settling> {
+        let woken = std::mem::take(&mut self.woken);
+        let deadline = tokio::time::Instant::now() + WOKEN_BOUND;
+        Some(Box::pin(crate::wait_table::all_looked(woken, deadline)))
     }
 
     /// A dispatch that resumed a command is over and did not park again:
@@ -475,13 +638,25 @@ impl BlockingSlot {
 
     /// Store what the wait produced, for the resume dispatch to pick up.
     pub fn set_pending(&mut self, delivery: Delivery, state: Option<BlockState>) {
+        if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+            &state
+        {
+            self.looked.extend(ticket.take_looked());
+        }
         self.pending = Some((delivery, state, false));
     }
 
     /// The client went while its command waited. The command is dispatched
     /// once more, but only to leave the line it stood in: see
-    /// [`client_gone`].
+    /// [`client_gone`]. Whoever woke it, if anyone did, waits for that
+    /// dispatch as for any other: it passes the turn on, and the client it
+    /// passes it to is the one that takes the element.
     pub fn set_gone(&mut self, state: Option<BlockState>) {
+        if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+            &state
+        {
+            self.looked.extend(ticket.take_looked());
+        }
         self.pending = Some((None, state, true));
     }
 
@@ -494,6 +669,14 @@ impl BlockingSlot {
             *gone = true;
         }
     }
+}
+
+/// A number for a connection, to the looks it waits for
+/// (`wait_table::collect_woken_for`).
+#[cold]
+fn new_owner() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Outcome of asking to park.
@@ -1060,6 +1243,45 @@ mod tests {
         assert_eq!(got.expect("k2 fired").0, b"k2");
     }
 
+    /// A woken client that never looks at its keys — paused, killed, or gone —
+    /// must not hold the reply past the bound: for all of them together.
+    /// Looks that name each other end.
+    #[test]
+    fn a_woken_client_that_never_looks_holds_the_reply_only_to_the_bound() {
+        use crate::wait_table::Look;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let woken = Look::new_for_tests(5);
+        // The slot has a `Drop`, so it cannot be built with `..Default::default()`.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut slot = BlockingSlot::default();
+        slot.woken = woken.clone();
+        let started = Instant::now();
+        rt.block_on(slot.settle().expect("something to wait for"));
+        let waited = started.elapsed();
+        assert!(waited >= WOKEN_BOUND, "gave up early: {waited:?}");
+        assert!(
+            waited < WOKEN_BOUND * 3,
+            "waited past the bound: {waited:?}"
+        );
+        // Done, and done with each other: no wait.
+        woken[0].done(&woken[1..]);
+        for (n, look) in woken.iter().enumerate().skip(1) {
+            look.done(&woken[..n]);
+        }
+        // The slot has a `Drop`, so it cannot be built with `..Default::default()`.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut slot = BlockingSlot::default();
+        slot.woken = woken;
+        let started = Instant::now();
+        rt.block_on(slot.settle().expect("something to wait for"));
+        assert!(started.elapsed() < WOKEN_BOUND / 2);
+        // Nothing woken, nothing to wait for.
+        assert!(BlockingSlot::default().settle().is_none());
+    }
+
     /// Every registration being cancelled must not hang a `timeout 0` wait
     /// forever with no way out.
     #[test]
@@ -1316,6 +1538,49 @@ mod gone_resume_tests {
                 );
             }
             assert_eq!(run(&["EXISTS", "d1", "d2"], None), b":0\r\n");
+        });
+    }
+
+    /// The client woken for an element has gone: whoever woke it has its
+    /// look once its gone dispatch has left the line and passed the turn
+    /// on, and that look carries the look of the client it passed the turn
+    /// to, which takes the element.
+    #[tokio::test]
+    async fn a_gone_resume_hands_its_waker_the_client_it_passes_to() {
+        with_server(|run, wait_table| {
+            run(&["RPUSH", "g", "e"], None);
+            let gone = wait_table.new_ticket();
+            let behind = wait_table.new_ticket();
+            let _gone_rx = wait_table.enqueue("g", &gone);
+            let mut behind_rx = wait_table.enqueue("g", &behind);
+            gone.parks_in(&["g".to_string()], false);
+            behind.parks_in(&["g".to_string()], false);
+            // The push's dispatch, which wakes the client at the head.
+            crate::wait_table::collect_woken();
+            wait_table.notify_signal("g");
+            let waker = crate::wait_table::take_woken().expect("woke one").woken;
+            assert_eq!(waker.len(), 1);
+            assert!(!waker[0].is_done());
+
+            let mut slot = BlockingSlot::default();
+            slot.set_gone(Some(BlockState::Queued {
+                deadline: None,
+                ticket: gone,
+            }));
+            run(&["BLPOP", "g", "0"], Some(slot.prime()));
+            assert!(slot.take_parked().is_none());
+            assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
+            assert!(waker[0].is_done(), "the gone client's look is not done");
+            // The one behind is waited for (twice, perhaps: the dispatch's
+            // write to `g` wakes the head of its line again, and that is the
+            // same client, yet to look).
+            assert!(!slot.woken.is_empty(), "the one behind is not waited for");
+            assert!(slot.woken.iter().all(|look| !look.is_done()));
+            drop(behind);
+            assert!(
+                slot.woken.iter().all(|look| look.is_done()),
+                "a client that went owes nothing"
+            );
         });
     }
 

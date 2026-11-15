@@ -427,6 +427,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fallback `HELLO` in the command table has the `id` field and the
   connection's protocol too. Thanks to @matheussilvano.
 
+- **What a client reads after a push that woke a blocked client includes
+  that client's pop (#42).** The woken client was answered on its own
+  task, so its `BLPOP` could land after the `LPUSH` that woke it had
+  replied: `INFO` or `LLEN` sent right behind the push could see one change
+  fewer and the element still there, which made Redis's `BLPOP/BLMOVE
+  should increase dirty` and `Circular BRPOPLPUSH` fail now and then. Now
+  a command that reads runs only once the clients woken by the commands
+  before it on the same connection have looked at their keys, for a chain
+  of them too (waiting at most 100 ms for a client that cannot look at
+  once: paused, killed), so what a client reads after its own push is what
+  Redis shows. Writes and replies are not held: a producer pipelining
+  pushes to queues with blocked workers keeps its rate (holding replies
+  until the workers had popped cost 30-40 % of the jobs per second in
+  suite 15). What still differs from Redis, as it did before: a write
+  pipelined right behind the push that woke a client acts on the list
+  before that client's pop. A second push's reply may count the element
+  the woken client has yet to take; `LPUSHX` or `LSET` find the list
+  there; `LPOP`, `LMOVE`, `LTRIM`, `DEL` or `RENAME` may take the element
+  first, and the client then waits on. Nothing is lost or delivered
+  twice, and a replica applies the same order. In builds with Lua, a
+  push made by a script is not waited for by the reads that follow it.
+  Thanks to @willgitdata for the fix.
+
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,
   then, for a while, was refused. Like Redis, which reads a `long double`,
