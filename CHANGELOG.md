@@ -342,20 +342,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fallback `HELLO` in the command table has the `id` field and the
   connection's protocol too. Thanks to @matheussilvano.
 
-- **A write that wakes a blocked client replies after that client has been
-  served (#42).** The woken client was answered on its own task, so its
-  `BLPOP` could land after the `LPUSH` that woke it had replied: `INFO` or
-  `LLEN` sent right behind the push could see one change fewer and the
-  element still there, which made Redis's `BLPOP/BLMOVE should increase
-  dirty` and `Circular BRPOPLPUSH` fail now and then. As in Redis, a
-  command's reply now goes out once the clients it woke have looked at their
-  keys, for a chain of them too, and a command that reads runs only after
-  the clients woken by the commands before it have; waiting at most 100 ms
-  for a client that cannot look at once (paused, killed). A pipeline of
-  writes waits once, before its replies are written, not write by write, so
-  a producer's pipelined pushes keep their rate; one difference from Redis
-  is left there: the reply of a push pipelined behind another to the same
-  key may count an element the first push's woken client has yet to take.
+- **What a client reads after a push that woke a blocked client includes
+  that client's pop (#42).** The woken client was answered on its own
+  task, so its `BLPOP` could land after the `LPUSH` that woke it had
+  replied: `INFO` or `LLEN` sent right behind the push could see one change
+  fewer and the element still there, which made Redis's `BLPOP/BLMOVE
+  should increase dirty` and `Circular BRPOPLPUSH` fail now and then. Now
+  a command that reads runs only once the clients woken by the commands
+  before it on the same connection have looked at their keys, for a chain
+  of them too (waiting at most 100 ms for a client that cannot look at
+  once: paused, killed), so what a client reads after its own push is what
+  Redis shows. Writes and replies are not held: a producer pipelining
+  pushes to queues with blocked workers keeps its rate (holding replies
+  until the workers had popped cost 30-40 % of the jobs per second in
+  suite 15). The one difference from Redis left: the reply of a push
+  pipelined right behind another to the same key may count an element the
+  first one's woken client has yet to take.
   Thanks to @willgitdata for the fix.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
