@@ -169,6 +169,17 @@ fn start_on(
     dir: &std::path::Path,
     port: u16,
 ) -> (std::process::Child, u16, std::io::BufReader<TcpStream>) {
+    start_with(dir, port, &[], &[], &[])
+}
+
+/// [`start_on`], with arguments (`base`, then `extra`) and environment.
+fn start_with(
+    dir: &std::path::Path,
+    port: u16,
+    base: &[&str],
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (std::process::Child, u16, std::io::BufReader<TcpStream>) {
     let mut port = port;
     for _ in 0..10 {
         let mut server = Command::new(kividb_bin())
@@ -180,6 +191,9 @@ fn start_on(
                 "--dir",
                 dir.to_str().unwrap(),
             ])
+            .args(base)
+            .args(extra)
+            .envs(env.iter().copied())
             .spawn()
             .expect("failed to start kividb");
         match connect_to(&mut server, port, Duration::from_secs(60)) {
@@ -387,37 +401,488 @@ fn port_takes_no_connection_once_the_server_has_exited() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn shutdown_abort_keeps_server_alive() {
-    let port = free_port();
-    let mut server = Command::new(kividb_bin())
-        .current_dir(tempfile::tempdir().unwrap().keep())
-        .args(["--port", &port.to_string()])
-        .spawn()
-        .unwrap();
+// ── SHUTDOWN as Redis answers it (#429) ──────────────────────────────────
+//
+// A shutdown that goes ahead is answered with nothing: the connection closes
+// when the process exits, after the final save. redis-py's `shutdown()`
+// takes any reply for a failure. A shutdown that fails, or is aborted, is
+// answered with an error and the server runs on. The replies below are
+// Redis 8.10.2's, byte for byte.
 
-    assert!(
-        wait_for_server(port, Duration::from_secs(5)),
-        "server on port {port} did not come up within 5s"
-    );
+/// The io models: `auto` is io_uring where the machine has it.
+const MODELS: [&str; 2] = ["auto", "tokio"];
 
-    let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+const FAILED: &[u8] = b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n";
+
+/// A server of these tests, in a data directory of its own.
+struct Srv {
+    child: std::process::Child,
+    port: u16,
+    dir: std::path::PathBuf,
+}
+
+impl Srv {
+    fn start(model: &str, extra: &[&str], env: &[(&str, &str)]) -> Srv {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let (child, port, _) = start_with(&dir, free_port(), &["--io-model", model], extra, env);
+        Srv { child, port, dir }
+    }
+
+    /// A raw connection: replies are read as bytes.
+    fn raw(&self) -> TcpStream {
+        let conn = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        conn.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        conn
+    }
+
+    fn exited(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let start = Instant::now();
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if start.elapsed() > within {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Srv {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn encode(args: &[&str]) -> Vec<u8> {
+    let mut req = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        req.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+    }
+    req
+}
+
+/// What the server sends until it closes the connection, or `within` is up:
+/// the bytes, and whether it closed.
+fn until_closed(conn: &mut TcpStream, within: Duration) -> (Vec<u8>, bool) {
     use std::io::Read;
+    let start = Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while start.elapsed() < within {
+        match conn.read(&mut buf) {
+            Ok(0) => return (got, true),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            // A reset is a close too.
+            Err(_) => return (got, true),
+        }
+    }
+    (got, false)
+}
 
-    conn.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$5\r\nABORT\r\n")
-        .unwrap();
-    let mut buf = [0u8; 16];
-    let n = conn.read(&mut buf).unwrap();
-    assert_eq!(&buf[..n], b"+OK\r\n", "expected +OK from SHUTDOWN ABORT");
+/// What the server has sent so far, until `len` bytes or `within`.
+fn read_len(conn: &mut TcpStream, len: usize, within: Duration) -> Vec<u8> {
+    use std::io::Read;
+    let start = Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while got.len() < len && start.elapsed() < within {
+        match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    got
+}
 
-    conn.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
-    let n = conn.read(&mut buf).unwrap();
-    assert_eq!(
-        &buf[..n],
-        b"+PONG\r\n",
-        "server stopped responding after ABORT"
-    );
+/// Every form of a SHUTDOWN that goes ahead: no reply at all, then the
+/// connection closes, and the process exits with status 0.
+#[test]
+fn a_shutdown_that_goes_ahead_sends_no_reply() {
+    for model in MODELS {
+        for form in [
+            &["SHUTDOWN"][..],
+            &["SHUTDOWN", "NOSAVE"],
+            &["SHUTDOWN", "SAVE"],
+            &["SHUTDOWN", "NOW"],
+            &["SHUTDOWN", "FORCE"],
+            &["SHUTDOWN", "NOSAVE", "NOW"],
+            &["SHUTDOWN", "NOW", "FORCE"],
+            &["shutdown", "nosave"],
+        ] {
+            let mut server = Srv::start(model, &[], &[]);
+            let mut conn = server.raw();
+            conn.write_all(&encode(form)).unwrap();
+            let (reply, closed) = until_closed(&mut conn, Duration::from_secs(30));
+            assert_eq!(
+                reply,
+                b"",
+                "{model}: {form:?} was answered {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+            assert!(closed, "{model}: {form:?}: the connection was not closed");
+            let status = server
+                .exited(Duration::from_secs(30))
+                .unwrap_or_else(|| panic!("{model}: no exit after {form:?}"));
+            assert!(status.success(), "{model}: {form:?} exited with {status}");
+        }
+    }
+}
 
-    server.kill().unwrap();
-    let _ = server.wait();
+/// Replies that were owed before the SHUTDOWN are sent before the
+/// connection closes: a pipelined `SET`, on RESP2 and RESP3; with
+/// `CLIENT REPLY OFF` there are none. The commands after a SHUTDOWN that
+/// goes ahead are not run.
+#[test]
+fn replies_before_a_shutdown_are_sent_and_commands_after_it_are_not_run() {
+    for model in MODELS {
+        for resp3 in [false, true] {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let (mut server, port, _) =
+                start_with(&dir, free_port(), &["--io-model", model], &[], &[]);
+            let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            conn.set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            if resp3 {
+                conn.write_all(&encode(&["HELLO", "3"])).unwrap();
+                // The reply is a map: the connection is read to its end.
+                thread::sleep(Duration::from_millis(300));
+                let _ = read_len(&mut conn, usize::MAX, Duration::from_millis(300));
+            }
+            // One write: the three commands arrive together.
+            let mut batch = encode(&["SET", "before", "1"]);
+            batch.extend(encode(&["SHUTDOWN", "SAVE"]));
+            batch.extend(encode(&["SET", "after", "1"]));
+            conn.write_all(&batch).unwrap();
+            let (reply, closed) = until_closed(&mut conn, Duration::from_secs(30));
+            assert_eq!(
+                reply,
+                b"+OK\r\n",
+                "{model} resp3={resp3}: got {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+            assert!(closed, "{model} resp3={resp3}: not closed");
+            assert!(
+                wait_for_exit(&mut server, Duration::from_secs(30)),
+                "{model}: no exit"
+            );
+            // What was acknowledged is in the final save; what came after
+            // the SHUTDOWN was never run.
+            let (mut again, _, mut c) = start_on(&dir, free_port());
+            assert_eq!(resp_cmd(&mut c, &["GET", "before"]).unwrap(), "1");
+            assert_eq!(resp_cmd(&mut c, &["GET", "after"]).unwrap(), "(nil)");
+            let _ = again.kill();
+            let _ = again.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // `CLIENT REPLY OFF`: there was no reply to the SET, and there is
+        // none to the SHUTDOWN.
+        let mut server = Srv::start(model, &[], &[]);
+        let mut conn = server.raw();
+        let mut batch = encode(&["CLIENT", "REPLY", "OFF"]);
+        batch.extend(encode(&["SET", "k", "v"]));
+        batch.extend(encode(&["SHUTDOWN", "NOSAVE"]));
+        conn.write_all(&batch).unwrap();
+        let (reply, closed) = until_closed(&mut conn, Duration::from_secs(30));
+        assert_eq!(reply, b"", "{model}: REPLY OFF: got {reply:?}");
+        assert!(closed);
+        assert!(server.exited(Duration::from_secs(30)).is_some());
+    }
+}
+
+/// The forms Redis refuses, with its replies; none stops the server.
+#[test]
+fn shutdown_refusals_match_redis_and_leave_the_server_running() {
+    for model in MODELS {
+        let server = Srv::start(model, &[], &[]);
+        let mut conn = server.raw();
+        let cases: [(&[&str], &[u8]); 7] = [
+            (&["SHUTDOWN", "SAVE", "NOSAVE"], b"-ERR syntax error\r\n"),
+            (&["SHUTDOWN", "FOO"], b"-ERR syntax error\r\n"),
+            (&["SHUTDOWN", "ABORT", "NOW"], b"-ERR syntax error\r\n"),
+            (&["SHUTDOWN", "ABORT"], b"-ERR No shutdown in progress.\r\n"),
+            (&["MULTI"], b"+OK\r\n"),
+            (
+                &["SHUTDOWN"],
+                b"-ERR Command not allowed inside a transaction\r\n",
+            ),
+            (
+                &["EXEC"],
+                b"-EXECABORT Transaction discarded because of previous errors.\r\n",
+            ),
+        ];
+        for (args, expected) in cases {
+            conn.write_all(&encode(args)).unwrap();
+            let got = read_len(&mut conn, expected.len(), Duration::from_secs(10));
+            assert_eq!(
+                got,
+                expected,
+                "{model}: {args:?}: got {:?}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+        conn.write_all(&encode(&["PING"])).unwrap();
+        assert_eq!(
+            read_len(&mut conn, 7, Duration::from_secs(10)),
+            b"+PONG\r\n"
+        );
+    }
+}
+
+/// A script may not shut the server down.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_cannot_shut_the_server_down() {
+    for model in MODELS {
+        let server = Srv::start(model, &[], &[]);
+        let mut conn = server.raw();
+        conn.write_all(&encode(&["EVAL", "return redis.pcall('shutdown')", "0"]))
+            .unwrap();
+        let got = read_len(&mut conn, 1, Duration::from_secs(10));
+        assert_eq!(got.first(), Some(&b'-'), "{model}: {got:?}");
+        conn.write_all(&encode(&["PING"])).unwrap();
+        let rest = until_closed(&mut conn, Duration::from_millis(500)).0;
+        assert!(rest.ends_with(b"+PONG\r\n"), "{model}: {rest:?}");
+    }
+}
+
+/// A final save that fails is answered with an error, and the server runs
+/// on: writes are accepted again (the gate and the pause are undone), the
+/// replies after the SHUTDOWN in the pipeline are sent after the error, and
+/// `CLIENT REPLY OFF` keeps the error from being sent. `FORCE` and `NOSAVE`
+/// end the process anyway.
+#[test]
+fn a_failed_final_save_is_an_error_and_the_server_runs_on() {
+    for model in MODELS {
+        let mut server = Srv::start(model, &[], &[("KIVIDB_TEST_FAILPOINTS", "final-save")]);
+        let mut conn = server.raw();
+        // The SHUTDOWN, a PING after it in the same write, and a write.
+        let mut batch = encode(&["SET", "kept", "1"]);
+        batch.extend(encode(&["SHUTDOWN"]));
+        batch.extend(encode(&["PING"]));
+        conn.write_all(&batch).unwrap();
+        let expected = [&b"+OK\r\n"[..], FAILED, b"+PONG\r\n"].concat();
+        let got = read_len(&mut conn, expected.len(), Duration::from_secs(30));
+        assert_eq!(
+            got,
+            expected,
+            "{model}: got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        // Not paused, not stopped: another connection writes and reads, and
+        // its writes are acknowledged.
+        let mut other = server.raw();
+        other.write_all(&encode(&["SET", "later", "2"])).unwrap();
+        assert_eq!(read_len(&mut other, 5, Duration::from_secs(10)), b"+OK\r\n");
+        other.write_all(&encode(&["GET", "kept"])).unwrap();
+        assert_eq!(
+            read_len(&mut other, 7, Duration::from_secs(10)),
+            b"$1\r\n1\r\n"
+        );
+        // Again: the same, with RESP3 and with replies off.
+        conn.write_all(&encode(&["HELLO", "3"])).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let _ = read_len(&mut conn, usize::MAX, Duration::from_millis(300));
+        conn.write_all(&encode(&["SHUTDOWN", "SAVE"])).unwrap();
+        let got = read_len(&mut conn, FAILED.len(), Duration::from_secs(30));
+        assert_eq!(
+            got,
+            FAILED,
+            "{model}: resp3: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        let mut off = encode(&["CLIENT", "REPLY", "OFF"]);
+        off.extend(encode(&["SHUTDOWN"]));
+        off.extend(encode(&["CLIENT", "REPLY", "ON"]));
+        off.extend(encode(&["PING"]));
+        conn.write_all(&off).unwrap();
+        // The error was not sent; the `+OK` of REPLY ON and the PONG were.
+        let got = read_len(&mut conn, 12, Duration::from_secs(30));
+        assert_eq!(got, b"+OK\r\n+PONG\r\n", "{model}: reply off: {got:?}");
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "{model}: exited"
+        );
+        // NOSAVE writes nothing, so nothing fails.
+        let mut conn = server.raw();
+        conn.write_all(&encode(&["SHUTDOWN", "NOSAVE"])).unwrap();
+        let (reply, closed) = until_closed(&mut conn, Duration::from_secs(30));
+        assert_eq!(reply, b"", "{model}: NOSAVE");
+        assert!(closed);
+        assert!(server.exited(Duration::from_secs(30)).unwrap().success());
+
+        // FORCE: the save fails and the server goes anyway, with status 1.
+        let mut server = Srv::start(model, &[], &[("KIVIDB_TEST_FAILPOINTS", "final-save")]);
+        let mut conn = server.raw();
+        conn.write_all(&encode(&["SHUTDOWN", "FORCE"])).unwrap();
+        let (reply, closed) = until_closed(&mut conn, Duration::from_secs(30));
+        assert_eq!(reply, b"", "{model}: FORCE");
+        assert!(closed);
+        let status = server.exited(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "{model}: FORCE exited with {status}"
+        );
+    }
+}
+
+/// A SIGTERM whose final save fails ends the process with status 1, as it
+/// always did; with the save good, it ends with 0.
+#[test]
+fn sigterm_ends_the_process_after_its_final_save() {
+    for model in MODELS {
+        for (fails, code) in [(false, 0), (true, 1)] {
+            let env: &[(&str, &str)] = if fails {
+                &[("KIVIDB_TEST_FAILPOINTS", "final-save")]
+            } else {
+                &[]
+            };
+            let mut server = Srv::start(model, &[], env);
+            unsafe { libc::kill(server.child.id() as libc::pid_t, libc::SIGTERM) };
+            let status = server
+                .exited(Duration::from_secs(30))
+                .unwrap_or_else(|| panic!("{model}: no exit after SIGTERM"));
+            assert_eq!(status.code(), Some(code), "{model} fails={fails}: {status}");
+        }
+    }
+}
+
+/// `SHUTDOWN` waits for a replica that lags, up to `shutdown-timeout`, and
+/// `SHUTDOWN ABORT` from another client ends the wait: the one that asked is
+/// answered an error, the abort is answered OK, and the server runs on, its
+/// clients no longer paused and its replica fed again. (Redis 8.10.2:
+/// `-ERR Errors trying to SHUTDOWN. Check logs.` to the first, `+OK` to the
+/// second.)
+#[test]
+fn shutdown_abort_ends_the_wait_for_a_lagging_replica() {
+    // NOSAVE waits for the replicas too, as in Redis.
+    for (model, form) in MODELS
+        .iter()
+        .flat_map(|model| [(*model, "SAVE"), (*model, "NOSAVE")])
+    {
+        let mut master = Srv::start(model, &["--shutdown-timeout", "60"], &[]);
+        let mut replica2 = Srv::start(
+            model,
+            &["--replicaof", "127.0.0.1", &master.port.to_string()],
+            &[],
+        );
+        let mut conn = master.raw();
+        let start = Instant::now();
+        loop {
+            conn.write_all(&encode(&["INFO", "replication"])).unwrap();
+            let (info, _) = until_closed(&mut conn, Duration::from_millis(300));
+            if String::from_utf8_lossy(&info).contains("connected_slaves:1") {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the replica did not attach"
+            );
+        }
+        unsafe { libc::kill(replica2.child.id() as libc::pid_t, libc::SIGSTOP) };
+        conn.write_all(&encode(&["SET", "lag", "1"])).unwrap();
+        assert_eq!(read_len(&mut conn, 5, Duration::from_secs(10)), b"+OK\r\n");
+        let mut asker = master.raw();
+        asker.write_all(&encode(&["SHUTDOWN", form])).unwrap();
+        // Waiting: no reply, no exit.
+        let (reply, closed) = until_closed(&mut asker, Duration::from_secs(2));
+        assert_eq!(
+            (reply.as_slice(), closed),
+            (&b""[..], false),
+            "{model}: still waiting"
+        );
+        assert!(master.child.try_wait().unwrap().is_none());
+        // Aborted by another client.
+        let mut other = master.raw();
+        other.write_all(&encode(&["SHUTDOWN", "ABORT"])).unwrap();
+        assert_eq!(
+            read_len(&mut other, 5, Duration::from_secs(10)),
+            b"+OK\r\n",
+            "{model}"
+        );
+        let got = read_len(&mut asker, FAILED.len(), Duration::from_secs(30));
+        assert_eq!(
+            got,
+            FAILED,
+            "{model}: the asker got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        // Nothing is paused now, and nothing is in progress.
+        other.write_all(&encode(&["SET", "after", "1"])).unwrap();
+        assert_eq!(
+            read_len(&mut other, 5, Duration::from_secs(10)),
+            b"+OK\r\n",
+            "{model}"
+        );
+        other.write_all(&encode(&["SHUTDOWN", "ABORT"])).unwrap();
+        let expected = b"-ERR No shutdown in progress.\r\n";
+        assert_eq!(
+            read_len(&mut other, expected.len(), Duration::from_secs(10)),
+            expected
+        );
+        unsafe { libc::kill(replica2.child.id() as libc::pid_t, libc::SIGCONT) };
+        let _ = replica2.child.kill();
+        // And a shutdown can be asked for again, and goes ahead.
+        let mut asker = master.raw();
+        asker.write_all(&encode(&["SHUTDOWN", "NOW"])).unwrap();
+        let (reply, closed) = until_closed(&mut asker, Duration::from_secs(30));
+        assert_eq!(
+            (reply.as_slice(), closed),
+            (&b""[..], true),
+            "{model}: again"
+        );
+        assert!(master.exited(Duration::from_secs(30)).unwrap().success());
+    }
+}
+
+/// `SHUTDOWN NOSAVE` writes no snapshot, so the AOF is all that carries the
+/// writes: what was queued for it is in the file, and synced, before the
+/// connection is closed and the process exits, even when replies are sent
+/// ahead of their records (`aof-ack-after-write no`).
+#[test]
+fn shutdown_nosave_leaves_every_queued_write_in_the_aof() {
+    for model in MODELS {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let (mut server, port, _) =
+            start_with(&dir, free_port(), &["--io-model", model, "--aof"], &[], &[]);
+        let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        conn.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        conn.write_all(&encode(&["CONFIG", "SET", "aof-ack-after-write", "no"]))
+            .unwrap();
+        assert_eq!(read_len(&mut conn, 5, Duration::from_secs(10)), b"+OK\r\n");
+        const KEYS: usize = 20_000;
+        let mut batch = Vec::new();
+        for i in 0..KEYS {
+            batch.extend(encode(&["SET", &format!("k{i}"), "v"]));
+        }
+        batch.extend(encode(&["SHUTDOWN", "NOSAVE"]));
+        conn.write_all(&batch).unwrap();
+        let (replies, closed) = until_closed(&mut conn, Duration::from_secs(60));
+        assert!(closed, "{model}: not closed");
+        // Every SET was answered before the close.
+        assert_eq!(replies.len(), KEYS * 5, "{model}: replies before the close");
+        assert!(wait_for_exit(&mut server, Duration::from_secs(30)));
+        let (mut again, _, mut c) =
+            start_with(&dir, free_port(), &["--io-model", model, "--aof"], &[], &[]);
+        assert_eq!(
+            resp_cmd(&mut c, &["DBSIZE"]).unwrap(),
+            format!(":{KEYS}"),
+            "{model}: keys after the restart"
+        );
+        let _ = again.kill();
+        let _ = again.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

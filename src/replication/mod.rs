@@ -3738,11 +3738,13 @@ fn wait_for_replicas_until(state: &ReplState, hub_tx: &HubTx, deadline: std::tim
             done_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ) && std::time::Instant::now() < deadline
+            && !crate::shutdown::abort_requested()
         {
             std::thread::sleep(pause);
         }
     }
     while std::time::Instant::now() < deadline
+        && !crate::shutdown::abort_requested()
         && replicas_at_shutdown(state).iter().any(|(_, p)| {
             p.state() == ReplicaState::Online && p.delivered() < p.sent.load(Ordering::Relaxed)
         })

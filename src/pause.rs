@@ -684,10 +684,16 @@ pub fn holds<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>]) -> bool {
         return false;
     }
     if !write_only {
+        // `SHUTDOWN ABORT` too: a shutdown pauses every client while it
+        // waits for the replicas, and this is what ends that wait.
         return !(name == "CLIENT"
             && cmd
                 .get(1)
-                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")));
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")))
+            && !(name == "SHUTDOWN"
+                && cmd
+                    .get(1)
+                    .is_some_and(|sub| sub.eq_ignore_ascii_case(b"ABORT")));
     }
     if name == "EXEC" {
         return queued.iter().any(|command| queued_may_replicate(command));

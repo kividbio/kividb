@@ -285,6 +285,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`SHUTDOWN` that goes ahead answers nothing, as Redis does, and one that
+  fails answers an error and keeps the server running (#429).** It
+  answered `+OK` and then closed the connection, so redis-py's
+  `shutdown()`, which takes any reply for a failure, raised "SHUTDOWN seems
+  to have failed" on every successful shutdown. The connection now stays
+  silent until the process exits, after the final save, and replies that
+  were owed before the `SHUTDOWN` (a pipelined `SET`) are sent first.
+  If the final save cannot be written, `SHUTDOWN` answers `-ERR Errors
+  trying to SHUTDOWN. Check logs.` and the server runs on, with its
+  clients and writes no longer paused (`SHUTDOWN FORCE`, and a signal,
+  still end the process with status 1). `SHUTDOWN ABORT` cancels a
+  shutdown that is waiting for lagging replicas, and answers `-ERR No
+  shutdown in progress.` when there is none, where it answered `+OK`. An
+  unknown or conflicting modifier is `-ERR syntax error`, as in Redis.
+
 - **A replica promoted after its master died part way through a slot
   import deletes what the import brought, and an import sent again no
   longer brings back keys the source deleted (#741).** The keys a
