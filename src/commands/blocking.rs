@@ -416,16 +416,20 @@ pub struct BlockingSlot {
     woken: Vec<std::sync::Arc<crate::wait_table::Look>>,
     /// This connection, to the looks it waits for: one per woken client.
     owner: u64,
+    /// Whether the dispatch under way collects the clients it wakes.
+    collecting: bool,
 }
 
 impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
-        if self.owner == 0 {
-            self.owner = new_owner();
+        // Nobody stands in any line (nearly always): nothing this command
+        // does can wake anyone, and there is nothing to collect.
+        self.collecting = crate::wait_table::anyone_in_line();
+        if self.collecting {
+            self.collect();
         }
-        crate::wait_table::collect_woken_for(self.owner);
         self.ctl.awaitable = true;
         self.ctl.parked = None;
         match self.pending.take() {
@@ -444,11 +448,21 @@ impl BlockingSlot {
         &mut self.ctl
     }
 
+    /// Collect what the dispatch about to run wakes, for this connection.
+    #[inline(never)]
+    fn collect(&mut self) {
+        if self.owner == 0 {
+            self.owner = new_owner();
+        }
+        crate::wait_table::collect_woken_for(self.owner);
+    }
+
     /// Take the wait a handler parked during the dispatch just completed.
     ///
     /// Called straight after every dispatch and before anything is awaited:
     /// what it woke is in a thread-local, which another connection on this
     /// thread would overwrite.
+    #[inline]
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
         let parked = self.ctl.parked.take();
         if parked.is_none() && self.in_resume {
@@ -457,7 +471,11 @@ impl BlockingSlot {
         // After `resume_over`: a refused resume's ticket, dropped there,
         // passes its turn on, and the client that wakes is this dispatch's to
         // wait for, as the client a handler passes the turn to is.
-        let collected = crate::wait_table::take_woken();
+        let collected = if self.collecting {
+            crate::wait_table::take_woken()
+        } else {
+            None
+        };
         // Nearly every command: woke nobody, owes nobody a look, did not wait.
         if collected.is_none() && parked.is_none() && self.looked.is_empty() {
             return parked;

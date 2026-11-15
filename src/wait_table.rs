@@ -459,8 +459,20 @@ impl LineTable {
 
     fn clear(&self) {
         self.lines.lock().clear();
-        self.count.store(0, Ordering::Relaxed);
+        IN_LINE.fetch_sub(self.count.swap(0, Ordering::Relaxed), Ordering::Relaxed);
     }
+}
+
+/// Clients standing in a line, in every table of the process: while there
+/// are none, a connection's command collects nothing it wakes and its
+/// connection skips the bookkeeping (#42) altogether.
+static IN_LINE: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether any client stands in a line anywhere in the process: one
+/// relaxed load, for a connection about to run a command.
+#[inline]
+pub fn anyone_in_line() -> bool {
+    IN_LINE.load(Ordering::Relaxed) != 0
 }
 
 pub struct WaitTable {
@@ -635,6 +647,7 @@ impl WaitTable {
             }
         }
         table.count.fetch_add(added, Ordering::Relaxed);
+        IN_LINE.fetch_add(added, Ordering::Relaxed);
         rx
     }
 
@@ -682,6 +695,7 @@ impl WaitTable {
             })
             .collect();
         table.count.fetch_sub(removed, Ordering::Relaxed);
+        IN_LINE.fetch_sub(removed, Ordering::Relaxed);
         woken
     }
 
@@ -784,6 +798,7 @@ impl WaitTable {
             line.remove(id);
         }
         table.count.fetch_sub(gone.len(), Ordering::Relaxed);
+        IN_LINE.fetch_sub(gone.len(), Ordering::Relaxed);
         if line.is_empty() {
             lines.remove(key);
         }
