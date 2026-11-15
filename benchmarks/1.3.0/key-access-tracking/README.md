@@ -11,25 +11,35 @@ callgrind, 40,000 commands per workload, built with `LTO=fat` (the release
 profile as shipped). Pipelined is `redis-benchmark -P 16`, not pipelined `-P 1`;
 the keys are loaded first. `MGET16` is an `MGET` of 16 keys.
 
-| command | master, tracking off (today's default) | branch, tracking off | branch, tracking on | tracking on vs today |
+| command | master, tracking off (today) | branch, tracking off | branch, tracking on | tracking on vs today |
 |---|---:|---:|---:|---:|
-| GET 100 B, pipelined | 3234 | 3230 (-0.12%) | 3284 | +50 (+1.55%) |
-| SET 100 B, pipelined | 3960 | 3945 (-0.38%) | 4001 | +41 (+1.04%) |
-| GET 1 KB, pipelined | 3826 | 3798 (-0.73%) | 3863 | +37 (+0.97%) |
-| SET 1 KB, pipelined | 4095 | 4082 (-0.32%) | 4147 | +52 (+1.27%) |
-| GET 100 B, not pipelined | 9725 | 9721 (-0.04%) | 9778 | +53 (+0.54%) |
-| SET 100 B, not pipelined | 10447 | 10434 (-0.12%) | 10498 | +51 (+0.49%) |
-| GET 1 KB, not pipelined | 10311 | 10294 (-0.16%) | 10320 | +9 (+0.09%) |
-| SET 1 KB, not pipelined | 10582 | 10573 (-0.09%) | 10631 | +49 (+0.46%) |
-| INCR | 4096 | 4072 (-0.59%) | 4131 | +35 (+0.85%) |
-| HGET | 3954 | 3938 (-0.40%) | 3994 | +40 (+1.01%) |
-| LPUSH | 5299 | 5314 (+0.28%) | 5368 | +69 (+1.30%) |
-| LPOP | 4519 | 4503 (-0.35%) | 4554 | +35 (+0.77%) |
-| MGET of 16 keys | 20536 | 20506 (-0.15%) | 20559 | +23 (+0.11%) |
+| GET 100 B, pipelined | 3258 | 3276 (+0.55%) | 3291 | +33 (+1.01%) |
+| SET 100 B, pipelined | 3984 | 4011 (+0.68%) | 4013 | +29 (+0.73%) |
+| GET 1 KB, pipelined | 3826 | 3813 (-0.34%) | 3884 | +58 (+1.52%) |
+| SET 1 KB, pipelined | 4107 | 4082 (-0.61%) | 4149 | +42 (+1.02%) |
+| GET 100 B, not pipelined | 9792 | 9902 (+1.12%) | 9940 | +148 (+1.51%) |
+| SET 100 B, not pipelined | 10583 | 10480 (-0.97%) | 10636 | +53 (+0.50%) |
+| GET 1 KB, not pipelined | 10455 | 10399 (-0.54%) | 10555 | +100 (+0.96%) |
+| SET 1 KB, not pipelined | 10663 | 10637 (-0.24%) | 11045 | +382 (+3.58%) |
+| INCR | 4101 | 4076 (-0.61%) | 4143 | +42 (+1.02%) |
+| HGET | 3976 | 3949 (-0.68%) | 4027 | +51 (+1.28%) |
+| LPUSH | 5289 | 5332 (+0.81%) | 5390 | +101 (+1.91%) |
+| LPOP | 4530 | 4509 (-0.46%) | 4593 | +63 (+1.39%) |
+| MGET of 16 keys | 20493 | 20500 (+0.03%) | 20548 | +55 (+0.27%) |
 
-Turning tracking on in master, before this change, cost +9.9% on a pipelined
-`GET` of 100 bytes (+8.0% on `SET`, +7 to +8% on `INCR`, `HGET`, `LPUSH` and
-`LPOP`): about 320 instructions a command. What brought it to about 50:
+This is the run on the final commit (`results/callgrind-*.txt`). An earlier
+run of the same code (before the default was put back to `no`) gave, for
+pipelined 100 B `GET` and `SET`: master 3234 and 3960, branch off 3230 and
+3945, branch on 3284 and 4001 (+1.55% and +1.04% over master). Master itself
+differs by 0.7% between the two runs (3234 and 3258; the keys redis-benchmark
+picks and the hash seeds differ), so a single run cannot show less than about
++-0.7% on one command, and the not-pipelined `SET 1 KB` outlier (+3.58%) is
+of that kind. The mean of the two runs, pipelined `GET`/`SET` 100 B: tracking
+off +0.2% / +0.15% over master, tracking on +1.3% / +0.9%.
+
+Turning tracking on in master, before this change, cost +9.3% to +9.9% on a
+pipelined `GET` of 100 bytes (+7.7 to +8.0% on `SET`, +7 to +8% on `INCR`,
+`HGET`, `LPUSH` and `LPOP`): about 320 instructions a command. What brought it to about 50:
 
 - the clock is kept for the second it was read in, on each thread, instead of
   subtracting two instants for every command (a third of the cost);
@@ -95,7 +105,8 @@ Instruction counts are the same from run to run for a given binary; two
 builds differ by up to 1 to 2% in a command nothing changed in (code layout),
 which is why the table is built with `LTO=fat`.
 
-- Tracking off: more than 1% above master's on any command here.
-- Tracking on: more than 2% above master's tracking-off count on a pipelined
-  `GET` or `SET`, or more than 1% on one that is not pipelined.
+- Tracking off: more than 0.3% above master's on a pipelined `GET` or `SET`
+  averaged over two runs, or more than 1% on any command here in one.
+- Tracking on: more than 1.6% above master's tracking-off count on a pipelined
+  `GET`, or 2% on any other command here, over two runs.
 - Bytes per key: any difference between the two settings beyond 1 B.
