@@ -1205,10 +1205,23 @@ fn a_push_that_wakes_a_client_replies_after_its_pop_is_counted() {
             };
             let after: i64 = info
                 .lines()
-                .find_map(|line| line.trim().strip_prefix("rdb_changes_since_last_save:")?.parse().ok())
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix("rdb_changes_since_last_save:")?
+                        .parse()
+                        .ok()
+                })
                 .expect("rdb_changes_since_last_save");
-            assert_eq!(after, before + 2, "{io}: round {round}: the pop was not counted before the push replied");
-            assert_eq!(ctl.read(), V::Int(0), "{io}: round {round}: LLEN saw the element");
+            assert_eq!(
+                after,
+                before + 2,
+                "{io}: round {round}: the pop was not counted before the push replied"
+            );
+            assert_eq!(
+                ctl.read(),
+                V::Int(0),
+                "{io}: round {round}: LLEN saw the element"
+            );
             assert_eq!(blocked.read(), strs(&["dirty", "a"]), "{io}");
         }
     }
