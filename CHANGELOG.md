@@ -261,6 +261,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A write that wakes a blocked client replies after that client has been
+  served (#42).** The woken client was answered on its own task, so its
+  `BLPOP` could land after the `LPUSH` that woke it had replied: `INFO` or
+  `LLEN` sent right behind the push could see one change fewer and the
+  element still there, which made Redis's `BLPOP/BLMOVE should increase
+  dirty` and `Circular BRPOPLPUSH` fail now and then. As in Redis, a command
+  now replies once the clients it woke have looked at their keys, for a
+  chain of them too, waiting at most 100 ms for a client that cannot look
+  at once (paused, killed). Thanks to @willgitdata for the fix.
+
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,
   then, for a while, was refused. Like Redis, which reads a `long double`,

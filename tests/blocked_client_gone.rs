@@ -1175,3 +1175,41 @@ fn a_push_whose_woken_client_has_gone_is_not_held_for_it() {
         }
     }
 }
+
+/// The flake of #42, made deterministic: a `BLPOP` woken by an `LPUSH` from
+/// another connection has popped, and been counted in
+/// `rdb_changes_since_last_save`, by the time the `LPUSH` replies, as in
+/// Redis. `INFO` sent in the same packet behind the push sees exactly two
+/// more changes — the push and the pop — and `LLEN` an empty list. The woken
+/// client used to be served on its own task after the push had replied, so
+/// the `INFO` behind the push saw one change, and the next round's first
+/// `INFO` the other.
+#[test]
+fn a_push_that_wakes_a_client_replies_after_its_pop_is_counted() {
+    for io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let changes = |c: &mut Conn| info_field(c, "persistence", "rdb_changes_since_last_save");
+        for round in 0..200 {
+            let mut blocked = server.conn();
+            blocked.send(&["BLPOP", "dirty", "0"]);
+            wait_blocked(&mut ctl, 1);
+            let before = changes(&mut ctl);
+            let mut packet = request(&["LPUSH", "dirty", "a"]);
+            packet.extend(request(&["INFO", "persistence"]));
+            packet.extend(request(&["LLEN", "dirty"]));
+            ctl.writer.write_all(&packet).unwrap();
+            assert_eq!(ctl.read(), V::Int(1));
+            let V::Str(info) = ctl.read() else {
+                panic!("INFO is a bulk string");
+            };
+            let after: i64 = info
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("rdb_changes_since_last_save:")?.parse().ok())
+                .expect("rdb_changes_since_last_save");
+            assert_eq!(after, before + 2, "{io}: round {round}: the pop was not counted before the push replied");
+            assert_eq!(ctl.read(), V::Int(0), "{io}: round {round}: LLEN saw the element");
+            assert_eq!(blocked.read(), strs(&["dirty", "a"]), "{io}");
+        }
+    }
+}

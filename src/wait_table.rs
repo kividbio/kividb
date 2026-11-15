@@ -68,7 +68,7 @@ impl Ticket {
             .lines
             .lock()
             .iter()
-            .any(|(line, key)| table.woken_in(*line, key, self.id));
+            .any(|(line, key)| table.woken_in(*line, key.as_bytes(), self.id));
         if woken_again {
             self.looked.lock().extend(looked);
         }
@@ -330,7 +330,7 @@ impl WaitTable {
 
     /// Whether the client of ticket `id` stands in `key`'s line woken, and
     /// has yet to look.
-    fn woken_in(&self, line: Line, key: &str, id: u64) -> bool {
+    fn woken_in(&self, line: Line, key: &[u8], id: u64) -> bool {
         let lines = match line {
             Line::Keys => &self.queues,
             Line::Readers => &self.reader_queues,
