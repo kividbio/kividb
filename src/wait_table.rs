@@ -1264,6 +1264,7 @@ mod signal_tests {
         let Woken {
             woken: passed,
             owed,
+            ..
         } = take_woken().expect("passed on");
         assert!(rx2.try_recv().is_ok());
         assert_eq!(passed.len(), 1, "the drop's wake is not waited for");
