@@ -3529,3 +3529,190 @@ fn json_numbers_survive_aof_and_checkpoint_restarts_exactly() {
     let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An index made after some documents were written, and some of those
+/// deleted after it: the log replayed holds the `FT.CREATE` between them.
+/// Its walk in the replay indexed the documents of that moment, the replay
+/// left the deleted ones in, and an index made after a dump was not walked
+/// once the replay was done: it counted the deleted ones and not the ones
+/// written after it, which no search of it found either.
+#[test]
+fn num_docs_after_a_replay_of_an_index_made_between_the_writes() {
+    let _serial = persist_serial();
+    for with_dump in [false, true] {
+        let dir = temp_dir(if with_dump {
+            "num_docs_late_dump"
+        } else {
+            "num_docs_late"
+        });
+        let port = free_port();
+        let mut srv = start_aof_server(port, &dir, &[]);
+        assert!(wait_for_server(port, Duration::from_secs(10)), "start");
+        let create = |c: &mut Conn, name: &str, schema: &str| {
+            let command = format!("FT.CREATE {name} ON HASH PREFIX 1 doc: SCHEMA {schema}");
+            let args: Vec<&str> = command.split_whitespace().collect();
+            assert!(c.cmds(&args).is_ok(), "{command}");
+        };
+        let write = |c: &mut Conn, from: usize, to: usize| {
+            for i in from..to {
+                let key = format!("doc:{i}");
+                let vec = pack_f32(&[i as f32, 1.0]);
+                c.cmd(&[b"HSET", key.as_bytes(), b"vec", &vec, b"title", b"hello"]);
+            }
+        };
+        let flat = "vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC L2";
+        let mut indexes = vec!["late", "late_graph", "late_words"];
+        {
+            let mut c = Conn::connect(port);
+            if with_dump {
+                create(&mut c, "early", flat);
+                indexes.push("early");
+                assert!(!c.cmds(&["SAVE"]).is_error());
+            }
+            write(&mut c, 0, 10);
+            create(&mut c, "late", flat);
+            create(
+                &mut c,
+                "late_graph",
+                "vec VECTOR HNSW 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC L2",
+            );
+            create(&mut c, "late_words", "title TEXT");
+            write(&mut c, 10, 20);
+            assert_eq!(c.cmds(&["DEL", "doc:0", "doc:1", "doc:12"]).as_int(), 3);
+            assert!(c.cmds(&["SET", "doc:3", "x"]).is_ok());
+        }
+        let check = |port: u16, when: &str| {
+            let mut c = Conn::connect(port);
+            for index in &indexes {
+                let info = c.cmds(&["FT.INFO", index]);
+                let info = info.as_array();
+                let at = info
+                    .iter()
+                    .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+                    .unwrap_or_else(|| panic!("no num_docs for {index}: {info:?}"));
+                assert_eq!(
+                    info[at + 1].as_int(),
+                    16,
+                    "{index}, {when}, dump: {with_dump}"
+                );
+            }
+            let query = pack_f32(&[0.0, 1.0]);
+            let found = c.cmd(&[
+                b"FT.SEARCH",
+                b"late",
+                b"*=>[KNN 100 @vec $q]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &query,
+                b"NOCONTENT",
+                b"DIALECT",
+                b"2",
+            ]);
+            assert_eq!(
+                found.as_array()[0].as_int(),
+                16,
+                "{when}, dump: {with_dump}"
+            );
+        };
+        check(port, "before a restart");
+        kill_server(&mut srv);
+
+        let port = free_port();
+        let mut srv = start_aof_server(port, &dir, &[]);
+        assert!(wait_for_server(port, Duration::from_secs(10)), "restart");
+        check(port, "replayed from the AOF");
+
+        send_shutdown_nosave(port);
+        let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `num_docs` is read off the documents an index holds (#590), so it is
+/// right after a restart only if the index is filled again with every
+/// document, an index of vectors alone too: replayed from the AOF, and
+/// loaded from the checkpoint's `dump.kdb`.
+#[test]
+fn num_docs_is_the_same_after_an_aof_replay_and_a_snapshot_load() {
+    let _serial = persist_serial();
+    let dir = temp_dir("num_docs");
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(wait_for_server(port, Duration::from_secs(10)), "start");
+    {
+        let mut c = Conn::connect(port);
+        for create in [
+            "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE graph ON HASH PREFIX 1 doc: SCHEMA vec VECTOR HNSW 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT",
+        ] {
+            let create: Vec<&str> = create.split_whitespace().collect();
+            assert!(c.cmds(&create).is_ok(), "{create:?}");
+        }
+        for i in 0..40 {
+            let key = format!("doc:{i}");
+            let vec = pack_f32(&[i as f32, 1.0]);
+            c.cmd(&[b"HSET", key.as_bytes(), b"vec", &vec, b"title", b"hello"]);
+        }
+        // Some leave, each its own way; a key outside the indexes comes.
+        for command in [
+            "DEL doc:0 doc:1 doc:2",
+            "SET doc:3 x",
+            "RENAME doc:4 away:4",
+            "HDEL doc:5 vec title",
+            "HSET other:1 title hello",
+        ] {
+            let args: Vec<&str> = command.split_whitespace().collect();
+            assert!(!c.cmds(&args).is_error(), "{command}");
+        }
+    }
+    let check = |port: u16, when: &str| {
+        let mut c = Conn::connect(port);
+        for index in ["vectors", "graph", "words"] {
+            let info = c.cmds(&["FT.INFO", index]);
+            let info = info.as_array();
+            let at = info
+                .iter()
+                .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+                .unwrap_or_else(|| panic!("no num_docs for {index}: {info:?}"));
+            assert_eq!(info[at + 1].as_int(), 34, "{index}, {when}");
+        }
+    };
+    check(port, "before a restart");
+    kill_server(&mut srv);
+
+    // Replayed from the AOF.
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(wait_for_server(port, Duration::from_secs(10)), "restart");
+    check(port, "replayed from the AOF");
+
+    // Loaded from the checkpoint's dump.kdb.
+    let mut c = Conn::connect(port);
+    assert!(!c.cmds(&["BGREWRITEAOF"]).is_error());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while c
+        .cmds(&["INFO", "persistence"])
+        .as_str()
+        .contains("aof_rewrite_in_progress:1")
+    {
+        assert!(Instant::now() < deadline, "the rewrite did not finish");
+        thread::sleep(Duration::from_millis(50));
+    }
+    while !dir.join("dump.kdb").exists() {
+        assert!(Instant::now() < deadline, "the rewrite left no dump.kdb");
+        thread::sleep(Duration::from_millis(50));
+    }
+    kill_server(&mut srv);
+    let port = free_port();
+    let mut srv = start_aof_server(port, &dir, &[]);
+    assert!(wait_for_server(port, Duration::from_secs(10)), "restart");
+    check(port, "loaded from dump.kdb");
+
+    send_shutdown_nosave(port);
+    let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

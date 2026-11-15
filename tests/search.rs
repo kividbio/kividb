@@ -2718,6 +2718,137 @@ fn a_cursor_reads_an_aggregation_a_few_rows_at_a_time() {
     }
 }
 
+/// A cursor is found by the index's name and by an alias of it, whichever
+/// the aggregation was run by. It was found only by the name the cursor was
+/// opened with (#567).
+#[test]
+fn a_cursor_is_found_through_an_alias() {
+    let mut c = conn();
+    movies(&mut c, "a5", "a5:");
+    assert!(c.cmd(&["FT.ALIASADD", "a5al", "a5"]).ok());
+    let open = |c: &mut Conn, index: &str| -> String {
+        let reply = c.cmd(&[
+            "FT.AGGREGATE",
+            index,
+            "*",
+            "LOAD",
+            "1",
+            "@title",
+            "WITHCURSOR",
+            "COUNT",
+            "1",
+        ]);
+        let cursor = reply.arr()[1].i();
+        assert!(cursor > 0, "{reply:?}");
+        cursor.to_string()
+    };
+    for (opened_by, read_by) in [("a5al", "a5"), ("a5", "a5al"), ("a5al", "a5al")] {
+        let cursor = open(&mut c, opened_by);
+        let reply = c.cmd(&["FT.CURSOR", "READ", read_by, &cursor, "COUNT", "1"]);
+        assert!(!reply.is_err_reply(), "{opened_by} {read_by}: {reply:?}");
+        assert_eq!(reply.arr()[1].i().to_string(), cursor);
+        assert!(
+            c.cmd(&["FT.CURSOR", "DEL", read_by, &cursor]).ok(),
+            "{opened_by} {read_by}"
+        );
+    }
+}
+
+/// `FT.CONFIG HELP` describes every setting, in RediSearch's words. The
+/// descriptions were all empty (#567).
+#[test]
+fn the_query_engine_settings_are_described() {
+    let mut c = conn();
+    let reply = c.cmd(&["FT.CONFIG", "HELP", "TIMEOUT"]);
+    let entry = reply.arr()[0].arr();
+    assert_eq!(entry[0].s(), "TIMEOUT");
+    assert_eq!(entry[1].s(), "Description");
+    assert_eq!(entry[2].s(), "Query (search) timeout");
+    assert_eq!(entry[3].s(), "Value");
+    let all = c.cmd(&["FT.CONFIG", "HELP", "*"]);
+    assert!(all.arr().len() > 10);
+    for entry in all.arr() {
+        let entry = entry.arr();
+        assert!(
+            !entry[2].s().is_empty(),
+            "{} has no description",
+            entry[0].s()
+        );
+    }
+    // Byte for byte, the words RediSearch's C source runs together too
+    // (#583).
+    for (name, run_together) in [
+        ("UNION_ITERATOR_HEAP", "the iterator willswitch to heap"),
+        ("MULTI_TEXT_SLOP", "multi text values.Can control"),
+        (
+            "BM25STD_TANH_FACTOR",
+            "BM25STD scorer.The default value is 4.",
+        ),
+    ] {
+        let reply = c.cmd(&["FT.CONFIG", "HELP", name]);
+        let text = reply.arr()[0].arr()[2].s().to_string();
+        assert!(text.contains(run_together), "{name}: {text}");
+    }
+}
+
+/// `FT.SPELLCHECK` writes a small score as RediSearch does, in scientific
+/// notation (1 document of 1024 is `9.765625e-4`), divides by every
+/// document of the index, including those with no word near the query,
+/// and answers RESP3 with RediSearch's maps and doubles (#583).
+#[test]
+fn spellcheck_scores_as_redisearch_writes_them() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "sp7",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "sp7:",
+            "SCHEMA",
+            "body",
+            "TEXT",
+        ])
+        .ok()
+    );
+    c.cmd(&["HSET", "sp7:0", "body", "zebra"]);
+    for i in 1..1024 {
+        c.cmd(&["HSET", &format!("sp7:{i}"), "body", "plain"]);
+    }
+    // A document with no TEXT value counts too.
+    c.cmd(&["HSET", "sp7:none", "other", "x"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let reply = c.cmd(&["FT.SPELLCHECK", "sp7", "zebrb"]);
+    let term = reply.arr()[0].arr();
+    assert_eq!(term[0].s(), "TERM");
+    assert_eq!(term[1].s(), "zebrb");
+    let suggestion = term[2].arr()[0].arr();
+    assert_eq!(suggestion[0].s(), "9.75609756097561e-4", "{reply:?}");
+    assert_eq!(suggestion[1].s(), "zebra");
+
+    c.cmd(&["DEL", "sp7:none"]);
+    let reply = c.cmd(&["FT.SPELLCHECK", "sp7", "zebrb"]);
+    let suggestion = reply.arr()[0].arr()[2].arr()[0].arr().to_vec();
+    assert_eq!(suggestion[0].s(), "9.765625e-4", "{reply:?}");
+
+    let mut c3 = conn();
+    assert!(matches!(c3.cmd(&["HELLO", "3"]), V::Map(_)));
+    let reply = c3.cmd(&["FT.SPELLCHECK", "sp7", "zebrb plain"]);
+    let V::Map(results) = reply.get("results") else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(results.len(), 1, "{reply:?}");
+    assert_eq!(results[0].0.s(), "zebrb");
+    let V::Map(entry) = &results[0].1.arr()[0] else {
+        panic!("{reply:?}");
+    };
+    assert_eq!(entry[0].0.s(), "zebra");
+    assert_eq!(entry[0].1, V::Double(1.0 / 1024.0));
+}
+
 /// `FT.EXPLAIN` echoed the query back; `FT.PROFILE` returned an empty array.
 #[test]
 fn explain_and_profile_describe_the_query() {
@@ -3446,6 +3577,103 @@ fn a_filtered_knn_keeps_on_timeout_whichever_way_it_is_answered() {
             matches!(&reply, V::Err(e) if e.contains("Timeout limit was reached")),
             "{name} (RESP{resp}): {reply:?}"
         );
+    }
+}
+
+/// FT.HYBRID's `TIMEOUT` under each `ON_TIMEOUT`, as Redis 8.10.2 answers:
+/// `return` and `return_strict` reply with what was found and a warning
+/// naming the part cut short, and `fail` with an error. Documents are loaded
+/// until a 1 ms query is cut short, then four times as many again.
+#[test]
+fn hybrid_search_keeps_on_timeout() {
+    let _one = timeout_test();
+    let mut c = own_conn();
+    assert!(matches!(c.cmd(&["HELLO", "3"]), V::Map(_)));
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "hyt",
+            "PREFIX",
+            "1",
+            "hyt:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+        ])
+        .ok()
+    );
+    // `AAAAAAAA` is eight bytes: two FLOAT32s.
+    let hybrid = |c: &mut Conn, timeout: &str| -> V {
+        c.cmd(&[
+            "FT.HYBRID",
+            "hyt",
+            "SEARCH",
+            "hello",
+            "VSIM",
+            "@v",
+            "$b",
+            "PARAMS",
+            "2",
+            "b",
+            "AAAAAAAA",
+            "TIMEOUT",
+            timeout,
+        ])
+    };
+    let cut_short = |reply: &V| -> bool {
+        reply
+            .get("warnings")
+            .arr()
+            .iter()
+            .any(|w| w.s() == "Timeout limit was reached (SEARCH)")
+    };
+
+    let mut n = 0usize;
+    let mut timed_out = false;
+    while n < 200_000 {
+        hset_many(&mut c, "hyt:", n, 8_000);
+        n += 8_000;
+        let mut late = || cut_short(&hybrid(&mut c, "1"));
+        if late() && late() {
+            timed_out = true;
+            break;
+        }
+    }
+    assert!(timed_out, "TIMEOUT 1 still finished after {n} documents");
+    hset_many(&mut c, "hyt:", n, 4 * n);
+
+    // No limit: no warning, a full page.
+    let all = hybrid(&mut c, "0");
+    assert!(all.get("warnings").arr().is_empty(), "{all:?}");
+    assert_eq!(all.get("results").arr().len(), 10, "{all:?}");
+
+    let mut replies = Vec::new();
+    for mode in ["return", "return_strict", "fail"] {
+        assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", mode]).ok());
+        replies.push((mode, hybrid(&mut c, "1")));
+    }
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+    for (mode, reply) in replies {
+        if mode == "fail" {
+            assert_eq!(
+                reply.err(),
+                "SEARCH_TIMEOUT Timeout limit was reached",
+                "{mode}"
+            );
+        } else {
+            assert!(cut_short(&reply), "{mode}: {reply:?}");
+            assert!(reply.get("results").arr().len() <= 10, "{mode}: {reply:?}");
+        }
     }
 }
 
@@ -4257,4 +4485,126 @@ fn negative_document_scores_clamp_for_bm25_and_tfidf() {
     assert_eq!(tanh.iter().find(|(id, _)| id == "sn:m").unwrap().1, -1.0);
 
     c.cmd(&["FT.DROPINDEX", "sn", "DD"]);
+}
+
+/// A grouped aggregation reports how many groups there are, not how many
+/// are on the page: a client pages through the groups by that number
+/// (redis-py's `AggregateResult.total`). It reported the page, 10 for a
+/// `LIMIT 0 10` over a thousand groups, where Redis 8.10 reports the
+/// thousand. Redis's total is the groups the last `GROUPBY` made, before
+/// `LIMIT` or `SORTBY ... MAX` cut them down.
+#[test]
+fn a_grouped_aggregation_reports_the_number_of_groups() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "gtot",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "gtot:",
+            "SCHEMA",
+            "f",
+            "NUMERIC",
+            "SORTABLE",
+        ])
+        .ok()
+    );
+    // 28 documents in 7 groups of 4.
+    for i in 0..28 {
+        c.cmd(&["HSET", &format!("gtot:{i}"), "f", &(i % 7).to_string()]);
+    }
+    let group = ["*", "GROUPBY", "1", "@f", "REDUCE", "COUNT", "0", "AS", "n"];
+    let run = |c: &mut Conn, tail: &[&str]| -> V {
+        let mut cmd = vec!["FT.AGGREGATE", "gtot"];
+        cmd.extend_from_slice(&group);
+        cmd.extend_from_slice(tail);
+        c.cmd(&cmd)
+    };
+    // (the clauses after the GROUPBY, the rows on the page); the total of
+    // every one of them is 7.
+    let cases: &[(&[&str], usize)] = &[
+        (&[], 7),
+        (&["LIMIT", "0", "3"], 3),
+        (&["LIMIT", "2", "3"], 3),
+        (&["LIMIT", "0", "0"], 0),
+        (&["LIMIT", "50", "3"], 0),
+        (&["LIMIT", "0", "100"], 7),
+        (&["SORTBY", "2", "@n", "DESC", "MAX", "3"], 3),
+        (
+            &["SORTBY", "2", "@n", "DESC", "MAX", "3", "LIMIT", "1", "1"],
+            1,
+        ),
+        (&["APPLY", "@n*2", "AS", "d", "LIMIT", "0", "2"], 2),
+        (
+            &["LIMIT", "0", "3", "SORTBY", "2", "@n", "DESC", "MAX", "2"],
+            2,
+        ),
+    ];
+    let mut c3 = conn();
+    assert!(matches!(c3.cmd(&["HELLO", "3"]), V::Map(_)));
+    for (tail, page) in cases {
+        let reply = run(&mut c, tail);
+        assert_eq!(reply.arr()[0].i(), 7, "RESP2 {tail:?}");
+        assert_eq!(reply.arr().len() - 1, *page, "RESP2 page {tail:?}");
+        let reply = run(&mut c3, tail);
+        assert_eq!(reply.get("total_results").i(), 7, "RESP3 {tail:?}");
+        assert_eq!(
+            reply.get("results").arr().len(),
+            *page,
+            "RESP3 page {tail:?}"
+        );
+    }
+
+    // A later GROUPBY counts its own groups: one, here.
+    let reply = run(
+        &mut c,
+        &[
+            "LIMIT", "0", "3", "GROUPBY", "0", "REDUCE", "COUNT", "0", "AS", "c",
+        ],
+    );
+    assert_eq!(reply.arr()[0].i(), 1);
+
+    // A FILTER after the GROUPBY and no LIMIT: the groups that pass (f is
+    // 5 and 6), which is what Redis reports. With a LIMIT Redis's total
+    // depends on how much it read and differs between RESP2 and RESP3, so it
+    // is left as it was: the page.
+    let reply = run(&mut c, &["FILTER", "@f>4"]);
+    assert_eq!(reply.arr()[0].i(), 2);
+
+    // No GROUPBY: unchanged, the rows of the page.
+    let reply = c3.cmd(&[
+        "FT.AGGREGATE",
+        "gtot",
+        "*",
+        "LOAD",
+        "1",
+        "@f",
+        "LIMIT",
+        "0",
+        "10",
+    ]);
+    assert_eq!(reply.get("total_results").i(), 10);
+
+    // `WITHCURSOR`: the groups with the first page, 0 with the pages after
+    // it, as Redis answers.
+    let reply = run(&mut c, &["WITHCURSOR", "COUNT", "3"]);
+    assert_eq!(reply.arr()[0].arr()[0].i(), 7);
+    assert_eq!(reply.arr()[0].arr().len() - 1, 3);
+    let cursor = reply.arr()[1].i().to_string();
+    let reply = c.cmd(&["FT.CURSOR", "READ", "gtot", &cursor, "COUNT", "3"]);
+    assert_eq!(reply.arr()[0].arr()[0].i(), 0);
+    assert_eq!(reply.arr()[0].arr().len() - 1, 3);
+    let cursor = reply.arr()[1].i().to_string();
+    let reply = c.cmd(&["FT.CURSOR", "READ", "gtot", &cursor, "COUNT", "3"]);
+    assert_eq!(reply.arr()[0].arr()[0].i(), 0);
+    assert_eq!(reply.arr()[0].arr().len() - 1, 1);
+    assert_eq!(reply.arr()[1].i(), 0);
+    let reply = run(&mut c, &["LIMIT", "0", "2", "WITHCURSOR", "COUNT", "3"]);
+    assert_eq!(reply.arr()[0].arr()[0].i(), 7);
+    assert_eq!(reply.arr()[0].arr().len() - 1, 2);
+
+    c.cmd(&["FT.DROPINDEX", "gtot", "DD"]);
 }

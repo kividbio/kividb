@@ -35,9 +35,9 @@ pip install "litellm[proxy,caching]"
 ```yaml
 # config.yaml
 model_list:
-  - model_name: gpt-4o-mini
+  - model_name: gpt-6-luna
     litellm_params:
-      model: openai/gpt-4o-mini
+      model: openai/gpt-6-luna
       api_key: os.environ/OPENAI_API_KEY
 
 router_settings:
@@ -66,7 +66,7 @@ import litellm
 from litellm.caching.caching import Cache
 
 litellm.cache = Cache(type="redis", host="localhost", port="6380")
-response = litellm.completion(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}], caching=True)
+response = litellm.completion(model="openai/gpt-6-luna", messages=[{"role": "user", "content": "hi"}], caching=True)
 ```
 
 ## What to know

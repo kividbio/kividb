@@ -297,6 +297,30 @@ fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(rest.try_into().ok()?))
 }
 
+// ── Vector set quantization in the log ───────────────────────────────────────
+
+/// Follows a `VADD` whose options were kept; 1.2 skips it as unknown.
+pub(crate) const VSET_QUANT_MARKER: &[u8] = b"*1\r\n$21\r\nKIVIDB.AOF-VSET-QUANT\r\n";
+
+/// The marker's one argument: clients cannot send it.
+const VSET_QUANT_MARKER_NAME: &[u8] = b"KIVIDB.AOF-VSET-QUANT";
+
+fn is_vset_quant_marker(cmd: &[Vec<u8>]) -> bool {
+    matches!(cmd, [name] if name.as_slice() == VSET_QUANT_MARKER_NAME)
+}
+
+/// Whether a stream payload ends with a `VADD` that needs the marker.
+pub(crate) fn needs_vset_quant_marker(payload: &[u8]) -> bool {
+    // Most payloads are no `VADD`: not parsed.
+    if !payload.windows(4).any(|w| w.eq_ignore_ascii_case(b"VADD")) {
+        return false;
+    }
+    parse_aof_commands(payload)
+        .0
+        .last()
+        .is_some_and(|cmd| crate::vector::quant::carries_quant_option(cmd))
+}
+
 // ── Written before it is acknowledged ────────────────────────────────────────
 //
 // A write was acknowledged as soon as its record was queued for the writer:
@@ -895,12 +919,32 @@ pub fn acks_wait() -> bool {
 /// Whether a command may write a record its reply should wait for: a write,
 /// or a script or a transaction that may make some.
 #[inline]
-pub fn may_log(name: &[u8]) -> bool {
-    crate::replication::is_write_command_bytes(name)
-        || name.eq_ignore_ascii_case(b"EVAL")
-        || name.eq_ignore_ascii_case(b"EVALSHA")
-        || name.eq_ignore_ascii_case(b"FCALL")
-        || name.eq_ignore_ascii_case(b"EXEC")
+pub fn may_log(cmd: &[&[u8]]) -> bool {
+    let Some(&cmd0) = cmd.first() else {
+        return false;
+    };
+    // A write by name, the most of them, is told by its name alone.
+    if crate::replication::is_write_command_bytes(cmd0) {
+        return true;
+    }
+    // The rest, told apart by length first: most commands are none of them.
+    let is = |name: &str| cmd0.eq_ignore_ascii_case(name.as_bytes());
+    // Writes only with some arguments (`GEORADIUS ... STORE`, `MIGRATE`,
+    // `FUNCTION LOAD`): judged by them, so the reply waits for the record
+    // like any other write's.
+    let by_arguments =
+        |name: &str| is(name) && crate::replication::command_mutates_for_replication(name, cmd);
+    // EVAL, EVALSHA, FCALL and EXEC may write from what they run.
+    match cmd0.len() {
+        4 => is("EVAL") || is("EXEC"),
+        5 => is("FCALL"),
+        6 => by_arguments("SCRIPT"),
+        7 => is("EVALSHA") || by_arguments("MIGRATE"),
+        8 => by_arguments("FUNCTION"),
+        9 => by_arguments("GEORADIUS"),
+        17 => by_arguments("GEORADIUSBYMEMBER"),
+        _ => false,
+    }
 }
 
 /// How long a reply to a write waits for its records to reach the file
@@ -1703,6 +1747,12 @@ fn sync_for_replies() {
     }
     match file {
         Some(Ok(file)) => {
+            // A test holds the sync for these replies here: only here, not
+            // in the second's sync (`do_fsync`), which answers no reply. Held
+            // there too, a tick that came first took the hit the test
+            // waited for, and the replies' sync then waited at the next one,
+            // which the test never let go of (#515).
+            failpoint("aof-fsync-before-reply");
             sync_before_reply(&file);
             AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
         }
@@ -1719,7 +1769,6 @@ fn sync_for_replies() {
 /// new log whose name may not be. A sync that fails ends the server, as in
 /// Redis: it can neither reply nor keep the promise.
 fn sync_before_reply(file: &std::fs::File) {
-    failpoint("aof-fsync-before-reply");
     let synced = (|| {
         if OLD_LOG_UNSYNCED.load(Ordering::Acquire) != 0 {
             sync_old_log()?;
@@ -1766,6 +1815,8 @@ fn do_fsync() {
     if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
+    // A test holds the sync here, as a slow disk would: `WAITAOF` waits.
+    failpoint("fsync");
     // Under `appendfsync always`, a sync that fails stops the server, here
     // as for a reply: logged and passed over, its error would be gone for
     // the next sync, which would answer replies with their writes lost.
@@ -1997,12 +2048,7 @@ fn checkpoint_inner(
         );
     }
 
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp_path = format!(
-        "dump.kdb.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let tmp_path = temp_dump_name();
     let written = frozen
         .write_file(&tmp_path)
         .and_then(|()| install_dump(&tmp_path, generation, !aof_on));
@@ -2127,6 +2173,63 @@ fn logs_as_saved() -> std::io::Result<LogsAtSave> {
         }
     }
     logs_on_disk()
+}
+
+/// The name a dump is written under before [`install_dump`] puts it in
+/// place, `dump.kdb.<pid>.<n>.tmp`: one of its own for each writer, since a
+/// checkpoint and a save with the AOF off can overlap, and two writing one
+/// file would interleave.
+pub(crate) fn temp_dump_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "dump.kdb.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Whether `name` is one of [`temp_dump_name`]'s, of any process.
+fn is_temp_dump(name: &str) -> bool {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("dump.kdb.")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(pid, n)| number(pid) && number(n))
+}
+
+/// Remove the dumps that saves cut short (a kill -9, the OOM killer, a
+/// Kubernetes liveness probe) left in the data directory, naming each in
+/// the log. Each is as big as the dataset, and nothing reads it: recovery
+/// goes by `dump.kdb` and the save number beside it. Left there, each crash
+/// during a save added one, until the volume was full (#545).
+///
+/// Only at start, by the process holding the data directory's lock, and
+/// before it saves anything: every such file is then another process's, one
+/// with this pid included, as every start in a container has the same.
+pub fn remove_cut_short_dumps() {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return;
+    };
+    let mut cut_short: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            is_temp_dump(&name).then(|| (name, entry.metadata().map_or(0, |meta| meta.len())))
+        })
+        .collect();
+    cut_short.sort();
+    for (name, len) in cut_short {
+        match std::fs::remove_file(&name) {
+            Ok(()) => log_warn!(
+                "Removed {name} ({len} bytes), the dump of a save that did not finish: nothing \
+                 reads it"
+            ),
+            Err(e) => log_warn!(
+                "Can't remove {name}, the dump of a save that did not finish ({e}): nothing \
+                 reads it, remove it by hand"
+            ),
+        }
+    }
 }
 
 /// Put the dump written to `tmp` in place as save number `generation`, with
@@ -2862,6 +2965,12 @@ fn classify_tail(rest: &[u8]) -> Tail {
 /// KiviDB.
 pub(crate) fn fatal_persistence(what: &str) -> ! {
     log_fatal!("{what}");
+    // Keys outside database 0 of a cluster node: the file is fine, the
+    // node cannot serve them (#484).
+    if what.contains(crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0) {
+        log_fatal!("{}.", crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+        std::process::exit(1);
+    }
     log_fatal!(
         "Refusing to start with an empty dataset in place of one that could not be \
          loaded. Fix the file (or its permissions), or move it out of the working directory \
@@ -3036,7 +3145,8 @@ pub fn replay_aof(
     };
 
     if let Some(image) = image {
-        let loaded = crate::snapshot::load_snapshot_bytes(image)?;
+        let loaded = crate::snapshot::load_snapshot_bytes(image)
+            .map_err(|e| crate::snapshot::refusal_of_file(e, "the AOF's preamble"))?;
         let crate::snapshot::LoadedSnapshot {
             dbs,
             index_schemas,
@@ -3060,7 +3170,12 @@ pub fn replay_aof(
 
     let _indexing = DeferIndexing::start();
 
-    for (cmd, live) in commands.into_iter().zip(live) {
+    let mut records = commands.into_iter().zip(live).peekable();
+    while let Some((cmd, live)) = records.next() {
+        // Read with the record before it, below.
+        if is_vset_quant_marker(&cmd) {
+            continue;
+        }
         // What is left of a transaction here is whole: its commands are
         // applied in order, and nothing runs beside a replay to see them
         // half done. Its `MULTI` and `EXEC` have nothing more to do.
@@ -3072,6 +3187,15 @@ pub fn replay_aof(
             continue;
         }
         stats.commands += 1;
+        // Without its marker, a `VADD` is 1.2's, which stored f32.
+        let marked = records
+            .peek()
+            .is_some_and(|(next, _)| is_vset_quant_marker(next));
+        let cmd = if marked {
+            cmd
+        } else {
+            crate::vector::quant::without_quant_options(cmd).0
+        };
         if env
             .apply_command(
                 cmd,
@@ -3474,9 +3598,10 @@ pub fn recover_local(
                     repl_state,
                     dump_loaded,
                 );
-                if recovery.index_names.is_empty() {
-                    recovery.index_names = names;
-                }
+                // Every index there is now, not the snapshot's alone: one
+                // created since the dump is in the log, and its documents
+                // are indexed by the walk after this as well.
+                recovery.index_names = names;
                 // Delta writes are not in the snapshot's HNSW graph: the
                 // backfill after this brings it up to date with the keys.
                 if dump_loaded {
@@ -3620,7 +3745,7 @@ fn preload(
         }
         // An index created during the backup window is in the replayed
         // commands, not in the base snapshot.
-        index_names = index_store.read().keys().cloned().collect();
+        index_names = crate::vector::index_names(index_store);
     }
     Ok(index_names)
 }
@@ -3728,7 +3853,7 @@ pub fn recover_from_aof(
         Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be loaded: {e}")),
     }
 
-    index_store.read().keys().cloned().collect()
+    crate::vector::index_names(index_store)
 }
 
 // ── Test hooks ───────────────────────────────────────────────────────────────
@@ -3762,9 +3887,13 @@ pub(crate) fn failpoint(name: &'static str) {
         return;
     }
     log_warn!("Test failpoint {path} reached — waiting for it to be removed");
-    while std::path::Path::new(&path).exists() {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // Off the runtime: a tokio worker held here for as long as a test likes
+    // must not take the polling of every other client with it.
+    crate::cluster::migration::off_the_runtime(|| {
+        while std::path::Path::new(&path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
 }
 
 /// Whether `KIVIDB_TEST_FAILPOINTS` names `name`. Read once.
@@ -3788,6 +3917,12 @@ fn failpoint_named(name: &str) -> bool {
 /// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
 /// [`failpoint`] is: whether it is to fail.
 fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// What a node did before, that a test has it do again, named in
+/// `KIVIDB_TEST_FAILPOINTS` as a [`failpoint`] is: whether it is to.
+pub(crate) fn test_behaves_as_before(name: &str) -> bool {
     failpoint_named(name)
 }
 
@@ -4471,6 +4606,244 @@ mod backlog_tests {
     }
 }
 
+/// Time series commands in an AOF: those written by 1.2.0, with what that
+/// version accepted and 1.2.1 refuses from a client (#565), a chunk size
+/// out of bounds, `IGNORE`, replayed rather than the series lost, and its
+/// `TS.INCRBY` records read as it read them; and 1.2.1's, replayed as they
+/// ran.
+#[cfg(test)]
+mod ts_option_replay_tests {
+    use super::past_deadline_replay_tests::{replayed, replayed_with_index};
+    use crate::store::ValueRef;
+
+    /// `TS.INCRBY` records as 1.2.0 wrote them, `TIMESTAMP <time>` at the
+    /// end, read as 1.2.0 read them: each sample at its time, the options
+    /// passed over, no trim to the retention, and the records after them
+    /// applied. A word before the time that takes it when read with the
+    /// rest changes nothing. A record of 1.2.1, behind its mark, is read
+    /// with its options and trims.
+    #[test]
+    fn incrby_records_of_1_2_0_are_read_as_1_2_0_read_them() {
+        let store = replayed(&[
+            vec!["TS.INCRBY", "a", "1", "LABELS", "x", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "a", "1", "TIMESTAMP", "50"],
+            vec!["TS.INCRBY", "b", "1", "RETENTION", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "c", "1", "ENCODING", "TIMESTAMP", "42"],
+            vec![
+                "TS.INCRBY",
+                "d",
+                "1",
+                "RETENTION",
+                "100",
+                "LABELS",
+                "x",
+                "y",
+                "z",
+                "TIMESTAMP",
+                "42",
+            ],
+            vec!["TS.INCRBY", "e", "1", "DUPLICATE_POLICY", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "f", "1", "LABELS", "a", "b", "TIMESTAMP", "42"],
+            // Read cleanly too, these were trimmed and given options.
+            vec!["TS.CREATE", "r", "RETENTION", "10"],
+            vec!["TS.INCRBY", "r", "1", "TIMESTAMP", "1"],
+            vec!["TS.INCRBY", "r", "1", "RETENTION", "10", "TIMESTAMP", "100"],
+            // 1.2.1's.
+            vec![
+                "TS.INCRBY",
+                "m",
+                "1",
+                "timestamp",
+                "5",
+                "RETENTION",
+                "10",
+                "LABELS",
+                "a",
+                "b",
+            ],
+            vec!["TS.INCRBY", "m", "1", "timestamp", "100"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let samples = |key: &str| {
+            series(key)
+                .samples
+                .iter()
+                .map(|(t, v)| (*t, *v))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(samples("a"), [(42, 1.0), (50, 2.0)]);
+        for key in ["a", "b", "c", "d", "e", "f"] {
+            let s = series(key);
+            assert!(s.labels.is_empty(), "{key}");
+            assert_eq!(s.retention, 0, "{key}");
+            assert_eq!(s.samples.get(&42), Some(&1.0), "{key}");
+        }
+        assert_eq!(samples("r"), [(1, 1.0), (100, 2.0)]);
+        let m = series("m");
+        assert_eq!(m.retention, 10);
+        assert_eq!(m.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(samples("m"), [(100, 2.0)]);
+    }
+
+    /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
+    /// `TS.INCRBY` as the feed writes it, with a word left over from
+    /// `LABELS`: replayed as they ran.
+    /// A time above `i64::MAX`, which 1.2.0 took: in its log as given
+    /// (`TS.ADD`, `TS.MADD`), or, from `TS.INCRBY`, as the negative number
+    /// it replied. Replayed, each sample at the time 1.2.0 kept (#592).
+    #[test]
+    fn times_above_i64_max_of_1_2_0_replay() {
+        let max = u64::MAX.to_string();
+        let below = (u64::MAX - 1).to_string();
+        let store = replayed(&[
+            vec!["TS.ADD", "h", below.as_str(), "1"],
+            vec!["TS.MADD", "h", max.as_str(), "2"],
+            vec!["TS.INCRBY", "i", "1", "TIMESTAMP", "-1"],
+        ]);
+        let samples = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner
+                    .read()
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (*t, *v))
+                    .collect::<Vec<_>>(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert_eq!(samples("h"), [(u64::MAX - 1, 1.0), (u64::MAX, 2.0)]);
+        assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
+    }
+
+    /// A compaction's destination past its time (its `DEL` not yet in the
+    /// log), deleted, made again and given its source again; and a source
+    /// renamed. Replayed, the links are as the master had them (#593).
+    #[test]
+    fn compaction_links_replay_as_they_ran() {
+        let store = replayed(&[
+            vec!["TS.CREATE", "s"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "1", "1"],
+            vec!["PEXPIREAT", "d", "1"],
+            vec!["TS.ADD", "s", "15", "1"],
+            vec!["DEL", "d"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "25", "1"],
+            vec!["RENAME", "s", "s2"],
+            vec!["TS.ADD", "s2", "35", "1"],
+            // A destination renamed onto another of its source's.
+            vec!["TS.CREATE", "w"],
+            vec!["TS.CREATE", "a"],
+            vec!["TS.CREATE", "b"],
+            vec!["TS.CREATERULE", "w", "a", "AGGREGATION", "sum", "10"],
+            vec!["TS.CREATERULE", "w", "b", "AGGREGATION", "sum", "10"],
+            vec!["RENAME", "a", "b"],
+            vec!["TS.ADD", "w", "1", "1"],
+            vec!["TS.ADD", "w", "15", "1"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let s = series("s2");
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].dest_key, "d");
+        let d = series("d");
+        assert_eq!(d.source.as_deref(), Some("s2"));
+        assert_eq!(
+            d.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
+            [(10, 1.0), (20, 1.0)]
+        );
+        let w = series("w");
+        assert_eq!(w.rules.len(), 1);
+        assert_eq!(w.rules[0].dest_key, "b");
+        assert_eq!(series("b").source.as_deref(), Some("w"));
+        assert_eq!(series("b").samples.get(&0), Some(&1.0));
+    }
+
+    #[test]
+    fn options_replay_as_they_ran() {
+        let (store, index) = replayed_with_index(&[
+            vec!["TS.CREATE", "k", "LABELS", "a", "b"],
+            vec!["TS.ALTER", "k", "LABELS"],
+            vec!["TS.CREATE", "d", "DUPLICATE_POLICY", "BLOCK"],
+            vec!["TS.ADD", "d", "1", "1"],
+            vec!["TS.ADD", "d", "1", "5", "ON_DUPLICATE", "SUM"],
+            vec!["TS.INCRBY", "c", "2", "timestamp", "9", "LABELS", "x"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert!(series("k").labels.is_empty());
+        let indexed = |entry: &str| {
+            crate::read_lock!(index)
+                .get(entry)
+                .is_some_and(|keys| !keys.is_empty())
+        };
+        assert!(!indexed("a=b"));
+        let d = series("d");
+        assert_eq!(d.samples.get(&1), Some(&6.0));
+        assert_eq!(d.duplicate_policy, crate::types::DuplicatePolicy::Block);
+        let c = series("c");
+        assert_eq!(c.samples.get(&9), Some(&2.0));
+        assert!(c.labels.is_empty());
+    }
+
+    #[test]
+    fn words_an_older_version_passed_over_are_passed_over_again() {
+        let store = replayed(&[
+            vec![
+                "TS.CREATE",
+                "k",
+                "RETENTION",
+                "5000",
+                "FOO",
+                "LABELS",
+                "a",
+                "b",
+            ],
+            vec!["TS.ALTER", "k", "CHUNK", "SIZE", "100"],
+            vec!["TS.INCRBY", "c", "1", "BOGUS", "TIMESTAMP", "7"],
+            vec!["TS.ADD", "k", "10", "1.5", "IGNORE", "5", "0.5"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let k = series("k");
+        assert_eq!(k.retention, 5000);
+        assert_eq!(k.chunk_size, 100);
+        assert_eq!(k.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(k.samples.get(&10), Some(&1.5));
+        let c = series("c");
+        assert_eq!(c.samples.get(&7), Some(&1.0));
+    }
+}
+
 /// A deadline the log gave a key, or a hash field, and the writes made to
 /// it after that while it lived: replayed once the deadline has passed.
 #[cfg(test)]
@@ -4485,7 +4858,14 @@ mod past_deadline_replay_tests {
     }
 
     /// `records`, written to an AOF and replayed into a new store.
-    fn replayed(records: &[Vec<&str>]) -> Store {
+    pub(super) fn replayed(records: &[Vec<&str>]) -> Store {
+        replayed_with_index(records).0
+    }
+
+    /// [`replayed`], and the time series label index the replay built.
+    pub(super) fn replayed_with_index(
+        records: &[Vec<&str>],
+    ) -> (Store, crate::store::SharedTsIndex) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("appendonly.aof");
         let log: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
@@ -4512,7 +4892,7 @@ mod past_deadline_replay_tests {
         )
         .expect("replay");
         assert_eq!(stats.errors, 0, "every record applied");
-        store
+        (store, ts_index)
     }
 
     fn expires(store: &Store, key: &str) -> Option<u64> {
@@ -4700,7 +5080,7 @@ mod past_deadline_replay_tests {
             .insert("g".to_string(), std::sync::Arc::from(&b"5"[..]));
         inner
             .expiries
-            .insert("g".to_string(), std::time::Instant::now());
+            .insert("g".to_string(), crate::types::field_now() - 1);
         {
             let _replay = crate::expiry::replay();
             assert!(!inner.is_field_expired("g"));
@@ -4723,5 +5103,352 @@ mod past_deadline_replay_tests {
         ]);
         assert_eq!(expires(&store, "h"), None);
         assert_eq!(hash_fields(&store, "h"), ["f1"]);
+    }
+}
+
+#[cfg(test)]
+mod may_log_tests {
+    use super::may_log;
+
+    fn logs(cmd: &[&str]) -> bool {
+        let cmd: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+        may_log(&cmd)
+    }
+
+    /// A reply waits for the AOF for a write by name, a script or a
+    /// transaction, and a write by argument only with the arguments that
+    /// write; never for a read.
+    #[test]
+    fn writes_are_told_by_name_or_by_their_arguments() {
+        for write in [
+            &["SET", "k", "v"][..],
+            &["incr", "k"],
+            &["eval", "return 1", "0"],
+            &["EVALSHA", "x", "0"],
+            &["fcall", "f", "0"],
+            &["EXEC"],
+            &["GEORADIUS", "k", "15", "37", "200", "km", "STORE", "d"],
+            &["georadiusbymember", "k", "m", "200", "km", "storedist", "d"],
+            &["MIGRATE", "h", "1", "k", "0", "100"],
+            &["SCRIPT", "LOAD", "return 1"],
+            &["FUNCTION", "FLUSH"],
+        ] {
+            assert!(logs(write), "{write:?}");
+        }
+        for read in [
+            &["GET", "k"][..],
+            &["PING"],
+            &["GEORADIUS", "k", "15", "37", "200", "km"],
+            &["GEORADIUSBYMEMBER", "k", "store", "200", "km"],
+            &["FUNCTION", "LIST"],
+            &["SCRIPT", "EXISTS", "x"],
+            &["EVAL_RO", "return 1", "0"],
+        ] {
+            assert!(!logs(read), "{read:?}");
+        }
+    }
+}
+
+/// A marker keeps its own `VADD`'s options; unmarked ones replay as 1.2.
+#[cfg(test)]
+mod vset_quant_marker_tests {
+    use super::*;
+    use crate::store::{Store, ValueRef};
+    use crate::vector::quant::{Quant, StoredVector};
+
+    fn record(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    fn vadd_e(key: &str, element: &str, option: &str) -> Vec<u8> {
+        let mut parts = vec!["VADD", key, "VALUES", "3", "3", "-4", "0.5", element];
+        if !option.is_empty() {
+            parts.push(option);
+        }
+        record(&parts)
+    }
+
+    fn vadd(key: &str, option: &str) -> Vec<u8> {
+        vadd_e(key, "e", option)
+    }
+
+    const M: &[u8] = VSET_QUANT_MARKER;
+
+    /// `log` replayed into a new store.
+    fn replay(log: &[u8]) -> (Store, ReplayStats) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        std::fs::write(&path, log).expect("write");
+        let store = crate::store::new_store(1);
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let stats = replay_aof(
+            &path.to_string_lossy(),
+            &store,
+            &crate::vector::new_index_store(),
+            &crate::vector::new_dict_store(),
+            &std::sync::Arc::new(crate::wait_table::WaitTable::new()),
+            &crate::store::new_ts_index(),
+            &std::sync::Arc::new(crate::config::Config::default()),
+            &compaction_tx,
+            &std::sync::Arc::new(crate::replication::ReplState::new_master()),
+            false,
+        )
+        .expect("replay");
+        (store, stats)
+    }
+
+    /// The set's quantization, whether it was asked for, and `element`'s storage.
+    fn set(store: &Store, key: &str, element: &str) -> Option<(Quant, bool, &'static str)> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.get(key.as_bytes()) {
+            Some(ValueRef::VectorSet(vs)) => {
+                let vs = vs.read();
+                let name = crate::key_bytes::KeyBytes::from(element.as_bytes());
+                let stored = match vs.entries.get(&name).map(|e| &e.vector) {
+                    Some(StoredVector::F32(_)) => "f32",
+                    Some(StoredVector::Q8 { .. }) => "int8",
+                    Some(StoredVector::Bin { .. }) => "bin",
+                    None => "none",
+                };
+                Some((vs.quant, vs.quant_chosen, stored))
+            }
+            _ => None,
+        }
+    }
+
+    fn quant(store: &Store, key: &str) -> Option<(Quant, bool)> {
+        set(store, key, "e").map(|(q, chosen, _)| (q, chosen))
+    }
+
+    fn delta(records: &[u8]) -> Vec<u8> {
+        let mut log = delta_header(7).to_vec();
+        log.extend_from_slice(records);
+        log
+    }
+
+    #[test]
+    fn the_marker_is_one_record_no_client_can_send() {
+        assert_eq!(
+            M,
+            crate::resp::write::encode_resp_command(&[VSET_QUANT_MARKER_NAME.to_vec()])
+        );
+        let (cmds, used) = parse_aof_commands(M);
+        assert_eq!(used, M.len());
+        assert!(is_vset_quant_marker(&cmds[0]));
+        assert!(!crate::commands::arity::is_known("KIVIDB.AOF-VSET-QUANT"));
+    }
+
+    #[test]
+    fn a_log_of_1_2_replays_as_1_2_stored_it() {
+        let records = [vadd("a", "Q8"), vadd("b", "BIN"), vadd("c", "NOQUANT")].concat();
+        for log in [records.clone(), delta(&records)] {
+            let (store, stats) = replay(&log);
+            assert_eq!((stats.errors, stats.commands), (0, 3));
+            for key in ["a", "b", "c"] {
+                assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_vadd_replays_as_asked() {
+        let records = [
+            vadd("a", "Q8"),
+            M.to_vec(),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(
+            (stats.errors, stats.commands),
+            (0, 3),
+            "a marker is no command"
+        );
+        assert_eq!(set(&store, "a", "e"), Some((Quant::Q8, true, "int8")));
+        assert_eq!(set(&store, "b", "e"), Some((Quant::Bin, true, "bin")));
+        assert_eq!(set(&store, "c", "e"), Some((Quant::F32, true, "f32")));
+    }
+
+    /// Only the record just before a marker is marked, and only a `VADD`.
+    #[test]
+    fn a_marker_never_reaches_past_its_own_record() {
+        let records = [
+            // At the start: nothing before it.
+            M.to_vec(),
+            vadd("first", "Q8"),
+            // 1.2's, then a 1.3 one after it.
+            vadd("old", "BIN"),
+            vadd("new", "BIN"),
+            M.to_vec(),
+            // After another command, or a `VADD` with no option.
+            record(&["SET", "s", "1"]),
+            M.to_vec(),
+            vadd("after_set", "Q8"),
+            vadd("plain", ""),
+            M.to_vec(),
+            vadd("after_plain", "Q8"),
+            // Two in a row mark one record.
+            vadd("twice", "Q8"),
+            M.to_vec(),
+            M.to_vec(),
+            vadd("after_twice", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for key in [
+            "first",
+            "old",
+            "after_set",
+            "plain",
+            "after_plain",
+            "after_twice",
+        ] {
+            assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+        }
+        assert_eq!(quant(&store, "new"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "twice"), Some((Quant::Q8, true)));
+    }
+
+    /// Cut while being written, the marker is dropped and its `VADD` replays as f32.
+    #[test]
+    fn a_torn_marker_leaves_its_vadd_f32() {
+        for option in ["Q8", "BIN", "NOQUANT"] {
+            for cut in [1, 10, M.len() - 1] {
+                let mut log = delta(&vadd("a", option));
+                let whole = log.len();
+                log.extend_from_slice(&M[..cut]);
+                let (store, stats) = replay(&log);
+                assert!(stats.truncated_tail, "{option} {cut}");
+                assert_eq!(stats.valid_len as usize, whole, "{option} {cut}");
+                assert_eq!(
+                    set(&store, "a", "e"),
+                    Some((Quant::F32, false, "f32")),
+                    "{option} {cut}"
+                );
+            }
+        }
+    }
+
+    /// A later `VADD` follows the set, marked or not: only creation reads the marker.
+    #[test]
+    fn a_later_vadd_follows_the_set() {
+        let records = [
+            vadd_e("q", "e", "Q8"),
+            M.to_vec(),
+            vadd_e("q", "unmarked", "Q8"),
+            vadd_e("q", "other", "BIN"),
+            vadd_e("q", "none", ""),
+            vadd_e("f", "e", "Q8"),
+            vadd_e("f", "marked", "Q8"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for element in ["e", "unmarked", "other", "none"] {
+            assert_eq!(
+                set(&store, "q", element),
+                Some((Quant::Q8, true, "int8")),
+                "{element}"
+            );
+        }
+        for element in ["e", "marked"] {
+            assert_eq!(
+                set(&store, "f", element),
+                Some((Quant::F32, false, "f32")),
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_inside_a_transaction() {
+        let records = [
+            record(&["MULTI"]),
+            vadd("a", "Q8"),
+            M.to_vec(),
+            record(&["SET", "s", "1"]),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            record(&["EXEC"]),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        assert_eq!(quant(&store, "a"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "b"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "c"), Some((Quant::F32, false)));
+
+        // Its `EXEC` never written: dropped whole, markers too.
+        let whole = delta(&vadd("x", "Q8"));
+        let mut log = whole.clone();
+        log.extend([record(&["MULTI"]), vadd("y", "Q8"), M.to_vec()].concat());
+        let (store, stats) = replay(&log);
+        assert!(stats.truncated_tail);
+        assert_eq!(stats.valid_len as usize, whole.len());
+        assert_eq!(quant(&store, "x"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "y"), None);
+    }
+
+    /// A flush skips the `VADD` before it; its marker reaches nothing further.
+    #[test]
+    fn a_flush_after_a_marked_vadd() {
+        let records = [
+            vadd("gone", "Q8"),
+            M.to_vec(),
+            record(&["FLUSHALL"]),
+            vadd("kept", "Q8"),
+            M.to_vec(),
+            vadd("unmarked", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(quant(&store, "gone"), None);
+        assert_eq!(quant(&store, "kept"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "unmarked"), Some((Quant::F32, false)));
+    }
+
+    /// The draft form, with an argument, marks nothing.
+    #[test]
+    fn a_marker_with_arguments_is_no_marker() {
+        let records = [
+            vadd("a", "Q8"),
+            record(&["KIVIDB.AOF-VSET-QUANT", "1"]),
+            vadd("b", "Q8"),
+        ]
+        .concat();
+        let (store, _) = replay(&delta(&records));
+        assert_eq!(quant(&store, "a"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "b"), Some((Quant::F32, false)));
+    }
+
+    /// What a backup increment adds after a stream payload.
+    #[test]
+    fn payloads_that_need_a_marker() {
+        let select = record(&["SELECT", "0"]);
+        for (payload, needs) in [
+            (vadd("a", "Q8"), true),
+            ([select.clone(), vadd("a", "bin")].concat(), true),
+            (vadd("a", "NOQUANT"), true),
+            (vadd("a", ""), false),
+            ([vadd("a", "Q8"), select.clone()].concat(), false),
+            (record(&["SET", "VADD", "Q8"]), false),
+            (record(&["VREM", "a", "Q8"]), false),
+        ] {
+            assert_eq!(
+                needs_vset_quant_marker(&payload),
+                needs,
+                "{}",
+                String::from_utf8_lossy(&payload)
+            );
+        }
     }
 }

@@ -141,6 +141,19 @@ impl KeyBytes {
         self.tag() != HEAP
     }
 
+    /// The bytes a [`KeyBytes`] of `bytes` would put on the heap: none when
+    /// [`new`](Self::new) keeps it inline, else the key's length (what
+    /// `MEMORY USAGE` counts for a copy of a key, without making one).
+    #[inline]
+    pub fn heap_bytes_of(bytes: &[u8]) -> usize {
+        let len = bytes.len();
+        if len <= INLINE || (len == SIZE && bytes[SIZE - 1] < HEAP) {
+            0
+        } else {
+            len
+        }
+    }
+
     /// The key as text, if it is UTF-8.
     #[inline]
     pub fn to_str(&self) -> Result<&str, std::str::Utf8Error> {
@@ -521,6 +534,8 @@ mod tests {
             let copy = held.clone();
             assert_eq!(copy.as_bytes(), &key[..]);
             assert_eq!(copy.is_inline(), held.is_inline());
+            let heap = if held.is_inline() { 0 } else { key.len() };
+            assert_eq!(KeyBytes::heap_bytes_of(&key), heap, "{key:?}");
             drop(held);
             assert_eq!(copy.as_bytes(), &key[..], "a clone outlives its original");
         }

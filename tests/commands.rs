@@ -227,6 +227,38 @@ fn debug_refuses_unknown_subcommands() {
 }
 
 #[test]
+fn debug_sleep_argument_errors() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let error = |reply: RespValue| match reply {
+        RespValue::Error(e) => e,
+        other => panic!("not an error: {other:?}"),
+    };
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP", "abc"])),
+        "ERR value is not a valid float"
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP"])),
+        "ERR unknown subcommand or wrong number of arguments for 'SLEEP'. Try DEBUG HELP."
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "sleep"])),
+        "ERR unknown subcommand or wrong number of arguments for 'sleep'. Try DEBUG HELP."
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP", "0", "1"])),
+        "ERR unknown subcommand or wrong number of arguments for 'SLEEP'. Try DEBUG HELP."
+    );
+    assert_eq!(
+        error(c.cmds(&["DEBUG", "SLEEP", "-1"])),
+        "ERR value is out of range"
+    );
+    assert!(c.cmds(&["DEBUG", "SLEEP", "0"]).is_ok());
+}
+
+#[test]
 fn debug_object_describes_the_key() {
     let port = free_port();
     start_server(port);
@@ -1085,7 +1117,10 @@ fn test_command_list_filterby_module_built_in() {
     assert!(names(&mut c, "timeseries").contains(&"ts.add".to_string()));
     let vset = names(&mut c, "vectorset");
     assert!(vset.contains(&"vadd".to_string()) && vset.contains(&"vsim".to_string()));
-    assert!(names(&mut c, "bf").is_empty());
+    // Redis 8's `bf` module: the probabilistic types.
+    let bf = names(&mut c, "bf");
+    assert!(bf.contains(&"bf.add".to_string()), "{bf:?}");
+    assert!(bf.iter().all(|n| n.starts_with("bf.")), "{bf:?}");
 }
 
 // COMMAND LIST FILTERBY ACLCAT returns commands in that category.
@@ -2438,6 +2473,35 @@ fn test_restore_of_a_huge_claimed_length_is_bad_data_not_a_crash() {
         matches!(&reply, RespValue::Error(e) if e == "ERR DUMP payload version or checksum are wrong"),
         "{reply:?}"
     );
+}
+
+/// On a node with cluster support disabled, `CLUSTER MYID`,
+/// `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `READONLY`, `READWRITE` and `ASKING`
+/// refuse, as in Redis. They answered (#563).
+#[test]
+fn cluster_commands_refuse_when_cluster_support_is_disabled() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for cmd in [
+        &["CLUSTER", "MYID"][..],
+        &["CLUSTER", "COUNTKEYSINSLOT", "0"],
+        &["CLUSTER", "GETKEYSINSLOT", "0", "1"],
+        &["CLUSTER", "ORPHANSLOTS"],
+        &["CLUSTER", "DROPORPHANS"],
+        &["READONLY"],
+        &["READWRITE"],
+        &["ASKING"],
+    ] {
+        let reply = c.cmds(cmd);
+        assert_eq!(
+            reply,
+            RespValue::Error("ERR This instance has cluster support disabled".into()),
+            "{cmd:?}"
+        );
+    }
+    // KEYSLOT still answers.
+    assert_eq!(c.cmds(&["CLUSTER", "KEYSLOT", "foo"]).as_int(), 12182);
 }
 
 // Without Lua, every script command says which build has it: BullMQ and

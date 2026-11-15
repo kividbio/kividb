@@ -391,8 +391,9 @@ fn test_wait_no_replicas() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    // WAIT 1 0 — wait for 1 replica, 0ms timeout
-    let r = c.cmds(&["WAIT", "1", "0"]);
+    // WAIT 1 100: no replica acknowledges; after the timeout, as in Redis,
+    // the answer is 0. (`WAIT 1 0` waits for ever.)
+    let r = c.cmds(&["WAIT", "1", "100"]);
     assert_eq!(r.as_int(), 0);
 }
 
@@ -1111,6 +1112,84 @@ fn test_watch_on_a_replica_sees_its_masters_writes() {
     assert_eq!(r.cmds(&["EXEC"]), RespValue::Nil);
 }
 
+/// A full sync replaces a replica's dataset: a WATCH on a key that was in
+/// the old one or is in the new one fails the EXEC, one on a key in neither
+/// does not, as in Redis (`touchAllWatchedKeysInDb`). The watches survived
+/// the full sync, and every EXEC ran (#673).
+#[test]
+fn a_full_sync_breaks_the_watches_on_a_replicas_keys() {
+    // The old dataset dropped before the new one loads, and kept until it
+    // has (`swapdb`).
+    for load in ["disabled", "swapdb"] {
+        full_sync_breaks_watches(load);
+    }
+}
+
+fn full_sync_breaks_watches(load: &str) {
+    let master_a = spawn_server(Config::default());
+    let master_b = spawn_server(Config::default());
+    let mut a = Conn::connect(master_a);
+    let mut b = Conn::connect(master_b);
+    for (k, v) in [("w", "a"), ("gone", "a"), ("same", "1")] {
+        assert!(a.cmds(&["SET", k, v]).is_ok());
+    }
+    for (k, v) in [("w", "b"), ("new", "b"), ("same", "1")] {
+        assert!(b.cmds(&["SET", k, v]).is_ok());
+    }
+    let replica = spawn_server(replica_of(master_a));
+    let mut r = Conn::connect(replica);
+    wait_link_up(&mut r);
+    assert!(
+        r.cmds(&["CONFIG", "SET", "repl-diskless-load", load])
+            .is_ok()
+    );
+    wait_until(
+        "the replica to have a's data",
+        Duration::from_secs(10),
+        || r.cmds(&["GET", "gone"]) == RespValue::Bulk(b"a".to_vec()),
+    );
+
+    let keys = ["w", "gone", "new", "same", "never"];
+    let mut watching: Vec<Conn> = keys
+        .iter()
+        .map(|k| {
+            let mut c = Conn::connect(replica);
+            assert!(c.cmds(&["WATCH", k]).is_ok());
+            assert!(c.cmds(&["MULTI"]).is_ok());
+            assert_eq!(c.cmds(&["PING"]), RespValue::SimpleStr("QUEUED".into()));
+            c
+        })
+        .collect();
+
+    // A full sync from another master.
+    assert!(
+        r.cmds(&["REPLICAOF", "127.0.0.1", &master_b.to_string()])
+            .is_ok()
+    );
+    wait_until(
+        "the replica to have b's data",
+        Duration::from_secs(20),
+        || {
+            let mut probe = Conn::connect(replica);
+            probe.cmds(&["GET", "new"]) == RespValue::Bulk(b"b".to_vec())
+                && probe.cmds(&["EXISTS", "gone"]) == RespValue::Int(0)
+        },
+    );
+
+    for (k, c) in keys.iter().zip(watching.iter_mut()) {
+        let got = c.cmds(&["EXEC"]);
+        if *k == "never" {
+            assert_eq!(
+                got,
+                RespValue::Array(vec![RespValue::SimpleStr("PONG".into())]),
+                "{load}: a watch on a key in neither dataset holds"
+            );
+        } else {
+            assert_eq!(got, RespValue::Nil, "{load}: the watch on {k} is broken");
+        }
+    }
+}
+
 /// A replica does not take replicas of its own. One that did sent its data
 /// once and nothing after, while the replica of it reported its link up
 /// (#144). It now says why, and the would-be replica's link stays down; a
@@ -1508,6 +1587,311 @@ fn test_previously_unpropagated_writes_reach_the_replica() {
     assert_eq!(replica.cmds(&["LLEN", "dst"]).as_int(), 1);
 }
 
+/// A blocking pop is sent to replicas and the AOF as the pop it made, as in
+/// Redis: `BLPOP` as `LPOP` of the key it took from, `BLMPOP` as `LPOP key
+/// count`, `BZPOPMIN` as `ZPOPMIN`, from a client that did not wait, one
+/// that did, one in a transaction and one in a script; and as nothing when
+/// it took nothing (#558). A `BLPOP k1 k2` that leaves `k1` to a client that
+/// has waited longer, and takes from `k2`, is sent as `LPOP k2`: sent as it
+/// was, the replica ran it on `k1`, and kept `k2`'s element for good.
+#[test]
+fn test_blocking_pops_are_sent_as_the_pop_they_made() {
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    let mut tap = attach_stream_reader(master_port);
+    let request = |args: &[&str]| {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+        }
+        out
+    };
+    let blocked = |master: &mut Conn| {
+        wait_until("the client is blocked", Duration::from_secs(10), || {
+            master
+                .cmds(&["INFO", "clients"])
+                .as_str()
+                .contains("blocked_clients:1")
+        })
+    };
+
+    assert_eq!(
+        master.cmds(&["RPUSH", "l1", "a", "b", "c", "d"]).as_int(),
+        4
+    );
+    assert_eq!(
+        master
+            .cmds(&["ZADD", "z", "1", "m1", "2", "m2", "3", "m3", "4", "m4"])
+            .as_int(),
+        4
+    );
+    master.cmds(&["BLPOP", "none", "l1", "0"]);
+    master.cmds(&["BRPOP", "l1", "0"]);
+    master.cmds(&["BLMPOP", "0", "2", "none", "l1", "LEFT", "COUNT", "5"]);
+    master.cmds(&["BZPOPMIN", "z", "0"]);
+    master.cmds(&["BZPOPMAX", "z", "0"]);
+    master.cmds(&["BZMPOP", "0", "1", "z", "MAX", "COUNT", "9"]);
+    assert_eq!(master.cmds(&["BLPOP", "none", "0.01"]), RespValue::Nil);
+
+    assert_eq!(master.cmds(&["RPUSH", "l2", "x"]).as_int(), 1);
+    // A transaction of more than one write is sent wrapped in MULTI/EXEC; its
+    // pop that took nothing is not sent.
+    assert!(master.cmds(&["MULTI"]).is_ok());
+    master.cmds(&["BLPOP", "l2", "0"]);
+    master.cmds(&["BLPOP", "l2", "0"]);
+    master.cmds(&["RPUSH", "l2", "y"]);
+    master.cmds(&["BLPOP", "l2", "0"]);
+    assert_eq!(master.cmds(&["EXEC"]).as_array().len(), 4);
+
+    // One that waits, and is given an element.
+    let mut waiter = Conn::connect(master_port);
+    waiter
+        .stream
+        .write_all(&request(&["BLPOP", "lw", "0"]))
+        .unwrap();
+    blocked(&mut master);
+    assert_eq!(master.cmds(&["RPUSH", "lw", "v"]).as_int(), 1);
+    assert_eq!(waiter.read_value().as_array().len(), 2);
+
+    // `k1`'s element belongs to the client blocked on it: a `BLPOP k1 k2`
+    // sent with the pushes takes `k2`'s, whether it runs before that client
+    // is woken or after.
+    let mut first = Conn::connect(master_port);
+    first
+        .stream
+        .write_all(&request(&["BLPOP", "k1", "0"]))
+        .unwrap();
+    blocked(&mut master);
+    let mut later = Conn::connect(master_port);
+    let mut batch = request(&["RPUSH", "k1", "a"]);
+    batch.extend(request(&["RPUSH", "k2", "b"]));
+    batch.extend(request(&["BLPOP", "k1", "k2", "0"]));
+    later.stream.write_all(&batch).unwrap();
+    assert_eq!(later.read_value().as_int(), 1);
+    assert_eq!(later.read_value().as_int(), 1);
+    let took = |reply: RespValue| {
+        reply
+            .as_array()
+            .iter()
+            .map(|part| part.as_str().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(took(later.read_value()), ["k2", "b"]);
+    assert_eq!(took(first.read_value()), ["k1", "a"]);
+
+    #[cfg(feature = "lua")]
+    {
+        // A script's pops are sent as the pops they made, in MULTI/EXEC, and
+        // the one that took nothing is not.
+        assert_eq!(master.cmds(&["RPUSH", "l3", "s", "t"]).as_int(), 2);
+        let reply = master.cmds(&[
+            "EVAL",
+            "local first = redis.call('BLPOP', KEYS[1], 0) \
+             redis.call('BRPOP', KEYS[1], 0) \
+             redis.call('BLPOP', KEYS[1], 0) \
+             return first",
+            "1",
+            "l3",
+        ]);
+        assert_eq!(took(reply), ["l3", "s"]);
+    }
+    assert!(master.cmds(&["SET", "end", "1"]).is_ok());
+
+    let mut seen = stream_until(&mut tap, |command| command.starts_with("SET end"));
+    // The pushes to `k1` and `k2` and the two pops are made by two clients at
+    // once. `first`, woken by the push to `k1`, may pop it before the push to
+    // `k2` is applied, or after; and either pop may be sent first. What must
+    // hold is that the two pushes are in the order they were sent, and each
+    // pop comes after the push it took from. Those four are then put in one
+    // order, to compare the rest.
+    let racing = ["RPUSH k1 a", "RPUSH k2 b", "LPOP k1", "LPOP k2"];
+    let from = seen
+        .iter()
+        .position(|command| command == "LPOP lw")
+        .map(|at| at + 1)
+        .filter(|from| from + racing.len() <= seen.len())
+        .unwrap_or_else(|| panic!("no pushes and pops of k1 and k2: {seen:?}"));
+    let window = &seen[from..from + racing.len()];
+    let at = |command: &str| {
+        window
+            .iter()
+            .position(|sent| sent == command)
+            .unwrap_or_else(|| panic!("{command} not sent with the others: {seen:?}"))
+    };
+    assert!(at("RPUSH k1 a") < at("RPUSH k2 b"), "{seen:?}");
+    assert!(at("RPUSH k1 a") < at("LPOP k1"), "{seen:?}");
+    assert!(at("RPUSH k2 b") < at("LPOP k2"), "{seen:?}");
+    for (sent, command) in seen[from..from + racing.len()].iter_mut().zip(racing) {
+        *sent = command.to_string();
+    }
+    let mut expected = vec![
+        "SELECT 0",
+        "RPUSH l1 a b c d",
+        "ZADD z 1 m1 2 m2 3 m3 4 m4",
+        "LPOP l1",
+        "RPOP l1",
+        "LPOP l1 2",
+        "ZPOPMIN z",
+        "ZPOPMAX z",
+        "ZPOPMAX z 2",
+        "RPUSH l2 x",
+        "MULTI",
+        "LPOP l2",
+        "RPUSH l2 y",
+        "LPOP l2",
+        "EXEC",
+        "RPUSH lw v",
+        "LPOP lw",
+        "RPUSH k1 a",
+        "RPUSH k2 b",
+        "LPOP k1",
+        "LPOP k2",
+    ];
+    if cfg!(feature = "lua") {
+        expected.extend(["RPUSH l3 s t", "MULTI", "LPOP l3", "RPOP l3", "EXEC"]);
+    }
+    expected.push("SET end 1");
+    assert_eq!(seen, expected);
+
+    // The replica holds what the master does, whatever order the stream
+    // had: every list and set popped empty, and the one key written last.
+    assert_eq!(master.cmds(&["WAIT", "1", "5000"]).as_int(), 1);
+    for key in ["l1", "l2", "l3", "lw", "k1", "k2", "z"] {
+        assert_eq!(master.cmds(&["EXISTS", key]).as_int(), 0, "{key}");
+        assert_eq!(replica.cmds(&["EXISTS", key]).as_int(), 0, "{key}");
+    }
+    assert_eq!(master.cmds(&["DBSIZE"]).as_int(), 1);
+    assert_eq!(replica.cmds(&["DBSIZE"]).as_int(), 1);
+    assert_eq!(replica.cmds(&["GET", "end"]).as_str(), "1");
+}
+
+/// Send `args` and read the one reply, whatever its RESP3 type. Returns the
+/// reply's first line.
+fn resp3_call(c: &mut Conn, args: &[&str]) -> String {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+    }
+    c.stream.write_all(&out).unwrap();
+    read_resp3(&mut c.reader)
+}
+
+fn read_resp3(r: &mut impl BufRead) -> String {
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    let head = line.trim_end().to_string();
+    let n = head
+        .get(1..)
+        .and_then(|n| n.parse::<i64>().ok())
+        .unwrap_or(0);
+    match head.as_bytes().first() {
+        Some(b'$' | b'=' | b'!') if n >= 0 => {
+            let mut body = vec![0u8; n as usize + 2];
+            r.read_exact(&mut body).unwrap();
+        }
+        Some(b'*' | b'~' | b'>') if n > 0 => {
+            for _ in 0..n {
+                read_resp3(r);
+            }
+        }
+        Some(b'%' | b'|') if n > 0 => {
+            for _ in 0..2 * n {
+                read_resp3(r);
+            }
+        }
+        _ => {}
+    }
+    head
+}
+
+/// A RESP3 client's writes reach replicas and the AOF as their effects, as
+/// a RESP2 client's do. `SPOP` with a count answers it with a set (`~`),
+/// which was not read: nothing was sent, and the replicas kept the members
+/// the master had popped. So from a script after `redis.setresp(3)`.
+#[test]
+fn test_a_resp3_client_s_writes_are_sent_as_their_effects() {
+    let master_port = spawn_server(Config::default());
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    let mut tap = attach_stream_reader(master_port);
+    let mut c = Conn::connect(master_port);
+    assert!(resp3_call(&mut c, &["HELLO", "3"]).starts_with('%'));
+
+    resp3_call(&mut c, &["SADD", "s", "a", "b", "c", "d", "e"]);
+    assert_eq!(resp3_call(&mut c, &["SPOP", "s", "2"]), "~2");
+    assert_eq!(resp3_call(&mut c, &["SPOP", "s"]), "$1");
+    assert_eq!(
+        resp3_call(&mut c, &["SPOP", "none", "2"]).as_bytes()[0],
+        b'~'
+    );
+    resp3_call(&mut c, &["RPUSH", "l", "a", "b"]);
+    resp3_call(&mut c, &["BLPOP", "l", "0"]);
+    resp3_call(&mut c, &["BLMOVE", "l", "l2", "LEFT", "RIGHT", "0"]);
+    resp3_call(&mut c, &["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    resp3_call(&mut c, &["BZPOPMIN", "z", "0"]);
+    resp3_call(&mut c, &["BZMPOP", "0", "1", "z", "MAX", "COUNT", "5"]);
+    resp3_call(&mut c, &["SET", "f", "1"]);
+    resp3_call(&mut c, &["INCRBYFLOAT", "f", "1.5"]);
+    #[cfg(feature = "lua")]
+    {
+        resp3_call(&mut c, &["SADD", "s2", "x", "y", "z"]);
+        let reply = resp3_call(
+            &mut c,
+            &[
+                "EVAL",
+                "redis.setresp(3) return redis.call('SPOP', KEYS[1], 2)",
+                "1",
+                "s2",
+            ],
+        );
+        assert!(!reply.starts_with('-'), "{reply}");
+    }
+    assert!(resp3_call(&mut c, &["SET", "end", "1"]).starts_with('+'));
+
+    let seen = stream_until(&mut tap, |command| command.starts_with("SET end"));
+    for sent in &seen {
+        let name = sent.split(' ').next().unwrap_or("");
+        assert!(
+            !matches!(
+                name,
+                "SPOP" | "BLPOP" | "BLMOVE" | "BZPOPMIN" | "BZMPOP" | "INCRBYFLOAT"
+            ),
+            "{sent} was sent as it was: {seen:?}"
+        );
+    }
+    let has = |prefix: &str| seen.iter().filter(|sent| sent.starts_with(prefix)).count();
+    assert_eq!(has("SREM s "), 2, "{seen:?}");
+    assert_eq!(has("LPOP l"), 1, "{seen:?}");
+    assert_eq!(has("LMOVE l l2 LEFT RIGHT"), 1, "{seen:?}");
+    assert_eq!(has("ZPOPMIN z"), 1, "{seen:?}");
+    assert_eq!(has("ZPOPMAX z 2"), 1, "{seen:?}");
+    assert_eq!(has("SET f 2.5 KEEPTTL"), 1, "{seen:?}");
+    if cfg!(feature = "lua") {
+        assert_eq!(has("SREM s2 "), 1, "{seen:?}");
+    }
+
+    // The replica holds what the master does.
+    let mut master = Conn::connect(master_port);
+    assert_eq!(master.cmds(&["WAIT", "1", "5000"]).as_int(), 1);
+    for key in ["s", "s2"] {
+        let members = |c: &mut Conn| {
+            let mut m: Vec<String> = c
+                .cmds(&["SMEMBERS", key])
+                .as_array()
+                .iter()
+                .map(|v| v.as_str().to_string())
+                .collect();
+            m.sort();
+            m
+        };
+        assert_eq!(members(&mut replica), members(&mut master), "{key}");
+    }
+}
+
 /// A replica attached while the master is taking non-idempotent writes must
 /// end up identical to it. The full-sync payload and the stream used to
 /// overlap — a write landing during the dump was in both — so `INCR` counters
@@ -1686,6 +2070,72 @@ fn test_full_resync_rebuilds_label_and_search_indexes() {
     );
 }
 
+/// `FT.INFO`'s `num_docs` is read off the documents an index holds (#590):
+/// on a replica, those the full resync brought and the index was filled
+/// with, then those its master's writes add and take away as it applies
+/// them. An index of vectors alone, which kept no list of its documents.
+#[test]
+fn num_docs_on_a_replica_follows_a_full_resync_and_the_writes_applied() {
+    let num_docs = |c: &mut Conn| {
+        let info = c.cmds(&["FT.INFO", "vectors"]);
+        let info = info.as_array();
+        let at = info
+            .iter()
+            .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+            .unwrap_or_else(|| panic!("no num_docs: {info:?}"));
+        info[at + 1].as_int()
+    };
+    let document = |c: &mut Conn, i: usize| {
+        let key = format!("doc:{i}");
+        let vec: Vec<u8> = [i as f32, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        c.cmd(&[b"HSET", key.as_bytes(), b"vec", &vec]);
+    };
+    let master_port = spawn_server(Config::default());
+    let mut master = Conn::connect(master_port);
+    let create = "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 \
+                  DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert!(master.cmds(&create).is_ok());
+    for i in 0..30 {
+        document(&mut master, i);
+    }
+
+    let replica_port = spawn_server(replica_of(master_port));
+    let mut replica = Conn::connect(replica_port);
+    wait_link_up(&mut replica);
+    wait_until("the resync's documents", Duration::from_secs(10), || {
+        num_docs(&mut replica) == 30
+    });
+
+    for i in 30..35 {
+        document(&mut master, i);
+    }
+    for command in [
+        "DEL doc:0 doc:1",
+        "SET doc:2 x",
+        "RENAME doc:3 away:3",
+        "PEXPIRE doc:4 1",
+        "HPEXPIRE doc:5 1 FIELDS 1 vec",
+        "HSET other:1 vec x",
+    ] {
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = master.cmds(&args);
+        assert!(
+            !matches!(reply, RespValue::Error(_)),
+            "{command}: {reply:?}"
+        );
+    }
+    wait_until("the master's own count", Duration::from_secs(10), || {
+        num_docs(&mut master) == 29
+    });
+    wait_until("the writes applied", Duration::from_secs(10), || {
+        num_docs(&mut replica) == 29
+    });
+}
+
 fn error_of(reply: &RespValue) -> &str {
     match reply {
         RespValue::Error(e) => e,
@@ -1821,6 +2271,61 @@ fn a_master_without_enough_good_replicas_refuses_writes() {
         m.cmds(&["SET", "a", "6"]).is_ok(),
         "a lag of 0 turns it off"
     );
+}
+
+/// What `min-replicas-to-write` refuses is judged by the arguments, as Redis
+/// judges it by the `write` flag. `GEORADIUS ... STORE` and `STOREDIST`
+/// write, and are refused, alone and in a transaction; `GEORADIUS` without
+/// them reads. `SELECT` and `SCRIPT LOAD` / `FLUSH` are propagated but are
+/// not writes: they run, alone and in a transaction, as in Redis.
+#[test]
+fn min_replicas_judges_writes_by_their_arguments() {
+    let port = free_port();
+    start_server(port);
+    let mut m = Conn::connect(port);
+    m.cmds(&["GEOADD", "src", "13.361389", "38.115556", "palermo"]);
+    assert!(
+        m.cmds(&["CONFIG", "SET", "min-replicas-to-write", "1"])
+            .is_ok()
+    );
+
+    let stored = m.cmds(&["GEORADIUS", "src", "15", "37", "200", "km", "STORE", "dst"]);
+    assert!(error_of(&stored).starts_with("NOREPLICAS"), "{stored:?}");
+    let dist = m.cmds(&[
+        "GEORADIUSBYMEMBER",
+        "src",
+        "palermo",
+        "200",
+        "km",
+        "STOREDIST",
+        "dst",
+    ]);
+    assert!(error_of(&dist).starts_with("NOREPLICAS"), "{dist:?}");
+    assert!(m.cmds(&["MULTI"]).is_ok());
+    m.cmds(&["GEORADIUS", "src", "15", "37", "200", "km", "STORE", "dst"]);
+    let exec = m.cmds(&["EXEC"]);
+    assert!(error_of(&exec).starts_with("EXECABORT"), "{exec:?}");
+    assert_eq!(m.cmds(&["EXISTS", "dst"]).as_int(), 0);
+    let read = m.cmds(&["GEORADIUS", "src", "15", "37", "200", "km"]);
+    assert_eq!(read.as_array().len(), 1, "{read:?}");
+
+    #[cfg(feature = "lua")]
+    {
+        let sha = m.cmds(&["SCRIPT", "LOAD", "return 1"]);
+        assert!(!matches!(sha, RespValue::Error(_)), "SCRIPT LOAD: {sha:?}");
+        assert_eq!(sha.as_str().len(), 40);
+        assert!(m.cmds(&["MULTI"]).is_ok());
+        m.cmds(&["SCRIPT", "LOAD", "return 2"]);
+        let exec = m.cmds(&["EXEC"]);
+        assert!(
+            !matches!(exec, RespValue::Error(_)),
+            "MULTI SCRIPT LOAD: {exec:?}"
+        );
+        assert_eq!(exec.as_array().len(), 1);
+        assert!(m.cmds(&["SCRIPT", "FLUSH"]).is_ok());
+    }
+    assert!(m.cmds(&["SELECT", "1"]).is_ok());
+    assert!(m.cmds(&["SELECT", "0"]).is_ok());
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2621,7 +3126,7 @@ fn replica_fed_a_dd(version: Option<&str>) -> bool {
     let replica_port = spawn_server(replica_of(master));
     let mut replica = Conn::connect(replica_port);
     wait_until("the stream is applied", Duration::from_secs(10), || {
-        replica.cmds(&["EXISTS", "done"]).as_int() == 1
+        matches!(replica.cmds(&["EXISTS", "done"]), RespValue::Int(1))
     });
 
     assert_eq!(replica.cmds(&["EXISTS", "n:1"]).as_int(), 0);
@@ -2751,7 +3256,7 @@ fn a_replica_holds_json_numbers_exactly() {
             .is_ok()
     );
     wait_until("the replica has jr:stream", Duration::from_secs(10), || {
-        replica.cmds(&["EXISTS", "jr:stream"]).as_int() == 1
+        matches!(replica.cmds(&["EXISTS", "jr:stream"]), RespValue::Int(1))
     });
     assert!(exact(&mut replica, "jr:sync", synced), "from the full sync");
     assert!(
@@ -2850,6 +3355,71 @@ fn test_a_replica_of_keydb_in_active_replication_stops_at_rreplay() {
     assert_eq!(c.cmds(&["GET", "before"]).as_str(), "1");
     assert_eq!(c.cmds(&["EXISTS", "k"]).as_int(), 0);
     assert_eq!(c.cmds(&["EXISTS", "after"]).as_int(), 0);
+}
+
+/// A 1.2.0 master sends `TS.INCRBY` with `TIMESTAMP <time>` at the end, and
+/// read no other option. A 1.2.1 replica reads it so: the sample at that
+/// time, the options passed over, no trim to the retention. It is the
+/// master's dataset; read as 1.2.1 reads a command, the replica trimmed
+/// samples the master kept, made a label of `TIMESTAMP`, and put a sample
+/// at its own time (#555).
+#[test]
+fn test_a_replica_of_1_2_0_reads_its_ts_incrby_as_1_2_0_did() {
+    let mut payload = b"REDIS0009".to_vec();
+    payload.push(0xFF);
+    payload.extend_from_slice(&[0; 8]);
+    let master = keydb_master(
+        payload,
+        &[
+            &["TS.CREATE", "r", "RETENTION", "10"],
+            &["TS.INCRBY", "r", "1", "TIMESTAMP", "1"],
+            &["TS.INCRBY", "r", "1", "TIMESTAMP", "100"],
+            &[
+                "TS.INCRBY",
+                "c",
+                "1",
+                "RETENTION",
+                "10",
+                "LABELS",
+                "a",
+                "TIMESTAMP",
+                "5",
+            ],
+            &["TS.INCRBY", "c", "1", "LABELS", "x", "TIMESTAMP", "50"],
+            &["SET", "done", "1"],
+        ],
+    );
+    let node = spawn_server(replica_of(master));
+    let mut c = Conn::connect(node);
+    wait_until("the stream to be applied", Duration::from_secs(10), || {
+        matches!(c.cmds(&["EXISTS", "done"]), RespValue::Int(1))
+    });
+    let samples = |c: &mut Conn, key: &str| -> Vec<(i64, String)> {
+        c.cmds(&["TS.RANGE", key, "-", "+"])
+            .as_array()
+            .iter()
+            .map(|s| {
+                (
+                    s.as_array()[0].as_int(),
+                    s.as_array()[1].as_str().to_string(),
+                )
+            })
+            .collect()
+    };
+    let num = |n: &str| n.to_string();
+    assert_eq!(samples(&mut c, "r"), [(1, num("1")), (100, num("2"))]);
+    assert_eq!(samples(&mut c, "c"), [(5, num("1")), (50, num("2"))]);
+    let info = c.cmds(&["TS.INFO", "c"]);
+    let info = info.as_array();
+    let field = |name: &str| {
+        let at = info
+            .iter()
+            .position(|v| matches!(v, RespValue::Bulk(b) if b == name.as_bytes()))
+            .unwrap_or_else(|| panic!("no {name}"));
+        &info[at + 1]
+    };
+    assert_eq!(field("retentionTime").as_str(), "0");
+    assert_eq!(field("labels"), &RespValue::Array(vec![]));
 }
 
 /// A Redis full sync that does not read is a broken link, retried as

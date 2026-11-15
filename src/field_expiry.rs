@@ -24,7 +24,8 @@
 use crate::store::ValueRef;
 use ahash::AHashMap;
 use parking_lot::Mutex;
-use std::time::Instant;
+
+use crate::types::{FieldDeadline, field_due, field_now};
 
 use crate::store::Store;
 use crate::vector::IndexStore;
@@ -34,7 +35,7 @@ use crate::vector::IndexStore;
 type Entry = (usize, usize, crate::store::Key);
 
 /// The hashes to watch, each with the earliest time one of its fields is due.
-static WATCHED: Mutex<Option<AHashMap<Entry, Instant>>> = Mutex::new(None);
+static WATCHED: Mutex<Option<AHashMap<Entry, FieldDeadline>>> = Mutex::new(None);
 
 /// How many hashes [`WATCHED`] holds, of every store: stored under its lock
 /// after each change to it (see [`any_watched`]).
@@ -125,17 +126,21 @@ fn store_id(store: &Store) -> usize {
     std::sync::Arc::as_ptr(store) as *const () as usize
 }
 
-/// What a hash's place on the watch list takes, for a key of `key_len`
-/// bytes (`MEMORY USAGE`): its bucket and control byte in the list's
-/// table, and its own copy of the key (`to_string`, exactly as long as the
-/// key). Not the table's empty room: that is no one hash's, and deleting a
-/// hash does not give it back (the table does not shrink).
-pub fn watch_entry_size(key_len: usize) -> usize {
-    std::mem::size_of::<(Entry, Instant)>() + 1 + key_len
+/// What a hash's place on the watch list takes, for the hash at `key`
+/// (`MEMORY USAGE`): its bucket and control byte in the list's table, and
+/// its own copy of the key. That copy is a `store::Key`, which holds a key
+/// of up to twenty-three bytes in the bucket itself, so only a longer key
+/// adds its bytes, on the heap. Not the table's empty room: that is no one
+/// hash's, and deleting a hash does not give it back (the table does not
+/// shrink).
+pub fn watch_entry_size(key: &[u8]) -> usize {
+    std::mem::size_of::<(Entry, FieldDeadline)>()
+        + 1
+        + crate::key_bytes::KeyBytes::heap_bytes_of(key)
 }
 
 /// Note that the hash at `key` has a field due at `at`.
-pub fn track(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized), at: Instant) {
+pub fn track(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized), at: FieldDeadline) {
     let mut watched = WATCHED.lock();
     let watched = watched.get_or_insert_with(AHashMap::new);
     let earliest = watched
@@ -191,7 +196,7 @@ pub fn track_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) {
 pub fn rescan(store: &Store) {
     for (db, db_ref) in store.iter().enumerate() {
         for shard in db_ref.iter() {
-            let due: Vec<(crate::store::Key, Instant)> = shard
+            let due: Vec<(crate::store::Key, FieldDeadline)> = shard
                 .read()
                 .iter()
                 .filter_map(|(key, value)| match value {
@@ -228,7 +233,7 @@ pub enum Policy {
 /// [`Policy`] of this thread, for `store`. Only asked once a field is due.
 #[cold]
 pub fn policy(store: &Store) -> Policy {
-    if crate::expiry::fields_held() || crate::expiry::replaying() {
+    if due_fields_kept() {
         return Policy::Keep;
     }
     match crate::expiry::of(store) {
@@ -236,6 +241,13 @@ pub fn policy(store: &Store) -> Policy {
         _ if crate::pause::expiry_deferred() || crate::expiry::loading() => Policy::Hide,
         _ => Policy::Expire,
     }
+}
+
+/// Whether [`policy`] is `Keep` on this thread. It depends on the thread
+/// alone, so a reader with no store at hand (an index query) can ask it.
+#[inline]
+pub fn due_fields_kept() -> bool {
+    crate::expiry::fields_held() || crate::expiry::replaying()
 }
 
 /// What [`expire_due`] did.
@@ -247,8 +259,8 @@ pub struct Expired {
     pub key_removed: bool,
 }
 
-/// Remove the fields of the hash at `key` whose deadline is at or before
-/// `now`, as [`policy`] `Expire` says to; the hash too if that empties it.
+/// Remove the fields of the hash at `key` due at `now` ([`field_due`]), as
+/// [`policy`] `Expire` says to; the hash too if that empties it.
 ///
 /// For a command: called with no lock of the key's shard or of the hash
 /// held. Inside a command the write gate and the key's order are held
@@ -264,7 +276,7 @@ pub fn expire_due(
     index_store: &IndexStore,
     db: usize,
     key: &[u8],
-    now: Instant,
+    now: FieldDeadline,
 ) -> Expired {
     let target = crate::expiry::of(store);
     let told = target.as_ref().filter(|target| target.observed());
@@ -289,9 +301,9 @@ fn expire_ordered(
     index_store: &IndexStore,
     db: usize,
     key: &[u8],
-    now: Instant,
+    now: FieldDeadline,
     told: Option<&crate::expiry::Target>,
-) -> (Expired, Option<Instant>) {
+) -> (Expired, Option<FieldDeadline>) {
     let Some(db_ref) = store.get(db) else {
         return (Expired::default(), None);
     };
@@ -307,7 +319,7 @@ fn expire_ordered(
         let fields: Vec<String> = inner
             .expiries
             .iter()
-            .filter(|(_, at)| **at <= now)
+            .filter(|(_, at)| field_due(**at, now))
             .map(|(field, _)| field.clone())
             .collect();
         for field in &fields {
@@ -356,7 +368,8 @@ fn expire_ordered(
     // The indexes under the key's order, as a command's write: out of it a
     // write that came between could be written over with what this read.
     if key_removed {
-        crate::vector::maybe_unindex(index_store, db, key);
+        // Out of its indexes when the shard was let go of
+        // (`ShardMap::remove`).
         if marks {
             crate::vector::unmark_leaving(id, db, key);
         }
@@ -390,7 +403,7 @@ fn after_expiry(store: &Store, db: usize, key: &[u8], expired: &Expired) {
 /// watched.
 pub fn sweep(store: &Store, index_store: &IndexStore) {
     let id = store_id(store);
-    let now = Instant::now();
+    let now = field_now();
     let due: Vec<(usize, crate::store::Key)> = {
         let watched = WATCHED.lock();
         let Some(watched) = watched.as_ref() else {
@@ -398,7 +411,7 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
         };
         watched
             .iter()
-            .filter(|((store, _, _), at)| *store == id && **at <= now)
+            .filter(|((store, _, _), at)| *store == id && field_due(**at, now))
             .map(|((_, db, key), _)| (*db, key.clone()))
             .collect()
     };
@@ -464,8 +477,13 @@ pub fn sweep(store: &Store, index_store: &IndexStore) {
 /// A replica that waits for its master's `HDEL`s: the watch of each hash in
 /// `due` kept while it has a deadline, looked at again a second from now
 /// when that is past; dropped once it has none. Nothing is removed.
-fn settle_on_replica(store: &Store, id: usize, due: Vec<(usize, crate::store::Key)>, now: Instant) {
-    let again = now + std::time::Duration::from_secs(1);
+fn settle_on_replica(
+    store: &Store,
+    id: usize,
+    due: Vec<(usize, crate::store::Key)>,
+    now: FieldDeadline,
+) {
+    let again = now.saturating_add(1_000);
     for (db, key) in due {
         let next = store.get(db).and_then(|db_ref| {
             match crate::store::get_shard(db_ref, &key).read().get(&key) {
@@ -478,15 +496,13 @@ fn settle_on_replica(store: &Store, id: usize, due: Vec<(usize, crate::store::Ke
 }
 
 /// Remove, telling no one, the hash fields of `store` whose deadline was
-/// before `before` (milliseconds since the Unix epoch); returns how many.
+/// before `before` (milliseconds since the Unix epoch, as deadlines are kept:
+/// those due at `before`); returns how many.
 /// What a replica does at a partial resync with a master that sends the
 /// deletion of every field it expires, for the fields none will send one
 /// of (`ReplState::field_expiry_sweep_owed`).
 pub fn expire_fields_due_before(store: &Store, index_store: &IndexStore, before: u64) -> usize {
-    let ago = crate::commands::helpers::now_ms().saturating_sub(before);
-    let Some(cutoff) = Instant::now().checked_sub(std::time::Duration::from_millis(ago)) else {
-        return 0;
-    };
+    let cutoff: FieldDeadline = before;
     let mut removed = 0;
     for (db, db_ref) in store.iter().enumerate() {
         for shard in db_ref.iter() {
@@ -516,7 +532,7 @@ pub fn expire_fields_due_before(store: &Store, index_store: &IndexStore, before:
 /// What the sweep of `key`, which began at `now`, leaves of its watch: kept
 /// for `next`, the time its next field is due, or dropped. Under the key's
 /// write order.
-fn settle_watch(id: usize, db: usize, key: &[u8], next: Option<Instant>, now: Instant) {
+fn settle_watch(id: usize, db: usize, key: &[u8], next: Option<FieldDeadline>, now: FieldDeadline) {
     let mut watched = WATCHED.lock();
     if let Some(watched) = watched.as_mut() {
         let entry = (id, db, crate::store::Key::new(key));
@@ -525,7 +541,7 @@ fn settle_watch(id: usize, db: usize, key: &[u8], next: Option<Instant>, now: In
             // given before this took the order: keep the earlier.
             Some(at) => {
                 let current = watched.entry(entry).or_insert(at);
-                if *current <= now || at < *current {
+                if field_due(*current, now) || at < *current {
                     *current = at;
                 }
             }
@@ -540,16 +556,18 @@ fn settle_watch(id: usize, db: usize, key: &[u8], next: Option<Instant>, now: In
 /// For a test: the watches of its store, and only those. The list is keyed
 /// by a store's address, and a store freed by another test may have had the
 /// same one: what it left watched is forgotten when this is made, and what
-/// this store leaves when this is dropped.
+/// this store leaves when this is dropped. Its thread is
+/// [`crate::expiry::Undisturbed`] meanwhile: no other test's load or pause
+/// keeps its fields past their deadlines.
 #[cfg(test)]
-pub(crate) struct OwnWatches(usize);
+pub(crate) struct OwnWatches(usize, crate::expiry::Undisturbed);
 
 #[cfg(test)]
 impl OwnWatches {
     pub(crate) fn of(store: &Store) -> Self {
         let id = store_id(store);
         forget_watches(id);
-        Self(id)
+        Self(id, crate::expiry::Undisturbed::here())
     }
 }
 
@@ -585,6 +603,27 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// #497: a key the watch list holds inline (up to twenty-three bytes,
+    /// `store::Key`) adds nothing to what its place takes; a longer one adds
+    /// its bytes, on the heap.
+    #[test]
+    fn watch_entry_size_counts_only_a_key_on_the_heap() {
+        let place = std::mem::size_of::<(Entry, FieldDeadline)>() + 1;
+        assert_eq!(watch_entry_size(b""), place);
+        assert_eq!(watch_entry_size(b"h"), place);
+        assert_eq!(watch_entry_size(&[b'k'; 23]), place);
+        assert_eq!(watch_entry_size(&[b'k'; 24]), place);
+        let mut heap24 = [b'k'; 24];
+        heap24[23] = 0xff;
+        assert_eq!(watch_entry_size(&heap24), place + 24);
+        assert_eq!(watch_entry_size(&[b'k'; 40]), place + 40);
+        for key in [&b"h"[..], &[b'k'; 23], &heap24, &[b'k'; 40]] {
+            let held = crate::store::Key::new(key);
+            let heap = if held.is_inline() { 0 } else { key.len() };
+            assert_eq!(watch_entry_size(key), place + heap, "{key:?}");
+        }
+    }
+
     fn hash_with(fields: &[(&str, Option<Duration>)]) -> KiviDBValue {
         let mut inner = HashInner::new();
         for (name, ttl) in fields {
@@ -592,7 +631,7 @@ mod tests {
             if let Some(ttl) = ttl {
                 inner
                     .expiries
-                    .insert(name.to_string(), Instant::now() + *ttl);
+                    .insert(name.to_string(), field_now() + ttl.as_millis() as u64);
             }
         }
         KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)))
@@ -646,9 +685,7 @@ mod tests {
         for (name, value) in &fields {
             inner.fields.insert(name.clone(), Arc::clone(value));
         }
-        inner
-            .expiries
-            .insert("n".into(), Instant::now() + Duration::from_millis(1));
+        inner.expiries.insert("n".into(), field_now() + 1);
         crate::store::get_shard(&store[0], key).write().insert(
             key,
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner))),
@@ -753,7 +790,7 @@ mod tests {
                     hash_at(&store, KEY)
                         .write()
                         .expiries
-                        .insert("o".into(), Instant::now() + Duration::from_secs(60));
+                        .insert("o".into(), field_now() + 60_000);
                     track_key(&store, 0, KEY);
                 }));
             });
@@ -1051,7 +1088,7 @@ mod tests {
 mod propagation_tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tokio::sync::mpsc;
 
@@ -1141,10 +1178,10 @@ mod propagation_tests {
 
         /// `field` of `key` made due, its deadline gone by a moment ago.
         fn due(&self, key: &str, field: &str) {
-            self.deadline(key, field, Instant::now() - Duration::from_millis(5));
+            self.deadline(key, field, crate::types::field_now() - 5);
         }
 
-        fn deadline(&self, key: &str, field: &str, at: Instant) {
+        fn deadline(&self, key: &str, field: &str, at: crate::types::FieldDeadline) {
             let hash = match store::get_shard(&self.store[0], key).read().get(key) {
                 Some(ValueRef::HashEx(hash)) => Arc::clone(hash),
                 _ => panic!("{key} has no field TTLs"),
@@ -1255,6 +1292,34 @@ mod propagation_tests {
         assert!(!m.sent().iter().any(|c| c[0] == "HDEL"));
     }
 
+    /// A dataset another test is loading is not this master's: its due
+    /// field goes before the `XX` is weighed. The load, which is the
+    /// process's, was taken as this master's own, and the field was kept and
+    /// given the new deadline: `:1` (#535).
+    #[test]
+    fn another_tests_load_leaves_this_ones_expiry_alone() {
+        let mut m = master();
+        m.with_due_field("h");
+        std::thread::scope(|s| {
+            // Dropped before the scope waits for the loader, if this fails.
+            let (loaded, load_started) = std::sync::mpsc::channel();
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            s.spawn(move || {
+                let _load = crate::expiry::Loading::start();
+                loaded.send(()).unwrap();
+                let _ = stopped.recv();
+            });
+            load_started.recv().unwrap();
+            assert!(std::thread::spawn(crate::expiry::loading).join().unwrap());
+            assert_eq!(
+                m.run(&["HPEXPIRE", "h", "100000", "XX", "FIELDS", "1", "f"]),
+                "*1\r\n:-2\r\n"
+            );
+            drop(stop);
+        });
+        assert_eq!(m.sent(), [cmd(&["HDEL", "h", "f"])]);
+    }
+
     /// `XX` and `GT` are weighed here: the replica gets what was decided.
     #[test]
     fn a_conditional_field_expire_is_sent_as_its_effect() {
@@ -1355,6 +1420,100 @@ mod propagation_tests {
         assert_eq!(&sent[0][4..], ["FIELDS", "1", "a", "x"]);
         m.run(&["HSETEX", "h", "PXAT", "1", "FIELDS", "1", "a", "y"]);
         assert_eq!(m.sent(), [cmd(&["HDEL", "h", "a"])]);
+    }
+
+    /// `HSETEX` finds its due fields in the lookup it writes under (#543):
+    /// gone first, their `HDEL` before its record, so a due field is no
+    /// field to `FNX`. The record is the client's own fields and values,
+    /// bytes that are not UTF-8 included.
+    #[test]
+    fn hsetex_writes_after_the_deletion_of_its_due_fields() {
+        let mut m = master();
+        m.with_due_field("h");
+        assert_eq!(
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"
+            ]),
+            ":1\r\n"
+        );
+        let sent = m.sent();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0], cmd(&["HDEL", "h", "f"]));
+        assert_eq!(sent[1][..3], ["HSETEX", "h", "PXAT"]);
+        assert_eq!(&sent[1][4..], ["FIELDS", "1", "f", "new"]);
+        assert_eq!(
+            m.held("h"),
+            Some(vec![
+                ("f".to_string(), "new".to_string()),
+                ("keep".to_string(), "1".to_string())
+            ])
+        );
+
+        m.with_only_field_due("e");
+        assert_eq!(
+            m.run(&["HSETEX", "e", "KEEPTTL", "FIELDS", "1", "g", "1"]),
+            ":1\r\n"
+        );
+        let sent = m.sent();
+        assert!(deletion("e").contains(&sent[0]), "{sent:?}");
+        assert_eq!(
+            sent[1],
+            cmd(&["HSETEX", "e", "KEEPTTL", "FIELDS", "1", "g", "1"])
+        );
+        assert_eq!(m.held("e"), Some(vec![("g".to_string(), "1".to_string())]));
+
+        let name: &[u8] = b"n\xff\x00";
+        let value: &[u8] = b"\xfe\r\n";
+        assert_eq!(
+            m.run_bytes(&[b"HSETEX", b"b", b"FIELDS", b"1", name, value]),
+            ":1\r\n"
+        );
+        let mut bytes = Vec::new();
+        while let Ok(msg) = m.rx.try_recv() {
+            if let crate::replication::HubMsg::Propagate(payload) = msg {
+                bytes.extend_from_slice(&payload);
+            }
+        }
+        let mut wanted = b"*6\r\n$6\r\nHSETEX\r\n$1\r\nb\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n".to_vec();
+        wanted.extend_from_slice(b"$3\r\nn\xff\x00\r\n$3\r\n\xfe\r\n\r\n");
+        assert!(
+            bytes.ends_with(&wanted),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// With nothing to read the stream, `HSETEX` builds no record of what it
+    /// did (#543), and still removes a due field before it writes.
+    #[test]
+    fn an_hsetex_nobody_observes_still_writes_after_its_due_fields() {
+        let mut m = master();
+        m.with_due_field("h");
+        m.repl.backlog_active.store(false, Ordering::Relaxed);
+        assert!(!m.repl.feeds_hub());
+        // A record left from before: begun anew, and not kept.
+        crate::replication::script_feed::effects_begin();
+        assert_eq!(
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "new"
+            ]),
+            ":1\r\n"
+        );
+        assert!(!crate::replication::script_feed::recording());
+        assert!(m.sent().is_empty());
+        assert_eq!(
+            m.held("h"),
+            Some(vec![
+                ("f".to_string(), "new".to_string()),
+                ("keep".to_string(), "1".to_string())
+            ])
+        );
+        assert_eq!(
+            m.run(&[
+                "HSETEX", "h", "FNX", "PX", "100000", "FIELDS", "1", "f", "again"
+            ]),
+            ":0\r\n"
+        );
     }
 
     /// The last field due: the hash goes, its deletion sent, and the write
@@ -1604,7 +1763,7 @@ mod propagation_tests {
         crate::watch::register_for(&m.store, &registry);
         m.with_due_field("h");
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        crate::watch::WatchNotifier::watch(&*registry, 0, b"h", Arc::clone(&flag));
+        crate::watch::WatchNotifier::watch(&*registry, 0, b"h", Arc::clone(&flag), false);
         m.run(&["HGET", "h", "keep"]);
         assert!(flag.load(Ordering::SeqCst), "the watch was not broken");
         crate::watch::WatchNotifier::unwatch_all(&*registry, &[flag]);

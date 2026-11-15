@@ -24,6 +24,7 @@ mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+mod give_back;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
@@ -37,6 +38,7 @@ mod member_set;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
+pub mod output_limits;
 pub mod pause;
 pub mod protected_mode;
 mod pubsub;
@@ -47,6 +49,7 @@ mod script_clock;
 mod server;
 mod shared_bytes;
 pub mod shutdown;
+mod sketch;
 pub mod slowlog;
 mod snapshot;
 mod stats;
@@ -350,7 +353,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
     compaction::configure(&config);
+    give_back::set_enabled(config.allocator_give_back);
     snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
+    snapshot::SNAPSHOT_CLUSTER.store(config.cluster_enabled, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
         keyspace_events::parse_ks_flags(&config.notify_keyspace_events),
         std::sync::atomic::Ordering::Relaxed,
@@ -389,7 +394,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     // One engine to a data directory, before anything in it is read.
-    lock_data_dir();
+    if lock_data_dir() {
+        // Before this process saves anything: the saves that left a dump
+        // there were another process's.
+        aof::remove_cut_short_dumps();
+    }
     // io_uring's workers hold open files of their own, kept from clients.
     #[cfg(target_os = "linux")]
     let uring = match config.io_model {
@@ -455,8 +464,9 @@ const DATA_DIR_LOCK: &str = "kividb.lock";
 /// is an exclusive `flock` (`LockFileEx` on Windows) held until the process
 /// exits, when the system releases it however the process ends. The other
 /// process is usually on its way out, so this waits for it rather than
-/// giving up.
-fn lock_data_dir() {
+/// giving up. Whether the lock is held: a start that could not take it goes
+/// on without it.
+fn lock_data_dir() -> bool {
     static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
     let file = match std::fs::OpenOptions::new()
         .create(true)
@@ -470,7 +480,7 @@ fn lock_data_dir() {
                 "Can't open {DATA_DIR_LOCK} in the data directory ({e}): starting without the \
                  lock that keeps a second process out of it"
             );
-            return;
+            return false;
         }
     };
     let waiting_since = Instant::now();
@@ -497,7 +507,7 @@ fn lock_data_dir() {
                     "Can't lock {DATA_DIR_LOCK} ({e}): starting without the lock that keeps a \
                      second process out of the data directory"
                 );
-                return;
+                return false;
             }
         }
     }
@@ -508,6 +518,7 @@ fn lock_data_dir() {
         );
     }
     let _ = HELD.set(file);
+    true
 }
 
 /// Walk keys to populate TEXT / inverted / FLAT data and HNSW graphs. A graph
@@ -625,6 +636,7 @@ fn run_tokio(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let threads = config.resolve_threads();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
+        .thread_keep_alive(commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()?
         .block_on(async_main_tokio(config, started_at))
@@ -725,6 +737,10 @@ async fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 #[cfg(target_os = "linux")]
 fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
     stats::IO_URING.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Before the store holds a key: from here on a key's shard is its slot's.
+    if config.cluster_enabled {
+        store::shard_by_slot();
+    }
     let store: store::Store = store::new_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));
@@ -737,11 +753,12 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     let shutdown = Arc::new(AtomicBool::new(false));
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let latency = crate::latency::new_latency_tracker();
     let monitor_registry = crate::monitor::new_monitor_registry();
@@ -807,6 +824,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     if config.cluster_enabled {
         log_info!(
             "Cluster: Node ID        : {}",
@@ -846,6 +864,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -1602,6 +1621,10 @@ async fn async_main_tokio(
     log_info!("Shards per DB  : {}", store::num_shards());
     log_info!("Bind address   : {}", config.addr());
 
+    // Before the store holds a key: from here on a key's shard is its slot's.
+    if config.cluster_enabled {
+        store::shard_by_slot();
+    }
     let store: store::Store = store::new_store(config.databases);
     let lastsave = Arc::new(RwLock::new(0i64));
     let aof_enabled = config.aof;
@@ -1613,7 +1636,7 @@ async fn async_main_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be
@@ -1632,11 +1655,13 @@ async fn async_main_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let monitor_registry = crate::monitor::new_monitor_registry();
     let tracking_table = crate::tracking::new_tracking_table();
@@ -1701,6 +1726,7 @@ async fn async_main_tokio(
         // if anything: it serves none of its slots until its replica, which
         // may hold the data, has taken over or said it holds nothing.
         if config.cluster_enabled {
+            refuse_keys_outside_db0(&store);
             crate::replication::CLEAN_EXIT_MARKER.store(true, std::sync::atomic::Ordering::Relaxed);
             let stopped_cleanly =
                 crate::replication::take_clean_exit_marker(loaded.dump_fingerprint);
@@ -2276,4 +2302,26 @@ async fn async_main_tokio(
     unsafe { libc::_exit(0) };
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// A cluster node serves database 0 alone: keys loaded into another, from
+/// the AOF (a snapshot with them is refused as it is read, see
+/// `snapshot::SNAPSHOT_CLUSTER`), are where no client can reach them, and
+/// slot accounting and migration never see them. Redis refuses to start;
+/// so does KiviDB (#484).
+fn refuse_keys_outside_db0(store: &store::Store) {
+    for (db, shards) in store.iter().enumerate().skip(1) {
+        let keys: usize = shards
+            .iter()
+            .map(|shard| crate::read_lock!(shard).len())
+            .sum();
+        if keys > 0 {
+            log_fatal!(
+                "{}: {keys} keys were loaded into database {db}",
+                snapshot::CLUSTER_KEYS_OUTSIDE_DB0
+            );
+            log_fatal!("{}.", snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+            std::process::exit(1);
+        }
+    }
 }

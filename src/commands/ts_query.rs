@@ -564,7 +564,28 @@ pub(super) fn value_reply(resp: u8, value: f64) -> Vec<u8> {
     if resp >= 3 {
         resp_double_resp3(value)
     } else {
-        resp_simple(&value.to_string())
+        resp_simple(&resp2_value(value))
+    }
+}
+
+/// `value` as RedisTimeSeries writes it under RESP2, with dragonbox's
+/// `to_chars` (its `deps/dragonbox/dragonbox.cpp`): the fewest digits that
+/// read back the same, written out in full while dragonbox's decimal exponent
+/// is not positive, else as `1.5E-7`. That exponent is positive below 1, from
+/// 2^56, and from 2^52 where the digits end in a zero (`1E16`).
+fn resp2_value(value: f64) -> String {
+    let plain = value.to_string();
+    let magnitude = value.abs();
+    if value.is_infinite() {
+        format!("{}Infinity", if value < 0.0 { "-" } else { "" })
+    } else if value == 0.0
+        || value.is_nan()
+        || (1.0..2f64.powi(52)).contains(&magnitude)
+        || ((2f64.powi(52)..2f64.powi(56)).contains(&magnitude) && !plain.ends_with('0'))
+    {
+        plain
+    } else {
+        format!("{value:E}")
     }
 }
 

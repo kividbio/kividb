@@ -828,6 +828,21 @@ fn the_shared_machinery_is_reached() {
         panic!("INFO commandstats");
     };
     assert!(stats.contains("cmdstat_append:calls=2,"), "{stats}");
+
+    // The commands the connection answers itself are counted too.
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+    assert!(c.cmd(&["WATCH", "us:s"]).ok());
+    assert!(c.cmd(&["UNWATCH"]).ok());
+    assert!(matches!(c.cmd(&["HELLO", "2"]), V::Arr(_)));
+    let V::Str(stats) = c.cmd(&["INFO", "commandstats"]) else {
+        panic!("INFO commandstats");
+    };
+    for name in ["watch", "unwatch", "hello"] {
+        assert!(
+            stats.contains(&format!("cmdstat_{name}:calls=1,")),
+            "{name}: {stats}"
+        );
+    }
 }
 
 // ── What this loop got wrong, or made easy to get wrong ───────────────────────

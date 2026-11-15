@@ -307,6 +307,7 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(names(&["MIGRATE", "h", "1", "k", "0", "5"]), ["k"]);
+        assert_eq!(names(&["MIGRATE", "h", "1", "", "0", "5"]), [""]);
     }
 
     #[test]

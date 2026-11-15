@@ -45,10 +45,17 @@ class TestJsonSetGet:
         assert "a" not in result[0]
 
     def test_type(self, r):
+        from utils.helpers import active_protocol
+
         r.json().set("j", "$", {"arr": [1, 2], "num": 3, "str": "hi"})
-        assert r.json().type("j", "$.arr") == ["array"]
-        assert r.json().type("j", "$.num") == ["integer"]
-        assert r.json().type("j", "$.str") == ["string"]
+        # RedisJSON (Redis 8.10.2) wraps the RESP3 reply in one more array:
+        # `[["array"]]` for a JSONPath, where RESP2 has `["array"]`.
+        def wrap(v):
+            return [v] if active_protocol() == 3 else v
+
+        assert r.json().type("j", "$.arr") == wrap(["array"])
+        assert r.json().type("j", "$.num") == wrap(["integer"])
+        assert r.json().type("j", "$.str") == wrap(["string"])
 
     def test_wrongtype(self, r):
         r.set("k", "string")

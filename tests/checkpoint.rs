@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{port_is_free, restart_verified, start_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,34 +127,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`, asked with a socket that is bound and never
-/// listens (see tests/backup.rs).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on, outside the range the system hands out
-/// to outgoing connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(37);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 /// The I/O models to run each test on: both, where io_uring exists.
 fn io_models() -> &'static [&'static str] {
     if cfg!(target_os = "linux") {
@@ -208,8 +183,8 @@ struct Server {
 impl Server {
     fn start(io: &'static str, failpoints: &str) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
-        let child = launch(&dir, port, io, failpoints, true);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| launch(&dir, port, io, failpoints, true));
         let server = Server {
             port,
             dir,
@@ -243,7 +218,15 @@ impl Server {
     }
 
     fn restart(&mut self) -> Conn {
-        self.child = launch(&self.dir, self.port, self.io, &self.failpoints, self.aof);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters; nothing in this file keeps the port).
+        let (child, port, _) = restart_verified(
+            |port| launch(&self.dir, port, self.io, &self.failpoints, self.aof),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         self.conn()
     }
 
@@ -1217,9 +1200,12 @@ fn an_enable_overtaken_by_a_disable_does_not_answer_ok() {
         let mut c = server.conn();
         assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
         assert!(c.cmd(&["SET", "k", "1"]).ok());
-        // Connections are spread over the server's threads, and the enable
-        // holds its own while it waits at the step: the disable is sent on
-        // several, and one on another thread is answered.
+        // The enable holds its thread while it waits at the step. An io_uring
+        // server spreads connections over its threads, and the disable is
+        // sent on several: one on another thread is answered. A tokio server
+        // runs the enable off the runtime, and answers any of them; it used
+        // to keep the enable on a worker, and about one run in a hundred
+        // nothing else polled the sockets until the enable was done.
         let others: Vec<Conn> = (0..8).map(|_| server.conn()).collect();
         send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
         assert!(server.reached("aof-enabling.1", LONG), "{io}");
@@ -1819,6 +1805,89 @@ fn a_checkpoint_stopped_between_its_number_and_its_dump_loses_nothing() {
                 kept_aside(&server.dir).is_empty(),
                 "{io}, aof {aof_at_save}"
             );
+        }
+    }
+}
+
+/// The names in `dir` of the files a dump is written to before it is put in
+/// place, `dump.kdb.<pid>.<n>.tmp`.
+fn temp_dumps(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.strip_prefix("dump.kdb.")
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(pid, n)| {
+                    [pid, n]
+                        .iter()
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                })
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// A checkpoint cut short (a kill -9, the OOM killer, a liveness probe)
+/// leaves the file its dump was being written to, as big as the dump, which
+/// nothing ever reads. The next start, once it holds the data directory,
+/// removes those, whichever process wrote them -- in a container every start
+/// has the same pid -- and says so. Each crash used to leave one more, until
+/// the volume was full (#545). Files named otherwise are left alone.
+#[test]
+fn a_start_removes_the_dumps_of_checkpoints_cut_short() {
+    for &io in io_models() {
+        for (save, started) in [
+            ("BGSAVE", "Background saving started"),
+            ("BGREWRITEAOF", STARTED),
+        ] {
+            let mut server = Server::start(io, "dump-installing");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "k", "1"]).ok());
+            durable(&mut c);
+            assert_eq!(c.cmd(&[save]).s(), started, "{io}, {save}");
+            assert!(server.reached("dump-installing.1", LONG), "{io}, {save}");
+            let cut_short = temp_dumps(&server.dir);
+            assert_eq!(cut_short.len(), 1, "{io}, {save}: {cut_short:?}");
+            // As a start with the same pid would have left it.
+            std::fs::write(server.dir.join("dump.kdb.1.0.tmp"), b"cut short").unwrap();
+            let others = [
+                "dump.kdb.1.tmp",
+                "dump.kdb.x.0.tmp",
+                "dump.kdb.1.0.tmp.bak",
+                "old.dump.kdb.1.0.tmp",
+            ];
+            for name in others {
+                std::fs::write(server.dir.join(name), b"not a dump of ours").unwrap();
+            }
+            drop(c);
+            server.kill();
+
+            server.failpoints.clear();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{io}, {save}");
+            assert_eq!(
+                temp_dumps(&server.dir),
+                Vec::<String>::new(),
+                "{io}, {save}"
+            );
+            for name in others {
+                assert!(
+                    server.dir.join(name).exists(),
+                    "{io}, {save}: {name} removed"
+                );
+            }
+            let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+            for name in [cut_short[0].as_str(), "dump.kdb.1.0.tmp"] {
+                assert!(
+                    log.lines()
+                        .any(|line| line.contains("Removed") && line.contains(name)),
+                    "{io}, {save}: no line says {name} was removed"
+                );
+            }
         }
     }
 }

@@ -1,0 +1,166 @@
+{
+ "label": "redis-noquant",
+ "server": {
+  "redis_version": "8.10.2",
+  "os": "Linux 7.0.0-1017-azure x86_64",
+  "arch_bits": 64
+ },
+ "config": {
+  "host": "127.0.0.1",
+  "port": 6399,
+  "label": "redis-noquant",
+  "key": "vsbench",
+  "n": 100000,
+  "dim": 128,
+  "nq": 1000,
+  "seed": 42,
+  "format": "fp32",
+  "vadd_opts": "NOQUANT",
+  "load_clients": 4,
+  "batch": 500,
+  "clients": "1,16,100",
+  "ef": "default,200,800",
+  "procs": 4,
+  "duration": 10.0,
+  "warmup": 2.0,
+  "skip_load": false,
+  "keep": false
+ },
+ "client_host": {
+  "machine": "x86_64",
+  "cpus": 4,
+  "python": "3.12.3",
+  "redis_py": "8.1.0",
+  "numpy": "2.5.4"
+ },
+ "started": "2026-11-13T13:03:29Z",
+ "load": {
+  "seconds": 55.78922630500006,
+  "vectors_per_sec": 1792.4607782387832,
+  "errors": 0,
+  "vcard": 100000,
+  "used_memory_delta": 126851368,
+  "bytes_per_vector": 1268.51368
+ },
+ "vinfo": {
+  "quant-type": "f32",
+  "hnsw-m": 16,
+  "vector-dim": 128,
+  "projection-input-dim": 0,
+  "size": 100000,
+  "max-level": 7,
+  "attributes-count": 0,
+  "vset-uid": 3,
+  "hnsw-max-node-uid": 100000
+ },
+ "vsim": [
+  {
+   "clients": 1,
+   "ef": null,
+   "queries": 15199,
+   "seconds": 9.997180371000013,
+   "ops_per_sec": 1520.3286762825157,
+   "p50_ms": 0.6300579998423927,
+   "p99_ms": 0.9254977400496501,
+   "mean_ms": 0.6459819750645979,
+   "recall_at_10": 0.3041,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 16,
+   "ef": null,
+   "queries": 38115,
+   "seconds": 9.99533226199992,
+   "ops_per_sec": 3813.2799391676995,
+   "p50_ms": 4.009482999890679,
+   "p99_ms": 8.368933020160513,
+   "mean_ms": 4.173565576229444,
+   "recall_at_10": 0.3041,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 100,
+   "ef": null,
+   "queries": 36796,
+   "seconds": 10.014097290999871,
+   "ops_per_sec": 3674.4200631114554,
+   "p50_ms": 26.419765000014195,
+   "p99_ms": 46.958967650050475,
+   "mean_ms": 27.095137862974365,
+   "recall_at_10": 0.3041,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 1,
+   "ef": 200,
+   "queries": 9814,
+   "seconds": 9.996945156000038,
+   "ops_per_sec": 981.6998940030959,
+   "p50_ms": 0.9831940000140094,
+   "p99_ms": 1.4122486099836384,
+   "mean_ms": 1.0055380608305673,
+   "recall_at_10": 0.4764,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 16,
+   "ef": 200,
+   "queries": 24273,
+   "seconds": 9.995772178999914,
+   "ops_per_sec": 2428.32665304188,
+   "p50_ms": 6.227683000133766,
+   "p99_ms": 14.129760399991934,
+   "mean_ms": 6.562615929715628,
+   "recall_at_10": 0.4764,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 100,
+   "ef": 200,
+   "queries": 24316,
+   "seconds": 10.00444982099998,
+   "ops_per_sec": 2430.5184627903436,
+   "p50_ms": 39.92936300005567,
+   "p99_ms": 79.3141426000033,
+   "mean_ms": 40.988320367083496,
+   "recall_at_10": 0.4764,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 1,
+   "ef": 800,
+   "queries": 3161,
+   "seconds": 9.997562819999985,
+   "ops_per_sec": 316.17705804023194,
+   "p50_ms": 3.1054779999521998,
+   "p99_ms": 4.1143276000184414,
+   "mean_ms": 3.147088507117148,
+   "recall_at_10": 0.861,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 16,
+   "ef": 800,
+   "queries": 7622,
+   "seconds": 9.99726974400005,
+   "ops_per_sec": 762.4081569444909,
+   "p50_ms": 20.759703500061732,
+   "p99_ms": 37.71150114006559,
+   "mean_ms": 20.935663262267695,
+   "recall_at_10": 0.861,
+   "distinct_queries": 1000
+  },
+  {
+   "clients": 100,
+   "ef": 800,
+   "queries": 7847,
+   "seconds": 10.08413530200005,
+   "ops_per_sec": 778.1529863491276,
+   "p50_ms": 118.363219999992,
+   "p99_ms": 286.697947600087,
+   "mean_ms": 127.50272724684665,
+   "recall_at_10": 0.861,
+   "distinct_queries": 1000
+  }
+ ]
+}

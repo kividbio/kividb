@@ -177,6 +177,57 @@ fn free_port() -> u16 {
     }
 }
 
+/// The process id of the server `c` is connected to, if it says (`INFO`
+/// may be refused, as before `AUTH`).
+fn answering_pid(c: &mut Conn) -> Option<u32> {
+    match c.cmd(&["INFO", "server"]) {
+        V::Str(info) => info
+            .lines()
+            .find_map(|l| l.strip_prefix("process_id:"))
+            .and_then(|pid| pid.trim().parse().ok()),
+        _ => None,
+    }
+}
+
+/// Start a server with `spawn` on `port`, or on another free port if that
+/// one is taken, and connect to it, and to no other process (a server that
+/// does not say who it is, as before `AUTH`, is taken for the one started).
+/// Returns the port it ended up on. A port is free
+/// between a server's exit and its restart, and another test's server can be
+/// started on it then (under `cargo nextest` many start at once): the
+/// restarted one cannot listen, and a client that only connected read the
+/// other's empty dataset as what the restart had loaded.
+fn start_verified(mut spawn: impl FnMut(u16) -> Child, port: u16) -> (Child, Conn, u16) {
+    let mut port = port;
+    for _ in 0..10 {
+        let mut child = spawn(port);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let answered = loop {
+            if child.try_wait().unwrap().is_some() {
+                // It could not take the port.
+                break None;
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                let mut c = Conn::connect(port);
+                break Some((answering_pid(&mut c), c));
+            }
+            assert!(Instant::now() < deadline, "no server came up on {port}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        match answered {
+            Some((pid, c)) if pid.is_none_or(|pid| pid == child.id()) => return (child, c, port),
+            Some((pid, _)) => {
+                eprintln!("port {port} is answered by {pid:?}, not by the server started on it")
+            }
+            None => eprintln!("the server could not take port {port}"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        port = free_port();
+    }
+    panic!("no port could be had for the server");
+}
+
 fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
     kividb_with(dir, port, extra, &[])
 }
@@ -222,22 +273,23 @@ impl Server {
 
     fn start_with_env(extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
         let env: Vec<(String, String)> = env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let child = kividb_with(&dir, port, &args, &env);
-        let server = Server {
+        // Verified to be the process started: the port was free a moment ago,
+        // and another test's server may have taken it since.
+        let (child, mut c, port) =
+            start_verified(|port| kividb_with(&dir, port, &args, &env), free_port());
+        assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+        Server {
             port,
             dir,
             child,
             args,
             env,
-        };
-        assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
-        server
+        }
     }
 
     fn conn(&self) -> Conn {
@@ -264,12 +316,47 @@ impl Server {
         let _ = self.child.wait();
     }
 
-    fn restart(&mut self) {
-        self.child = kividb_with(&self.dir, self.port, &self.args, &self.env);
-        assert_eq!(self.conn().cmd(&["PING"]).s(), "PONG");
+    /// Start the server again on its data directory. The data directory is
+    /// what matters, not the port: if another test's server has taken the
+    /// port while this one was down (it is free between the exit and the
+    /// restart, and under `cargo nextest` many servers start at once), the
+    /// server is started on another free port, and `self.port` is that one.
+    /// Returns whether the port changed: whatever was pointed at the old one
+    /// (replicas, a relay) has to be pointed at the new one, as
+    /// `restart_master` does.
+    fn restart(&mut self) -> bool {
+        let before = self.port;
+        let (dir, args, env) = (self.dir.clone(), self.args.clone(), self.env.clone());
+        let (child, _, port) = start_verified(|port| kividb_with(&dir, port, &args, &env), before);
+        self.child = child;
+        self.port = port;
+        port != before
+    }
+
+    /// `restart` of a master, and its replicas follow it if it had to move.
+    fn restart_master(&mut self, replicas: &mut [&mut Server]) {
+        if self.restart() {
+            for replica in replicas {
+                replica.follow(self.port);
+            }
+        }
+    }
+
+    /// Replicate from a master now on `port`: the arguments of its next
+    /// start, and the running server, if there is one.
+    fn follow(&mut self, port: u16) {
+        if let Some(at) = self.args.iter().position(|a| a == "--replicaof") {
+            self.args[at + 2] = port.to_string();
+        }
+        if self.child.try_wait().unwrap().is_none() {
+            assert!(
+                self.conn()
+                    .cmd(&["REPLICAOF", "127.0.0.1", &port.to_string()])
+                    .ok()
+            );
+        }
     }
 }
-
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -296,6 +383,9 @@ struct Relay {
     /// A connection that has carried this many bytes from the master
     /// pauses the relay. `u64::MAX`: none does.
     pause_at: Arc<std::sync::atomic::AtomicU64>,
+    /// The port of the master it carries to: it moves when the master has to
+    /// be restarted on another one.
+    target: Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl Relay {
@@ -307,6 +397,8 @@ impl Relay {
         let budget = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let paused = Arc::new(AtomicBool::new(false));
         let pause_at = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let target = Arc::new(std::sync::atomic::AtomicU16::new(target));
+        let target_bg = Arc::clone(&target);
         let (open_bg, live_bg, budget_bg, paused_bg, pause_at_bg) = (
             Arc::clone(&open),
             Arc::clone(&live),
@@ -320,7 +412,9 @@ impl Relay {
                     let _ = client.shutdown(Shutdown::Both);
                     continue;
                 }
-                let Ok(upstream) = TcpStream::connect(("127.0.0.1", target)) else {
+                let Ok(upstream) =
+                    TcpStream::connect(("127.0.0.1", target_bg.load(Ordering::SeqCst)))
+                else {
                     continue;
                 };
                 let mut live = live_bg.lock().unwrap();
@@ -379,7 +473,13 @@ impl Relay {
             budget,
             paused,
             pause_at,
+            target,
         }
+    }
+
+    /// Carry the connections made from now on to a master on `port`.
+    fn retarget(&self, port: u16) {
+        self.target.store(port, Ordering::SeqCst);
     }
 
     /// Pause, as [`Self::pause`] does, once a connection has carried this
@@ -616,7 +716,7 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
 
     replica.shutdown();
     master.shutdown();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(
         m.info("replication", "master_replid"),
@@ -638,7 +738,7 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
     drop((m, r));
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_ne!(m.info("replication", "master_replid"), replid);
     let mut r = replica.conn();
@@ -657,7 +757,7 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
 fn a_select_while_writes_are_paused_moves_nothing_and_loses_nothing() {
     let mut master = Server::start(&["--aof"]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut m = master.conn();
     let mut r = replica.conn();
     wait_link_up(&mut r);
@@ -711,7 +811,7 @@ fn a_select_while_writes_are_paused_moves_nothing_and_loses_nothing() {
     assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
     drop((m, a, b));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(keys_in(&mut m, "3"), named("k"), "{}", master.log());
     assert_eq!(keys_in(&mut m, "0"), named("j"));
@@ -728,7 +828,7 @@ fn a_select_while_writes_are_paused_moves_nothing_and_loses_nothing() {
 fn a_master_stopped_under_writes_with_keys_expiring_continues_its_replica() {
     let mut master = Server::start(&["--aof", "--repl-ping-replica-period", "1"]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
     let mut r = replica.conn();
     for round in 0..3 {
         let mut m = master.conn();
@@ -755,7 +855,7 @@ fn a_master_stopped_under_writes_with_keys_expiring_continues_its_replica() {
             log.matches("has the whole stream").count() > round,
             "round {round}: the master did not see its replica take the whole stream:\n{log}"
         );
-        master.restart();
+        master.restart_master(&mut [&mut replica]);
         let mut m = master.conn();
         wait_link_up(&mut r);
         assert_eq!(
@@ -805,7 +905,9 @@ fn a_shutdown_waits_for_a_silent_replica_no_longer_than_shutdown_timeout() {
     assert!(!master.log().contains("did not acknowledge"));
 
     relay.resume();
-    master.restart();
+    if master.restart() {
+        relay.retarget(master.port);
+    }
     let mut m = master.conn();
     wait_link_up(&mut r);
     assert_same_dataset(&mut m, &mut r);
@@ -1031,7 +1133,7 @@ fn a_killed_master_continues_a_replica_that_holds_the_same_data() {
     // Let the AOF reach the disk, then kill: no save, no saved position.
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     let mut r = replica.conn();
     wait_link_up(&mut r);
@@ -1051,7 +1153,7 @@ fn a_killed_master_continues_a_replica_that_holds_the_same_data() {
     std::thread::sleep(Duration::from_millis(1500));
     replica.kill();
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     replica.restart();
     let mut m = master.conn();
     let mut r = replica.conn();
@@ -1068,7 +1170,7 @@ fn a_killed_master_continues_a_replica_that_holds_the_same_data() {
     drop(m);
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     replica.restart();
     let mut m = master.conn();
     let mut r = replica.conn();
@@ -1130,6 +1232,34 @@ fn a_replica_that_was_written_to_resyncs_in_full() {
     assert_eq!(r.cmd(&["EXISTS", "written-while-master"]).i(), 0);
     assert_eq!(m.stat("sync_full"), 2);
     assert_eq!(m.stat("sync_partial_ok"), 0);
+}
+
+/// A `SELECT` changes no data: a client that selects a database on a
+/// replica leaves it where it is in its master's stream, and a dropped link
+/// is resumed with a partial resync (#424). The `SELECT` counted as a write
+/// of the replica's own, and the replica resynced in full: every client
+/// configured with a database other than 0 did that to it.
+#[test]
+fn a_select_on_a_replica_keeps_its_partial_resync() {
+    let master = Server::start(&[]);
+    let relay = Relay::to(master.port);
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &relay.port.to_string()]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+
+    write_batch(&mut m, 0, 20);
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+
+    relay.cut();
+    wait_link_down(&mut r);
+    assert!(r.cmd(&["SELECT", "3"]).ok());
+    assert!(r.cmd(&["SELECT", "0"]).ok());
+    write_batch(&mut m, 1, 20);
+    relay.restore();
+    wait_link_up(&mut r);
+    assert_same_dataset(&mut m, &mut r);
+    assert_eq!(m.stat("sync_full"), 1, "{}", replica.log());
+    assert_eq!(m.stat("sync_partial_ok"), 1);
 }
 
 /// `repl-diskless-load`: by default the local dataset is dropped before the
@@ -1360,7 +1490,7 @@ fn a_replica_continued_by_a_promoted_master_gets_every_write_after_its_next_resy
 fn concurrent_writes_to_one_key_are_replicated_in_the_order_they_were_applied() {
     let mut master = Server::start(&["--aof"]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     wait_link_up(&mut r);
 
@@ -1425,7 +1555,7 @@ fn concurrent_writes_to_one_key_are_replicated_in_the_order_they_were_applied() 
     drop(m);
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     for (probe, expected) in probes.iter().zip(&on_master) {
         assert!(
@@ -1534,7 +1664,7 @@ fn sigterm_waits_for_the_final_snapshot() {
     let dir = tempfile::tempdir().unwrap().keep();
     let port = free_port();
     let log = std::fs::File::create(dir.join("server.log")).unwrap();
-    let spawn = |dir: &Path| {
+    let spawn = |dir: &Path, port: u16| {
         Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(dir)
             .args([
@@ -1553,8 +1683,7 @@ fn sigterm_waits_for_the_final_snapshot() {
             .spawn()
             .expect("could not start kividb")
     };
-    let mut child = spawn(&dir);
-    let mut c = Conn::connect(port);
+    let (mut child, mut c, port) = start_verified(|port| spawn(&dir, port), port);
 
     // Enough that writing it out takes a moment.
     let value = "v".repeat(200);
@@ -1613,10 +1742,14 @@ fn sigterm_waits_for_the_final_snapshot() {
         "the process ended before its snapshot was written:\n{output}"
     );
 
-    // And what it saved is everything.
-    let mut child = spawn(&dir);
-    let mut c = Conn::connect(port);
-    assert_eq!(c.cmd(&["DBSIZE"]).i(), total as i64);
+    // And what it saved is everything, as the restarted server says.
+    let (mut child, mut c, _) = start_verified(|port| spawn(&dir, port), port);
+    assert_eq!(
+        c.cmd(&["DBSIZE"]).i(),
+        total as i64,
+        "{}",
+        std::fs::read_to_string(dir.join("server.log")).unwrap()
+    );
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1840,6 +1973,349 @@ fn send_only(c: &mut Conn, args: &[&str]) {
     c.writer.write_all(&buf).unwrap();
 }
 
+/// Whether a reply comes to `c` within `wait`. Nothing is read.
+fn replied_within(c: &mut Conn, wait: Duration) -> bool {
+    c.reader
+        .get_ref()
+        .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+        .unwrap();
+    let replied = c
+        .reader
+        .fill_buf()
+        .is_ok_and(|buffered| !buffered.is_empty());
+    c.reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    replied
+}
+
+fn master_offset(c: &mut Conn) -> u64 {
+    c.info("replication", "master_repl_offset").parse().unwrap()
+}
+
+/// A master started with `extra` and `env` (its test hooks), and a replica
+/// that follows it, its link up.
+fn master_and_replica(extra: &[&str], env: &[(&str, &str)]) -> (Server, Server) {
+    let master = Server::start_with_env(extra, env);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    wait_link_up(&mut replica.conn());
+    (master, replica)
+}
+
+/// A connection to `server` that is answered now. On the io_uring loop a
+/// test hook that holds a command up holds its whole worker thread, and
+/// with it every connection the worker has: a connection that answers a
+/// `PING` at once is on another.
+fn answered_conn(server: &Server) -> Conn {
+    for _ in 0..40 {
+        let mut c = server.conn();
+        send_only(&mut c, &["PING"]);
+        if replied_within(&mut c, Duration::from_millis(150)) {
+            assert_eq!(c.read().s(), "PONG");
+            return c;
+        }
+    }
+    panic!("no connection was answered");
+}
+
+/// The replica's offset reaches `offset`.
+fn wait_replica_at(replica: &Server, offset: u64) -> Conn {
+    let mut r = replica.conn();
+    wait_until("the replica to reach the offset", || {
+        r.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|applied| applied >= offset)
+    });
+    r
+}
+
+/// Writes held up on their way to the write gate while another client
+/// pauses writes (#629). The first passed the pause check before the pause
+/// was set, and the test hook holds it there for `stall_ms`
+/// (`KIVIDB_TEST_PRE_GATE_DELAY_MS`, arguments beginning with `stalled:`).
+/// `CLIENT PAUSE` answers at once — it does not wait for a write that has
+/// not reached the gate — and once the write gets there it is held with the
+/// others: not applied, not answered, and not in `master_repl_offset`, until
+/// the pause ends. It used to be applied and answered during the pause,
+/// after `CLIENT PAUSE` had replied and the offset had been read: a
+/// switchover that promoted a replica at that offset lost it.
+///
+/// `before` is sent first, its replies read; then `writes`, in one go,
+/// whose replies are read once the pause has ended (the last of them
+/// `last`, if given). `key` is what the first of them sets to "1".
+fn writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+    extra: &[&str],
+    stall_ms: u64,
+    before: &[&[&str]],
+    writes: &[&[&str]],
+    key: &str,
+    last: Option<&str>,
+) {
+    let stall = stall_ms.to_string();
+    let (master, replica) =
+        master_and_replica(extra, &[("KIVIDB_TEST_PRE_GATE_DELAY_MS", stall.as_str())]);
+    assert!(master.conn().cmd(&["SET", "first", "0"]).ok());
+    let mut b = master.conn();
+    for args in before {
+        let reply = b.cmd(args);
+        assert!(!matches!(reply, V::Err(_)), "{args:?}: {reply:?}");
+    }
+    let sent = Instant::now();
+    let mut pipelined = Vec::new();
+    for args in writes {
+        pipelined.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+        for a in *args {
+            pipelined.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+        }
+    }
+    b.writer.write_all(&pipelined).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = answered_conn(&master);
+    assert!(
+        sent.elapsed() < Duration::from_millis(stall_ms) - Duration::from_millis(500),
+        "too late to pause before the write reaches the gate"
+    );
+
+    let pausing = Instant::now();
+    assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+    assert!(
+        pausing.elapsed() < Duration::from_millis(1000),
+        "CLIENT PAUSE waited for a write that had not reached the gate ({:?})",
+        pausing.elapsed()
+    );
+    let offset = master_offset(&mut a);
+    assert_eq!(master_offset(&mut a), offset);
+    // Past the end of the hold-up: the write has reached the gate.
+    std::thread::sleep(Duration::from_millis(stall_ms).saturating_sub(sent.elapsed()));
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !replied_within(&mut b, Duration::ZERO),
+        "{writes:?} was answered while writes were paused\n{}",
+        master.log()
+    );
+    assert_eq!(a.cmd(&["GET", key]), V::Nil, "{writes:?} was applied");
+    assert_eq!(
+        master_offset(&mut a),
+        offset,
+        "something was written after CLIENT PAUSE had replied"
+    );
+
+    assert!(a.cmd(&["CLIENT", "UNPAUSE"]).ok());
+    let replies: Vec<V> = writes.iter().map(|_| b.read()).collect();
+    for reply in &replies {
+        assert!(!matches!(reply, V::Err(_)), "{writes:?}: {replies:?}");
+    }
+    if let Some(last) = last {
+        assert_eq!(
+            replies.last().unwrap().s(),
+            last,
+            "out of order: {replies:?}"
+        );
+    }
+    assert_eq!(a.cmd(&["GET", key]).s(), "1");
+    let mut r = wait_replica_at(&replica, master_offset(&mut a));
+    assert_eq!(r.cmd(&["GET", key]).s(), "1");
+}
+
+#[test]
+fn a_write_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &[],
+        1500,
+        &[],
+        &[&["SET", "stalled:k", "1"]],
+        "stalled:k",
+        None,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends_on_io_uring() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &["--io-model", "uring"],
+        3000,
+        &[],
+        &[&["SET", "stalled:k", "1"]],
+        "stalled:k",
+        None,
+    );
+}
+
+/// What a client sent behind a held write waits behind it, and runs in its
+/// order: the `GET` (which the pause does not hold) answers what the `SET`
+/// wrote.
+#[test]
+fn a_command_pipelined_behind_a_held_write_runs_after_it() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &[],
+        1500,
+        &[],
+        &[&["SET", "stalled:p", "1"], &["GET", "stalled:p"]],
+        "stalled:p",
+        Some("1"),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_pipelined_behind_a_held_write_runs_after_it_on_io_uring() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &["--io-model", "uring"],
+        3000,
+        &[],
+        &[&["SET", "stalled:p", "1"], &["GET", "stalled:p"]],
+        "stalled:p",
+        Some("1"),
+    );
+}
+
+#[test]
+fn a_transaction_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &[],
+        1500,
+        &[&["MULTI"], &["SET", "stalled:t", "1"]],
+        &[&["EXEC"]],
+        "stalled:t",
+        None,
+    );
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_on_its_way_when_clients_are_paused_is_held_until_the_pause_ends() {
+    writes_on_their_way_are_held_by_a_pause_set_meanwhile(
+        &[],
+        1500,
+        &[],
+        &[&[
+            "EVAL",
+            "return redis.call('SET', KEYS[1], '1')",
+            "1",
+            "stalled:s",
+        ]],
+        "stalled:s",
+        None,
+    );
+}
+
+/// A write in the write gate when another client pauses writes (#629):
+/// `CLIENT PAUSE` answers once it is done, and the offset read after that
+/// covers it. The test hook holds the write in the gate, between being
+/// encoded and being queued (`KIVIDB_TEST_BARE_WRITE_DELAY_MS`). The pause
+/// used to be answered at once; the write was then queued and answered after
+/// the offset had been read, and a replica promoted at that offset did not
+/// have it.
+fn client_pause_answers_once_the_writes_in_the_gate_are_done_with(extra: &[&str]) {
+    let (master, replica) =
+        master_and_replica(extra, &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
+    assert!(master.conn().cmd(&["SET", "first", "0"]).ok());
+    let mut b = master.conn();
+    let sent = Instant::now();
+    send_only(&mut b, &["SET", "delayed:k", "1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = answered_conn(&master);
+
+    assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+    assert!(
+        sent.elapsed() >= Duration::from_millis(1400),
+        "CLIENT PAUSE did not wait for the write in the gate ({:?})",
+        sent.elapsed()
+    );
+    let offset = master_offset(&mut a);
+    assert!(b.read().ok());
+    assert_eq!(
+        master_offset(&mut a),
+        offset,
+        "the write was queued after CLIENT PAUSE had replied"
+    );
+    let mut r = wait_replica_at(&replica, offset);
+    assert_eq!(r.cmd(&["GET", "delayed:k"]).s(), "1", "{}", master.log());
+    assert!(a.cmd(&["CLIENT", "UNPAUSE"]).ok());
+}
+
+#[test]
+fn client_pause_answers_once_the_writes_in_the_gate_are_done() {
+    client_pause_answers_once_the_writes_in_the_gate_are_done_with(&[]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn client_pause_answers_once_the_writes_in_the_gate_are_done_on_io_uring() {
+    client_pause_answers_once_the_writes_in_the_gate_are_done_with(&["--io-model", "uring"]);
+}
+
+/// A write still in the gate when `CLIENT PAUSE`'s time to wait for it runs
+/// out (`KIVIDB_TEST_IN_FLIGHT_WAIT_MS` here; 5 seconds otherwise) fails the
+/// pause: answered OK, the switchover would read an offset that the write,
+/// acknowledged a moment later, is not in (#629). And the failed pause has
+/// paused nothing: another client's write goes through at once.
+#[test]
+fn client_pause_fails_and_pauses_nothing_if_a_write_in_the_gate_takes_too_long() {
+    let (master, _replica) = master_and_replica(
+        &[],
+        &[
+            ("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500"),
+            ("KIVIDB_TEST_IN_FLIGHT_WAIT_MS", "300"),
+        ],
+    );
+    assert!(master.conn().cmd(&["SET", "first", "0"]).ok());
+    let mut b = master.conn();
+    send_only(&mut b, &["SET", "delayed:k", "1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = answered_conn(&master);
+    let reply = a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]);
+    assert!(
+        matches!(&reply, V::Err(why) if why.contains("did not finish")),
+        "{reply:?}"
+    );
+    let mut c = answered_conn(&master);
+    send_only(&mut c, &["SET", "other", "1"]);
+    assert!(
+        replied_within(&mut c, Duration::from_millis(1000)),
+        "a write was held by a CLIENT PAUSE that failed"
+    );
+    assert!(c.read().ok());
+    assert!(b.read().ok());
+}
+
+/// `CLIENT PAUSE` inside a transaction answers at once: it does not wait
+/// for its own transaction, which holds the gate. The commands after it in
+/// the transaction run, and other clients' writes are held.
+#[test]
+fn client_pause_inside_a_transaction_does_not_wait_for_it() {
+    let (master, _replica) = master_and_replica(&[], &[]);
+    let mut c = master.conn();
+    assert!(c.cmd(&["MULTI"]).ok());
+    for args in [
+        &["SET", "m1", "1"][..],
+        &["CLIENT", "PAUSE", "30000", "WRITE"],
+        &["SET", "m2", "1"],
+    ] {
+        assert_eq!(c.cmd(args).s(), "QUEUED", "{args:?}");
+    }
+    let started = Instant::now();
+    let replies = c.cmd(&["EXEC"]);
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "EXEC waited {:?}",
+        started.elapsed()
+    );
+    assert!(replies.arr().iter().all(V::ok), "{replies:?}");
+    assert_eq!(c.cmd(&["GET", "m2"]).s(), "1");
+    let mut d = master.conn();
+    send_only(&mut d, &["SET", "m3", "1"]);
+    assert!(
+        !replied_within(&mut d, Duration::from_millis(500)),
+        "a write went through the pause"
+    );
+    assert!(c.cmd(&["CLIENT", "UNPAUSE"]).ok());
+    assert!(d.read().ok());
+}
+
 /// The keys of database `db`, sorted.
 fn keys_of_db(c: &mut Conn, db: &str) -> Vec<String> {
     assert!(c.cmd(&["SELECT", db]).ok());
@@ -1867,7 +2343,7 @@ fn a_write_on_its_way_at_the_first_select(extra: &[&str]) {
     let args: Vec<&str> = ["--aof"].iter().chain(extra).copied().collect();
     let mut master = Server::start_with_env(&args, &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut r = replica.conn();
     wait_link_up(&mut r);
     let mut m = master.conn();
@@ -1906,7 +2382,7 @@ fn a_write_on_its_way_at_the_first_select(extra: &[&str]) {
     master.kill();
     // An io_uring listener can outlive its process a moment.
     wait_until("the port to be let go", || port_is_free(master.port));
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(keys_of_db(&mut m, "3"), ["k"], "{}", master.log());
     assert_eq!(keys_of_db(&mut m, "0"), db0);
@@ -1935,7 +2411,7 @@ fn an_eviction_in_another_database_leaves_the_stream_in_db_0() {
     let mut master =
         Server::start_with_env(&["--aof"], &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "3000")]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut r = replica.conn();
     wait_link_up(&mut r);
     let mut m = master.conn();
@@ -1983,7 +2459,7 @@ fn an_eviction_in_another_database_leaves_the_stream_in_db_0() {
     assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
     drop((m, b));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(
         keys_of_db(&mut m, "3"),
@@ -2097,4 +2573,440 @@ fn a_field_deadline_during_a_full_sync_leaves_the_replica_as_the_master() {
         );
         assert_eq!(r.cmd(&["HLEN", &key]).i(), 1, "{key}");
     }
+}
+
+// ── Role changes and CLIENT KILL of replication links (#591, #595) ───────────
+
+/// The I/O models a test is run on: io_uring is Linux's.
+fn io_models() -> &'static [&'static str] {
+    if cfg!(target_os = "linux") {
+        &["tokio", "uring"]
+    } else {
+        &["tokio"]
+    }
+}
+
+/// Send a command without reading its reply.
+fn send(conn: &mut Conn, args: &[&str]) {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    conn.writer.write_all(&buf).unwrap();
+}
+
+/// Whether the server has closed the connection: nothing more to read.
+fn closed(conn: &mut Conn) -> bool {
+    let mut rest = String::new();
+    match conn.reader.read_line(&mut rest) {
+        Ok(0) => true,
+        Ok(_) => panic!("read {rest:?} where the connection should have closed"),
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionReset,
+    }
+}
+
+/// The one line of `CLIENT LIST TYPE <kind>`, and a field of it.
+fn client_line(conn: &mut Conn, kind: &str) -> String {
+    let list = conn.cmd(&["CLIENT", "LIST", "TYPE", kind]);
+    let lines: Vec<&str> = list.s().lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "CLIENT LIST TYPE {kind}: {lines:?}");
+    lines[0].to_string()
+}
+
+fn field<'a>(line: &'a str, name: &str) -> &'a str {
+    line.split(' ')
+        .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("no {name} in {line}"))
+}
+
+const ROLE_CHANGED: &str =
+    "UNBLOCKED force unblock from blocking operation, instance state changed (master -> replica?)";
+
+/// A master that becomes a replica ends every client blocked in a command
+/// with Redis's `-UNBLOCKED` error, and closes its connection, as Redis's
+/// `disconnectAllBlockedClients` does (#591). They used to stay blocked,
+/// woken only by what the new master wrote.
+#[test]
+fn blocked_clients_are_ended_when_a_master_becomes_a_replica() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start(&["--io-model", io]);
+        let mut admin = node.conn();
+        assert_eq!(admin.cmd(&["XADD", "s", "1-1", "f", "v"]).s(), "1-1");
+        assert!(admin.cmd(&["XGROUP", "CREATE", "s", "g", "$"]).ok());
+        let blocking: &[&[&str]] = &[
+            &["BLPOP", "l1", "0"],
+            &["BRPOP", "l2", "0"],
+            &["BLMOVE", "l3", "dst", "LEFT", "RIGHT", "0"],
+            &["BRPOPLPUSH", "l4", "dst", "0"],
+            &["BLMPOP", "0", "1", "l5", "LEFT"],
+            &["BZPOPMIN", "z1", "0"],
+            &["BZPOPMAX", "z2", "0"],
+            &["BZMPOP", "0", "1", "z3", "MIN"],
+            &["XREAD", "BLOCK", "0", "STREAMS", "s", "$"],
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "BLOCK",
+                "0",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            // With a timeout too: ended all the same.
+            &["BLPOP", "l6", "100"],
+            // `WAIT` is ended by the sweep and by its own look at the role:
+            // once, with one reply (`closed` fails on a second).
+            &["WAIT", "1", "0"],
+        ];
+        let mut clients = Vec::new();
+        for args in blocking {
+            let mut conn = node.conn();
+            send(&mut conn, args);
+            clients.push((args, conn));
+        }
+        let n = blocking.len().to_string();
+        wait_until("every client to block", || {
+            admin.info("clients", "blocked_clients") == n
+        });
+        // One that is not blocked is not touched.
+        let mut idle = node.conn();
+        assert_eq!(idle.cmd(&["PING"]).s(), "PONG");
+
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        for (args, mut conn) in clients {
+            assert_eq!(conn.read(), V::Err(ROLE_CHANGED.into()), "{args:?} on {io}");
+            assert!(closed(&mut conn), "{args:?} on {io}: still connected");
+        }
+        assert_eq!(idle.cmd(&["PING"]).s(), "PONG");
+        assert_eq!(admin.info("clients", "blocked_clients"), "0", "{io}");
+        // As a replica, it follows its new master.
+        let mut o = other.conn();
+        assert!(o.cmd(&["SET", "after", "1"]).ok());
+        wait_link_up(&mut admin);
+        wait_until("the new master's write", || {
+            admin.cmd(&["GET", "after"]) == V::Str("1".into())
+        });
+    }
+}
+
+/// `CLIENT KILL` (by `ID`, `ADDR` or `TYPE`) ends a replica's link on
+/// either I/O model, and the replica comes back by partial resync with the
+/// master's data, nothing lost or repeated, also with writes going on as it
+/// is killed (the stream cut in the middle of a write). The link is listed
+/// with `S`, and the replica's link to its master with `M` and no ACL user
+/// (#595). On the tokio loop the kill used to be answered 1 and do nothing;
+/// and neither loop listed the links as Redis does, so `TYPE replica` and
+/// `TYPE master` found none. `connected_clients` counts the master link on
+/// the replica, and not the replica's link on the master, as in Redis.
+#[test]
+fn client_kill_ends_replication_links_and_the_replica_continues() {
+    for io in io_models() {
+        let master = Server::start(&["--io-model", io]);
+        let replica = Server::start(&[
+            "--io-model",
+            io,
+            "--replicaof",
+            "127.0.0.1",
+            &master.port.to_string(),
+        ]);
+        let (mut m, mut r) = (master.conn(), replica.conn());
+        write_batch(&mut m, 0, 50);
+        wait_link_up(&mut r);
+        assert_same_dataset(&mut m, &mut r);
+        assert_eq!(m.stat("sync_full"), 1, "{io}");
+
+        let line = client_line(&mut r, "master");
+        assert_eq!(field(&line, "flags"), "M", "{io}: {line}");
+        assert_eq!(field(&line, "user"), "(superuser)", "{io}: {line}");
+        wait_until("the master to count only its one client", || {
+            m.info("clients", "connected_clients") == "1"
+        });
+        wait_until("the replica to count its client and its master", || {
+            r.info("clients", "connected_clients") == "2"
+        });
+
+        // Writes in flight through every kill below.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, port) = (Arc::clone(&stop), master.port);
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut n = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    assert!(c.cmd(&["INCR", "inflight"]).i() > 0);
+                    let item = n.to_string();
+                    assert!(c.cmd(&["RPUSH", "inflight-list", &item]).i() > 0);
+                    n += 1;
+                }
+                n
+            })
+        };
+
+        let mut resyncs = 0;
+        for (round, how) in ["ID", "ADDR", "TYPE replica", "TYPE slave"]
+            .into_iter()
+            .enumerate()
+        {
+            let line = client_line(&mut m, "replica");
+            assert_eq!(field(&line, "flags"), "S", "{io}: {line}");
+            let (id, addr) = (
+                field(&line, "id").to_string(),
+                field(&line, "addr").to_string(),
+            );
+            let killed = match how {
+                "ID" => m.cmd(&["CLIENT", "KILL", "ID", &id]),
+                "ADDR" => m.cmd(&["CLIENT", "KILL", "ADDR", &addr]),
+                _ => {
+                    let kind = how.split(' ').nth(1).unwrap();
+                    m.cmd(&["CLIENT", "KILL", "TYPE", kind])
+                }
+            };
+            assert_eq!(killed, V::Int(1), "{io}: CLIENT KILL {how}");
+            write_batch(&mut m, round + 1, 40);
+            resyncs += 1;
+            wait_until("the replica to resume by partial resync", || {
+                m.stat("sync_partial_ok") == resyncs
+            });
+            wait_link_up(&mut r);
+            assert_same_dataset(&mut m, &mut r);
+            assert_eq!(
+                m.info("replication", "connected_slaves"),
+                "1",
+                "{io}: CLIENT KILL {how}"
+            );
+        }
+
+        // The replica's side: its link to the master, killed there.
+        assert_eq!(
+            r.cmd(&["CLIENT", "KILL", "TYPE", "master"]),
+            V::Int(1),
+            "{io}"
+        );
+        write_batch(&mut m, 9, 40);
+        resyncs += 1;
+        wait_until("the replica to resume by partial resync", || {
+            m.stat("sync_partial_ok") == resyncs
+        });
+        wait_link_up(&mut r);
+
+        stop.store(true, Ordering::SeqCst);
+        let written = writer.join().unwrap();
+        assert!(written > 0, "{io}");
+        assert_same_dataset(&mut m, &mut r);
+        for probe in [
+            &["GET", "inflight"][..],
+            &["LLEN", "inflight-list"],
+            &["LRANGE", "inflight-list", "0", "-1"],
+        ] {
+            assert_eq!(m.cmd(probe), r.cmd(probe), "{io}: {probe:?}");
+        }
+        assert_eq!(m.cmd(&["GET", "inflight"]), V::Str(written.to_string()));
+        assert_eq!(m.stat("sync_full"), 1, "{io}: no dataset was sent again");
+        assert_eq!(m.stat("sync_partial_err"), 0, "{io}");
+    }
+}
+
+/// A command that parks just as the node becomes a replica — after the
+/// sweep has looked for blocked clients, before it is listed as one — is
+/// ended as the sweep would have ended it: by the count of role changes for
+/// `XREAD BLOCK`, which a replica may run, and also by the role itself for
+/// `BLPOP`, which it refuses (#591). The test build holds every park, on
+/// `KIVIDB_TEST_PARK_DELAY_MS`, for the change to land in between.
+#[test]
+fn a_command_that_parks_as_the_role_changes_is_ended() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start_with_env(
+            &["--io-model", io],
+            &[("KIVIDB_TEST_PARK_DELAY_MS", "1500")],
+        );
+        let mut admin = node.conn();
+        assert_eq!(admin.cmd(&["XADD", "s", "1-1", "f", "v"]).s(), "1-1");
+        let mut clients = Vec::new();
+        for args in [
+            &["XREAD", "BLOCK", "0", "STREAMS", "s", "$"][..],
+            &["BLPOP", "l", "0"],
+        ] {
+            let mut conn = node.conn();
+            send(&mut conn, args);
+            clients.push((args, conn));
+        }
+        // Parked, and held before they are listed as blocked.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(admin.info("clients", "blocked_clients"), "0", "{io}");
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        for (args, mut conn) in clients {
+            assert_eq!(conn.read(), V::Err(ROLE_CHANGED.into()), "{args:?} on {io}");
+            assert!(closed(&mut conn), "{args:?} on {io}: still connected");
+        }
+    }
+}
+
+/// `WAITAOF` waiting for its write to be synced is ended by a role change,
+/// as every blocked client is (#591). A failpoint holds the sync, as a slow
+/// disk would.
+#[test]
+fn waitaof_is_ended_when_a_master_becomes_a_replica() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start_with_env(
+            &["--io-model", io, "--aof"],
+            &[("KIVIDB_TEST_FAILPOINTS", "fsync")],
+        );
+        let mut admin = node.conn();
+        assert!(admin.cmd(&["SET", "k", "v"]).ok());
+        let mut waiting = node.conn();
+        send(&mut waiting, &["WAITAOF", "1", "0", "0"]);
+        let held = node.dir.join("failpoint.fsync.1");
+        wait_until("the sync to be held", || held.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        assert_eq!(waiting.read(), V::Err(ROLE_CHANGED.into()), "{io}");
+        assert!(closed(&mut waiting), "{io}: still connected");
+        // Let every held sync go.
+        for entry in std::fs::read_dir(&node.dir).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("failpoint.")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// A client held by `CLIENT PAUSE` is not blocked, and a role change leaves
+/// it be, as Redis leaves it: once the pause ends its command runs, on the
+/// replica the node now is, and it stays connected.
+#[test]
+fn a_client_held_by_a_pause_is_left_alone_on_a_role_change() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let node = Server::start(&["--io-model", io]);
+        let mut admin = node.conn();
+        assert!(admin.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+        let mut held = node.conn();
+        send(&mut held, &["SET", "k", "v"]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        assert!(admin.cmd(&["CLIENT", "UNPAUSE"]).ok());
+        match held.read() {
+            V::Err(e) => assert!(e.starts_with("READONLY"), "{io}: {e}"),
+            other => panic!("{io}: {other:?}"),
+        }
+        assert_eq!(held.cmd(&["PING"]).s(), "PONG", "{io}");
+    }
+}
+
+/// A node made a replica and then a master again while its blocked client's
+/// command was still to leave the line takes nothing for that client: the
+/// client is told of the role change, and every element stays. Writes were
+/// paused throughout, which held the command until the node was a master
+/// again; it used to look once more as if its time had run out, and take
+/// an element whose reply was never sent.
+#[test]
+fn a_role_change_and_back_loses_no_element() {
+    for io in io_models() {
+        let other = Server::start(&[]);
+        let mut o = other.conn();
+        assert_eq!(o.cmd(&["RPUSH", "k", "a", "b"]).i(), 2);
+        let node = Server::start(&["--io-model", io]);
+        let mut admin = node.conn();
+        let mut blocked = node.conn();
+        send(&mut blocked, &["BLPOP", "k", "0"]);
+        wait_until("the client to block", || {
+            admin.info("clients", "blocked_clients") == "1"
+        });
+        assert!(admin.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).ok());
+        assert!(
+            admin
+                .cmd(&["REPLICAOF", "127.0.0.1", &other.port.to_string()])
+                .ok()
+        );
+        wait_link_up(&mut admin);
+        wait_until("the new master's list", || {
+            admin.cmd(&["LLEN", "k"]) == V::Int(2)
+        });
+        assert!(admin.cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+        assert!(admin.cmd(&["CLIENT", "UNPAUSE"]).ok());
+        assert_eq!(blocked.read(), V::Err(ROLE_CHANGED.into()), "{io}");
+        assert!(closed(&mut blocked), "{io}: still connected");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            admin.cmd(&["LRANGE", "k", "0", "-1"]),
+            V::Arr(vec![V::Str("a".into()), V::Str("b".into())]),
+            "{io}"
+        );
+    }
+}
+
+/// With `--io-model tokio`, a `SAVE` blocks its own client and no other:
+/// another client is answered while it runs. It ran on a runtime worker
+/// without handing its place over, and with one worker nothing else was
+/// read until it was done (#605).
+///
+/// (`CONFIG SET maxmemory` below what is in use goes off the runtime the
+/// same way, but it cannot be watched from another client: every command
+/// sent while memory use is over the limit evicts keys itself first, as in
+/// Redis.)
+#[test]
+fn save_leaves_other_clients_answered() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(&dir)
+        .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+        .args(["--io-model", "tokio", "--threads", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+    assert_eq!(other.cmd(&["PING"]).s(), "PONG");
+    assert!(c.cmd(&["DEBUG", "POPULATE", "1500000", "k", "32"]).ok());
+
+    // Sent, not waited for; then the other client's PING, timed.
+    let sent = Instant::now();
+    c.writer.write_all(b"*1\r\n$4\r\nSAVE\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let pinging = Instant::now();
+    assert_eq!(other.cmd(&["PING"]).s(), "PONG");
+    let ping = pinging.elapsed();
+    let reply = c.read();
+    let took = sent.elapsed();
+    assert!(reply.ok(), "SAVE: {reply:?}");
+    assert!(
+        took > Duration::from_millis(300),
+        "SAVE took {took:?}: too little to tell"
+    );
+    assert!(
+        ping < took / 2,
+        "a PING waited {ping:?} for SAVE ({took:?})"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }

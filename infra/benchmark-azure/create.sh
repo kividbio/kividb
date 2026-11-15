@@ -12,6 +12,9 @@ set -euo pipefail
 : "${SSH_PUBLIC_KEY:?SSH_PUBLIC_KEY is required}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-kividb-benchmark}"
 LOCATION="${LOCATION:-centralindia}"
+# "false": only the server VM (the regression suite runs client and server on
+# one machine); the client's outputs are then left out.
+CREATE_CLIENT="${CREATE_CLIENT:-true}"
 SERVER_SIZE="${SERVER_SIZE:-Standard_D32ps_v5}"
 CLIENT_SIZE="${CLIENT_SIZE:-Standard_D32ps_v5}"
 IMAGE="${IMAGE:-Canonical:0001-com-ubuntu-server-jammy:22_04-lts-arm64:latest}"
@@ -125,7 +128,9 @@ create_vm() {
 
 # Server first, so a proximity group is anchored on the machine that matters.
 create_vm server "$SERVER_SIZE" 100
-create_vm client "$CLIENT_SIZE" 64
+if [[ "$CREATE_CLIENT" == "true" ]]; then
+  create_vm client "$CLIENT_SIZE" 64
+fi
 
 # tr: the Windows CLI ends lines with \r.
 ip() { az network public-ip show -g "$RESOURCE_GROUP" -n "$1" --query ipAddress -o tsv | tr -d '\r'; }
@@ -134,9 +139,9 @@ private_ip() { az network nic show -g "$RESOURCE_GROUP" -n "$1" --query 'ipConfi
 out run_id "$RUN_ID"
 out resource_group "$RESOURCE_GROUP"
 out server_name "$PREFIX-server"
-out client_name "$PREFIX-client"
+[[ "$CREATE_CLIENT" == "true" ]] && out client_name "$PREFIX-client"
 out server_private_ip "$(private_ip "$PREFIX-server-nic")"
 out server_public_ip "$(ip "$PREFIX-server-ip")"
-out client_private_ip "$(private_ip "$PREFIX-client-nic")"
-out client_public_ip "$(ip "$PREFIX-client-ip")"
+[[ "$CREATE_CLIENT" == "true" ]] && out client_private_ip "$(private_ip "$PREFIX-client-nic")"
+[[ "$CREATE_CLIENT" == "true" ]] && out client_public_ip "$(ip "$PREFIX-client-ip")"
 out ssh_user ubuntu

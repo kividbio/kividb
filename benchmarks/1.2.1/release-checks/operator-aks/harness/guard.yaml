@@ -1,0 +1,32 @@
+# Four small replicated clusters (1 master + 1 replica, AOF on: the operator default) for the #42 AOF-master guard.
+apiVersion: kividb.io/v1alpha1
+kind: KividbConfig
+metadata: {name: ack-no, namespace: e2e}
+spec:
+  directives: {aof-ack-after-write: "no"}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: g-yes, namespace: e2e}
+spec: {replicas: 1, image: "ghcr.io/kividbio/kividb:v1.2.0-rc7", storage: {size: 2Gi}, aclConfigRef: {name: rep-acl}}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: g-no, namespace: e2e}
+spec: {replicas: 1, image: "ghcr.io/kividbio/kividb:v1.2.0-rc7", storage: {size: 2Gi}, aclConfigRef: {name: rep-acl}, configRef: {name: ack-no}}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: g-113, namespace: e2e}
+spec: {replicas: 1, image: "ghcr.io/kividbio/kividb:v1.1.3", storage: {size: 2Gi}, aclConfigRef: {name: rep-acl}}
+---
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: g-bad, namespace: e2e}
+spec: {replicas: 1, image: "ACR.azurecr.io/kividb:v1.2.0-rc7-badver", storage: {size: 2Gi}, aclConfigRef: {name: rep-acl}}
+---
+# fb: the FailoverBlocked test (#35): 1 master + 1 replica on rc7
+apiVersion: kividb.io/v1alpha1
+kind: KividbCluster
+metadata: {name: fb, namespace: e2e}
+spec: {replicas: 1, image: "ghcr.io/kividbio/kividb:v1.2.0-rc7", storage: {size: 2Gi}, aclConfigRef: {name: rep-acl}}

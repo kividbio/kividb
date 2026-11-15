@@ -1,10 +1,10 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{
-    ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
-    ExpireModifierFlags, absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
-    expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis, from_unix_ms,
-    get_expiry, is_expired, lazy_expire_on_read, parse_bytes_as_i128, parse_expire_modifier_flags,
-    parse_utf8, set_expiry, system_time_from_unix_millis_i128, take_key, ttl_remaining_secs_ceil,
+    ERR_INVALID_EXPIRE_EXPIREAT_CMD, ERR_INVALID_EXPIRE_PEXPIRE_CMD,
+    ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ExpireModifierFlags, TimeArg, applying_stream, delete_key,
+    delete_key_if_expired, expire_deadline, expire_modifier_allows_set, expire_on_read,
+    from_unix_ms, get_expiry, is_expired, lazy_expire_on_read, ms_to_nearest_secs,
+    parse_expire_modifier_flags, parse_utf8, set_expiry, take_key, ttl_remaining_ms,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
@@ -13,7 +13,7 @@ use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What `OBJECT ENCODING` says of a value.
 ///
@@ -124,6 +124,16 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
 /// that followed made a new key of what came after, with no time to live,
 /// for good. Set, the key keeps its deadline, the writes go into it, and
 /// expiry takes it out once the load is done, with its `DEL` logged.
+///
+/// The same on a replica applying its master's stream (`applying_stream`),
+/// as Redis's `checkAlreadyExpired` is false there (`server.masterhost`):
+/// the master's `PEXPIREAT k t` arrives with `t` past whenever the replica
+/// lags, or the master set the time to live inside a transaction or script
+/// that ran longer than it. Deleted here, the key was gone on the replica
+/// while the master still had it, and the master's next writes to it
+/// (`INCR`, `PERSIST`) made a different key on the replica, for good
+/// (#665). Set, the replica keeps the key, hidden from reads past its
+/// time, until the master's `DEL` or its next writes say what it is.
 pub(crate) fn apply_expire(
     ctx: &Ctx,
     key: &[u8],
@@ -131,7 +141,7 @@ pub(crate) fn apply_expire(
     deletes: bool,
     flags: &ExpireModifierFlags,
 ) -> Vec<u8> {
-    let deletes = deletes && !crate::expiry::replaying();
+    let deletes = deletes && !crate::commands::helpers::applying_stream(ctx);
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     if !read_lock!(shard).contains_key(key) {
@@ -144,12 +154,14 @@ pub(crate) fn apply_expire(
     if deletes {
         let removed = delete_key(ctx.store, *ctx.selected_db, key);
         if removed {
-            crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
             crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
         }
         return resp_integer(if removed { 1 } else { 0 });
     }
-    set_expiry(ctx.store, *ctx.selected_db, key, new_abs);
+    // Past its time since it was looked at: gone, and deleted (#628).
+    if !set_expiry(ctx.store, *ctx.selected_db, key, new_abs) {
+        return resp_integer(0);
+    }
     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "expire", key);
     resp_integer(1)
 }
@@ -263,7 +275,7 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
     key.extend_from_slice(elem);
     key.extend_from_slice(suffix);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
-    let now = std::time::Instant::now();
+    let now = crate::types::field_now();
     let mut tried = false;
     loop {
         let map = read_lock!(shard);
@@ -283,7 +295,11 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
                 let name = crate::key_bytes::text_of(field);
                 let inner = h.read();
                 let value = inner.fields.get(&*name)?;
-                if inner.expiries.get(&*name).is_none_or(|at| *at > now) {
+                if inner
+                    .expiries
+                    .get(&*name)
+                    .is_none_or(|at| !crate::types::field_due(*at, now))
+                {
                     return Some(value.to_vec());
                 }
                 match crate::field_expiry::policy(ctx.store) {
@@ -328,72 +344,103 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // The keyspace is gone through a shard at a time, and each
             // shard in the order of its keys' positions (see
-            // `helpers::scan_position`): the cursor is the shard, and the
-            // position to go on from in it. Keys written or deleted while
-            // a scan is under way do not move the others.
-            const SHARD_SHIFT: u32 = 48;
+            // `ShardMap::scan`): the cursor is the shard, and the position
+            // to go on from in it. Keys written or deleted while a scan is
+            // under way do not move the others, and neither does a shard's
+            // table growing or shrinking.
+            const POSITION_BITS: u32 = crate::store::SCAN_POSITIONS.trailing_zeros();
             let db = &ctx.store[*ctx.selected_db];
             let num_shards = db.len() as u64;
-            let mut shard_idx = cursor >> SHARD_SHIFT;
-            let mut position = cursor & ((1u64 << SHARD_SHIFT) - 1);
+            let mut shard_idx = cursor >> POSITION_BITS;
+            let mut position = cursor & (crate::store::SCAN_POSITIONS - 1);
+            let pattern = options.pattern.as_deref().map(super::glob_redis::Glob::new);
+            let of_type = options.of_type.as_deref();
 
-            let mut keys: Vec<crate::store::Key> = Vec::new();
-            let mut looked_at = 0usize;
-            let mut next_cursor: u64 = 0;
-            while shard_idx < num_shards {
-                let map = read_lock!(db[shard_idx as usize]);
-                let (page, next) = crate::commands::helpers::scan_page(
-                    map.iter().map(|(key, value)| {
-                        (crate::commands::helpers::scan_position(key), (key, value))
-                    }),
-                    position,
-                    options.count.saturating_sub(looked_at).max(1),
-                    map.len(),
+            // As Redis does, a key is told whether it matches before it is
+            // asked whether it is past its time, and only the ones that
+            // match are copied (#754): here straight into the reply.
+            let walk = || {
+                let mut found = Vec::new();
+                let mut returned = 0usize;
+                // Keys past their time: expired once the shard is let go of.
+                let mut past: Vec<crate::store::Key> = Vec::new();
+                let mut looked_at = 0usize;
+                let mut next_cursor: u64 = 0;
+                while shard_idx < num_shards {
+                    let map = read_lock!(db[shard_idx as usize]);
                     // A shard is a small part of the keyspace: it is gone
-                    // through in a few pages.
-                    16,
-                );
-                // `COUNT` is how many keys to look at, not how many to
-                // return: the ones of another type count too.
-                looked_at += page.len();
-                keys.extend(
-                    page.into_iter()
-                        .filter(|(_, value)| {
-                            options
-                                .of_type
-                                .as_deref()
-                                .is_none_or(|t| value.type_name().eq_ignore_ascii_case(t))
-                        })
-                        .map(|(key, _)| crate::store::Key::new(key)),
-                );
-                drop(map);
-                if next != 0 {
-                    next_cursor = (shard_idx << SHARD_SHIFT) | next;
-                    break;
-                }
-                shard_idx += 1;
-                position = 0;
-                if looked_at >= options.count {
-                    if shard_idx < num_shards {
-                        next_cursor = shard_idx << SHARD_SHIFT;
+                    // through in a few pages whatever `COUNT` says.
+                    let want = options
+                        .count
+                        .saturating_sub(looked_at)
+                        .max(map.len() / 16)
+                        .max(1);
+                    let next = map.scan(position, want, |entry| {
+                        // `COUNT` is how many keys to look at, not how many
+                        // to return: the ones of another type count too.
+                        looked_at += 1;
+                        let key = entry.key();
+                        if pattern.as_ref().is_some_and(|glob| !glob.matches(key)) {
+                            return;
+                        }
+                        if of_type
+                            .is_some_and(|t| !entry.value().type_name().eq_ignore_ascii_case(t))
+                        {
+                            return;
+                        }
+                        if entry
+                            .expires()
+                            .is_some_and(crate::commands::helpers::is_past)
+                        {
+                            past.push(crate::store::Key::new(key));
+                            return;
+                        }
+                        write_bulk(&mut found, key);
+                        returned += 1;
+                    });
+                    drop(map);
+                    if next != 0 {
+                        next_cursor = (shard_idx << POSITION_BITS) | next;
+                        break;
                     }
-                    break;
+                    shard_idx += 1;
+                    position = 0;
+                    if looked_at >= options.count {
+                        if shard_idx < num_shards {
+                            next_cursor = shard_idx << POSITION_BITS;
+                        }
+                        break;
+                    }
                 }
-            }
-            // Falling out of the loop with shard_idx == num_shards means
-            // every shard was gone through: next_cursor stays 0 (done).
+                // Falling out of the loop with shard_idx == num_shards means
+                // every shard was gone through: next_cursor stays 0 (done).
 
-            keys.retain(|k| !lazy_expire_on_read(ctx.store, *ctx.selected_db, k));
-            if let Some(ref pat) = options.pattern {
-                keys.retain(|k| crate::commands::helpers::glob_match_bytes(pat, k));
-            }
+                // A key past its time is not returned, and is expired as a
+                // read of it would expire it. (A key written again since the
+                // shard was let go of is not: it was not there all along.)
+                for key in &past {
+                    lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
+                }
+                (found, returned, next_cursor)
+            };
+            // The keys it looks at: no more than `COUNT`, nor than there are.
+            // Counted only for a `COUNT` that could be long work.
+            let units = if options.count >= crate::commands::helpers::LONG_WORK {
+                options.count.min(crate::commands::helpers::db_len(db))
+            } else {
+                options.count
+            };
+            let (found, returned, next_cursor) = crate::commands::helpers::long_work(units, walk);
 
-            let key_items: Vec<Vec<u8>> = keys.iter().map(|k| resp_bulk(k)).collect();
-
-            Some(resp_array(vec![
-                resp_bulk_str(&next_cursor.to_string()),
-                resp_array(key_items),
-            ]))
+            let cursor = next_cursor.to_string();
+            let mut reply = Vec::with_capacity(found.len() + 32);
+            reply.extend_from_slice(b"*2\r\n");
+            write_bulk(&mut reply, cursor.as_bytes());
+            reply.push(b'*');
+            reply.extend_from_slice(returned.to_string().as_bytes());
+            reply.extend_from_slice(b"\r\n");
+            reply.extend_from_slice(&found);
+            Some(reply)
         }
 
         "KEYS" => {
@@ -405,33 +452,60 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let pattern = cmd[1];
 
             let db = &ctx.store[*ctx.selected_db];
-            // Collect into a temporary — we need the count before we can
-            // write the RESP array header, and we can't hold all shard locks
-            // simultaneously. Collecting key slices (not copies) keeps this cheap.
-            // Note: we can't return borrowed keys across the lock boundary,
-            // so we collect owned keys.
-            let mut candidates: Vec<crate::store::Key> = Vec::new();
-            for shard in db.iter() {
-                let map = read_lock!(shard);
-                candidates.extend(map.keys().map(crate::store::Key::new));
-            }
-            let mut matching: Vec<crate::store::Key> = Vec::new();
-            for key in candidates {
-                if lazy_expire_on_read(ctx.store, *ctx.selected_db, &key) {
-                    continue;
+            // A shard at a time, each let go of before the next is taken:
+            // nothing waits for the whole walk, only for the shard it is
+            // looking at (#754). Unlike Redis's, which runs alone, the
+            // answer is not the keyspace at one instant: a key written,
+            // meanwhile, to a shard already gone through is not in it. Only
+            // the keys that match are copied. Copying every key, and
+            // matching the copies, was most of what a `KEYS` over millions
+            // of keys cost.
+            //
+            // As `SCAN` does: the pattern is made ready once (`schedule:*`
+            // is a comparison of bytes, not the matcher's walk through the
+            // pattern for each key), a key that matches is told whether it
+            // is past its time from its own entry, and is written straight
+            // into the reply (#789).
+            let glob = super::glob_redis::Glob::new(pattern);
+            let walk = || {
+                let mut found = Vec::new();
+                let mut returned = 0usize;
+                // Keys past their time: expired once the shard is let go of.
+                let mut past: Vec<crate::store::Key> = Vec::new();
+                for shard in db.iter() {
+                    let map = read_lock!(shard);
+                    for entry in map.entries() {
+                        let key = entry.key();
+                        if !glob.matches(key) {
+                            continue;
+                        }
+                        if entry
+                            .expires()
+                            .is_some_and(crate::commands::helpers::is_past)
+                        {
+                            past.push(crate::store::Key::new(key));
+                            continue;
+                        }
+                        write_bulk(&mut found, key);
+                        returned += 1;
+                    }
                 }
-                if crate::commands::helpers::glob_match_bytes(pattern, &key) {
-                    matching.push(key);
+                // A key past its time is not listed, and goes. (A key
+                // written again since its shard was let go of is not: it was
+                // not there all along.)
+                for key in &past {
+                    lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
                 }
-            }
+                (found, returned)
+            };
+            let (found, returned) =
+                crate::commands::helpers::long_work(crate::commands::helpers::db_len(db), walk);
 
-            let mut buf = Vec::with_capacity(16 + matching.len() * 24);
+            let mut buf = Vec::with_capacity(found.len() + 16);
             buf.push(b'*');
-            buf.extend_from_slice(matching.len().to_string().as_bytes());
+            buf.extend_from_slice(returned.to_string().as_bytes());
             buf.extend_from_slice(b"\r\n");
-            for k in &matching {
-                write_bulk(&mut buf, k.as_bytes());
-            }
+            buf.extend_from_slice(&found);
             Some(buf)
         }
 
@@ -574,12 +648,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             match expires {
                 None => Some(resp_integer(-1)), // key exists but no TTL
-                Some(at) => match from_unix_ms(at)
-                    .duration_since(crate::script_clock::wall_system_time_now())
-                {
-                    Ok(d) => Some(resp_integer(ttl_remaining_secs_ceil(d))),
-                    Err(_) => Some(resp_integer(-2)),
-                },
+                Some(at) => Some(resp_integer(ms_to_nearest_secs(ttl_remaining_ms(at)))),
             }
         }
 
@@ -637,18 +706,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let ms = match parse_bytes_as_i128(cmd[2]) {
-                Some(m) => m,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
             // The clock is read once, here.
-            let when_ms = match absolute_when_ms_from_pexpire_ms(ms) {
-                Ok(w) => w,
+            let (ms, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::Millis,
+                ERR_INVALID_EXPIRE_PEXPIRE_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
                 Err(e) => return Some(resp_error(e)),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(when_ms) {
-                Some(t) => t,
-                None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIRE_CMD)),
             };
             // Only a time to live of zero or less deletes the key here, as
             // `expire_feed` propagates it. `PEXPIRE k 1` found the clock a
@@ -675,17 +741,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let unix_secs = match parse_bytes_as_i128(cmd[2]) {
-                Some(n) => n,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
-            let unix_ms = match unix_secs.checked_mul(1000) {
-                Some(ms) => ms,
-                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
-                Some(t) => t,
-                None => return Some(resp_error("ERR invalid expire time in EXPIREAT")),
+            // As Redis's `expireGenericCommand`: not an integer, then a
+            // time in seconds past `LLONG_MAX / 1000` either way, refused.
+            let (_, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::UnixSecs,
+                ERR_INVALID_EXPIRE_EXPIREAT_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
@@ -705,13 +770,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(f) => f,
                 Err(msg) => return Some(resp_error(&msg)),
             };
-            let unix_ms = match parse_bytes_as_i128(cmd[2]) {
-                Some(n) => n,
-                None => return Some(resp_error(ERR_VALUE_NOT_INTEGER)),
-            };
-            let new_exp = match system_time_from_unix_millis_i128(unix_ms) {
-                Some(t) => t,
-                None => return Some(resp_error(ERR_INVALID_EXPIRE_PEXPIREAT_CMD)),
+            // From a stream, 1.2.0's `PEXPIREAT` up to `u64::MAX` is taken
+            // as the latest (`applying_stream`).
+            let (_, new_exp) = match expire_deadline(
+                cmd[2],
+                TimeArg::UnixMillis,
+                ERR_INVALID_EXPIRE_PEXPIREAT_CMD,
+                applying_stream(ctx),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(resp_error(e)),
             };
             let now = crate::script_clock::wall_system_time_now();
             Some(apply_expire(ctx, key, new_exp, new_exp <= now, &flags))
@@ -741,12 +809,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             match expires {
                 None => Some(resp_integer(-1)),
-                Some(at) => match from_unix_ms(at)
-                    .duration_since(crate::script_clock::wall_system_time_now())
-                {
-                    Ok(d) => Some(resp_integer(d.as_millis() as i64)),
-                    Err(_) => Some(resp_integer(-2)),
-                },
+                Some(at) => Some(resp_integer(ttl_remaining_ms(at))),
             }
         }
 
@@ -791,10 +854,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Write to dst, the time to live going with the value: the one
             // dst had, if any, goes.
+            let series = matches!(value, KiviDBValue::TimeSeries(_));
             {
                 let shard = store::get_shard(db_ref, &dst);
                 let mut map = write_lock!(shard);
                 map.insert_expiring(&*dst, value, expiry);
+            }
+            if series {
+                crate::commands::ts::renamed(ctx, &src, &dst);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -837,9 +904,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let shard = store::get_shard(db_ref, &src);
                 write_lock!(shard).remove(src.as_slice());
             }
+            let series = matches!(src_value, KiviDBValue::TimeSeries(_));
             {
                 let shard = store::get_shard(db_ref, &dst);
                 write_lock!(shard).insert_expiring(&*dst, src_value, expiry);
+            }
+            if series {
+                crate::commands::ts::renamed(ctx, &src, &dst);
             }
             notify(ctx.pubsub, db, KS_GENERIC, "rename_from", &src);
             notify(ctx.pubsub, db, KS_GENERIC, "rename_to", &dst);
@@ -866,6 +937,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 match opt.as_str() {
                     "DB" => {
                         i += 1;
+                        // A cluster node has database 0 alone (#484): any
+                        // other is out of range, as in Redis 8, where it is
+                        // the one database a cluster node has.
+                        if ctx.cluster.enabled
+                            && parse_utf8(cmd.get(i).copied().unwrap_or(b""))
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .is_some_and(|n| n != 0)
+                        {
+                            return Some(resp_error("ERR DB index is out of range"));
+                        }
                         dst_db = match parse_utf8(cmd.get(i).copied().unwrap_or(b""))
                             .and_then(|s| s.parse().ok())
                         {
@@ -910,6 +991,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
+            if let KiviDBValue::TimeSeries(series) = &value {
+                crate::commands::ts::copied(ctx, &dst_key, series);
+            }
             // Write to destination, with the source's time to live (the
             // key replaced may have had one: the copy has the source's, or
             // none).
@@ -932,19 +1016,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut removed = 0i64;
             // `UNLINK` frees a large value in the background (`lazyfree`);
-            // `DEL` frees it here, as Redis does with `lazyfree-lazy-user-del no`.
+            // `DEL` frees it here, as Redis does with `lazyfree-lazy-user-del
+            // no`, and as `UNLINK` does with `yes` (`lazyfree::release_deleted`).
             let unlink = cmd[0].eq_ignore_ascii_case(b"UNLINK");
 
             // Any bytes: what a master expires, evicts or migrates away is
             // deleted on its replicas, and in its AOF, by the DEL or UNLINK
             // it sends, whatever its key (#437). A key that is not text was
             // skipped.
-            for &key in cmd.iter().skip(1) {
+            for (at, &key) in cmd.iter().enumerate().skip(1) {
                 // Redis: expireIfNeeded deletes volatile keys first; that removal does not add
                 // to the DEL count (see redis `delGenericCommand`).
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     if delete_key_if_expired(ctx.store, *ctx.selected_db, key) {
-                        crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                         crate::vector::maybe_request_compaction(
                             ctx.index_store,
                             ctx.compaction_tx,
@@ -953,15 +1037,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     continue;
                 }
-                let deleted = if unlink {
-                    take_key(ctx.store, *ctx.selected_db, key)
-                        .map(crate::lazyfree::release)
-                        .is_some()
-                } else {
-                    delete_key(ctx.store, *ctx.selected_db, key)
-                };
+                let deleted = take_key(ctx.store, *ctx.selected_db, key)
+                    .map(|value| {
+                        if unlink {
+                            crate::lazyfree::release(value)
+                        } else if !matches!(value, KiviDBValue::String(_)) {
+                            // A string is one allocation: freed here, as
+                            // it is dropped, with nothing to weigh.
+                            crate::lazyfree::release_deleted(value)
+                        }
+                    })
+                    .is_some();
+                // A document that was deleted left its indexes when the
+                // shard was let go of (`ShardMap::remove`).
                 if deleted {
-                    crate::vector::maybe_unindex(ctx.index_store, *ctx.selected_db, key);
                     crate::vector::maybe_request_compaction(
                         ctx.index_store,
                         ctx.compaction_tx,
@@ -969,9 +1058,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                     notify(ctx.pubsub, *ctx.selected_db, KS_GENERIC, "del", key);
                     removed += 1;
-                } else if ctx.watch_registry.has_watchers() {
-                    // There was nothing to delete: a client watching the key
-                    // has seen no change.
+                } else if (ctx.watch_registry.has_watchers()
+                    || crate::tracking::TRACKING_CLIENT_COUNT
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        != 0)
+                    && !cmd[1..at].contains(&key)
+                {
+                    // There was nothing to delete: a client watching the key,
+                    // or caching it, has seen no change. Unless the key was
+                    // named before in this command, and deleted then: `DEL a
+                    // a` changes `a`.
                     crate::watch::unchanged(*ctx.selected_db, key);
                 }
             }
@@ -985,6 +1081,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_error(
                     "ERR wrong number of arguments for 'move' command",
                 ));
+            }
+            // A cluster node has database 0 alone: a key moved to another
+            // would be out of every client's reach, and would stop the node
+            // from starting again (#484). A test has it moved as before, to
+            // give a replica a master holding keys there.
+            if ctx.cluster.enabled && !crate::aof::test_behaves_as_before("cluster-move") {
+                return Some(resp_error("ERR MOVE is not allowed in cluster mode"));
             }
             let key: Vec<u8> = cmd[1].to_vec();
             let target_db: usize = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
@@ -1040,6 +1143,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'swapdb' command",
                 ));
             }
+            // As `MOVE`: it would put the dataset in a database a cluster
+            // node does not serve (#484).
+            if ctx.cluster.enabled {
+                return Some(resp_error("ERR SWAPDB is not allowed in cluster mode"));
+            }
             let db1: usize = match parse_utf8(cmd[1]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR invalid DB index")),
@@ -1072,34 +1180,54 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         }
 
         "RANDOMKEY" => {
-            // A key picked at random: from a shard picked at random, and,
-            // if that one is empty, from the ones after it. A key whose
-            // time has run out is not a key: it is removed, and another
-            // picked.
+            // A key picked at random: from a shard picked at random in
+            // proportion to its keys, so that every key is as likely as any
+            // other (in cluster mode one busy hash tag fills one shard, and
+            // picked evenly its keys came up far less often than the rest,
+            // #294), and, if that one is empty by now, from the ones after
+            // it. A key whose time has run out is not a key: it is removed,
+            // and another picked, for as long as it takes, as in Redis
+            // (#566): each pick that removes one leaves one fewer to pick.
+            //
+            // An expired key that stays (on a replica, while writes are
+            // paused, or while loading) could be picked again and again:
+            // after 100 of those, as in Redis, the answer is one of them.
+            //
+            // Whether expired keys stay is asked again at every pick, as
+            // Redis does: a pause that begins while this looks must not
+            // leave it looking for ever.
             let db = *ctx.selected_db;
             let shards = ctx.store[db].len();
-            let mut expired = None;
-            for _ in 0..64 {
-                let start = rand::random::<usize>() % shards.max(1);
+            let expired_keys_stay = || {
+                crate::pause::expiry_deferred()
+                    || crate::expiry::held()
+                    || crate::expiry::of(ctx.store)
+                        .as_ref()
+                        .is_some_and(crate::expiry::Target::on_replica)
+            };
+            let mut kept_expired = 0;
+            loop {
+                let mut weights = Vec::with_capacity(shards);
+                crate::store::shard_weights(&ctx.store[db], false, &mut weights);
+                let start = crate::store::pick_weighted(&weights, rand::random::<usize>())
+                    .unwrap_or_else(|| rand::random::<usize>() % shards.max(1));
                 let picked = (0..shards).find_map(|step| {
                     let map = read_lock!(ctx.store[db][(start + step) % shards]);
                     map.random_entry(rand::random::<usize>)
                         .map(|(key, _)| crate::store::Key::new(key))
                 });
                 match picked {
-                    None => break,
+                    None => break Some(resp_null_bulk()),
                     Some(key) if lazy_expire_on_read(ctx.store, db, &key) => {
-                        expired = Some(key);
+                        if expired_keys_stay() {
+                            kept_expired += 1;
+                            if kept_expired == 100 {
+                                break Some(resp_bulk(&key));
+                            }
+                        }
                     }
-                    Some(key) => return Some(resp_bulk(&key)),
+                    Some(key) => break Some(resp_bulk(&key)),
                 }
-            }
-            // While writes are paused an expired key is not removed, so
-            // every pick could land on one again: as in Redis, the answer is
-            // then one of them, not nil.
-            match expired {
-                Some(key) if crate::pause::expiry_deferred() => Some(resp_bulk(&key)),
-                _ => Some(resp_null_bulk()),
             }
         }
 
@@ -1239,6 +1367,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(resp_error(e.message())),
             };
 
+            // A series restored has no links to other series, as in
+            // RedisTimeSeries (`RestoreKey`): a payload of 1.2.0, or
+            // `MIGRATE` from a node of 1.2.0, carries its compaction rules
+            // and source, by key name (#593). An atomic slot migration sends
+            // the rules among the keys it moves as `TS.CREATERULE`s.
+            if let KiviDBValue::TimeSeries(series) = &value {
+                let mut series = series.write();
+                series.rules.clear();
+                series.source = None;
+            }
+
             // A restored series has to be findable by its labels, the same as
             // one made with TS.CREATE.
             let ts_labels: Vec<(String, String)> = match &value {
@@ -1251,13 +1390,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 _ => Vec::new(),
             };
 
-            // Store it, with its time to live
+            // Store it, with its time to live: at most `i64::MAX` ms after
+            // the epoch, the latest any command sets. One past it read back
+            // negative, and its `PEXPIREAT` was refused where it was sent on.
             let expires_at = (ttl_ms > 0).then(|| {
-                if absttl {
-                    expiry_unix_millis(ttl_ms)
+                let at_ms = if absttl {
+                    ttl_ms
                 } else {
-                    expiry_at_after(Duration::from_millis(ttl_ms))
-                }
+                    (crate::script_clock::ttl_wall_ms_now() as u64).saturating_add(ttl_ms)
+                };
+                from_unix_ms(at_ms.min(i64::MAX as u64))
             });
             crate::commands::helpers::store_value_expiring(
                 ctx.store, db_idx, &key, value, expires_at,
@@ -1681,10 +1823,12 @@ enum TimeUnit {
 }
 
 fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
+    // Saturated: cut to 64 bits, a far deadline read back negative.
     let d = exp.duration_since(UNIX_EPOCH).unwrap_or_default();
     match unit {
-        TimeUnit::Secs => d.as_secs() as i64,
-        TimeUnit::Millis => d.as_millis() as i64,
+        // To the nearest second, as `TTL` (Redis's `(ms + 500) / 1000`).
+        TimeUnit::Secs => ms_to_nearest_secs(i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+        TimeUnit::Millis => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
     }
 }
 
