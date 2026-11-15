@@ -2592,15 +2592,42 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
         return;
     }
     let db = *ctx.selected_db;
-    for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-        let key = ctx.cmd[pos];
-        if may_be_empty && drop_if_empty(ctx, db, key) {
-            continue;
+    let notify = || {
+        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+            let key = ctx.cmd[pos];
+            if may_be_empty && drop_if_empty(ctx, db, key) {
+                continue;
+            }
+            if waiters {
+                ctx.wait_table.notify_signal(key);
+            }
         }
-        if waiters {
-            ctx.wait_table.notify_signal(key);
-        }
+    };
+    // A blocking pop's own keys gained nothing from it: what it wakes there
+    // is no client the reply waits for (#42). What it pushes (`BLMOVE`'s
+    // destination) its handler wakes, and that is waited for.
+    if waiters && pops_blocking(name) {
+        crate::wait_table::without_collecting(notify);
+    } else {
+        notify();
     }
+}
+
+/// The commands that wait for elements and take them.
+#[cold]
+fn pops_blocking(name: &str) -> bool {
+    matches!(
+        name,
+        "BLPOP"
+            | "BRPOP"
+            | "BRPOPLPUSH"
+            | "BLMOVE"
+            | "BLMPOP"
+            | "BZPOPMIN"
+            | "BZPOPMAX"
+            | "BZMPOP"
+            | "XREADGROUP"
+    )
 }
 
 /// [`apply_write_side_effects`] for a caller that has already classified the

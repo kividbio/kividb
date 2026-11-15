@@ -169,14 +169,12 @@ impl Look {
 pub async fn all_looked(looks: Vec<Arc<Look>>, deadline: tokio::time::Instant) {
     // By address: `Send`, unlike a pointer, and the looks are kept alive
     // by `todo` and the looks that carry them.
-    let mut seen: Vec<usize> = Vec::new();
+    let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::new();
     let mut todo = looks;
     while let Some(look) = todo.pop() {
-        let at = Arc::as_ptr(&look) as usize;
-        if seen.contains(&at) {
+        if !seen.insert(Arc::as_ptr(&look) as usize) {
             continue;
         }
-        seen.push(at);
         match tokio::time::timeout_at(deadline, look.wait()).await {
             Ok(then) => todo.extend(then),
             Err(_) => return,
@@ -202,6 +200,7 @@ thread_local! {
         std::cell::RefCell::new(Woken {
             woken: Vec::new(),
             owed: Vec::new(),
+            bells: Vec::new(),
         })
     };
 }
@@ -218,6 +217,9 @@ pub struct Woken {
     /// The looks owed by the clients whose tickets it dropped, done with
     /// their lines (its own, done with its command): done when it is.
     pub owed: Vec<Arc<Look>>,
+    /// The clients of `woken`, by their bell's address: one look each, however
+    /// many of its keys the command wrote.
+    bells: Vec<usize>,
 }
 
 #[inline]
@@ -259,14 +261,30 @@ fn take_collected() -> Woken {
 /// thread will wait for that client's look.
 #[cold]
 fn collect(bell: &Bell) {
-    let look = Look::new();
-    if bell.owe(&look)
-        && WOKEN
-            .try_with(|woken| woken.borrow_mut().woken.push(look))
-            .is_ok()
-    {
-        COLLECT.set(COLLECTED);
-    }
+    let at = bell as *const Bell as usize;
+    let _ = WOKEN.try_with(|woken| {
+        let mut woken = woken.borrow_mut();
+        if woken.bells.contains(&at) {
+            return;
+        }
+        let look = Look::new();
+        if bell.owe(&look) {
+            woken.bells.push(at);
+            woken.woken.push(look);
+            COLLECT.set(COLLECTED);
+        }
+    });
+}
+
+/// Run `f` without collecting what it wakes: the notices a blocking pop
+/// sends for its own keys, which it took from or left alone (it passes its
+/// turn on itself), give nobody anything to wait for. A thousand clients
+/// blocked on the same 270 keys made each such notice a look for every
+/// head of every one of those lines (#823).
+pub fn without_collecting(f: impl FnOnce()) {
+    let was = COLLECT.replace(IDLE);
+    f();
+    COLLECT.set(was.max(COLLECT.get()));
 }
 
 /// Looks owed by a ticket dropped now: to the command running on this
