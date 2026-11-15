@@ -51,12 +51,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   templates written for Redis start KiviDB unchanged. Values may be several
   (`--save 900 1 --save 300 10`), empty (`--save ""`) or start with a dash;
   a config file may be named first, and `-` reads config text from standard
-  input. A flag KiviDB has wins over a directive, a directive wins over the
+  input (so a `-` as the last argument is never a value). A flag KiviDB has wins over a directive, a directive wins over the
   config file, and one KiviDB accepts but ignores logs one warning. A name
   that is not known stops the server and names the closest one (a mistyped
   flag such as `--prot` too), where it used to print clap's usage and exit 2;
-  it now exits 1. `kividb --ping` reads them too. Thanks to  for the
-  first implementation.
+  it now exits 1. `--name=value` is taken too, with spaces in the value
+  (`--dir=/my dir`), which Redis does not accept. `--bind a b` lists two
+  addresses and warns that KiviDB listens on one, as the config file does.
+  No message prints the value of a password. `kividb --ping` reads them too.
+  Thanks to @mikak94 for the first implementation.
 - **`kividb --ping`, a health check that needs no shell (#433).** The images
   are distroless, so Compose files and platform templates could not run
   `redis-cli ping` and had no health check. `["CMD", "kividb", "--ping"]`

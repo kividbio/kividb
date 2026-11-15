@@ -17,7 +17,9 @@
 //
 // The form is Redis's (`main` in `server.c`):
 //   - the first argument, when it does not start with `-`, is a config file;
-//   - `-`, first or last, says the config text follows on standard input;
+//   - `-`, first or last, says the config text follows on standard input, so
+//     a `-` that is the last argument is never a value (`--dir -` is
+//     `--dir` with no value, an error, as in Redis);
 //   - `--name` starts an option, and every following argument up to the next
 //     one that starts with `--` is its values, so a value may start with one
 //     dash (`--maxmemory -1`) but not with two, except the first, which is
@@ -109,24 +111,37 @@ pub fn split(cmd: &clap::Command, args: Vec<OsString>) -> Result<Split, String> 
             continue;
         }
         let body = &s[2..];
-        let (name, mut values, equals, complete) = if body.contains(char::is_whitespace) {
-            let mut words = split_config_line(body).map_err(|e| format!("'{s}': {e}"))?;
-            if words.is_empty() {
-                return Err(format!("'{s}': no directive named"));
+        // Nothing below echoes `s`: it may hold a password.
+        // `--name=value` first: the value may hold spaces (`--dir=/my dir`).
+        // Only a name with whitespace before any `=` is `--name value` in one
+        // argument.
+        let (name, mut values, equals, complete) = match body.split_once('=') {
+            Some((name, value)) if !name.contains(char::is_whitespace) => {
+                (name.to_string(), vec![value.to_string()], true, true)
             }
-            let name = words.remove(0);
-            (name, words, false, true)
-        } else if let Some((name, value)) = body.split_once('=') {
-            (name.to_string(), vec![value.to_string()], true, true)
-        } else {
-            (body.to_string(), Vec::new(), false, false)
+            _ if body.contains(char::is_whitespace) => {
+                let mut words = split_config_line(body)
+                    .map_err(|e| format!("an argument with a name and a value: {e}"))?;
+                if words.is_empty() {
+                    return Err("an argument with no directive named".into());
+                }
+                let name = words.remove(0);
+                (name, words, false, true)
+            }
+            _ => (body.to_string(), Vec::new(), false, false),
         };
         j += 1;
         if name.is_empty() {
-            return Err(format!("'{s}': no directive named"));
+            return Err("an argument with no directive named".into());
         }
         let name = name.to_ascii_lowercase();
-        let native = native_arity(&cmd, &name);
+        // `bind` lists addresses, which a flag cannot: it goes the way of the
+        // config file's, with its warning when KiviDB uses only one.
+        let native = if name == "bind" {
+            None
+        } else {
+            native_arity(&cmd, &name)
+        };
         if !complete && native.as_ref().is_none_or(|(_, arity)| *arity > 0) {
             // As Redis reads them, the first argument after a bare name is
             // its value even if it starts with two dashes (`--requirepass
@@ -135,10 +150,7 @@ pub fn split(cmd: &clap::Command, args: Vec<OsString>) -> Result<Split, String> 
             while j < n && (first || !starts_option(&args[j])) && !(j == n - 1 && args[j] == "-") {
                 first = false;
                 let Some(value) = text(&args[j]) else {
-                    return Err(format!(
-                        "'--{name}': a value that is not valid UTF-8: {:?}",
-                        args[j]
-                    ));
+                    return Err(format!("'--{name}': a value that is not valid UTF-8"));
                 };
                 values.push(value);
                 j += 1;
@@ -162,17 +174,20 @@ pub fn split(cmd: &clap::Command, args: Vec<OsString>) -> Result<Split, String> 
                     .collect(),
             };
             segments.push((id, tokens));
-            // Redis's `bind` lists addresses, and KiviDB listens on one: it
-            // uses the first, as the config file's `bind` does.
-            if name != "bind"
-                && let Some(first) = extra.first()
-            {
+            if !extra.is_empty() {
+                // Counts only: a value may be a password.
                 return Err(format!(
-                    "'--{name}' takes {arity} value{}, and '{first}' follows it",
-                    if arity == 1 { "" } else { "s" }
+                    "'--{name}' takes {arity} value{}, and {} more follow{}",
+                    if arity == 1 { "" } else { "s" },
+                    extra.len(),
+                    if extra.len() == 1 { "s" } else { "" }
                 ));
             }
             continue;
+        }
+        // `--bind "a b"` lists two addresses, as `--bind a b` does.
+        if name == "bind" && values.len() == 1 {
+            values = values[0].split_whitespace().map(String::from).collect();
         }
         // Redis: `--save` with nothing after it is `--save ""`.
         if values.is_empty() && name == "save" {
@@ -258,7 +273,12 @@ pub fn apply(
                     ),
                 });
             }
-            Err(e) => return Err(format!("--{name}: {e}")),
+            Err(e) => {
+                return Err(format!(
+                    "--{name}: {}",
+                    crate::config::redact(name, args, e)
+                ));
+            }
         }
     }
     Ok(warnings)
@@ -340,10 +360,11 @@ mod tests {
             "--save", "900", "1", "--save", "300", "10", "--bind", "a", "b",
         ]);
         assert_eq!(
-            s.directives,
-            vec![d("save", &["900", "1"]), d("save", &["300", "10"])]
+            s.directives[..2],
+            [d("save", &["900", "1"]), d("save", &["300", "10"])]
         );
-        assert_eq!(native_of(&s), ["--bind=a"]);
+        assert_eq!(s.directives[2], d("bind", &["a", "b"]));
+        assert!(native_of(&s).is_empty());
     }
 
     #[test]
@@ -440,7 +461,10 @@ mod tests {
     #[test]
     fn a_native_flag_given_too_many_values_is_refused() {
         let e = split(&Config::command(), argv(&["--port", "1", "2"])).unwrap_err();
-        assert!(e.contains("--port") && e.contains("'2'"), "{e}");
+        assert!(
+            e.contains("--port") && e.contains("1 more follows") && !e.contains('2'),
+            "{e}"
+        );
         // A flag that takes no value leaves what follows to clap, which refuses it.
         let s = split_of(&["--aof", "yes"]);
         assert_eq!(native_of(&s), ["--aof", "yes"]);
@@ -614,6 +638,228 @@ mod tests {
         apply(&mut config, &cmd, &s.directives, &from_cli).unwrap();
         assert_eq!(config.aof_rewrite_percentage, 150);
         assert_eq!(config.databases, 3);
+    }
+
+    #[test]
+    fn a_value_with_spaces_after_an_equals_sign() {
+        let s = split_of(&["--requirepass=correct horse", "--dir=/data/my dir"]);
+        assert!(native_of(&s).iter().all(|a| !a.contains("--requirepass ")));
+        assert_eq!(
+            native_of(&s),
+            ["--requirepass=correct horse", "--dir=/data/my dir"]
+        );
+        let s = split_of(&["--logfile=/var/log/my app.log", "--dbfilename=a b"]);
+        assert_eq!(native_of(&s), ["--logfile=/var/log/my app.log"]);
+        assert_eq!(s.directives, vec![d("dbfilename", &["a b"])]);
+        let (c, _) = config_of(&["--requirepass=correct horse", "--dir=/data/my dir"]).unwrap();
+        assert_eq!(c.requirepass, "correct horse");
+        assert_eq!(c.dir, "/data/my dir");
+        let (c, _) = config_of(&["--ping", "--requirepass=a b"]).unwrap();
+        assert!(c.ping);
+        assert_eq!(c.requirepass, "a b");
+        // A name with a space before the `=` is a name and a value in one.
+        let s = split_of(&["--save 900 1=x"]);
+        assert_eq!(s.directives, vec![d("save", &["900", "1=x"])]);
+    }
+
+    #[test]
+    fn no_message_prints_a_secret() {
+        let cmd = Config::command();
+        let refused = |args: &[&str]| split(&cmd, argv(args)).unwrap_err();
+        // Too many values for a flag, a bad quote, a name with no directive.
+        for e in [
+            refused(&["--requirepass", "hunter2", "more-hunter2"]),
+            refused(&["--requirepass 'hunter2"]),
+            refused(&["--=hunter2"]),
+        ] {
+            assert!(!e.contains("hunter2"), "{e}");
+        }
+        for args in [
+            &["--frobnicate=hunter2"][..],
+            &["--frobnicate", "hunter2"][..],
+            &["--masterauth", "hunter2", "x"][..],
+        ] {
+            let e = config_of(args).unwrap_err();
+            assert!(!e.contains("hunter2"), "{e}");
+        }
+        // The refusal of a secret's value leaves the value out.
+        let args = vec!["hunter2".to_string()];
+        let e = crate::config::redact(
+            "requirepass",
+            &args,
+            "invalid value 'hunter2' for 'requirepass'".into(),
+        );
+        assert!(!e.contains("hunter2"), "{e}");
+        let e = crate::config::redact("maxmemory", &args, "invalid value 'hunter2'".into());
+        assert!(e.contains("hunter2"));
+        for name in [
+            "requirepass",
+            "masterauth",
+            "masteruser",
+            "tls-key-file-pass",
+            "client-secret",
+        ] {
+            assert!(crate::config::is_secret(name), "{name}");
+        }
+        assert!(!crate::config::is_secret("maxmemory"));
+        // A config text refused: the line is not echoed for a secret.
+        let mut config = Config::default();
+        let e = config
+            .apply_config_text("requirepass hunter2 hunter3\n", &|_| false)
+            .unwrap_err();
+        assert!(!e.contains("hunter"), "{e}");
+    }
+
+    #[test]
+    fn bind_lists_addresses_as_the_config_file_does() {
+        for args in [
+            &["--bind", "127.0.0.1", "::1"][..],
+            &["--bind", "127.0.0.1 ::1"][..],
+        ] {
+            let (c, w) = config_of(args).unwrap();
+            assert_eq!(c.bind, "127.0.0.1");
+            assert_eq!(w.len(), 1, "{w:?}");
+            assert!(
+                w[0].contains(
+                    "'bind' lists 2 addresses; KiviDB listens on one, and uses '127.0.0.1'"
+                ),
+                "{w:?}"
+            );
+        }
+        // The optional-address prefix, as in the config file.
+        let (c, w) = config_of(&["--bind", "-::1"]).unwrap();
+        assert_eq!(c.bind, "::1");
+        assert!(w.is_empty(), "{w:?}");
+        let (c, w) = config_of(&["--bind=10.0.0.1"]).unwrap();
+        assert_eq!(c.bind, "10.0.0.1");
+        assert!(c.bind_explicit && w.is_empty());
+    }
+
+    #[test]
+    fn a_trailing_dash_is_standard_input_not_a_value() {
+        let s = split_of(&["--dir", "-"]);
+        assert!(s.stdin);
+        assert_eq!(native_of(&s), ["--dir"]);
+        assert!(config_of(&["--dir", "-"]).is_err());
+        let e = config_of(&["--dbfilename", "-"]).unwrap_err();
+        assert!(e.contains("needs a value"), "{e}");
+    }
+
+    #[test]
+    fn the_command_lines_of_the_repo_are_read_as_they_were() {
+        let table: &[&[&str]] = &[
+            // docker/refresh/Dockerfile
+            &["--protected-mode", "no"],
+            // packaging/kividb.service
+            &["--configfile", "/etc/kividb/kividb.conf"],
+            // docker/verify/docker-compose*.yml
+            &[
+                "--port",
+                "6380",
+                "--requirepass",
+                "adminpass",
+                "--aclfile",
+                "/etc/kividb/users.acl",
+            ],
+            &[
+                "--port",
+                "6380",
+                "--tls-port",
+                "6390",
+                "--tls-cert-file",
+                "/certs/server.crt",
+                "--tls-key-file",
+                "/certs/server.key",
+                "--requirepass",
+                "adminpass",
+                "--aclfile",
+                "/etc/kividb/users.acl",
+            ],
+            // docs/INSTALL.md, docs/integrations/*.md
+            &["--aof", "--requirepass", "pw"],
+            &[
+                "--port",
+                "6379",
+                "--protected-mode",
+                "no",
+                "--aof",
+                "--maxmemory-policy",
+                "noeviction",
+            ],
+            &[
+                "--port",
+                "6379",
+                "--requirepass",
+                "difyai123456",
+                "--dir",
+                "/data",
+            ],
+            &[
+                "--port",
+                "6379",
+                "--requirepass",
+                "pw",
+                "--aof",
+                "--dir",
+                "/home/kividb",
+            ],
+            &[
+                "--port",
+                "6379",
+                "--requirepass",
+                "pw",
+                "--maxmemory",
+                "1gb",
+            ],
+            &["--protected-mode", "no", "--aof"],
+            &[
+                "--maxmemory-policy",
+                "volatile-lru",
+                "--dir",
+                "/home/kividb",
+            ],
+            // README.md, docs/CONFIGURATION.md
+            &[
+                "--port",
+                "6380",
+                "--tls-port",
+                "6381",
+                "--tls-cert-file",
+                "cert.pem",
+                "--tls-key-file",
+                "key.pem",
+            ],
+            &["--port", "6501", "--io-model", "tokio"],
+            &["--preload-file", "aof:/backups/n1/appendonly.aof.manifest"],
+            &["--preload-file", "rdb:/backups/n1/dump.kdb"],
+            &["--cluster-enabled", "yes"],
+            &["--replicaof", "host", "6379"],
+            &["--threads", "8"],
+            &["--loglevel", "warning"],
+            &["--tls-auth-clients", "no"],
+            &["--tls-auth-clients-allowed-names", "*.db1.example"],
+            &["--tls-cluster", "yes"],
+            &["--ping"],
+            &["--ping", "--ping-port", "6390"],
+        ];
+        for args in table {
+            let s = split_of(args);
+            assert!(
+                s.directives.is_empty(),
+                "{args:?} became {:?}",
+                s.directives
+            );
+            config_of(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+        let (c, _) = config_of(&["--replicaof", "host", "6379"]).unwrap();
+        assert_eq!(
+            c.replicaof,
+            Some(vec!["host".to_string(), "6379".to_string()])
+        );
+        let (c, _) = config_of(&["--protected-mode", "no"]).unwrap();
+        assert!(!c.protected_mode);
+        // `--version` and `--help` stay clap's.
+        assert_eq!(native_of(&split_of(&["--version"])), ["--version"]);
     }
 
     #[test]

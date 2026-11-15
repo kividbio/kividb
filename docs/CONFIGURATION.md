@@ -68,8 +68,11 @@ A directive is read as a config line is, with the same checks: a value that is n
 name that is not known, stops the server at start-up with a message that names it (and the
 closest known name, for a typo). A directive may have several values (`--save 900 1 --save 300
 10`), an empty one (`--save ""`), or one that starts with a dash. The first argument, when it
-does not start with `-`, is a config file, and `-` reads config text from standard input. Names
-are not case-sensitive, and `--name=value` is taken too. A directive that KiviDB accepts but
+does not start with `-`, is a config file, and `-` as the first or the last argument reads config
+text from standard input (so `--dir -` as the last argument is an error, as in Redis). Names are
+not case-sensitive, and `--name=value` is taken too, with spaces in the value (`--dir=/my dir`);
+`redis-server` does not accept that form. `--bind a b` lists two addresses; KiviDB listens on
+one, and warns, as it does for the config file. A directive that KiviDB accepts but
 does not act on (`--save 900 1`, `--tcp-keepalive`, `--io-threads`, ...) logs one warning.
 
 The order of precedence, strongest first: a flag of the table below, a directive on the command

@@ -361,3 +361,60 @@ fn ping_sees_the_port_and_password_of_the_command_line_and_a_config_file() {
     let out = ping(&[file, "--ping", "--port", &port, "--requirepass", "pw"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 }
+
+#[test]
+fn a_value_with_spaces_after_an_equals_sign() {
+    let dir = tempfile::tempdir().unwrap();
+    let spaced = dir.path().join("my dir");
+    std::fs::create_dir(&spaced).unwrap();
+    let dir_arg = format!("--dir={}", spaced.display());
+    let server = start_with(
+        &[
+            "--requirepass=correct horse",
+            &dir_arg,
+            "--logfile=my app.log",
+        ],
+        None,
+    );
+    assert_eq!(
+        server
+            .config(Some("correct horse"), "dir")
+            .trim_end_matches('/'),
+        spaced.to_str().unwrap().trim_end_matches('/')
+    );
+    // The check, with the same password.
+    let port = server.port.to_string();
+    let out = Command::new(BIN)
+        .args(["--ping", "--port", &port, "--requirepass=correct horse"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
+fn no_refusal_prints_a_password() {
+    for args in [
+        &["--requirepass", "hunter2", "more-hunter2"][..],
+        &["--requirepass 'hunter2"][..],
+        &["--frobnicate=hunter2"][..],
+        &["--ping", "--requirepass", "hunter2", "more-hunter2"][..],
+        &["--ping", "--requirepass=hunter2", "--frobnicate", "hunter2"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = stderr(&out);
+        assert!(!err.contains("hunter2"), "{args:?}: {err}");
+        assert!(!err.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn bind_with_several_addresses_warns_as_the_config_file_does() {
+    let server = start_with(&["--bind", "127.0.0.1", "::1"], None);
+    let log = server.log();
+    assert!(
+        log.contains("'bind' lists 2 addresses; KiviDB listens on one, and uses '127.0.0.1'"),
+        "{log}"
+    );
+}

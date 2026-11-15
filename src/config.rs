@@ -1524,7 +1524,15 @@ impl Config {
             match self.apply_directive(&key, args, from_cli) {
                 Ok(Some(warning)) => warnings.push(format!("line {number}: {warning}")),
                 Ok(None) => {}
-                Err(e) => return Err(format!("line {number}: {e} (in: {})", line.trim())),
+                Err(e) => {
+                    let e = redact(&key, args, e);
+                    // The line is echoed unless it may hold a secret.
+                    return Err(if is_secret(&key) {
+                        format!("line {number}: {e}")
+                    } else {
+                        format!("line {number}: {e} (in: {})", line.trim())
+                    });
+                }
             }
         }
         Ok(warnings)
@@ -2049,6 +2057,28 @@ fn refused(key: &str, value: &str, reply: &[u8]) -> String {
     let why = why.trim_end();
     let why = why.strip_prefix("ERR ").unwrap_or(why);
     format!("invalid value '{value}' for '{key}': {why}")
+}
+
+/// Whether a directive's value may be a secret, which no message may print.
+pub(crate) fn is_secret(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["pass", "auth", "secret", "token", "masteruser"]
+        .iter()
+        .any(|part| name.contains(part))
+}
+
+/// `error`, the refusal of directive `name` given `args`, with the values
+/// left out when `name` may hold a secret.
+pub(crate) fn redact(name: &str, args: &[String], error: String) -> String {
+    if is_secret(name)
+        && args
+            .iter()
+            .any(|a| !a.is_empty() && error.contains(a.as_str()))
+    {
+        format!("invalid value for '{name}' (not shown: it may be a secret)")
+    } else {
+        error
+    }
 }
 
 pub(crate) fn split_config_line(line: &str) -> Result<Vec<String>, String> {
