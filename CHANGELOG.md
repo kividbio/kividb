@@ -44,6 +44,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`kividb --ping`, a health check that needs no shell (#433).** The images
+  are distroless, so Compose files and platform templates could not run
+  `redis-cli ping` and had no health check. `["CMD", "kividb", "--ping"]`
+  sends `PING` to the server and exits 0 on `PONG`, 1 otherwise, within about
+  a second. It reads the port, TLS settings and `requirepass` from the command
+  line and config file as the server does, takes the password from
+  `KIVIDB_PASSWORD` first (and an ACL user from `KIVIDB_USER`), and starts no
+  server and touches no data. `--ping-host` and `--ping-port` point it
+  elsewhere; without `tls-ca-cert-file` it speaks TLS only to a server on
+  this host (docs/CONFIGURATION.md, "Health checks"). Thanks to @vikash7485.
 - **`kividb-full` packages, with Lua and TLS, in the apt and dnf
   repositories and the Homebrew tap (#732).** `sudo apt install
   kividb-full`, `sudo dnf install kividb-full` or `brew install
@@ -269,6 +279,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   blocked, so `usec_per_call` stays in microseconds however long a `WAIT`
   waits. Inside `MULTI` they are counted once, when `EXEC` runs them.
   Thanks to @matheussilvano.
+
+- **`HELLO` says `mode: cluster` on a node in cluster mode (#502).** It said
+  `standalone` on every node, so a client that reads it to decide whether to
+  route by slot took a cluster for a single node. On a replica `role` is now
+  `replica`, as in Redis (`ROLE` and `INFO` still say `slave`), and the
+  fallback `HELLO` in the command table has the `id` field and the
+  connection's protocol too. Thanks to @matheussilvano.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,
@@ -1296,6 +1313,11 @@ See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before 
   `MSETEX` are sent with only that one, as `PXAT`: with two, only the first
   was made a `PXAT` and both were sent, so `SET k v EX 10 EX 20` went out as
   `SET k v PXAT <t> EX 20`, and a restart started the 20 seconds over.
+  A record 1.2.0 already wrote keeps doing it under 1.2.1: replaying
+  a 1.2.0 AOF that holds `SET k v PXAT <t> EX 20` gives the key a
+  deadline 20 seconds from the replay, as 1.2.0's own replay did. Run
+  `BGREWRITEAOF` once after upgrading, and the rewritten log holds the
+  deadline alone.
   `GETEX` is sent as the deadline it left (`PEXPIREAT`), `PERSIST`, or
   `DEL`. `GETEX` with an `EXAT` or `PXAT` that has already passed deletes
   the key at once and says `del`, as Redis does, and `GETEX k PERSIST` on a
@@ -1397,6 +1419,16 @@ See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before 
   read it: its time, no other option, no trim. 1.2.1 sends these commands
   with a lower-case `timestamp` and the time right after the value, which
   tells its records from 1.2.0's.
+  - *Mixed versions:* a 1.2.0 replica of a 1.2.1 master applies the same
+    commands the 1.2.0 way: a series its master made with `TS.INCRBY` or
+    `TS.DECRBY` has the defaults and no labels on the replica, and
+    `TS.ADD … ON_DUPLICATE policy LABELS …` on the master is a series
+    with no labels there, so the replica keeps samples the master trims,
+    and `TS.MGET`/`TS.MRANGE` by label miss it. Nothing is lost that
+    1.2.0 itself would keep.
+    Upgrade replicas before their master, as always, and this does not
+    arise; a 1.2.1 replica of a 1.2.0 master reads its records as 1.2.0
+    did.
 
 - **Blocking commands in a script take what is there (#558).** Called from
   a script or a function, `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`,

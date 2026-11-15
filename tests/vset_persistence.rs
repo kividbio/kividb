@@ -383,10 +383,18 @@ fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
     }
 }
 
-fn wait_caught_up(master: &mut Conn, replica: &mut Conn) {
+/// The replica has finished its first sync. What the master wrote before
+/// that comes in its snapshot, which keeps a vector set as it is stored
+/// (`Q8` stays int8); only what is streamed after is stripped of options. A
+/// test of the stripping writes after this, never before.
+fn wait_linked(replica: &mut Conn) {
     wait_until("the replica's link to come up", 30, || {
         replica.info("replication", "master_link_status") == "up"
     });
+}
+
+fn wait_caught_up(master: &mut Conn, replica: &mut Conn) {
+    wait_linked(replica);
     wait_until("the replica to catch up", 60, || {
         let offset = master.info("replication", "master_repl_offset");
         replica.info("replication", "slave_repl_offset") == offset
@@ -1503,6 +1511,7 @@ fn a_backup_on_a_stripping_replica_is_f32() {
     let mut m = old.conn();
     let replica = Server::start(&["--replicaof", "127.0.0.1", &old.port.to_string()]);
     let mut r = replica.conn();
+    wait_linked(&mut r);
     write_to_old(&mut m, 0, "s");
     wait_caught_up(&mut m, &mut r);
     assert!(!r.cmd(&["BACKUP", "START"]).is_err());
@@ -1610,6 +1619,9 @@ fn promotion_does_not_pass_on_stripped_options() {
     let mut r2 = Server::start(&["--replicaof", "127.0.0.1", &mport]);
     let r3 = Server::start(&["--replicaof", "127.0.0.1", &mport]);
     let (mut c1, mut c2, mut c3) = (r1.conn(), r2.conn(), r3.conn());
+    for c in [&mut c1, &mut c2, &mut c3] {
+        wait_linked(c);
+    }
     write_to_old(&mut m, 0, "s");
     for c in [&mut c1, &mut c2, &mut c3] {
         wait_caught_up(&mut m, c);

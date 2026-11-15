@@ -2252,6 +2252,7 @@ pub async fn handle_client(
                                             &args,
                                             &mut resp_version,
                                             &repl_state,
+                                            cluster_state.enabled,
                                         )
                                     } else {
                                         commands::transaction::connection_reply_in_exec(
@@ -2428,7 +2429,12 @@ pub async fn handle_client(
                         key_restricted: &mut key_restricted,
                         cmd_restricted: &mut cmd_restricted,
                     }
-                    .hello(&cmd, &mut resp_version, &repl_state);
+                    .hello(
+                        &cmd,
+                        &mut resp_version,
+                        &repl_state,
+                        cluster_state.enabled,
+                    );
                     // Counted here: the commands below are not.
                     crate::cmdstats::record("HELLO", &cmd, &reply, started.elapsed());
                     out_buf.extend_from_slice(&reply);

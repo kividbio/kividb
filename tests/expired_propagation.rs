@@ -654,19 +654,47 @@ fn a_replica_held_back_past_the_deadline_converges() {
     caught_up(&mut m, &mut r);
 
     assert!(replica.signal("-STOP"));
-    let t = now_ms() + 300;
+    // Every write below must find its key alive. They go out in one
+    // pipeline (400 round trips, each one a chance to be descheduled past
+    // the deadline on a busy machine, otherwise) with seconds to spare; the
+    // test waits for the deadline anyway, below.
+    let t = now_ms() + 3_000;
     let at = t.to_string();
     let later = (now_ms() + 600_000).to_string();
+    let mut writes: Vec<Vec<String>> = Vec::new();
     for i in 0..100 {
         let kept = format!("kept:{i}");
         let gone = format!("gone:{i}");
-        m.ok(&["SET", &kept, "5", "PXAT", &at]);
-        assert_eq!(m.cmd(&["INCR", &kept]).int(), 6);
-        assert_eq!(m.cmd(&["PEXPIREAT", &kept, &later]).int(), 1);
-        m.ok(&["SET", &gone, "5", "PXAT", &at]);
-        assert_eq!(m.cmd(&["INCR", &gone]).int(), 6);
+        for args in [
+            vec!["SET", &kept, "5", "PXAT", &at],
+            vec!["INCR", &kept],
+            vec!["PEXPIREAT", &kept, &later],
+            vec!["SET", &gone, "5", "PXAT", &at],
+            vec!["INCR", &gone],
+        ] {
+            writes.push(args.into_iter().map(String::from).collect());
+        }
     }
-    assert!(now_ms() < t);
+    let commands: Vec<Vec<&str>> = writes
+        .iter()
+        .map(|c| c.iter().map(String::as_str).collect())
+        .collect();
+    let replies = m.pipeline(&commands);
+    let sent_by = now_ms();
+    let want = [
+        V::Simple("OK".into()),
+        V::Int(6),
+        V::Int(1),
+        V::Simple("OK".into()),
+        V::Int(6),
+    ];
+    for (i, reply) in replies.chunks(5).enumerate() {
+        assert_eq!(reply, want, "kept:{i} and gone:{i}");
+    }
+    assert!(
+        sent_by < t,
+        "the writes took until {sent_by}, past the deadline {t}"
+    );
     // The master deletes `gone:*` meanwhile; the replica has not even seen
     // them yet.
     // 100 kept, and caught-up.
