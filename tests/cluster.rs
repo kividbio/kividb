@@ -10650,3 +10650,35 @@ fn hybrid_search_is_refused_across_masters() {
     assert_eq!(fields[0].text(), "total_results", "{reply:?}");
     assert_eq!(fields[1].int(), 1, "{reply:?}");
 }
+
+/// `HELLO` says `mode: cluster` on a node that runs in cluster mode, which
+/// clients read to decide whether to route by slot. On a replica the role is
+/// `replica`.
+#[test]
+fn hello_reports_the_cluster_mode() {
+    let (nodes, _) = form_cluster(3);
+    let field = |reply: &Resp, name: &str| {
+        let fields = reply.array();
+        let at = fields.iter().position(|f| f.text() == name).unwrap();
+        fields[at + 1].text()
+    };
+    let reply = nodes[0].conn().cmd(&["HELLO", "2"]);
+    assert_eq!(field(&reply, "mode"), "cluster", "{reply:?}");
+    let reply = nodes[0].conn().cmd(&["HELLO", "3"]);
+    let (_, value) = reply
+        .map()
+        .iter()
+        .find(|(k, _)| k.text() == "mode")
+        .expect("a mode field");
+    assert_eq!(value.text(), "cluster", "{reply:?}");
+
+    // A replica is in cluster mode too, and HELLO calls its role `replica`
+    // where ROLE still says `slave`, as Redis does.
+    let replica = add_replica(&nodes, &nodes[0]);
+    let reply = replica.conn().cmd(&["HELLO", "2"]);
+    assert_eq!(field(&reply, "mode"), "cluster", "{reply:?}");
+    assert_eq!(field(&reply, "role"), "replica", "{reply:?}");
+    let reply = nodes[0].conn().cmd(&["HELLO", "2"]);
+    assert_eq!(field(&reply, "role"), "master", "{reply:?}");
+    assert_eq!(replica.conn().cmd(&["ROLE"]).array()[0].text(), "slave");
+}

@@ -44,6 +44,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`kividb --ping`, a health check that needs no shell (#433).** The images
+  are distroless, so Compose files and platform templates could not run
+  `redis-cli ping` and had no health check. `["CMD", "kividb", "--ping"]`
+  sends `PING` to the server and exits 0 on `PONG`, 1 otherwise, within about
+  a second. It reads the port, TLS settings and `requirepass` from the command
+  line and config file as the server does, takes the password from
+  `KIVIDB_PASSWORD` first (and an ACL user from `KIVIDB_USER`), and starts no
+  server and touches no data. `--ping-host` and `--ping-port` point it
+  elsewhere; without `tls-ca-cert-file` it speaks TLS only to a server on
+  this host (docs/CONFIGURATION.md, "Health checks"). Thanks to @vikash7485.
 - **`kividb-full` packages, with Lua and TLS, in the apt and dnf
   repositories and the Homebrew tap (#732).** `sudo apt install
   kividb-full`, `sudo dnf install kividb-full` or `brew install
@@ -282,6 +292,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   comes to the promoted node meanwhile is left out of the cleanup for good,
   and `CLUSTER RESET` forgets the imports. A replica or master of an
   earlier release behaves as before: `CLUSTER ORPHANSLOTS` lists the keys.
+
+- **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
+  the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
+  `DISCARD`, `RESET` and `AUTH` were counted with 0 microseconds; they, and
+  now `WAIT` and `WAITAOF`, report the time they took. For the two, as in
+  Redis, that is the work of the call and not the time the client was
+  blocked, so `usec_per_call` stays in microseconds however long a `WAIT`
+  waits. Inside `MULTI` they are counted once, when `EXEC` runs them.
+  Thanks to @matheussilvano.
+
+- **`HELLO` says `mode: cluster` on a node in cluster mode (#502).** It said
+  `standalone` on every node, so a client that reads it to decide whether to
+  route by slot took a cluster for a single node. On a replica `role` is now
+  `replica`, as in Redis (`ROLE` and `INFO` still say `slave`), and the
+  fallback `HELLO` in the command table has the `id` field and the
+  connection's protocol too. Thanks to @matheussilvano.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,

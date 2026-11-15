@@ -115,6 +115,7 @@ impl Login<'_> {
         cmd: &[&[u8]],
         resp_version: &mut u8,
         repl_state: &crate::replication::ReplState,
+        cluster_enabled: bool,
     ) -> Vec<u8> {
         let mut protocol: Option<u8> = None;
         let mut next = 1usize;
@@ -189,7 +190,7 @@ impl Login<'_> {
         // default changed to protocol 3) expect the HELLO reply itself encoded
         // as a `%` map once RESP3 is negotiated; RESP2 stays a flat `*` array
         // of pairs.
-        let role = repl_state.role();
+        let role = repl_state.hello_role();
         // The Redis release this server follows, as `INFO`'s `redis_version`
         // says: clients read these two to know what they may use (#451).
         // KiviDB's own release follows them, as Dragonfly's does, and is
@@ -206,7 +207,11 @@ impl Login<'_> {
             resp_bulk_str("id"),
             resp_integer(self.client_id as i64),
             resp_bulk_str("mode"),
-            resp_bulk_str("standalone"),
+            resp_bulk_str(if cluster_enabled {
+                "cluster"
+            } else {
+                "standalone"
+            }),
             resp_bulk_str("role"),
             resp_bulk_str(&role),
             resp_bulk_str("modules"),

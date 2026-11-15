@@ -4,6 +4,7 @@
 - [Protected mode](#protected-mode)
 - [Configuration](#configuration)
 - [TLS](#tls)
+- [Health checks](#health-checks)
 - [Logs and errors](#logs-and-errors)
 - [Startup update check](#startup-update-check)
 
@@ -138,6 +139,70 @@ does `tls-port` on a node with `tls-cluster yes`.
 without `--tls`) fails the handshake; at `--loglevel verbose` the server logs
 `TLS: handshake failed from <address>`. For
 memtier_benchmark, add `--tls` (and `--tls-skip-verify` for a self-signed certificate).
+
+## Health checks
+
+`kividb --ping` checks that a server is up, with nothing but the binary: the Docker images
+have no shell and no `redis-cli`, so it is the health check to use there, in exec form.
+
+```yaml
+healthcheck:
+  test: ["CMD", "kividb", "--ping"]
+```
+
+It connects to `127.0.0.1` on the server's port, sends `PING`, prints `PONG` and exits **0**
+if the server answers `PONG`. Anything else (no connection, a refused password, an error
+reply, no reply within about a second, or an argument it cannot read) exits **1**, with the
+reason on standard error. It starts no server, writes no log and does not touch the data
+directory.
+
+**It is a separate process.** It does not see the arguments the server was started with (the
+container's `command:` or `args:`), only its own and the config file. A `--port`,
+`--requirepass`, `--dir` or `--tls-*` given to the server must be given to the check too, or
+moved into the config file, which both read:
+
+- **Port**: `--port`, or `port` in the config file. With `--port 0` it connects to
+  `--tls-port` over TLS. `--ping-port` picks another port.
+- **Address**: `127.0.0.1`. If `bind` does not cover loopback (for example `--bind
+  10.0.0.5`), give the check the address with `--ping-host`.
+- **Password**: `KIVIDB_PASSWORD` in the environment, else `requirepass` from the config file
+  or the command line, sent as `AUTH <password>` for the default user. Prefer the environment
+  variable or the config file: an argument shows in `ps` and `docker inspect`. A password the
+  server does not need is ignored. The password goes to whatever `--ping-host` and
+  `--ping-port` point at.
+- **ACL users**: with `KIVIDB_USER` set as well, it sends `AUTH <user> <password>` with
+  `KIVIDB_PASSWORD` (`requirepass` is the default user's, so it is not used). Where an
+  `aclfile` or `ACL SETUSER` turns the default user off, give the check a user of its own that
+  may run `PING` and nothing else, for example `user health on >long-password -@all +ping`,
+  and set `KIVIDB_USER=health` and `KIVIDB_PASSWORD` in its environment.
+- **TLS**: on the TLS port it uses TLS (the `tls` or `full` build). With
+  `--tls-ca-cert-file`, it checks the server's certificate chain against that CA (not the
+  name, as between nodes) and presents `tls-client-cert-file`, or `tls-cert-file`, which
+  `tls-auth-clients yes` asks for. Without a CA file it takes the server's certificate as it
+  is, but only from a server on this host (a loopback address): a server elsewhere needs the
+  CA file, since the password would go to whoever answers. Relative TLS file names are read
+  from `dir`, as the server reads them.
+
+**Kubernetes.** A server opens its ports only once it has loaded its snapshot and append-only
+file, so the check fails while a large dataset loads. Use it as a `readinessProbe`, or as a
+`livenessProbe` together with a `startupProbe` that allows for the load, so that a slow start
+is not taken for a dead server:
+
+```yaml
+startupProbe:
+  exec:
+    command: ["kividb", "--ping"]
+  periodSeconds: 5
+  failureThreshold: 120      # up to 10 minutes to load
+livenessProbe:
+  exec:
+    command: ["kividb", "--ping"]
+  periodSeconds: 10
+readinessProbe:
+  exec:
+    command: ["kividb", "--ping"]
+  periodSeconds: 5
+```
 
 ## Logs and errors
 

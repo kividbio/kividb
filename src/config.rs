@@ -388,6 +388,25 @@ pub struct Config {
     #[arg(long, default_value = crate::update_check::DEFAULT_URL)]
     pub update_check_url: String,
 
+    /// Health check: send PING to the server this configuration describes,
+    /// then exit 0 on PONG and 1 otherwise, within about a second. Starts no
+    /// server. Reads the port, TLS and `requirepass` from the other options
+    /// and the config file; the password in KIVIDB_PASSWORD comes first. For
+    /// images with no shell: `["CMD", "kividb", "--ping"]`. See
+    /// docs/CONFIGURATION.md.
+    #[arg(long)]
+    pub ping: bool,
+
+    /// The address `--ping` connects to.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub ping_host: String,
+
+    /// The port `--ping` connects to; 0 (the default) is `port`, or
+    /// `tls-port` over TLS when `port` is 0. The TLS port is spoken to over
+    /// TLS.
+    #[arg(long, default_value_t = 0)]
+    pub ping_port: u16,
+
     /// Keyspace notification events to publish (empty = disabled).
     #[arg(long, default_value = "")]
     pub notify_keyspace_events: String,
@@ -674,6 +693,9 @@ impl Default for Config {
             tls_client_key_file: String::new(),
             update_check: true,
             update_check_url: crate::update_check::DEFAULT_URL.into(),
+            ping: false,
+            ping_host: "127.0.0.1".into(),
+            ping_port: 0,
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
@@ -803,6 +825,9 @@ impl Config {
             tls_client_key_file: String::new(),
             update_check: false,
             update_check_url: crate::update_check::DEFAULT_URL.into(),
+            ping: false,
+            ping_host: "127.0.0.1".into(),
+            ping_port: 0,
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
