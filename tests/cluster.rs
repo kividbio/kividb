@@ -6839,6 +6839,15 @@ impl CutShort {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(promoted) = self.replicas.iter().position(|r| r.is_master()) {
+                // A master by its own account, but its view of the cluster may
+                // still be down for a moment: a key command then gets
+                // CLUSTERDOWN. Wait until it serves.
+                let node = &self.replicas[promoted];
+                wait_until(
+                    "the promoted replica's cluster to be ok",
+                    Duration::from_secs(60),
+                    || node.cluster_info("cluster_state") == "ok",
+                );
                 return promoted;
             }
             if Instant::now() > deadline {
