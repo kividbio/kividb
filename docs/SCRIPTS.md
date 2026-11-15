@@ -55,6 +55,7 @@ What is still Lua 5.4, with the way to write it so that it works on both:
 | `string.format('%q', 1.5)` writes the float in hexadecimal (`0x1.8p+0`) | `"1.5"` | `string.format('%q', tostring(x))`, or `%s` |
 | `%05s`, `%#s` and `%+s` (flags other than `-` on `%s`) are errors | taken | leave the flag out |
 | `bit` returns unsigned 32-bit numbers (`bit.bnot(0)` is `4294967295`) and `bit.tohex` writes capitals | signed (`-1`), lower case | `bit.tobit(x)` on what you compare, `string.lower(bit.tohex(x))` |
+| A vararg function has no implicit `arg` table: `function f(...) return #arg end` fails with `nonexistent global variable 'arg'` (#820) | `arg` is the table of the extra arguments, with `n` (Lua 5.1 is built with `LUA_COMPAT_VARARG`) | `local arg = {...}`, or `select('#', ...)` for the count |
 
 Moving scripts to Lua 5.1 entirely, so that these go too, is tracked
 separately.
