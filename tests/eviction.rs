@@ -824,11 +824,11 @@ fn restore_keeps_a_keys_idle_time_or_frequency() {
     }
 }
 
-/// With `key-access-tracking yes`, a key's idle time is kept under
-/// `noeviction` too, and only a use of the key resets it: not `TTL`, `TYPE`,
-/// `EXISTS` or `OBJECT` (#21). Off, the default, it is not kept: 0.
+/// By default (`key-access-tracking no`) a key's idle time is not kept under
+/// `noeviction`: 0. `CONFIG SET` can turn it on and off, and only a value that
+/// is yes or no is taken.
 #[test]
-fn key_access_tracking_keeps_idle_time_under_noeviction() {
+fn key_access_tracking_is_off_by_default() {
     let server = Server::start(&[]);
     let mut c = server.conn();
     let get = |c: &mut Conn, name: &str| match c.cmd(&["CONFIG", "GET", name]) {
@@ -844,8 +844,25 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
         c.cmd(&["CONFIG", "SET", "key-access-tracking", "maybe"])
             .is_err()
     );
-
     assert!(c.cmd(&["CONFIG", "SET", "key-access-tracking", "yes"]).ok());
+    assert_eq!(get(&mut c, "key-access-tracking"), "yes");
+    assert!(c.cmd(&["CONFIG", "SET", "key-access-tracking", "no"]).ok());
+    assert_eq!(get(&mut c, "key-access-tracking"), "no");
+}
+
+/// With `key-access-tracking yes`, a key's idle time is kept under
+/// `noeviction` too, and only a use of the key resets it: not `TTL`, `TYPE`,
+/// `EXISTS` or `OBJECT` (#21).
+#[test]
+fn key_access_tracking_keeps_idle_time_under_noeviction() {
+    let get = |c: &mut Conn, name: &str| match c.cmd(&["CONFIG", "GET", name]) {
+        V::Arr(row) => row[1].s().to_string(),
+        other => panic!("{other:?}"),
+    };
+
+    let server = Server::start(&["--key-access-tracking", "yes"]);
+    let mut c = server.conn();
+    assert_eq!(get(&mut c, "maxmemory-policy"), "noeviction");
     assert_eq!(get(&mut c, "key-access-tracking"), "yes");
     assert!(c.cmd(&["SET", "foo", "bar"]).ok());
     assert!(c.cmd(&["SET", "other", "bar"]).ok());
@@ -867,6 +884,61 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
         c.cmd(&["OBJECT", "IDLETIME", "other"]).i() < 2,
         "GET uses it"
     );
+    // As in Redis 8.10.2: no count under a policy that is not LFU, and a
+    // missing key has neither.
+    assert!(
+        c.cmd(&["OBJECT", "FREQ", "foo"])
+            .s()
+            .starts_with("ERR An LFU maxmemory policy is not selected")
+    );
+    assert_eq!(c.cmd(&["OBJECT", "IDLETIME", "nokey"]), V::Nil);
+}
+
+/// `RESTORE ... IDLETIME` and `FREQ`, and what `OBJECT IDLETIME` and `FREQ`
+/// then say, with `key-access-tracking yes` under `noeviction`, as Redis 8.10.2 answers
+/// them (#21). `IDLETIME` is kept; `FREQ` is a count, and there is none
+/// without an LFU policy, so it is ignored, as Redis ignores it.
+#[test]
+fn restore_idle_time_and_frequency_under_noeviction_with_tracking_on() {
+    let server = Server::start(&["--key-access-tracking", "yes"]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+    let payload = c.dump("foo");
+    c.cmd(&["DEL", "foo"]);
+
+    assert!(c.restore("foo", &payload, &["IDLETIME", "1000"]).ok());
+    let idle = c.cmd(&["OBJECT", "IDLETIME", "foo"]).i();
+    assert!((1000..=1010).contains(&idle), "idle {idle}");
+    assert_eq!(c.cmd(&["GET", "foo"]).s(), "bar");
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+        "a read uses it"
+    );
+
+    // FREQ under noeviction: accepted, not applied; the key is new.
+    c.cmd(&["DEL", "foo"]);
+    assert!(c.restore("foo", &payload, &["FREQ", "100"]).ok());
+    assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2);
+
+    // With an LFU policy it is the count, and there is no idle time.
+    assert!(
+        c.cmd(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"])
+            .ok()
+    );
+    c.cmd(&["DEL", "foo"]);
+    assert!(c.restore("foo", &payload, &["FREQ", "100"]).ok());
+    let freq = c.cmd(&["OBJECT", "FREQ", "foo"]).i();
+    // 99 if a minute turned between the two: the count decays by one a minute.
+    assert!((99..=100).contains(&freq), "freq {freq}");
+    assert!(
+        c.cmd(&["OBJECT", "IDLETIME", "foo"])
+            .s()
+            .starts_with("ERR An LFU maxmemory policy is selected, idle time not tracked")
+    );
+    // IDLETIME under LFU is ignored: the key starts at the initial count.
+    c.cmd(&["DEL", "foo"]);
+    assert!(c.restore("foo", &payload, &["IDLETIME", "1000"]).ok());
+    assert_eq!(c.cmd(&["OBJECT", "FREQ", "foo"]).i(), 5);
 }
 
 /// `CONFIG SET maxmemory-policy` between the LRU and LFU kinds at runtime:

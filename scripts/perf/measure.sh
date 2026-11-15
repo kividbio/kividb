@@ -7,9 +7,15 @@
 # command: read, parse, execute, reply, write.
 # Env: N (100000), P (16), MODEL (tokio), PROFILE=<tag> prints that tag's
 # hottest functions for each workload into /out/profile-<workload>.txt
+# WORKLOADS=lists adds LPUSH, RPUSH and LPOP (full adds them too).
 # WORKLOADS=full adds INCR and DEL, and GET, SET, INCR and DEL with a TTL on
 # every key and under allkeys-lru, and GET, SET and INCR under allkeys-lfu
 # (the memory redesign's matrix).
+# WORKLOADS=access runs, for each tag, the commands that matter for
+# `key-access-tracking` with it off and on (both explicit, so the result does
+# not depend on the default): GET and SET with 100 B and 1 KB values,
+# pipelined (-P 16) and not (-P 1); and pipelined INCR, HGET, LPUSH, LPOP and
+# a 16-key MGET. Labels end in -no / -yes.
 set -u
 N=${N:-100000} P=${P:-16} MODEL=${MODEL:-tokio} PORT=6400
 mkdir -p /out
@@ -18,7 +24,9 @@ mkdir -p /out
 # the command in PRELOAD (redis-benchmark's own arguments, __rand_int__ and
 # all). SERVER_EXTRA goes on the server's command line.
 one() { # tag, label, redis-benchmark args...
-  local tag=$1 label=$2; shift 2
+  local tag=$1 label=$2 P=${PIPE:-$P}; shift 2
+  # ONLY=<regex> measures just the workloads whose label matches it.
+  if [ -n "${ONLY:-}" ] && ! [[ $label =~ $ONLY ]]; then return; fi
   rm -rf /tmp/hp && mkdir -p /tmp/hp && cd /tmp/hp
   # shellcheck disable=SC2086
   valgrind --tool=callgrind --instr-atstart=no --callgrind-out-file=/tmp/hp/out \
@@ -55,12 +63,42 @@ one() { # tag, label, redis-benchmark args...
 V100=$(printf 'x%.0s' $(seq 100))
 LRU="--maxmemory 64gb --maxmemory-policy allkeys-lru"
 LFU="--maxmemory 64gb --maxmemory-policy allkeys-lfu"
+if [ "${WORKLOADS:-}" = access ]; then
+  for tag in "$@"; do
+    for mode in no yes; do
+      export SERVER_EXTRA="--key-access-tracking $mode"
+      for pipe in 16 1; do
+        export PIPE=$pipe
+        DSIZE=100;  one "$tag" "GET-100-p$pipe-$mode" -d 100  -t get
+        DSIZE=100;  one "$tag" "SET-100-p$pipe-$mode" -d 100  -t set
+        DSIZE=1024; one "$tag" "GET-1K-p$pipe-$mode"  -d 1024 -t get
+        DSIZE=1024; one "$tag" "SET-1K-p$pipe-$mode"  -d 1024 -t set
+      done
+      export PIPE=16
+      PRELOAD="SET counter:__rand_int__ 0" DSIZE=100 one "$tag" "INCR-$mode" -t incr
+      PRELOAD="HSET hash:__rand_int__ f v" DSIZE=100 one "$tag" "HGET-$mode" HGET hash:__rand_int__ f
+      DSIZE=100 one "$tag" "LPUSH-$mode" LPUSH list:__rand_int__ x
+      PRELOAD="LPUSH list:__rand_int__ x" PRELOAD_N=400000 DSIZE=100 one "$tag" "LPOP-$mode" LPOP list:__rand_int__
+      K="key:__rand_int__"
+      DSIZE=100 one "$tag" "MGET16-$mode" MGET $K $K $K $K $K $K $K $K $K $K $K $K $K $K $K $K
+    done
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
 for tag in "$@"; do
   DSIZE=100;  one "$tag" GET-100  -d 100  -t get
   DSIZE=100;  one "$tag" SET-100  -d 100  -t set
   DSIZE=1024; one "$tag" GET-1K   -d 1024 -t get
   DSIZE=1024; one "$tag" SET-1K   -d 1024 -t set
   DSIZE=100;  one "$tag" MIX-100  -d 100  -t set,get
+  if [ "${WORKLOADS:-}" = full ] || [ "${WORKLOADS:-}" = lists ]; then
+    # One list (redis-benchmark's mylist), nobody blocked on it: the cost a
+    # push or a pop pays for the blocking commands' lines when none waits.
+    DSIZE=100; one "$tag" LPUSH -d 100 -t lpush
+    DSIZE=100; one "$tag" RPUSH -d 100 -t rpush
+    PRELOAD="-d 100 -t lpush" PRELOAD_N=200000 DSIZE=100 one "$tag" LPOP -d 100 -t lpop
+  fi
   if [ "${WORKLOADS:-}" = full ]; then
     # INCR's keys are counter:<n>; DEL runs on 200,000 loaded keys, so most
     # of the 60,000 it measures find their key (about four in five).

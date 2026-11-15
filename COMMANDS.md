@@ -894,7 +894,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `MEMORY MALLOC-STATS` | `MEMORY MALLOC-STATS` | Allocator statistics (minimal) |
 | `MEMORY PURGE` | `MEMORY PURGE` | Ask the allocator to return free memory; replies `OK` |
 | `MEMORY HELP` | `MEMORY HELP` | List the `MEMORY` subcommands |
-| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 unless an LRU or LFU policy (or `key-access-tracking`) is on. `ERR no such key` for a missing key |
+| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 unless an LRU or LFU policy (or `key-access-tracking yes`) is on. `ERR no such key` for a missing key |
 | `DEBUG SET-ACTIVE-EXPIRE` | `DEBUG SET-ACTIVE-EXPIRE 0\|1` | Stop or restart the background expiry of keys and hash fields. Keys past their time still go when read. Process-wide, and on again after a restart |
 | `DEBUG PAUSE-CRON` | `DEBUG PAUSE-CRON 0\|1` | Pause or resume the background expiry, as in Redis, where it runs inside the cron |
 | `DEBUG SLEEP` | `DEBUG SLEEP seconds` | Block this connection's worker thread for `seconds` |
@@ -1297,6 +1297,56 @@ the node reports them, and an operator deletes them:
   and is not importing or migrating it, then, batch by batch, which of
   these keys it has. Keys it does not have are kept, counted, and still
   listed by `CLUSTER ORPHANSLOTS`; they are not this command's to delete.
+
+One case is cleaned up on its own, because the node knows exactly which
+keys are stale: a replica promoted after its master died part way through
+a `CLUSTER MIGRATION IMPORT` (#741). A master tells the replicas that ask
+for it (`REPLCONF capa slot-imports`) which imports it has under way, and
+of which of their slots it held keys before each began. That message
+(`KIVIDB.IMPORTS LIVE|SYNC [<task-id> <slots> <kept>] ...`) is not part of
+the replication stream: no offset counts it, and no backlog, AOF or
+snapshot holds it, and a replica of an earlier release never asks for it
+and is never sent it. The replica notes its own keys of the slots at the
+moment its master looked at its own, and writes the slots down beside the
+cluster config (`<cluster-config-file>.followed-imports`; slots only, no
+key names). Promoted with an import still listed:
+
+- It deletes what the import brought: every key of a slot of which nothing
+  was held before, and in the others the keys not held before. Never a
+  key that was there before the import, and never one of a slot it owns.
+- Only once nothing on this node is importing, migrating or deleting the
+  slot, the slot's owner is a master it sees as up, and that owner, asked
+  directly (`CLUSTER SYNCSLOTS ORPHANCHECK`), owns the slot and is not
+  moving it. The owner is asked again before each batch of keys is
+  deleted (`ORPHANKEYS`). The deletes go through the write path, so they
+  reach its replicas and AOF; a replica never deletes on its own.
+- It stops if the node becomes a replica, and tries again every second
+  otherwise. A replica of it promoted next carries it on. The log says
+  why it waits, and `INFO cluster` reports how many slots are left
+  (`cluster_import_cleanup_slots`). Meanwhile a `CLUSTER MIGRATION IMPORT`
+  of those slots is refused: kept beside what it brings, keys the source
+  deleted since would be served again.
+- A replica that did not see the import begin (attached part way, sent the
+  dataset in full, or restarted) knows only which slots had keys before,
+  and keeps every key of those.
+- An import its master completed is not cleaned up once the replica has
+  heard it end (the master's next marker no longer lists it), whatever the
+  promoted node's slot table says: its keys may be the slots' only copy. If
+  the master died after taking the slots but before that marker reached the
+  replica, the owner check protects them: the source, told the slots were
+  taken, no longer owns them and says so, and nothing is deleted; if it was
+  never told, it still has them all.
+- A slot that comes to the promoted node (`CLUSTER ADDSLOTS`, `SETSLOT
+  IMPORTING` or `NODE`, an import, a failover) is left out of the cleanup
+  for good, even once it leaves again: keys written to it meanwhile are
+  acknowledged writes. After a restart, whether a slot was the node's
+  before it is not known, so of an import read back from disk only the
+  keys the owner has are deleted.
+- `CLUSTER RESET` forgets the imports: the node is no longer that master's
+  replica, nor in that cluster, and their keys are left as they are.
+- If the owner runs an earlier release, which cannot be asked, or the
+  replica or its master does, the keys are left as an earlier release
+  left them, for `CLUSTER DROPORPHANS`.
 
 | Command | Syntax | Notes |
 |---|---|---|

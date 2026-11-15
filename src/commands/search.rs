@@ -1063,8 +1063,9 @@ pub(crate) fn plan(
     def: &IndexDef,
     filter: &Filter,
     only: Option<&AHashSet<String>>,
+    now: &crate::types::QueryClock,
 ) -> Option<Plan> {
-    plan_in(ctx.store, *ctx.selected_db, def, filter, only)
+    plan_in(ctx.store, *ctx.selected_db, def, filter, only, now)
 }
 
 /// [`plan`], for database `db` of `store`.
@@ -1074,6 +1075,7 @@ fn plan_in(
     def: &IndexDef,
     filter: &Filter,
     only: Option<&AHashSet<String>>,
+    now: &crate::types::QueryClock,
 ) -> Option<Plan> {
     // The postings are of the index's own database's documents.
     if !def.keeps_postings() || def.db_index != db {
@@ -1129,7 +1131,9 @@ fn plan_in(
     let any_volatile = !volatile.is_empty();
     for (key, id) in volatile {
         if exact {
-            let matches = with_doc(store, def, &key, |fields, _| filter::eval(filter, fields));
+            let matches = with_doc(store, def, &key, now, |fields, _| {
+                filter::eval(filter, fields)
+            });
             if matches == Some(true) {
                 ids.set(id);
             } else {
@@ -1173,18 +1177,27 @@ pub(crate) fn filter_search_scored(
     filter: &Filter,
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
+    now: &crate::types::QueryClock,
     scorer: crate::vector::score::Scorer,
 ) -> FilterHits {
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
-    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields, json| {
-        out.push(Match {
-            key: key.to_string(),
-            score: relevance(def, key, fields, &scoring, json),
-            distance: range.and_then(|clause| filter::range_distance(clause, fields)),
-        });
-    });
+    let timed_out = filter_each(
+        ctx,
+        def,
+        filter,
+        only,
+        deadline,
+        now,
+        |key, fields, json| {
+            out.push(Match {
+                key: key.to_string(),
+                score: relevance(def, key, fields, &scoring, json),
+                distance: range.and_then(|clause| filter::range_distance(clause, fields)),
+            });
+        },
+    );
     FilterHits {
         matches: out,
         timed_out,
@@ -1201,6 +1214,7 @@ pub(crate) fn filter_each(
     filter: &Filter,
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
+    now: &crate::types::QueryClock,
     mut accept: impl FnMut(&str, &Fields, Option<&serde_json::Value>),
 ) -> bool {
     let db = &ctx.store[*ctx.selected_db];
@@ -1208,13 +1222,13 @@ pub(crate) fn filter_each(
 
     // From postings, if they narrow the filter: the documents they name, each
     // read only to hand it over, or to try it where they are not exact.
-    if let Some(plan) = plan(ctx, def, filter, only) {
+    if let Some(plan) = plan(ctx, def, filter, only, now) {
         let mut seen = 0u32;
         for key in keys_of(def, &plan.ids) {
             if deadline_due(deadline, &mut seen) {
                 return true;
             }
-            with_doc(db, def, &key, |fields, json| {
+            with_doc(db, def, &key, now, |fields, json| {
                 if plan.exact || filter::eval(filter, fields) {
                     accept(&key, fields, json);
                 }
@@ -1296,7 +1310,7 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     continue;
                 }
-                with_doc(db, def, key, |fields, json| {
+                with_doc(db, def, key, now, |fields, json| {
                     if *matches || filter::eval(filter, fields) {
                         accept(key, fields, json);
                     }
@@ -1308,7 +1322,9 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     return;
                 }
-                if let Some(fields) = crate::vector::query_doc_fields(&def.on, &def.fields, value) {
+                if let Some(fields) =
+                    crate::vector::query_doc_fields(&def.on, &def.fields, value, now)
+                {
                     let json = fields.json();
                     consider(key, &fields, json);
                 }
@@ -1334,7 +1350,12 @@ fn holds_document(db: &Db, def: &IndexDef, key: &str) -> bool {
 /// out. A vector index holds such a field's vector until the removal
 /// reindexes the hash, so a nearest-neighbour search asks this of its hits.
 /// The shard is let go before the hash is read, as in `with_doc`.
-pub(crate) fn field_hidden(db: &Db, key: &str, field: &str) -> bool {
+pub(crate) fn field_hidden(
+    db: &Db,
+    key: &str,
+    field: &str,
+    now: &crate::types::QueryClock,
+) -> bool {
     if !crate::field_expiry::any_watched() {
         return false;
     }
@@ -1346,15 +1367,18 @@ pub(crate) fn field_hidden(db: &Db, key: &str, field: &str) -> bool {
     let Some(KiviDBValue::HashEx(hash)) = value else {
         return false;
     };
-    hash.read().hides(field, crate::types::field_now())
+    hash.read().hides(field, now.get())
 }
 
 /// Run `f` on the document at `key`, if there is one of the kind the index
-/// covers: on its fields, and for a JSON document on the document too.
+/// covers: on its fields, and for a JSON document on the document too. `now`
+/// is the moment the query judges field deadlines by, read once per query
+/// (`types::field_now`), so that it sees every document at the same moment.
 pub(crate) fn with_doc<R>(
     db: &Db,
     def: &IndexDef,
     key: &str,
+    now: &crate::types::QueryClock,
     f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
 ) -> Option<R> {
     // Out of the shard, so that its lock is not held while `f` runs. A key
@@ -1374,7 +1398,7 @@ pub(crate) fn with_doc<R>(
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
         (IndexOn::Hash, KiviDBValue::HashEx(hash)) => {
             let hash = hash.read();
-            let shown = hash.shown(crate::types::field_now());
+            let shown = hash.shown(now.get());
             // Every field due: no document, as HGETALL shows it empty.
             if shown.is_empty() {
                 return None;
@@ -1508,6 +1532,7 @@ fn page_from_postings(
     filter: &Filter,
     args: &SearchArgs,
     deadline: Option<Instant>,
+    now: &crate::types::QueryClock,
 ) -> Option<Posted> {
     // A distance is no part of the postings.
     if filter.vector_range().is_some() {
@@ -1542,7 +1567,7 @@ fn page_from_postings(
     if def.postings.peek().read_all {
         return None;
     }
-    let plan = plan(ctx, def, filter, args.inkeys.as_ref())?;
+    let plan = plan(ctx, def, filter, args.inkeys.as_ref(), now)?;
     // Exactly the matches. Ordered by a number, with the numbers the
     // documents hold, which a field's time to live may have taken away.
     if !plan.exact || (plan.volatile && numeric.is_some()) {
@@ -1641,7 +1666,7 @@ fn page_from_postings(
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let mut page = Vec::with_capacity(picked.len());
     for (key, number) in picked {
-        let hit = with_doc(db, def, &key, |fields, json| {
+        let hit = with_doc(db, def, &key, now, |fields, json| {
             if !filter::eval(filter, fields) {
                 return None;
             }
@@ -2184,6 +2209,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         std::str::from_utf8(cmd[2]).map_err(|_| "The query must be valid UTF-8".to_string())?;
     let args = parse_search_args(cmd, 3)?;
     let deadline = search_deadline(args.timeout_ms);
+    // One moment for the whole query to judge field deadlines by.
+    let clock = crate::types::QueryClock::new();
+    let now = &clock;
 
     let def = ctx
         .index_store
@@ -2244,7 +2272,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     // ── The page, from postings, where they know it ─────────────────────────
     let posted = match &query.knn {
         Some(_) => None,
-        None => page_from_postings(ctx, &def, &filter, &args, deadline),
+        None => page_from_postings(ctx, &def, &filter, &args, deadline, now),
     };
 
     // ── Otherwise every match, in the query's own order ─────────────────────
@@ -2268,7 +2296,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 // The nearest `k` whose vector field the query sees: one
                 // past its deadline is left out, and more are asked for.
                 let nearest_of = |k: usize| {
-                    crate::commands::vector::nearest_shown(db, &knn.field, k, |k| match live {
+                    crate::commands::vector::nearest_shown(db, &knn.field, k, now, |k| match live {
                         LiveIndex::Flat(index) => {
                             crate::vector::knn_flat(index, &knn.vector, k, metric)
                         }
@@ -2312,6 +2340,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 knn,
                 field,
                 deadline,
+                now,
             ) {
                 // The documents the filter matches, from postings: see
                 // `knn_planned`.
@@ -2329,6 +2358,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                     &filter,
                     args.inkeys.as_ref(),
                     deadline,
+                    now,
                     // Measured only if the query sees the vector field: a
                     // hash's past its deadline is left out of `fields`.
                     |key, fields, json| {
@@ -2358,8 +2388,15 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             let scorer = args
                 .scorer
                 .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
-            let found =
-                filter_search_scored(ctx, &def, &filter, args.inkeys.as_ref(), deadline, scorer);
+            let found = filter_search_scored(
+                ctx,
+                &def,
+                &filter,
+                args.inkeys.as_ref(),
+                deadline,
+                now,
+                scorer,
+            );
             timed_out = found.timed_out;
             let mut matches = found.matches;
             // A sort cannot stop part-way. Past the deadline it is left
@@ -2433,7 +2470,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             // holds.
             hit.sort_key = match hit.extras.iter().find(|(alias, _)| alias == name) {
                 Some((_, value)) => value.parse::<f64>().ok().map(SortKey::Number),
-                None => with_doc(db, &def, &hit.key, |fields, _| {
+                None => with_doc(db, &def, &hit.key, now, |fields, _| {
                     sort_key_of(fields, source, numeric, unf)
                 })
                 .flatten(),
@@ -2509,7 +2546,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .map(|(alias, value)| (alias.clone(), value.clone().into_bytes()))
                 .collect()
         };
-        with_doc(db, &def, &hit.key, |fields, json| {
+        with_doc(db, &def, &hit.key, now, |fields, json| {
             match (&args.returns, json) {
                 (Some(returns), _) => returns
                     .iter()
@@ -2964,7 +3001,15 @@ mod tests {
                 .map(|key| key.to_string())
                 .collect()
         };
-        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        let plan = plan_in(
+            &store,
+            0,
+            &def,
+            &filter,
+            None,
+            &crate::types::QueryClock::new(),
+        )
+        .unwrap();
         assert!(plan.exact);
         assert_eq!(matches(&plan), ["d347:a"], "a watched hash is tried");
 
@@ -2973,7 +3018,15 @@ mod tests {
         crate::test_hooks::set("plan: postings read", move || {
             crate::field_expiry::sweep(&s, &i)
         });
-        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        let plan = plan_in(
+            &store,
+            0,
+            &def,
+            &filter,
+            None,
+            &crate::types::QueryClock::new(),
+        )
+        .unwrap();
         assert!(
             crate::field_expiry::watched_keys(&store, 0).is_empty(),
             "the sweep ran, and the hash is no longer watched"

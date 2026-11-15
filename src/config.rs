@@ -79,6 +79,7 @@ const VERSION: &str = concat!(
 #[command(
     name = "kividb",
     about = "Fast Redis-compatible store",
+    after_help = "Any other configuration directive (see CONFIG GET *) is accepted as `--<directive> <value>`, as redis-server takes it: --appendonly yes --save \"900 1\". A flag above wins over the same directive; a directive wins over the config file.",
     version = VERSION,
     author = env!("CARGO_PKG_AUTHORS")
 )]
@@ -177,8 +178,9 @@ pub struct Config {
     pub lfu_log_factor: u32,
 
     /// Record every key's use whatever the eviction policy, so that `OBJECT
-    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too. Costs
-    /// every command a little: see `eviction::key_access_tracking`.
+    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too, as
+    /// Redis's do. Off by default: it costs every command about 50
+    /// instructions, see `eviction::key_access_tracking`.
     #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args = 1)]
     pub key_access_tracking: bool,
 
@@ -387,6 +389,25 @@ pub struct Config {
     /// the newest release's tag (https:// only).
     #[arg(long, default_value = crate::update_check::DEFAULT_URL)]
     pub update_check_url: String,
+
+    /// Health check: send PING to the server this configuration describes,
+    /// then exit 0 on PONG and 1 otherwise, within about a second. Starts no
+    /// server. Reads the port, TLS and `requirepass` from the other options
+    /// and the config file; the password in KIVIDB_PASSWORD comes first. For
+    /// images with no shell: `["CMD", "kividb", "--ping"]`. See
+    /// docs/CONFIGURATION.md.
+    #[arg(long)]
+    pub ping: bool,
+
+    /// The address `--ping` connects to.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub ping_host: String,
+
+    /// The port `--ping` connects to; 0 (the default) is `port`, or
+    /// `tls-port` over TLS when `port` is 0. The TLS port is spoken to over
+    /// TLS.
+    #[arg(long, default_value_t = 0)]
+    pub ping_port: u16,
 
     /// Keyspace notification events to publish (empty = disabled).
     #[arg(long, default_value = "")]
@@ -674,6 +695,9 @@ impl Default for Config {
             tls_client_key_file: String::new(),
             update_check: true,
             update_check_url: crate::update_check::DEFAULT_URL.into(),
+            ping: false,
+            ping_host: "127.0.0.1".into(),
+            ping_port: 0,
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
@@ -803,6 +827,9 @@ impl Config {
             tls_client_key_file: String::new(),
             update_check: false,
             update_check_url: crate::update_check::DEFAULT_URL.into(),
+            ping: false,
+            ping_host: "127.0.0.1".into(),
+            ping_port: 0,
             notify_keyspace_events: String::new(),
             repl_replica_max_backlog_bytes: 268_435_456,
             repl_replica_sync_max_backlog_bytes: 1_073_741_824,
@@ -1497,14 +1524,22 @@ impl Config {
             match self.apply_directive(&key, args, from_cli) {
                 Ok(Some(warning)) => warnings.push(format!("line {number}: {warning}")),
                 Ok(None) => {}
-                Err(e) => return Err(format!("line {number}: {e} (in: {})", line.trim())),
+                Err(e) => {
+                    let e = redact(&key, args, e);
+                    // The line is echoed unless it may hold a secret.
+                    return Err(if is_secret(&key) {
+                        format!("line {number}: {e}")
+                    } else {
+                        format!("line {number}: {e} (in: {})", line.trim())
+                    });
+                }
             }
         }
         Ok(warnings)
     }
 
     /// Apply one directive. `Ok(Some(_))` is a warning about it.
-    fn apply_directive(
+    pub(crate) fn apply_directive(
         &mut self,
         key: &str,
         args: &[String],
@@ -2024,7 +2059,29 @@ fn refused(key: &str, value: &str, reply: &[u8]) -> String {
     format!("invalid value '{value}' for '{key}': {why}")
 }
 
-fn split_config_line(line: &str) -> Result<Vec<String>, String> {
+/// Whether a directive's value may be a secret, which no message may print.
+pub(crate) fn is_secret(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["pass", "auth", "secret", "token", "masteruser"]
+        .iter()
+        .any(|part| name.contains(part))
+}
+
+/// `error`, the refusal of directive `name` given `args`, with the values
+/// left out when `name` may hold a secret.
+pub(crate) fn redact(name: &str, args: &[String], error: String) -> String {
+    if is_secret(name)
+        && args
+            .iter()
+            .any(|a| !a.is_empty() && error.contains(a.as_str()))
+    {
+        format!("invalid value for '{name}' (not shown: it may be a secret)")
+    } else {
+        error
+    }
+}
+
+pub(crate) fn split_config_line(line: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut chars = line.chars().peekable();
     loop {

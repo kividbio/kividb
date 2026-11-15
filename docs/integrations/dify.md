@@ -8,8 +8,7 @@ service for **`kividb/kividb:v1.2.0-lua`** and keep everything else.
 **Checked:** with Dify `1.19.0`'s own docker-compose, the end-to-end harness passes 33 of 33 checks on
 KiviDB, the same 33 that pass on Redis 8 (23 of 33 on the default image, without Lua). Dify's own Redis
 tests pass 42 of 43 on KiviDB, against 43 on Redis 8; the one that does not is the cluster-mode test, which stops on
-two start-up differences filed as [#390](https://github.com/kividbio/kividb/issues/390) and
-[#391](https://github.com/kividbio/kividb/issues/391). The harness, how to run it, and the raw results of
+a start-up difference filed as [#391](https://github.com/kividbio/kividb/issues/391). The harness, how to run it, and the raw results of
 each run (`results-*.json`, one line per check) are in
 [benchmarks/dify-compat](../../benchmarks/dify-compat/).
 
@@ -71,10 +70,8 @@ logged as they happen. See [PERSISTENCE.md](../PERSISTENCE.md).
 - **Not tested:** Redis Sentinel (`REDIS_USE_SENTINEL`), Redis Cluster (`REDIS_USE_CLUSTERS`), TLS
   (`REDIS_USE_SSL`), and the opt-in KnowledgeFS services. The agent backend and the collaboration
   websocket server start and connect, but no agent app or live collaboration session is run.
-- **Cluster mode:** Dify's own cluster-mode test starts its server with `--appendonly no`, which KiviDB's
-  command line refuses ([#390](https://github.com/kividbio/kividb/issues/390)), and then sets
-  `cluster-announce-ip` with `CONFIG SET`, which KiviDB allows only at start-up
-  ([#391](https://github.com/kividbio/kividb/issues/391)).
+- **Cluster mode:** Dify's own cluster-mode test sets `cluster-announce-ip` with `CONFIG SET`, which
+  KiviDB allows only at start-up ([#391](https://github.com/kividbio/kividb/issues/391)).
 - **Models:** the harness points Dify's OpenAI-API-compatible plugin at a local stub for the chat and
   embedding models. It proves the wiring, not a model's results.
 - **Scale is not tested:** a handful of apps, runs and documents, and no timing figures.

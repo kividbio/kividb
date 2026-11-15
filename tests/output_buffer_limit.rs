@@ -16,6 +16,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod common;
+use common::start_verified;
+
 const MB: usize = 1 << 20;
 
 /// One test at a time: see the top of the file.
@@ -170,25 +173,6 @@ struct Server {
     dir: std::path::PathBuf,
 }
 
-fn port_is_free(port: u16) -> bool {
-    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-}
-
-/// A port nothing listens on, outside the range handed out to outgoing
-/// connections (see `tests/uring.rs`).
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(37);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 /// The I/O models to run a test on: the tokio loop, and on Linux the
 /// io_uring one too.
 fn io_models() -> &'static [&'static str] {
@@ -227,33 +211,37 @@ impl Server {
         with_config: bool,
         extra: &[&str],
     ) -> Self {
-        let port = free_port();
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("server.log"))
-            .unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kividb"));
-        command.current_dir(&dir).args([
-            "--port",
-            &port.to_string(),
-            "--bind",
-            "127.0.0.1",
-            "--io-model",
-            io_model,
-            "--threads",
-            "2",
-        ]);
-        if with_config {
-            command.args(["--configfile", "kividb.conf"]);
-        }
-        command.args(extra);
-        let child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("could not start kividb");
+        // Verified to be the process started, also on a restart from the same
+        // directory (a port is free between a server's exit and the next
+        // start, and another test's server can take it): see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| {
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("server.log"))
+                .unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_kividb"));
+            command.current_dir(&dir).args([
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--io-model",
+                io_model,
+                "--threads",
+                "2",
+            ]);
+            if with_config {
+                command.args(["--configfile", "kividb.conf"]);
+            }
+            command.args(extra);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .expect("could not start kividb")
+        });
         let server = Server { port, child, dir };
         assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
         server

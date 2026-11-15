@@ -39,6 +39,8 @@ pub async fn handle_replica_connection_uring(
     psync: Option<crate::replication::PsyncRequest>,
     // It sent `REPLCONF capa vset-quant`.
     vset_quant_announced: bool,
+    // It sent `REPLCONF capa slot-imports`.
+    slot_imports_announced: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
@@ -75,6 +77,7 @@ pub async fn handle_replica_connection_uring(
         peer_port,
         tx: replica_tx,
         pending_bytes: Arc::clone(&pending_bytes),
+        slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
@@ -116,10 +119,10 @@ pub async fn handle_replica_connection_uring(
     };
 
     // ── 3. `+CONTINUE`, or `+FULLRESYNC` (omitted for legacy `SYNC`) ──────
-    let word = repl_state.vset_quant_word(vset_quant_announced);
+    let word = repl_state.psync_words(vset_quant_announced, slot_imports_announced);
     let greeting = match &full_sync {
         None => Some(format!("+CONTINUE {}{word}\r\n", repl_state.repl_id())),
-        Some(sync) if !legacy_sync => Some(sync.announcement(&repl_state.repl_id(), word)),
+        Some(sync) if !legacy_sync => Some(sync.announcement(&repl_state.repl_id(), &word)),
         Some(_) => None,
     };
     if let Some(greeting) = greeting {
@@ -482,7 +485,9 @@ async fn park_blocking_uring(
     // leaves the line it was standing in — or, its client gone or the role
     // changed, only to leave that line, taking nothing (see
     // `server::park_blocking`).
-    if interrupted.gone || interrupted.role_changed {
+    // Unblocked with an error, it takes nothing either: its reply is
+    // `-UNBLOCKED`, and an element popped for it would be lost (#758).
+    if interrupted.gone || interrupted.role_changed || interrupted.unblocked_with_error {
         slot.set_gone(block_state);
     } else {
         slot.set_pending(delivery, block_state);
@@ -1121,6 +1126,14 @@ pub async fn handle_client(
             // Tokio's loop already loads AOF_ENABLED per command; this parameter
             // was the boot-time snapshot and left post-toggle writes unlogged.
             let aof_enabled = crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+            // The clients the commands before this one woke have looked, if
+            // this one reads: it sees what they took (#42). A write does not
+            // wait for them, and nor do the replies.
+            if blocking_slot.settles_before(cmd[0])
+                && let Some(settling) = blocking_slot.settle()
+            {
+                settling.await;
+            }
             // ── QUIT ─────────────────────────────────────────────────────────
             // Reply +OK and close the connection. Handled in the connection
             // loop rather than the dispatch table because closing the socket
@@ -1358,7 +1371,9 @@ pub async fn handle_client(
                         if std::mem::take(&mut aof_wait) {
                             crate::aof::written(&aof_tx).await;
                         }
-                        match park_blocking_uring(
+                        // Boxed, and so polled out of line: the wait is cold, and the
+                        // connection's own future stays the size it is without it.
+                        match Box::pin(park_blocking_uring(
                             wait,
                             &mut blocking_slot,
                             &stream,
@@ -1369,7 +1384,7 @@ pub async fn handle_client(
                             &mut interrupted,
                             &peer_watch,
                             &repl_state,
-                        )
+                        ))
                         .await
                         {
                             // `parse_offset` deliberately not advanced: the same
@@ -1442,7 +1457,9 @@ pub async fn handle_client(
                     if std::mem::take(&mut aof_wait) {
                         crate::aof::written(&aof_tx).await;
                     }
-                    match park_blocking_uring(
+                    // Boxed, and so polled out of line: the wait is cold, and the
+                    // connection's own future stays the size it is without it.
+                    match Box::pin(park_blocking_uring(
                         wait,
                         &mut blocking_slot,
                         &stream,
@@ -1453,7 +1470,7 @@ pub async fn handle_client(
                         &mut interrupted,
                         &peer_watch,
                         &repl_state,
-                    )
+                    ))
                     .await
                     {
                         // See the note at the non-slowlog site above.
@@ -1686,7 +1703,14 @@ pub async fn handle_client(
 
             // ── Transaction + Auth commands ───────────────────────────────
             // Queued, inside MULTI: counted when EXEC runs them.
-            let queued_here = tx.active && matches!(cmd_name.as_str(), "UNWATCH" | "AUTH");
+            let queued_here =
+                tx.active && matches!(cmd_name.as_str(), "UNWATCH" | "AUTH" | "WAIT" | "WAITAOF");
+            // For `INFO commandstats`: the time of the command, less the
+            // time a `WAIT` or `WAITAOF` spent blocked (`waited_for`), as
+            // Redis counts the work of the call and not the wait of a
+            // blocked client.
+            let started = Instant::now();
+            let mut waited_for = std::time::Duration::ZERO;
             let response = match cmd_name.as_str() {
                 "MULTI" => {
                     if tx.active {
@@ -2245,6 +2269,7 @@ pub async fn handle_client(
                                             &args,
                                             &mut resp_version,
                                             &repl_state,
+                                            cluster_state.enabled,
                                         )
                                     } else {
                                         commands::transaction::connection_reply_in_exec(
@@ -2421,9 +2446,14 @@ pub async fn handle_client(
                         key_restricted: &mut key_restricted,
                         cmd_restricted: &mut cmd_restricted,
                     }
-                    .hello(&cmd, &mut resp_version, &repl_state);
+                    .hello(
+                        &cmd,
+                        &mut resp_version,
+                        &repl_state,
+                        cluster_state.enabled,
+                    );
                     // Counted here: the commands below are not.
-                    crate::cmdstats::record("HELLO", &cmd, &reply, std::time::Duration::ZERO);
+                    crate::cmdstats::record("HELLO", &cmd, &reply, started.elapsed());
                     out_buf.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
@@ -2470,6 +2500,7 @@ pub async fn handle_client(
                             });
                         let role_epoch = crate::commands::blocking::role_changes(&repl_state);
 
+                        let blocked_at = Instant::now();
                         let waited = unless_gone(
                             async {
                                 loop {
@@ -2498,6 +2529,7 @@ pub async fn handle_client(
                             &peer_watch,
                         )
                         .await;
+                        waited_for = blocked_at.elapsed();
                         match waited {
                             Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
                                 out_buf.extend_from_slice(&reply);
@@ -2525,6 +2557,7 @@ pub async fn handle_client(
                             let _blocked = (wanted > 0).then(|| {
                                 client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
                             });
+                            let blocked_at = Instant::now();
                             let waited = unless_gone(
                                 crate::replication::wait_for_replicas(
                                     &repl_state,
@@ -2536,6 +2569,7 @@ pub async fn handle_client(
                                 &peer_watch,
                             )
                             .await;
+                            waited_for = blocked_at.elapsed();
                             match waited {
                                 Some(end) if end.close => {
                                     // This master became a replica: told so,
@@ -2755,7 +2789,7 @@ pub async fn handle_client(
             if !queued_here
                 && matches!(
                     cmd_name.as_str(),
-                    "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH"
+                    "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH" | "WAIT" | "WAITAOF"
                 )
             {
                 // None of them has subcommands, so the name is all `record` needs.
@@ -2763,7 +2797,7 @@ pub async fn handle_client(
                     &cmd_name,
                     &[cmd_name.as_bytes()],
                     &response,
-                    std::time::Duration::ZERO,
+                    started.elapsed().saturating_sub(waited_for),
                 );
             }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —
@@ -2861,6 +2895,9 @@ pub async fn handle_client(
         if std::mem::take(&mut aof_wait) {
             crate::aof::written(&aof_tx).await;
         }
+        // What its commands woke and nothing has waited for yet stays for
+        // the next command that reads; looks done by now are forgotten.
+        blocking_slot.forget_looked();
         // `client-output-buffer-limit` (#774): replies over the hard limit,
         // or over the soft limit for longer than its seconds, end the
         // connection unwritten, as Redis drops such a client and its output.
@@ -2943,6 +2980,9 @@ pub async fn handle_client(
                 let vset_quant_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_vset_quant == Some(true));
+                let slot_imports_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_slot_imports);
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595). `CLIENT KILL` shuts its socket, as
                 // any client's, which ends the link.
@@ -2960,6 +3000,7 @@ pub async fn handle_client(
                     listening_port,
                     psync,
                     vset_quant_announced,
+                    slot_imports_announced,
                 )
                 .await?;
 

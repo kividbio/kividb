@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{free_port, restart_verified, start_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,34 +130,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`: asked with a socket that is bound and never
-/// listens (see `tests/resync.rs`).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing listens on, outside the range handed to outgoing
-/// connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(41);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn kividb(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -197,9 +172,9 @@ struct Server {
 impl Server {
     fn start(extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = kividb(&dir, port, &args, &[]);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| kividb(&dir, port, &args, &[]));
         let server = Server {
             port,
             dir,
@@ -233,7 +208,16 @@ impl Server {
     /// connection made the moment it comes up can be reset (master does the
     /// same): it is tried again.
     fn restart(&mut self) {
-        self.child = kividb(&self.dir, self.port, &self.args, &self.env);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters): `self.port` is the one it is on. Whoever was pointed at
+        // the old port has to be pointed at `self.port` again.
+        let (child, port, _) = restart_verified(
+            |port| kividb(&self.dir, port, &self.args, &self.env),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
@@ -1298,6 +1282,69 @@ fn ft_knn_leaves_out_a_due_vector_as_its_removal_would() {
         let got: Vec<_> = KNN_QUERIES.iter().map(|q| knn(&mut p, "v", q)).collect();
         assert_eq!(got, want, "{algo}: due and still stored");
     }
+}
+
+/// The `n` of each row of an FT.AGGREGATE with a KNN `query` on `index` around
+/// the origin, nearest first.
+fn aggregate_knn(c: &mut Conn, index: &str, query: &str) -> Vec<String> {
+    let origin = vec2(0.0, 0.0);
+    let args: [&[u8]; 12] = [
+        b"FT.AGGREGATE",
+        index.as_bytes(),
+        query.as_bytes(),
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"LOAD",
+        b"1",
+        b"@n",
+        b"DIALECT",
+        b"2",
+    ];
+    let reply = cmd_bytes(c, &args);
+    reply.arr()[1..]
+        .iter()
+        .map(|row| {
+            let row = row.arr();
+            let at = row
+                .iter()
+                .position(|v| v.s() == "n")
+                .unwrap_or_else(|| panic!("a row with n: {reply:?}"));
+            row[at + 1].s().to_string()
+        })
+        .collect()
+}
+
+/// FT.AGGREGATE reads each hash once, and the KNN leaves out a due vector as
+/// its removal would: with the vector due and stored, as after the sweep.
+#[test]
+fn ft_aggregate_knn_leaves_out_a_due_vector_as_its_removal_would() {
+    let queries = [
+        "*=>[KNN 2 @vec $q AS d]",
+        "(@t:{red})=>[KNN 2 @vec $q AS d]",
+        "(@n:[0 10])=>[KNN 2 @vec $q AS d]",
+    ];
+    let removed = Server::start(&[]);
+    let mut r = removed.conn();
+    vectors(&mut r, "v", "FLAT", 4, 1, false, true);
+    wait_until("the sweep to remove the fields", 10, || {
+        r.cmd(&["HLEN", "v:0"]).i() == 3 && r.cmd(&["HLEN", "v:1"]).i() == 4
+    });
+    let want: Vec<_> = queries
+        .iter()
+        .map(|q| aggregate_knn(&mut r, "v", q))
+        .collect();
+    assert_eq!(want[0], ["1", "2"], "after removal");
+
+    let paused = Server::start(&[]);
+    let mut p = paused.conn();
+    vectors(&mut p, "v", "FLAT", 4, 1, false, false);
+    let got: Vec<_> = queries
+        .iter()
+        .map(|q| aggregate_knn(&mut p, "v", q))
+        .collect();
+    assert_eq!(got, want, "due and still stored");
 }
 
 #[test]

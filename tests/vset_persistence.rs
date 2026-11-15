@@ -7,8 +7,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+mod common;
+use common::{restart_verified, start_verified};
 
 // ── RESP client ───────────────────────────────────────────────────────────────
 
@@ -151,30 +153,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(43);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn spawn(bin: &Path, dir: &Path, port: u16, extra: &[String], env: &[(&str, &str)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -261,11 +239,11 @@ impl Server {
     }
 
     fn start_with(bin: PathBuf, tmp: tempfile::TempDir, extra: &[&str], hides: bool) -> Self {
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
         let dir = tmp.path().to_path_buf();
         let env: &[(&str, &str)] = if hides { &HIDE } else { &[] };
-        let child = spawn(&bin, &dir, port, &args, env);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| spawn(&bin, &dir, port, &args, env));
         let mut server = Server {
             port,
             dir,
@@ -310,7 +288,16 @@ impl Server {
     fn restart(&mut self) {
         // Else the new process cannot bind, and the old one answers.
         assert!(self.child.try_wait().unwrap().is_some(), "still running");
-        self.child = spawn(&self.bin, &self.dir, self.port, &self.args, self.env());
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters): `self.port` is the one it is on.
+        let env = self.env();
+        let (child, port, _) = restart_verified(
+            |port| spawn(&self.bin, &self.dir, port, &self.args, env),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         self.wait_up();
     }
 
@@ -396,10 +383,18 @@ fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
     }
 }
 
-fn wait_caught_up(master: &mut Conn, replica: &mut Conn) {
+/// The replica has finished its first sync. What the master wrote before
+/// that comes in its snapshot, which keeps a vector set as it is stored
+/// (`Q8` stays int8); only what is streamed after is stripped of options. A
+/// test of the stripping writes after this, never before.
+fn wait_linked(replica: &mut Conn) {
     wait_until("the replica's link to come up", 30, || {
         replica.info("replication", "master_link_status") == "up"
     });
+}
+
+fn wait_caught_up(master: &mut Conn, replica: &mut Conn) {
+    wait_linked(replica);
     wait_until("the replica to catch up", 60, || {
         let offset = master.info("replication", "master_repl_offset");
         replica.info("replication", "slave_repl_offset") == offset
@@ -1270,7 +1265,6 @@ fn replicas_of_1_2_match_it_through_promotion() {
     assert_same_sets(&mut c1, &mut c2, &["s", "u", "w"], "R1 continued, R2");
 
     // KiviDB does not chain replicas: R2 under R1 is refused.
-    let r1port = r1.port.to_string();
     let mut probe = Conn::connect(r1.port);
     let refused = probe.cmd(&["PSYNC", "?", "-1"]);
     assert!(
@@ -1327,6 +1321,8 @@ fn replicas_of_1_2_match_it_through_promotion() {
         c1.info_opt("server", "kividb_vset_quantization").as_deref(),
         Some("1")
     );
+    // R1's port as it is now: a restart can have moved it.
+    let r1port = r1.port.to_string();
     let bin = r2.bin.clone();
     r2.restart_as(bin, &["--aof", "--replicaof", "127.0.0.1", &r1port]);
     let mut c2 = r2.conn();
@@ -1515,6 +1511,7 @@ fn a_backup_on_a_stripping_replica_is_f32() {
     let mut m = old.conn();
     let replica = Server::start(&["--replicaof", "127.0.0.1", &old.port.to_string()]);
     let mut r = replica.conn();
+    wait_linked(&mut r);
     write_to_old(&mut m, 0, "s");
     wait_caught_up(&mut m, &mut r);
     assert!(!r.cmd(&["BACKUP", "START"]).is_err());
@@ -1622,6 +1619,9 @@ fn promotion_does_not_pass_on_stripped_options() {
     let mut r2 = Server::start(&["--replicaof", "127.0.0.1", &mport]);
     let r3 = Server::start(&["--replicaof", "127.0.0.1", &mport]);
     let (mut c1, mut c2, mut c3) = (r1.conn(), r2.conn(), r3.conn());
+    for c in [&mut c1, &mut c2, &mut c3] {
+        wait_linked(c);
+    }
     write_to_old(&mut m, 0, "s");
     for c in [&mut c1, &mut c2, &mut c3] {
         wait_caught_up(&mut m, c);

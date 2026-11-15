@@ -172,7 +172,7 @@ need action or attention:
 
 ## What still fails
 
-Thirty-one tests, in three groups.
+Twenty-nine tests, in three groups.
 
 **Things KiviDB does not have (17).**
 
@@ -183,8 +183,7 @@ Thirty-one tests, in three groups.
 | `latency-monitor` | 2 | the `expire-cycle` latency event |
 | `querybuf` | 2 | these are on **io_uring only**: the server reports `idle=` correctly now, but io_uring has no idle timer to shrink a private query buffer while the client waits, so the unit's idle-wait on a smaller `qbuf` never satisfies. The second failure is a knock-on of the first, not a separate gap. On **Tokio** the whole unit passes (see below) |
 
-**Redis's internal encodings (5).** `dump` (2): `RESTORE … IDLETIME` and
-`FREQ` are accepted and not applied. `type/hash` (2) and the one unit that
+**Redis's internal encodings (3).** `type/hash` (2) and the one unit that
 still ends early, `type/stream-cgroups`: the tests `RESTORE` a payload
 produced by Redis itself; KiviDB's `DUMP` format is its own and it does not
 read Redis's. `hyperloglog` (1): the test reads the cache-valid bit of
@@ -197,7 +196,10 @@ Redis's HyperLogLog header with `GETRANGE`.
 - `introspection` (2): `CONFIG SET maxmemory-clients` and `CONFIG SET port`
   are accepted and remembered without being applied, so the tests'
   out-of-range value and unusable port are not refused.
-- `introspection-2` (1): `TTL`, `TYPE` and `EXISTS` reset a key's idle time.
+- `introspection-2` (1): `OBJECT IDLETIME` is 0 under `noeviction` unless
+  `key-access-tracking yes` is set (off by default), so the test of `TTL`,
+  `TYPE` and `EXISTS` leaving a key's idle time alone fails; it passes with it
+  on.
 - `pubsub` (2): a RESP3 client that publishes to a channel it is subscribed
   to, from inside a script or a transaction, gets the message before the
   reply to the script; Redis sends the reply first.

@@ -4494,6 +4494,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     out.push_str(&format!(
                         "cluster_orphan_slots:{slots}\r\ncluster_orphan_keys:{keys}\r\n"
                     ));
+                    // And of those, the slots of which an unfinished import
+                    // into its old master brought keys, still to be
+                    // deleted (#741).
+                    out.push_str(&format!(
+                        "cluster_import_cleanup_slots:{}\r\n",
+                        crate::cluster::followed_imports::slots_to_clean(ctx.cluster)
+                    ));
                 }
                 out.push_str("\r\n");
             }
@@ -5736,6 +5743,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     });
                 }
                 if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1]
+                        .eq_ignore_ascii_case(crate::replication::SLOT_IMPORTS_CAPA.as_bytes())
+                    && !crate::replication::hides_slot_imports_capability()
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_slot_imports = true;
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
                     && cmd[i + 1].eq_ignore_ascii_case(b"vset-quant")
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
@@ -6369,7 +6385,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // HELLO is intercepted in the server loops before reaching here.
             // If it arrives here something went wrong — return a minimal response
             // rather than an error, so clients don't break.
-            Some(resp_array(vec![
+            let proto = ctx.resp as i64;
+            let fields = vec![
                 resp_bulk_str("server"),
                 resp_bulk_str("redis"),
                 resp_bulk_str("version"),
@@ -6377,14 +6394,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 resp_bulk_str("kividb_version"),
                 resp_bulk_str(env!("CARGO_PKG_VERSION")),
                 resp_bulk_str("proto"),
-                resp_integer(2),
+                resp_integer(proto),
+                resp_bulk_str("id"),
+                resp_integer(ctx.client_id as i64),
                 resp_bulk_str("mode"),
-                resp_bulk_str("standalone"),
+                resp_bulk_str(if ctx.cluster.enabled {
+                    "cluster"
+                } else {
+                    "standalone"
+                }),
                 resp_bulk_str("role"),
-                resp_bulk_str("master"),
+                resp_bulk_str(&ctx.repl_state.hello_role()),
                 resp_bulk_str("modules"),
-                module_list_reply(2),
-            ]))
+                module_list_reply(proto as u8),
+            ];
+            Some(if proto == 3 {
+                resp_map(fields)
+            } else {
+                resp_array(fields)
+            })
         }
 
         "TIME" => {

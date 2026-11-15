@@ -23,12 +23,13 @@
 //!
 //! When a key was last used (or modified), or how often, is kept in the
 //! key's own entry, in one 32-bit word of its header, as Redis keeps it in
-//! the object's `lru` field: see [`Access`]. It is written only while a
-//! policy that asks for it is selected (or `key-access-tracking` is on):
-//! with `noeviction` a command pays one atomic load for all of this, and
-//! each of its lookups one thread-local load. The word is written only when
-//! it changes, so a key read again and again within the same second dirties
-//! its cache line once.
+//! the object's `lru` field: see [`Access`]. It is written while a policy
+//! that asks for it is selected, and whatever the policy while
+//! `key-access-tracking yes` is set (as in Redis, so that `OBJECT IDLETIME`
+//! answers under `noeviction`); by default, with a policy that does not ask
+//! for it, a command pays one atomic load for all of this, and each of its lookups one thread-local load. The word
+//! is written only when it changes, so a key read again and again within
+//! the same second dirties its cache line once.
 //!
 //! **Where a use is written.** By the lookups the command makes anyway: the
 //! dispatcher opens a `store::AccessScope` around the command with the
@@ -47,9 +48,10 @@
 use crate::commands::ctx::Ctx;
 use crate::store::Store;
 use rand::Rng;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ── The policy ────────────────────────────────────────────────────────────────
 
@@ -191,9 +193,11 @@ pub fn set_policy(policy: Policy) {
 /// `key-access-tracking`: whether a key's use is recorded under every
 /// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
 /// `noeviction` too, as Redis does (#21). Off by default: recording costs
-/// every command a clock reading, and each lookup a store to the key's
-/// entry when its word changes (it costs a key nothing: the word is in every
-/// entry anyway). Under an LRU or LFU policy it is recorded either way.
+/// every command a clock reading (kept for the second it is read in) and a
+/// scope for its lookups, and each lookup a store to the key's entry when
+/// its word changes: about 50 instructions, 1 to 1.5% of a pipelined `GET`
+/// or `SET` (`benchmarks/1.3.0/key-access-tracking`). It costs a key nothing:
+/// the word is in every entry anyway. Under an LRU or LFU policy it is recorded either way.
 pub fn key_access_tracking() -> bool {
     TRACK_ALWAYS.load(Ordering::Relaxed)
 }
@@ -339,18 +343,50 @@ fn clock() -> u32 {
     clock_at(Instant::now())
 }
 
-/// [`clock`] at `now`.
+thread_local! {
+    /// The second [`clock_at`] last answered for on this thread: when it
+    /// ends, and what [`clock`] says in it.
+    static SECOND: Cell<Option<(Instant, u32)>> = const { Cell::new(None) };
+}
+
+/// [`clock`] at `now`. Answered from the second this thread last asked
+/// about, and worked out again only when that ends: subtracting two
+/// instants was a tenth of what recording a use cost a command.
 #[inline]
 fn clock_at(now: Instant) -> u32 {
-    CLOCK_BASE + now.saturating_duration_since(*START).as_secs() as u32
+    if let Some((until, seconds)) = SECOND.get()
+        && now < until
+    {
+        return seconds;
+    }
+    clock_in_a_new_second(now)
+}
+
+#[cold]
+#[inline(never)]
+fn clock_in_a_new_second(now: Instant) -> u32 {
+    let start = *START;
+    let elapsed = now.saturating_duration_since(start).as_secs();
+    let seconds = CLOCK_BASE + elapsed as u32;
+    SECOND.set(Some((start + Duration::from_secs(elapsed + 1), seconds)));
+    seconds
 }
 
 /// What a command that uses keys has its lookups write to them, starting
 /// at `now` (`store::AccessScope`): the clock (LRU), or the minute with the
 /// stamp's top bit set (LFU, see [`counted`]). 0, nothing, when nothing is
 /// recorded, or only modifications are (LRM: see the module).
-#[inline]
+#[inline(always)]
 pub fn stamp(now: Instant) -> u32 {
+    // The common case first: one comparison.
+    if TRACK.load(Ordering::Relaxed) == Track::Used as u8 {
+        return Access::clock_word(clock_at(now));
+    }
+    stamp_other(now)
+}
+
+#[inline(never)]
+fn stamp_other(now: Instant) -> u32 {
     match track() {
         Track::Used => Access::clock_word(clock_at(now)),
         Track::Frequency => Access::LFU | ((clock_at(now) / 60) & 0xffff) << 8,
