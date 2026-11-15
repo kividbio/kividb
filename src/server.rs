@@ -1502,7 +1502,14 @@ where
 
             // ── Transaction + Auth commands ───────────────────────────────
             // Queued, inside MULTI: counted when EXEC runs them.
-            let queued_here = tx.active && matches!(cmd_name.as_str(), "UNWATCH" | "AUTH");
+            let queued_here =
+                tx.active && matches!(cmd_name.as_str(), "UNWATCH" | "AUTH" | "WAIT" | "WAITAOF");
+            // For `INFO commandstats`: the time of the command, less the
+            // time a `WAIT` or `WAITAOF` spent blocked (`waited_for`), as
+            // Redis counts the work of the call and not the wait of a
+            // blocked client.
+            let started = Instant::now();
+            let mut waited_for = std::time::Duration::ZERO;
             let response = match cmd_name.as_str() {
                 "MULTI" => {
                     if tx.active {
@@ -2061,6 +2068,7 @@ where
                                             &args,
                                             &mut resp_version,
                                             &repl_state,
+                                            cluster_state.enabled,
                                         )
                                     } else {
                                         commands::transaction::connection_reply_in_exec(
@@ -2238,9 +2246,14 @@ where
                         key_restricted: &mut key_restricted,
                         cmd_restricted: &mut cmd_restricted,
                     }
-                    .hello(&cmd, &mut resp_version, &repl_state);
+                    .hello(
+                        &cmd,
+                        &mut resp_version,
+                        &repl_state,
+                        cluster_state.enabled,
+                    );
                     // Counted here: the commands below are not.
-                    crate::cmdstats::record("HELLO", &cmd, &reply, std::time::Duration::ZERO);
+                    crate::cmdstats::record("HELLO", &cmd, &reply, started.elapsed());
                     combined.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
@@ -2287,6 +2300,7 @@ where
                             });
                         let role_epoch = crate::commands::blocking::role_changes(&repl_state);
 
+                        let blocked_at = Instant::now();
                         let waited = tokio::select! {
                             biased;
                             reply = async {
@@ -2314,6 +2328,7 @@ where
                             } => Some(reply),
                             () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
                         };
+                        waited_for = blocked_at.elapsed();
                         match waited {
                             Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
                                 combined.extend_from_slice(&reply);
@@ -2341,6 +2356,7 @@ where
                             let _blocked = (wanted > 0).then(|| {
                                 client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
                             });
+                            let blocked_at = Instant::now();
                             let waited = tokio::select! {
                                 biased;
                                 reply = crate::replication::wait_for_replicas(
@@ -2352,6 +2368,7 @@ where
                                 ) => Some(reply),
                                 () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
                             };
+                            waited_for = blocked_at.elapsed();
                             match waited {
                                 Some(end) if end.close => {
                                     // This master became a replica: told so,
@@ -2570,7 +2587,7 @@ where
             if !queued_here
                 && matches!(
                     cmd_name.as_str(),
-                    "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH"
+                    "DISCARD" | "WATCH" | "UNWATCH" | "RESET" | "AUTH" | "WAIT" | "WAITAOF"
                 )
             {
                 // None of them has subcommands, so the name is all `record` needs.
@@ -2578,7 +2595,7 @@ where
                     &cmd_name,
                     &[cmd_name.as_bytes()],
                     &response,
-                    std::time::Duration::ZERO,
+                    started.elapsed().saturating_sub(waited_for),
                 );
             }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —

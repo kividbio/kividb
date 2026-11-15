@@ -40,6 +40,7 @@ pub mod monitor;
 pub mod node_tls;
 pub mod output_limits;
 pub mod pause;
+mod ping;
 pub mod protected_mode;
 mod pubsub;
 pub mod redis_settings;
@@ -284,18 +285,46 @@ fn main() {
     }
 }
 
+/// Exit on a command line clap refused, as clap does (usage, exit 2), except
+/// under `--ping`: Docker reserves a health check's exit code 2, so the
+/// check fails with 1 like any other failure. `--help` and `--version` are
+/// left to clap.
+fn bad_arguments(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    let shown = matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
+    if !shown && std::env::args_os().any(|a| a == "--ping") {
+        let _ = e.print();
+        std::process::exit(1);
+    }
+    e.exit()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parsed by hand rather than with `Config::parse()`, to keep the matches:
     // the config file must not override an option given on the command line,
     // and only the matches know which those are.
-    let matches = <Config as clap::CommandFactory>::command().get_matches();
-    let mut cfg =
-        <Config as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let matches = <Config as clap::CommandFactory>::command()
+        .try_get_matches()
+        .unwrap_or_else(|e| bad_arguments(e));
+    let mut cfg = <Config as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|e| bad_arguments(e));
     let from_cli =
         |option: &str| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine);
     cfg.bind_explicit =
         matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
-    match cfg.apply_config_file(&from_cli) {
+    let config_file = cfg.apply_config_file(&from_cli);
+    // `--ping` is a client: it needs the ports, TLS files and password the
+    // command line and config file give, and nothing a server does after
+    // this. It prints no warnings about the file: health checks run every few
+    // seconds, and the server has already logged them.
+    if cfg.ping {
+        if let Err(e) = config_file {
+            eprintln!("kividb --ping: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(ping::run(&cfg));
+    }
+    match config_file {
         Ok(warnings) => {
             for w in warnings {
                 log_warn!("{w}");

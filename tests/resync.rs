@@ -2987,7 +2987,18 @@ fn save_leaves_other_clients_answered() {
     let mut c = Conn::connect(port);
     let mut other = Conn::connect(port);
     assert_eq!(other.cmd(&["PING"]).s(), "PONG");
-    assert!(c.cmd(&["DEBUG", "POPULATE", "1500000", "k", "32"]).ok());
+    // 1.5M keys, but in 15 commands: with one worker thread on a machine
+    // busy with other tests, one POPULATE of all of them has outlasted the
+    // client's 30 s read timeout, though the server was making progress.
+    // Each of these has a timeout of its own.
+    for chunk in 0..15 {
+        let prefix = format!("k{chunk}");
+        assert!(
+            c.cmd(&["DEBUG", "POPULATE", "100000", &prefix, "32"]).ok(),
+            "populating {prefix}"
+        );
+    }
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 1_500_000);
 
     // Sent, not waited for; then the other client's PING, timed.
     let sent = Instant::now();
@@ -3009,4 +3020,6 @@ fn save_leaves_other_clients_answered() {
     );
     let _ = child.kill();
     let _ = child.wait();
+    // The snapshot of 1.5M keys is some 100 MB: not left in /tmp.
+    let _ = std::fs::remove_dir_all(&dir);
 }

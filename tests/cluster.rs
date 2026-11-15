@@ -4246,15 +4246,38 @@ fn routed_and_held(node: &Node, hit: u32) -> PathBuf {
 }
 
 fn wait_import_completed(dst: &Node, task_id: &str) {
-    wait_until("the import to complete", Duration::from_secs(60), || {
-        let status = dst
-            .conn()
-            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", task_id]);
-        status
+    wait_task_completed(dst, task_id, "the import to complete");
+}
+
+/// Until `node` has the migration task `task_id` as completed. The
+/// destination of an import is done when it has taken the slots over; the
+/// source goes on a moment longer (it deletes its copy), and until it has
+/// finished its side no import of those slots is accepted there.
+fn wait_task_completed(dst: &Node, task_id: &str, what: &str) {
+    let status = || {
+        dst.conn()
+            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", task_id])
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let now = status();
+        if now
             .array()
             .first()
             .is_some_and(|task| task_field(task, "state").text() == "completed")
-    });
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            // Stuck or only slow? Say where the task stood and what the
+            // destination logged.
+            panic!(
+                "timed out after 60s waiting for: {what}\nstatus: {now:?}\n{}",
+                dst.log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `CLUSTER FAILOVER` on the source's replica while a `CLUSTER MIGRATION
@@ -8530,11 +8553,21 @@ fn num_docs_follows_slots_that_move_out_and_back() {
         (1, "every document counted once the slots moved out"),
         (0, "every document counted once the slots moved back"),
     ] {
-        let id = nodes[taker]
+        let started = nodes[taker]
             .conn()
-            .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &from, &to])
-            .text();
+            .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &from, &to]);
+        assert!(started.err().is_none(), "{when}: IMPORT: {started:?}");
+        let id = started.text();
         wait_import_completed(&nodes[taker], &id);
+        // The other node, the source, is still deleting its copy of the
+        // slots when the taker is done, and an import the other way in that
+        // window is refused ("already in progress"): the test took the
+        // refusal for the import's id and then waited 60 s for it.
+        wait_task_completed(
+            &nodes[1 - taker],
+            &id,
+            "the source to finish its side of the migration",
+        );
         everywhere(when);
     }
 }
@@ -9863,4 +9896,36 @@ fn hybrid_search_is_refused_across_masters() {
     let fields = reply.array();
     assert_eq!(fields[0].text(), "total_results", "{reply:?}");
     assert_eq!(fields[1].int(), 1, "{reply:?}");
+}
+
+/// `HELLO` says `mode: cluster` on a node that runs in cluster mode, which
+/// clients read to decide whether to route by slot. On a replica the role is
+/// `replica`.
+#[test]
+fn hello_reports_the_cluster_mode() {
+    let (nodes, _) = form_cluster(3);
+    let field = |reply: &Resp, name: &str| {
+        let fields = reply.array();
+        let at = fields.iter().position(|f| f.text() == name).unwrap();
+        fields[at + 1].text()
+    };
+    let reply = nodes[0].conn().cmd(&["HELLO", "2"]);
+    assert_eq!(field(&reply, "mode"), "cluster", "{reply:?}");
+    let reply = nodes[0].conn().cmd(&["HELLO", "3"]);
+    let (_, value) = reply
+        .map()
+        .iter()
+        .find(|(k, _)| k.text() == "mode")
+        .expect("a mode field");
+    assert_eq!(value.text(), "cluster", "{reply:?}");
+
+    // A replica is in cluster mode too, and HELLO calls its role `replica`
+    // where ROLE still says `slave`, as Redis does.
+    let replica = add_replica(&nodes, &nodes[0]);
+    let reply = replica.conn().cmd(&["HELLO", "2"]);
+    assert_eq!(field(&reply, "mode"), "cluster", "{reply:?}");
+    assert_eq!(field(&reply, "role"), "replica", "{reply:?}");
+    let reply = nodes[0].conn().cmd(&["HELLO", "2"]);
+    assert_eq!(field(&reply, "role"), "master", "{reply:?}");
+    assert_eq!(replica.conn().cmd(&["ROLE"]).array()[0].text(), "slave");
 }
