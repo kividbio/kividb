@@ -285,6 +285,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
+  scan whatever follows the cursor, and read their options as Redis does
+  (#820).** `ZSCAN key 0 MATCH * COUNT 0` on a missing key answered `ERR
+  syntax error`, so sidekiq-unique-jobs, which sizes its `ZSCAN` by `ZCARD`,
+  failed on an empty digest set. The commands now read the cursor, look the
+  key up (missing: `0` and an empty list; another type: `WRONGTYPE`) and only
+  then read the options, one after another, the first fault being the one
+  reported. `COUNT` is read as Redis reads an integer, so `+3`, `03` and
+  `-0` are "not an integer" now, not taken. `NOVALUES` in `SCAN`, `SSCAN`
+  and `ZSCAN` answers `NOVALUES option can only be used in HSCAN`. On a key
+  that is there, `COUNT 0` is still a syntax error in all four commands, as
+  in Redis 8.10.2 and 8.10.3. Lua's implicit `arg` table in vararg functions
+  is not part of this fix; it comes with the move to Lua 5.1 (#756) and is
+  listed in docs/SCRIPTS.md.
 - **A replica promoted after its master died part way through a slot
   import deletes what the import brought, and an import sent again no
   longer brings back keys the source deleted (#741).** The keys a
