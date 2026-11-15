@@ -271,6 +271,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`BRPOP` across many keys keeps up with many blocked clients (#758).**
+  A client blocked on 270 queues raced 270 receivers, each with a task and
+  a timer of its own, and every wait, wake-up and timeout walked a sorted
+  line of every client on each of those keys; a client that timed out also
+  woke the next client in every one of its lines, for nothing. Each client
+  now waits on one receiver with one timer, a key's line is an ordered map,
+  and a client that leaves passes its turn on only where it had one. On a
+  D4s_v5 with 200 jobs pushed every 0.1 s, 1,000 workers x 270 queues get
+  1,924 jobs/s (1.2.2: 373, Redis 8.10.2: 1,566) and 4,000 workers 1,902
+  (1.2.2: 18, Redis: 944), with the same FIFO order per key; the suite is
+  `benchmarks/1.3.0/regressions/suites/15-brpop-many-keys.py`.
+  Also, a client unblocked with `CLIENT UNBLOCK … ERROR` just as an element
+  arrived on its key no longer pops it and then answers `-UNBLOCKED` in its
+  place, losing it: it takes nothing, as in Redis.
+
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
   `DISCARD`, `RESET` and `AUTH` were counted with 0 microseconds; they, and

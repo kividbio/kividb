@@ -1,20 +1,22 @@
 use crate::store::Key;
 use ahash::AHashMap;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::oneshot;
 
-// What a woken waiter receives. Nothing is delivered through it — a waiter
-// looks at the key for itself once it is woken — so it is always empty; the
-// type is what the connection loop's wait is written against.
+// What a woken waiter receives. A client blocked in a line (see
+// [`WaitTable::enqueue_all`]) is sent the key that woke it; nothing else is
+// delivered through it — a waiter looks at the key for itself once it is
+// woken — and the other waiters are sent nothing.
 pub(crate) type Value = Arc<[u8]>;
 
 /// A blocked client's place in line, taken when its command first has to
 /// wait and kept until it is answered. The client holds it; the table holds
-/// only a weak reference, so a client that goes away — answered, timed out or
-/// disconnected — leaves the line without anyone having to remember to take
-/// it out.
+/// only its [`Bell`], which says whether the ticket is still held, so a
+/// client that goes away — answered, timed out or disconnected — leaves the
+/// line without anyone having to remember to take it out.
 ///
 /// And without losing the turn: a client that was woken and is dropped
 /// before it has looked at the key — its connection closed, or its command
@@ -27,9 +29,43 @@ pub struct Ticket {
     id: u64,
     /// The lines it waits in, to leave when it is dropped: recorded when its
     /// command parks (see [`Ticket::parks_in`]), so that one answered at
-    /// once costs nothing for this.
+    /// once costs nothing for this, and forgotten when it has left them
+    /// ([`WaitTable::leave_all`]), so that one answered after a wait does
+    /// not look for itself in every line again.
     lines: Mutex<Vec<(Line, Key)>>,
     table: Weak<WaitTable>,
+    /// How it is woken, from whichever line it is woken in.
+    bell: Arc<Bell>,
+}
+
+/// How a client standing in lines for several keys is woken: one for all of
+/// them (#758). A client blocked on 270 keys used to be given a receiver for
+/// each, raced by a task of its own with a timer of its own — 270 tasks and
+/// timers for each wait, and as many again every time it was woken and
+/// waited again. It now waits on one receiver, with one timer, whichever key
+/// wakes it; the key that did is what it is sent.
+struct Bell {
+    /// The sender of the wait under way, taken by the first key to wake it.
+    /// A fresh one for each wait ([`Ticket::arm`]).
+    tx: Mutex<Option<oneshot::Sender<Value>>>,
+    /// Cleared when the ticket is dropped: its client is no longer waiting,
+    /// and the lines skip it.
+    alive: AtomicBool,
+}
+
+impl Bell {
+    #[inline]
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// Wake the client for `key`, unless another key has woken it already
+    /// in this wait (it will look at all its keys anyway).
+    fn ring(&self, key: &[u8]) {
+        if let Some(tx) = self.tx.lock().take() {
+            let _ = tx.send(Arc::from(key));
+        }
+    }
 }
 
 /// Which of a key's two lines (see [`WaitTable`]).
@@ -50,10 +86,20 @@ impl Ticket {
             lines.extend(keys.iter().map(|key| (line, Key::new(key.as_ref()))));
         }
     }
+
+    /// A fresh receiver for the wait about to start: the one a key that is
+    /// written wakes. The receiver of the last wait, if there was one, is
+    /// woken no more.
+    fn arm(&self) -> oneshot::Receiver<Value> {
+        let (tx, rx) = oneshot::channel();
+        *self.bell.tx.lock() = Some(tx);
+        rx
+    }
 }
 
 impl Drop for Ticket {
     fn drop(&mut self) {
+        self.bell.alive.store(false, Ordering::Release);
         // Taken without a lock: nothing else can reach a ticket being dropped.
         let lines = std::mem::take(self.lines.get_mut());
         if lines.is_empty() {
@@ -62,19 +108,50 @@ impl Drop for Ticket {
         let Some(table) = self.table.upgrade() else {
             return;
         };
-        for (line, key) in lines {
-            table.leave_dropped(line, key.as_bytes(), self.id);
-        }
+        table.leave_dropped(&lines, self.id);
     }
 }
 
 /// One client in the line for a key.
 struct Queued {
-    id: u64,
-    alive: Weak<Ticket>,
-    /// How to wake it. `None` once it has been woken and until it has looked
-    /// at the key and either gone or waited again.
-    tx: Option<oneshot::Sender<Value>>,
+    bell: Arc<Bell>,
+    /// Woken, and it has not yet looked at the key and either gone or
+    /// waited again: the turn is with it.
+    woken: bool,
+}
+
+/// Key → the clients in its line, by ticket: the order they blocked in.
+/// Standing in line, leaving it and finding its head each take a few steps
+/// whatever the length of the line, where a sorted `Vec` took a pass over
+/// it (#758: a thousand clients blocked on the same 270 keys made every
+/// wait, wake-up and timeout walk 270 lines of a thousand).
+type Lines = AHashMap<Key, BTreeMap<u64, Queued>>;
+
+/// One kind of line, for every key, and how many clients stand in it.
+struct LineTable {
+    lines: Mutex<Lines>,
+    /// Number of entries in `lines`, so a write can skip the lock entirely
+    /// when nobody is waiting — which is nearly always.
+    count: AtomicUsize,
+}
+
+impl LineTable {
+    fn new() -> Self {
+        Self {
+            lines: Mutex::new(AHashMap::new()),
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.count.load(Ordering::Relaxed) == 0
+    }
+
+    fn clear(&self) {
+        self.lines.lock().clear();
+        self.count.store(0, Ordering::Relaxed);
+    }
 }
 
 pub struct WaitTable {
@@ -83,25 +160,21 @@ pub struct WaitTable {
     // without looking through the others. They are all woken together, so
     // their order does not matter. See [`WaitTable::notify_stream_waiters`].
     inner: Mutex<AHashMap<Key, AHashMap<u64, oneshot::Sender<Value>>>>,
-    /// Key → clients waiting to be told the key was written: the blocking
-    /// list and sorted-set commands and `TS.READ`. See
+    /// Key → clients waiting to be told the key was written: `TS.READ`. See
     /// [`WaitTable::register_signal`].
     signals: Mutex<AHashMap<Key, Vec<oneshot::Sender<Value>>>>,
     /// Number of entries in `signals`, so a push can skip the lock entirely
     /// when nobody is waiting — which is nearly always.
     signal_count: AtomicUsize,
     /// Key → the clients blocked on it in a list or sorted-set command, in
-    /// the order they blocked. See [`WaitTable::enqueue`].
-    queues: Mutex<AHashMap<Key, Vec<Queued>>>,
+    /// the order they blocked. See [`WaitTable::enqueue_all`].
+    queues: LineTable,
     /// Key → the clients blocked on it in `XREADGROUP`, in the order they
     /// blocked. A line of its own: these clients are waiting on a stream and
     /// those in `queues` on a list or a sorted set, and what one kind finds
     /// at the key says nothing about what the other will. Each line is woken
     /// from its head when the key is written.
-    reader_queues: Mutex<AHashMap<Key, Vec<Queued>>>,
-    /// Number of entries in `queues` and `reader_queues`, for the same
-    /// reason as `signal_count`.
-    queued_count: AtomicUsize,
+    reader_queues: LineTable,
     next_ticket: AtomicU64,
 }
 
@@ -111,9 +184,8 @@ impl WaitTable {
             inner: Mutex::new(AHashMap::new()),
             signals: Mutex::new(AHashMap::new()),
             signal_count: AtomicUsize::new(0),
-            queues: Mutex::new(AHashMap::new()),
-            reader_queues: Mutex::new(AHashMap::new()),
-            queued_count: AtomicUsize::new(0),
+            queues: LineTable::new(),
+            reader_queues: LineTable::new(),
             next_ticket: AtomicU64::new(1),
         }
     }
@@ -124,9 +196,15 @@ impl WaitTable {
         let mut signals = self.signals.lock();
         signals.clear();
         self.signal_count.store(0, Ordering::Relaxed);
-        self.queues.lock().clear();
-        self.reader_queues.lock().clear();
-        self.queued_count.store(0, Ordering::Relaxed);
+        self.queues.clear();
+        self.reader_queues.clear();
+    }
+
+    fn table(&self, line: Line) -> &LineTable {
+        match line {
+            Line::Keys => &self.queues,
+            Line::Readers => &self.reader_queues,
+        }
     }
 
     // ── The line for a key ────────────────────────────────────────────────
@@ -145,98 +223,156 @@ impl WaitTable {
             id: self.next_ticket.fetch_add(1, Ordering::Relaxed),
             lines: Mutex::new(Vec::new()),
             table: Arc::downgrade(self),
+            bell: Arc::new(Bell {
+                tx: Mutex::new(None),
+                alive: AtomicBool::new(true),
+            }),
         })
     }
 
-    /// A ticket dropped while it stood in `key`'s line: out of it, and, if it
+    /// A ticket dropped while it stood in lines: out of them, and, where it
     /// had been woken and had not looked, the turn to the client behind it.
-    /// Nothing to do for one that left the line before it went, as a command
-    /// that is answered does.
-    fn leave_dropped(&self, line: Line, key: &[u8], id: u64) {
-        let lines = match line {
-            Line::Keys => &self.queues,
-            Line::Readers => &self.reader_queues,
-        };
-        let woken = {
-            let mut queues = lines.lock();
-            let Some(queue) = queues.get_mut(key) else {
-                return;
-            };
-            let Ok(at) = queue.binary_search_by_key(&id, |queued| queued.id) else {
-                return;
-            };
-            let woken = queue.remove(at).tx.is_none();
-            self.queued_count.fetch_sub(1, Ordering::Relaxed);
-            if queue.is_empty() {
-                queues.remove(key);
+    /// Nothing to do for one that left the lines before it went, as a
+    /// command that is answered does.
+    fn leave_dropped(&self, lines: &[(Line, Key)], id: u64) {
+        for line in [Line::Keys, Line::Readers] {
+            let table = self.table(line);
+            if table.is_empty() {
+                continue;
             }
-            woken
-        };
-        if woken {
-            self.wake_next_in(lines, key, id);
+            let keys = lines
+                .iter()
+                .filter(|(of, _)| *of == line)
+                .map(|(_, key)| key.as_bytes());
+            let woken = self.leave_in(table, keys, id);
+            for (key, woken) in lines.iter().filter(|(of, _)| *of == line).zip(woken) {
+                if woken {
+                    self.wake_next_in(table, key.1.as_bytes(), id);
+                }
+            }
         }
     }
 
-    /// Stand in the line for `key` — or, already in it, stay where `ticket`
-    /// says — and return the receiver this client is woken through.
+    /// Stand in the line for each of `keys` — or, already in it, stay where
+    /// `ticket` says — under one lock, and return the receiver this client
+    /// is woken through, by whichever of them is written first.
+    pub fn enqueue_all(
+        &self,
+        keys: &[impl AsRef<[u8]>],
+        ticket: &Arc<Ticket>,
+    ) -> oneshot::Receiver<Value> {
+        self.enqueue_in(&self.queues, keys, ticket)
+    }
+
+    /// [`enqueue_all`](Self::enqueue_all) for one key.
+    #[cfg(test)]
     pub fn enqueue(
         &self,
         key: &(impl AsRef<[u8]> + ?Sized),
         ticket: &Arc<Ticket>,
     ) -> oneshot::Receiver<Value> {
-        let key = key.as_ref();
-        self.enqueue_in(&self.queues, key, ticket)
+        self.enqueue_in(&self.queues, &[key.as_ref()], ticket)
     }
 
-    /// [`enqueue`](Self::enqueue), in the line of the key's `XREADGROUP`
-    /// clients.
+    /// [`enqueue_all`](Self::enqueue_all), in the lines of the keys'
+    /// `XREADGROUP` clients.
+    pub fn enqueue_readers(
+        &self,
+        keys: &[impl AsRef<[u8]>],
+        ticket: &Arc<Ticket>,
+    ) -> oneshot::Receiver<Value> {
+        self.enqueue_in(&self.reader_queues, keys, ticket)
+    }
+
+    /// [`enqueue_readers`](Self::enqueue_readers) for one key.
+    #[cfg(test)]
     pub fn enqueue_reader(
         &self,
         key: &(impl AsRef<[u8]> + ?Sized),
         ticket: &Arc<Ticket>,
     ) -> oneshot::Receiver<Value> {
-        let key = key.as_ref();
-        self.enqueue_in(&self.reader_queues, key, ticket)
+        self.enqueue_in(&self.reader_queues, &[key.as_ref()], ticket)
     }
 
     fn enqueue_in(
         &self,
-        lines: &Mutex<AHashMap<Key, Vec<Queued>>>,
-        key: &[u8],
+        table: &LineTable,
+        keys: &[impl AsRef<[u8]>],
         ticket: &Arc<Ticket>,
     ) -> oneshot::Receiver<Value> {
-        let (tx, rx) = oneshot::channel();
-        let mut queues = lines.lock();
-        let queue = queues.entry(Key::new(key)).or_default();
-        // The moment to forget clients that have gone: it keeps a key that is
-        // waited on again and again from collecting them. Not one that was
-        // woken and has not looked: its ticket's `Drop`, under way, takes it
-        // out and passes its turn on, which it could not do once it was gone.
-        let before = queue.len();
-        queue.retain(|queued| queued.alive.strong_count() > 0 || queued.tx.is_none());
-        self.queued_count
-            .fetch_sub(before - queue.len(), Ordering::Relaxed);
-        match queue.binary_search_by_key(&ticket.id, |queued| queued.id) {
-            Ok(at) => queue[at].tx = Some(tx),
-            Err(at) => {
-                queue.insert(
-                    at,
-                    Queued {
-                        id: ticket.id,
-                        alive: Arc::downgrade(ticket),
-                        tx: Some(tx),
-                    },
-                );
-                self.queued_count.fetch_add(1, Ordering::Relaxed);
+        // Armed before it stands in line: a write the moment it does wakes it.
+        let rx = ticket.arm();
+        let mut lines = table.lines.lock();
+        let mut added = 0;
+        for key in keys {
+            let key = key.as_ref();
+            if !lines.contains_key(key) {
+                lines.insert(Key::new(key), BTreeMap::new());
+            }
+            let Some(line) = lines.get_mut(key) else {
+                continue;
+            };
+            match line.entry(ticket.id) {
+                // Waiting again, in the same place: not woken now.
+                std::collections::btree_map::Entry::Occupied(mut at) => at.get_mut().woken = false,
+                std::collections::btree_map::Entry::Vacant(at) => {
+                    at.insert(Queued {
+                        bell: Arc::clone(&ticket.bell),
+                        woken: false,
+                    });
+                    added += 1;
+                }
             }
         }
+        table.count.fetch_add(added, Ordering::Relaxed);
         rx
     }
 
     /// Leave the line for `key`.
+    #[cfg(test)]
     pub fn dequeue(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) {
-        let key = key.as_ref();
-        self.dequeue_in(&self.queues, key, ticket);
+        self.leave_in(&self.queues, std::iter::once(key.as_ref()), ticket.id);
+    }
+
+    /// Leave the line of each of `keys`, under one lock, and say for each
+    /// whether the turn there was this client's: it had been woken there
+    /// and had not looked since it last waited. A key named twice is left
+    /// once; the second time says `false`.
+    pub fn dequeue_all(&self, keys: &[impl AsRef<[u8]>], ticket: &Ticket) -> Vec<bool> {
+        self.leave_in(&self.queues, keys.iter().map(|key| key.as_ref()), ticket.id)
+    }
+
+    /// The command is answered: it has left every line its ticket stands
+    /// in, and its ticket's `Drop` has nothing left to do.
+    pub fn left_all(&self, ticket: &Ticket) {
+        ticket.lines.lock().clear();
+    }
+
+    fn leave_in<'k>(
+        &self,
+        table: &LineTable,
+        keys: impl Iterator<Item = &'k [u8]>,
+        id: u64,
+    ) -> Vec<bool> {
+        let mut lines = table.lines.lock();
+        let mut removed = 0;
+        let woken = keys
+            .map(|key| {
+                let Some(line) = lines.get_mut(key) else {
+                    return false;
+                };
+                let woken = line.remove(&id).map(|queued| {
+                    removed += 1;
+                    queued.woken
+                });
+                if line.is_empty() {
+                    lines.remove(key);
+                }
+                woken.unwrap_or(false)
+            })
+            .collect();
+        table.count.fetch_sub(removed, Ordering::Relaxed);
+        woken
     }
 
     /// Leave the line of `key`'s `XREADGROUP` clients, and give the turn to
@@ -244,7 +380,7 @@ impl WaitTable {
     /// there is something.
     pub fn reader_done(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) {
         let key = key.as_ref();
-        self.dequeue_in(&self.reader_queues, key, ticket);
+        self.leave_in(&self.reader_queues, std::iter::once(key), ticket.id);
         self.wake_next_in(&self.reader_queues, key, ticket.id);
     }
 
@@ -254,31 +390,18 @@ impl WaitTable {
         self.wake_next_in(&self.reader_queues, key, ticket.id);
     }
 
-    fn dequeue_in(&self, lines: &Mutex<AHashMap<Key, Vec<Queued>>>, key: &[u8], ticket: &Ticket) {
-        let mut queues = lines.lock();
-        let Some(queue) = queues.get_mut(key) else {
-            return;
-        };
-        if let Ok(at) = queue.binary_search_by_key(&ticket.id, |queued| queued.id) {
-            queue.remove(at);
-            self.queued_count.fetch_sub(1, Ordering::Relaxed);
-        }
-        if queue.is_empty() {
-            queues.remove(key);
-        }
-    }
-
     /// Whether a client that blocked before `ticket` is still in the line
     /// for `key`.
     pub fn someone_ahead(&self, key: &(impl AsRef<[u8]> + ?Sized), ticket: &Ticket) -> bool {
         let key = key.as_ref();
-        if self.queued_count.load(Ordering::Relaxed) == 0 {
+        if self.queues.is_empty() {
             return false;
         }
-        self.queues.lock().get(key).is_some_and(|queue| {
-            queue
-                .iter()
-                .any(|queued| queued.id < ticket.id && queued.alive.strong_count() > 0)
+        // From the front: the first that is still waiting answers it, and
+        // that is nearly always the first.
+        self.queues.lines.lock().get(key).is_some_and(|line| {
+            line.range(..ticket.id)
+                .any(|(_, queued)| queued.bell.alive())
         })
     }
 
@@ -304,25 +427,36 @@ impl WaitTable {
         self.wake_next_in(&self.queues, key, after);
     }
 
-    fn wake_next_in(&self, lines: &Mutex<AHashMap<Key, Vec<Queued>>>, key: &[u8], after: u64) {
-        if self.queued_count.load(Ordering::Relaxed) == 0 {
+    fn wake_next_in(&self, table: &LineTable, key: &[u8], after: u64) {
+        if table.is_empty() {
             return;
         }
-        let mut queues = lines.lock();
-        let Some(queue) = queues.get_mut(key) else {
+        let mut lines = table.lines.lock();
+        let Some(line) = lines.get_mut(key) else {
             return;
         };
-        let before = queue.len();
-        queue.retain(|queued| queued.alive.strong_count() > 0);
-        self.queued_count
-            .fetch_sub(before - queue.len(), Ordering::Relaxed);
-        if let Some(next) = queue.iter_mut().find(|queued| queued.id > after)
-            && let Some(tx) = next.tx.take()
-        {
-            let _ = tx.send(Arc::from([].as_slice()));
+        // Clients that have gone are passed over, and forgotten: a ticket
+        // dropped without leaving (its command unwound) leaves its entries
+        // here, and this is where they go. One that was woken and went
+        // without looking hands its turn on by being passed over.
+        let mut gone = Vec::new();
+        for (&id, queued) in line.range_mut(after.saturating_add(1)..) {
+            if !queued.bell.alive() {
+                gone.push(id);
+                continue;
+            }
+            if !queued.woken {
+                queued.woken = true;
+                queued.bell.ring(key);
+            }
+            break;
         }
-        if queue.is_empty() {
-            queues.remove(key);
+        for id in &gone {
+            line.remove(id);
+        }
+        table.count.fetch_sub(gone.len(), Ordering::Relaxed);
+        if line.is_empty() {
+            lines.remove(key);
         }
     }
 
@@ -330,8 +464,7 @@ impl WaitTable {
     ///
     /// The waiter is told nothing more than that: it looks at the key itself,
     /// takes what its own rules say it should, and goes back to waiting if
-    /// there was nothing for it — another client was quicker, or the list is
-    /// still too short for `BLMOVEM … EXACTLY`.
+    /// there was nothing for it.
     pub fn register_signal(&self, key: &(impl AsRef<[u8]> + ?Sized)) -> oneshot::Receiver<Value> {
         let key = key.as_ref();
         let (tx, rx) = oneshot::channel();
@@ -341,12 +474,14 @@ impl WaitTable {
         rx
     }
 
-    /// Whether anyone at all is waiting for a signal. One atomic load, so the
-    /// write path can skip working out which keys it touched.
+    /// Whether anyone at all is waiting for a signal. One atomic load per
+    /// kind of waiter, so the write path can skip working out which keys it
+    /// touched.
     #[inline]
     pub fn has_signal_waiters(&self) -> bool {
         self.signal_count.load(Ordering::Relaxed) != 0
-            || self.queued_count.load(Ordering::Relaxed) != 0
+            || !self.queues.is_empty()
+            || !self.reader_queues.is_empty()
     }
 
     /// Wake everyone registered with [`register_signal`](Self::register_signal)
@@ -377,8 +512,8 @@ impl WaitTable {
     pub fn notify_all_signals(&self) {
         let keys: Vec<Key> = {
             let signals = self.signals.lock();
-            let queues = self.queues.lock();
-            let readers = self.reader_queues.lock();
+            let queues = self.queues.lines.lock();
+            let readers = self.reader_queues.lines.lock();
             signals
                 .keys()
                 .chain(queues.keys())
@@ -407,16 +542,15 @@ impl WaitTable {
                 keys.insert(key.clone());
             }
         }
-        let alive =
-            |queue: &Vec<Queued>| queue.iter().any(|queued| queued.alive.strong_count() > 0);
-        for (key, queue) in self.queues.lock().iter() {
-            if alive(queue) {
+        let alive = |line: &BTreeMap<u64, Queued>| line.values().any(|queued| queued.bell.alive());
+        for (key, line) in self.queues.lines.lock().iter() {
+            if alive(line) {
                 keys.insert(key.clone());
             }
         }
         let mut on_nokey = 0;
-        for (key, queue) in self.reader_queues.lock().iter() {
-            if alive(queue) {
+        for (key, line) in self.reader_queues.lines.lock().iter() {
+            if alive(line) {
                 keys.insert(key.clone());
                 on_nokey += 1;
             }
@@ -708,5 +842,97 @@ mod signal_tests {
         assert!(table.has_signal_waiters());
         table.notify_signal("a");
         assert!(!table.has_signal_waiters());
+    }
+
+    /// A client in the lines of several keys waits on one receiver, which
+    /// the first of them to be written wakes, with that key's name; leaving
+    /// says in which lines the turn was its own (#758).
+    #[test]
+    fn one_receiver_for_all_of_a_clients_keys() {
+        let table = Arc::new(WaitTable::new());
+        let ticket = table.new_ticket();
+        let mut rx = table.enqueue_all(&["a", "b", "c"], &ticket);
+        ticket.parks_in(&["a", "b", "c"], false);
+        assert_eq!(table.queues.count.load(Ordering::Relaxed), 3);
+        table.notify_signal("b");
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"b");
+        // Written again, and another key: the turn is with it already, and
+        // it has been woken in this wait.
+        table.notify_signal("b");
+        table.notify_signal("c");
+        assert_eq!(
+            table.dequeue_all(&["a", "b", "c", "b"], &ticket),
+            [false, true, true, false]
+        );
+        table.left_all(&ticket);
+        assert_eq!(table.queues.count.load(Ordering::Relaxed), 0);
+        assert!(table.queues.lines.lock().is_empty());
+        drop(ticket);
+        assert!(!table.has_signal_waiters());
+    }
+
+    /// Waiting again re-arms: the receiver of the last wait is not woken,
+    /// the new one is, and the client keeps its place in every line.
+    #[test]
+    fn waiting_again_keeps_the_place_in_every_line() {
+        let table = Arc::new(WaitTable::new());
+        let first = table.new_ticket();
+        let second = table.new_ticket();
+        let _rx1 = table.enqueue_all(&["a", "b"], &first);
+        let mut rx2 = table.enqueue_all(&["a", "b"], &second);
+        table.notify_signal("a");
+        // The first looked, found nothing it could take, and waits again.
+        let mut rx1 = table.enqueue_all(&["a", "b"], &first);
+        table.notify_signal("b");
+        assert_eq!(rx1.try_recv().unwrap().as_ref(), b"b");
+        assert!(rx2.try_recv().is_err());
+        assert!(table.someone_ahead("a", &second));
+        assert!(!table.someone_ahead("a", &first));
+    }
+
+    /// A ticket dropped while it stands in many lines leaves all of them,
+    /// and passes its turn on only where it had been woken.
+    #[test]
+    fn a_dropped_ticket_leaves_every_line() {
+        let table = Arc::new(WaitTable::new());
+        let keys: Vec<String> = (0..270).map(|i| format!("queue:{i}")).collect();
+        let tickets: Vec<_> = (0..100).map(|_| table.new_ticket()).collect();
+        let mut rxs: Vec<_> = tickets
+            .iter()
+            .map(|ticket| {
+                let rx = table.enqueue_all(&keys, ticket);
+                ticket.parks_in(&keys, false);
+                rx
+            })
+            .collect();
+        assert_eq!(table.queues.count.load(Ordering::Relaxed), 270 * 100);
+        table.notify_signal("queue:7");
+        assert_eq!(rxs[0].try_recv().unwrap().as_ref(), b"queue:7");
+        let mut tickets = tickets.into_iter();
+        // The first was woken for queue:7 and goes without looking: the
+        // second is woken for it, and for nothing else.
+        drop(tickets.next());
+        assert_eq!(rxs[1].try_recv().unwrap().as_ref(), b"queue:7");
+        assert!(rxs[2].try_recv().is_err());
+        assert_eq!(table.queues.count.load(Ordering::Relaxed), 270 * 99);
+        drop(tickets);
+        assert_eq!(table.queues.count.load(Ordering::Relaxed), 0);
+        assert!(table.queues.lines.lock().is_empty());
+    }
+
+    /// Entries left behind by a ticket that went without leaving (its
+    /// command unwound before it parked) are passed over and forgotten.
+    #[test]
+    fn entries_of_a_ticket_that_never_parked_are_passed_over() {
+        let table = Arc::new(WaitTable::new());
+        let gone = table.new_ticket();
+        let behind = table.new_ticket();
+        let _gone_rx = table.enqueue_all(&["k"], &gone);
+        let mut rx = table.enqueue_all(&["k"], &behind);
+        drop(gone);
+        assert!(!table.someone_ahead("k", &behind));
+        table.notify_signal("k");
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"k");
+        assert_eq!(table.queues.count.load(Ordering::Relaxed), 1);
     }
 }
