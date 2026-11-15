@@ -77,9 +77,13 @@ impl Bell {
     /// Wake the client for `key`, unless another key has woken it already
     /// in this wait (it will look at all its keys anyway).
     fn ring(&self, key: &[u8]) -> Rang {
-        match self.tx.lock().take() {
-            Some(tx) if tx.send(Arc::from(key)).is_ok() => Rang::Sent,
-            Some(_) => Rang::Closed,
+        let tx = self.tx.lock().take();
+        match tx {
+            Some(tx) if tx.is_closed() => Rang::Closed,
+            Some(tx) => match tx.send(Arc::from(key)) {
+                Ok(()) => Rang::Sent,
+                Err(_) => Rang::Closed,
+            },
             None => Rang::Already,
         }
     }
@@ -163,10 +167,12 @@ impl Look {
 /// deadline. A look already seen is not waited for twice, so looks that
 /// name each other end.
 pub async fn all_looked(looks: Vec<Arc<Look>>, deadline: tokio::time::Instant) {
-    let mut seen: Vec<*const Look> = Vec::new();
+    // By address: `Send`, unlike a pointer, and the looks are kept alive
+    // by `todo` and the looks that carry them.
+    let mut seen: Vec<usize> = Vec::new();
     let mut todo = looks;
     while let Some(look) = todo.pop() {
-        let at = Arc::as_ptr(&look);
+        let at = Arc::as_ptr(&look) as usize;
         if seen.contains(&at) {
             continue;
         }
