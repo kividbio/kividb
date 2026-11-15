@@ -285,6 +285,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A script that writes nothing, a `SELECT` and `SCRIPT LOAD` no longer
+  move the master's replication offset (#705).** A read-only script that
+  ran `SELECT`, and every `SELECT` a client sent, added a `SELECT n` to the
+  replication stream and the AOF (23 bytes each), and `SCRIPT LOAD` and
+  `SCRIPT FLUSH` added the command itself; in Redis 8.10 `master_repl_offset`
+  stays where it is for all of them. A write already carries the `SELECT`
+  it needs, so nothing is lost: scripts that write in several databases,
+  also in a transaction, reach the replica and the AOF in the same databases
+  as before. One difference you can see: a script loaded on the master is
+  no longer loaded on its replicas, as in Redis since 7.0, so a client that
+  runs `EVALSHA` there gets `NOSCRIPT` and loads the script, which is what
+  clients do for Redis. A script's writes always reached a replica as the
+  commands it made, never as `EVALSHA`, so a replica did not need it.
+
 - **A replica promoted after its master died part way through a slot
   import deletes what the import brought, and an import sent again no
   longer brings back keys the source deleted (#741).** The keys a
