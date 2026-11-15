@@ -2524,6 +2524,18 @@ end
     lua
 }
 
+/// A map key or set member must be something Lua accepts as a table index:
+/// anything but nil (a double arrives as the table `{double=...}`, so there
+/// is no NaN). It is Lua's own error, here as a clean one.
+fn table_key_check(key: &LuaValue, what: &str) -> LuaResult<()> {
+    if matches!(key, LuaValue::Nil) {
+        return Err(LuaError::RuntimeError(format!(
+            "RESP parse: {what} must not be nil"
+        )));
+    }
+    Ok(())
+}
+
 /// Find `\r\n` starting from `start`; returns index of `\r`.
 fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
     buf[start..]
@@ -2631,15 +2643,10 @@ fn parse_resp_value(lua: &Lua, buf: &[u8], pos: usize) -> LuaResult<(LuaValue, u
             for _ in 0..count {
                 let (k, next_k) = parse_resp_value(lua, buf, cur)?;
                 let (v, next_v) = parse_resp_value(lua, buf, next_k)?;
-                match k {
-                    LuaValue::String(ks) => inner.set(ks, v)?,
-                    LuaValue::Integer(i) => inner.set(i, v)?,
-                    _ => {
-                        return Err(LuaError::RuntimeError(
-                            "RESP parse: map key must be string or integer".into(),
-                        ));
-                    }
-                }
+                // Any converted value is a key, as in Redis (`lua_settable`): a
+                // status reply is the table `{ok=...}`, used by identity.
+                table_key_check(&k, "map key")?;
+                inner.set(k, v)?;
                 cur = next_v;
             }
             let outer = lua.create_table()?;
@@ -2741,15 +2748,8 @@ fn parse_resp_value(lua: &Lua, buf: &[u8], pos: usize) -> LuaResult<(LuaValue, u
             let mut cur = end + 2;
             for _ in 0..count {
                 let (elem, next) = parse_resp_value(lua, buf, cur)?;
-                match elem {
-                    LuaValue::String(s) => inner.set(s, true)?,
-                    LuaValue::Integer(i) => inner.set(i, true)?,
-                    _ => {
-                        return Err(LuaError::RuntimeError(
-                            "RESP parse: set member must be string or integer".into(),
-                        ));
-                    }
-                }
+                table_key_check(&elem, "set member")?;
+                inner.set(elem, true)?;
                 cur = next;
             }
             let outer = lua.create_table()?;
@@ -5871,5 +5871,40 @@ mod function_stats_reply_tests {
               %2\r\n$15\r\nlibraries_count\r\n:1\r\n$15\r\nfunctions_count\r\n:3\r\n"
                 .to_vec()
         );
+    }
+}
+
+#[cfg(test)]
+mod resp_parse_key_tests {
+    use super::*;
+
+    /// A RESP3 map or set takes any converted value as its key, as in Redis:
+    /// a status reply (`+results`) becomes the table `{ok='results'}`.
+    #[test]
+    fn a_status_reply_is_a_map_key_or_set_member() {
+        let lua = Lua::new();
+        let (v, _) = parse_resp_value(&lua, b"%1\r\n+results\r\n:7\r\n", 0).unwrap();
+        let LuaValue::Table(outer) = v else { panic!() };
+        let map: mlua::Table = outer.get("map").unwrap();
+        let (k, n): (mlua::Table, i64) = map.pairs().next().unwrap().unwrap();
+        assert_eq!(k.get::<String>("ok").unwrap(), "results");
+        assert_eq!(n, 7);
+
+        let (v, _) = parse_resp_value(&lua, b"~1\r\n+x\r\n", 0).unwrap();
+        let LuaValue::Table(outer) = v else { panic!() };
+        let set: mlua::Table = outer.get("set").unwrap();
+        let (k, yes): (mlua::Table, bool) = set.pairs().next().unwrap().unwrap();
+        assert_eq!(k.get::<String>("ok").unwrap(), "x");
+        assert!(yes);
+    }
+
+    /// A null key, which Lua refuses, is a clean error, not a panic.
+    #[test]
+    fn a_null_key_is_an_error() {
+        let lua = Lua::new();
+        for buf in [&b"%1\r\n_\r\n:1\r\n"[..], b"~1\r\n_\r\n"] {
+            let err = parse_resp_value(&lua, buf, 0).unwrap_err().to_string();
+            assert!(err.contains("must not be nil"), "{err}");
+        }
     }
 }

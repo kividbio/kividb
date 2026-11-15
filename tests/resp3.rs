@@ -102,9 +102,17 @@ impl RawConn {
     /// Reads until the reply looks complete rather than assuming it arrives in
     /// one TCP segment — larger aggregate replies are routinely split.
     fn raw(&mut self, args: &[&str]) -> Vec<u8> {
+        let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        self.raw_bytes(&args)
+    }
+
+    /// [`Self::raw`] for arguments that need not be UTF-8.
+    fn raw_bytes(&mut self, args: &[&[u8]]) -> Vec<u8> {
         let mut buf = format!("*{}\r\n", args.len()).into_bytes();
         for a in args {
-            buf.extend_from_slice(format!("${}\r\n{}\r\n", a.len(), a).as_bytes());
+            buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            buf.extend_from_slice(a);
+            buf.extend_from_slice(b"\r\n");
         }
         self.stream.write_all(&buf).unwrap();
 
@@ -197,6 +205,288 @@ macro_rules! assert_wire {
             s(e)
         );
     }};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Geo — coordinates and distances, as Redis 8.10.2 writes them (#701)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn geo_points(c: &mut RawConn) {
+    c.raw(&[
+        "GEOADD",
+        "g",
+        "13.361389",
+        "38.115556",
+        "Palermo",
+        "15.087269",
+        "37.502669",
+        "Catania",
+    ]);
+}
+
+#[test]
+fn geo_coordinates_have_the_fewest_digits_that_read_back_the_same() {
+    let port = free_port();
+    start_server(port);
+
+    let mut c2 = RawConn::connect(port);
+    geo_points(&mut c2);
+    assert_wire!(
+        c2.raw(&["GEOPOS", "g", "Palermo"]),
+        b"*1\r\n*2\r\n$18\r\n13.361389338970184\r\n$16\r\n38.1155563954963\r\n",
+        "RESP2 GEOPOS"
+    );
+
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+    assert_wire!(
+        c3.raw(&["GEOPOS", "g", "Palermo"]),
+        b"*1\r\n*2\r\n,13.361389338970184\r\n,38.1155563954963\r\n",
+        "RESP3 GEOPOS"
+    );
+}
+
+#[test]
+fn geo_distances_are_bulk_strings_under_both_protocols() {
+    let port = free_port();
+    start_server(port);
+    let search = [
+        "GEOSEARCH",
+        "g",
+        "FROMLONLAT",
+        "15",
+        "37",
+        "BYRADIUS",
+        "200",
+        "km",
+        "WITHCOORD",
+        "WITHDIST",
+        "ASC",
+    ];
+
+    let mut c2 = RawConn::connect(port);
+    geo_points(&mut c2);
+    assert_wire!(
+        c2.raw(&["GEODIST", "g", "Palermo", "Catania"]),
+        b"$11\r\n166274.1516\r\n",
+        "RESP2 GEODIST"
+    );
+    assert_wire!(
+        c2.raw(&search),
+        b"*2\r\n\
+          *3\r\n$7\r\nCatania\r\n$7\r\n56.4413\r\n\
+          *2\r\n$18\r\n15.087267458438873\r\n$17\r\n37.50266842333162\r\n\
+          *3\r\n$7\r\nPalermo\r\n$8\r\n190.4424\r\n\
+          *2\r\n$18\r\n13.361389338970184\r\n$16\r\n38.1155563954963\r\n",
+        "RESP2 GEOSEARCH WITHCOORD WITHDIST"
+    );
+
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+    assert_wire!(
+        c3.raw(&["GEODIST", "g", "Palermo", "Catania"]),
+        b"$11\r\n166274.1516\r\n",
+        "RESP3 GEODIST"
+    );
+    assert_wire!(
+        c3.raw(&["GEODIST", "g", "Palermo", "Palermo"]),
+        b"$6\r\n0.0000\r\n",
+        "RESP3 GEODIST of a member to itself"
+    );
+    assert_wire!(
+        c3.raw(&search),
+        b"*2\r\n\
+          *3\r\n$7\r\nCatania\r\n$7\r\n56.4413\r\n\
+          *2\r\n,15.087267458438873\r\n,37.50266842333162\r\n\
+          *3\r\n$7\r\nPalermo\r\n$8\r\n190.4424\r\n\
+          *2\r\n,13.361389338970184\r\n,38.1155563954963\r\n",
+        "RESP3 GEOSEARCH WITHCOORD WITHDIST"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Time series — sample values, as Redis 8.10.2 writes them (#701)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn ts_values_under_resp2_take_an_exponent_where_redistimeseries_gives_one() {
+    let port = free_port();
+    start_server(port);
+    let mut c2 = RawConn::connect(port);
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+
+    let check = |c: &mut RawConn, value: &str, want: &[u8]| {
+        c.raw(&["DEL", "t"]);
+        c.raw(&["TS.ADD", "t", "1", value]);
+        let mut sample = b"*2\r\n:1\r\n".to_vec();
+        sample.extend_from_slice(want);
+        assert_wire!(
+            c.raw(&["TS.GET", "t"]),
+            &sample,
+            format!("TS.GET of {value}")
+        );
+    };
+    for (value, want) in [
+        ("0", "0"),
+        ("-0", "-0"),
+        ("0.1", "1E-1"),
+        ("-0.5", "-5E-1"),
+        ("0.9999999999999999", "9.999999999999999E-1"),
+        ("1.5e-7", "1.5E-7"),
+        ("1", "1"),
+        ("-2.5", "-2.5"),
+        ("100", "100"),
+        ("123456.789", "123456.789"),
+        ("1000000000000000", "1000000000000000"),
+        ("4503599627370490", "4503599627370490"),
+        ("5721508784661410", "5.72150878466141E15"),
+        ("9007199254740990", "9.00719925474099E15"),
+        ("9999999999999998", "9999999999999998"),
+        ("1e16", "1E16"),
+        ("10642226689827378", "10642226689827378"),
+        ("36028797018963970", "3.602879701896397E16"),
+        ("72057594037927936", "7.205759403792794E16"),
+        ("123456789012345678", "1.2345678901234568E17"),
+        ("1e21", "1E21"),
+    ] {
+        check(&mut c2, value, format!("+{want}\r\n").as_bytes());
+    }
+    check(&mut c3, "0.1", b",0.1\r\n");
+    check(&mut c3, "1e21", b",1e+21\r\n");
+
+    for (key, value, want) in [
+        ("up", "1e308", b"+Infinity\r\n" as &[u8]),
+        ("down", "-1e308", b"+-Infinity\r\n"),
+    ] {
+        c2.raw(&["TS.ADD", key, "1", value]);
+        c2.raw(&["TS.ADD", key, "2", value]);
+        let mut sum = b"*1\r\n*2\r\n:0\r\n".to_vec();
+        sum.extend_from_slice(want);
+        assert_wire!(
+            c2.raw(&["TS.RANGE", key, "-", "+", "AGGREGATION", "sum", "10"]),
+            &sum,
+            format!("a sum of {value} twice")
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RedisJSON errors, as Redis 8.10.2 gives them (#701)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn json_commands_on_a_key_of_another_type_answer_as_redisjson_does() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    c.raw(&["SET", "s", "x"]);
+
+    for command in [
+        &["JSON.SET", "s", "$", "1"][..],
+        &["JSON.GET", "s"],
+        &["JSON.GET", "s", "$"],
+        &["JSON.DEL", "s"],
+        &["JSON.FORGET", "s"],
+        &["JSON.TYPE", "s"],
+        &["JSON.STRLEN", "s"],
+        &["JSON.STRAPPEND", "s", "\"a\""],
+        &["JSON.ARRAPPEND", "s", "$", "1"],
+        &["JSON.ARRINDEX", "s", "$", "1"],
+        &["JSON.ARRINSERT", "s", "$", "0", "1"],
+        &["JSON.ARRLEN", "s"],
+        &["JSON.ARRPOP", "s"],
+        &["JSON.ARRTRIM", "s", "$", "0", "1"],
+        &["JSON.CLEAR", "s"],
+        &["JSON.NUMINCRBY", "s", "$", "1"],
+        &["JSON.NUMMULTBY", "s", "$", "2"],
+        &["JSON.OBJKEYS", "s"],
+        &["JSON.OBJLEN", "s"],
+        &["JSON.TOGGLE", "s", "$"],
+        &["JSON.MERGE", "s", "$", "1"],
+        &["JSON.MSET", "s", "$", "1"],
+        &["JSON.RESP", "s"],
+        &["JSON.DEBUG", "MEMORY", "s"],
+    ] {
+        assert_wire!(
+            c.raw(command),
+            b"-Existing key has wrong Redis type\r\n",
+            command.join(" ")
+        );
+    }
+}
+
+#[test]
+fn json_values_that_do_not_parse_answer_with_serde_jsons_text() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    c.raw(&["JSON.SET", "j", "$", r#"{"a":1,"b":[1],"s":"x"}"#]);
+
+    for (command, want) in [
+        (
+            &["JSON.SET", "j", "$", "{bad"][..],
+            "key must be a string at line 1 column 2",
+        ),
+        (
+            &["JSON.SET", "j", "$", "[1,"],
+            "EOF while parsing a value at line 1 column 3",
+        ),
+        (
+            &["JSON.SET", "j", "$", r#"{"a":1} x"#],
+            "trailing characters at line 1 column 9",
+        ),
+        (
+            &["JSON.ARRAPPEND", "j", "$.b", "{bad"],
+            "key must be a string at line 1 column 2",
+        ),
+        (
+            &["JSON.ARRINSERT", "j", "$.b", "0", "{bad"],
+            "key must be a string at line 1 column 2",
+        ),
+        (
+            &["JSON.MERGE", "j", "$", "{bad"],
+            "key must be a string at line 1 column 2",
+        ),
+        (
+            &["JSON.MSET", "j", "$", "{bad"],
+            "key must be a string at line 1 column 2",
+        ),
+        (
+            &["JSON.ARRINDEX", "j", "$.b", "{bad"],
+            "ERR key must be a string at line 1 column 2",
+        ),
+        (
+            &["JSON.NUMINCRBY", "j", "$.a", "x"],
+            "ERR expected value at line 1 column 1",
+        ),
+        (
+            &["JSON.NUMMULTBY", "j", "$.a", "[1,"],
+            "ERR EOF while parsing a value at line 1 column 3",
+        ),
+        (&["JSON.NUMINCRBY", "j", "$.a", "\"a\""], "bad input number"),
+        (
+            &["JSON.STRAPPEND", "j", "$.s", "bad"],
+            "ERR expected value at line 1 column 1",
+        ),
+        (
+            &["JSON.STRAPPEND", "j", "$.s", "1"],
+            "WRONGTYPE wrong type of path value - expected string",
+        ),
+    ] {
+        let want = format!("-{want}\r\n");
+        assert_wire!(c.raw(command), want.as_bytes(), command.join(" "));
+    }
+    for command in [
+        &[&b"JSON.SET"[..], b"j", b"$", b"\"\xff\""][..],
+        &[b"JSON.ARRINDEX", b"j", b"$.b", b"\"\xff\""],
+    ] {
+        assert_wire!(
+            c.raw_bytes(command),
+            b"-Couldn't parse as UTF-8 string\r\n",
+            String::from_utf8_lossy(command[0])
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1731,4 +2021,245 @@ fn doubles_and_json_replies_are_written_as_redis_writes_them() {
             format!("RESP2 legacy NUMINCRBY {path}")
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ARLASTITEMS, ARINFO and the search replies follow the script's protocol (#439)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The expected bytes of the array commands are Redis 8.10.2's. Its build has
+// no search module, so the FT.* replies are the shapes a RESP3 client already
+// got, pinned here for a script under `redis.setresp(3)` too.
+
+/// A hole in the array is a null of the client's protocol, in a RESP3 reply
+/// as much as in a RESP2 one.
+#[test]
+fn arlastitems_holes_are_the_null_of_the_clients_protocol() {
+    let port = free_port();
+    start_server(port);
+    let mut c2 = RawConn::connect(port);
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+    c2.raw(&["ARSET", "ali439", "1", "x"]);
+    c2.raw(&["ARSET", "ali439", "3", "z"]);
+
+    assert_wire!(
+        c2.raw(&["ARLASTITEMS", "ali439", "5"]),
+        b"*2\r\n$-1\r\n$1\r\nz\r\n",
+        "RESP2 ARLASTITEMS"
+    );
+    assert_wire!(
+        c3.raw(&["ARLASTITEMS", "ali439", "5"]),
+        b"*2\r\n_\r\n$1\r\nz\r\n",
+        "RESP3 ARLASTITEMS"
+    );
+    assert_wire!(
+        c2.raw(&["ARLASTITEMS", "ali439", "5", "REV"]),
+        b"*2\r\n$1\r\nz\r\n$-1\r\n",
+        "RESP2 ARLASTITEMS REV"
+    );
+    assert_wire!(
+        c3.raw(&["ARLASTITEMS", "ali439", "5", "REV"]),
+        b"*2\r\n$1\r\nz\r\n_\r\n",
+        "RESP3 ARLASTITEMS REV"
+    );
+    // ARINFO is a flat array to RESP2 and a map to RESP3.
+    let info2 = c2.raw(&["ARINFO", "ali439"]);
+    let info3 = c3.raw(&["ARINFO", "ali439"]);
+    assert!(
+        info2.starts_with(b"*14\r\n$5\r\ncount\r\n:2\r\n"),
+        "{}",
+        s(&info2)
+    );
+    assert!(
+        info3.starts_with(b"%7\r\n$5\r\ncount\r\n:2\r\n"),
+        "{}",
+        s(&info3)
+    );
+    assert_eq!(info2[b"*14".len()..], info3[b"%7".len()..]);
+}
+
+/// What `redis.call` hands a script is shaped by the script's own protocol:
+/// the default is RESP2 (a hole is `false`, `ARINFO` an array), under
+/// `setresp(3)` a hole is `nil` and `ARINFO` a map.
+#[cfg(feature = "lua")]
+#[test]
+fn array_replies_inside_a_script_follow_setresp() {
+    const P: &str = "redis.call('DEL','ali439s') redis.call('ARSET','ali439s',1,'x') \
+                     redis.call('ARSET','ali439s',3,'z') ";
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    // The default script protocol is RESP2, where a hole is a Lua false;
+    // it is sent as the client's null.
+    let hole = format!("{P}return redis.call('ARLASTITEMS','ali439s',5)");
+    assert_wire!(
+        eval_on(&mut c2, "EVAL", &hole),
+        b"*2\r\n$-1\r\n$1\r\nz\r\n",
+        "RESP2 client: a hole"
+    );
+    assert_wire!(
+        eval_on(&mut c3, "EVAL", &hole),
+        b"*2\r\n_\r\n$1\r\nz\r\n",
+        "RESP3 client: a hole"
+    );
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "return type(redis.call('ARLASTITEMS','ali439s',5)[1])",
+            b"$7\r\nboolean\r\n",
+        ),
+        (
+            "redis.setresp(2) return type(redis.call('ARLASTITEMS','ali439s',5)[1])",
+            b"$7\r\nboolean\r\n",
+        ),
+        // A nil ends a Lua array, as it does in Redis.
+        (
+            "redis.setresp(3) return redis.call('ARLASTITEMS','ali439s',5)",
+            b"*0\r\n",
+        ),
+        (
+            "redis.setresp(3) return type(redis.call('ARLASTITEMS','ali439s',5)[1])",
+            b"$3\r\nnil\r\n",
+        ),
+        (
+            "redis.setresp(3) return redis.call('ARLASTITEMS','ali439s',5,'REV')",
+            b"*1\r\n$1\r\nz\r\n",
+        ),
+        (
+            "return type(redis.call('ARINFO','ali439s').map)",
+            b"$3\r\nnil\r\n",
+        ),
+        (
+            "redis.setresp(3) return type(redis.call('ARINFO','ali439s').map)",
+            b"$5\r\ntable\r\n",
+        ),
+        (
+            "redis.setresp(3) return redis.call('ARINFO','ali439s').map.count",
+            b":2\r\n",
+        ),
+    ];
+    for (script, expected) in cases {
+        let script = format!("{P}{script}");
+        for (name, c) in [("RESP2", &mut c2), ("RESP3", &mut c3)] {
+            assert_wire!(
+                eval_on(c, "EVAL", &script),
+                expected,
+                format!("{name} client: {script}")
+            );
+        }
+    }
+}
+
+/// `VEMB ... RAW` ends with the vector's norm: a double under RESP3.
+#[cfg(feature = "lua")]
+#[test]
+fn vemb_inside_a_script_follows_setresp() {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    c2.raw(&["VADD", "vemb439", "VALUES", "2", "3", "4", "e"]);
+    let cases: &[(&str, &[u8], &[u8])] = &[
+        (
+            "return type(redis.call('VEMB','vemb439','e','RAW')[3])",
+            b"$6\r\nstring\r\n",
+            b"$6\r\nstring\r\n",
+        ),
+        (
+            "redis.setresp(3) return type(redis.call('VEMB','vemb439','e','RAW')[3])",
+            b"$5\r\ntable\r\n",
+            b"$5\r\ntable\r\n",
+        ),
+        (
+            "redis.setresp(3) return redis.call('VEMB','vemb439','e','RAW')[3]",
+            b"$1\r\n5\r\n",
+            b",5\r\n",
+        ),
+    ];
+    for (script, resp2, resp3) in cases {
+        assert_wire!(
+            eval_on(&mut c2, "EVAL", script),
+            resp2,
+            format!("RESP2: {script}")
+        );
+        assert_wire!(
+            eval_on(&mut c3, "EVAL", script),
+            resp3,
+            format!("RESP3: {script}")
+        );
+    }
+}
+
+/// FT.SEARCH, FT.AGGREGATE, FT.CONFIG, FT.SPELLCHECK and FT.INFO inside a
+/// script read `redis.setresp`, not the connection's protocol: RESP2 shapes
+/// (arrays) by default, RESP3 maps after `setresp(3)`, on a RESP2 client as
+/// on a RESP3 one.
+#[cfg(feature = "lua")]
+#[test]
+fn search_replies_inside_a_script_follow_setresp() {
+    let port = free_port();
+    start_server(port);
+    let (mut c2, mut c3) = lua_conns(port);
+    assert_wire!(
+        c2.raw(&[
+            "FT.CREATE",
+            "idx439",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "s439:",
+            "SCHEMA",
+            "t",
+            "TEXT"
+        ]),
+        b"+OK\r\n",
+        "FT.CREATE"
+    );
+    c2.raw(&["HSET", "s439:1", "t", "hello world"]);
+    c2.raw(&["HSET", "s439:2", "t", "hello there"]);
+    let search = "redis.call('FT.SEARCH','idx439','hello','NOCONTENT')";
+    let aggregate = "redis.call('FT.AGGREGATE','idx439','hello','LOAD','1','@t')";
+    let config = "redis.call('FT.CONFIG','GET','*')";
+    let info = "redis.call('FT.INFO','idx439')";
+    let spell = "redis.call('FT.SPELLCHECK','idx439','helo')";
+    let nil: &[u8] = b"$3\r\nnil\r\n";
+    let table: &[u8] = b"$5\r\ntable\r\n";
+    let cases: Vec<(String, &[u8])> = vec![
+        (format!("return type({search}.map)"), nil),
+        (format!("return {search}[1]"), b":2\r\n"),
+        (format!("redis.setresp(3) return type({search}.map)"), table),
+        (
+            format!("redis.setresp(3) return {search}.map.total_results"),
+            b":2\r\n",
+        ),
+        (format!("return type({aggregate}.map)"), nil),
+        (
+            format!("redis.setresp(3) return type({aggregate}.map)"),
+            table,
+        ),
+        (format!("return type({config}.map)"), nil),
+        (format!("redis.setresp(3) return type({config}.map)"), table),
+        (format!("return type({info}.map)"), nil),
+        (format!("redis.setresp(3) return type({info}.map)"), table),
+        // FT.SPELLCHECK's RESP3 map is keyed by the simple string `results`,
+        // which a script sees as the table `{ok='results'}` (#797).
+        (format!("return type({spell}.map)"), nil),
+        (
+            format!(
+                "redis.setresp(3) local r = {spell} \
+                 for k in pairs(r.map) do return k.ok end"
+            ),
+            b"$7\r\nresults\r\n",
+        ),
+    ];
+    for (script, expected) in &cases {
+        for (name, c) in [("RESP2", &mut c2), ("RESP3", &mut c3)] {
+            assert_wire!(
+                eval_on(c, "EVAL", script),
+                expected,
+                format!("{name} client: {script}")
+            );
+        }
+    }
+    c2.raw(&["FT.DROPINDEX", "idx439"]);
 }

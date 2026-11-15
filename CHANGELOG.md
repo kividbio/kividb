@@ -189,6 +189,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A grouped `FT.AGGREGATE` reports how many groups there are (#761).** The
+  first element of the reply (`total_results` under RESP3) was the number of
+  rows on the page, so `GROUPBY 1 @f REDUCE COUNT 0 AS n LIMIT 0 10` over a
+  thousand groups said 10. It now says 1000, as Redis 8.10 does, which is
+  what clients such as redis-py's `AggregateResult.total` page by. It counts
+  the groups the last `GROUPBY` made, before `LIMIT` or `SORTBY ... MAX` cut
+  them down; with `WITHCURSOR` the first page carries it and `FT.CURSOR READ`
+  answers 0 after. A `FILTER` after the `GROUPBY`, and aggregations without a
+  `GROUPBY`, are left as they were.
+
+- **Geo coordinates and distances are written as Redis 8.10 writes them
+  (#701).** Under RESP2, `GEOPOS` and `WITHCOORD` give the fewest digits
+  that read back as the same coordinate (`13.361389338970184`), not 17
+  decimals (`13.36138933897018433`). Under RESP3, `GEODIST` and `WITHDIST`
+  give a bulk string (`166274.1516`), as under RESP2, not a double. A client
+  that parses the numbers gets the same values; one that compares the text,
+  or reads a RESP3 distance as a double, sees the change.
+
+- **Time series values under RESP2 are written as RedisTimeSeries writes
+  them (#701).** `TS.GET`, `TS.RANGE`, `TS.MGET`, `TS.MRANGE` and their
+  `REV` forms give a value below 1, from 2^56, or from 2^52 ending in a zero
+  with an exponent (`1E-1`, `1E21`, `5.72150878466141E15`), and an infinite
+  sum as `Infinity`, not `0.1`, `1000000000000000000000` and `inf`. RESP3
+  replies are unchanged.
+
+- **RedisJSON errors read as Redis 8.10 gives them (#701).** A JSON command
+  on a key of another type answers `Existing key has wrong Redis type`, not
+  `WRONGTYPE ...`. A JSON argument that does not parse answers with
+  serde_json's text (`EOF while parsing a value at line 1 column 3`),
+  after `ERR ` for `JSON.ARRINDEX`, `JSON.NUMINCRBY`, `JSON.NUMMULTBY` and
+  `JSON.STRAPPEND`, not `ERR invalid JSON`; one that is not UTF-8 answers
+  `Couldn't parse as UTF-8 string`. `JSON.NUMINCRBY` with a value that is
+  not a number answers `bad input number`, and `JSON.STRAPPEND` with one
+  that is not a string `WRONGTYPE wrong type of path value - expected
+  string`.
+
 - **`MEMORY USAGE` of a stream is what its entries take, and reads
   differently (#683).** Stream entries are now packed into blocks, and
   `MEMORY USAGE` counts those blocks exactly instead of estimating from a
@@ -221,8 +257,69 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   counted from then).
   `FT.SPELLCHECK` sends `TERM` (RESP2) and `results` (RESP3) as simple
   strings, as RediSearch does; they were bulk strings.
+- **`ARLASTITEMS` and the search and vector replies follow the protocol of
+  the client or the script (#439).** `ARLASTITEMS` sent `$-1` for an empty
+  slot to a RESP3 client; it is now `_`, as in Redis 8.10. `FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.CURSOR`, `FT.CONFIG GET`, `FT.SPELLCHECK`, `FT.INFO`,
+  `FT.PROFILE`, `FT.HYBRID`, `VEMB` and `ARINFO` took the connection's
+  protocol, so inside a script they ignored `redis.setresp`. They now follow
+  it, as the other commands do: RESP2 shapes by default, RESP3 ones after
+  `redis.setresp(3)`. A script can now read a RESP3 map or set whose key is
+  a status reply, as `FT.SPELLCHECK`'s `results` is (#797): as in Redis, the
+  key is the table `{ok='results'}`. It was an error ("map key must be
+  string or integer").
 
 ### Fixed
+
+- **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
+  (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,
+  then, for a while, was refused. Like Redis, which reads a `long double`,
+  every blocking list and sorted-set command now waits 1 ms on a positive
+  decimal timeout that is too small for a double but not for a `long double`
+  (down to about `1.8e-4951`); a decimal text no `long double` holds
+  (`1e-5000`, `1e5000`) is "not a float or out of range", `inf` and `2e308`
+  are "out of range", and `0` still waits for ever. Two deliberate
+  differences: a negative timeout of any size is refused with "timeout is
+  negative" (Redis 8.10.2 waits for ever on `-1e-343`), and a hexadecimal
+  float too small or too large for a double is "not a float" (Redis: 1 ms,
+  or "out of range"). Thanks to @francoXwrld for the fix.
+
+- **`KEYS` with a pattern that matches few keys is no longer slower than in
+  1.2.2 (#789).** `KEYS` matched each key in place through the general glob
+  matcher, about 136 instructions a key for `user:99*`, and was 5-15 %
+  slower than 1.2.2 although it no longer copies every key. It now makes
+  the pattern ready once, as `SCAN` does, so `prefix:*`, `*suffix` and
+  `*part*` are told by comparing bytes (most keys by their first or last
+  byte alone), and writes the keys that match straight into the reply.
+  Over 2,000,000 keys, `KEYS user:99*` went from 144 ms (1.2.2: 137 ms) to
+  83 ms on both I/O models, and `KEYS *:1999` from 309 ms to 59 ms.
+  `SCAN`, `HSCAN`, `SSCAN` and `ZSCAN` use the same comparison, now
+  inlined.
+
+- **`Q8` and `BIN` vector sets search and load at full speed on x86-64
+  (#793).** The int8 dot product, the Hamming distance and quantizing
+  compiled for the baseline x86-64 target, which has no SSE4.1 or POPCNT, so
+  a `Q8` `VSIM` was slower than an f32 one there. They now pick AVX-512BW or
+  AVX2 and POPCNT at run time, once, as the f32 kernels already did; release
+  binaries still run on any x86-64, arm64 is unchanged, and stored vectors and
+  scores are the same bits as before. Measured on x86-64 Azure D4s_v5 (768
+  dimensions, 10,000 vectors, 8 clients): `Q8` `VSIM` 910 -> 2,621 q/s
+  (f32: 699; v1.2.2: 686; Redis 8.10.2 Q8 with HNSW: 6,960), `BIN` 3,704 ->
+  4,963 q/s, and `VADD ... Q8` 51.6k -> 61.4k a second, the f32 rate.
+
+- **`DUMP`/`RESTORE`, `MIGRATE` and slot migration of vector sets and time
+  series work between KiviDB nodes, and the docs no longer say they don't
+  (#722).** Payloads are a one-entry snapshot image: Redis can't read
+  them, and KiviDB doesn't read Redis's for these two types. A vector set
+  moves whole, every quantization included, except that, as through a
+  snapshot, a `NOQUANT` set's explicit choice isn't kept (so a 1.2 node
+  still restores it during a rolling upgrade; the set then accepts a
+  `VADD` with any quantization option). A time series moves with its
+  samples, labels, retention, chunk size and duplicate policy, but not its
+  compaction rules: an atomic slot migration (`CLUSTER MIGRATION`)
+  recreates them on the new owner, while `DUMP`/`RESTORE`, `MIGRATE` and
+  `MIGRATE`-based resharding (`redis-cli --cluster reshard`) drop them, so
+  run `TS.CREATERULE` again afterwards.
 
 - **An atomic slot migration and `CLUSTER SETSLOT` no longer take the same
   slot at once (#755).** `CLUSTER MIGRATION IMPORT` ran on a slot in
@@ -337,6 +434,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own thread (#762). In a build with Lua and `lua-parallel-scripts yes`,
   `KEYS` and `SCAN` still run alone, as before, so as not to see a script
   part-way through.
+
+- **`SINTER` of a big set with a small one costs the small set's size, not
+  the big one's (#759).** `SINTER`, `SINTERSTORE`, `SINTERCARD`, `SDIFF`,
+  `SDIFFSTORE` and `SUNION` copied every set they named out of the store
+  before working on the copies. They now read the sets in place, an
+  intersection walks the smallest set and looks its members up in the
+  others, a difference walks only the first set, and `SINTERCARD` stops at
+  its `LIMIT`. `SINTER` of a 20M-member set with a 4,096-member one went
+  from 2,573 ms to 2.3 ms (Redis 8.10.2: 4.8 ms), and `SINTERCARD` of the
+  two from 2,568 ms to 0.30 ms (Redis: 1.9 ms); at 1M members, 95.8 ms to
+  2.3 ms (Redis: 2.6 ms). `SUNION` reads one set at a time, so an `SADD`
+  to the small set no longer waits for a union with a big one (worst 0.5 ms
+  against 363 ms during `SUNION` of 1M and 4,096 members). Replies are the
+  same as before.
 
 - **A full `SCAN … MATCH` over a large keyspace no longer trails Redis
   (#751).** Each call hashed every key of the shard it was in to find its

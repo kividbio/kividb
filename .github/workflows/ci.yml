@@ -8,6 +8,7 @@ on:
       - 'tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.config/nextest.toml'
       - 'scripts/redis_compat*'
       - '.github/workflows/ci.yml'
   # By hand, from the Actions tab: the full build and test of a branch, e.g.
@@ -16,6 +17,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+# A new push to a pull request stops the runs of the commit it replaces. Only
+# for pull requests: a manual run is never cancelled, and each has a group of
+# its own.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ── Cheap gate: only build/test if real source changed ───────────────────
@@ -42,32 +50,34 @@ jobs:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
-          # Deliberately diffing against the *previous push* on this PR
-          # (github.event.before, set on `synchronize` events), not the
-          # PR's merge-base -- paths-filter's default is "has this whole
-          # PR touched source", which stays true for every push once any
-          # commit in the PR has, even a later workflow-only push. This
-          # instead answers "did *this* push touch source". Falls back to
-          # empty (paths-filter's own default: diff against the merge
-          # base) for `opened`/`reopened`, where there's no meaningful
-          # previous push to diff against anyway.
-          base: ${{ github.event.action == 'synchronize' && github.event.before || '' }}
+          # Diffed against the PR's merge base, not the previous push: a push
+          # cancels the run of the one before it (see `concurrency` above), so
+          # "what did this push touch" would lose a source change whose run
+          # was cancelled by a workflow-only push.
           filters: |
             source:
               - 'src/**'
               - 'tests/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.config/nextest.toml'
               - 'scripts/redis_compat*'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/linux-verification.yml'
 
-  rust:
+  # -- What `rust` used to do in one 41-minute job, as parallel jobs ---------
+  # `cargo test` compiled and ran 75 test binaries one after the other. Now the
+  # tests are compiled ONCE into a nextest archive and run in SHARDS from it,
+  # so the shards add runners but no compiles. `rust` at the end is the single
+  # job the branch ruleset requires: it fails if any of these did.
+
+  lint:
     needs: detect-changes
-    # always(): on a manual run detect-changes is skipped, which would
-    # otherwise skip this job too.
     if: >-
       always() && needs.detect-changes.result != 'failure' &&
       (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.run_ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -83,10 +93,101 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --features lua,tls
+  build-tests:
+    needs: detect-changes
+    if: >-
+      always() && needs.detect-changes.result != 'failure' &&
+      (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.run_ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # No debug info in the test binaries: they are uploaded once and
+      # downloaded by every shard, and the archive is several times smaller
+      # without it. A panic still says where it happened.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
 
-      # Mixed-version tests need the 1.2.2 release binary, pinned by digest.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pinned by commit, as setup-uv is in smoke-test.yml.
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest@0.9.150
+
+      - name: Build the tests (once, for every shard)
+        run: cargo nextest archive --features lua,tls --archive-file nextest-archive.tar.zst
+
+      # nextest does not run doctests. There are none today; this keeps it so.
+      - name: Doctests
+        run: cargo test --doc --features lua,tls
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          # Already compressed.
+          compression-level: 0
+
+  test:
+    needs: build-tests
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-tests is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: test (${{ matrix.shard }}/6)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      # The tests read tests/fixtures, and the archive's binaries were built
+      # at this path: check out where the build did.
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest@0.9.150
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+
+      - name: Run shard ${{ matrix.shard }} of 6
+        run: >-
+          cargo-nextest nextest run --profile ci
+          --archive-file nextest-archive.tar.zst
+          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
+          --workspace-remap "$GITHUB_WORKSPACE"
+          --partition hash:${{ matrix.shard }}/6
+
+  # Mixed-version tests need the 1.2.2 release binary, pinned by digest.
+  mixed-version:
+    needs: build-tests
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-tests is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest@0.9.150
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+
       - name: Test against KiviDB 1.2.2
         run: |
           if [ "$(uname -m)" != x86_64 ]; then
@@ -104,9 +205,27 @@ jobs:
           # Fail if any 1.2 test was skipped, not only if one failed.
           expected=$(grep -c '^#\[ignore = "needs a 1.2 binary' tests/vset_persistence.rs)
           KIVIDB_1_2_BIN="$dir/kividb/kividb" \
-            cargo test --features lua,tls --test vset_persistence -- --ignored --test-threads=1 \
-            | tee "$dir/test.log"
-          grep -q "test result: ok. $expected passed; 0 failed" "$dir/test.log"
+            cargo-nextest nextest run --profile ci --color never \
+              --archive-file nextest-archive.tar.zst \
+              --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+              --workspace-remap "$GITHUB_WORKSPACE" \
+              --run-ignored ignored-only -E 'binary(=vset_persistence)' -j 1 \
+            2>&1 | tee "$dir/test.log"
+          grep -q "$expected tests run: $expected passed" "$dir/test.log"
+
+  build-release:
+    needs: detect-changes
+    if: >-
+      always() && needs.detect-changes.result != 'failure' &&
+      (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.run_ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: cargo build --release --features lua,tls
@@ -118,12 +237,44 @@ jobs:
           path: target/release/kividb
           retention-days: 1
 
+  # The check the branch ruleset requires under the name `rust`: it passes
+  # only if everything above did. Skipped, like them, when no source changed.
+  rust:
+    needs: [detect-changes, lint, build-tests, test, mixed-version, build-release]
+    # Also when detect-changes itself failed: the jobs above were skipped, and
+    # a skipped check would count as passed. It runs, and fails below.
+    if: >-
+      always() && (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.result == 'failure' ||
+      needs.detect-changes.outputs.run_ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate
+        env:
+          RESULTS: >-
+            detect-changes=${{ needs.detect-changes.result == 'failure' && 'failure' || 'success' }}
+            lint=${{ needs.lint.result }}
+            build-tests=${{ needs.build-tests.result }}
+            test=${{ needs.test.result }}
+            mixed-version=${{ needs.mixed-version.result }}
+            build-release=${{ needs.build-release.result }}
+        run: |
+          echo "$RESULTS" | tr ' ' '\n'
+          for r in $RESULTS; do
+            [ "${r#*=}" = success ] || { echo "::error::${r%%=*} did not succeed (${r#*=})"; exit 1; }
+          done
+
   e2e:
     runs-on: ubuntu-latest
-    needs: rust
-    # As `rust`: on a manual run detect-changes is skipped, and a job that
-    # needs a job that needs it is skipped too unless it says otherwise.
-    if: always() && needs.rust.result == 'success'
+    # Needs the binary only, so it starts as soon as that is built and runs
+    # beside the tests instead of after them. `rust` still fails the PR if
+    # the tests do.
+    needs: build-release
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-release is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-release.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -178,10 +329,14 @@ jobs:
 
   redis-compat:
     runs-on: ubuntu-latest
-    needs: rust
-    # As `rust`: on a manual run detect-changes is skipped, and a job that
-    # needs a job that needs it is skipped too unless it says otherwise.
-    if: always() && needs.rust.result == 'success'
+    # Needs the binary only, so it starts as soon as that is built and runs
+    # beside the tests instead of after them. `rust` still fails the PR if
+    # the tests do.
+    needs: build-release
+    # A manual run skips detect-changes, and GitHub skips a job whose
+    # upstream was skipped unless it says otherwise. When no source
+    # changed, build-release is skipped too, so this is false then.
+    if: ${{ !cancelled() && needs.build-release.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 

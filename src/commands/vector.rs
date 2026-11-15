@@ -894,7 +894,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // ── Parse and execute pipeline clauses ────────────────────────────────────
     // To the same deadline: GROUPBY, APPLY, FILTER and SORTBY over a large
     // scan cost as much as the scan.
-    let (rows, cut) = crate::commands::aggregate_pipeline::run_within(rows, cmd, 3, deadline);
+    let (rows, cut, groups) =
+        crate::commands::aggregate_pipeline::run_counted(rows, cmd, 3, deadline);
     timed_out |= cut;
     if cut && crate::commands::search::on_timeout_fails() {
         return Some(resp_error("Timeout limit was reached"));
@@ -1016,17 +1017,21 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // `WITHCURSOR`: the first rows now, the rest as they are asked for.
     if let Some((count, max_idle)) = cursor {
         return Some(crate::commands::search_tools::open_cursor(
-            ctx.resp,
+            crate::commands::handler::effective_resp_for_reply(ctx),
             &index_name,
             rows_out,
             count,
             max_idle,
             timed_out,
+            groups,
         ));
     }
+    // A grouped aggregation reports how many groups there were, not how many
+    // are on this page; any other reports the page.
+    let total = groups.unwrap_or(rows_out.len());
     Some(crate::commands::search_tools::rows_reply(
-        ctx.resp,
-        rows_out.len(),
+        crate::commands::handler::effective_resp_for_reply(ctx),
+        total,
         &rows_out,
         timed_out,
     ))
@@ -1509,7 +1514,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // A suggestion's score is the share of the index's documents that hold
     // it (`spell_check.c`), best first, written as Redis writes a double; a
     // word only in an INCLUDE dictionary scores 0.
-    let resp3 = ctx.resp == 3;
+    let resp3 = crate::commands::handler::effective_resp_for_reply(ctx) == 3;
     let score = |docs: usize| -> Vec<u8> {
         let digits = crate::commands::helpers::format_score(docs as f64 / total_docs);
         if resp3 {

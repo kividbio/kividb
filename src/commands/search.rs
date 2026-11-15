@@ -496,7 +496,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error(&no_such_index(name)));
     };
     let def = &def;
-    let resp = ctx.resp;
+    let resp = search_resp(ctx);
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
     // The index's own database, whichever the client has selected.
     let mut num_docs = count_docs(def, cluster);
@@ -2570,7 +2570,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             },
         })
         .collect();
-    let page = encode_page(ctx.resp, &page, total, &args, nocontent, timed_out);
+    let page = encode_page(search_resp(ctx), &page, total, &args, nocontent, timed_out);
     // A coordinator that asks for it is told whether this part timed out;
     // one from before there was a timeout gets the page as it expects it.
     if shard && crate::cluster::search::wants_timeout_flag(&ctx.cmd) {
@@ -2694,6 +2694,18 @@ fn encode_page(
 thread_local! {
     /// Set while a coordinator runs its own part of a search.
     static SHARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The protocol a reply is written in: a script's own (`redis.setresp`)
+/// inside one, the client's otherwise. A shard's part is always RESP2,
+/// whatever the script says: the coordinator parses it as such.
+#[inline]
+fn search_resp(ctx: &Ctx) -> u8 {
+    if SHARD.with(|s| s.get()) {
+        2
+    } else {
+        crate::commands::handler::effective_resp_for_reply(ctx)
+    }
 }
 
 /// FT.SEARCH across the cluster: see `cluster::search`.
@@ -2865,7 +2877,12 @@ fn coordinate(
         return Err("Timeout limit was reached".into());
     }
     Ok(encode_page(
-        ctx.resp, &page, total, args, nocontent, timed_out,
+        search_resp(ctx),
+        &page,
+        total,
+        args,
+        nocontent,
+        timed_out,
     ))
 }
 

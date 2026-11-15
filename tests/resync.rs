@@ -177,6 +177,57 @@ fn free_port() -> u16 {
     }
 }
 
+/// The process id of the server `c` is connected to, if it says (`INFO`
+/// may be refused, as before `AUTH`).
+fn answering_pid(c: &mut Conn) -> Option<u32> {
+    match c.cmd(&["INFO", "server"]) {
+        V::Str(info) => info
+            .lines()
+            .find_map(|l| l.strip_prefix("process_id:"))
+            .and_then(|pid| pid.trim().parse().ok()),
+        _ => None,
+    }
+}
+
+/// Start a server with `spawn` on `port`, or on another free port if that
+/// one is taken, and connect to it, and to no other process (a server that
+/// does not say who it is, as before `AUTH`, is taken for the one started).
+/// Returns the port it ended up on. A port is free
+/// between a server's exit and its restart, and another test's server can be
+/// started on it then (under `cargo nextest` many start at once): the
+/// restarted one cannot listen, and a client that only connected read the
+/// other's empty dataset as what the restart had loaded.
+fn start_verified(mut spawn: impl FnMut(u16) -> Child, port: u16) -> (Child, Conn, u16) {
+    let mut port = port;
+    for _ in 0..10 {
+        let mut child = spawn(port);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let answered = loop {
+            if child.try_wait().unwrap().is_some() {
+                // It could not take the port.
+                break None;
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                let mut c = Conn::connect(port);
+                break Some((answering_pid(&mut c), c));
+            }
+            assert!(Instant::now() < deadline, "no server came up on {port}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        match answered {
+            Some((pid, c)) if pid.is_none_or(|pid| pid == child.id()) => return (child, c, port),
+            Some((pid, _)) => {
+                eprintln!("port {port} is answered by {pid:?}, not by the server started on it")
+            }
+            None => eprintln!("the server could not take port {port}"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        port = free_port();
+    }
+    panic!("no port could be had for the server");
+}
+
 fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
     kividb_with(dir, port, extra, &[])
 }
@@ -222,22 +273,23 @@ impl Server {
 
     fn start_with_env(extra: &[&str], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
         let env: Vec<(String, String)> = env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let child = kividb_with(&dir, port, &args, &env);
-        let server = Server {
+        // Verified to be the process started: the port was free a moment ago,
+        // and another test's server may have taken it since.
+        let (child, mut c, port) =
+            start_verified(|port| kividb_with(&dir, port, &args, &env), free_port());
+        assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+        Server {
             port,
             dir,
             child,
             args,
             env,
-        };
-        assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
-        server
+        }
     }
 
     fn conn(&self) -> Conn {
@@ -264,12 +316,47 @@ impl Server {
         let _ = self.child.wait();
     }
 
-    fn restart(&mut self) {
-        self.child = kividb_with(&self.dir, self.port, &self.args, &self.env);
-        assert_eq!(self.conn().cmd(&["PING"]).s(), "PONG");
+    /// Start the server again on its data directory. The data directory is
+    /// what matters, not the port: if another test's server has taken the
+    /// port while this one was down (it is free between the exit and the
+    /// restart, and under `cargo nextest` many servers start at once), the
+    /// server is started on another free port, and `self.port` is that one.
+    /// Returns whether the port changed: whatever was pointed at the old one
+    /// (replicas, a relay) has to be pointed at the new one, as
+    /// `restart_master` does.
+    fn restart(&mut self) -> bool {
+        let before = self.port;
+        let (dir, args, env) = (self.dir.clone(), self.args.clone(), self.env.clone());
+        let (child, _, port) = start_verified(|port| kividb_with(&dir, port, &args, &env), before);
+        self.child = child;
+        self.port = port;
+        port != before
+    }
+
+    /// `restart` of a master, and its replicas follow it if it had to move.
+    fn restart_master(&mut self, replicas: &mut [&mut Server]) {
+        if self.restart() {
+            for replica in replicas {
+                replica.follow(self.port);
+            }
+        }
+    }
+
+    /// Replicate from a master now on `port`: the arguments of its next
+    /// start, and the running server, if there is one.
+    fn follow(&mut self, port: u16) {
+        if let Some(at) = self.args.iter().position(|a| a == "--replicaof") {
+            self.args[at + 2] = port.to_string();
+        }
+        if self.child.try_wait().unwrap().is_none() {
+            assert!(
+                self.conn()
+                    .cmd(&["REPLICAOF", "127.0.0.1", &port.to_string()])
+                    .ok()
+            );
+        }
     }
 }
-
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -296,6 +383,9 @@ struct Relay {
     /// A connection that has carried this many bytes from the master
     /// pauses the relay. `u64::MAX`: none does.
     pause_at: Arc<std::sync::atomic::AtomicU64>,
+    /// The port of the master it carries to: it moves when the master has to
+    /// be restarted on another one.
+    target: Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl Relay {
@@ -307,6 +397,8 @@ impl Relay {
         let budget = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let paused = Arc::new(AtomicBool::new(false));
         let pause_at = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let target = Arc::new(std::sync::atomic::AtomicU16::new(target));
+        let target_bg = Arc::clone(&target);
         let (open_bg, live_bg, budget_bg, paused_bg, pause_at_bg) = (
             Arc::clone(&open),
             Arc::clone(&live),
@@ -320,7 +412,9 @@ impl Relay {
                     let _ = client.shutdown(Shutdown::Both);
                     continue;
                 }
-                let Ok(upstream) = TcpStream::connect(("127.0.0.1", target)) else {
+                let Ok(upstream) =
+                    TcpStream::connect(("127.0.0.1", target_bg.load(Ordering::SeqCst)))
+                else {
                     continue;
                 };
                 let mut live = live_bg.lock().unwrap();
@@ -379,7 +473,13 @@ impl Relay {
             budget,
             paused,
             pause_at,
+            target,
         }
+    }
+
+    /// Carry the connections made from now on to a master on `port`.
+    fn retarget(&self, port: u16) {
+        self.target.store(port, Ordering::SeqCst);
     }
 
     /// Pause, as [`Self::pause`] does, once a connection has carried this
@@ -616,7 +716,7 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
 
     replica.shutdown();
     master.shutdown();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(
         m.info("replication", "master_replid"),
@@ -638,7 +738,7 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
     drop((m, r));
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_ne!(m.info("replication", "master_replid"), replid);
     let mut r = replica.conn();
@@ -657,7 +757,7 @@ fn a_cleanly_restarted_master_continues_its_replicas() {
 fn a_select_while_writes_are_paused_moves_nothing_and_loses_nothing() {
     let mut master = Server::start(&["--aof"]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut m = master.conn();
     let mut r = replica.conn();
     wait_link_up(&mut r);
@@ -711,7 +811,7 @@ fn a_select_while_writes_are_paused_moves_nothing_and_loses_nothing() {
     assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
     drop((m, a, b));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(keys_in(&mut m, "3"), named("k"), "{}", master.log());
     assert_eq!(keys_in(&mut m, "0"), named("j"));
@@ -728,7 +828,7 @@ fn a_select_while_writes_are_paused_moves_nothing_and_loses_nothing() {
 fn a_master_stopped_under_writes_with_keys_expiring_continues_its_replica() {
     let mut master = Server::start(&["--aof", "--repl-ping-replica-period", "1"]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
     let mut r = replica.conn();
     for round in 0..3 {
         let mut m = master.conn();
@@ -755,7 +855,7 @@ fn a_master_stopped_under_writes_with_keys_expiring_continues_its_replica() {
             log.matches("has the whole stream").count() > round,
             "round {round}: the master did not see its replica take the whole stream:\n{log}"
         );
-        master.restart();
+        master.restart_master(&mut [&mut replica]);
         let mut m = master.conn();
         wait_link_up(&mut r);
         assert_eq!(
@@ -805,7 +905,9 @@ fn a_shutdown_waits_for_a_silent_replica_no_longer_than_shutdown_timeout() {
     assert!(!master.log().contains("did not acknowledge"));
 
     relay.resume();
-    master.restart();
+    if master.restart() {
+        relay.retarget(master.port);
+    }
     let mut m = master.conn();
     wait_link_up(&mut r);
     assert_same_dataset(&mut m, &mut r);
@@ -1031,7 +1133,7 @@ fn a_killed_master_continues_a_replica_that_holds_the_same_data() {
     // Let the AOF reach the disk, then kill: no save, no saved position.
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     let mut r = replica.conn();
     wait_link_up(&mut r);
@@ -1051,7 +1153,7 @@ fn a_killed_master_continues_a_replica_that_holds_the_same_data() {
     std::thread::sleep(Duration::from_millis(1500));
     replica.kill();
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     replica.restart();
     let mut m = master.conn();
     let mut r = replica.conn();
@@ -1068,7 +1170,7 @@ fn a_killed_master_continues_a_replica_that_holds_the_same_data() {
     drop(m);
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     replica.restart();
     let mut m = master.conn();
     let mut r = replica.conn();
@@ -1388,7 +1490,7 @@ fn a_replica_continued_by_a_promoted_master_gets_every_write_after_its_next_resy
 fn concurrent_writes_to_one_key_are_replicated_in_the_order_they_were_applied() {
     let mut master = Server::start(&["--aof"]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     wait_link_up(&mut r);
 
@@ -1453,7 +1555,7 @@ fn concurrent_writes_to_one_key_are_replicated_in_the_order_they_were_applied() 
     drop(m);
     std::thread::sleep(Duration::from_millis(1500));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     for (probe, expected) in probes.iter().zip(&on_master) {
         assert!(
@@ -1562,7 +1664,7 @@ fn sigterm_waits_for_the_final_snapshot() {
     let dir = tempfile::tempdir().unwrap().keep();
     let port = free_port();
     let log = std::fs::File::create(dir.join("server.log")).unwrap();
-    let spawn = |dir: &Path| {
+    let spawn = |dir: &Path, port: u16| {
         Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(dir)
             .args([
@@ -1581,8 +1683,7 @@ fn sigterm_waits_for_the_final_snapshot() {
             .spawn()
             .expect("could not start kividb")
     };
-    let mut child = spawn(&dir);
-    let mut c = Conn::connect(port);
+    let (mut child, mut c, port) = start_verified(|port| spawn(&dir, port), port);
 
     // Enough that writing it out takes a moment.
     let value = "v".repeat(200);
@@ -1641,10 +1742,14 @@ fn sigterm_waits_for_the_final_snapshot() {
         "the process ended before its snapshot was written:\n{output}"
     );
 
-    // And what it saved is everything.
-    let mut child = spawn(&dir);
-    let mut c = Conn::connect(port);
-    assert_eq!(c.cmd(&["DBSIZE"]).i(), total as i64);
+    // And what it saved is everything, as the restarted server says.
+    let (mut child, mut c, _) = start_verified(|port| spawn(&dir, port), port);
+    assert_eq!(
+        c.cmd(&["DBSIZE"]).i(),
+        total as i64,
+        "{}",
+        std::fs::read_to_string(dir.join("server.log")).unwrap()
+    );
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
@@ -2238,7 +2343,7 @@ fn a_write_on_its_way_at_the_first_select(extra: &[&str]) {
     let args: Vec<&str> = ["--aof"].iter().chain(extra).copied().collect();
     let mut master = Server::start_with_env(&args, &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "1500")]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut r = replica.conn();
     wait_link_up(&mut r);
     let mut m = master.conn();
@@ -2277,7 +2382,7 @@ fn a_write_on_its_way_at_the_first_select(extra: &[&str]) {
     master.kill();
     // An io_uring listener can outlive its process a moment.
     wait_until("the port to be let go", || port_is_free(master.port));
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(keys_of_db(&mut m, "3"), ["k"], "{}", master.log());
     assert_eq!(keys_of_db(&mut m, "0"), db0);
@@ -2306,7 +2411,7 @@ fn an_eviction_in_another_database_leaves_the_stream_in_db_0() {
     let mut master =
         Server::start_with_env(&["--aof"], &[("KIVIDB_TEST_BARE_WRITE_DELAY_MS", "3000")]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut r = replica.conn();
     wait_link_up(&mut r);
     let mut m = master.conn();
@@ -2354,7 +2459,7 @@ fn an_eviction_in_another_database_leaves_the_stream_in_db_0() {
     assert_eq!(b.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
     drop((m, b));
     master.kill();
-    master.restart();
+    master.restart_master(&mut [&mut replica]);
     let mut m = master.conn();
     assert_eq!(
         keys_of_db(&mut m, "3"),

@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{Started, confirm, port_is_free};
+
 const NODE_TIMEOUT_MS: u64 = 2000;
 
 // ── Minimal RESP client ───────────────────────────────────────────────────────
@@ -195,25 +198,6 @@ impl Conn {
 
 // ── Node fixture ──────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`. It is asked with a socket that is bound and
-/// never listens. One that listened, as this used to, could be given a
-/// connection: a server another test is starting holds, between its fork and
-/// its exec, a copy of every socket this process has open, and a client that
-/// dialled the port in that moment was connected to the copy and then reset
-/// ("Connection reset by peer", at the first command of a test).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    // As the server's own socket, so that a copy of this one, while it
-    // lasts, does not keep the server from the port.
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
 /// A port whose bus port (`+10000`) is also free — and neither of them one
 /// the system hands out to outgoing connections. The wait for a node to come
 /// up dials both ports over and over; were either in the ephemeral range, one
@@ -261,11 +245,40 @@ impl Node {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         };
-        node.spawn();
-        node
+        // A new node is not known to any other yet, so if its port was taken
+        // between the pick and the bind (by another test's server), it can
+        // be started on another: see `try_spawn`.
+        for _ in 0..10 {
+            match node.try_spawn() {
+                Ok(()) => return node,
+                Err(why) => {
+                    assert!(why.contains("taken by another process"), "{why}");
+                    eprintln!("{why}");
+                    node.kill();
+                    let _ = std::fs::remove_file(node.dir.join("nodes.conf"));
+                    node.port = cluster_port();
+                }
+            }
+        }
+        panic!("no port could be had for the node");
     }
 
+    /// Start the node on its port, and wait for it. Panics if another
+    /// process has the port: see `try_spawn`.
     fn spawn(&mut self) {
+        if let Err(why) = self.try_spawn() {
+            panic!("{why}");
+        }
+    }
+
+    /// Start the node on its port (its own address, in its `nodes.conf` and
+    /// in its peers', so a restarted node cannot move to another), and wait
+    /// until it is up. `Err` if the node's port is not its own: another
+    /// process (a server of another test, started on the port in the gap
+    /// between this node's exit and its restart) answers on it, or the node
+    /// could not listen. Reading that process as the node would show an empty
+    /// or foreign dataset and report a loss that never happened.
+    fn try_spawn(&mut self) -> Result<(), String> {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -314,10 +327,36 @@ impl Node {
         // whole suite at once) that has been seen to take 9 s.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                let log = self.log();
+                return Err(if log.contains("Can't listen on") {
+                    format!(
+                        "port {} taken by another process during restart: the node could not listen ({status}):\n{log}",
+                        self.port
+                    )
+                } else {
+                    format!("the node on {} exited ({status}):\n{log}", self.port)
+                });
+            }
             let up = TcpStream::connect(("127.0.0.1", self.port)).is_ok()
                 && TcpStream::connect(("127.0.0.1", self.port + 10_000)).is_ok();
             if up {
-                return;
+                // Whose is the client port? A node that does not say who it
+                // is (INFO refused) is taken for the one started.
+                let child = self.child.as_mut().unwrap();
+                let own = child.id();
+                return match confirm(child, self.port, Duration::from_secs(60)) {
+                    Started::Ours => Ok(()),
+                    Started::Foreign(pid) => Err(format!(
+                        "port {} taken by another process during restart: process {pid} answers on it, not the node started on it (process {own})",
+                        self.port
+                    )),
+                    Started::Exited => Err(format!(
+                        "port {} taken by another process during restart, or the node failed to start:\n{}",
+                        self.port,
+                        self.log()
+                    )),
+                };
             }
             assert!(
                 Instant::now() < deadline,
@@ -481,14 +520,30 @@ fn form_cluster_of(nodes: Vec<Node>) -> (Vec<Node>, Vec<(u16, u16)>) {
 }
 
 /// Wait until every node in `nodes` knows `known` nodes and reports the
-/// cluster as up.
+/// cluster as up. On a timeout, says what each node sees.
 fn wait_cluster_ok(nodes: &[&Node], known: usize) {
-    wait_until("cluster to converge", Duration::from_secs(30), || {
+    let converged = || {
         nodes.iter().all(|n| {
             n.cluster_info("cluster_state") == "ok"
                 && n.cluster_info("cluster_known_nodes") == known.to_string()
         })
-    });
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if converged() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let seen: String = nodes
+        .iter()
+        .map(|n| {
+            let state = n.cluster_info("cluster_state");
+            let nodes = n.conn().cmd(&["CLUSTER", "NODES"]).text();
+            format!("node {} ({state}):\n{nodes}", n.port)
+        })
+        .collect();
+    panic!("timed out after 30s waiting for: cluster to converge\n{seen}");
 }
 
 /// Attach a fresh node as a replica of `master` and wait for it to sync.
@@ -1283,6 +1338,34 @@ fn a_cluster_restarted_whole_does_not_fail_anyone_over() {
     let (mut nodes, _) = form_cluster(3);
     let replica = add_replica(&nodes, &nodes[0]);
     nodes.push(replica);
+    // Killed only once every node has saved the replica, as a replica of
+    // node 0, to its nodes.conf. A node saves it on a thread of its own,
+    // some time after it learns it (the other masters, by gossip, up to a
+    // heartbeat later); killed before that, on a busy machine, the masters
+    // came back without the replica, would not hear from a node they did
+    // not know, and the cluster never converged on 4 nodes. A node does
+    // not join by announcing itself: it would have to be met again.
+    let master_id = nodes[0].id();
+    let replica_id = nodes[3].id();
+    for node in &nodes {
+        let conf = node.dir.join("nodes.conf");
+        wait_until(
+            "every node to save the replica to its nodes.conf",
+            Duration::from_secs(15),
+            || {
+                std::fs::read_to_string(&conf)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| {
+                        let f: Vec<&str> = l.split(' ').collect();
+                        f.len() > 3
+                            && f[0] == replica_id
+                            && f[2].contains("slave")
+                            && f[3] == master_id
+                    })
+            },
+        );
+    }
     for node in &mut nodes {
         node.kill();
     }
@@ -2832,6 +2915,193 @@ fn atomic_slot_migration_moves_time_series_with_their_rules() {
     // The rule works there: a sample in a later bucket closes [10, 20).
     d.cmd(&["TS.ADD", &k("raw"), "25", "5"]);
     assert_eq!(d.cmd(&["TS.RANGE", &k("avg"), "-", "+"]).array().len(), 2);
+}
+
+/// Vector sets of each quantization (the default one last) and a series.
+const MOVED_VSETS: [(&str, &str); 4] = [
+    ("vq8", "Q8"),
+    ("vbin", "BIN"),
+    ("vnoq", "NOQUANT"),
+    ("vdef", ""),
+];
+
+/// [`MOVED_VSETS`] with attributes, and a series with labels and settings,
+/// under `k`; `vq8` with a time to live.
+fn add_vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) {
+    for (name, opt) in MOVED_VSETS {
+        let key = k(name);
+        for n in 0..8 {
+            let v: Vec<String> = (0..16)
+                .map(|i| (((i * 7 + n * 5) % 13) as f32 - 6.5).to_string())
+                .collect();
+            let e = format!("e{n}");
+            let mut args = vec!["VADD", &key, "VALUES", "16"];
+            args.extend(v.iter().map(String::as_str));
+            args.push(&e);
+            if !opt.is_empty() {
+                args.push(opt);
+            }
+            assert_eq!(c.cmd(&args), Resp::Int(1), "{key} {e}");
+        }
+        assert_eq!(c.cmd(&["VSETATTR", &key, "e3", r#"{"n":3}"#]), Resp::Int(1));
+    }
+    assert_eq!(c.cmd(&["PEXPIRE", &k("vq8"), "500000"]), Resp::Int(1));
+    assert!(
+        c.cmd(&[
+            "TS.CREATE",
+            &k("ts"),
+            "RETENTION",
+            "100000",
+            "CHUNK_SIZE",
+            "128",
+            "DUPLICATE_POLICY",
+            "MAX",
+            "LABELS",
+            "kind",
+            "moved722",
+        ])
+        .is_ok()
+    );
+    for (at, value) in [("1", "1.5"), ("2", "-2"), ("3", "1e300")] {
+        assert_eq!(
+            c.cmd(&["TS.ADD", &k("ts"), at, value]).int().to_string(),
+            at
+        );
+    }
+}
+
+/// What a move must keep of [`add_vsets_and_series`]'s keys.
+fn vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) -> Vec<Resp> {
+    let mut out = Vec::new();
+    for (name, _) in MOVED_VSETS {
+        let key = k(name);
+        out.push(c.cmd(&["VINFO", &key]));
+        out.push(c.cmd(&["VCARD", &key]));
+        out.push(c.cmd(&["VSIM", &key, "ELE", "e1", "COUNT", "4", "WITHSCORES"]));
+        for n in 0..8 {
+            let e = format!("e{n}");
+            out.push(c.cmd(&["VEMB", &key, &e, "RAW"]));
+            out.push(c.cmd(&["VGETATTR", &key, &e]));
+        }
+    }
+    out.push(c.cmd(&["TS.RANGE", &k("ts"), "-", "+"]));
+    let info = c.cmd(&["TS.INFO", &k("ts")]);
+    for field in [
+        "totalSamples",
+        "retentionTime",
+        "chunkSize",
+        "duplicatePolicy",
+        "labels",
+    ] {
+        out.push(task_field(&info, field));
+    }
+    out
+}
+
+/// After a move: the time to live came along, the series is found by its
+/// label, and the Q8 and BIN sets still refuse another quantization. A
+/// `NOQUANT` set takes one, as after a reload: its choice is not kept.
+fn check_moved(c: &mut Conn, k: &dyn Fn(&str) -> String) {
+    let pttl = c.cmd(&["PTTL", &k("vq8")]).int();
+    assert!((1..=500_000).contains(&pttl), "PTTL {pttl}");
+    assert_eq!(c.cmd(&["PTTL", &k("vbin")]).int(), -1);
+    assert_eq!(
+        c.cmd(&["TS.QUERYINDEX", "kind=moved722"]).array(),
+        [Resp::Bulk(k("ts").into_bytes())]
+    );
+    let v: Vec<String> = (0..16).map(|i| (i as f32 + 0.5).to_string()).collect();
+    for (name, opt, refused) in [
+        ("vq8", "BIN", true),
+        ("vbin", "Q8", true),
+        ("vnoq", "Q8", false),
+        ("vdef", "Q8", false),
+    ] {
+        let key = k(name);
+        let mut args = vec!["VADD", &key, "VALUES", "16"];
+        args.extend(v.iter().map(String::as_str));
+        args.extend(["new", opt]);
+        let r = c.cmd(&args);
+        if refused {
+            assert!(
+                r.err().is_some_and(|e| e.contains("quantization mismatch")),
+                "{name}: {r:?}"
+            );
+        } else {
+            assert_eq!(r, Resp::Int(1), "{name}");
+        }
+    }
+}
+
+/// A slot holding vector sets of each quantization and a series moves by
+/// `MIGRATE`, as the resharding tools move it, whole (#722).
+#[test]
+fn migrate_moves_a_slot_of_vector_sets_and_series_whole() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "vs722");
+    let slot = slot_of(&tag).to_string();
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    add_vsets_and_series(&mut s, &k);
+    let before = vsets_and_series(&mut s, &k);
+
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let keys: Vec<String> = MOVED_VSETS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(["ts"])
+        .map(k)
+        .collect();
+    let mut args = vec!["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"];
+    args.extend(keys.iter().map(String::as_str));
+    let reply = s.cmd(&args);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+
+    let mut d = dst.conn();
+    assert_eq!(d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 5);
+    assert_eq!(vsets_and_series(&mut d, &k), before);
+    check_moved(&mut d, &k);
+}
+
+/// The same slot moved by an atomic slot migration (#722).
+#[test]
+fn atomic_slot_migration_moves_vector_sets_and_series_whole() {
+    let (nodes, _) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let tag = key_in(0..=1000, "vs722");
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+    add_vsets_and_series(&mut s, &k);
+    let before = vsets_and_series(&mut s, &k);
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(dst, &task_id);
+
+    let mut d = dst.conn();
+    assert_eq!(vsets_and_series(&mut d, &k), before);
+    check_moved(&mut d, &k);
 }
 
 /// A slot left open by a reshard that stopped part way, with keys on both
