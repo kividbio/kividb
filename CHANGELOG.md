@@ -1399,7 +1399,7 @@ See [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md) for what to check before 
     `TS.ADD … ON_DUPLICATE policy LABELS …` on the master is a series
     with no labels there, so the replica keeps samples the master trims,
     and `TS.MGET`/`TS.MRANGE` by label miss it. Nothing is lost that
-    1.2.0 itself would keep, and a full sync puts the replica right.
+    1.2.0 itself would keep.
     Upgrade replicas before their master, as always, and this does not
     arise; a 1.2.1 replica of a 1.2.0 master reads its records as 1.2.0
     did.
