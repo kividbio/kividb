@@ -464,15 +464,20 @@ impl BlockingSlot {
     /// thread would overwrite.
     #[inline]
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
+        // Looked at in place: moving the wait out of the slot to look at it
+        // copied it on every command.
+        if self.ctl.parked.is_none() {
+            if self.in_resume {
+                self.resume_over();
+            }
+            // Nearly every command: ran while nobody stood in any line,
+            // owes nobody a look, and did not wait.
+            if !self.collecting && self.looked.is_empty() {
+                return None;
+            }
+            return self.looked_or_waits(None);
+        }
         let parked = self.ctl.parked.take();
-        if parked.is_none() && self.in_resume {
-            self.resume_over();
-        }
-        // Nearly every command: ran while nobody stood in any line, owes
-        // nobody a look, and did not wait.
-        if !self.collecting && parked.is_none() && self.looked.is_empty() {
-            return None;
-        }
         self.looked_or_waits(parked)
     }
 
