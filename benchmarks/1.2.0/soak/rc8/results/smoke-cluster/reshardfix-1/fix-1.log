@@ -1,0 +1,40 @@
+10.80.1.9:7001 (995d6d75...) -> 482973 keys | 5461 slots | 1 slaves.
+10.80.1.8:7001 (5e84742c...) -> 483480 keys | 5462 slots | 1 slaves.
+10.80.1.5:7001 (edf44ebe...) -> 483186 keys | 5461 slots | 1 slaves.
+[OK] 1449639 keys in 3 masters.
+88.48 keys per slot on average.
+>>> Performing Cluster Check (using node 10.80.1.9:7001)
+M: 995d6d75a259c993c5b0ae137ed2703ff6cff88c 10.80.1.9:7001
+   slots:[0-5460] (5461 slots) master
+   1 additional replica(s)
+S: 009e55cb39a9455d1cd4d20a486a8c10b13aef9c 10.80.1.8:7002
+   slots: (0 slots) slave
+   replicates 995d6d75a259c993c5b0ae137ed2703ff6cff88c
+S: 379e7c66b385cdda896090c1ff891bbaced8296e 10.80.1.9:7002
+   slots: (0 slots) slave
+   replicates edf44ebed6ce18aefdc8df9b0c66bbdc7bc6c6cb
+M: 5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b 10.80.1.8:7001
+   slots:[5461-10922] (5462 slots) master
+   1 additional replica(s)
+S: dace016cae1789ce0271af18da915f0c6b6faf70 10.80.1.5:7002
+   slots: (0 slots) slave
+   replicates 5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b
+M: edf44ebed6ce18aefdc8df9b0c66bbdc7bc6c6cb 10.80.1.5:7001
+   slots:[10923-16383] (5461 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+[WARNING] Node 10.80.1.9:7001 has slots in migrating state 0.
+[WARNING] Node 10.80.1.8:7001 has slots in importing state 0.
+[WARNING] The following slots are open: 0.
+>>> Fixing open slot 0
+*** Found keys about slot 0 in non-owner node 10.80.1.8:7001!
+Set as migrating in: 10.80.1.9:7001
+Set as importing in: 10.80.1.8:7001
+>>> No single clear owner for the slot, selecting an owner by # of keys...
+*** Configuring 10.80.1.9:7001 as the slot owner
+>>> Case 2: Moving all the 0 slot keys to its owner 10.80.1.9:7001
+Moving slot 0 from 10.80.1.8:7001 to 10.80.1.9:7001: .............................
+>>> Setting 0 as STABLE in 10.80.1.8:7001
+>>> Check slots coverage...
+[OK] All 16384 slots covered.

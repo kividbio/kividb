@@ -1,0 +1,20 @@
+policy {b'maxmemory-policy': b'noeviction'}
+restore idletime 1000: b'OK'
+idletime ~1000: True
+freq under noeviction: ERR:An LFU maxmemory policy is not selected, access frequency no
+get: b'bar' idletime after get: 0
+restore freq 100 under noeviction: b'OK'
+idletime after restore freq: 0
+idletime >=2 after TTL/TYPE/EXISTS/OBJECT: True
+touch: 1 idletime: 0
+idletime missing key: None
+restore freq 100 lfu: b'OK'
+freq 99..100: True
+idletime under lfu: ERR:An LFU maxmemory policy is selected, idle time not tracked. 
+restore idletime under lfu: b'OK'
+freq after idletime restore: 5
+restore idletime lru: b'OK'
+idletime lru ~1000: True
+freq under lru: ERR:An LFU maxmemory policy is not selected, access frequency no
+restore freq under lru: b'OK'
+idletime ~0: True

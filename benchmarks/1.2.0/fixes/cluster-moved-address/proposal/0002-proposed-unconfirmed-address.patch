@@ -1,0 +1,98 @@
+diff --git a/src/cluster/bus/listener.rs b/src/cluster/bus/listener.rs
+index 5e50b4b..4afbc4d 100644
+--- a/src/cluster/bus/listener.rs
++++ b/src/cluster/bus/listener.rs
+@@ -531,10 +531,16 @@ fn upsert_node(
+         // way, each having dialled the other's old one; they kept those
+         // for ever, each seeing the other as failed, and a shard left
+         // without a master the cluster could see went down with it.
++        // So does one we have not heard from since we started, whose
++        // address is still nodes.conf's: the start grace otherwise keeps
++        // it unsuspected for two node timeouts, and the moment it ends
++        // our suspicion and a peer's report from before the node came
++        // back make a quorum, and a healthy master is failed over.
+         let suspect = NodeFlags::PFAIL | NodeFlags::FAIL;
++        let unconfirmed = !direct_contact && state.unconfirmed_addresses.read().contains(&id);
+         let moved = !direct_contact
+             && !ip.is_empty()
+-            && entry.flags.intersects(suspect)
++            && (entry.flags.intersects(suspect) || unconfirmed)
+             && !flags.intersects(suspect | NodeFlags::NOADDR)
+             && (entry.ip != ip
+                 || entry.client_port != client_port
+@@ -575,6 +581,7 @@ fn upsert_node(
+         if direct_contact {
+             entry.pong_received_ms = now_ms();
+             entry.flags.remove(NodeFlags::PFAIL);
++            state.unconfirmed_addresses.write().remove(&id);
+         } else if is_new {
+             // Give a node we have only heard about a full timeout before
+             // suspecting it, the same grace a freshly met one gets.
+@@ -922,6 +929,26 @@ mod tests {
+         );
+     }
+ 
++    /// After a restart, a peer we have not heard from yet has the address
++    /// nodes.conf gave it, which may be stale: a healthy relay's address
++    /// replaces it at once, before the start grace would let us suspect it.
++    #[test]
++    fn after_a_restart_a_peer_not_yet_heard_from_takes_a_healthy_relays_address() {
++        let cs = ClusterState::new_enabled(None, 15000);
++        let (a, b) = (generate_node_id(), generate_node_id());
++        process_message(&cs, meet(a), peer());
++        let known = gossip_of(b, "10.0.0.8", 7002, NodeFlags::MASTER);
++        process_message(&cs, ping(a, NodeFlags::MASTER, vec![known]), peer());
++        cs.start_the_clock_on_peers();
++
++        let moved = gossip_of(b, "10.0.0.88", 7002, NodeFlags::MASTER);
++        process_message(&cs, ping(a, NodeFlags::MASTER, vec![moved]), peer());
++        let nodes = cs.nodes.read();
++        let node = nodes.get(&b).unwrap();
++        assert_eq!(node.ip, "10.0.0.88");
++        assert!(!node.flags.intersects(NodeFlags::PFAIL | NodeFlags::FAIL));
++    }
++
+     /// A node we reach keeps the address it gives itself, whatever a third
+     /// party says; and one the relay cannot reach either keeps the one we
+     /// have.
+diff --git a/src/cluster/mod.rs b/src/cluster/mod.rs
+index a85933c..ef78d5c 100644
+--- a/src/cluster/mod.rs
++++ b/src/cluster/mod.rs
+@@ -224,6 +224,10 @@ pub struct ClusterState {
+     /// "Reporter believes reportee is failing as of timestamp."
+     /// Reports older than 2*node_timeout are discarded as stale.
+     pub failure_reports: RwLock<AHashMap<NodeId, AHashMap<NodeId, u64>>>,
++    /// Peers whose address is still the one nodes.conf gave us: none of
++    /// them has reached us since this process started. A node that moved
++    /// while we were down is only reachable at an address a peer relays.
++    pub(crate) unconfirmed_addresses: RwLock<ahash::AHashSet<NodeId>>,
+     /// The epoch at which we last cast a FAILOVER_AUTH_ACK. Prevents voting
+     /// twice in the same epoch — a key safety property of the Raft-like
+     /// election. Persisted to nodes.conf.
+@@ -322,6 +326,7 @@ impl ClusterState {
+             config_path,
+             node_timeout_ms,
+             failure_reports: RwLock::new(AHashMap::new()),
++            unconfirmed_addresses: RwLock::new(ahash::AHashSet::new()),
+             last_vote_epoch: AtomicU64::new(last_vote_epoch),
+             election: parking_lot::Mutex::new(None),
+             election_pending: AtomicBool::new(false),
+@@ -576,6 +581,7 @@ impl ClusterState {
+     fn start_the_clock_on_peers(&self) {
+         let now = now_ms() + self.node_timeout_ms;
+         let me = self.myself();
++        let mut unconfirmed = ahash::AHashSet::new();
+         for node in self.nodes.write().values_mut() {
+             if node.id == me {
+                 continue;
+@@ -583,7 +589,9 @@ impl ClusterState {
+             node.ping_sent_ms = 0;
+             node.pong_received_ms = now;
+             node.flags.remove(NodeFlags::PFAIL);
++            unconfirmed.insert(node.id);
+         }
++        *self.unconfirmed_addresses.write() = unconfirmed;
+         self.failure_reports.write().clear();
+     }
+ 

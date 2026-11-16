@@ -1,0 +1,8 @@
+total 29136
+-rw-rw-r-- 1 azureuser azureuser 29813607 Nov  2 21:03 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser       28 Nov  2 21:02 bin
+-rw-rw-r-- 1 azureuser azureuser       92 Nov  2 21:02 node.conf
+-rw-rw-r-- 1 azureuser azureuser        5 Nov  2 21:02 pid
+-rw-rw-r-- 1 azureuser azureuser     4195 Nov  2 21:02 server.log
+aof_size 29813607 trailing_zero_bytes 0
+last 160 bytes: b'xx\r\n*3\r\n$3\r\nSET\r\n$11\r\nack:6:23939\r\n$40\r\n6:23939:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n*3\r\n$3\r\nSET\r\n$11\r\nack:8:23892\r\n$40\r\n8:23892:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n'

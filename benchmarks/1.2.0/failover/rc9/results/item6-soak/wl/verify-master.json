@@ -1,0 +1,108 @@
+{
+ "node": "master",
+ "checked_at_s": 1811.8,
+ "per_kind": {
+  "str": {
+   "acked": 176920,
+   "unknown": 0,
+   "ok": 176920,
+   "bad": 0
+  },
+  "str_ttl": {
+   "acked": 176918,
+   "unknown": 0,
+   "ok": 176918,
+   "bad": 0
+  },
+  "str_expired": {
+   "acked": 176916,
+   "unknown": 1,
+   "ok": 176916,
+   "bad": 0
+  },
+  "hash": {
+   "acked": 176914,
+   "unknown": 2,
+   "ok": 176914,
+   "bad": 0
+  },
+  "hash_field_ttl": {
+   "acked": 176914,
+   "unknown": 2,
+   "ok": 176914,
+   "bad": 0
+  },
+  "hash_field_expired": {
+   "acked": 176914,
+   "unknown": 2,
+   "ok": 176914,
+   "bad": 0
+  },
+  "multi_l_s_z_incr": {
+   "acked": 176915,
+   "unknown": 0,
+   "ok": 176915,
+   "bad": 0
+  },
+  "overwrite": {
+   "acked": 176912,
+   "unknown": 1,
+   "ok": 1000,
+   "bad": 0
+  }
+ },
+ "problems": [],
+ "counters": {
+  "0": {
+   "value": 22116,
+   "acked": 22116,
+   "acked_plus_unknown": 22116,
+   "ok": true
+  },
+  "1": {
+   "value": 22120,
+   "acked": 22120,
+   "acked_plus_unknown": 22120,
+   "ok": true
+  },
+  "2": {
+   "value": 22112,
+   "acked": 22112,
+   "acked_plus_unknown": 22112,
+   "ok": true
+  },
+  "3": {
+   "value": 22115,
+   "acked": 22115,
+   "acked_plus_unknown": 22115,
+   "ok": true
+  },
+  "4": {
+   "value": 22118,
+   "acked": 22118,
+   "acked_plus_unknown": 22118,
+   "ok": true
+  },
+  "5": {
+   "value": 22106,
+   "acked": 22106,
+   "acked_plus_unknown": 22106,
+   "ok": true
+  },
+  "6": {
+   "value": 22115,
+   "acked": 22115,
+   "acked_plus_unknown": 22115,
+   "ok": true
+  },
+  "7": {
+   "value": 22113,
+   "acked": 22113,
+   "acked_plus_unknown": 22113,
+   "ok": true
+  }
+ },
+ "acked_total": 1415323,
+ "unknown_total": 8,
+ "bad_total": 0
+}

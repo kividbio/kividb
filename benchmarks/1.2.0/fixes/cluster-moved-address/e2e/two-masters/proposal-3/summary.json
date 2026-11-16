@@ -1,0 +1,108 @@
+{
+ "label": "proposal",
+ "scenario": "two-masters",
+ "rep": "3",
+ "node_timeout_ms": 5000,
+ "down_s": 10.0,
+ "moving": [
+  "n1",
+  "n2"
+ ],
+ "new_ips": {
+  "n1": "10.99.0.21",
+  "n2": "10.99.0.22"
+ },
+ "restart_after_kill_s": 10.03,
+ "moved_views_converged_s": 1.98,
+ "all_views_and_state_ok_s": 1.98,
+ "cluster_state_ok_everywhere_s": 1.48,
+ "flaps_after_restart": 0,
+ "per_observer_moved_view_ok_s": {
+  "n1": 1.98,
+  "n2": 1.48,
+  "n3": 1.48,
+  "n4": 1.48,
+  "n5": 1.48,
+  "n6": 1.48
+ },
+ "observed_after_restart_s": 16.98,
+ "writes_failed_after_kill": 91,
+ "writes_clusterdown_after_kill": 18,
+ "writes_attempted_after_kill": 3411,
+ "last_failed_write_s_after_kill": 11,
+ "last_clusterdown_s_after_kill": 11,
+ "failed_seconds_after_restart": 2,
+ "clusterdown_seconds": 6,
+ "clusterdown_from": [
+  "10.99.0.13"
+ ],
+ "other_errors": [],
+ "address_sequences": {
+  "n1->n1": [
+   "127.0.0.1",
+   "10.99.0.21"
+  ],
+  "n1->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ],
+  "n2->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n2->n2": [
+   "127.0.0.1",
+   "10.99.0.22"
+  ],
+  "n3->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n3->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ],
+  "n4->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n4->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ],
+  "n5->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n5->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ],
+  "n6->n1": [
+   "10.99.0.11",
+   "10.99.0.21"
+  ],
+  "n6->n2": [
+   "10.99.0.12",
+   "10.99.0.22"
+  ]
+ },
+ "events": [
+  [
+   3.934,
+   "cluster formed {'n1': 'a5819ef77592f4bc234dba9fb3c9fc4cd1773864', 'n2': '685876ea6a9f6a978f36b10a44df7212fd2cb11d', 'n3': '850440d1b1b143a4e6e3530bbb22d96ea5a00f8a', 'n4': '7cf0bde9e5060f80743d0f2106f6e2f4f3e75c25', 'n5': '8f9b16dc7305e95cd0f00abd9d872ac750f2b7f9', 'n6': 'f23a244f24d72c65b4006a54b662273c3b8f9b8d'}"
+  ],
+  [
+   23.935,
+   "stop ['n1', 'n2']"
+  ],
+  [
+   24.788,
+   "re-IP {'n1': '10.99.0.21', 'n2': '10.99.0.22'}"
+  ],
+  [
+   33.961,
+   "restarted ['n1', 'n2']"
+  ]
+ ]
+}

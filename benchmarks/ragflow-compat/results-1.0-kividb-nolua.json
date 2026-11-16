@@ -1,0 +1,336 @@
+{
+  "label": "kividb-nolua",
+  "image": "kividb/kividb:v1.2.0",
+  "redis_version": "8.10.0",
+  "ragflow": "v1.0.0-rc3",
+  "ragflow_commit": "03c1246150febe6b204b3799dffb3afe52103fb8",
+  "counts": {
+    "PASS": 20,
+    "FAIL": 11,
+    "WARN": 0,
+    "SKIP": 0
+  },
+  "checks": [
+    {
+      "check": "connection: PING through RAGFlow's password, database 1",
+      "status": "PASS",
+      "detail": "redis_version 8.10.0",
+      "ms": 124
+    },
+    {
+      "check": "start-up: every RAGFlow service is running",
+      "status": "PASS",
+      "detail": "6 containers: es01, kvrocks, minio, mysql, nats, ragflow-cpu",
+      "ms": 118
+    },
+    {
+      "check": "start-up: the Go server's four modes are running (each connects to the server at start)",
+      "status": "PASS",
+      "detail": "api, admin, syncer, ingestor",
+      "ms": 158
+    },
+    {
+      "check": "start-up: HELLO / CLIENT / SELECT / AUTH / PING / INFO sent at connect are all accepted",
+      "status": "PASS",
+      "detail": "client|maint_notifications x4, client|setinfo x12, info x1, ping x5, select x6",
+      "ms": 121
+    },
+    {
+      "check": "account: register",
+      "status": "PASS",
+      "detail": "",
+      "ms": 100
+    },
+    {
+      "check": "account: login",
+      "status": "PASS",
+      "detail": "token signed with the secret key RAGFlow stored in the server",
+      "ms": 222
+    },
+    {
+      "check": "account: create an API token",
+      "status": "PASS",
+      "detail": "",
+      "ms": 12
+    },
+    {
+      "check": "models: add the OpenAI-API-compatible provider pointing at the stub",
+      "status": "PASS",
+      "detail": "",
+      "ms": 42
+    },
+    {
+      "check": "models: make the stub's chat and embedding models the defaults",
+      "status": "PASS",
+      "detail": "",
+      "ms": 25
+    },
+    {
+      "check": "dataset: two uploaded documents are parsed by the ingestor",
+      "status": "PASS",
+      "detail": "2 documents COMPLETED",
+      "ms": 4271
+    },
+    {
+      "check": "dataset: the documents have chunks",
+      "status": "PASS",
+      "detail": "2 chunks",
+      "ms": 72
+    },
+    {
+      "check": "dataset: retrieval finds the right chunk",
+      "status": "PASS",
+      "detail": "",
+      "ms": 111
+    },
+    {
+      "check": "dataset: an HTML document with an inline image is parsed (its image goes through the media cache)",
+      "status": "FAIL",
+      "detail": "Fatal: parse failed: [('comet.html', 'FAILED', 'html media cache write: mediacache: write image 3a2f42aba770: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)\\n------------------------\\nnode path: [Parser:HipSignsRhyme]')]",
+      "ms": 2252
+    },
+    {
+      "check": "chat: a completion in a session answers from the stub model",
+      "status": "PASS",
+      "detail": "",
+      "ms": 119
+    },
+    {
+      "check": "chat: a streamed completion",
+      "status": "PASS",
+      "detail": "3 events",
+      "ms": 108
+    },
+    {
+      "check": "agent: an echo agent run answers, and takes and releases the session's lease",
+      "status": "FAIL",
+      "detail": "RuntimeError: POST /agents/chat/completions -> code 500: Internal storage error while accessing the agent.",
+      "ms": 146
+    },
+    {
+      "check": "agent: a streamed run, and the conversation is persisted",
+      "status": "FAIL",
+      "detail": "AssertionError: 0 events: []",
+      "ms": 14
+    },
+    {
+      "check": "contract: the agent-run lease (RunTracker's 4 scripts) is single-owner",
+      "status": "FAIL",
+      "detail": "ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+      "ms": 1
+    },
+    {
+      "check": "contract: a lease expires on time and a new owner can take it",
+      "status": "FAIL",
+      "detail": "ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+      "ms": 0
+    },
+    {
+      "check": "contract: the distributed lock (SET NX PX + delete_if_equal)",
+      "status": "FAIL",
+      "detail": "ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+      "ms": 0
+    },
+    {
+      "check": "contract: the token-bucket rate limit (webhooks)",
+      "status": "FAIL",
+      "detail": "ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+      "ms": 0
+    },
+    {
+      "check": "contract: the media cache put (images during ingestion)",
+      "status": "FAIL",
+      "detail": "ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+      "ms": 0
+    },
+    {
+      "check": "contract: WATCH / MULTI / EXEC optimistic update (webhook traces)",
+      "status": "PASS",
+      "detail": "a changed key aborts EXEC; an unchanged one commits",
+      "ms": 125
+    },
+    {
+      "check": "restart: with the ingestor paused, 3 parse tasks wait",
+      "status": "PASS",
+      "detail": "3 documents waiting: ['SCHEDULED']",
+      "ms": 5959
+    },
+    {
+      "check": "restart: the server restarts again with the tasks waiting",
+      "status": "PASS",
+      "detail": "restarted",
+      "ms": 604
+    },
+    {
+      "check": "restart: the login session survives the restarts (the secret key is kept)",
+      "status": "PASS",
+      "detail": "the secret key survived two restarts; the login token still works",
+      "ms": 129
+    },
+    {
+      "check": "restart: the ingestor resumes and parses every queued document",
+      "status": "PASS",
+      "detail": "3 documents COMPLETED",
+      "ms": 4069
+    },
+    {
+      "check": "restart: retrieval finds a document parsed after the restarts",
+      "status": "PASS",
+      "detail": "",
+      "ms": 39
+    },
+    {
+      "check": "restart: an agent run after the restarts",
+      "status": "FAIL",
+      "detail": "RuntimeError: POST /agents/chat/completions -> code 500: Internal storage error while accessing the agent.",
+      "ms": 14
+    },
+    {
+      "check": "server: no command RAGFlow sent was refused (INFO commandstats)",
+      "status": "FAIL",
+      "detail": "AssertionError: eval: failed 2, rejected 0",
+      "ms": 253
+    },
+    {
+      "check": "server: RAGFlow logged no server errors (warn/error lines about the cache)",
+      "status": "FAIL",
+      "detail": "AssertionError: 6 line(s), e.g. of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)\t{\"pid\": 51, \"component\": \"Parser:HipSignsRhyme\", \"task_id\": \"d504eba9ca1e443fb165adcd8098bdf4\", \"document_id\": \"08d1f6fb7fe74616b6ea7e43e365233d\"}",
+      "ms": 128
+    }
+  ],
+  "commands_at_startup": {
+    "client|maint_notifications": {
+      "calls": 4,
+      "failed": 0,
+      "rejected": 4
+    },
+    "client|setinfo": {
+      "calls": 12,
+      "failed": 0,
+      "rejected": 0
+    },
+    "info": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "ping": {
+      "calls": 5,
+      "failed": 0,
+      "rejected": 0
+    },
+    "select": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "commands_after_run": {
+    "client|setinfo": {
+      "calls": 18,
+      "failed": 0,
+      "rejected": 0
+    },
+    "del": {
+      "calls": 18,
+      "failed": 0,
+      "rejected": 0
+    },
+    "eval": {
+      "calls": 2,
+      "failed": 2,
+      "rejected": 0
+    },
+    "exists": {
+      "calls": 10,
+      "failed": 0,
+      "rejected": 0
+    },
+    "expire": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    },
+    "get": {
+      "calls": 10,
+      "failed": 0,
+      "rejected": 0
+    },
+    "hset": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "info": {
+      "calls": 2,
+      "failed": 0,
+      "rejected": 0
+    },
+    "ping": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "sadd": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "scan": {
+      "calls": 1,
+      "failed": 0,
+      "rejected": 0
+    },
+    "select": {
+      "calls": 9,
+      "failed": 0,
+      "rejected": 0
+    },
+    "set": {
+      "calls": 3,
+      "failed": 0,
+      "rejected": 0
+    },
+    "smembers": {
+      "calls": 6,
+      "failed": 0,
+      "rejected": 0
+    },
+    "ttl": {
+      "calls": 7,
+      "failed": 0,
+      "rejected": 0
+    },
+    "type": {
+      "calls": 7,
+      "failed": 0,
+      "rejected": 0
+    }
+  },
+  "errorstats": {
+    "errorstat_ERR": {
+      "count": 2
+    }
+  },
+  "keys_after_run": {
+    "agent:run:<id>": {
+      "keys": 6,
+      "no_expiry": 0,
+      "type": "hash"
+    },
+    "ragflow:system:secret_key": {
+      "keys": 1,
+      "no_expiry": 1,
+      "type": "string"
+    }
+  },
+  "log_lines": [
+    "2026-11-05 15:40:54.157+08:00\terror\tingestor_server\tcomponent progress: error, Parser: parser: \"html\": html media cache write: mediacache: write image 3a2f42aba770: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)\t{\"pid\": 51, \"component\": \"Parser:HipSignsRhyme\", \"task_id\": \"d504eba9ca1e443fb165adcd8098bdf4\", \"document_id\": \"08d1f6fb7fe74616b6ea7e43e365233d\"}",
+    "2026-11-05 15:40:54.167+08:00\terror\tingestor_server\tagent: component invoke failed, Parser: parser: \"html\": html media cache write: mediacache: write image 3a2f42aba770: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)\t{\"pid\": 51, \"component_id\": \"Parser:HipSignsRhyme\", \"component_class\": \"Parser\"}",
+    "2026-11-05 15:40:54.179+08:00\terror\tingestor_server\tTask d504eba9ca1e443fb165adcd8098bdf4 failed, pipeline: run canvas workflow: [NodeRunError] agent: component \"Parser\" invoke: Parser: parser: \"html\": html media cache write: mediacache: write image 3a2f42aba770: media put: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)",
+    "2026-11-05 15:40:56.569+08:00\twarn\tapi_server_9380\tagent chat completions: RunAgent failed\t{\"pid\": 45, \"user_id\": \"76cdd41195904324969e9e0209c20b73\", \"agent_id\": \"162cf0292b0343599f55d7dfe35a9bcf\", \"session_id\": \"9507efdab75b4d50b07c57afa27d5c38\", \"error\": \"RunAgent: register active session: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file): agent storage error\", \"user_input_type\": \"string\", \"user_input_present\": true, \"user_input_length\": 13, \"user_input_blank\": false}",
+    "2026-11-05 15:40:56.583+08:00\twarn\tapi_server_9380\tagent chat completions: RunAgent failed\t{\"pid\": 45, \"user_id\": \"76cdd41195904324969e9e0209c20b73\", \"agent_id\": \"162cf0292b0343599f55d7dfe35a9bcf\", \"session_id\": \"9507efdab75b4d50b07c57afa27d5c38\", \"error\": \"RunAgent: register active session: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file): agent storage error\", \"user_input_type\": \"string\", \"user_input_present\": true, \"user_input_length\": 13, \"user_input_blank\": false}",
+    "2026-11-05 15:41:07.963+08:00\twarn\tapi_server_9380\tagent chat completions: RunAgent failed\t{\"pid\": 45, \"user_id\": \"76cdd41195904324969e9e0209c20b73\", \"agent_id\": \"162cf0292b0343599f55d7dfe35a9bcf\", \"session_id\": \"9507efdab75b4d50b07c57afa27d5c38\", \"error\": \"RunAgent: register active session: ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file): agent storage error\", \"user_input_type\": \"string\", \"user_input_present\": true, \"user_input_length\": 13, \"user_input_blank\": false}"
+  ],
+  "when": "2026-11-05T07:41:08+00:00"
+}

@@ -1,0 +1,50 @@
+{
+ "mode": "standalone",
+ "writers": 16,
+ "duration_s": 30.0,
+ "acked": 91192,
+ "unacked_errors": 16695,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   -0.096,
+   "old dump.kdb saved (300000 keys)"
+  ],
+  [
+   8.004,
+   "B started in A's data directory"
+  ],
+  [
+   8.209,
+   "SIGTERM to A"
+  ],
+  [
+   8.401,
+   "A exited"
+  ],
+  [
+   8.829,
+   "B answers PING"
+  ]
+ ],
+ "recovery": {
+  "event_t": -0.096,
+  "pre_event_ok_per_100ms_median": 0,
+  "first_error_t": 8.3,
+  "last_error_t": 30.0,
+  "writes_below_80pct_from_t": 8.3,
+  "throughput_back_t": 30.1,
+  "recovery_s": 30.2
+ },
+ "error_kinds": {
+  "ConnectionError:Connection": 16,
+  "ConnectionError:Error": 16679
+ }
+}

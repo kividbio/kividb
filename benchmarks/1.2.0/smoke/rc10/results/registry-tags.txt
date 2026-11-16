@@ -1,0 +1,31 @@
+ghcr.io/kividbio/kividb:v1.2.0-rc10	sha256:35f98bd70d16532eb146f6980edaef5e88841a3cade01e14d982d73311dce910	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+docker.io/kividb/kividb:v1.2.0-rc10	sha256:35f98bd70d16532eb146f6980edaef5e88841a3cade01e14d982d73311dce910	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+ghcr.io/kividbio/kividb:v1.2.0-rc10-lua	sha256:977382164a2effebd55bd877d32d08afb10ec96b5af1627d23306042cf21ceed	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+docker.io/kividb/kividb:v1.2.0-rc10-lua	sha256:977382164a2effebd55bd877d32d08afb10ec96b5af1627d23306042cf21ceed	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+ghcr.io/kividbio/kividb:v1.2.0-rc10-tls	sha256:b895ec23b183f6b0e7b95a2f6613ef5ba69182846afd5744c1726d1382b6b63b	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+docker.io/kividb/kividb:v1.2.0-rc10-tls	sha256:b895ec23b183f6b0e7b95a2f6613ef5ba69182846afd5744c1726d1382b6b63b	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+ghcr.io/kividbio/kividb:v1.2.0-rc10-full	sha256:c189b9b7c2e6e0b8754dfa5051ac5378c908bc232d090ce362c3213c3fe37fa9	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+docker.io/kividb/kividb:v1.2.0-rc10-full	sha256:c189b9b7c2e6e0b8754dfa5051ac5378c908bc232d090ce362c3213c3fe37fa9	linux/amd64 unknown/unknown linux/arm64 unknown/unknown
+ghcr.io/kividbio/kividb:latest	sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+docker.io/kividb/kividb:latest	sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+ghcr.io/kividbio/kividb:1.1	sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+docker.io/kividb/kividb:1.1	sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+ghcr.io/kividbio/kividb:1.2	absent
+docker.io/kividb/kividb:1.2	absent
+ghcr v1.1.3	sha256:5677cfc55fc4a26f247f0ea38dce2cb02237bf27de875f5c362f095aa6a8318d
+ghcr.io/kividbio/kividb:v1.2.0-rc10-amd64	present
+docker.io/kividb/kividb:v1.2.0-rc10-amd64	absent
+ghcr.io/kividbio/kividb:v1.2.0-rc10-arm64	present
+docker.io/kividb/kividb:v1.2.0-rc10-arm64	absent
+ghcr.io/kividbio/kividb:v1.2.0-rc10-lua-amd64	present
+docker.io/kividb/kividb:v1.2.0-rc10-lua-amd64	absent
+ghcr.io/kividbio/kividb:v1.2.0-rc10-lua-arm64	present
+docker.io/kividb/kividb:v1.2.0-rc10-lua-arm64	absent
+ghcr.io/kividbio/kividb:v1.2.0-rc10-tls-amd64	present
+docker.io/kividb/kividb:v1.2.0-rc10-tls-amd64	absent
+ghcr.io/kividbio/kividb:v1.2.0-rc10-tls-arm64	present
+docker.io/kividb/kividb:v1.2.0-rc10-tls-arm64	absent
+ghcr.io/kividbio/kividb:v1.2.0-rc10-full-amd64	present
+docker.io/kividb/kividb:v1.2.0-rc10-full-amd64	absent
+ghcr.io/kividbio/kividb:v1.2.0-rc10-full-arm64	present
+docker.io/kividb/kividb:v1.2.0-rc10-full-arm64	absent

@@ -1,0 +1,32 @@
+Json file /home/azureuser/results-extra/kividb-rc10/r3/d100/warmup/warm.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     5567251 ops, 5563351 (avg: 5563351) ops/sec, 758.11MB/sec (avg: 758.11MB/sec),  0.42 (avg:  0.42) msec latency[RUN #1 40%,   2 secs] 15 threads 10 conns:    11004419 ops, 5435803 (avg: 5499591) ops/sec, 740.73MB/sec (avg: 749.43MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 60%,   3 secs] 15 threads 10 conns:    16481878 ops, 5476374 (avg: 5491854) ops/sec, 746.26MB/sec (avg: 748.37MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 80%,   4 secs] 15 threads 10 conns:    21975587 ops, 5489652 (avg: 5491303) ops/sec, 748.07MB/sec (avg: 748.30MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 100%,   5 secs]  5 threads 10 conns:    27399856 ops, 5489652 (avg: 5478972) ops/sec, 748.07MB/sec (avg: 746.62MB/sec),  0.43 (avg:  0.43) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    27400240 ops, 5489652 (avg: 5478999) ops/sec, 748.07MB/sec (avg: 746.62MB/sec),  0.43 (avg:  0.43) msec latency
+
+Writing Full Run command HDR latency histogram results to /home/azureuser/results-extra/kividb-rc10/r3/d100/warmup/warm.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /home/azureuser/results-extra/kividb-rc10/r3/d100/warmup/warm.c1_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to /home/azureuser/results-extra/kividb-rc10/r3/d100/warmup/warm.c1_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to /home/azureuser/results-extra/kividb-rc10/r3/d100/warmup/warm.c1_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   68.304s  (user 30.453s, sys 37.851s)
+  Wall time:        5.003s
+  Cores used:       13.652   (avg 91.0% across 15 worker threads)
+  Peak utilization: 1375.6%
+Saving JSON output file: /home/azureuser/results-extra/kividb-rc10/r3/d100/warmup/warm.c1.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5479180.10   5479180.10         0.00         0.42907         0.42300         0.72700         1.25500    764564.14 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5479180.10   5479180.10         0.00         0.42907         0.42300         0.72700         1.25500    764564.14 
+rc=0

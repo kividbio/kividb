@@ -1,0 +1,197 @@
+{
+  "params": {
+    "experiment": "kividb-m16-ef128",
+    "dataset": "dbpedia-openai-100K-1536-angular",
+    "parallel": 16,
+    "batch_size": 64,
+    "engine_params": {
+      "schema_version": 1,
+      "phase": "upload",
+      "invocation": {
+        "host": "SERVER_IP",
+        "engines_file": "kividb-engine.json",
+        "allow_partial_configs": false,
+        "allow_partial_corpus": false,
+        "dump_raw_latencies": false,
+        "dump_results": null,
+        "upload_reader": "auto",
+        "exit_on_error": true,
+        "fail_on_dropped_queries": false,
+        "keep_data": false,
+        "reset_between_configs": false,
+        "skip_if_exists": false,
+        "skip_search": false,
+        "skip_upload": false,
+        "skip_vector_index": false,
+        "repetitions": 3,
+        "warmup_seconds": 0.0,
+        "configurations_dir": "~/vdbx/experiments/configurations",
+        "results_dir": "~/vdbx/results"
+      },
+      "declared": {
+        "collection_params": {
+          "hnsw_config": {
+            "M": 16,
+            "EF_CONSTRUCTION": 128
+          }
+        },
+        "upload_params": {
+          "parallel": 16,
+          "batch_size": 64
+        }
+      },
+      "effective": {
+        "INDEXING_WAIT_SECS": 610,
+        "KIVIDB_INDEX_NAME": "idx",
+        "KIVIDB_INDEX_NAME_EXACT": false,
+        "KIVIDB_PORT": 6380,
+        "indexing_wait_phase": "upload_tail",
+        "upload_batch_size": 64,
+        "upload_parallel": 16
+      },
+      "env": {
+        "INDEXING_WAIT_SECS": null,
+        "KIVIDB_AUTH": null,
+        "KIVIDB_INDEX_NAME": null,
+        "KIVIDB_INDEX_NAME_EXACT": null,
+        "KIVIDB_PORT": "6380",
+        "KIVIDB_UPLOAD_BATCH_SIZE": null,
+        "KIVIDB_UPLOAD_PARALLEL": null,
+        "KIVIDB_USER": null
+      },
+      "overridden": [],
+      "ignored_declared_keys": {
+        "exhaustive": false,
+        "covers": "hnsw_config keys serde could not type, plus the CI-asserted KNOWN_UNREAD inventory for this engine",
+        "keys": []
+      }
+    },
+    "build": {
+      "crate_version": "0.2.0",
+      "git_sha": "d22d44e8b46009a800a59e952710166ece2e38a1",
+      "git_tree": "clean",
+      "git_sha_source": "git",
+      "target": "aarch64-unknown-linux-gnu",
+      "profile": "release",
+      "features": [],
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "openssl": "OpenSSL 3.0.2 15 Mar 2022",
+      "hdf5": "1.10.7"
+    },
+    "index_layout": "vector",
+    "index_workloads": [
+      "vector"
+    ]
+  },
+  "results": {
+    "upload_time": 11.803072348,
+    "total_time": 12.545438161,
+    "upload_count": 100000,
+    "memory_usage": {
+      "used_memory": [
+        1309400544
+      ],
+      "index_memory_bytes": null,
+      "index_info": [
+        "index_name",
+        "idx:kividb-m16-ef128",
+        "index_options",
+        [],
+        "index_definition",
+        [
+          "key_type",
+          "HASH",
+          "prefixes",
+          [
+            "kividb-m16-ef128:"
+          ],
+          "default_score",
+          "1"
+        ],
+        "attributes",
+        [
+          [
+            "identifier",
+            "vector",
+            "attribute",
+            "vector",
+            "type",
+            "VECTOR",
+            "algorithm",
+            "HNSW",
+            "data_type",
+            "FLOAT32",
+            "dim",
+            1536,
+            "distance_metric",
+            "COSINE",
+            "M",
+            16,
+            "ef_construction",
+            128
+          ]
+        ],
+        "num_docs",
+        100000,
+        "max_doc_id",
+        100000,
+        "num_terms",
+        0,
+        "num_records",
+        0,
+        "text_terms_bytes",
+        0,
+        "text_postings_bytes",
+        0,
+        "text_docs_bytes",
+        0,
+        "indexing",
+        0,
+        "percent_indexed",
+        "1",
+        "hash_indexing_failures",
+        0,
+        "index_on",
+        "hash",
+        "prefixes",
+        [
+          "kividb-m16-ef128:"
+        ],
+        "num_fields",
+        "1",
+        "fields",
+        [
+          "vector (VECTOR HNSW(M=16,ef=128) DIM=1536 COSINE)"
+        ],
+        "hnsw_live_count",
+        "100000",
+        "hnsw_tombstone_count",
+        "0",
+        "hnsw_tombstone_ratio",
+        "0.0000",
+        "hnsw_compaction_in_progress",
+        "0",
+        "hnsw_indexes",
+        [
+          [
+            "field",
+            "vector",
+            "live_count",
+            "100000",
+            "tombstone_count",
+            "0",
+            "tombstone_ratio",
+            "0.0000",
+            "compaction_in_progress",
+            "0"
+          ]
+        ]
+      ]
+    },
+    "upload_reader": {
+      "reader": "memory",
+      "flag": "auto",
+      "reason": "this engine's upload has no streaming path"
+    }
+  }
+}

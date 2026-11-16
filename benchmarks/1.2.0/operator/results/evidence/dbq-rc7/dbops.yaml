@@ -1,0 +1,59 @@
+apiVersion: v1
+items:
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbDbOps
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbDbOps","metadata":{"annotations":{},"name":"rep-q1-023732","namespace":"e2e"},"spec":{"clusterRef":{"name":"rep"},"op":"restart"}}
+    creationTimestamp: "2026-11-02T21:07:48Z"
+    generation: 1
+    name: rep-q1-023732
+    namespace: e2e
+    resourceVersion: "36976"
+    uid: 8ad853ad-c6c0-4708-ad4d-3b91455aaf45
+  spec:
+    clusterRef:
+      name: rep
+    maxRetries: 0
+    op: restart
+  status:
+    completionTime: "2026-11-02T21:09:18Z"
+    message: restart completed
+    phase: Completed
+    restart:
+      completedPods:
+      - rep-0
+      - rep-2
+      - rep-1
+    startTime: "2026-11-02T21:07:48Z"
+- apiVersion: kividb.io/v1alpha1
+  kind: KividbDbOps
+  metadata:
+    annotations:
+      kubectl.kubernetes.io/last-applied-configuration: |
+        {"apiVersion":"kividb.io/v1alpha1","kind":"KividbDbOps","metadata":{"annotations":{},"name":"rep-q2-023732","namespace":"e2e"},"spec":{"clusterRef":{"name":"rep"},"op":"restart"}}
+    creationTimestamp: "2026-11-02T21:07:48Z"
+    generation: 1
+    name: rep-q2-023732
+    namespace: e2e
+    resourceVersion: "38059"
+    uid: ffb879b6-9cbf-4461-8e1e-66b08aabf176
+  spec:
+    clusterRef:
+      name: rep
+    maxRetries: 0
+    op: restart
+  status:
+    completionTime: "2026-11-02T21:10:54Z"
+    message: restart completed
+    phase: Completed
+    restart:
+      completedPods:
+      - rep-1
+      - rep-2
+      - rep-0
+    startTime: "2026-11-02T21:09:19Z"
+kind: List
+metadata:
+  resourceVersion: ""

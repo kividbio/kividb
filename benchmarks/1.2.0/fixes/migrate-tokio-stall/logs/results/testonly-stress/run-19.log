@@ -1,0 +1,24 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/cluster.rs (target/debug/deps/cluster-14105df2dfb67d3b)
+
+running 1 test
+test a_write_while_migrate_is_on_the_wire_is_not_lost ... FAILED
+
+failures:
+
+---- a_write_while_migrate_is_on_the_wire_is_not_lost stdout ----
+
+thread '<unnamed>' (99765) panicked at tests/cluster.rs:125:33:
+["MIGRATE", "127.0.0.1", "18432", "", "0", "5000", "KEYS", "race:0", "race:1844", "race:119589"] failed: Resource temporarily unavailable (os error 11)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'a_write_while_migrate_is_on_the_wire_is_not_lost' (99634) panicked at tests/cluster.rs:125:33:
+["INCR", "race:1844"] failed: Resource temporarily unavailable (os error 11)
+
+
+failures:
+    a_write_while_migrate_is_on_the_wire_is_not_lost
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 49 filtered out; finished in 13.15s
+
+error: test failed, to rerun pass `--test cluster`

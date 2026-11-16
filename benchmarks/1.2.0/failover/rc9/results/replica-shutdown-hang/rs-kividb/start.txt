@@ -1,0 +1,4 @@
+started kividb master pid 27563
+started kividb replica pid 27606
+/opt/kv/kividb --configfile /mnt/kv/node.conf
+kividb 1.2.0-rc9

@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+mod common;
+use common::restart_verified;
+
 // ── Helpers (same as string-json.rs) ─────────────────────────────────────────
 
 /// Whether nothing has `port`. It is asked with a socket that is bound and
@@ -367,10 +370,14 @@ fn test_config_rewrite_with_configfile() {
     let port = free_port();
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("kividb_rewrite_test_{port}.conf"));
+    // Started from a file, which may be empty: there is nothing to rewrite
+    // otherwise (#442).
+    std::fs::write(&tmp, "").unwrap();
 
     let mut server = std::process::Command::new(
         std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
     )
+    .current_dir(tempfile::tempdir().unwrap().keep())
     .args([
         "--port",
         &port.to_string(),
@@ -414,6 +421,72 @@ fn test_config_rewrite_with_configfile() {
     server.kill().unwrap();
     let _ = server.wait();
     let _ = std::fs::remove_file(&tmp);
+}
+
+/// A server not started from a config file refuses `CONFIG REWRITE`, as
+/// Redis does, and writes nothing (#442). It used to create the file at its
+/// `--configfile` path (by default `/etc/kividb/kividb.conf`, which every
+/// server on the host shares), and the next server started with that path
+/// loaded it: after Sentinel's `REPLICAOF` and `CONFIG REWRITE`, unrelated
+/// servers came up as replicas and a full sync replaced their data.
+#[test]
+fn config_rewrite_without_a_config_file_is_refused_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("absent.conf");
+    let spawn = |port: u16| {
+        std::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
+        )
+        .current_dir(dir.path())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--dir",
+            dir.path().to_str().unwrap(),
+            "--configfile",
+            conf.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start kividb")
+    };
+    let info_field = |c: &mut Conn, section: &str, field: &str| -> String {
+        let info = c.cmds(&["INFO", section]);
+        info.as_str()
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")).map(str::to_string))
+            .unwrap_or_else(|| panic!("no {field} in INFO {section}"))
+    };
+
+    let port = free_port();
+    let master_port = free_port();
+    let mut server = spawn(port);
+    let mut c = Conn::connect(port);
+    assert_eq!(info_field(&mut c, "server", "config_file"), "");
+    assert!(
+        c.cmds(&["REPLICAOF", "127.0.0.1", &master_port.to_string()])
+            .is_ok()
+    );
+    let reply = c.cmds(&["CONFIG", "REWRITE"]);
+    server.kill().unwrap();
+    let _ = server.wait();
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR The server is running without a config file"),
+        "{reply:?}"
+    );
+    assert!(!conf.exists(), "CONFIG REWRITE wrote {}", conf.display());
+
+    // Another server given the same path is not made a replica by it.
+    let other = free_port();
+    let mut server = spawn(other);
+    let mut c = Conn::connect(other);
+    let role = info_field(&mut c, "replication", "role");
+    server.kill().unwrap();
+    let _ = server.wait();
+    assert_eq!(role, "master");
 }
 
 /// `hll-write-format` from the config file is in effect before the AOF is
@@ -463,7 +536,15 @@ fn hll_write_format_from_config_file_survives_restart_and_aof_replay() {
     server.kill().unwrap();
     let _ = server.wait();
 
-    let mut server = spawn(&redis_conf);
+    // On the port of the config file if it is still free, and on another (the
+    // file rewritten) if a test of another process has taken it in the gap.
+    let (mut server, redis_port, _) = restart_verified(
+        |port| {
+            write_config(&redis_conf, port, &slash(&redis_dir), Some("redis"));
+            spawn(&redis_conf)
+        },
+        redis_port,
+    );
     let mut c = Conn::connect(redis_port);
     assert_eq!(format_of(&mut c), "redis", "setting lost across restart");
     assert_eq!(c.get_bytes("hll")[4], 0, "replayed value kept its format");
@@ -496,9 +577,10 @@ fn hll_write_format_from_config_file_survives_restart_and_aof_replay() {
 /// CONFIG REWRITE keeps the config file's mode. It used to write a new file
 /// with the default mode (0644), as Redis does, so a file kept private
 /// because it holds `requirepass` became readable by every user (#51). With
-/// no file to keep the mode of, the new one is 0600. Whatever is already at
-/// the temporary path, a file left by an earlier rewrite or a symlink put
-/// there by another user, is never written through.
+/// no file to keep the mode of (it was removed after the server started from
+/// it), the new one is 0600. Whatever is already at the temporary path, a
+/// file left by an earlier rewrite or a symlink put there by another user,
+/// is never written through.
 #[cfg(unix)]
 #[test]
 fn test_config_rewrite_keeps_the_file_mode() {
@@ -514,10 +596,14 @@ fn test_config_rewrite_keeps_the_file_mode() {
         let mut path = std::env::temp_dir();
         path.push(format!("kividb_rewrite_mode_test_{port}.conf"));
         let _ = std::fs::remove_file(&path);
-        if let Some(mode) = original {
-            std::fs::write(&path, format!("port {port}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-        }
+        // The server starts from the file; `None` removes it before the
+        // rewrite.
+        std::fs::write(&path, format!("port {port}\n")).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(original.unwrap_or(0o644)),
+        )
+        .unwrap();
         let tmp = path.with_extension("tmp");
         let victim = path.with_extension("victim");
         let _ = std::fs::remove_file(&tmp);
@@ -535,6 +621,7 @@ fn test_config_rewrite_keeps_the_file_mode() {
         let mut server = std::process::Command::new(
             std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
         )
+        .current_dir(tempfile::tempdir().unwrap().keep())
         .args([
             "--port",
             &port.to_string(),
@@ -544,6 +631,9 @@ fn test_config_rewrite_keeps_the_file_mode() {
         .spawn()
         .expect("failed to start kividb");
         let mut c = Conn::connect(port);
+        if original.is_none() {
+            std::fs::remove_file(&path).unwrap();
+        }
         let result = c.cmds(&["CONFIG", "REWRITE"]);
         server.kill().unwrap();
         let _ = server.wait();
@@ -769,13 +859,7 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
     );
     assert_eq!(get(&mut c, "bogus-name"), None);
 
-    for name in [
-        "threads",
-        "io-model",
-        "aof",
-        "repl-replica-max-backlog-bytes",
-        "backupdirname",
-    ] {
+    for name in ["threads", "io-model", "aof", "backupdirname"] {
         let reply = c.cmds(&["CONFIG", "SET", name, "1000"]);
         assert!(
             matches!(&reply, RespValue::Error(e) if e == &format!(
@@ -785,20 +869,25 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
             "{name}: {reply:?}"
         );
     }
-    assert_eq!(
-        get(&mut c, "repl-replica-max-backlog-bytes").as_deref(),
-        Some("268435456")
-    );
+    assert_eq!(get(&mut c, "backupdirname").as_deref(), Some("backupdir"));
     // To what it already is, is no change.
     assert!(
-        c.cmds(&[
-            "CONFIG",
-            "SET",
-            "repl-replica-max-backlog-bytes",
-            "268435456"
-        ])
-        .is_ok()
+        c.cmds(&["CONFIG", "SET", "backupdirname", "backupdir"])
+            .is_ok()
     );
+    // The replicas' queue limits can be changed (#305).
+    for name in [
+        "repl-replica-max-backlog-bytes",
+        "repl-replica-sync-max-backlog-bytes",
+    ] {
+        assert!(c.cmds(&["CONFIG", "SET", name, "512mb"]).is_ok(), "{name}");
+        assert_eq!(get(&mut c, name).as_deref(), Some("536870912"), "{name}");
+        // 0 is no limit, as in Redis (#774).
+        assert!(c.cmds(&["CONFIG", "SET", name, "0"]).is_ok(), "{name}");
+        assert_eq!(get(&mut c, name).as_deref(), Some("0"), "{name}");
+        let reply = c.cmds(&["CONFIG", "SET", name, "-1"]);
+        assert!(reply.is_error(), "{name}: {reply:?}");
+    }
     // One refused takes the others back with it.
     let reply = c.cmds(&["CONFIG", "SET", "hz", "20", "bogus-name", "1"]);
     assert!(reply.is_error(), "{reply:?}");
@@ -826,6 +915,71 @@ fn config_set_refuses_unknown_and_startup_only_settings() {
             .any(|v| v.as_str() == "watchdog-period"),
         "{all:?}"
     );
+}
+
+/// `CONFIG SET latency-tracking-info-percentiles` takes what Redis takes and
+/// refuses what it refuses, with its words (#255). Each reply below is what
+/// Redis 8.10.3 answered; a refused value leaves what was there.
+#[test]
+fn config_set_latency_tracking_info_percentiles_refuses_what_redis_refuses() {
+    let _turn = maxmemory_turn();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let key = "latency-tracking-info-percentiles";
+    let get = |c: &mut Conn| {
+        c.cmds(&["CONFIG", "GET", key]).as_array()[1]
+            .as_str()
+            .to_string()
+    };
+    let refused = format!("ERR CONFIG SET failed (possibly related to argument '{key}') - ");
+    let not_numbers = "Invalid latency-tracking-info-percentiles parameters";
+    let out_of_range =
+        "latency-tracking-info-percentiles parameters should sit between [0.0,100.0]";
+
+    assert_eq!(get(&mut c), "50 99 99.9");
+    for (value, why) in [
+        ("abc", not_numbers),
+        ("50 abc", not_numbers),
+        ("101", out_of_range),
+        ("-1", out_of_range),
+        (" 50", not_numbers),
+        ("50 ", not_numbers),
+        ("50  99", not_numbers),
+        ("nan", not_numbers),
+        ("1e-400", not_numbers),
+        ("inf", out_of_range),
+    ] {
+        match c.cmds(&["CONFIG", "SET", key, value]) {
+            RespValue::Error(message) => {
+                assert_eq!(message, format!("{refused}{why}"), "{value:?}")
+            }
+            other => panic!("{value:?} was not refused: {other:?}"),
+        }
+        assert_eq!(
+            get(&mut c),
+            "50 99 99.9",
+            "{value:?} changed what was there"
+        );
+    }
+    for (value, reads_back) in [
+        ("", ""),
+        ("50 99 99.9", "50 99 99.9"),
+        ("0", "0"),
+        ("100", "100"),
+        ("0x10", "16"),
+        ("1e1", "10"),
+        ("50.0 99.90", "50 99.9"),
+        ("99.9999999", "100"),
+        ("-0", "-0"),
+        ("1e-310", "0"),
+    ] {
+        let reply = c.cmds(&["CONFIG", "SET", key, value]);
+        assert!(reply.is_ok(), "{value:?}: {reply:?}");
+        assert_eq!(get(&mut c), reads_back, "{value:?}");
+    }
+    // Put back what other tests of this process go by.
+    assert!(c.cmds(&["CONFIG", "SET", key, "50 99 99.9"]).is_ok());
 }
 
 #[test]
@@ -992,6 +1146,36 @@ fn turned_away(port: u16) -> bool {
     reply == "-ERR max number of clients reached\r\n"
 }
 
+// A connection turned away at maxclients is counted in INFO stats rejected_connections.
+#[cfg(unix)]
+#[test]
+fn stats_are_updated_when_connection_is_turned_away() {
+    let server = start_with_open_files(40, 100, "io-model tokio\nthreads 1\nmaxclients 1");
+
+    let mut conn = Conn::connect(server.port);
+    assert_eq!(maxclients(&mut conn), "1");
+
+    let rejected = |conn: &mut Conn| -> u64 {
+        conn.cmds(&["INFO", "stats"])
+            .as_str()
+            .lines()
+            .find_map(|line| line.strip_prefix("rejected_connections:"))
+            .expect("rejected_connections in INFO stats")
+            .parse()
+            .unwrap()
+    };
+
+    let before = rejected(&mut conn);
+    assert!(turned_away(server.port));
+    let after = rejected(&mut conn);
+
+    assert_eq!(
+        after,
+        before + 1,
+        "rejected_connections should increase by one"
+    );
+}
+
 #[cfg(unix)]
 fn maxclients(c: &mut Conn) -> String {
     c.cmds(&["CONFIG", "GET", "maxclients"]).as_array()[1]
@@ -1133,4 +1317,184 @@ fn maxclients_leaves_room_for_what_the_io_model_holds() {
             "{io_model}: {reply:?}"
         );
     }
+}
+
+/// A kividb process, killed when dropped.
+struct Spawned(std::process::Child);
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_kividb(args: &[&str]) -> Spawned {
+    Spawned(
+        std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .args(args)
+            .spawn()
+            .expect("start kividb"),
+    )
+}
+
+/// `INFO replication`'s value of `field`, once the server is a replica.
+fn replica_info(c: &mut Conn, field: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = c.cmds(&["INFO", "replication"]).as_str().to_string();
+        if info.contains("role:slave") {
+            let prefix = format!("{field}:");
+            return info
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap_or_else(|| panic!("no {field} in {info}"))
+                .to_string();
+        }
+        assert!(Instant::now() < deadline, "not a replica: {info}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn config_get(c: &mut Conn, name: &str) -> String {
+    let reply = c.cmds(&["CONFIG", "GET", name]);
+    reply.as_array()[1].as_str().to_string()
+}
+
+/// `replica-priority` is what `INFO replication` reports as
+/// `slave_priority`, which Sentinel reads to choose the replica to promote
+/// and never promotes at 0. It was taken by `CONFIG SET` and the config file
+/// and only remembered: `INFO` said 100 whatever was set, so Sentinel
+/// promoted a replica set to 0 (#443). It is set from the config file, the
+/// command line and `CONFIG SET`, under both its names, and `CONFIG
+/// REWRITE` keeps it. `replica-announced` likewise reaches
+/// `replica_announced`.
+#[test]
+fn replica_priority_and_announced_reach_info_replication() {
+    let dir = tempfile::tempdir().unwrap();
+    let master_port = free_port();
+    let _master = spawn_kividb(&[
+        "--port",
+        &master_port.to_string(),
+        "--bind",
+        "127.0.0.1",
+        "--loglevel",
+        "warning",
+        "--dir",
+        dir.path().to_str().unwrap(),
+    ]);
+    Conn::connect(master_port);
+
+    // From the config file, under Redis's old name.
+    let conf = dir.path().join("replica.conf");
+    let replica_port = free_port();
+    std::fs::write(
+        &conf,
+        format!(
+            "port {replica_port}\nbind 127.0.0.1\nloglevel warning\n\
+             replicaof 127.0.0.1 {master_port}\nslave-priority 7\nreplica-announced no\n"
+        ),
+    )
+    .unwrap();
+    let replica_dir = dir.path().join("replica");
+    std::fs::create_dir_all(&replica_dir).unwrap();
+    let replica = spawn_kividb(&[
+        "--configfile",
+        conf.to_str().unwrap(),
+        "--dir",
+        replica_dir.to_str().unwrap(),
+    ]);
+    let mut c = Conn::connect(replica_port);
+    assert_eq!(replica_info(&mut c, "slave_priority"), "7");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "0");
+    assert_eq!(config_get(&mut c, "replica-priority"), "7");
+    assert_eq!(config_get(&mut c, "slave-priority"), "7");
+    assert_eq!(config_get(&mut c, "replica-announced"), "no");
+
+    // From CONFIG SET, under either name.
+    assert!(c.cmds(&["CONFIG", "SET", "replica-priority", "0"]).is_ok());
+    assert_eq!(replica_info(&mut c, "slave_priority"), "0");
+    assert_eq!(config_get(&mut c, "slave-priority"), "0");
+    assert!(c.cmds(&["CONFIG", "SET", "slave-priority", "5"]).is_ok());
+    assert_eq!(replica_info(&mut c, "slave_priority"), "5");
+    assert_eq!(config_get(&mut c, "replica-priority"), "5");
+    assert!(
+        c.cmds(&["CONFIG", "SET", "replica-announced", "yes"])
+            .is_ok()
+    );
+    assert_eq!(replica_info(&mut c, "replica_announced"), "1");
+    for (name, value, why) in [
+        (
+            "replica-priority",
+            "-1",
+            "argument must be between 0 and 2147483647 inclusive",
+        ),
+        (
+            "replica-priority",
+            "2147483648",
+            "argument must be between 0 and 2147483647 inclusive",
+        ),
+        (
+            "replica-priority",
+            "high",
+            "argument couldn't be parsed into an integer",
+        ),
+        (
+            "replica-announced",
+            "maybe",
+            "argument must be 'yes' or 'no'",
+        ),
+    ] {
+        let reply = c.cmds(&["CONFIG", "SET", name, value]);
+        let expected =
+            format!("ERR CONFIG SET failed (possibly related to argument '{name}') - {why}");
+        assert!(
+            matches!(&reply, RespValue::Error(e) if *e == expected),
+            "{name} {value}: {reply:?}"
+        );
+    }
+    assert_eq!(replica_info(&mut c, "slave_priority"), "5");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "1");
+
+    // CONFIG REWRITE keeps what was set, for the next start.
+    assert!(c.cmds(&["CONFIG", "SET", "replica-priority", "0"]).is_ok());
+    assert!(
+        c.cmds(&["CONFIG", "SET", "replica-announced", "no"])
+            .is_ok()
+    );
+    assert!(c.cmds(&["CONFIG", "REWRITE"]).is_ok());
+    drop(c);
+    drop(replica);
+    let _replica = spawn_kividb(&[
+        "--configfile",
+        conf.to_str().unwrap(),
+        "--dir",
+        replica_dir.to_str().unwrap(),
+    ]);
+    let mut c = Conn::connect(replica_port);
+    assert_eq!(replica_info(&mut c, "slave_priority"), "0");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "0");
+
+    // From the command line.
+    let other_port = free_port();
+    let other_dir = dir.path().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let _other = spawn_kividb(&[
+        "--port",
+        &other_port.to_string(),
+        "--bind",
+        "127.0.0.1",
+        "--loglevel",
+        "warning",
+        "--dir",
+        other_dir.to_str().unwrap(),
+        "--replicaof",
+        "127.0.0.1",
+        &master_port.to_string(),
+        "--replica-priority",
+        "3",
+    ]);
+    let mut c = Conn::connect(other_port);
+    assert_eq!(replica_info(&mut c, "slave_priority"), "3");
+    assert_eq!(replica_info(&mut c, "replica_announced"), "1");
 }

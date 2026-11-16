@@ -1,0 +1,57 @@
+1793676119.381 RUN ./vector-db-benchmark --host SERVER_IP --engines-file kividb-engine.json --parallels 100 --datasets glove-25-angular --skip-if-exists false 
+1793676119.389 vector-db-benchmark v0.1.0
+1793676119.391 Found 1 datasets, 1 engines
+1793676119.393 
+1793676119.394 ============================================================
+1793676119.396 Running experiment (1/1): kividb-glove25 - glove-25-angular
+1793676119.398 ============================================================
+1793676119.400 Experiment stage: Configure
+1793676119.402 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 256}
+1793676119.404 Experiment stage: Upload
+1793676119.406 Reading dataset from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793676119.604 Read 1183514 vectors (25d) in 0.210s (5622764 vectors/sec)
+1793676119.606 Starting upload with 100 threads, batch size 64...
+1793676149.927 Upload time: 30.323s (39030 records/sec)
+1793676150.008 Indexing complete: 1183514 docs in 0.1s
+1793676150.010 Index time: 0.081s, Total time (read+upload+index): 30.615s
+1793676150.142 Results saved to: "/home/azureuser/vdb/results/kividb-glove25-glove-25-angular-upload-0-1183514-2026-11-03-03-22-30.json"
+1793676150.144 Experiment stage: Search
+1793676150.146 	Running search 0: ef=128, parallel=100
+1793676150.224 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793676150.539 	  rep 1/3: QPS 33575.5
+1793676150.621 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793676150.933 	  rep 2/3: QPS 33905.3
+1793676151.016 	Reading queries from /home/azureuser/vdb/datasets/glove-25-angular/glove-25-angular.hdf5...
+1793676151.326 	  rep 3/3: QPS 34115.0
+1793676151.328 	→ QPS: 34115.0, Recall: 0.9647, Precision: 0.9647, MRR: 1.0000, NDCG: 0.9744 (best of reps)
+1793676151.584 	Results saved to: "/home/azureuser/vdb/results/kividb-glove25-glove-25-angular-search-0-28435-2026-11-03-03-22-31.json"
+1793676151.586 ----------------------------------------------------------------------------------
+1793676151.588 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P95 (ms)    
+1793676151.589 ----------------------------------------------------------------------------------
+1793676151.591 0.9647     0.9647     1.0000   0.9744   34115.0    2.718        3.732       
+1793676151.593 
+1793676151.595 
+1793676151.597 QPS vs Precision Trade-off - kividb-glove25 - glove-25-angular (up and to the right is better):
+1793676151.598 
+1793676151.600    34115 │●                                                           
+1793676151.602    31014 │                                                            
+1793676151.604    27912 │                                                            
+1793676151.606    24811 │                                                            
+1793676151.608    21710 │                                                            
+1793676151.609    18608 │                                                            
+1793676151.611    15507 │                                                            
+1793676151.613    12405 │                                                            
+1793676151.615     9304 │                                                            
+1793676151.617     6203 │                                                            
+1793676151.619     3101 │                                                            
+1793676151.621        0 │                                                            
+1793676151.622          └────────────────────────────────────────────────────────────
+1793676151.624           0.965          0.968          0.971          0.975          
+1793676151.626         Precision (0.0 = 0%, 1.0 = 100%)
+1793676151.628 
+1793676151.630 ================================================================================
+1793676151.632 Results saved to:  /home/azureuser/vdb/results
+1793676151.634 Summary saved to:  /home/azureuser/vdb/results/kividb-glove25-glove-25-angular-summary.json
+1793676151.635 Experiment stage: Cleanup (deleting index and data)
+1793676157.055 Experiment stage: Done
+1793676157.071 EXIT 0

@@ -69,7 +69,16 @@ pub struct Activity {
     /// watched in the low. Written by the connection's loop as its replies go
     /// out, only when they changed.
     tx: AtomicU64,
+    /// `CLIENT LIST`'s `omem` (#774): a large batch of replies while it is
+    /// being written (one under [`REPLY_OUTPUT_SHOWN_FROM`] is written at
+    /// once, and not shown), and what is queued for a subscriber.
+    reply_output: AtomicU64,
+    pubsub_output: AtomicU64,
 }
+
+/// A batch of replies this large or larger is shown in `omem` while it is
+/// written; a smaller one goes out in one write, and is not.
+pub const REPLY_OUTPUT_SHOWN_FROM: usize = 64 * 1024;
 
 /// Clients blocked in a command with a timeout: `clients_in_timeout_table`.
 static IN_TIMEOUT_TABLE: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +190,23 @@ impl ReplyGate {
             self.keep =
                 cmd[0].len() >= 9 && cmd[0][cmd[0].len() - 9..].eq_ignore_ascii_case(b"SUBSCRIBE");
         }
+    }
+
+    /// The command that began last is dispatched again (a parked command
+    /// resumed, a write a pause sent back): not a new command, so neither
+    /// settled nor begun again, which would use up a `CLIENT REPLY SKIP`
+    /// on the dispatch that did not reply. Its reply starts where `out`
+    /// ends now: what was before it may have been sent meanwhile.
+    pub fn again(&mut self, out: &[u8]) {
+        if self.open {
+            self.mark = out.len();
+        }
+    }
+
+    /// The command that has just begun is one whose reply is not wanted
+    /// (`CLIENT REPLY OFF`, or `SKIP`).
+    pub fn drops_reply(&self) -> bool {
+        self.open && !self.keep
     }
 
     /// Drop the reply of the command that has just run, if it is not wanted.
@@ -327,6 +353,21 @@ fn unpack<const N: usize>(from: &[AtomicU64; N], len: usize) -> String {
 }
 
 impl Activity {
+    /// See [`Activity::reply_output`].
+    pub fn set_reply_output(&self, bytes: usize) {
+        self.reply_output.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// See [`Activity::pubsub_output`].
+    pub fn set_pubsub_output(&self, bytes: usize) {
+        self.pubsub_output.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// What is waiting to be written to the connection: `omem`.
+    pub fn output(&self) -> u64 {
+        self.reply_output.load(Ordering::Relaxed) + self.pubsub_output.load(Ordering::Relaxed)
+    }
+
     /// The connection's transaction now: the commands queued if it is in
     /// one, and the keys it watches. See [`Activity::tx`].
     #[inline]
@@ -501,6 +542,8 @@ pub struct ClientInfo {
     pub activity: Arc<Activity>,
     pub query_buffer: Arc<QueryBufferMetrics>,
     pub no_evict: bool,
+    /// Waiting in a blocking command: `b` in `CLIENT LIST`.
+    pub blocked: bool,
     /// True iff the client has issued ASKING for the next command.
     /// Single-shot: cleared after the next command runs (whatever the result).
     pub asking: bool,
@@ -518,7 +561,7 @@ pub struct ClientInfo {
     // Tracking state
     pub tracking: bool,
     pub tracking_bcast: bool,
-    pub tracking_prefixes: Vec<String>,
+    pub tracking_prefixes: Vec<Vec<u8>>,
     pub tracking_redirect: Option<u64>, // redirect invalidation to another client ID
     /// The client they were redirected to has gone.
     pub tracking_redirect_broken: bool,
@@ -547,6 +590,10 @@ pub struct ClientInfo {
     /// been told `+LOSTDATA`; 0 if it did not. See
     /// `ReplState::psync_offer`.
     pub replica_lost_data: u8,
+    /// `None` until a KiviDB capa arrives; then whether it reads Q8 and BIN.
+    pub replica_vset_quant: Option<bool>,
+    /// It sent `REPLCONF capa slot-imports` (#741).
+    pub replica_slot_imports: bool,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -570,6 +617,7 @@ impl ClientInfo {
             activity: Arc::new(activity),
             query_buffer: Arc::default(),
             no_evict: false,
+            blocked: false,
             asking: false,
             readonly: false,
             tracking: false,
@@ -591,6 +639,8 @@ impl ClientInfo {
             replica_listening_port: 0,
             replica_takes_digest: false,
             replica_lost_data: 0,
+            replica_vset_quant: None,
+            replica_slot_imports: false,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -622,8 +672,17 @@ impl ClientInfo {
         if self.subscriptions.iter().any(|n| *n > 0) {
             flags.push('P');
         }
+        if self.activity.tx().0 >= 0 {
+            flags.push('x');
+        }
+        if self.blocked {
+            flags.push('b');
+        }
         if self.tracking {
             flags.push('t');
+        }
+        if self.no_evict {
+            flags.push('e');
         }
         if flags.is_empty() {
             flags.push('N');
@@ -631,7 +690,7 @@ impl ClientInfo {
         format!(
             "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} \
             ssub={} multi={} watch={} qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
-            rbs=0 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem={} events=r cmd={} \
+            rbs=0 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem={} events=r cmd={} \
             user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0 tot-net-in={} \
             tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} \
             avg-pipeline-len-cnt={}\n",
@@ -650,8 +709,10 @@ impl ClientInfo {
             self.activity.tx().1,
             qbuf,
             qbuf_free,
-            // What KiviDB measures of a client's memory: its query buffer.
-            qbuf + qbuf_free,
+            self.activity.output(),
+            // What KiviDB measures of a client's memory: its query buffer,
+            // and what is waiting to be written to it.
+            qbuf + qbuf_free + self.activity.output(),
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -711,7 +772,13 @@ fn reserved_fds() -> usize {
 #[cfg(unix)]
 fn clients_for(soft: libc::rlim_t, max: usize, reserved: usize) -> usize {
     let reserved = libc::rlim_t::try_from(reserved).unwrap_or(libc::RLIM_INFINITY);
-    usize::try_from(soft.saturating_sub(reserved)).map_or(max, |n| n.min(max))
+    // Not `saturating_sub` alone: `rlim_t` is signed on FreeBSD, where it
+    // goes below zero, and the conversion below then fails and gives `max`
+    // (#288).
+    if soft <= reserved {
+        return 0;
+    }
+    usize::try_from(soft - reserved).map_or(max, |n| n.min(max))
 }
 
 /// Raises the soft open-file limit toward what `max` clients need, never past
@@ -733,7 +800,10 @@ pub fn clients_that_fit(max: usize) -> std::io::Result<usize> {
     // whatever the hard limit says.
     let (mut soft, mut high) = (limit.rlim_cur, wanted.min(limit.rlim_max));
     while soft < high {
-        let next = soft + (high - soft).div_ceil(2);
+        // Half the gap, rounded up. Not `div_ceil`: `rlim_t` is signed on
+        // FreeBSD, where `div_ceil` is not stable (#288).
+        let gap = high - soft;
+        let next = soft + gap / 2 + gap % 2;
         let raised = libc::rlimit {
             rlim_cur: next,
             rlim_max: limit.rlim_max,
@@ -791,6 +861,63 @@ pub fn turn_away(mut socket: tokio::net::TcpStream) {
     });
 }
 
+/// A replica's link to its master, listed among its clients as Redis lists
+/// it: `flags=M`, `TYPE master`, by the master's address. `CLIENT KILL` ends
+/// the link, and the replica connects again and continues from where it
+/// stands (#595). Taken off the list when dropped.
+pub struct MasterLink {
+    registry: ClientRegistry,
+    id: u64,
+    activity: Arc<Activity>,
+    kill_rx: KillRx,
+    /// Until it is known to have been taken off the list other than by a
+    /// kill: its `kill_rx` is then done with.
+    listed: bool,
+}
+
+impl MasterLink {
+    pub fn register(registry: &ClientRegistry, addr: String, laddr: String) -> Self {
+        let id = next_client_id();
+        let (mut info, killed) = ClientInfo::new(id, addr);
+        info.laddr = laddr;
+        info.flags = "M".to_string();
+        // Redis's master client has no ACL user.
+        info.user = "(superuser)".to_string();
+        let activity = Arc::clone(&info.activity);
+        registry.register(info);
+        Self {
+            registry: Arc::clone(registry),
+            id,
+            activity,
+            kill_rx: killed,
+            listed: true,
+        }
+    }
+
+    /// Resolves when the link is killed (`CLIENT KILL`), and never
+    /// otherwise. Cancel-safe: it may be raced and dropped again and again.
+    pub async fn killed(&mut self) {
+        if self.listed {
+            if (&mut self.kill_rx).await.is_ok() {
+                return;
+            }
+            self.listed = false;
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// The master has sent something: the link is not idle.
+    pub fn touch(&self) {
+        self.activity.touch();
+    }
+}
+
+impl Drop for MasterLink {
+    fn drop(&mut self) {
+        self.registry.unregister(self.id);
+    }
+}
+
 /// A connection's place under `maxclients`, given back when dropped.
 pub struct Slot(ClientRegistry);
 
@@ -806,6 +933,7 @@ pub fn admit(registry: &ClientRegistry) -> Option<Slot> {
     let max = MAX_CLIENTS.load(Ordering::Relaxed);
     let slot = ClientRegistryInner::admit_up_to(registry, max);
     if slot.is_none() {
+        crate::stats::REJECTED_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         crate::log_throttled!(
             10,
             crate::loglevel::WARN,
@@ -885,6 +1013,16 @@ impl ClientRegistryInner {
         self.clients.read().is_empty()
     }
 
+    /// `connected_clients`: the clients less the replicas' links, as Redis
+    /// counts them.
+    pub fn connected_clients(&self) -> usize {
+        self.clients
+            .read()
+            .values()
+            .filter(|info| !info.flags.contains('S'))
+            .count()
+    }
+
     /// The client has begun to wait in a blocking command (`Some`), or has
     /// stopped (`None`).
     pub fn set_blocked(
@@ -896,6 +1034,7 @@ impl ClientRegistryInner {
         let blocked = unblock.is_some();
         if let Some(info) = self.clients.write().get_mut(&id) {
             info.unblock_tx = unblock;
+            info.blocked = blocked;
             let counted = blocked && with_timeout;
             if counted != info.blocked_with_timeout {
                 if counted {
@@ -909,6 +1048,20 @@ impl ClientRegistryInner {
         if blocked {
             crate::pause::went_on(id);
         }
+    }
+
+    /// Client `id` waits in a command that is no key's (`WAIT`): blocked,
+    /// counted in `blocked_clients`, and ended by `CLIENT UNBLOCK` through
+    /// `unblock`, until what this returns is dropped.
+    pub fn blocked_in(
+        &self,
+        id: u64,
+        unblock: oneshot::Sender<crate::commands::blocking::Unblock>,
+        with_timeout: bool,
+    ) -> BlockedIn<'_> {
+        self.set_blocked(id, Some(unblock), with_timeout);
+        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        BlockedIn { registry: self, id }
     }
 
     /// `CLIENT UNBLOCK`: end the client's wait, if it is waiting.
@@ -926,16 +1079,36 @@ impl ClientRegistryInner {
         IN_TIMEOUT_TABLE.load(Ordering::Relaxed)
     }
 
-    /// What the clients' query buffers hold, the replicas' apart:
-    /// `(mem_clients_normal, mem_clients_slaves)` (#152).
+    /// This node has become a replica: every client waiting in a blocking
+    /// command is answered `-UNBLOCKED … (master -> replica?)` and its
+    /// connection closed, as Redis's `disconnectAllBlockedClients` does
+    /// (#591). A client paused by `CLIENT PAUSE` is not blocked, and is let
+    /// be, as in Redis. Returns how many were ended.
+    pub fn end_blocked_for_role_change(&self) -> usize {
+        let senders: Vec<_> = self
+            .clients
+            .write()
+            .values_mut()
+            .filter_map(|info| info.unblock_tx.take())
+            .collect();
+        senders
+            .into_iter()
+            .filter_map(|tx| tx.send(crate::commands::blocking::Unblock::RoleChange).ok())
+            .count()
+    }
+
+    /// What the clients' query buffers hold, and what is waiting to be
+    /// written to them, the replicas' apart: `(mem_clients_normal,
+    /// mem_clients_slaves)` (#152).
     pub fn buffer_totals(&self) -> (u64, u64) {
         let (mut normal, mut replicas) = (0u64, 0u64);
         for info in self.clients.read().values() {
             let (len, free) = info.query_buffer.values();
+            let used = len + free + info.activity.output();
             if info.flags.contains('S') {
-                replicas += len + free;
+                replicas += used;
             } else {
-                normal += len + free;
+                normal += used;
             }
         }
         (normal, replicas)
@@ -981,6 +1154,14 @@ impl ClientRegistryInner {
         }
     }
 
+    /// The connection's [`Activity`], while it is connected.
+    pub fn activity(&self, id: u64) -> Option<Arc<Activity>> {
+        self.clients
+            .read()
+            .get(&id)
+            .map(|info| Arc::clone(&info.activity))
+    }
+
     pub fn list(&self) -> Vec<ClientInfo> {
         // ClientInfo no longer derives Clone (kill_tx isn't Clone).
         // Build list lines directly instead of cloning.
@@ -999,6 +1180,7 @@ impl ClientRegistryInner {
                 activity: Arc::clone(&c.activity),
                 query_buffer: Arc::clone(&c.query_buffer),
                 no_evict: c.no_evict,
+                blocked: c.blocked,
                 asking: c.asking,
                 readonly: c.readonly,
                 tracking: c.tracking,
@@ -1020,6 +1202,8 @@ impl ClientRegistryInner {
                 replica_listening_port: c.replica_listening_port,
                 replica_takes_digest: c.replica_takes_digest,
                 replica_lost_data: c.replica_lost_data,
+                replica_vset_quant: c.replica_vset_quant,
+                replica_slot_imports: c.replica_slot_imports,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -1038,6 +1222,7 @@ impl ClientRegistryInner {
             activity: Arc::clone(&c.activity),
             query_buffer: Arc::clone(&c.query_buffer),
             no_evict: c.no_evict,
+            blocked: c.blocked,
             asking: c.asking,
             readonly: c.readonly,
             kill_tx: None,
@@ -1059,6 +1244,8 @@ impl ClientRegistryInner {
             replica_listening_port: c.replica_listening_port,
             replica_takes_digest: c.replica_takes_digest,
             replica_lost_data: c.replica_lost_data,
+            replica_vset_quant: c.replica_vset_quant,
+            replica_slot_imports: c.replica_slot_imports,
             subscriptions: c.subscriptions,
         })
     }
@@ -1175,6 +1362,20 @@ pub fn new_client_registry() -> ClientRegistry {
 impl Default for ClientRegistryInner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// See [`ClientRegistry::blocked_in`]: the client stops being blocked when
+/// this is dropped.
+pub struct BlockedIn<'a> {
+    registry: &'a ClientRegistryInner,
+    id: u64,
+}
+
+impl Drop for BlockedIn<'_> {
+    fn drop(&mut self) {
+        self.registry.set_blocked(self.id, None, false);
+        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

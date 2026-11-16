@@ -1,0 +1,690 @@
+=== 1793725946 17:12:26
+VmHWM:	    9568 kB
+VmRSS:	    9568 kB
+Threads:	14
+used_memory:1311975
+used_memory_rss:10801152
+maxmemory:1073741824
+mem_fragmentation_ratio:8.2327
+total_commands_processed:3
+instantaneous_ops_per_sec:0
+keyspace_hits:0
+keyspace_misses:0
+evicted_keys:0
+0
+stat: 0 0
+=== 1793725976 17:12:56
+VmHWM:	  310696 kB
+VmRSS:	  310696 kB
+Threads:	14
+used_memory:309603794
+used_memory_rss:318210048
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0278
+total_commands_processed:1594720
+instantaneous_ops_per_sec:72941
+keyspace_hits:525866
+keyspace_misses:534402
+evicted_keys:0
+534486
+stat: 528 1658
+=== 1793726006 17:13:26
+VmHWM:	  678288 kB
+VmRSS:	  678288 kB
+Threads:	14
+used_memory:683756418
+used_memory_rss:694636544
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0159
+total_commands_processed:3775366
+instantaneous_ops_per_sec:71190
+keyspace_hits:1384827
+keyspace_misses:1195242
+evicted_keys:0
+1195315
+stat: 1245 3895
+=== 1793726036 17:13:56
+VmHWM:	 1018712 kB
+VmRSS:	 1018712 kB
+Threads:	14
+used_memory:1030169810
+used_memory_rss:1043202048
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0127
+total_commands_processed:5947566
+instantaneous_ops_per_sec:71078
+keyspace_hits:2300675
+keyspace_misses:1823417
+evicted_keys:0
+1823492
+stat: 1941 6148
+=== 1793726066 17:14:26
+VmHWM:	 1066176 kB
+VmRSS:	 1066176 kB
+Threads:	14
+used_memory:1073741410
+used_memory_rss:1091764224
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0168
+total_commands_processed:8000987
+instantaneous_ops_per_sec:69233
+keyspace_hits:3190957
+keyspace_misses:2404984
+evicted_keys:536844
+1868123
+stat: 2851 8206
+=== 1793726096 17:14:56
+VmHWM:	 1067780 kB
+VmRSS:	 1067780 kB
+Threads:	14
+used_memory:1073741666
+used_memory_rss:1093406720
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0183
+total_commands_processed:10061276
+instantaneous_ops_per_sec:69480
+keyspace_hits:4082595
+keyspace_misses:2989308
+evicted_keys:1121425
+1867867
+stat: 3750 10274
+=== 1793726126 17:15:26
+VmHWM:	 1068616 kB
+VmRSS:	 1068616 kB
+Threads:	14
+used_memory:1073741602
+used_memory_rss:1094262784
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0191
+total_commands_processed:12115214
+instantaneous_ops_per_sec:68300
+keyspace_hits:4971444
+keyspace_misses:3571852
+evicted_keys:1702914
+1868922
+stat: 4648 12342
+=== 1793726156 17:15:56
+VmHWM:	 1069328 kB
+VmRSS:	 1069328 kB
+Threads:	14
+used_memory:1073741042
+used_memory_rss:1094991872
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0198
+total_commands_processed:14193860
+instantaneous_ops_per_sec:68361
+keyspace_hits:5871159
+keyspace_misses:4161317
+evicted_keys:2292099
+1869199
+stat: 5562 14397
+=== 1793726187 17:16:27
+VmHWM:	 1070096 kB
+VmRSS:	 1070096 kB
+Threads:	14
+used_memory:1073741602
+used_memory_rss:1095778304
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0205
+total_commands_processed:16261502
+instantaneous_ops_per_sec:67487
+keyspace_hits:6766681
+keyspace_misses:4747373
+evicted_keys:2879813
+1867545
+stat: 6468 16461
+=== 1793726217 17:16:57
+VmHWM:	 1070676 kB
+VmRSS:	 1070676 kB
+Threads:	14
+used_memory:1073741778
+used_memory_rss:1096372224
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0211
+total_commands_processed:18316445
+instantaneous_ops_per_sec:68320
+keyspace_hits:7655191
+keyspace_misses:5330588
+evicted_keys:3463348
+1867217
+stat: 7349 18548
+=== 1793726247 17:17:27
+VmHWM:	 1071188 kB
+VmRSS:	 1071188 kB
+Threads:	14
+used_memory:1073741458
+used_memory_rss:1096896512
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0216
+total_commands_processed:20382883
+instantaneous_ops_per_sec:65324
+keyspace_hits:8548685
+keyspace_misses:5917058
+evicted_keys:4050086
+1866948
+stat: 8249 20615
+=== 1793726277 17:17:57
+VmHWM:	 1071444 kB
+VmRSS:	 1071444 kB
+Threads:	14
+used_memory:1073741186
+used_memory_rss:1097158656
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0218
+total_commands_processed:22358040
+instantaneous_ops_per_sec:67236
+keyspace_hits:9402619
+keyspace_misses:6477669
+evicted_keys:4609748
+1867915
+stat: 9142 22675
+=== 1793726307 17:18:27
+VmHWM:	 1071636 kB
+VmRSS:	 1071636 kB
+Threads:	14
+used_memory:1073741618
+used_memory_rss:1097355264
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0220
+total_commands_processed:24414732
+instantaneous_ops_per_sec:68676
+keyspace_hits:10293174
+keyspace_misses:7060737
+evicted_keys:5193241
+1867476
+stat: 10055 24729
+=== 1793726337 17:18:57
+VmHWM:	 1071956 kB
+VmRSS:	 1071956 kB
+Threads:	14
+used_memory:1073741714
+used_memory_rss:1097682944
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0223
+total_commands_processed:26450979
+instantaneous_ops_per_sec:68456
+keyspace_hits:11173993
+keyspace_misses:7638449
+evicted_keys:5771224
+1867197
+stat: 10977 26773
+=== 1793726367 17:19:27
+VmHWM:	 1071956 kB
+VmRSS:	 1071956 kB
+Threads:	14
+used_memory:1073741362
+used_memory_rss:1097682944
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0223
+total_commands_processed:28500847
+instantaneous_ops_per_sec:70369
+keyspace_hits:12061267
+keyspace_misses:8219744
+evicted_keys:6351588
+1868134
+stat: 11877 28839
+=== 1793726397 17:19:57
+VmHWM:	 1072148 kB
+VmRSS:	 1072148 kB
+Threads:	14
+used_memory:1073741474
+used_memory_rss:1097879552
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0225
+total_commands_processed:30550996
+instantaneous_ops_per_sec:68796
+keyspace_hits:12947153
+keyspace_misses:8801875
+evicted_keys:6933832
+1868028
+stat: 12782 30902
+=== 1793726427 17:20:27
+VmHWM:	 1072212 kB
+VmRSS:	 1072212 kB
+Threads:	14
+used_memory:1073741666
+used_memory_rss:1097945088
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0225
+total_commands_processed:32603875
+instantaneous_ops_per_sec:67447
+keyspace_hits:13834699
+keyspace_misses:9384540
+evicted_keys:7516718
+1867804
+stat: 13680 32972
+=== 1793726457 17:20:57
+VmHWM:	 1072340 kB
+VmRSS:	 1072340 kB
+Threads:	14
+used_memory:1073741026
+used_memory_rss:1098076160
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0227
+total_commands_processed:34585771
+instantaneous_ops_per_sec:66685
+keyspace_hits:14692755
+keyspace_misses:9946457
+evicted_keys:8078163
+1868290
+stat: 14572 35029
+=== 1793726487 17:21:27
+VmHWM:	 1072404 kB
+VmRSS:	 1072404 kB
+Threads:	14
+used_memory:1073741218
+used_memory_rss:1098141696
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0227
+total_commands_processed:36647198
+instantaneous_ops_per_sec:68404
+keyspace_hits:15583949
+keyspace_misses:10531574
+evicted_keys:8663995
+1867562
+stat: 15491 37077
+=== 1793726517 17:21:57
+VmHWM:	 1072600 kB
+VmRSS:	 1072600 kB
+Threads:	14
+used_memory:1073741138
+used_memory_rss:1098342400
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0229
+total_commands_processed:38706553
+instantaneous_ops_per_sec:69428
+keyspace_hits:16475497
+keyspace_misses:11115477
+evicted_keys:9247241
+1868204
+stat: 16378 39158
+=== 1793726547 17:22:27
+VmHWM:	 1072664 kB
+VmRSS:	 1072664 kB
+Threads:	14
+used_memory:1073741506
+used_memory_rss:1098407936
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0230
+total_commands_processed:40778444
+instantaneous_ops_per_sec:68190
+keyspace_hits:17371070
+keyspace_misses:11703634
+evicted_keys:9835245
+1868370
+stat: 17283 41222
+=== 1793726577 17:22:57
+VmHWM:	 1072728 kB
+VmRSS:	 1072728 kB
+Threads:	14
+used_memory:1073741074
+used_memory_rss:1098473472
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0230
+total_commands_processed:42847477
+instantaneous_ops_per_sec:68364
+keyspace_hits:18266379
+keyspace_misses:12290493
+evicted_keys:10421873
+1868589
+stat: 18180 43294
+=== 1793726607 17:23:27
+VmHWM:	 1072664 kB
+VmRSS:	 1072664 kB
+Threads:	14
+used_memory:1073741762
+used_memory_rss:1098407936
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0230
+total_commands_processed:44911194
+instantaneous_ops_per_sec:68259
+keyspace_hits:19158523
+keyspace_misses:12876278
+evicted_keys:11008490
+1867767
+stat: 19074 45370
+=== 1793726637 17:23:57
+VmHWM:	 1072792 kB
+VmRSS:	 1072792 kB
+Threads:	14
+used_memory:1073741826
+used_memory_rss:1098539008
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0231
+total_commands_processed:46973302
+instantaneous_ops_per_sec:70381
+keyspace_hits:20052163
+keyspace_misses:13460511
+evicted_keys:11591313
+1869176
+stat: 19983 47428
+=== 1793726667 17:24:27
+VmHWM:	 1090940 kB
+VmRSS:	 1090940 kB
+Threads:	14
+used_memory:1073741506
+used_memory_rss:1117122560
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0404
+total_commands_processed:48730356
+instantaneous_ops_per_sec:68335
+keyspace_hits:20811657
+keyspace_misses:13959288
+evicted_keys:12090746
+1868534
+stat: 20795 49206
+=== 1793726697 17:24:57
+VmHWM:	 1090928 kB
+VmRSS:	 1090876 kB
+Threads:	14
+used_memory:1073741122
+used_memory_rss:1117057024
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0403
+total_commands_processed:50798103
+instantaneous_ops_per_sec:70132
+keyspace_hits:21704820
+keyspace_misses:14546579
+evicted_keys:12678169
+1868396
+stat: 21695 51276
+=== 1793726727 17:25:27
+VmHWM:	 1091004 kB
+VmRSS:	 1091004 kB
+Threads:	14
+used_memory:1073741202
+used_memory_rss:1117188096
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0405
+total_commands_processed:52846588
+instantaneous_ops_per_sec:69756
+keyspace_hits:22589906
+keyspace_misses:15128280
+evicted_keys:13260075
+1868198
+stat: 22593 53346
+=== 1793726757 17:25:57
+VmHWM:	 1091132 kB
+VmRSS:	 1091132 kB
+Threads:	14
+used_memory:1073741762
+used_memory_rss:1117319168
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0406
+total_commands_processed:54924045
+instantaneous_ops_per_sec:68138
+keyspace_hits:23489717
+keyspace_misses:15717100
+evicted_keys:13849410
+1867664
+stat: 23481 55427
+=== 1793726787 17:26:27
+VmHWM:	 1091260 kB
+VmRSS:	 1091260 kB
+Threads:	14
+used_memory:1073741746
+used_memory_rss:1117450240
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0407
+total_commands_processed:56989663
+instantaneous_ops_per_sec:69050
+keyspace_hits:24383469
+keyspace_misses:16303029
+evicted_keys:14434828
+1868185
+stat: 24377 57501
+=== 1793726817 17:26:57
+VmHWM:	 1091324 kB
+VmRSS:	 1091324 kB
+Threads:	14
+used_memory:1073741250
+used_memory_rss:1117515776
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0408
+total_commands_processed:59056120
+instantaneous_ops_per_sec:69327
+keyspace_hits:25278950
+keyspace_misses:16888516
+evicted_keys:15020519
+1867975
+stat: 25278 59569
+=== 1793726847 17:27:27
+VmHWM:	 1091312 kB
+VmRSS:	 1091244 kB
+Threads:	14
+used_memory:1073741842
+used_memory_rss:1117437952
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0407
+total_commands_processed:61122922
+instantaneous_ops_per_sec:71559
+keyspace_hits:26173579
+keyspace_misses:17474602
+evicted_keys:15605633
+1868942
+stat: 26170 61646
+=== 1793726877 17:27:57
+VmHWM:	 1091324 kB
+VmRSS:	 1091324 kB
+Threads:	14
+used_memory:1073741506
+used_memory_rss:1117515776
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0408
+total_commands_processed:63200947
+instantaneous_ops_per_sec:70977
+keyspace_hits:27073152
+keyspace_misses:18063826
+evicted_keys:16194904
+1868891
+stat: 27072 63713
+=== 1793726907 17:28:27
+VmHWM:	 1091312 kB
+VmRSS:	 1091260 kB
+Threads:	14
+used_memory:1073741458
+used_memory_rss:1117450240
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0407
+total_commands_processed:65277264
+instantaneous_ops_per_sec:68492
+keyspace_hits:27971321
+keyspace_misses:18652900
+evicted_keys:16784441
+1868454
+stat: 27974 65781
+=== 1793726937 17:28:57
+VmHWM:	 1091312 kB
+VmRSS:	 1091196 kB
+Threads:	14
+used_memory:1073741618
+used_memory_rss:1117384704
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0406
+total_commands_processed:67367269
+instantaneous_ops_per_sec:68394
+keyspace_hits:28874112
+keyspace_misses:19246505
+evicted_keys:17378818
+1867659
+stat: 28883 67842
+=== 1793726967 17:29:27
+VmHWM:	 1091452 kB
+VmRSS:	 1091452 kB
+Threads:	14
+used_memory:1073741778
+used_memory_rss:1117646848
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0409
+total_commands_processed:69429406
+instantaneous_ops_per_sec:68895
+keyspace_hits:29765475
+keyspace_misses:19831892
+evicted_keys:17963435
+1868434
+stat: 29793 69899
+=== 1793726997 17:29:57
+VmHWM:	 1091356 kB
+VmRSS:	 1091356 kB
+Threads:	14
+used_memory:1073741682
+used_memory_rss:1117552640
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0408
+total_commands_processed:71499047
+instantaneous_ops_per_sec:69383
+keyspace_hits:30661113
+keyspace_misses:20418889
+evicted_keys:18550202
+1868662
+stat: 30698 71962
+=== 1793727027 17:30:27
+VmHWM:	 1091324 kB
+VmRSS:	 1091324 kB
+Threads:	14
+used_memory:1073741154
+used_memory_rss:1117515776
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0408
+total_commands_processed:73574145
+instantaneous_ops_per_sec:69496
+keyspace_hits:31558048
+keyspace_misses:21007972
+evicted_keys:19139013
+1868933
+stat: 31601 74029
+=== 1793727057 17:30:57
+VmHWM:	 1091452 kB
+VmRSS:	 1091452 kB
+Threads:	14
+used_memory:1073741586
+used_memory_rss:1117646848
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0409
+total_commands_processed:75633586
+instantaneous_ops_per_sec:70202
+keyspace_hits:32448816
+keyspace_misses:21592306
+evicted_keys:19724142
+1868133
+stat: 32509 76089
+=== 1793727087 17:31:27
+VmHWM:	 1091644 kB
+VmRSS:	 1091644 kB
+Threads:	14
+used_memory:1073741426
+used_memory_rss:1117843456
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0411
+total_commands_processed:77695278
+instantaneous_ops_per_sec:70399
+keyspace_hits:33341067
+keyspace_misses:22177024
+evicted_keys:20309093
+1867903
+stat: 33424 78141
+=== 1793727117 17:31:57
+VmHWM:	 1092028 kB
+VmRSS:	 1092028 kB
+Threads:	14
+used_memory:1073741810
+used_memory_rss:1118236672
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0414
+total_commands_processed:79763780
+instantaneous_ops_per_sec:68744
+keyspace_hits:34235172
+keyspace_misses:22764221
+evicted_keys:20896389
+1867795
+stat: 34332 80204
+=== 1793727147 17:32:27
+VmHWM:	 1091952 kB
+VmRSS:	 1091900 kB
+Threads:	14
+used_memory:1073741298
+used_memory_rss:1118105600
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0413
+total_commands_processed:81834022
+instantaneous_ops_per_sec:67981
+keyspace_hits:35129636
+keyspace_misses:23352109
+evicted_keys:21483075
+1869001
+stat: 35246 82258
+=== 1793727177 17:32:57
+VmHWM:	 1091952 kB
+VmRSS:	 1091772 kB
+Threads:	14
+used_memory:1073741314
+used_memory_rss:1117974528
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0412
+total_commands_processed:83900854
+instantaneous_ops_per_sec:68538
+keyspace_hits:36022744
+keyspace_misses:23938969
+evicted_keys:22070442
+1868497
+stat: 36160 84315
+=== 1793727207 17:33:27
+VmHWM:	 1091952 kB
+VmRSS:	 1091836 kB
+Threads:	14
+used_memory:1073741378
+used_memory_rss:1118040064
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0413
+total_commands_processed:85984892
+instantaneous_ops_per_sec:71274
+keyspace_hits:36922620
+keyspace_misses:24531049
+evicted_keys:22662699
+1868327
+stat: 37069 86376
+=== 1793727237 17:33:57
+VmHWM:	 1091952 kB
+VmRSS:	 1091644 kB
+Threads:	14
+used_memory:1073010018
+used_memory_rss:1117843456
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0418
+total_commands_processed:88059008
+instantaneous_ops_per_sec:71179
+keyspace_hits:37819525
+keyspace_misses:25119652
+evicted_keys:23252091
+1867633
+stat: 38003 88411
+=== 1793727267 17:34:27
+VmHWM:	 1091952 kB
+VmRSS:	 1091644 kB
+Threads:	14
+used_memory:1073741442
+used_memory_rss:1117843456
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0411
+total_commands_processed:90080966
+instantaneous_ops_per_sec:67861
+keyspace_hits:38694660
+keyspace_misses:25693061
+evicted_keys:23824528
+1868510
+stat: 38917 90465
+=== 1793727297 17:34:57
+VmHWM:	 1091952 kB
+VmRSS:	 1091644 kB
+Threads:	14
+used_memory:1073741650
+used_memory_rss:1117843456
+maxmemory:1073741824
+mem_fragmentation_ratio:1.0411
+total_commands_processed:92147493
+instantaneous_ops_per_sec:69214
+keyspace_hits:39588457
+keyspace_misses:26279425
+evicted_keys:24410382
+1869020
+stat: 39821 92528

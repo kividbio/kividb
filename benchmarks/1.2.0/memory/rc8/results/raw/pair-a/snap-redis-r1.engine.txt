@@ -1,0 +1,2 @@
+redis persist redis:8.10.3 redis_version:8.10.3 
+[redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --io-threads 8 --dir /data --save  --appendonly yes --auto-aof-rewrite-percentage 0]

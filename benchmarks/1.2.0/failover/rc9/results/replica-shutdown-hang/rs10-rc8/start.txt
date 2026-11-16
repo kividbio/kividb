@@ -1,0 +1,4 @@
+started rc8 master pid 38926
+started rc8 replica pid 43122
+/opt/kv/kividb-rc8 --configfile /mnt/kv/node.conf
+kividb 1.2.0-rc8

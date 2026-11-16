@@ -1,0 +1,3 @@
+kividb-rc8 plain kividb/kividb:build-082dab3d8929 redis_version:8.10.0 kividb_version:1.2.0-rc8 
+[--port 6379 --bind 0.0.0.0 --protected-mode no --dir /data]
+backlog: repl-backlog-size=1048576 role:master connected_slaves:0 repl_backlog_active:0 repl_backlog_size:1048576 repl_backlog_histlen:0 

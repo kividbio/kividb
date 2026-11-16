@@ -1,0 +1,2 @@
+shd-0-1 177216 slave
+shd-0-0 177221 master

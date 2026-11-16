@@ -1,0 +1,11 @@
+# started on Mon Nov  2 17:47:22 2026
+
+
+ Performance counter stats for process id '123579':
+
+           4264688      raw_syscalls:sys_enter                                                
+            220719      context-switches                                                      
+         132600.68 msec task-clock                                                            
+
+      10.004463224 seconds time elapsed
+

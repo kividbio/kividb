@@ -1,0 +1,12 @@
+2026-11-02T21:39:35Z   Normal    Killing                  g-yes-1                      Stopping container kividb
+2026-11-02T21:39:35Z   Normal    Killing                  g-yes-1                      Stopping container agent
+2026-11-02T21:39:35Z   Normal    SuccessfulCreate         g-yes                        Create Pod g-yes-1 in StatefulSet g-yes successful
+2026-11-02T21:39:35Z   Normal    Scheduled                g-yes-1                      Successfully assigned e2e/g-yes-1 to aks-nodepool1-15662409-vmss000002
+2026-11-02T21:39:35Z   Normal    Pulled                   g-yes-1                      Container image "ghcr.io/kividbio/kividb:v1.2.0-rc7" already present on machine and can be accessed by the pod
+2026-11-02T21:39:35Z   Normal    Created                  g-yes-1                      Container created
+2026-11-02T21:39:36Z   Normal    Started                  g-yes-1                      Container started
+2026-11-02T21:39:36Z   Normal    Pulled                   g-yes-1                      Container image "ACR.azurecr.io/kividb-operator-agent:0.7.0-afc6f49" already present on machine and can be accessed by the pod
+2026-11-02T21:39:36Z   Normal    Created                  g-yes-1                      Container created
+2026-11-02T21:39:36Z   Normal    Started                  g-yes-1                      Container started
+2026-11-02T21:42:08Z   Warning   FailedPreStopHook        g-yes-1                      PreStopHook failed
+2026-11-02T21:42:08Z   Warning   FailedPreStopHook        g-yes-1                      PreStopHook failed

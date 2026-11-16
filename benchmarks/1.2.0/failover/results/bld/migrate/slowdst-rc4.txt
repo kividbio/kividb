@@ -1,0 +1,6 @@
+trial 1: MIGRATE replied b'+OK\r\n' after 3.01s; 2 PINGs while it waited, 1 stalled, worst 2.908s
+trial 2: MIGRATE replied b'+OK\r\n' after 3.01s; 2 PINGs while it waited, 1 stalled, worst 2.909s
+trial 3: MIGRATE replied b'+OK\r\n' after 3.01s; 2 PINGs while it waited, 1 stalled, worst 2.908s
+trial 4: MIGRATE replied b'+OK\r\n' after 3.01s; 2 PINGs while it waited, 1 stalled, worst 2.908s
+trial 5: MIGRATE replied b'+OK\r\n' after 3.01s; 2 PINGs while it waited, 1 stalled, worst 2.914s
+delay=0.2 hold=3.0 timeout_ms=5000 stalled_trials=5/5

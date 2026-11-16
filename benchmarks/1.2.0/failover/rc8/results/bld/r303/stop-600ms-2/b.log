@@ -1,0 +1,59 @@
+2026-11-03T05:24:07.907Z 21806 [WARN] /tmp/r303l/kividb.conf: line 1: 'save' is accepted but has no effect: KiviDB does not snapshot on a schedule — use `appendonly yes`, or BGSAVE
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc8 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc8
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 62GiB available
+  * CPUs           : 16 cores detected
+  * Listening on   : 127.0.0.1:7101
+  * Worker threads : 14
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T05:24:07.965Z 21806 [INFO] KiviDB 1.2.0-rc8 starting: pid 21806, default build, config file '/tmp/r303l/kividb.conf'
+2026-11-03T05:24:07.965Z 21806 [WARN] The data directory /tmp/r303l/a is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T05:24:08.716Z 21806 [INFO] The data directory is free after 0.8s: starting
+2026-11-03T05:24:08.716Z 21806 [INFO] I/O model      : io_uring
+2026-11-03T05:24:08.718Z 21806 [INFO] Shards per DB  : 128
+2026-11-03T05:24:08.718Z 21806 [INFO] I/O model      : io_uring
+2026-11-03T05:24:08.718Z 21806 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T05:24:09.078Z 21806 [INFO] Loaded 397281 keys from snapshot (0 with a TTL)
+2026-11-03T05:24:09.079Z 21806 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T05:24:09.085Z 21806 [INFO] Replication: Loaded dataset is offset 48608945 of this node's stream cb88a6fbe211e37bc199c3fe3801b3e757c454ec — replicas stopped cleanly with it can be continued
+2026-11-03T05:24:09.086Z 21806 [INFO] Ready to accept connections on 127.0.0.1:7101
+2026-11-03T05:24:33.446Z 21806 [INFO] Replication: Partial resync for 127.0.0.1:56254: continuing from offset 48608945 (0 bytes of backlog)

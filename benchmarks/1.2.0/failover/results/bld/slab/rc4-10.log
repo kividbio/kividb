@@ -1,0 +1,20 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running unittests src/lib.rs (/home/azureuser/target/release/deps/kividb-e6843cfc0771adb4)
+
+running 1 test
+
+thread 'value_slab::tests::plan_evacuation_never_takes_a_slab_a_thread_owns' (15119) panicked at src/value_slab.rs:938:9:
+assertion `left != right` failed: the block T2 holds, handed out again
+  left: 137639755841536
+ right: 137639755841536
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test value_slab::tests::plan_evacuation_never_takes_a_slab_a_thread_owns ... FAILED
+
+failures:
+
+failures:
+    value_slab::tests::plan_evacuation_never_takes_a_slab_a_thread_owns
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 610 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

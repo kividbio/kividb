@@ -1,0 +1,12 @@
+lines with two engines for fx-1-1: 0
+2026-11-03T05:35:10.260056308Z 2026-11-03T05:35:10.259Z 1 [INFO] Cluster: Manual failover requested by e0fa86a1542f8d0e2ef7ff114a2e482afd0953f8 — writes paused, replica must reach offset 15337244
+2026-11-03T05:35:10.337770748Z 2026-11-03T05:35:10.337Z 1 [INFO] Replication: Full resync from a6e7787e5642d6ab172cb44d95d9fc87809255d9 offset=15337373
+2026-11-03T05:35:10.490592226Z 2026-11-03T05:35:10.489Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T05:35:10.490609717Z 2026-11-03T05:35:10.490Z 1 [INFO] Writing final snapshot...
+2026-11-03T05:35:10.520469306Z 2026-11-03T05:35:10.520Z 1 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-03T05:35:18.732391154Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-03T05:35:18.748279847Z 2026-11-03T05:35:18.748Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T05:35:18.753329228Z 2026-11-03T05:35:18.753Z 1 [INFO] Loaded 0 keys from snapshot (0 with a TTL)
+2026-11-03T05:35:18.755489529Z 2026-11-03T05:35:18.755Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T05:35:18.792073152Z 2026-11-03T05:35:18.791Z 1 [INFO] Replication: Full resync from a6e7787e5642d6ab172cb44d95d9fc87809255d9 offset=15434785
+2026-11-03T05:35:19.255035446Z 2026-11-03T05:35:19.254Z 1 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta

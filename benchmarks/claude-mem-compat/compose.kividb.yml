@@ -1,0 +1,26 @@
+# Replaces the Valkey in claude-mem's docker-compose.yml with KiviDB. The service keeps
+# the name `valkey`, so claude-mem's CLAUDE_MEM_REDIS_URL (redis://valkey:6379) is used
+# unchanged.
+#
+# The -lua variant: BullMQ, which claude-mem's queue is built on, runs its job moves as
+# Lua scripts, so the default (Lua-free) image cannot serve it.
+#
+# The same settings claude-mem gives Valkey: append-only file on (fsync every second, the
+# KiviDB default) and noeviction. The data lives in KiviDB's working directory, which the
+# image owns (uid 1000), so it gets its own volume.
+services:
+  valkey:
+    image: kividb/kividb:v1.2.0-lua
+    command: ["--port", "6379", "--protected-mode", "no", "--aof", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - kividb-data:/home/kividb
+    # The KiviDB image has no shell and no CLI to PING with, so this check only proves the
+    # binary runs. The server and worker connect with ioredis, which retries until KiviDB
+    # accepts connections, and the harness PINGs it itself.
+    healthcheck:
+      test: ["CMD", "kividb", "--version"]
+    ports:
+      - "127.0.0.1:6399:6379"
+
+volumes:
+  kividb-data:

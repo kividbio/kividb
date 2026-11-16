@@ -1,0 +1,38 @@
+21:24:46 import-start CLUSTER MIGRATION IMPORT 10923 11422 on 10.70.1.10:7002 (fc4237d6cc855948547eae5ed0e07b98775336e1, 2021153 keys), source 10.70.1.7:7001 (b571f2f65eb12e58face40b14d2e78aa87d75711, 2024606 keys)
+21:24:46 import-id 181617fa7903274d32ad8f65efc6a9e4002c86b3
+21:24:50 import-done in 3.65 s: id 181617fa7903274d32ad8f65efc6a9e4002c86b3 slots 10923-11422 source b571f2f65eb12e58face40b14d2e78aa87d75711 dest fc4237d6cc855948547eae5ed0e07b98775336e1 operation import state completed last_error  retries 0 create_time 1793654686552 start_time 1793654686553 end_time 1793654689724 write_pause_ms 0 capture_pause_ms 0
+21:24:50 import-keys source 1889972 dest 2208570
+21:24:50 import-end cluster-ok after 0.16 s
+21:36:46 kill9-start slot=3000 master=10.70.1.10:7002 replica=10.70.1.9:7001
+21:36:47 kill9-killed 10.70.1.10:7002
+21:36:53 kill9-promoted 10.70.1.9:7001 after 5.58 s
+restarted :7002 pid 87695
+21:37:17 kill9-restarted 10.70.1.10:7002
+21:37:26 kill9-rejoined 10.70.1.10:7002 as replica after 8.39 s
+21:37:26 kill9-end cluster-ok after 0.17 s
+21:49:46 failover-start slot=13000 master=10.70.1.7:7001 replica=10.70.1.9:7002
+21:49:46 failover-reply OK
+21:49:47 failover-promoted 10.70.1.9:7002 after 0.02 s
+21:49:55 failover-old-master-replica 10.70.1.7:7001 after 8.00 s
+21:49:55 failover-end cluster-ok after 0.13 s
+21:59:46 import-start CLUSTER MIGRATION IMPORT 5461 5960 on 10.70.1.9:7002 (19462581ea100c47276a75458bcaaee87bda5098, 2833659 keys), source 10.70.1.7:7002 (52f8aeda20c4eeb8be6af705f0923a58eb244534, 3124302 keys)
+21:59:46 import-id d8d59c271c1a712c8aa2fb80cb3d78f8252325f3
+21:59:51 import-done in 5.20 s: id d8d59c271c1a712c8aa2fb80cb3d78f8252325f3 slots 5461-5960 source 52f8aeda20c4eeb8be6af705f0923a58eb244534 dest 19462581ea100c47276a75458bcaaee87bda5098 operation import state completed last_error  retries 0 create_time 1793656786725 start_time 1793656786725 end_time 1793656791737 write_pause_ms 0 capture_pause_ms 0 
+21:59:51 import-keys source 3065250 dest 3121756
+21:59:52 import-end cluster-ok after 0.15 s
+22:09:47 reshard-start 5 slots from 10.70.1.9:7002 (19462581ea100c47276a75458bcaaee87bda5098, 3431713 keys) to 10.70.1.9:7001 (9f8a4b92c1338b6be0d4eee4e049710391dac8f6) with redis-cli
+22:10:06 reshard-attempt 1 exit=1 after 19.58 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+22:11:03 reshard-repair slot 5462: {"slot": 5462, "src_keys_before": 525, "dst_keys_before": 249, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 96, "setslot_node": {"10.70.1.9:7001": "OK", "10.70.1.9:7002": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.10:7002": "OK", "10.70.1.7:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 772, "seconds": 56.37}
+22:11:16 reshard-attempt 2 exit=1 after 89.53 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19135'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+22:11:36 reshard-repair slot 5463: {"slot": 5463, "src_keys_before": 61, "dst_keys_before": 480, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 26, "setslot_node": {"10.70.1.9:7001": "OK", "10.70.1.9:7002": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.10:7002": "OK", "10.70.1.7:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 541, "seconds": 19.06}
+22:12:13 reshard-attempt 3 exit=0 after 146.31 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:19135'. The copy sent to 10.70.1.9:7001 may be older; MIGRATE them again with REPLACE
+22:12:14 reshard-done in 146.93 s: 5 slots moved in 3 redis-cli runs, slots begun=5
+22:12:14 reshard-end cluster-ok after 0.16 s
+22:24:47 kill9-start slot=13000 master=10.70.1.9:7002 replica=10.70.1.7:7001
+22:24:47 kill9-killed 10.70.1.9:7002
+22:24:53 kill9-promoted 10.70.1.7:7001 after 5.83 s
+restarted :7002 pid 144554
+22:25:22 kill9-restarted 10.70.1.9:7002
+22:25:36 kill9-rejoined 10.70.1.9:7002 as replica after 12.86 s
+22:25:36 kill9-end cluster-ok after 0.14 s
+22:25:36 events-done

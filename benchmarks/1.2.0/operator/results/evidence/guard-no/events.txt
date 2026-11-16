@@ -1,0 +1,17 @@
+2026-11-02T21:26:07Z   Normal    Killing                  g-no-1                          Stopping container kividb
+2026-11-02T21:26:07Z   Normal    Killing                  g-no-1                          Stopping container agent
+2026-11-02T21:26:07Z   Normal    SuccessfulCreate         g-no                            Create Pod g-no-1 in StatefulSet g-no successful
+2026-11-02T21:26:07Z   Normal    Scheduled                g-no-1                          Successfully assigned e2e/g-no-1 to aks-nodepool1-15662409-vmss000002
+2026-11-02T21:26:07Z   Warning   FailedAttachVolume       g-no-1                          Waiting for detach for volume "pvc-2e7fdf30-c26c-4144-86cf-bfbd2f216008" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node
+2026-11-02T21:26:08Z   Warning   Unhealthy                g-no-1                          Readiness probe failed: Get "http://10.244.0.100:8081/readyz": EOF
+2026-11-02T21:26:08Z   Warning   FailedPreStopHook        g-no-1                          PreStopHook failed
+2026-11-02T21:26:08Z   Warning   FailedPreStopHook        g-no-1                          PreStopHook failed
+2026-11-02T21:26:33Z   Normal    SuccessfulAttachVolume   g-no-1                          AttachVolume.Attach succeeded for volume "pvc-2e7fdf30-c26c-4144-86cf-bfbd2f216008" 
+2026-11-02T21:26:34Z   Normal    Pulled                   g-no-1                          Container image "ghcr.io/kividbio/kividb:v1.2.0-rc7" already present on machine and can be accessed by the pod
+2026-11-02T21:26:34Z   Normal    Created                  g-no-1                          Container created
+2026-11-02T21:26:34Z   Normal    Started                  g-no-1                          Container started
+2026-11-02T21:26:34Z   Normal    Pulled                   g-no-1                          Container image "ACR.azurecr.io/kividb-operator-agent:0.7.0-afc6f49" already present on machine and can be accessed by the pod
+2026-11-02T21:26:34Z   Normal    Created                  g-no-1                          Container created
+2026-11-02T21:26:34Z   Normal    Started                  g-no-1                          Container started
+2026-11-02T21:27:10Z   Warning   MasterRestartedBehind    g-no                            g-no-1 restarted and came back as the master at replication offset 0, behind the 61015273 it had reached and behind g-no-0 (offset 61152543), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-02T21:27:10Z   Warning   Failover                 g-no                            master g-no-1 restarted behind its replicas; promoted g-no-0

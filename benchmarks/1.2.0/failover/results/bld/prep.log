@@ -1,0 +1,12 @@
+info: downloading installer
+info: profile set to minimal
+info: default host tuple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+598b74d20ec04de5a0ff74001324907562806c3c
+a6b1bf388582dd6b343b34471864145c97dab74d
+Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=d9928c2c16bf6168
+PREP-DONE

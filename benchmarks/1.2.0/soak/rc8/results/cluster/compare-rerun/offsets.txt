@@ -1,0 +1,8 @@
+shard 8000: 10.80.1.5:7002 role:master
+master_repl_offset:59014673208 | 10.80.1.8:7001 role:slave
+master_host:10.80.1.5
+slave_repl_offset:59014673208
+shard 13000: 10.80.1.5:7001 role:master
+master_repl_offset:59065215550 | 10.80.1.9:7002 role:slave
+master_host:10.80.1.5
+slave_repl_offset:59065215550

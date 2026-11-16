@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{free_port, restart_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,42 +154,6 @@ struct Server {
     child: Child,
 }
 
-/// Whether nothing has `port`. It is asked with a socket that is bound and
-/// never listens. One that listened, as this used to, could be given a
-/// connection: a server another test is starting holds, between its fork and
-/// its exec, a copy of every socket this process has open, and a client that
-/// dialled the port in that moment was connected to the copy and then reset
-/// ("Connection reset by peer", at the first command of a test).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    // As the server's own socket, so that a copy of this one, while it
-    // lasts, does not keep the server from the port.
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on — and not one the system hands out to
-/// outgoing connections. A client that starts dialling before its server is
-/// listening can otherwise be given, as its own end, the very port it is
-/// dialling: it is then connected to itself and reads back what it writes.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(31);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn kividb(dir: &Path, port: u16, extra: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kividb"));
     cmd.current_dir(dir)
@@ -224,6 +191,25 @@ impl Server {
 
     fn conn(&self) -> Conn {
         Conn::connect(self.port)
+    }
+
+    /// Started again on the same directory, with `extra` as its arguments.
+    /// On the same port if it is still free, and on another if a test of
+    /// another process has taken it in the gap (the data directory is what
+    /// matters): `self.port` is the one it is on, and a client has to be given
+    /// that one. Verified to be the process started: see tests/common/mod.rs.
+    fn restart_with(&mut self, extra: &[&str]) {
+        let (child, port, _) = restart_verified(
+            |port| {
+                kividb(&self.dir, port, extra)
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("could not restart kividb")
+            },
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
     }
 }
 
@@ -301,7 +287,7 @@ fn keys_on_two_shards() -> (String, String) {
 }
 
 fn counter(snapshot: &kividb::snapshot::LoadedSnapshot, key: &str) -> i64 {
-    match snapshot.dbs[0].get(key) {
+    match snapshot.dbs[0].get(key.as_bytes()) {
         Some(kividb::types::KiviDBValue::String(b)) => {
             std::str::from_utf8(b.as_ref()).unwrap().parse().unwrap()
         }
@@ -703,7 +689,6 @@ fn lastsave_starts_at_the_start_and_moves_with_every_save() {
 #[test]
 fn a_killed_server_keeps_every_acknowledged_write() {
     let mut server = Server::start(&["--aof"]);
-    let port = server.port;
     // The default; `no` gives up the guarantee for speed (1.1.2's way).
     let mut c = server.conn();
     let setting = c.cmd(&["CONFIG", "GET", "aof-ack-after-write"]);
@@ -716,6 +701,7 @@ fn a_killed_server_keeps_every_acknowledged_write() {
     );
     drop(c);
     for round in 0..3 {
+        let port = server.port;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writers: Vec<_> = (0..6)
             .map(|w| {
@@ -740,10 +726,7 @@ fn a_killed_server_keeps_every_acknowledged_write() {
         server.child.wait().unwrap();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let acked: Vec<(String, i64)> = writers.into_iter().map(|w| w.join().unwrap()).collect();
-        server.child = kividb(&server.dir, port, &["--aof"])
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("could not restart kividb");
+        server.restart_with(&["--aof"]);
         let mut c = server.conn();
         for (key, acked) in acked {
             let kept: i64 = match c.cmd(&["GET", &key]) {
@@ -755,6 +738,236 @@ fn a_killed_server_keeps_every_acknowledged_write() {
                 "round {round}: {key} kept {kept}, {acked} acknowledged"
             );
         }
+    }
+}
+
+/// `appendfsync always` (#513): a reply to a write is sent only once its
+/// record is synced to disk, whether the setting comes from the
+/// configuration file, the command line or `CONFIG SET`. It was accepted
+/// and the file synced once a second, so a power failure could lose a
+/// second of acknowledged writes. The sync is held at a test failpoint, and
+/// no reply may come while it is held.
+#[test]
+fn appendfsync_always_replies_only_once_the_write_is_synced() {
+    const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    for how in ["file", "command line", "CONFIG SET"] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let port = free_port();
+        let mut extra = vec!["--aof"];
+        match how {
+            "file" => std::fs::write(dir.join("kividb.conf"), "appendfsync always\n").unwrap(),
+            "command line" => extra.extend(["--appendfsync", "always"]),
+            _ => {}
+        }
+        let child = kividb(&dir, port, &extra)
+            .env("KIVIDB_TEST_FAILPOINTS", "aof-fsync-before-reply")
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("could not start kividb");
+        let server = Server { port, dir, child };
+        let mut c = server.conn();
+        if how == "CONFIG SET" {
+            let before = c.cmd(&["CONFIG", "GET", "appendfsync"]);
+            assert_eq!(before.arr()[1].s(), "everysec");
+            assert!(
+                c.cmd(&["CONFIG", "SET", "appendfsync", "sometimes"])
+                    .is_err()
+            );
+            assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+        }
+        let setting = c.cmd(&["CONFIG", "GET", "appendfsync"]);
+        assert_eq!(setting.arr()[1].s(), "always", "{how}");
+
+        let held = server.dir.join("failpoint.aof-fsync-before-reply.1");
+        c.writer.write_all(SET).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !held.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{how}: the write was acknowledged without a sync"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The sync is held: no reply yet.
+        c.writer
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut line = String::new();
+        let early = c.reader.read_line(&mut line);
+        assert!(
+            early.is_err() && line.is_empty(),
+            "{how}: replied {line:?} before its write was synced"
+        );
+        c.writer
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        std::fs::remove_file(&held).unwrap();
+        assert!(c.read().ok(), "{how}");
+
+        // Under `everysec` the reply does not wait for a sync.
+        assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "everysec"]).ok());
+        assert!(c.cmd(&["SET", "k2", "v"]).ok());
+        assert!(
+            !server
+                .dir
+                .join("failpoint.aof-fsync-before-reply.2")
+                .exists(),
+            "{how}: synced for a reply under everysec"
+        );
+    }
+}
+
+/// The test hold of the sync for replies under `appendfsync always` is
+/// reached by that sync only, not by the second's sync, which answers no
+/// reply (#515). The second's sync took it too: when it ran first, with a
+/// write's record in the file, it took the hit a test waited for, and the
+/// write's own sync then waited at the next hit, which the test above never
+/// lets go of. Here the second's sync is held (at `fsync`) with a record
+/// unsynced while the setting turns to `always`, and a write is sent: the
+/// first hold of the reply's sync is the write's, and its reply comes once
+/// that is let go.
+#[test]
+fn the_reply_sync_failpoint_is_the_replys_not_the_seconds_sync() {
+    const SET: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nw\r\n";
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let child = kividb(&dir, port, &["--aof"])
+        .env("KIVIDB_TEST_FAILPOINTS", "fsync,aof-fsync-before-reply")
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir, child };
+    let wait_for = |path: &std::path::Path, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "{what} was never reached");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let mut c = server.conn();
+    // A record written and not yet synced, under `everysec`.
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    // The second's sync, asked for, holds the writer with that record
+    // unsynced.
+    let mut waiter = server.conn();
+    waiter
+        .writer
+        .write_all(b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$1\r\n0\r\n")
+        .unwrap();
+    let fsync = server.dir.join("failpoint.fsync.1");
+    wait_for(&fsync, "the second's sync");
+    // Any later second's sync goes on at once.
+    let done = Arc::new(AtomicBool::new(false));
+    let releaser = {
+        let (dir, done) = (server.dir.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut next = 2;
+            while !done.load(Ordering::Relaxed) {
+                if std::fs::remove_file(dir.join(format!("failpoint.fsync.{next}"))).is_ok() {
+                    next += 1;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    // Now every reply to a write waits for its sync, and one is sent.
+    assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+    c.writer.write_all(SET).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::remove_file(&fsync).unwrap();
+    // The first hold of a reply's sync is the write's.
+    let held = server.dir.join("failpoint.aof-fsync-before-reply.1");
+    wait_for(&held, "the reply's sync");
+    std::fs::remove_file(&held).unwrap();
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = String::new();
+    let replied = c.reader.read_line(&mut line);
+    assert!(
+        replied.is_ok() && line == "+OK\r\n",
+        "no reply once the reply's sync was let go ({replied:?}, {line:?}); held again: {}",
+        server
+            .dir
+            .join("failpoint.aof-fsync-before-reply.2")
+            .exists()
+    );
+    c.writer
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "w");
+    done.store(true, Ordering::Relaxed);
+    releaser.join().unwrap();
+}
+
+/// Under `appendfsync always`, a sync of the AOF that fails stops the
+/// server (#514's review). The checkpoint's sync of the old log used to be
+/// logged and passed over, its mark cleared: Linux reports a failed
+/// writeback once to each open file, so the next sync of the log returned
+/// success and answered replies whose writes could be lost. Here the old
+/// log's sync is made to fail while writers keep going: the server exits,
+/// and every write it acknowledged is there after a restart.
+#[test]
+fn appendfsync_always_stops_at_a_failed_sync() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let port = free_port();
+    let args = ["--aof", "--appendfsync", "always"];
+    let mut child = kividb(&dir, port, &args)
+        .env("KIVIDB_TEST_FAILPOINTS", "turn-over-sync-fails")
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not start kividb");
+    let stderr = child.stderr.take().unwrap();
+    let said = std::thread::spawn(move || {
+        let mut said = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut said);
+        said
+    });
+    let mut server = Server { port, dir, child };
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "before", "1"]).ok());
+
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let key = format!("acked:{w}");
+                let mut acked = 0i64;
+                while let Some(V::Int(n)) = c.try_cmd(&["INCR", &key]) {
+                    acked = n;
+                }
+                (key, acked)
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = c.cmd(&["BGREWRITEAOF"]);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server carried on after a failed sync under appendfsync always"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "{status:?}");
+    let acked: Vec<(String, i64)> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    let said = said.join().unwrap();
+    assert!(said.contains("failed under appendfsync always"), "{said}");
+
+    server.restart_with(&args);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["GET", "before"]).s(), "1");
+    for (key, acked) in acked {
+        let kept: i64 = match c.cmd(&["GET", &key]) {
+            V::Str(n) => n.parse().unwrap(),
+            _ => 0,
+        };
+        assert!(kept >= acked, "{key} kept {kept}, {acked} acknowledged");
     }
 }
 
@@ -773,10 +986,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
     server.child.kill().unwrap();
     server.child.wait().unwrap();
 
-    server.child = kividb(&server.dir, server.port, &[])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&[]);
     let mut c = server.conn();
     assert_eq!(status(&mut c).0, "sealed");
     assert_eq!(c.cmd(&["BACKUP", "LIST"]).strings(), listed);
@@ -789,10 +999,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
     // Cut short by the restart: a failed backup, which the next one clears.
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &[])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&[]);
     let mut c = server.conn();
     assert_eq!(status(&mut c).0, "failed");
     assert!(c.cmd(&["BACKUP", "START"]).ok());
@@ -806,7 +1013,7 @@ fn a_backup_from_before_a_restart_can_be_listed_and_cleaned_up() {
 /// restart (#150).
 #[test]
 fn a_sealed_backup_from_before_a_restart_still_runs_out() {
-    let mut server = Server::start(&["--backup-sealed-ttl", "3"]);
+    let mut server = Server::start(&["--backup-sealed-ttl", "10"]);
     let mut c = server.conn();
     assert!(c.cmd(&["BACKUP", "START"]).ok());
     wait_for_state(&mut c, "incrementing");
@@ -814,10 +1021,7 @@ fn a_sealed_backup_from_before_a_restart_still_runs_out() {
     drop(c);
     server.child.kill().unwrap();
     server.child.wait().unwrap();
-    server.child = kividb(&server.dir, server.port, &["--backup-sealed-ttl", "3"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--backup-sealed-ttl", "10"]);
     let mut c = server.conn();
     assert_eq!(status(&mut c).0, "sealed");
     wait_for_state(&mut c, "idle");
@@ -853,6 +1057,43 @@ fn a_single_snapshot_can_be_preloaded() {
     let preload = format!("rdb:{}", source.dir.join("dump.kdb").display());
     let restored = Server::start(&["--preload-file", &preload]);
     assert_eq!(restored.conn().cmd(&["GET", "from-snapshot"]).s(), "yes");
+}
+
+/// A hash loaded from `dump.kdb` whose fields all expire after the restart
+/// is deleted when they do, like one written since: the sweep watches it.
+#[test]
+fn hashes_loaded_from_a_snapshot_lose_their_expired_fields_and_go() {
+    // Long enough that the restart below finishes before the fields are due,
+    // on a slow runner too; the wait after it counts from when they were set.
+    const TTL_MS: u64 = 10_000;
+    let ttl = TTL_MS.to_string();
+    let ttl = ttl.as_str();
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    let set_at = std::time::Instant::now();
+    c.cmd(&["HSET", "h1", "f1", "v1"]);
+    c.cmd(&["HPEXPIRE", "h1", ttl, "FIELDS", "1", "f1"]);
+    c.cmd(&["HSET", "h2", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h2", ttl, "FIELDS", "2", "f1", "f2"]);
+    c.cmd(&["HSET", "h3", "f1", "v1", "f2", "v2"]);
+    c.cmd(&["HPEXPIRE", "h3", ttl, "FIELDS", "1", "f1"]);
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    server.restart_with(&[]);
+
+    let mut c = server.conn();
+    assert!(
+        set_at.elapsed() < Duration::from_millis(TTL_MS),
+        "the restart took longer than the fields' TTL"
+    );
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 3);
+    // Past the deadline, plus time for the background sweep (10 a second).
+    let due = Duration::from_millis(TTL_MS + 1_500);
+    std::thread::sleep(due.saturating_sub(set_at.elapsed()));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 1);
+    assert_eq!(c.cmd(&["HLEN", "h3"]).i(), 1);
 }
 
 // ── AOF replay ────────────────────────────────────────────────────────────────
@@ -948,10 +1189,7 @@ fn ttls_survive_an_aof_replay_unchanged() {
     server.child.kill().unwrap();
     server.child.wait().unwrap();
     std::thread::sleep(Duration::from_millis(1500));
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
 
     let mut c = server.conn();
     assert_same_expiries(&before, &expiry_times(&mut c));
@@ -1042,10 +1280,7 @@ fn a_truncated_aof_tail_is_cut_off_and_the_log_stays_usable() {
     torn.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$4\r\nhalf");
     std::fs::write(&aof, &torn).unwrap();
 
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
     let mut c = server.conn();
     assert_eq!(c.cmd(&["DBSIZE"]).i(), 20);
     assert_eq!(c.cmd(&["EXISTS", "half"]).i(), 0);
@@ -1061,10 +1296,7 @@ fn a_truncated_aof_tail_is_cut_off_and_the_log_stays_usable() {
     );
 
     // The record written after the tear follows whole records, so this loads.
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
     let mut c = server.conn();
     assert_eq!(c.cmd(&["DBSIZE"]).i(), 21);
     assert_eq!(c.cmd(&["GET", "after"]).s(), "v");
@@ -1221,10 +1453,7 @@ fn checkpointed_then_written(server: &mut Server) {
 }
 
 fn restart_with_aof(server: &mut Server) -> Conn {
-    server.child = kividb(&server.dir, server.port, &["--aof"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("could not restart kividb");
+    server.restart_with(&["--aof"]);
     server.conn()
 }
 
@@ -1379,7 +1608,8 @@ fn hotkeys_session() {
     // process and sees every command it runs.
     let server = Server::start(&[]);
     let mut c = server.conn();
-    assert!(c.cmd(&["HOTKEYS", "STOP"]).is_err(), "nothing to stop");
+    // Nothing to stop: nil, as in Redis 8.10.
+    assert_eq!(c.cmd(&["HOTKEYS", "STOP"]), V::Nil);
     assert!(c.cmd(&["HOTKEYS", "START"]).is_err(), "METRICS is required");
     assert!(
         c.cmd(&["HOTKEYS", "START", "METRICS", "1", "CPU", "SLOTS", "1", "5"])
@@ -1572,4 +1802,873 @@ fn a_script_past_its_time_limit_is_busy_and_can_be_killed() {
     // is told BUSY.
     let reply = c.cmd(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "k"]);
     assert_eq!(reply.s(), "v");
+}
+
+// ── The AOF off: no file made, and none needed (#47) ─────────────────────────
+
+/// Start a server in `dir`, prepared by the test, and wait for it to listen.
+/// One that exits instead fails the test with what it said.
+fn start_in(dir: &Path, extra: &[&str]) -> Server {
+    let port = free_port();
+    let mut child = kividb(dir, port, extra)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not start kividb");
+    let mut stderr = child.stderr.take().unwrap();
+    let said = std::thread::spawn(move || {
+        let mut said = String::new();
+        let _ = stderr.read_to_string(&mut said);
+        said
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "kividb exited ({status}) instead of starting: {}",
+                said.join().unwrap()
+            );
+        }
+        assert!(Instant::now() < deadline, "kividb never listened on {port}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Server {
+        port,
+        dir: dir.to_path_buf(),
+        child,
+    }
+}
+
+/// Make `dir` read-only, or writable again. A no-op off unix, and for root,
+/// which writes anyway: the tests that need a failure also put a directory
+/// where the log would go.
+fn set_read_only(dir: &Path, read_only: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if read_only { 0o555 } else { 0o755 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, read_only);
+}
+
+/// With `appendonly no`, a server makes no `appendonly.aof`, and starts in a
+/// data directory it cannot write to: the wrong owner, a full disk, a
+/// hardened systemd unit. Every start used to create the log, and one that
+/// could not stopped the server.
+#[test]
+fn the_aof_off_makes_no_log_and_starts_in_a_read_only_directory() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    set_read_only(&dir, true);
+    let server = start_in(&dir, &[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "v");
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "appendonly"]).strings(),
+        ["appendonly", "no"]
+    );
+    set_read_only(&dir, false);
+    assert!(
+        !dir.join("appendonly.aof").exists(),
+        "appendonly.aof was made with the AOF off"
+    );
+}
+
+/// The AOF turned on with `CONFIG SET` makes its log then, and keeps what
+/// was written before and after across a restart that loads it.
+#[test]
+fn the_aof_turned_on_at_runtime_keeps_the_writes_across_a_restart() {
+    let mut server = Server::start(&[]);
+    let aof = server.dir.join("appendonly.aof");
+    let mut c = server.conn();
+    assert!(c.cmd(&["SET", "before", "1"]).ok());
+    assert!(!aof.exists(), "appendonly.aof was made with the AOF off");
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert!(aof.exists(), "CONFIG SET appendonly yes made no log");
+    assert!(c.cmd(&["SET", "after", "2"]).ok());
+    drop(c);
+    // Killed: what is kept is what the log and the snapshot hold.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    let mut c = restart_with_aof(&mut server);
+    assert_eq!(c.cmd(&["GET", "before"]).s(), "1");
+    assert_eq!(c.cmd(&["GET", "after"]).s(), "2");
+}
+
+/// Turned on where its log cannot be made, the AOF is an error reply, as in
+/// Redis, not an exit: it stays off, the server goes on serving, and it can
+/// be turned on once the log can be made.
+#[test]
+fn the_aof_turned_on_where_no_log_can_be_made_is_an_error_not_an_exit() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    // A directory where the log would go fails the open for root too.
+    let blocker = dir.join("appendonly.aof");
+    std::fs::create_dir(&blocker).unwrap();
+    set_read_only(&dir, true);
+    let server = start_in(&dir, &[]);
+    let mut c = server.conn();
+    let reply = c.cmd(&["CONFIG", "SET", "appendonly", "yes"]);
+    assert!(
+        reply.is_err() && reply.s().contains("Unable to turn on AOF"),
+        "{reply:?}"
+    );
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "appendonly"]).strings(),
+        ["appendonly", "no"]
+    );
+    assert!(c.cmd(&["SET", "k", "v"]).ok());
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "v");
+
+    set_read_only(&dir, false);
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(c.cmd(&["CONFIG", "SET", "appendonly", "yes"]).ok());
+    assert!(c.cmd(&["SET", "logged", "1"]).ok());
+    let log = std::fs::read(&blocker).unwrap();
+    assert!(
+        log.windows(6).any(|w| w == b"logged"),
+        "the write after turning the AOF on is not in the log"
+    );
+}
+
+/// Started with the AOF on and a log it cannot open, the server still
+/// exits, before it serves: it would take writes and keep none of them. The
+/// log is set up before the writer's thread is spawned now, not in it.
+#[cfg(unix)]
+#[test]
+fn the_aof_on_with_a_log_that_cannot_be_opened_still_exits() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    // A link into a directory that is not there: to recovery there is no
+    // log, and none can be made through it, for root too.
+    std::os::unix::fs::symlink(
+        dir.join("missing").join("appendonly.aof"),
+        dir.join("appendonly.aof"),
+    )
+    .unwrap();
+    let output = std::fs::File::create(dir.join("server.log")).unwrap();
+    let port = free_port();
+    let mut child = kividb(&dir, port, &["--aof"])
+        .stdout(output.try_clone().unwrap())
+        .stderr(output)
+        .spawn()
+        .expect("could not start kividb");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("kividb went on with a log it cannot open");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = std::fs::read_to_string(dir.join("server.log")).unwrap();
+    assert!(!status.success(), "{status}: {said}");
+    assert!(
+        said.contains("appendonly.aof cannot be opened for appending"),
+        "{said}"
+    );
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "something listens on {port}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A backup into the data directory would share its files' prefix with the
+/// server's own, and `BACKUP CLEANUP` would delete `appendonly.aof.prev` with
+/// them. It is refused.
+#[test]
+fn a_backup_into_the_data_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("kividb.conf"), "backupdirname .\n").unwrap();
+    let server = start_in(&dir, &[]);
+    let mut c = server.conn();
+    let reply = c.cmd(&["BACKUP", "START"]);
+    assert!(
+        matches!(&reply, V::Err(e) if e.contains("is the data directory")),
+        "{reply:?}"
+    );
+}
+
+/// Every file of `dir` and what it holds.
+fn directory(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name, std::fs::read(entry.path()).unwrap_or_default())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether a server started in `dir` with `args` exited with an error within
+/// 30 s (one that starts is stopped), and what it logged.
+fn fails_to_start(dir: &Path, args: &[&str]) -> (bool, String) {
+    let mut child = kividb(dir, free_port(), args)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not run kividb");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let failed = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break !status.success();
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+    (failed, stderr)
+}
+
+/// A preload target that is not a whole snapshot is fatal, and the data
+/// directory is left exactly as it was: the same files, holding the same
+/// bytes (#444).
+///
+/// A Dragonfly snapshot in Dragonfly's own format (a summary with no keys,
+/// and a file for each shard) started the server empty: "preload-file: 0
+/// keys from the base snapshot". Its files are refused by name (`.dfs`),
+/// from every Dragonfly version; renamed, by the fields Dragonfly 1.32 and
+/// later write in them, and a summary from before 1.32 as a Dragonfly file
+/// with no keys. The fixtures are from Dragonfly 2.1, 1.31 and 1.15. A cut
+/// file, one with a byte changed, and a KiviDB snapshot cut short loaded as
+/// far as they went.
+#[test]
+fn a_preload_file_that_is_not_a_whole_snapshot_is_fatal() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture = |name: &str| std::fs::read(fixtures.join(name)).unwrap();
+    let source = Server::start(&[]);
+    let mut c = source.conn();
+    for i in 0..50 {
+        c.cmd(&["SET", &format!("key:{i}"), &"v".repeat(100)]);
+    }
+    assert!(c.cmd(&["SAVE"]).ok());
+    let kdb = std::fs::read(source.dir.join("dump.kdb")).unwrap();
+    let rdb = fixture("redis-8.10.rdb");
+    let mut flipped = rdb.clone();
+    let at = flipped.windows(5).position(|w| w == b"hello").unwrap();
+    flipped[at] = b'j';
+
+    // Each target, and what the refusal says.
+    let targets: Vec<(&str, Vec<u8>, &str)> = vec![
+        // As Dragonfly names them.
+        (
+            "dump-2026-11-06T01:48:42-summary.dfs",
+            fixture("dragonfly-2.1-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:42-0000.dfs",
+            fixture("dragonfly-2.1-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:17-summary.dfs",
+            fixture("dragonfly-1.31-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:48:17-0000.DFS",
+            fixture("dragonfly-1.31-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "dump-2026-11-06T01:47:48-summary.dfs",
+            fixture("dragonfly-1.15-summary.dfs"),
+            "Dragonfly",
+        ),
+        // Renamed: by what is in them.
+        (
+            "summary-2.1.rdb",
+            fixture("dragonfly-2.1-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "shard-2.1.rdb",
+            fixture("dragonfly-2.1-0000.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "summary-1.31.rdb",
+            fixture("dragonfly-1.31-summary.dfs"),
+            "Dragonfly",
+        ),
+        (
+            "summary-1.15.rdb",
+            fixture("dragonfly-1.15-summary.dfs"),
+            "could not be loaded",
+        ),
+        ("empty", Vec::new(), "could not be loaded"),
+        ("cut.rdb", rdb[..rdb.len() - 8].to_vec(), "checksum"),
+        ("damaged.rdb", flipped, "rdbchecksum no"),
+        (
+            "cut.kdb",
+            kdb[..kdb.len() / 2].to_vec(),
+            "could not be loaded",
+        ),
+        ("header.kdb", kdb[..12].to_vec(), "cut short"),
+    ];
+    // The data directory holds a dump of its own and the lock file a server
+    // makes, all of which must stay as they are.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("dump.rdb"), b"REDIS0011\xFF\0\0\0\0\0\0\0\0").unwrap();
+    std::fs::write(data.join("kividb.lock"), b"").unwrap();
+    let before = directory(&data);
+    for (name, bytes, says) in targets {
+        let file = dir.path().join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let target = format!("rdb:{}", file.display());
+        let (failed, stderr) = fails_to_start(&data, &["--preload-file", &target]);
+        assert!(failed, "{name} must not start: {stderr}");
+        assert!(stderr.contains("could not be loaded"), "{name}: {stderr}");
+        assert!(stderr.contains(says), "{name}: {stderr}");
+        assert!(
+            directory(&data) == before,
+            "{name} changed the data directory"
+        );
+    }
+
+    // A Dragonfly shard's file as `dump.rdb` does not start the server on
+    // that shard's keys either.
+    std::fs::write(data.join("dump.rdb"), fixture("dragonfly-2.1-0000.dfs")).unwrap();
+    let before = directory(&data);
+    let (failed, stderr) = fails_to_start(&data, &[]);
+    assert!(failed, "{stderr}");
+    assert!(stderr.contains("Dragonfly"), "{stderr}");
+    assert!(
+        directory(&data) == before,
+        "dump.rdb changed the data directory"
+    );
+}
+
+/// `rdbchecksum no` skips the check of an RDB file's checksum as it is
+/// loaded, as in Redis, so that a file whose only fault is its checksum can
+/// still be loaded on purpose (#444).
+#[test]
+fn rdbchecksum_no_loads_a_file_whose_checksum_is_wrong() {
+    let mut damaged =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redis-8.10.rdb"))
+            .unwrap();
+    let at = damaged.windows(5).position(|w| w == b"hello").unwrap();
+    damaged[at] = b'j';
+    let dir = tempfile::tempdir().unwrap().keep();
+    let file = dir.join("damaged.rdb");
+    std::fs::write(&file, damaged).unwrap();
+    std::fs::write(dir.join("kividb.conf"), "rdbchecksum no\n").unwrap();
+    let port = free_port();
+    let target = format!("rdb:{}", file.display());
+    let child = kividb(&dir, port, &["--preload-file", &target])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("could not start kividb");
+    let server = Server { port, dir, child };
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 9);
+    let reply = c.cmd(&["CONFIG", "GET", "rdbchecksum"]);
+    assert_eq!(reply.arr()[1].s(), "no");
+}
+
+// ── The empty key (#441) ─────────────────────────────────────────────────────
+//
+// Redis allows the empty key. In a snapshot it was written with the key
+// length that ends a database, and the next start failed: "dump.kdb cannot
+// be loaded: failed to fill whole buffer".
+
+/// Stop `server` with no warning and start another in its directory, as
+/// `extra` says. One that does not start fails the test with what it said.
+fn killed_and_started_again(server: &mut Server, extra: &[&str]) -> Server {
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    start_in(&server.dir, extra)
+}
+
+/// The empty key of each kind of value, and empty members and fields.
+fn write_empty_keys(c: &mut Conn) {
+    assert!(c.cmd(&["SET", "", "x", "EX", "100000"]).ok());
+    assert_eq!(c.cmd(&["HSET", "hash", "", "v"]).i(), 1);
+    assert_eq!(c.cmd(&["SADD", "set", ""]).i(), 1);
+    assert_eq!(c.cmd(&["ZADD", "zset", "1.5", ""]).i(), 1);
+    assert_eq!(c.cmd(&["RPUSH", "list", "", "e"]).i(), 2);
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert_eq!(c.cmd(&["HSET", "", "", "in-1"]).i(), 1);
+    assert_eq!(c.cmd(&["EXPIRE", "", "200000"]).i(), 1);
+    assert!(c.cmd(&["SET", "after", "1"]).ok());
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+}
+
+fn assert_empty_keys(c: &mut Conn) {
+    assert_eq!(c.cmd(&["GET", ""]).s(), "x");
+    let ttl = c.cmd(&["TTL", ""]).i();
+    assert!((1..=100000).contains(&ttl), "TTL of the empty key: {ttl}");
+    assert_eq!(c.cmd(&["HGET", "hash", ""]).s(), "v");
+    assert_eq!(c.cmd(&["SISMEMBER", "set", ""]).i(), 1);
+    assert_eq!(c.cmd(&["ZSCORE", "zset", ""]).s(), "1.5");
+    assert_eq!(c.cmd(&["LRANGE", "list", "0", "-1"]).strings(), ["", "e"]);
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert_eq!(c.cmd(&["HGET", "", ""]).s(), "in-1");
+    let ttl = c.cmd(&["TTL", ""]).i();
+    assert!(
+        (100001..=200000).contains(&ttl),
+        "TTL of the empty key in database 1: {ttl}"
+    );
+    assert_eq!(c.cmd(&["GET", "after"]).s(), "1");
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+}
+
+#[test]
+fn the_empty_key_survives_a_save_and_a_restart() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    write_empty_keys(&mut c);
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    // Written under the stand-in length: the stand-in, the string tag, a
+    // length of 1 and the value. The server also reads 1.2.0's layout, so
+    // a restart alone would not show the writer had gone back to it.
+    let dump = std::fs::read(server.dir.join("dump.kdb")).unwrap();
+    let entry = [0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0, 0, 0, b'x'];
+    assert!(
+        dump.windows(entry.len()).any(|w| w == entry),
+        "the empty key is not under the stand-in length"
+    );
+    let restarted = killed_and_started_again(&mut server, &[]);
+    let mut c = restarted.conn();
+    assert_empty_keys(&mut c);
+    // And the image the restarted server writes loads again.
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    let mut restarted = restarted;
+    let again = killed_and_started_again(&mut restarted, &[]);
+    assert_empty_keys(&mut again.conn());
+}
+
+/// With the AOF on, a `SAVE` is a checkpoint: the snapshot it writes is
+/// where the next start begins, and the log after it is replayed on top.
+#[test]
+fn the_empty_key_survives_an_aof_checkpoint_and_a_restart() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    write_empty_keys(&mut c);
+    assert!(c.cmd(&["SAVE"]).ok());
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    assert!(c.cmd(&["SET", "", "in-the-log"]).ok());
+    drop(c);
+    std::thread::sleep(Duration::from_millis(1500));
+    let restarted = killed_and_started_again(&mut server, &["--aof"]);
+    let mut c = restarted.conn();
+    assert_empty_keys(&mut c);
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(c.cmd(&["GET", ""]).s(), "in-the-log");
+}
+
+/// `MIGRATE` of the empty key, a hash with an empty field, named after
+/// `KEYS`, to another server.
+#[test]
+fn the_empty_key_can_be_migrated() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    assert_eq!(c.cmd(&["HSET", "", "", "v"]).i(), 1);
+    let port = to.port.to_string();
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS", ""]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
+    assert_eq!(to.conn().cmd(&["HGET", "", ""]).s(), "v");
+
+    // Without `KEYS`, the empty key argument is the empty key, as in Redis:
+    // it was a syntax error (#458). `KEYS` and nothing after it moves
+    // nothing.
+    assert!(c.cmd(&["SET", "", "plain"]).ok());
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "REPLACE"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["EXISTS", ""]).i(), 0);
+    assert_eq!(to.conn().cmd(&["GET", ""]).s(), "plain");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000"]);
+    assert_eq!(reply.s(), "NOKEY");
+    let reply = c.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]);
+    assert_eq!(reply.s(), "NOKEY");
+}
+
+// ── MIGRATE's connections ─────────────────────────────────────────────────────
+//
+// MIGRATE keeps its connection to a target for the next call, as Redis does,
+// rather than dialling one per call and leaving a socket in TIME_WAIT per
+// call on the source (#726).
+
+/// The connections `server` has accepted so far.
+fn connections_received(c: &mut Conn) -> i64 {
+    let info = c.cmd(&["INFO", "stats"]);
+    info.s()
+        .lines()
+        .find_map(|l| l.strip_prefix("total_connections_received:"))
+        .expect("total_connections_received")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `MIGRATE` of `key` from `c` to the server on `port`, with `extra` after
+/// the timeout.
+fn migrate(c: &mut Conn, port: &str, key: &str, db: &str, extra: &[&str]) -> V {
+    let mut args = vec!["MIGRATE", "127.0.0.1", port, key, db, "5000"];
+    args.extend_from_slice(extra);
+    c.cmd(&args)
+}
+
+/// Two thousand `MIGRATE`s of one key each to one target go over one
+/// connection: they each opened one. Going from one database to another
+/// selects the other on it, and every key lands where it was sent.
+#[test]
+fn many_migrates_to_one_target_go_over_one_connection() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    let before = connections_received(&mut t);
+    for i in 0..2000 {
+        let key = format!("k{i}");
+        assert!(c.cmd(&["SET", &key, "v"]).ok());
+        let reply = migrate(&mut c, &port, &key, "0", &[]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    let opened = connections_received(&mut t) - before;
+    assert!(opened <= 3, "{opened} connections for 2000 MIGRATEs");
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 0);
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 2000);
+
+    // Database 3, then 0 again, on the same connection.
+    for (key, db) in [("in3", "3"), ("also3", "3"), ("in0", "0")] {
+        assert!(c.cmd(&["SET", key, db]).ok());
+        let reply = migrate(&mut c, &port, key, db, &[]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(connections_received(&mut t) - before, opened);
+    assert_eq!(t.cmd(&["GET", "in0"]).s(), "0");
+    assert!(t.cmd(&["SELECT", "3"]).ok());
+    assert_eq!(t.cmd(&["GET", "in3"]).s(), "3");
+    assert_eq!(t.cmd(&["GET", "also3"]).s(), "3");
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 2);
+}
+
+/// A kept connection the target has closed since (`CLIENT KILL`) is not
+/// used: the next `MIGRATE` dials a new one, and goes through.
+#[test]
+fn a_migrate_after_the_target_killed_its_connection_goes_through() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    assert!(c.cmd(&["SET", "first", "1"]).ok());
+    assert!(migrate(&mut c, &port, "first", "0", &[]).ok());
+    let killed = t.cmd(&["CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes"]);
+    assert!(killed.i() >= 1, "the MIGRATE connection: {killed:?}");
+    std::thread::sleep(Duration::from_millis(100));
+    let before = connections_received(&mut t);
+    assert!(c.cmd(&["SET", "second", "2"]).ok());
+    let reply = migrate(&mut c, &port, "second", "0", &[]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(connections_received(&mut t) - before, 1);
+    assert_eq!(t.cmd(&["GET", "second"]).s(), "2");
+    assert_eq!(c.cmd(&["EXISTS", "second"]).i(), 0);
+}
+
+/// A connection is kept for the `AUTH` or `AUTH2` it was opened with: other
+/// credentials open another. A wrong password fails the call, and keeps
+/// the key here.
+#[test]
+fn migrate_keeps_a_connection_per_login() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    assert!(t.cmd(&["CONFIG", "SET", "requirepass", "pw"]).ok());
+    assert!(t.cmd(&["AUTH", "pw"]).ok());
+    let port = to.port.to_string();
+    let before = connections_received(&mut t);
+    let opened = |t: &mut Conn| connections_received(t) - before;
+
+    for key in ["a", "b"] {
+        assert!(c.cmd(&["SET", key, "v"]).ok());
+        let reply = migrate(&mut c, &port, key, "0", &["AUTH", "pw"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(opened(&mut t), 1);
+    for key in ["c", "d"] {
+        assert!(c.cmd(&["SET", key, "v"]).ok());
+        let reply = migrate(&mut c, &port, key, "0", &["AUTH2", "default", "pw"]);
+        assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
+    }
+    assert_eq!(opened(&mut t), 2);
+
+    assert!(c.cmd(&["SET", "e", "v"]).ok());
+    let reply = migrate(&mut c, &port, "e", "0", &["AUTH", "wrong"]);
+    assert!(
+        reply.is_err() && reply.s().contains("AUTH"),
+        "MIGRATE: {reply:?}"
+    );
+    assert_eq!(c.cmd(&["GET", "e"]).s(), "v");
+    assert_eq!(opened(&mut t), 3);
+    // Without credentials: refused by the target, on a new connection.
+    let reply = migrate(&mut c, &port, "e", "0", &[]);
+    assert!(reply.is_err(), "MIGRATE: {reply:?}");
+    assert_eq!(c.cmd(&["GET", "e"]).s(), "v");
+    assert_eq!(opened(&mut t), 4);
+    // The first login's connection is still kept.
+    let reply = migrate(&mut c, &port, "e", "0", &["AUTH", "pw"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(opened(&mut t), 4);
+    assert_eq!(t.cmd(&["DBSIZE"]).i(), 5);
+}
+
+/// A `RESTORE` refused by the target (`BUSYKEY`, without `REPLACE`) fails
+/// the call and keeps the key here, as before. Its reply was whole, so the
+/// connection is kept, and the next call goes over it.
+#[test]
+fn a_migrate_whose_restore_fails_keeps_its_key() {
+    let from = Server::start(&[]);
+    let to = Server::start(&[]);
+    let mut c = from.conn();
+    let mut t = to.conn();
+    let port = to.port.to_string();
+    assert!(t.cmd(&["SET", "busy", "there"]).ok());
+    assert!(c.cmd(&["SET", "busy", "here"]).ok());
+    assert!(c.cmd(&["SET", "free", "here"]).ok());
+    let before = connections_received(&mut t);
+
+    let reply = migrate(&mut c, &port, "busy", "0", &[]);
+    assert!(
+        reply.is_err() && reply.s().contains("BUSYKEY"),
+        "MIGRATE: {reply:?}"
+    );
+    assert_eq!(c.cmd(&["GET", "busy"]).s(), "here");
+    assert_eq!(t.cmd(&["GET", "busy"]).s(), "there");
+
+    let reply = migrate(&mut c, &port, "free", "0", &[]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    let reply = migrate(&mut c, &port, "busy", "0", &["REPLACE"]);
+    assert!(reply.ok(), "MIGRATE: {reply:?}");
+    assert_eq!(t.cmd(&["GET", "busy"]).s(), "here");
+    assert_eq!(c.cmd(&["EXISTS", "busy", "free"]).i(), 0);
+    assert_eq!(connections_received(&mut t) - before, 1);
+}
+
+/// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
+/// ends a database: `databases` databases, the empty key in `at`, and every
+/// key with a time to live.
+fn dump_1_2_0(databases: usize, at: usize) -> Vec<u8> {
+    use kividb::shared_bytes::SharedBytes;
+    use kividb::types::KiviDBValue;
+    let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+    let far = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 100_000_000;
+    let mut image = Vec::new();
+    kividb::snapshot::write_kdb_header(&mut image, databases as u32).unwrap();
+    let mut expiries = Vec::new();
+    for db in 0..databases {
+        let mut keys = Vec::new();
+        let before = format!("before-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &before, string("1").view()).unwrap();
+        keys.push(before);
+        if db == at {
+            image.extend(0u32.to_le_bytes());
+            kividb::snapshot::write_kdb_value(&mut image, string("x").view()).unwrap();
+            keys.push(String::new());
+        }
+        let after = format!("after-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &after, string("2").view()).unwrap();
+        keys.push(after);
+        kividb::snapshot::write_kdb_db_end(&mut image).unwrap();
+        expiries.push(keys);
+    }
+    // The expiry section, as `write_kdb_expiry_maps` lays it out.
+    image.extend(b"KIVIEX1\0");
+    image.extend((databases as u32).to_le_bytes());
+    for keys in expiries {
+        image.extend((keys.len() as u32).to_le_bytes());
+        for key in keys {
+            image.extend((key.len() as u32).to_le_bytes());
+            image.extend(key.as_bytes());
+            image.extend(far.to_le_bytes());
+        }
+    }
+    image
+}
+
+/// 1.2.0 wrote the empty key with the length that ends a database. With it
+/// in the first of 16 databases neither 1.2.0 nor 1.2.1 started; with it in
+/// the only database, both started without the keys after it and without
+/// any time to live. Each such file now loads whole.
+#[test]
+fn a_1_2_0_dump_with_the_empty_key_loads_whole() {
+    for (databases, at) in [(16, 0), (16, 7), (16, 15), (1, 0)] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join("dump.kdb"), dump_1_2_0(databases, at)).unwrap();
+        let databases_arg = databases.to_string();
+        let server = start_in(&dir, &["--databases", &databases_arg]);
+        let mut c = server.conn();
+        for db in 0..databases {
+            assert!(c.cmd(&["SELECT", &db.to_string()]).ok());
+            let mut keys = vec![format!("before-{db}"), format!("after-{db}")];
+            if db == at {
+                assert_eq!(
+                    c.cmd(&["GET", ""]).s(),
+                    "x",
+                    "{databases} databases, at {at}"
+                );
+                keys.push(String::new());
+            }
+            assert_eq!(c.cmd(&["DBSIZE"]).i(), keys.len() as i64, "database {db}");
+            for key in keys {
+                let ttl = c.cmd(&["TTL", &key]).i();
+                assert!(
+                    ttl > 99_000,
+                    "{databases} databases, at {at}: TTL of {key:?} in {db}: {ttl}"
+                );
+            }
+        }
+    }
+}
+
+/// An `appendonly.aof` that opens with a KDB preamble, as earlier releases
+/// wrote them, with the empty key in the preamble.
+#[test]
+fn the_empty_key_in_an_aof_preamble_loads() {
+    use kividb::shared_bytes::SharedBytes;
+    use kividb::types::KiviDBValue;
+    let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+    let db0 = std::collections::HashMap::from([
+        (String::new(), string("x")),
+        ("k".to_string(), string("1")),
+    ]);
+    let mut image = Vec::new();
+    kividb::snapshot::write_kdb_image(&mut image, &[db0], None).unwrap();
+    let mut log = b"KIVIAOF1".to_vec();
+    log.push(1); // a preamble follows
+    log.extend((image.len() as u64).to_le_bytes());
+    log.extend(&image);
+    log.extend(record(&["SET", "tail", "2"]));
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("appendonly.aof"), &log).unwrap();
+    let server = start_in(&dir, &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["GET", ""]).s(), "x");
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "1");
+    assert_eq!(c.cmd(&["GET", "tail"]).s(), "2");
+}
+
+/// A `SELECT` changes no data: a script that has only selected a database
+/// can still be killed, as in Redis (#424). Its `SELECT` used to count as a
+/// write, and `SCRIPT KILL` was answered UNKILLABLE.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_that_has_only_selected_a_database_can_be_killed() {
+    let server = Server::start(&[]);
+    let port = server.port;
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "lua-time-limit", "200"]).ok());
+
+    let runner = std::thread::spawn(move || {
+        let mut r = Conn::connect(port);
+        r.cmd(&["EVAL", "redis.call('SELECT', 1) while true do end", "0"])
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = c.cmd(&["PING"]);
+        if reply.is_err() && reply.s().starts_with("BUSY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the script never got busy: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reply = c.cmd(&["SCRIPT", "KILL"]);
+    assert!(reply.ok(), "{reply:?}");
+    assert!(runner.join().unwrap().is_err());
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+}
+
+/// What a script may do with `SELECT`, as Redis 8.10.2 lets it: a read-only
+/// script may select another database (#424), and on a cluster node no
+/// script may select one other than 0, as no client may (#428).
+#[cfg(feature = "lua")]
+#[test]
+fn scripts_select_databases_as_redis_lets_them() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(c.cmd(&["SELECT", "1"]).ok());
+    assert!(c.cmd(&["SET", "x", "one"]).ok());
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    let read = "redis.call('SELECT', 1) return redis.call('GET', 'x')";
+    assert_eq!(c.cmd(&["EVAL_RO", read, "0"]).s(), "one");
+    let no_writes = format!("#!lua flags=no-writes\n{read}");
+    assert_eq!(c.cmd(&["EVAL", &no_writes, "0"]).s(), "one");
+
+    let node = Server::start(&["--cluster-enabled", "yes"]);
+    let mut n = node.conn();
+    let reply = n.cmd(&["EVAL", "return redis.call('SELECT', 3)", "0"]);
+    assert!(
+        reply.is_err()
+            && reply
+                .s()
+                .starts_with("ERR SELECT is not allowed in cluster mode"),
+        "{reply:?}"
+    );
+    assert!(n.cmd(&["EVAL", "return redis.call('SELECT', 0)", "0"]).ok());
+}
+
+/// A read-only replica loads and flushes scripts, as Redis does: its script
+/// cache is its own, and a client loads a script there before it runs it by
+/// its SHA (#527). What changes data is still refused.
+#[cfg(feature = "lua")]
+#[test]
+fn a_read_only_replica_loads_and_flushes_scripts() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !r
+        .cmd(&["INFO", "replication"])
+        .s()
+        .contains("master_link_status:up")
+    {
+        assert!(Instant::now() < deadline, "the replica never linked up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let sha = r.cmd(&["SCRIPT", "LOAD", "return 1"]).s().to_string();
+    assert_eq!(sha.len(), 40, "{sha}");
+    assert_eq!(r.cmd(&["EVALSHA", &sha, "0"]).i(), 1);
+    assert!(r.cmd(&["SCRIPT", "FLUSH"]).ok());
+    let reply = r.cmd(&["EVALSHA", &sha, "0"]);
+    assert!(
+        reply.is_err() && reply.s().starts_with("NOSCRIPT"),
+        "{reply:?}"
+    );
+    for refused in [&["FUNCTION", "FLUSH"][..], &["SET", "k", "v"]] {
+        let reply = r.cmd(refused);
+        assert!(
+            reply.is_err() && reply.s().starts_with("READONLY"),
+            "{refused:?}: {reply:?}"
+        );
+    }
 }

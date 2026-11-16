@@ -1,0 +1,5 @@
+=== sigterm-3 2026-11-03T12:33:29.648Z
+2026-11-03T12:33:29.946Z 17723 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T12:33:29.946Z 17723 [INFO] Writing final snapshot...
+2026-11-03T12:33:31.054Z 17723 [INFO] AOF: rebased onto dump.kdb (generation 252) — log is now the delta
+2026-11-03T12:33:31.054Z 17723 [INFO] Goodbye.

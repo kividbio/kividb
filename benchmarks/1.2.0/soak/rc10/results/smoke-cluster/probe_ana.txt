@@ -1,0 +1,4 @@
+round src->dst exit secs | source probe: base p99 | p50 p99 p99.9 worst (ms) | 1s-p99 median worst | stall s, max conns | dest p99 worst | third p99 worst | mixed ops/s p99med
+1 3000->8000 0 106 | 3.13 | 41.26 829 1142 1315 | 533 1255 | 107 8 | 3.51 38.99 | 3.24 36.85 | 23250 33194
+   source service time p50 1.40 p99 73.08 p99.9 79.10 worst 113 ms (baseline p99 1.89)
+   source cmds: {"cluster|getkeysinslot": {"calls": 2262, "mean_us": 38204.4}, "cluster|info": {"calls": 88, "mean_us": 837.5}, "cluster|nodes": {"calls": 2, "mean_us": 317.0}, "cluster|setslot": {"calls": 256, "mean_us": 35666.1}, "cluster|slots": {"calls": 294, "mean_us": 641.3}, "migrate": {"calls": 2134, "mean_us": 1254.4}}  slowlog: {}

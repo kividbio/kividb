@@ -1,0 +1,62 @@
+2026-11-02T13:57:27Z  kividb-cand  [kividb 1.2.0-rc6]
+    /home/azureuser/bin/kividb-cand --port 6379 --bind 0.0.0.0
+2026-11-02T14:04:31Z  kividb-rc4  [kividb 1.2.0-rc4]
+    /home/azureuser/bin/kividb-rc4 --port 6379 --bind 0.0.0.0
+2026-11-02T14:11:34Z  kividb-113  [kividb 1.1.3]
+    /home/azureuser/bin/kividb-1.1.3 --port 6379 --bind 0.0.0.0
+2026-11-02T14:18:43Z  kividb-cand  [kividb 1.2.0-rc6]
+    /home/azureuser/bin/kividb-cand --port 6379 --bind 0.0.0.0
+2026-11-02T14:25:47Z  kividb-rc4  [kividb 1.2.0-rc4]
+    /home/azureuser/bin/kividb-rc4 --port 6379 --bind 0.0.0.0
+2026-11-02T14:32:49Z  kividb-113  [kividb 1.1.3]
+    /home/azureuser/bin/kividb-1.1.3 --port 6379 --bind 0.0.0.0
+2026-11-02T14:39:59Z  kividb-cand  [kividb 1.2.0-rc6]
+    /home/azureuser/bin/kividb-cand --port 6379 --bind 0.0.0.0
+2026-11-02T14:47:03Z  kividb-rc4  [kividb 1.2.0-rc4]
+    /home/azureuser/bin/kividb-rc4 --port 6379 --bind 0.0.0.0
+2026-11-02T14:54:08Z  kividb-113  [kividb 1.1.3]
+    /home/azureuser/bin/kividb-1.1.3 --port 6379 --bind 0.0.0.0
+2026-11-02T15:01:18Z  redis  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=37c721be60ebe104]
+    /home/azureuser/bin/redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-02T15:08:58Z  redis-cluster  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=37c721be60ebe104 x 32 primaries, ports 7000-7031]
+    /home/azureuser/bin/redis-server --port 7000 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --cluster-enabled yes --cluster-config-file nodes-7000.conf --cluster-node-timeout 15000 --dir /home/azureuser/run/7000
+2026-11-02T15:16:30Z  valkey  [Valkey server v=9.1.3 sha=29173b67:0 malloc=jemalloc-5.3.0 bits=64 build=241eb3f2e3fc1f69]
+    /home/azureuser/bin/valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-02T15:23:59Z  dragonfly  [dragonfly v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87]
+    /home/azureuser/bin/dragonfly --port 6379 --bind 0.0.0.0 --dbfilename  --logtostderr
+2026-11-02T15:30:55Z  garnet  [Garnet v2.2.5]
+    /home/azureuser/garnet/GarnetServer --port 6379 --bind 0.0.0.0 --index 1g --memory 64g
+2026-11-02T15:38:28Z  redis  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=37c721be60ebe104]
+    /home/azureuser/bin/redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-02T15:46:08Z  redis-cluster  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=37c721be60ebe104 x 32 primaries, ports 7000-7031]
+    /home/azureuser/bin/redis-server --port 7000 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --cluster-enabled yes --cluster-config-file nodes-7000.conf --cluster-node-timeout 15000 --dir /home/azureuser/run/7000
+2026-11-02T15:53:35Z  valkey  [Valkey server v=9.1.3 sha=29173b67:0 malloc=jemalloc-5.3.0 bits=64 build=241eb3f2e3fc1f69]
+    /home/azureuser/bin/valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-02T16:01:03Z  dragonfly  [dragonfly v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87]
+    /home/azureuser/bin/dragonfly --port 6379 --bind 0.0.0.0 --dbfilename  --logtostderr
+2026-11-02T16:08:02Z  garnet  [Garnet v2.2.5]
+    /home/azureuser/garnet/GarnetServer --port 6379 --bind 0.0.0.0 --index 1g --memory 64g
+2026-11-02T16:15:34Z  redis  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=37c721be60ebe104]
+    /home/azureuser/bin/redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-02T16:23:16Z  redis-cluster  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=37c721be60ebe104 x 32 primaries, ports 7000-7031]
+    /home/azureuser/bin/redis-server --port 7000 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --cluster-enabled yes --cluster-config-file nodes-7000.conf --cluster-node-timeout 15000 --dir /home/azureuser/run/7000
+2026-11-02T16:30:32Z  valkey  [Valkey server v=9.1.3 sha=29173b67:0 malloc=jemalloc-5.3.0 bits=64 build=241eb3f2e3fc1f69]
+    /home/azureuser/bin/valkey-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-02T16:37:59Z  dragonfly  [dragonfly v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87]
+    /home/azureuser/bin/dragonfly --port 6379 --bind 0.0.0.0 --dbfilename  --logtostderr
+2026-11-02T16:44:56Z  garnet  [Garnet v2.2.5]
+    /home/azureuser/garnet/GarnetServer --port 6379 --bind 0.0.0.0 --index 1g --memory 64g
+2026-11-02T16:52:28Z  kividb-cand  [kividb 1.2.0-rc6]
+    /home/azureuser/bin/kividb-cand --port 6379 --bind 0.0.0.0
+2026-11-02T16:59:31Z  kividb-rc4  [kividb 1.2.0-rc4]
+    /home/azureuser/bin/kividb-rc4 --port 6379 --bind 0.0.0.0
+2026-11-02T17:06:36Z  redis  [Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=37c721be60ebe104]
+    /home/azureuser/bin/redis-server --port 6379 --bind 0.0.0.0 --protected-mode no --save  --appendonly no --io-threads 24
+2026-11-02T17:14:33Z  kividb-cand  [kividb 1.2.0-rc6]
+    /home/azureuser/bin/kividb-cand --port 6379 --bind 0.0.0.0
+2026-11-02T17:21:37Z  kividb-rc4  [kividb 1.2.0-rc4]
+    /home/azureuser/bin/kividb-rc4 --port 6379 --bind 0.0.0.0
+2026-11-02T17:28:40Z  kividb-cand  [kividb 1.2.0-rc6]
+    /home/azureuser/bin/kividb-cand --port 6379 --bind 0.0.0.0
+2026-11-02T17:35:43Z  kividb-rc4  [kividb 1.2.0-rc4]
+    /home/azureuser/bin/kividb-rc4 --port 6379 --bind 0.0.0.0

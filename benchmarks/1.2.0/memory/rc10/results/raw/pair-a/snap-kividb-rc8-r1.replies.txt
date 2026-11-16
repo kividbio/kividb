@@ -1,0 +1,2 @@
+Background saving started
+Background append only file rewriting started

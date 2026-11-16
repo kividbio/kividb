@@ -1,0 +1,13 @@
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-03T07:54:22.164Z 1 [INFO] AOF replay: 780373 commands, 780372 keys, 29.56 MB in 0.63s
+2026-11-03T07:54:22.193Z 1 [INFO] Replication: dataset fingerprinted in 17 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-03T07:54:54.065Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:54:54.153Z 1 [INFO] Replication: Full resync from 5ef8950f4c55cf2f6e53ce44f8abf67fa2aa546d offset=30995297
+2026-11-03T07:54:54.153Z 1 [INFO] Replication: Receiving full-sync payload (18506794 bytes)...
+2026-11-03T07:54:54.307Z 1 [WARN] Replication: Dropped the 780372 local keys before loading 780372 from the master
+2026-11-03T07:54:54.994Z 1 [INFO] Replication: Full sync loaded: 780372 keys (0 with a TTL), replacing 780372 local keys
+2026-11-03T07:54:54.996Z 1 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:54:55.169Z 1 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T07:54:55.170Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.
+2026-11-03T07:54:55.170Z 1 [INFO] Replication: Backlog restarted at offset 30995297 (it ended at 0)

@@ -1,0 +1,2 @@
+prefilled: master keys 3400000, replica keys 3400000
+end: offsets master=3871882646 replica=3871882646; DBSIZE master 3529959 replica 3529959; master sync_full 7 sync_partial_ok 0

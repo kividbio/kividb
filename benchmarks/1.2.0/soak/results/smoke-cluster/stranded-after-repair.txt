@@ -1,0 +1,17 @@
+ack:3:7958 3:7958:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:4:11404 4:11404:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:4:14376 4:14376:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:5:11627 5:11627:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:5:14155 5:14155:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:6:14731 6:14731:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:6:22080 6:22080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:7:14512 7:14512:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:8:5206 8:5206:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:9:4657 9:4657:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:9:19249 9:19249:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:10:7152 10:7152:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:11:3271 11:3271:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:12:17878 12:17878:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:14:21300 14:21300:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:15:17692 15:17692:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ack:15:21123 15:21123:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

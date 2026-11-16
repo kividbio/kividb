@@ -1,0 +1,23 @@
+built rc10 (39bfacd2, lto=fat) in 307 s
+-rwxr-xr-x 2 root root 88166824 Nov  3 15:50 /target/perf-rc10/release/kividb
+bac52c15086b25b31c9a56ef30d228d97c3f2c4cd64204134bc7b0ad354e55bd  /target/perf-rc10/release/kividb
+kividb 1.2.0-rc10
+GET-100 rc10 3360
+SET-100 rc10 4306
+GET-1K rc10 3864
+SET-1K rc10 4432
+MIX-100 rc10 7688
+INCR rc10 4088
+DEL rc10 4504
+GET-100-TTL rc10 3437
+SET-100-TTL rc10 5690
+INCR-TTL rc10 4132
+DEL-TTL rc10 5164
+GET-100-LRU rc10 3711
+SET-100-LRU rc10 4666
+INCR-LRU rc10 4430
+DEL-LRU rc10 4853
+GET-100-LFU rc10 3926
+SET-100-LFU rc10 5002
+INCR-LFU rc10 4729
+done

@@ -1,0 +1,27 @@
+22:46:42 restart-check replica REPLICAOF NO ONE: OK
+22:46:45 restart-check before: master keys=2747621 expires=702934 persistent=2044687 | replica keys=2747449 expires=702934 persistent=2044515
+22:53:39 restart-check compare before: {"dbsize_a": 2747621, "dbsize_b": 2747449, "scanned_a": 2747621, "scanned_b": 2747449, "compared": 2747621, "differ_first_pass": 172, "differ_after_recheck": 172, "expiring_at_compare": 0, "real_differences": 172, "sample": ["wl:hx:6:5064", "wl:hx:1:5067", "wl:hx:3:5066", "wl:hx:3:5070", "wl:hx:4:5078", "wl:hx:6:5065", "wl:hx:5:5079", "wl:hx:4:5061", "wl:hx:2:5074", "wl:hx:4:5076", "wl:hx:6:5073", "wl:hx:6:5062", "wl:hx:2:5077", "wl:hx:4:5072", "wl:hx:0:5065", "wl:hx:6:5079", "wl:hx:6:5068", "wl:hx:3:5072", "wl:hx:7:5059", "wl:hx:5:5064"], "seconds": 413.4}
+22:53:42 restart-check master: kill -9 44690
+22:53:51 restart-check master: serving again after 8.39 s; keys=2747449 expires=702934 persistent=2044515
+    log:   * AOF            : enabled
+    log:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+    log: 2026-11-02T22:53:43.418Z 97693 [INFO] Found dump.kdb — loading native snapshot
+    log: 2026-11-02T22:53:50.324Z 97693 [INFO] Loaded 2982830 keys from snapshot (938315 with a TTL)
+    log: 2026-11-02T22:53:50.352Z 97693 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+    log: 2026-11-02T22:53:50.352Z 97693 [INFO] Found appendonly.aof — recovering from the append-only file
+    log: 2026-11-02T22:53:51.210Z 97693 [INFO] AOF replay: 235381 commands, 2747449 keys, 6.60 MB in 0.86s
+23:00:39 restart-check compare restarted master vs untouched replica: {"dbsize_a": 2747449, "dbsize_b": 2747449, "scanned_a": 2747449, "scanned_b": 2747449, "compared": 2747449, "differ_first_pass": 0, "differ_after_recheck": 0, "expiring_at_compare": 0, "real_differences": 0, "sample": [], "seconds": 406.7}
+23:01:02 restart-check write log on the restarted master: {"node": "master-after-kill9", "acked": 5623474, "unknown": 8, "bad": 0, "checked_keys_ok": 4921541}
+23:01:05 restart-check replica: kill -9 63511
+23:01:15 restart-check replica: serving again after 8.77 s; keys=2747449 expires=702934 persistent=2044515
+    log:   * AOF            : enabled
+    log:   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+    log: 2026-11-02T23:01:06.652Z 97752 [INFO] Found dump.kdb — loading native snapshot
+    log: 2026-11-02T23:01:13.845Z 97752 [INFO] Loaded 2965641 keys from snapshot (921126 with a TTL)
+    log: 2026-11-02T23:01:13.876Z 97752 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+    log: 2026-11-02T23:01:13.876Z 97752 [INFO] Found appendonly.aof — recovering from the append-only file
+    log: 2026-11-02T23:01:14.740Z 97752 [INFO] AOF replay: 218192 commands, 2747449 keys, 6.11 MB in 0.86s
+23:08:02 restart-check compare both restarted: {"dbsize_a": 2747449, "dbsize_b": 2747449, "scanned_a": 2747449, "scanned_b": 2747449, "compared": 2747449, "differ_first_pass": 0, "differ_after_recheck": 0, "expiring_at_compare": 0, "real_differences": 0, "sample": [], "seconds": 406.4}
+23:08:27 restart-check write log on the restarted replica: {"node": "replica-after-kill9", "acked": 5623474, "unknown": 8, "bad": 0, "checked_keys_ok": 4921541}
+23:08:27 restart-check after: master keys=2747449 expires=702934 persistent=2044515 | replica keys=2747449 expires=702934 persistent=2044515
+RESTART-DONE

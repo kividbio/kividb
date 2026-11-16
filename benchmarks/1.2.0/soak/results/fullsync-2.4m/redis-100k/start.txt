@@ -1,0 +1,2 @@
+started redis master pid 177161
+started redis replica pid 172086

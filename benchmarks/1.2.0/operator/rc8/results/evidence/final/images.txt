@@ -1,0 +1,17 @@
+g-113-0          ghcr.io/kividbio/kividb:v1.1.3                0,0
+g-113-1          ghcr.io/kividbio/kividb:v1.1.3                0,0
+g-no-0           <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+g-no-1           <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+g-yes-0          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+g-yes-1          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+rep-0            <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+rep-1            <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+rep-2            <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+rep-restored-0   <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+rep-restored-1   <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+shd-0-0          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+shd-0-1          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+shd-1-0          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+shd-1-1          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+shd-2-0          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0
+shd-2-1          <registry>.azurecr.io/kividb:1.2.0-rc8   0,0

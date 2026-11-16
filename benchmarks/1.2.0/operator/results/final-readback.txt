@@ -1,0 +1,7 @@
+loader-shd acked 4621908 checked 4623124 missing 121939 wrong 0 readErr 0
+loader-rep acked 4589093 checked 4590413 missing 0 wrong 0 readErr 0
+loader-g-yes acked 2346838 checked 2347406 missing 0 wrong 0 readErr 0
+loader-g-no acked 2365580 checked 2366188 missing 0 wrong 0 readErr 0
+loader-g-113 acked 2392153 checked 2392773 missing 0 wrong 0 readErr 0
+loader-g-bad acked 2411936 checked 2412536 missing 0 wrong 0 readErr 0
+loader-fb acked 2382892 checked 2383472 missing 0 wrong 0 readErr 0

@@ -1,0 +1,64 @@
+Json file ~/results/garnet/r1/d100/warmup/warm.c1.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 20%,   1 secs] 15 threads 10 conns:     4882391 ops, 4874221 (avg: 4874221) ops/sec, 664.21MB/sec (avg: 664.21MB/sec),  0.48 (avg:  0.48) msec latency[RUN #1 40%,   2 secs] 15 threads 10 conns:    10274696 ops, 5391442 (avg: 5132636) ops/sec, 734.69MB/sec (avg: 699.42MB/sec),  0.44 (avg:  0.46) msec latency
+warning: high CPU on thread 1: 97.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 3: 96.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 4: 95.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 5: 96.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 6: 95.4% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 7: 96.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 8: 96.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 9: 97.2% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 11: 95.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 12: 95.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 13: 96.2% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 14: 96.5% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 60%,   3 secs] 15 threads 10 conns:    15632858 ops, 5356838 (avg: 5207337) ops/sec, 729.97MB/sec (avg: 709.60MB/sec),  0.44 (avg:  0.45) msec latency
+warning: high CPU on thread 0: 95.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 2: 95.4% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 10: 95.6% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 80%,   4 secs] 15 threads 10 conns:    20951451 ops, 5317832 (avg: 5234949) ops/sec, 724.66MB/sec (avg: 713.36MB/sec),  0.44 (avg:  0.45) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:    26188688 ops, 5317832 (avg: 5236670) ops/sec, 724.66MB/sec (avg: 713.60MB/sec),  0.44 (avg:  0.45) msec latency
+
+Writing Full Run command HDR latency histogram results to ~/results/garnet/r1/d100/warmup/warm.c1_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to ~/results/garnet/r1/d100/warmup/warm.c1_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to ~/results/garnet/r1/d100/warmup/warm.c1_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to ~/results/garnet/r1/d100/warmup/warm.c1_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   70.813s  (user 30.629s, sys 40.184s)
+  Wall time:        5.002s
+  Cores used:       14.156   (avg 94.4% across 15 worker threads)
+  Peak utilization: 1438.6%
+warning: thread 1 averaged 95.2% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 14 averaged 95.1% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+Saving JSON output file: ~/results/garnet/r1/d100/warmup/warm.c1.json
+Json file closed.
+15        Threads
+10        Connections per thread
+5         Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets      5236851.52   5236851.52         0.00         0.44861         0.40700         1.41500         3.47100    730749.47 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals    5236851.52   5236851.52         0.00         0.44861         0.40700         1.41500         3.47100    730749.47 
+rc=0

@@ -1,0 +1,264 @@
+INSTALL crds+helm start 20:16:30 1793650590
+INSTALL helm done after 1 s 20:16:31 1793650591
+INSTALL crds+helm start 20:16:40 1793650600
+INSTALL helm done after 27 s 20:17:07 1793650627
+CREATE rep+shd on 1.1.3 20:17:18 1793650638
+CREATE rep+shd Running (47 s) 20:18:18 1793650698
+BEGIN upgrade-rep 20:21:05 1793650865
+CREATE guard clusters g-yes g-no g-113 g-bad fb 20:21:16 1793650876
+upgrade-rep spec.image -> v1.2.0-rc7 20:21:20 1793650880
+upgrade-rep all 3 pods on v1.2.0-rc7, Running 20:22:28 1793650948
+STOP upgrade-rep 20:22:48 1793650968
+END upgrade-rep 20:23:00 1793650980
+BEGIN upgrade-shd 20:23:01 1793650981
+upgrade-shd spec.image -> v1.2.0-rc7 20:23:16 1793650996
+LOADERS g-* fb started (400 SET/s each) 20:23:22 1793651002
+upgrade-shd all 6 pods on v1.2.0-rc7, Running 20:25:23 1793651123
+STOP upgrade-shd 20:25:43 1793651143
+END upgrade-shd 20:25:56 1793651156
+BEGIN restart-rc7 20:26:32 1793651192
+restart-rc7 DbOps restart 20:26:47 1793651207
+restart-rc7 DbOps Completed 20:29:17 1793651357
+STOP restart-rc7 20:29:37 1793651377
+END restart-rc7 20:29:53 1793651393
+BEGIN failover-rc7 20:29:55 1793651395
+failover-rc7 FAILOVER shd-0-1 20:30:17 1793651417
+failover-rc7 FAILOVER shd-1-1 20:30:48 1793651448
+failover-rc7 FAILOVER shd-2-1 20:31:18 1793651478
+STOP failover-rc7 20:31:58 1793651518
+END failover-rc7 20:32:14 1793651534
+BEGIN sigstop-rc7 20:32:19 1793651539
+sigstop-rc7 SIGSTOP shd-1-1 20:32:34 1793651554
+sigstop-rc7 shd-1-1 container restarted 20:35:04 1793651704
+sigstop-rc7 shd-1-1 Ready 20:35:23 1793651723
+STOP sigstop-rc7 20:35:44 1793651744
+END sigstop-rc7 20:36:02 1793651762
+BEGIN sigkill-rc7 20:36:10 1793651770
+sigkill-rc7 SIGKILL shd-0-1 20:36:20 1793651781
+sigkill-rc7 shd-0-1 Ready 20:36:33 1793651793
+STOP sigkill-rc7 20:36:54 1793651814
+END sigkill-rc7 20:37:13 1793651833
+BEGIN forcedel-rc7 20:37:21 1793651841
+forcedel-rc7 force delete shd-2-1 20:37:32 1793651852
+forcedel-rc7 shd-2-1 Ready 20:37:47 1793651867
+STOP forcedel-rc7 20:38:07 1793651887
+END forcedel-rc7 20:38:27 1793651907
+BEGIN delete-rc7 20:38:33 1793651913
+delete-rc7 delete shd-1-0 20:38:49 1793651929
+delete-rc7 old shd-1-0 gone 20:38:53 1793651933
+delete-rc7 shd-1-0 Ready 20:39:06 1793651946
+STOP delete-rc7 20:39:26 1793651966
+END delete-rc7 20:39:46 1793651986
+BEGIN drain-rc7 20:39:57 1793651997
+drain-rc7 drain vmss000002 20:40:12 1793652012
+drain-rc7 drained 20:40:38 1793652038
+CREATE fx (3x(1+1) rc7) for the force-delete repro 20:40:40 1793652040
+drain-rc7 all kividb pods Ready 20:46:46 1793652406
+STOP drain-rc7 20:47:07 1793652427
+END drain-rc7 20:47:33 1793652453
+STOP drain-rc7-rep 20:47:34 1793652454
+BEGIN fx-force1 20:47:39 1793652459
+fx-force1 force delete fx-0-0 20:47:49 1793652469
+END drain-rc7-rep 20:48:03 1793652483
+split-rc7 try 1: delete shd-0-0 and shd-1-0 together 20:48:09 1793652489
+fx-force1 fx-0-0 Ready 20:48:22 1793652503
+STOP fx-force1 20:48:44 1793652524
+END fx-force1 20:48:54 1793652534
+split-rc7 try 2: delete shd-0-0 and shd-1-0 together 20:49:27 1793652567
+fx bulk load 3M x 1KB 20:49:38 1793652578
+BEGIN fx-force2 20:50:12 1793652612
+fx-force2 cordoned all nodes but vmss000003 20:50:25 1793652625
+fx-force2 force delete fx-0-1 20:50:25 1793652625
+split-rc7 try 3: delete shd-0-0 and shd-1-0 together 20:50:26 1793652626
+fx-force2 new fx-0-1 on vmss000003, nodes uncordoned 20:50:32 1793652632
+fx-force2 fx-0-1 Ready 20:50:39 1793652639
+STOP fx-force2 20:51:15 1793652675
+END fx-force2 20:51:27 1793652687
+BEGIN repdel-rc7 20:51:47 1793652707
+repdel-rc7 delete replica shd-0-0 20:52:03 1793652723
+fx flushed, loader-fx restarted with prefix g5 20:52:15 1793652735
+repdel-rc7 shd-0-0 Ready 20:52:38 1793652758
+STOP repdel-rc7 20:52:58 1793652778
+fxloss try 1: BGSAVE on fx-0-0 20:53:18 1793652798
+END repdel-rc7 20:53:26 1793652806
+BEGIN reshard-up-rc7 20:53:29 1793652809
+reshard-up-rc7 spec.shards=4 20:53:44 1793652824
+BEGIN fx-loss1 20:54:07 1793652847
+fx-loss1 cordoned all nodes but vmss000002 20:54:21 1793652861
+fx-loss1 force delete fx-0-0 20:54:21 1793652861
+reshard-up-rc7 RebalanceCompleted 20:54:26 1793652866
+reshard-up-rc7 Running with 8 pods 20:54:28 1793652868
+fx-loss1 new fx-0-0 on vmss000002, nodes uncordoned 20:54:28 1793652868
+fx-loss1 fx-0-0 Ready 20:54:35 1793652875
+STOP reshard-up-rc7 20:54:51 1793652891
+STOP fx-loss1 20:55:10 1793652910
+END fx-loss1 20:55:22 1793652922
+END reshard-up-rc7 20:55:22 1793652922
+BEGIN reshard-down-rc7 20:55:27 1793652927
+reshard-down-rc7 spec.shards=3 20:55:42 1793652942
+reshard-down-rc7 RebalanceCompleted 20:55:53 1793652953
+reshard-down-rc7 Running with 6 pods 20:55:56 1793652956
+fxloss try 2: BGSAVE on fx-0-0 20:56:10 1793652970
+STOP reshard-down-rc7 20:56:19 1793652979
+END reshard-down-rc7 20:56:48 1793653008
+BEGIN rep-sigstop-rc7 20:56:55 1793653015
+BEGIN fx-loss2 20:57:00 1793653020
+rep-sigstop-rc7 SIGSTOP rep-2 20:57:10 1793653030
+fx-loss2 cordoned all nodes but vmss000002 20:57:14 1793653034
+fx-loss2 force delete fx-0-0 20:57:14 1793653034
+fx-loss2 new fx-0-0 on vmss000002, nodes uncordoned 20:57:20 1793653040
+fx-loss2 fx-0-0 Ready 20:57:27 1793653047
+STOP fx-loss2 20:58:03 1793653083
+END fx-loss2 20:58:15 1793653095
+fxloss try 3: BGSAVE on fx-0-1 20:59:04 1793653144
+rep-sigstop-rc7 rep-2 container restarted 20:59:49 1793653189
+BEGIN fx-loss3 20:59:53 1793653194
+fx-loss3 cordoned all nodes but vmss000003 21:00:07 1793653207
+fx-loss3 force delete fx-0-1 21:00:07 1793653207
+rep-sigstop-rc7 rep-2 Ready 21:00:08 1793653208
+fx-loss3 new fx-0-1 on vmss000003, nodes uncordoned 21:00:14 1793653214
+fx-loss3 fx-0-1 Ready 21:00:21 1793653221
+STOP rep-sigstop-rc7 21:00:28 1793653228
+STOP fx-loss3 21:00:56 1793653256
+END rep-sigstop-rc7 21:01:04 1793653264
+BEGIN rep-sigkill-rc7 21:01:08 1793653268
+END fx-loss3 21:01:10 1793653270
+rep-sigkill-rc7 SIGKILL rep-0 21:01:19 1793653279
+rep-sigkill-rc7 rep-0 Ready 21:01:33 1793653293
+STOP rep-sigkill-rc7 21:01:54 1793653314
+fxloss try 4: BGSAVE on fx-0-1 21:01:58 1793653318
+END rep-sigkill-rc7 21:02:29 1793653349
+BEGIN rep-forcedel-rc7 21:02:34 1793653354
+rep-forcedel-rc7 force delete rep-0 21:02:44 1793653364
+BEGIN fx-loss4 21:02:48 1793653368
+fx-loss4 cordoned all nodes but vmss000003 21:03:01 1793653381
+fx-loss4 force delete fx-0-1 21:03:01 1793653381
+fx-loss4 new fx-0-1 on vmss000003, nodes uncordoned 21:03:08 1793653388
+fx-loss4 fx-0-1 Ready 21:03:15 1793653395
+rep-forcedel-rc7 rep-0 Ready 21:03:17 1793653397
+STOP rep-forcedel-rc7 21:03:37 1793653417
+STOP fx-loss4 21:03:51 1793653431
+END fx-loss4 21:04:11 1793653451
+END rep-forcedel-rc7 21:04:17 1793653457
+BEGIN rep-restart-rc7 21:04:19 1793653459
+rep-restart-rc7 DbOps restart 21:04:34 1793653474
+BEGIN fx-graceful 21:04:36 1793653476
+fx-graceful cordoned all nodes but vmss000003 21:04:49 1793653489
+fx-graceful graceful delete fx-0-1 21:04:49 1793653489
+fx-graceful new fx-0-1 on vmss000003, nodes uncordoned 21:04:57 1793653497
+fx-graceful fx-0-1 Ready 21:05:16 1793653516
+STOP fx-graceful 21:05:38 1793653538
+END fx-graceful 21:05:54 1793653554
+rep-restart-rc7 DbOps Completed 21:06:09 1793653569
+fx deleted (repro done) 21:06:29 1793653589
+STOP rep-restart-rc7 21:06:30 1793653590
+END rep-restart-rc7 21:07:06 1793653626
+BEGIN dbq-rc7 21:07:32 1793653652
+dbq-rc7 two DbOps restarts at once: rep-q1-023732 rep-q2-023732 21:07:47 1793653667
+dbq-rc7 rep-q1-023732 Running 21:07:53 1793653673
+dbq-rc7 rep-q2-023732 Running 21:09:25 1793653765
+dbq-rc7 rep-q1-023732 Completed, rep-q2-023732 Completed, at most 1 pod(s) down at once 21:11:00 1793653860
+STOP dbq-rc7 21:11:22 1793653882
+END dbq-rc7 21:12:01 1793653921
+BEGIN holdback-rc7 21:12:04 1793653924
+holdback-rc7 spec.configRef -> missing-cfg (does not exist) 21:12:19 1793653939
+holdback-rc7 SIGSTOP master rep-1 21:12:43 1793653963
+holdback-rc7 master rep-1 -> rep-0 after 48 s 21:13:37 1793654017
+holdback-rc7 old master rep-1 back (liveness restart) 21:15:34 1793654134
+holdback-rc7 spec.configRef removed 21:15:34 1793654134
+holdback-rc7 Ready again: True/AllPodsReady/master=rep-0, 3 pod(s) ready 21:15:37 1793654137
+STOP holdback-rc7 21:15:51 1793654151
+END holdback-rc7 21:16:52 1793654212
+BEGIN fblock-rc7 21:16:57 1793654217
+fblock-rc7 SIGSTOP master fb-0 21:17:12 1793654233
+fblock-rc7 wipe replica fb-1 data dir + SIGKILL (restarts empty) 21:17:21 1793654241
+fblock-rc7 master fb-0 restarted by liveness 21:20:05 1793654405
+fblock-rc7 master fb-0, replica keys 1301692 21:20:16 1793654416
+STOP fblock-rc7 21:20:35 1793654436
+END fblock-rc7 21:21:03 1793654463
+BEGIN guard-yes 21:21:09 1793654469
+guard-yes operator scaled to 0 21:21:24 1793654484
+guard-yes SIGSTOP + force delete + SIGKILL g-yes-1 (pid 22732) 21:21:29 1793654489
+guard-yes new g-yes-1 Ready (10.244.3.44) 21:22:12 1793654532
+guard-yes operator scaled to 1 21:22:14 1793654534
+guard-yes master after: g-yes-1 21:24:55 1793654695
+guard-yes verdict KEPT 21:25:00 1793654700
+STOP guard-yes 21:25:10 1793654710
+END guard-yes 21:25:38 1793654738
+BEGIN guard-no 21:25:44 1793654744
+guard-no operator scaled to 0 21:25:59 1793654759
+guard-no SIGSTOP + force delete + SIGKILL g-no-1 (pid 48261) 21:26:05 1793654765
+guard-no new g-no-1 Ready (10.244.3.101) 21:26:49 1793654809
+guard-no operator scaled to 1 21:26:51 1793654811
+guard-no master after: g-no-0 21:29:34 1793654974
+guard-no verdict FAILED_OVER 21:29:39 1793654979
+STOP guard-no 21:29:49 1793654989
+END guard-no 21:30:19 1793655019
+BEGIN guard-113 21:30:24 1793655024
+guard-113 operator scaled to 0 21:30:39 1793655039
+guard-113 SIGSTOP + force delete + SIGKILL g-113-0 (pid 22595) 21:30:45 1793655045
+guard-113 new g-113-0 Ready (10.244.3.150) 21:31:22 1793655082
+guard-113 operator scaled to 1 21:31:24 1793655084
+guard-113 master after: g-113-1 21:34:04 1793655244
+guard-113 verdict FAILED_OVER 21:34:08 1793655248
+STOP guard-113 21:34:18 1793655258
+END guard-113 21:34:49 1793655289
+BEGIN guard-bad 21:34:55 1793655295
+guard-bad operator scaled to 0 21:35:10 1793655310
+guard-bad SIGSTOP + force delete + SIGKILL g-bad-1 (pid 22984) 21:35:16 1793655316
+guard-bad new g-bad-1 Ready (10.244.0.101) 21:35:35 1793655335
+guard-bad operator scaled to 1 21:35:37 1793655337
+guard-bad master after: g-bad-0 21:38:18 1793655498
+guard-bad verdict FAILED_OVER 21:38:22 1793655502
+STOP guard-bad 21:38:33 1793655513
+END guard-bad 21:39:06 1793655546
+BEGIN guard-yes-opup 21:39:13 1793655553
+guard-yes-opup SIGSTOP + force delete + SIGKILL g-yes-1 (pid 114917) 21:39:33 1793655573
+guard-yes-opup new g-yes-1 Ready (10.244.3.98) 21:39:53 1793655593
+guard-yes-opup master after: g-yes-1 21:42:40 1793655760
+guard-yes-opup verdict KEPT 21:42:45 1793655765
+STOP guard-yes-opup 21:42:55 1793655775
+END guard-yes-opup 21:43:30 1793655810
+BEGIN shrink-a-rc7 21:43:30 1793655810
+shrink-a-rc7 spec.shards=4 21:43:46 1793655826
+shrink-a-rc7 Running with 4 shards 21:44:28 1793655868
+shrink-a-rc7 spec.shards=3 21:44:28 1793655868
+shrink-a-rc7 shrink finished (Running, 6 pods) 21:44:51 1793655891
+shrink-a-rc7 operator stopped 21:44:55 1793655895
+shrink-a-rc7 stale status written back (phase Rebalancing) 21:45:00 1793655900
+shrink-a-rc7 operator started 21:45:00 1793655900
+shrink-a-rc7 recovered: Running with 3 shards after 28 s 21:45:28 1793655928
+STOP shrink-a-rc7 21:45:52 1793655952
+END shrink-a-rc7 21:46:45 1793656005
+BEGIN shrink-b-rc7 21:46:47 1793656007
+shrink-b-rc7 spec.shards=4 21:47:02 1793656022
+shrink-b-rc7 Running with 4 shards 21:48:12 1793656092
+shrink-b-rc7 spec.shards=3 21:48:12 1793656092
+shrink-b-rc7 shrink finished (Running, 6 pods) 21:48:32 1793656112
+shrink-b-rc7 operator stopped 21:48:36 1793656116
+shrink-b-rc7 stale status written back (phase Rebalancing) 21:48:40 1793656120
+shrink-b-rc7 spec.shards=4 while the finish is lost 21:48:40 1793656121
+shrink-b-rc7 operator started 21:48:42 1793656122
+shrink-b-rc7 recovered: Running with 4 shards after 59 s 21:49:41 1793656181
+STOP shrink-b-rc7 21:50:06 1793656206
+END shrink-b-rc7 21:51:03 1793656263
+BEGIN reshard-down2-rc7 21:51:07 1793656267
+reshard-down2-rc7 spec.shards=3 21:51:22 1793656282
+reshard-down2-rc7 RebalanceCompleted 21:51:41 1793656301
+reshard-down2-rc7 Running with 6 pods 21:51:43 1793656304
+STOP reshard-down2-rc7 21:52:07 1793656327
+END reshard-down2-rc7 21:53:02 1793656382
+backup rep: loader stopped 21:53:08 1793656388
+backup rep: rep-bk-032310 complete 21:53:26 1793656406
+backup rep: rep-restored Running after 43 s 21:54:12 1793656452
+backup rep: loader started 21:54:34 1793656474
+backup shd: loader stopped 21:54:34 1793656474
+backup shd: shd-bk-032435 complete 21:54:44 1793656484
+backup shd: loader started 21:55:08 1793656508
+bootguard-rc7 1: add bootstrapFromSnapshot to running rep 21:55:09 1793656509
+bootguard-rc7 2: 1000 extra keys into rep-restored 21:55:30 1793656530
+bootguard-rc7 2: delete rep-restored and create it again at once 21:55:37 1793656537
+bootguard-rc7 2: rep-restored Running again after 36 s 21:56:13 1793656573
+bootguard2 delete rep-restored and create it again at once (repeat) 21:57:27 1793656647
+FINAL read-back of every loader 22:01:17 1793656878
+TEARDOWN: az group delete 22:06:28 1793657188

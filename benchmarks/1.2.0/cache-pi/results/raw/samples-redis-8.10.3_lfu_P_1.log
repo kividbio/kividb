@@ -1,0 +1,85 @@
+=== 1793628951 14:15:51
+VmHWM:	   10988 kB
+VmRSS:	   10988 kB
+Threads:	6
+used_memory:615664
+used_memory_rss:11153408
+maxmemory:1073741824
+mem_fragmentation_ratio:20.20
+total_commands_processed:2
+instantaneous_ops_per_sec:0
+evicted_keys:0
+keyspace_hits:0
+keyspace_misses:0
+0
+stat: 0 0
+=== 1793628981 14:16:21
+VmHWM:	  398308 kB
+VmRSS:	  398308 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 610 1819
+=== 1793629011 14:16:51
+VmHWM:	  807728 kB
+VmRSS:	  807728 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 1378 3958
+=== 1793629041 14:17:21
+VmHWM:	 1076836 kB
+VmRSS:	 1076836 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 2168 6079
+=== 1793629071 14:17:51
+VmHWM:	 1079804 kB
+VmRSS:	 1079804 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 3037 8140
+=== 1793629101 14:18:21
+VmHWM:	 1081388 kB
+VmRSS:	 1081388 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 3904 10202
+=== 1793629131 14:18:51
+VmHWM:	 1081880 kB
+VmRSS:	 1081880 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 4754 12191
+=== 1793629161 14:19:21
+VmHWM:	 1082244 kB
+VmRSS:	 1082244 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 5613 14270
+=== 1793629191 14:19:51
+VmHWM:	 1082312 kB
+VmRSS:	 1082312 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 6482 16330
+=== 1793629221 14:20:21
+VmHWM:	 1082364 kB
+VmRSS:	 1082364 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 7352 18388
+=== 1793629251 14:20:51
+VmHWM:	 1082396 kB
+VmRSS:	 1082396 kB
+Threads:	6
+ERR max number of clients reached
+
+stat: 8224 20443

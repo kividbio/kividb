@@ -1,0 +1,6 @@
+total 58835936
+drwxrwxrwx 2 root      root             4096 Nov  2 14:44 .
+drwxr-xr-x 4 root      root             4096 Nov  2 13:51 ..
+-rw-r--r-- 1 azureuser azureuser 28789087454 Nov  2 14:47 appendonly.aof
+-rw-r--r-- 1 azureuser azureuser 31458888973 Nov  2 14:44 dump.kdb
+-rw-r--r-- 1 azureuser azureuser          24 Nov  2 14:44 dump.kdb.gen

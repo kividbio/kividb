@@ -1,0 +1,7 @@
+== glove-25-angular kividb-cand start 19:04:57
+exit=0 glove-25-angular kividb-cand 19:05:43
+kividb-cand peak_rss_kb=1304368
+== glove-25-angular kividb-rc4 start 19:05:49
+exit=0 glove-25-angular kividb-rc4 19:06:34
+kividb-rc4 peak_rss_kb=1304828
+SUITE DONE xg3 19:06:41

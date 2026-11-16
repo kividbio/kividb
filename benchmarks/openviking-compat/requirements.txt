@@ -1,0 +1,6 @@
+# The published OpenViking wheel (it carries the native ragfs binding the PathLock migration test
+# needs) with its "expiry" extra, which adds redis-py.
+openviking[expiry]==0.5.3
+redis==6.4.0
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1

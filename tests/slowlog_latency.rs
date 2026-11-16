@@ -198,6 +198,23 @@ fn start_server(port: u16) {
     });
 }
 
+/// Start a server with the slowlog as `Config::default()` has it (off), not
+/// as `start_server` sets it (10 ms): a command that waits for a busy CPU
+/// longer than that is logged under the latter.
+fn start_server_default_config(port: u16) {
+    thread::spawn(move || {
+        kividb::run_for_test(kividb::config::Config {
+            port,
+            bind: "127.0.0.1".to_string(),
+            threads: 2,
+            loglevel: "error".to_string(),
+            io_model: kividb::config::IoModel::Tokio,
+            configfile: "./kividb.conf".to_string(),
+            ..Default::default()
+        });
+    });
+}
+
 /// Start a server with threshold=0 so every command is logged.
 fn start_server_log_all(port: u16) {
     thread::spawn(move || {
@@ -1128,9 +1145,9 @@ fn test_latency_history_entry_structure() {
     }
 }
 
-// LATENCY HISTORY is capped at 180 samples per event.
+// LATENCY HISTORY is capped at 160 samples per event, as in Redis.
 #[test]
-fn test_latency_history_capped_at_180() {
+fn test_latency_history_capped_at_160() {
     let port = free_port();
     start_server_log_all(port);
     let mut c = Conn::connect(port);
@@ -1143,8 +1160,8 @@ fn test_latency_history_capped_at_180() {
     for event in &["command", "fast-command"] {
         let history = c.cmd(&["LATENCY", "HISTORY", event]);
         assert!(
-            history.as_array().len() <= 180,
-            "LATENCY HISTORY for '{event}' must not exceed 180 samples, got {}",
+            history.as_array().len() <= 160,
+            "LATENCY HISTORY for '{event}' must not exceed 160 samples, got {}",
             history.as_array().len()
         );
     }
@@ -1335,20 +1352,36 @@ fn test_fast_path_throughput_guard() {
     let port = free_port();
     // Use DEFAULT config — no explicit slowlog threshold.
     // This is the critical part: if the default changed back to 10_000,
-    // this test catches it via the throughput drop.
-    start_server(port);
+    // this test catches it by the threshold itself, below.
+    start_server_default_config(port);
     let mut c = Conn::connect(port);
+    let threshold = c.cmd(&["CONFIG", "GET", "slowlog-log-slower-than"]);
+    assert_eq!(
+        threshold.as_array()[1].as_str(),
+        "-1",
+        "the slowlog is meant to be off by default"
+    );
 
     // Pre-populate a key
     c.cmd(&["SET", "bench_key", "bench_value"]);
 
-    // Measure how long 10_000 GETs take
-    let start = std::time::Instant::now();
-    for _ in 0..10_000 {
-        let result = c.cmd(&["GET", "bench_key"]);
-        assert!(matches!(result, RespValue::Bulk(_)));
+    // Measure how long 10_000 GETs take. A machine busy with other tests can
+    // stall one batch (one took 2.5 s on a loaded 4-core runner), but not
+    // five in a row: a per-command cost added to the fast path slows every
+    // batch, so the guard is as sharp as before, and the first fast batch
+    // ends it.
+    let mut elapsed = Duration::MAX;
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let result = c.cmd(&["GET", "bench_key"]);
+            assert!(matches!(result, RespValue::Bulk(_)));
+        }
+        elapsed = elapsed.min(start.elapsed());
+        if elapsed.as_secs() < 2 {
+            break;
+        }
     }
-    let elapsed = start.elapsed();
 
     // 10_000 commands should complete in under 2 seconds on any CI machine.
     // At 25M QPS baseline this takes ~400 microseconds.

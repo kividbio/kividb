@@ -1,0 +1,47 @@
+{
+ "mode": "cluster",
+ "writers": 16,
+ "duration_s": 480.0,
+ "acked": 711253,
+ "unacked_errors": 0,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [
+  [
+   195.364,
+   "reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.11:7001 (8a05d5514d657a04eec0dfbb1c9d07c457183c5f, 566737 keys) to 10.81.1.12:7001 (702fb397ca13fc1b03281acdd41e4dc9bb2d9722) with plain redis-cli"
+  ],
+  [
+   301.719,
+   "reshard-end round 1 exit=0 after 106.32 s: slots begun=128, TRYAGAIN=0, ERR=0:"
+  ],
+  [
+   303.421,
+   "reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128"
+  ],
+  [
+   314.041,
+   "reshard-done round 1 cluster-ok after 0.20 s"
+  ],
+  [
+   314.248,
+   "events-done"
+  ]
+ ],
+ "recovery": {
+  "event_t": 195.364,
+  "pre_event_ok_per_100ms_median": 160,
+  "first_error_t": null,
+  "last_error_t": null,
+  "writes_below_80pct_from_t": 195.4,
+  "throughput_back_t": 196.20000000000002,
+  "recovery_s": 0.84
+ },
+ "error_kinds": {}
+}

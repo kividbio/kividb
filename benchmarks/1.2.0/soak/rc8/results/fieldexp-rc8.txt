@@ -1,0 +1,22 @@
+== rc8: kividb 1.2.0-rc8
+    started pid 3064 
+none: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+fieldexp.sh: line 21:  3064 Killed                  ( cd $D && exec nohup $B --configfile $D/node.conf >> $D/server.log 2>&1 < /dev/null )
+    started pid 3247 
+    started pid 3313 
+term-early: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+fieldexp.sh: line 21:  3313 Killed                  ( cd $D && exec nohup $B --configfile $D/node.conf >> $D/server.log 2>&1 < /dev/null )
+    started pid 3612 
+fieldexp.sh: line 19:  3612 Killed                  ( cd $D && exec nohup $B --configfile $D/node.conf >> $D/server.log 2>&1 < /dev/null )
+    started pid 3667 
+kill9-early: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+fieldexp.sh: line 21:  3667 Killed                  ( cd $D && exec nohup $B --configfile $D/node.conf >> $D/server.log 2>&1 < /dev/null )
+    started pid 3970 
+    started pid 4039 
+term-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+fieldexp.sh: line 21:  4039 Killed                  ( cd $D && exec nohup $B --configfile $D/node.conf >> $D/server.log 2>&1 < /dev/null )
+    started pid 4330 
+fieldexp.sh: line 31:  4330 Killed                  ( cd $D && exec nohup $B --configfile $D/node.conf >> $D/server.log 2>&1 < /dev/null )
+    started pid 4388 
+kill9-late: h1:exists=0,hlen=0,type=none h2:exists=0,hlen=0,type=none h3:exists=1,hlen=1,type=hash dbsize=1
+fieldexp.sh: line 38:  4388 Killed                  ( cd $D && exec nohup $B --configfile $D/node.conf >> $D/server.log 2>&1 < /dev/null )

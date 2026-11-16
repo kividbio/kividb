@@ -1,0 +1,28 @@
+== h-and-m-2048-angular-filters kividb-rc10 start 15:48:36
+exit=0 h-and-m-2048-angular-filters kividb-rc10 15:52:21
+kividb-rc10 peak_rss_kb=2289016
+== h-and-m-2048-angular-filters kividb-rc8 start 15:52:28
+exit=0 h-and-m-2048-angular-filters kividb-rc8 15:55:35
+kividb-rc8 peak_rss_kb=2280696
+SUITE DONE p1 15:55:41
+== dbpedia-openai-100K-1536-angular kividb-rc8 start 15:55:41
+exit=0 dbpedia-openai-100K-1536-angular kividb-rc8 15:57:00
+kividb-rc8 peak_rss_kb=1308904
+== dbpedia-openai-100K-1536-angular kividb-rc10 start 15:57:07
+exit=0 dbpedia-openai-100K-1536-angular kividb-rc10 15:58:04
+kividb-rc10 peak_rss_kb=1308580
+SUITE DONE p1 15:58:11
+== glove-25-angular kividb-rc10 start 15:58:11
+exit=0 glove-25-angular kividb-rc10 15:58:58
+kividb-rc10 peak_rss_kb=1308568
+== glove-25-angular kividb-rc8 start 15:59:04
+exit=0 glove-25-angular kividb-rc8 15:59:50
+kividb-rc8 peak_rss_kb=1308876
+SUITE DONE p1 15:59:56
+== dbpedia-openai-1M-1536-angular kividb-rc8 start 15:59:56
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc8 16:18:01
+kividb-rc8 peak_rss_kb=12897396
+== dbpedia-openai-1M-1536-angular kividb-rc10 start 16:18:07
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc10 16:22:29
+kividb-rc10 peak_rss_kb=12893076
+SUITE DONE p1 16:22:36

@@ -1,0 +1,38 @@
+Updating Subscription Management repositories.
+Unable to read consumer identity
+
+This system is not registered with an entitlement server. You can use subscription-manager to register.
+
+Red Hat Universal Base Image 9 (RPMs) - BaseOS  4.2 MB/s | 439 kB     00:00    
+Red Hat Universal Base Image 9 (RPMs) - AppStre  21 MB/s | 2.4 MB     00:00    
+Red Hat Universal Base Image 9 (RPMs) - CodeRea 3.1 MB/s | 278 kB     00:00    
+Dependencies resolved.
+================================================================================
+ Package        Architecture    Version              Repository            Size
+================================================================================
+Installing:
+ kividb         aarch64         1.2.0~rc10-1         @commandline         5.8 M
+
+Transaction Summary
+================================================================================
+Install  1 Package
+
+Total size: 5.8 M
+Installed size: 14 M
+Downloading Packages:
+Running transaction check
+Transaction check succeeded.
+Running transaction test
+Transaction test succeeded.
+Running transaction
+  Preparing        :                                                        1/1 
+  Running scriptlet: kividb-1.2.0~rc10-1.aarch64                            1/1 
+  Installing       : kividb-1.2.0~rc10-1.aarch64                            1/1 
+  Running scriptlet: kividb-1.2.0~rc10-1.aarch64                            1/1 
+  Verifying        : kividb-1.2.0~rc10-1.aarch64                            1/1 
+Installed products updated.
+
+Installed:
+  kividb-1.2.0~rc10-1.aarch64                                                   
+
+Complete!

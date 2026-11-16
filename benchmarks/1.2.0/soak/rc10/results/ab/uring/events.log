@@ -1,0 +1,42 @@
+13:53:56 reshard-start round 1 src-shard=3000 dst-shard=8000: 128 slots (0-127) from 10.81.1.11:7001 (8a05d5514d657a04eec0dfbb1c9d07c457183c5f, 566737 keys) to 10.81.1.12:7001 (702fb397ca13fc1b03281acdd41e4dc9bb2d9722) with plain redis-cli
+13:55:42 reshard-end round 1 exit=0 after 106.32 s: slots begun=128, TRYAGAIN=0, ERR=0: 
+CLUSTER GETKEYSINSLOT: n=2026 median=37779us max=68522us
+GET: n=698 median=38743us max=70364us
+SET: n=569 median=36645us max=83471us
+HSET: n=293 median=36386us max=64634us
+MIGRATE: n=276 median=14611us max=63331us
+LPUSH: n=181 median=40257us max=61735us
+CLUSTER SETSLOT: n=128 median=59880us max=93856us
+SADD: n=124 median=40166us max=61855us
+INCRBY: n=115 median=36785us max=63343us
+HGET: n=101 median=37847us max=78221us
+ZADD: n=97 median=37462us max=92209us
+LRANGE: n=91 median=37039us max=59921us
+LTRIM: n=88 median=35706us max=59868us
+EXPIRE: n=59 median=34892us max=68168us
+ZINCRBY: n=49 median=33619us max=60329us
+HGETALL: n=45 median=35965us max=61445us
+SREM: n=41 median=34644us max=61400us
+SCARD: n=37 median=33764us max=83407us
+SISMEMBER: n=36 median=36556us max=66334us
+ZRANGEBYSCORE: n=34 median=35213us max=60189us
+ZREVRANGE: n=32 median=41131us max=60168us
+HTTL: n=30 median=38324us max=59586us
+HEXPIRE: n=30 median=33585us max=60526us
+DEL: n=29 median=37656us max=58053us
+RPOP: n=17 median=43101us max=60829us
+INFO: n=11 median=21502us max=28409us
+CLUSTER SLOTS: n=1 median=52863us max=52863us
+SET: n=18 median=30633us max=35280us
+INFO: n=11 median=27816us max=37918us
+GET: n=9 median=21572us max=29251us
+CLUSTER SETSLOT: n=5 median=15409us max=21759us
+LPUSH: n=3 median=29529us max=30376us
+INCRBY: n=2 median=28814us max=28814us
+SADD: n=2 median=29523us max=29523us
+ZADD: n=2 median=14373us max=14373us
+HSET: n=2 median=28811us max=28811us
+HGET: n=1 median=12710us max=12710us
+13:55:44 reshard-check round 1: open-on-source=[] open-slots-lines=0 covered=1 err-lines=0 moved-slots=128
+13:55:55 reshard-done round 1 cluster-ok after 0.20 s
+13:55:55 events-done

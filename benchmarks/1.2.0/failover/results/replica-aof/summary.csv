@@ -1,0 +1,3 @@
+run,minutes,replica_used_first_GB,replica_used_max_GB,replica_used_last_GB,replica_used_slope_2nd_half_MB_per_min,replica_rss_max_GB,master_used_last_GB,replica_checkpoints_done,replica_checkpoint_open_at_end,replica_checkpoint_s_median,replica_checkpoint_s_max,master_checkpoints_done,rewrite_in_progress_samples,load_ops_per_s_median,load_errors,compared_keys,real_differences
+rc7-aof-15m,14.9,0.2,1.0,0.91,-0.2,1.22,0.95,85,False,0.74,0.76,85,7/90,100000,0,1275828,0
+rc4-aof-240s,3.9,0.41,7.06,7.06,1426.5,7.42,0.94,1,True,155.62,155.62,23,20/24,100000,0,,

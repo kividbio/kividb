@@ -1,0 +1,5 @@
+rc7-100k: rate 100000; keys 3424209; full syncs after the wipe 13; evictions 13; link-down samples 194; last link-down 253 s after the restart (load ran 239 s after it); last sync done 253.9 s after the restart; peak queue ~260 MiB
+rc6-100k: rate 100000; keys 3424251; full syncs after the wipe 13; evictions 13; link-down samples 196; last link-down 252 s after the restart (load ran 240 s after it); last sync done 253.1 s after the restart; peak queue ~268 MiB
+redis-100k: rate 100000; keys 3485560; full syncs after the wipe 1; evictions 0; link-down samples 20; last link-down 20 s after the restart (load ran 240 s after it); last sync done -1793669243.5 s after the restart; peak queue ~5637 MiB
+rc7-75k: rate 75000; keys 3375652; full syncs after the wipe 1; evictions 1; link-down samples 12; last link-down 12 s after the restart (load ran 239 s after it); last sync done 12.0 s after the restart; peak queue ~210 MiB
+rc7-50k: rate 50000; keys 3319981; full syncs after the wipe 1; evictions 1; link-down samples 11; last link-down 11 s after the restart (load ran 239 s after it); last sync done 11.4 s after the restart; peak queue ~128 MiB

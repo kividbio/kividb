@@ -93,6 +93,9 @@ pub static TOTAL_NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_ERROR_REPLIES: AtomicU64 = AtomicU64::new(0);
 pub static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Clients closed for `client-output-buffer-limit`: `INFO`'s
+/// `client_output_buffer_limit_disconnections`.
+pub static OUTPUT_BUFFER_LIMIT_DISCONNECTIONS: AtomicU64 = AtomicU64::new(0);
 /// Changes to the dataset since it was last saved, a counter to each thread
 /// that has made one. See [`record_rdb_change`].
 static RDB_CHANGES: parking_lot::Mutex<Vec<std::sync::Arc<AtomicU64>>> =
@@ -249,6 +252,16 @@ pub static LAST_SAMPLE_COMMANDS: AtomicU64 = AtomicU64::new(0);
 #[inline(always)]
 pub fn record_command_processed() {
     tl_bump!(TL_COMMANDS);
+}
+
+/// A command counted by [`record_command_processed`] did not run after all:
+/// it is dispatched again (a write a `CLIENT PAUSE` sent back to be held),
+/// and counted then. On the thread that counted it.
+pub fn unrecord_command_processed() {
+    TL_COMMANDS.with(|mine| {
+        let now = mine.0.load(Ordering::Relaxed);
+        mine.0.store(now.saturating_sub(1), Ordering::Relaxed)
+    });
 }
 
 #[inline(always)]

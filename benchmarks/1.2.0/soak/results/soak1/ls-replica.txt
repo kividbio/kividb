@@ -1,0 +1,10 @@
+total 1038740
+drwxrwxr-x 2 azureuser azureuser       4096 Nov  2 22:35 .
+drwxr-xr-x 5 azureuser root            4096 Nov  2 20:34 ..
+-rw-rw-r-- 1 azureuser azureuser    6403228 Nov  2 22:44 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser 1056926275 Nov  2 22:35 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser         24 Nov  2 22:35 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser        111 Nov  2 22:34 dump.kdb.repl
+-rw-rw-r-- 1 azureuser azureuser        130 Nov  2 20:34 node.conf
+-rw-rw-r-- 1 azureuser azureuser          6 Nov  2 22:00 pid
+-rw-rw-r-- 1 azureuser azureuser     301389 Nov  2 22:35 server.log

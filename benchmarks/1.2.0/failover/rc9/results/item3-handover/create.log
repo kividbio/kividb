@@ -1,0 +1,89 @@
+>>> Performing hash slots allocation on 3 nodes...
+Master[0] -> Slots 0 - 5460
+Master[1] -> Slots 5461 - 10922
+Master[2] -> Slots 10923 - 16383
+M: dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 10.91.1.11:7001
+   slots:[0-5460] (5461 slots) master
+M: 32c5267b9b43f96bad9d3d3106e2bbd007158350 10.91.1.12:7001
+   slots:[5461-10922] (5462 slots) master
+M: 7fa82d69dc38aacb8c5e991b9761b93d6cb9403a 10.91.1.13:7001
+   slots:[10923-16383] (5461 slots) master
+>>> Nodes configuration updated
+>>> Assign a different config epoch to each node
+>>> Sending CLUSTER MEET messages to join the cluster
+Waiting for the cluster to join
+
+>>> Performing Cluster Check (using node 10.91.1.11:7001)
+M: dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 10.91.1.11:7001
+   slots:[0-5460] (5461 slots) master
+M: 32c5267b9b43f96bad9d3d3106e2bbd007158350 10.91.1.12:7001
+   slots:[5461-10922] (5462 slots) master
+M: 7fa82d69dc38aacb8c5e991b9761b93d6cb9403a 10.91.1.13:7001
+   slots:[10923-16383] (5461 slots) master
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+>>> Adding node 10.91.1.12:7002 to cluster 10.91.1.11:7001
+>>> Performing Cluster Check (using node 10.91.1.11:7001)
+M: dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 10.91.1.11:7001
+   slots:[0-5460] (5461 slots) master
+M: 32c5267b9b43f96bad9d3d3106e2bbd007158350 10.91.1.12:7001
+   slots:[5461-10922] (5462 slots) master
+M: 7fa82d69dc38aacb8c5e991b9761b93d6cb9403a 10.91.1.13:7001
+   slots:[10923-16383] (5461 slots) master
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+>>> Send CLUSTER MEET to node 10.91.1.12:7002 to make it join the cluster.
+Waiting for the cluster to join
+
+>>> Configure node as replica of 10.91.1.11:7001.
+[OK] New node added correctly.
+>>> Adding node 10.91.1.13:7002 to cluster 10.91.1.12:7001
+>>> Performing Cluster Check (using node 10.91.1.12:7001)
+M: 32c5267b9b43f96bad9d3d3106e2bbd007158350 10.91.1.12:7001
+   slots:[5461-10922] (5462 slots) master
+S: 4a52399711849e87855b040896742b2156720cd6 10.91.1.12:7002
+   slots: (0 slots) slave
+   replicates dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9
+M: 7fa82d69dc38aacb8c5e991b9761b93d6cb9403a 10.91.1.13:7001
+   slots:[10923-16383] (5461 slots) master
+M: dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 10.91.1.11:7001
+   slots:[0-5460] (5461 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+>>> Send CLUSTER MEET to node 10.91.1.13:7002 to make it join the cluster.
+Waiting for the cluster to join
+
+>>> Configure node as replica of 10.91.1.12:7001.
+[OK] New node added correctly.
+>>> Adding node 10.91.1.11:7002 to cluster 10.91.1.13:7001
+>>> Performing Cluster Check (using node 10.91.1.13:7001)
+M: 7fa82d69dc38aacb8c5e991b9761b93d6cb9403a 10.91.1.13:7001
+   slots:[10923-16383] (5461 slots) master
+M: 32c5267b9b43f96bad9d3d3106e2bbd007158350 10.91.1.12:7001
+   slots:[5461-10922] (5462 slots) master
+   1 additional replica(s)
+S: 4a52399711849e87855b040896742b2156720cd6 10.91.1.12:7002
+   slots: (0 slots) slave
+   replicates dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9
+S: 56e422e32f0941da01e37c082db17e2e9e63f827 10.91.1.13:7002
+   slots: (0 slots) slave
+   replicates 32c5267b9b43f96bad9d3d3106e2bbd007158350
+M: dc6f9d6ff377183ae5aea1a4fd59bb372a8d80d9 10.91.1.11:7001
+   slots:[0-5460] (5461 slots) master
+   1 additional replica(s)
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.
+>>> Send CLUSTER MEET to node 10.91.1.11:7002 to make it join the cluster.
+Waiting for the cluster to join
+.
+>>> Configure node as replica of 10.91.1.13:7001.
+[OK] New node added correctly.

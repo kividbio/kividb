@@ -1,0 +1,12 @@
+server redis8 at redis://127.0.0.1:6422 (redis_version 8.10.3), service names compat-02b2df7c-a, compat-02b2df7c-b
+  [PASS] two runtimes start on one service name (storage, publisher, consumer)  (7 keys)
+  [PASS] report 12 items due in 1 s, then unregister one of them
+  [PASS] every item falls due and is called back exactly once, across the two runtimes  (runtime a: 5 calls, runtime b: 7 calls)
+  [PASS] a callback that answers RETRY is called again, then completes
+  [PASS] an unregistered item is never called back
+  [PASS] both runtimes stop cleanly
+  [PASS] a runtime reports 3 items and stops before they fall due
+  [PASS] a new runtime calls back the items the stopped one left
+
+redis8: 8 PASS, 0 FAIL of 8 checks
+wrote benchmarks/openviking-compat/expiry-redis8.json

@@ -790,6 +790,52 @@ fn random_filters_answer_from_postings_what_the_scan_answers() {
     assert_eq!(info.get("num_docs").i(), model.len() as i64, "{info:?}");
 }
 
+/// A TEXT field dropped by a read once past its time (`HGETALL`) is not
+/// matched before the field-expiry sweep has brought the TEXT index up to
+/// date (#364): in an index with no TAG or NUMERIC field, which keeps no
+/// postings, and in one whose postings are off. Each query comes at once,
+/// well inside the 100 ms between sweeps.
+#[test]
+fn a_text_field_dropped_by_a_read_is_not_matched() {
+    let mut c = conn();
+    let schemas: [(&str, &[&str]); 2] = [
+        ("tx364", &["body", "TEXT"]),
+        ("tp364", &["body", "TEXT", "c", "TAG"]),
+    ];
+    for (index, schema) in schemas {
+        let prefix = format!("{index}:");
+        let mut args = vec![
+            "FT.CREATE",
+            index,
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            prefix.as_str(),
+            "SCHEMA",
+        ];
+        args.extend_from_slice(schema);
+        assert!(c.cmd(&args).ok());
+    }
+    postings(&mut c, "tp364", false);
+    for (index, _) in schemas {
+        for i in 0..20 {
+            let key = format!("{index}:{i}");
+            assert_eq!(
+                c.cmd(&["HSET", &key, "body", "hello", "c", "red"]),
+                V::Int(2)
+            );
+            let reply = c.cmd(&["HPEXPIRE", &key, "1", "FIELDS", "1", "body"]);
+            assert_eq!(reply.arr()[0], V::Int(1), "{reply:?}");
+            thread::sleep(Duration::from_millis(3));
+            c.cmd(&["HGETALL", &key]);
+            let found = search(&mut c, index, "hello");
+            assert!(found.is_empty(), "{index}, {key}: {found:?}");
+            assert_eq!(aggregate_count(&mut c, index, "hello"), 0, "{index}, {key}");
+        }
+    }
+}
+
 /// A TAG or NUMERIC field added by FT.ALTER is answered from postings filled
 /// from the documents already there.
 #[test]
@@ -1095,11 +1141,27 @@ fn page(c: &mut Conn, index: &str, on: bool) {
 /// FT.SEARCH `index` `args`: the page from postings, every match read, and
 /// every document tried (postings off). Asked again if a key was deleted
 /// meanwhile (the active expiry cycle): relevance counts the documents.
+///
+/// What is compared before and after is the index's own count of what it
+/// holds as well as the keyspace's (#421). A key the expiry deletes leaves
+/// the keyspace under its shard's lock, and its index a moment later, once
+/// that lock is let go of: `DBSIZE` taken in between was the same after the
+/// three queries, while the first had scored with the document still in the
+/// index's statistics and the others without it (a BM25 of 1.811 against
+/// 1.821).
 fn three_ways(c: &mut Conn, index: &str, args: &[String]) -> (V, V, V) {
     let mut cmd: Vec<&str> = vec!["FT.SEARCH", index];
     cmd.extend(args.iter().map(String::as_str));
+    let held = |c: &mut Conn| {
+        let info = c.cmd(&["FT.INFO", index]);
+        (
+            c.cmd(&["DBSIZE"]),
+            info.get("num_records").clone(),
+            info.get("doc_ids").clone(),
+        )
+    };
     loop {
-        let before = c.cmd(&["DBSIZE"]);
+        let before = held(c);
         let paged = c.cmd(&cmd);
         page(c, index, false);
         let whole = c.cmd(&cmd);
@@ -1107,7 +1169,7 @@ fn three_ways(c: &mut Conn, index: &str, args: &[String]) -> (V, V, V) {
         let scanned = c.cmd(&cmd);
         postings(c, index, true);
         page(c, index, true);
-        if c.cmd(&["DBSIZE"]) == before {
+        if held(c) == before {
             return (paged, whole, scanned);
         }
     }

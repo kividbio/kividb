@@ -1,0 +1,3 @@
+The KividbCluster "rep" is invalid: spec: Invalid value: spec.bootstrapFromSnapshot cannot be added after creation: it seeds a new cluster, and on a running one would overwrite pod-0's data
+exit 1
+rep pods unchanged

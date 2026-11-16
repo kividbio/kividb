@@ -1,0 +1,145 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc6 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc6
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T00:43:40.678Z 165784 [INFO] KiviDB 1.2.0-rc6 starting: pid 165784, default build, config file '/mnt/kv/node.conf'
+2026-11-03T00:43:40.678Z 165784 [INFO] I/O model      : io_uring
+2026-11-03T00:43:40.679Z 165784 [INFO] Shards per DB  : 64
+2026-11-03T00:43:40.679Z 165784 [INFO] I/O model      : io_uring
+2026-11-03T00:43:40.679Z 165784 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T00:43:41.526Z 165784 [INFO] Replication: Channel replica registered: 10.70.1.8:42660
+2026-11-03T00:43:41.527Z 165784 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T00:43:50.679Z 165784 [INFO] AOF: auto-checkpoint: 423.04 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T00:43:51.565Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T00:44:01.565Z 165784 [INFO] AOF: auto-checkpoint: 260.54 MB is 100%+ above the 20.01 MB baseline — folding into dump.kdb
+2026-11-03T00:44:02.722Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T00:44:12.722Z 165784 [INFO] AOF: auto-checkpoint: 267.12 MB is 100%+ above the 27.41 MB baseline — folding into dump.kdb
+2026-11-03T00:44:14.090Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T00:44:24.090Z 165784 [INFO] AOF: auto-checkpoint: 270.19 MB is 100%+ above the 32.00 MB baseline — folding into dump.kdb
+2026-11-03T00:44:25.564Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T00:44:35.564Z 165784 [INFO] AOF: auto-checkpoint: 273.85 MB is 100%+ above the 35.02 MB baseline — folding into dump.kdb
+2026-11-03T00:44:37.155Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T00:44:47.155Z 165784 [INFO] AOF: auto-checkpoint: 276.21 MB is 100%+ above the 38.55 MB baseline — folding into dump.kdb
+2026-11-03T00:44:48.726Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-03T00:44:58.726Z 165784 [INFO] AOF: auto-checkpoint: 272.43 MB is 100%+ above the 36.88 MB baseline — folding into dump.kdb
+2026-11-03T00:45:00.334Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-03T00:45:10.334Z 165784 [INFO] AOF: auto-checkpoint: 277.11 MB is 100%+ above the 38.58 MB baseline — folding into dump.kdb
+2026-11-03T00:45:12.034Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-03T00:45:16.641Z 165784 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T00:45:16.641Z 165784 [INFO] Writing final snapshot...
+2026-11-03T00:45:18.235Z 165784 [INFO] AOF: rebased onto dump.kdb (generation 9) — log is now the delta
+2026-11-03T00:45:18.235Z 165784 [INFO] Goodbye.
+=== restart 2026-11-03T00:45:18Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc6 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc6
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T00:45:18.582Z 166995 [INFO] KiviDB 1.2.0-rc6 starting: pid 166995, default build, config file '/mnt/kv/node.conf'
+2026-11-03T00:45:18.582Z 166995 [INFO] I/O model      : io_uring
+2026-11-03T00:45:18.583Z 166995 [INFO] Shards per DB  : 64
+2026-11-03T00:45:18.584Z 166995 [INFO] I/O model      : io_uring
+2026-11-03T00:45:18.584Z 166995 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T00:45:21.690Z 166995 [INFO] Loaded 1321289 keys from snapshot (195895 with a TTL)
+2026-11-03T00:45:21.690Z 166995 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T00:45:21.690Z 166995 [INFO] Replication: Loaded dataset is offset 2592399031 of this node's stream 15df1b97e236b19180fe034d624d058a2d49b5cd — replicas stopped cleanly with it can be continued
+2026-11-03T00:45:21.691Z 166995 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T00:45:22.351Z 166995 [INFO] Replication: Channel replica registered: 10.70.1.8:34838
+2026-11-03T00:45:23.678Z 166995 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T00:45:29.143Z 166995 [WARN] Replication: Channel replica 10.70.1.8:34838 exceeded backlog limit (268463110 > 268435456 bytes) — evicting
+2026-11-03T00:45:31.691Z 166995 [INFO] AOF: auto-checkpoint: 347.94 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T00:45:32.826Z 166995 [INFO] Replication: uring: replica disconnected
+2026-11-03T00:45:33.405Z 166995 [INFO] AOF: rebased onto dump.kdb (generation 10) — log is now the delta
+2026-11-03T00:45:33.835Z 166995 [INFO] Replication: Channel replica registered: 10.70.1.8:46460
+2026-11-03T00:45:35.247Z 166995 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T00:45:43.405Z 166995 [INFO] AOF: auto-checkpoint: 277.55 MB is 100%+ above the 39.53 MB baseline — folding into dump.kdb
+2026-11-03T00:45:45.153Z 166995 [INFO] AOF: rebased onto dump.kdb (generation 11) — log is now the delta
+2026-11-03T00:45:55.153Z 166995 [INFO] AOF: auto-checkpoint: 277.11 MB is 100%+ above the 40.61 MB baseline — folding into dump.kdb
+2026-11-03T00:45:56.933Z 166995 [INFO] AOF: rebased onto dump.kdb (generation 12) — log is now the delta
+2026-11-03T00:46:06.933Z 166995 [INFO] AOF: auto-checkpoint: 278.45 MB is 100%+ above the 42.95 MB baseline — folding into dump.kdb
+2026-11-03T00:46:08.671Z 166995 [INFO] AOF: rebased onto dump.kdb (generation 13) — log is now the delta
+2026-11-03T00:46:18.671Z 166995 [INFO] AOF: auto-checkpoint: 213.07 MB is 100%+ above the 41.16 MB baseline — folding into dump.kdb
+2026-11-03T00:46:20.314Z 166995 [INFO] AOF: rebased onto dump.kdb (generation 14) — log is now the delta

@@ -1,0 +1,4 @@
+2026-11-03T03:15:44Z  garnet  [Garnet v2.2.5]
+    ~/garnet/GarnetServer --port 6379 --bind 0.0.0.0 --index 1g --memory 64g
+up: garnet
+stopped

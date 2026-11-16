@@ -1,0 +1,57 @@
+1793676913.565 RUN ./vector-db-benchmark --host SERVER_IP --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --datasets dbpedia-openai-100K-1536-angular --skip-if-exists false --parallels 100
+1793676913.573 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793676913.575 Found 1 datasets, 1 engines
+1793676913.577 
+1793676913.579 ============================================================
+1793676913.580 Running experiment (1/1): dragonfly-m16-ef128 - dbpedia-openai-100K-1536-angular
+1793676913.582 ============================================================
+1793676913.584 Experiment stage: Configure
+1793676913.586 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793676913.813 Experiment stage: Upload
+1793676913.815 Reading dataset from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793676914.538 Read 100000 vectors (1536d) in 0.725s (137995 vectors/sec)
+1793676914.540 Starting upload with 16 threads, batch size 64...
+1793676923.868 Upload time: 9.331s (10718 records/sec)
+1793676923.871 Indexing complete (num_docs=100000/100000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793676923.873 Index time: 0.003s, Total time (read+upload+index): 10.058s
+1793676923.888 Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-upload-0-100000-2026-11-03-03-35-23.json"
+1793676924.531 Experiment stage: Search
+1793676924.533 	Running search 2: ef=128, parallel=100
+1793676924.535 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793676925.746 	  rep 1/3: QPS 9359.3
+1793676925.748 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793676926.962 	  rep 2/3: QPS 9378.4
+1793676926.964 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-100K-1536-angular/dbpedia_openai_100K...
+1793676928.177 	  rep 3/3: QPS 9362.5
+1793676928.178 	→ QPS: 9378.4, Recall: 0.9803, Precision@returned: 0.9803, MRR: 0.9986, NDCG: 0.9865 (best of reps)
+1793676928.183 	Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-search-2-33775-2026-11-03-03-35-28.json"
+1793676928.185 -----------------------------------------------------------------------------------------------
+1793676928.187 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793676928.189 -----------------------------------------------------------------------------------------------
+1793676928.191 0.9803     0.9803     0.9986   0.9865   9378.4     10.204       13.450       14.605      
+1793676928.192 
+1793676928.194 
+1793676928.196 QPS vs Precision Trade-off - dragonfly-m16-ef128 - dbpedia-openai-100K-1536-angular (up and to the right is better):
+1793676928.198 
+1793676928.200     9378 │●                                                           
+1793676928.202     8526 │                                                            
+1793676928.203     7673 │                                                            
+1793676928.205     6821 │                                                            
+1793676928.207     5968 │                                                            
+1793676928.209     5116 │                                                            
+1793676928.211     4263 │                                                            
+1793676928.213     3410 │                                                            
+1793676928.214     2558 │                                                            
+1793676928.216     1705 │                                                            
+1793676928.218      853 │                                                            
+1793676928.220        0 │                                                            
+1793676928.222          └────────────────────────────────────────────────────────────
+1793676928.224           0.980          0.984          0.987          0.990          
+1793676928.225         Precision (0.0 = 0%, 1.0 = 100%)
+1793676928.227 
+1793676928.229 ================================================================================
+1793676928.231 Results saved to:  /home/azureuser/vdbx/results
+1793676928.233 Summary saved to:  /home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-100K-1536-angular-summary.json
+1793676928.235 Experiment stage: Cleanup (deleting index and data)
+1793676928.678 Experiment stage: Done
+1793676928.712 EXIT 0

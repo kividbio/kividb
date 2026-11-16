@@ -1,0 +1,2 @@
+redis_version:8.10.0
+kividb_version:1.2.0-rc7

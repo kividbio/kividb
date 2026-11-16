@@ -1,0 +1,21 @@
+{
+ "mode": "cluster",
+ "writers": 16,
+ "duration_s": 45.0,
+ "acked": 8904,
+ "unacked_errors": 747,
+ "lost_acked": 0,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": null,
+ "lost_ack_time_last": null,
+ "lost_sample": [],
+ "events": [],
+ "recovery": {},
+ "error_kinds": {
+  "ConnectionError:Error": 365,
+  "ClusterDownError:The": 382
+ }
+}

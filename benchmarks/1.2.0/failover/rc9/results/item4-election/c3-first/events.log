@@ -1,0 +1,4 @@
+resync :7002 pid 81387
+restarted :7001 pid 82131
+resync :7002 pid 83628
+restarted :7001 pid 84545

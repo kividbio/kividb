@@ -1,0 +1,273 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T07:45:54.659Z 48991 [INFO] KiviDB 1.2.0-rc9 starting: pid 48991, default build, config file '/mnt/kv/node.conf'
+2026-11-03T07:45:54.660Z 48991 [INFO] I/O model      : io_uring
+2026-11-03T07:45:54.660Z 48991 [INFO] Shards per DB  : 64
+2026-11-03T07:45:54.660Z 48991 [INFO] I/O model      : io_uring
+2026-11-03T07:45:54.661Z 48991 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T07:45:54.661Z 48991 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T07:45:54.664Z 48991 [INFO] Replication: Full resync from 610bcff3c9a4a3987f9b7dcde073049ea21b7387 offset=0
+2026-11-03T07:45:54.664Z 48991 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-03T07:45:54.665Z 48991 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-03T07:45:54.665Z 48991 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:45:54.668Z 48991 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T07:45:54.668Z 48991 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T07:46:00.220Z 48991 [WARN] Replication: Replication link to 10.91.1.11:6379 failed: Connection reset by peer (os error 104) — retrying every 1s
+2026-11-03T07:46:03.712Z 48991 [WARN] Replication: Dropped the 1756954 local keys before loading 3400000 from the master
+2026-11-03T07:46:04.661Z 48991 [INFO] AOF: auto-checkpoint: 541.22 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T07:46:04.715Z 48991 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T07:46:08.932Z 48991 [INFO] Replication: Full sync loaded: 3400000 keys (0 with a TTL), replacing 1756954 local keys
+2026-11-03T07:46:09.125Z 48991 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T07:46:10.156Z 48991 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T07:46:10.157Z 48991 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T07:46:10.157Z 48991 [INFO] Replication: Backlog restarted at offset 1098269939 (it ended at 567509956)
+2026-11-03T07:46:14.715Z 48991 [INFO] AOF: auto-checkpoint: 108.94 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T07:46:15.884Z 48991 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T07:46:25.884Z 48991 [INFO] AOF: auto-checkpoint: 267.35 MB is 100%+ above the 26.73 MB baseline — folding into dump.kdb
+2026-11-03T07:46:27.232Z 48991 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+=== round 1: clean stop 2026-11-03T07:46:33.217Z
+2026-11-03T07:46:33.483Z 48991 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:46:33.484Z 48991 [INFO] Writing final snapshot...
+2026-11-03T07:46:37.232Z 48991 [INFO] AOF: auto-checkpoint: 182.45 MB is 100%+ above the 32.13 MB baseline — folding into dump.kdb
+=== round 1: start, full sync expected 2026-11-03T07:47:42.021Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T07:47:42.293Z 54780 [INFO] KiviDB 1.2.0-rc9 starting: pid 54780, default build, config file '/mnt/kv/node.conf'
+2026-11-03T07:47:42.293Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T07:47:47.303Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (5s so far)
+2026-11-03T07:47:52.313Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (10s so far)
+2026-11-03T07:47:57.324Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (15s so far)
+2026-11-03T07:48:02.335Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (20s so far)
+2026-11-03T07:48:07.345Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (25s so far)
+2026-11-03T07:48:12.354Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (30s so far)
+2026-11-03T07:48:17.363Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (35s so far)
+2026-11-03T07:48:22.372Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (40s so far)
+2026-11-03T07:48:27.382Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (45s so far)
+2026-11-03T07:48:32.395Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (50s so far)
+2026-11-03T07:48:37.409Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (55s so far)
+2026-11-03T07:48:42.422Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (60s so far)
+2026-11-03T07:48:47.435Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (65s so far)
+2026-11-03T07:48:52.447Z 54780 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (70s so far)
+=== round 1: SIGTERM mid sync 2026-11-03T07:48:56.246Z
+=== round 1: start after the stop 2026-11-03T07:48:58.379Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T07:48:58.645Z 57987 [INFO] KiviDB 1.2.0-rc9 starting: pid 57987, default build, config file '/mnt/kv/node.conf'
+2026-11-03T07:48:58.645Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T07:49:03.655Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (5s so far)
+2026-11-03T07:49:08.665Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (10s so far)
+2026-11-03T07:49:13.675Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (15s so far)
+2026-11-03T07:49:18.684Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (20s so far)
+2026-11-03T07:49:23.694Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (25s so far)
+2026-11-03T07:49:28.704Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (30s so far)
+2026-11-03T07:49:33.714Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (35s so far)
+2026-11-03T07:49:38.723Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (40s so far)
+2026-11-03T07:49:43.734Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (45s so far)
+2026-11-03T07:49:48.744Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (50s so far)
+2026-11-03T07:49:53.755Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (55s so far)
+2026-11-03T07:49:58.765Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (60s so far)
+2026-11-03T07:50:03.774Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (65s so far)
+2026-11-03T07:50:08.784Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (70s so far)
+2026-11-03T07:50:13.793Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (75s so far)
+2026-11-03T07:50:18.803Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (80s so far)
+2026-11-03T07:50:23.813Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (85s so far)
+2026-11-03T07:50:28.823Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (90s so far)
+2026-11-03T07:50:33.833Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (95s so far)
+2026-11-03T07:50:38.842Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (100s so far)
+2026-11-03T07:50:43.852Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (105s so far)
+2026-11-03T07:50:48.862Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (110s so far)
+2026-11-03T07:50:53.872Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (115s so far)
+2026-11-03T07:50:58.885Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (120s so far)
+2026-11-03T07:51:03.894Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (125s so far)
+2026-11-03T07:51:08.911Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (130s so far)
+2026-11-03T07:51:13.921Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (135s so far)
+2026-11-03T07:51:18.932Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (140s so far)
+2026-11-03T07:51:23.942Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (145s so far)
+2026-11-03T07:51:28.952Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (150s so far)
+2026-11-03T07:51:33.962Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (155s so far)
+2026-11-03T07:51:38.972Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (160s so far)
+2026-11-03T07:51:43.984Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (165s so far)
+2026-11-03T07:51:48.994Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (170s so far)
+2026-11-03T07:51:54.003Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (175s so far)
+2026-11-03T07:51:59.013Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (180s so far)
+2026-11-03T07:52:04.024Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (185s so far)
+2026-11-03T07:52:09.033Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (190s so far)
+2026-11-03T07:52:14.043Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (195s so far)
+2026-11-03T07:52:19.052Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (200s so far)
+2026-11-03T07:52:24.061Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (205s so far)
+2026-11-03T07:52:29.071Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (210s so far)
+2026-11-03T07:52:34.080Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (215s so far)
+2026-11-03T07:52:39.091Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (220s so far)
+2026-11-03T07:52:44.103Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (225s so far)
+2026-11-03T07:52:49.113Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (230s so far)
+2026-11-03T07:52:54.123Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (235s so far)
+2026-11-03T07:52:59.132Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (240s so far)
+2026-11-03T07:53:04.142Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (245s so far)
+2026-11-03T07:53:09.152Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (250s so far)
+2026-11-03T07:53:14.162Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (255s so far)
+2026-11-03T07:53:19.172Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (260s so far)
+2026-11-03T07:53:24.181Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (265s so far)
+2026-11-03T07:53:29.190Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (270s so far)
+2026-11-03T07:53:34.201Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (275s so far)
+2026-11-03T07:53:39.211Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (280s so far)
+2026-11-03T07:53:44.225Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (285s so far)
+2026-11-03T07:53:49.238Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (290s so far)
+2026-11-03T07:53:54.250Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (295s so far)
+2026-11-03T07:53:59.260Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (300s so far)
+2026-11-03T07:54:04.270Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (305s so far)
+2026-11-03T07:54:09.279Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (310s so far)
+2026-11-03T07:54:14.290Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (315s so far)
+2026-11-03T07:54:19.300Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (320s so far)
+2026-11-03T07:54:24.310Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (325s so far)
+2026-11-03T07:54:29.319Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (330s so far)
+2026-11-03T07:54:34.329Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (335s so far)
+2026-11-03T07:54:39.339Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (340s so far)
+2026-11-03T07:54:44.349Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (345s so far)
+2026-11-03T07:54:49.359Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (350s so far)
+2026-11-03T07:54:54.369Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (355s so far)
+2026-11-03T07:54:59.378Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (360s so far)
+2026-11-03T07:55:04.387Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (365s so far)
+2026-11-03T07:55:09.399Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (370s so far)
+2026-11-03T07:55:14.408Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (375s so far)
+2026-11-03T07:55:19.419Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (380s so far)
+2026-11-03T07:55:24.429Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (385s so far)
+2026-11-03T07:55:29.438Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (390s so far)
+2026-11-03T07:55:34.447Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (395s so far)
+2026-11-03T07:55:39.456Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (400s so far)
+2026-11-03T07:55:44.466Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (405s so far)
+2026-11-03T07:55:49.475Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (410s so far)
+2026-11-03T07:55:54.485Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (415s so far)
+2026-11-03T07:55:59.494Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (420s so far)
+2026-11-03T07:56:04.506Z 57987 [WARN] The data directory /mnt/kv is in use by another process (it holds kividb.lock): waiting for it to be free (425s so far)

@@ -1,0 +1,11 @@
+2026-11-03T07:29:10.226148235Z 2026-11-03T07:29:10.225Z 1 [INFO] Cluster: Voted for 2e4fa5855bcbaa3f27f095f776b037e66709991e to take over from 0400792f2f4c129d42e926ec8e9dd114d031d450 at epoch 12 (manual failover)
+2026-11-03T07:29:35.578638363Z 2026-11-03T07:29:35.578Z 1 [INFO] Cluster: Manual failover requested by 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 — writes paused, replica must reach offset 5033836
+2026-11-03T07:29:35.581143629Z 2026-11-03T07:29:35.581Z 1 [INFO] Cluster: Voted for 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 to take over from 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 at epoch 13 (manual failover)
+2026-11-03T07:29:35.637534857Z 2026-11-03T07:29:35.636Z 1 [INFO] Cluster: Slots of this shard are now owned by 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 — following it as a replica
+2026-11-03T07:29:35.637556699Z 2026-11-03T07:29:35.636Z 1 [INFO] Replication: This node's dataset is offset 5033836 of its own stream 3f477ddce8a4c0d540a14d0d8a947ac38199d127: a master that continues that stream can continue this node
+2026-11-03T07:29:35.637622312Z 2026-11-03T07:29:35.637Z 1 [INFO] Replication: Replica <ip>:54606 disconnected: this node is now a replica itself
+2026-11-03T07:29:35.637773240Z 2026-11-03T07:29:35.637Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:29:35.638252256Z 2026-11-03T07:29:35.638Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:29:35.645960463Z 2026-11-03T07:29:35.645Z 1 [INFO] Replication: The master continues 3f477ddce8a4c0d540a14d0d8a947ac38199d127 as fd6127a8968414c8482fe319164589cd6d92914b
+2026-11-03T07:29:35.645975872Z 2026-11-03T07:29:35.645Z 1 [INFO] Replication: Partial resync: continuing from offset 5033836 — no dataset transfer
+2026-11-03T07:29:35.646423087Z 2026-11-03T07:29:35.646Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.

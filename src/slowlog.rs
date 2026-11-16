@@ -5,9 +5,9 @@ use std::sync::{
 
 pub struct SlowLogEntry {
     pub id: u64,
-    pub timestamp: u64,   // Unix seconds when command started
-    pub duration_us: u64, // execution time in microseconds
-    pub cmd: Vec<String>, // command tokens (truncated)
+    pub timestamp: u64,    // Unix seconds when command started
+    pub duration_us: u64,  // execution time in microseconds
+    pub cmd: Vec<Vec<u8>>, // command tokens (truncated), as sent
     pub client_addr: String,
     pub client_name: String,
     /// The command's argument count before truncation, command name included
@@ -62,6 +62,95 @@ pub fn new_slowlog_from_config(config: &crate::config::Config) -> SharedSlowLog 
     log
 }
 
+/// What `SLOWLOG` and `MONITOR` show in place of a secret, as Redis does.
+pub const REDACTED: &[u8] = b"(redacted)";
+
+/// The settings whose values are secrets: `CONFIG SET` of one is shown in
+/// `SLOWLOG` and `MONITOR`, and written to the server log, without its value.
+pub const SECRET_SETTINGS: &[&str] = &[
+    "requirepass",
+    "masterauth",
+    "primaryauth",
+    "cluster-bus-secret",
+    "tls-key-file-pass",
+    "tls-client-key-file-pass",
+];
+
+/// `cmd` as `SLOWLOG` and `MONITOR` may show it: passwords and secret
+/// settings replaced by [`REDACTED`]. `None` when it holds none, which is
+/// nearly always. As in Redis.
+///
+/// - `AUTH`: every argument.
+/// - `HELLO ... AUTH username password`: the two after `AUTH`.
+/// - `MIGRATE ... AUTH password` / `AUTH2 username password`: what follows.
+/// - `ACL SETUSER name rule ...`: every rule, passwords and hashes among them.
+/// - `CONFIG SET name value ...`: the value of a secret setting.
+pub fn redact<A: AsRef<[u8]>>(cmd: &[A]) -> Option<Vec<Vec<u8>>> {
+    let arg = |i: usize| cmd.get(i).map(AsRef::as_ref);
+    let is = |i: usize, word: &str| arg(i).is_some_and(|a| a.eq_ignore_ascii_case(word.as_bytes()));
+    // Nearly every command logged is none of these: it costs a look at its
+    // name, and nothing is allocated for it, which matters when every
+    // command is logged (`slowlog-log-slower-than 0`).
+    if !["AUTH", "HELLO", "MIGRATE", "ACL", "CONFIG"]
+        .iter()
+        .any(|name| is(0, name))
+    {
+        return None;
+    }
+    let mut secret = vec![false; cmd.len()];
+    let mut mark = |from: usize, count: usize| {
+        for flag in secret.iter_mut().skip(from).take(count) {
+            *flag = true;
+        }
+    };
+    if is(0, "AUTH") {
+        mark(1, cmd.len());
+    } else if is(0, "HELLO") {
+        for i in 2..cmd.len() {
+            if is(i, "AUTH") {
+                mark(i + 1, 2);
+            }
+        }
+    } else if is(0, "MIGRATE") {
+        // Past host, port, key, db and timeout.
+        for i in 6..cmd.len() {
+            if is(i, "KEYS") {
+                break;
+            }
+            if is(i, "AUTH") {
+                mark(i + 1, 1);
+            } else if is(i, "AUTH2") {
+                mark(i + 1, 2);
+            }
+        }
+    } else if is(0, "ACL") && is(1, "SETUSER") {
+        mark(3, cmd.len());
+    } else if is(0, "CONFIG") && is(1, "SET") {
+        let mut i = 2;
+        while i + 1 < cmd.len() {
+            if SECRET_SETTINGS.iter().any(|name| is(i, name)) {
+                mark(i + 1, 1);
+            }
+            i += 2;
+        }
+    }
+    if !secret.contains(&true) {
+        return None;
+    }
+    Some(
+        cmd.iter()
+            .zip(secret)
+            .map(|(a, hide)| {
+                if hide {
+                    REDACTED.to_vec()
+                } else {
+                    a.as_ref().to_vec()
+                }
+            })
+            .collect(),
+    )
+}
+
 /// The logged form of a command: at most `max_argc` arguments, each at most
 /// `max_string_len` bytes, with what was cut described in place — the same
 /// shape Redis logs.
@@ -73,7 +162,7 @@ pub fn truncate_command<A: AsRef<[u8]>>(
     cmd: &[A],
     max_argc: usize,
     max_string_len: usize,
-) -> Vec<String> {
+) -> Vec<Vec<u8>> {
     // A limit of 0 would log nothing at all, not even the command name.
     let max_argc = max_argc.max(1);
     let kept = if cmd.len() > max_argc {
@@ -81,23 +170,23 @@ pub fn truncate_command<A: AsRef<[u8]>>(
     } else {
         cmd.len()
     };
-    let mut out: Vec<String> = cmd[..kept]
+    let mut out: Vec<Vec<u8>> = cmd[..kept]
         .iter()
         .map(|arg| {
             let arg = arg.as_ref();
             if arg.len() > max_string_len {
-                format!(
-                    "{}... ({} more bytes)",
-                    String::from_utf8_lossy(&arg[..max_string_len]),
-                    arg.len() - max_string_len
-                )
+                let mut cut = arg[..max_string_len].to_vec();
+                cut.extend_from_slice(
+                    format!("... ({} more bytes)", arg.len() - max_string_len).as_bytes(),
+                );
+                cut
             } else {
-                String::from_utf8_lossy(arg).into_owned()
+                arg.to_vec()
             }
         })
         .collect();
     if cmd.len() > max_argc {
-        out.push(format!("... ({} more arguments)", cmd.len() - kept));
+        out.push(format!("... ({} more arguments)", cmd.len() - kept).into_bytes());
     }
     out
 }
@@ -197,7 +286,12 @@ impl SlowLog {
                 .unwrap_or_default()
                 .as_secs(),
             duration_us,
-            cmd: truncate_command(cmd, self.entry_max_argc(), self.entry_max_string_len()),
+            cmd: match redact(cmd) {
+                Some(shown) => {
+                    truncate_command(&shown, self.entry_max_argc(), self.entry_max_string_len())
+                }
+                None => truncate_command(cmd, self.entry_max_argc(), self.entry_max_string_len()),
+            },
             client_addr: client_addr.to_string(),
             client_name,
             argc: cmd.len(),
@@ -262,6 +356,136 @@ impl SlowLog {
 mod tests {
     use super::*;
 
+    fn shown(cmd: &[&str]) -> Vec<String> {
+        match redact(cmd) {
+            Some(r) => r
+                .into_iter()
+                .map(|a| String::from_utf8(a).unwrap())
+                .collect(),
+            None => cmd.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    /// Passwords and secret settings never reach `SLOWLOG` or `MONITOR`;
+    /// everything else is shown as sent.
+    #[test]
+    fn secrets_are_redacted_and_nothing_else() {
+        let r = "(redacted)";
+        assert_eq!(shown(&["AUTH", "pw"]), ["AUTH", r]);
+        assert_eq!(shown(&["auth", "alice", "pw"]), ["auth", r, r]);
+        assert_eq!(
+            shown(&["HELLO", "3", "AUTH", "alice", "pw", "SETNAME", "app"]),
+            ["HELLO", "3", "AUTH", r, r, "SETNAME", "app"]
+        );
+        assert_eq!(
+            shown(&[
+                "MIGRATE", "h", "6379", "", "0", "5000", "AUTH", "pw", "KEYS", "k"
+            ]),
+            [
+                "MIGRATE", "h", "6379", "", "0", "5000", "AUTH", r, "KEYS", "k"
+            ]
+        );
+        assert_eq!(
+            shown(&[
+                "MIGRATE", "h", "6379", "k", "0", "5000", "COPY", "AUTH2", "u", "pw"
+            ]),
+            [
+                "MIGRATE", "h", "6379", "k", "0", "5000", "COPY", "AUTH2", r, r
+            ]
+        );
+        // A key called AUTH is a key.
+        assert!(redact(&["MIGRATE", "h", "6379", "", "0", "5000", "KEYS", "AUTH"]).is_none());
+        assert_eq!(
+            shown(&["ACL", "SETUSER", "alice", "on", ">pw", "~*"]),
+            ["ACL", "SETUSER", "alice", r, r, r]
+        );
+        assert_eq!(
+            shown(&[
+                "CONFIG",
+                "SET",
+                "maxmemory",
+                "1gb",
+                "requirepass",
+                "pw",
+                "MASTERAUTH",
+                "x"
+            ]),
+            [
+                "CONFIG",
+                "SET",
+                "maxmemory",
+                "1gb",
+                "requirepass",
+                r,
+                "MASTERAUTH",
+                r
+            ]
+        );
+        assert_eq!(
+            shown(&[
+                "CONFIG",
+                "SET",
+                "tls-key-file-pass",
+                "a",
+                "tls-client-key-file-pass",
+                "b"
+            ]),
+            [
+                "CONFIG",
+                "SET",
+                "tls-key-file-pass",
+                r,
+                "tls-client-key-file-pass",
+                r
+            ]
+        );
+        let plain_commands: [&[&str]; 5] = [
+            &["SET", "AUTH", "pw"],
+            &["CONFIG", "SET", "maxmemory", "1gb"],
+            &["CONFIG", "GET", "requirepass"],
+            &["ACL", "GETUSER", "alice"],
+            &["HELLO", "3"],
+        ];
+        for plain in plain_commands {
+            assert!(redact(plain).is_none(), "{plain:?}");
+        }
+    }
+
+    /// What `SLOWLOG GET` keeps of a command with a password.
+    #[test]
+    fn the_slowlog_keeps_no_password() {
+        let log = new_slowlog(0, 10);
+        log.record(
+            &["ACL", "SETUSER", "alice", ">hunter2"],
+            5,
+            "127.0.0.1:1",
+            String::new(),
+        );
+        log.record(
+            &["CONFIG", "SET", "requirepass", "hunter2"],
+            5,
+            "127.0.0.1:1",
+            String::new(),
+        );
+        for entry in log.get(10) {
+            assert!(
+                !entry
+                    .cmd
+                    .iter()
+                    .any(|a| a.windows(7).any(|w| w == b"hunter2")),
+                "{:?}",
+                entry.cmd
+            );
+        }
+    }
+
+    /// An argument that is not text is logged as the bytes it is.
+    #[test]
+    fn arguments_are_logged_as_their_bytes() {
+        let cmd: [&[u8]; 3] = [b"GET", b"\xff\x00k", b"\xfe"];
+        assert_eq!(truncate_command(&cmd, 32, 128), cmd.map(<[u8]>::to_vec));
+    }
+
     /// The worked example on the SLOWLOG GET reference page: 33 arguments
     /// against the default limit of 32.
     #[test]
@@ -272,26 +496,32 @@ mod tests {
 
         let logged = truncate_command(&cmd, 32, 128);
         assert_eq!(logged.len(), 32);
-        assert_eq!(logged[0], "SADD");
-        assert_eq!(logged[30], "31");
-        assert_eq!(logged[31], "... (2 more arguments)");
+        assert_eq!(logged[0], b"SADD");
+        assert_eq!(logged[30], b"31");
+        assert_eq!(logged[31], b"... (2 more arguments)");
     }
 
     #[test]
     fn a_command_within_the_limits_is_logged_verbatim() {
         let cmd = ["SET", "k", "v"];
-        assert_eq!(truncate_command(&cmd, 32, 128), vec!["SET", "k", "v"]);
+        assert_eq!(
+            truncate_command(&cmd, 32, 128),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]
+        );
         // Exactly at the argument limit: nothing is cut.
         let cmd: Vec<String> = (0..32).map(|n| n.to_string()).collect();
         assert_eq!(truncate_command(&cmd, 32, 128).len(), 32);
-        assert!(!truncate_command(&cmd, 32, 128)[31].starts_with("..."));
+        assert!(!truncate_command(&cmd, 32, 128)[31].starts_with(b"..."));
     }
 
     #[test]
     fn long_arguments_are_cut_with_a_byte_count() {
         let big = "x".repeat(200);
         let logged = truncate_command(&["SET", "k", big.as_str()], 32, 128);
-        assert_eq!(logged[2], format!("{}... (72 more bytes)", "x".repeat(128)));
+        assert_eq!(
+            logged[2],
+            format!("{}... (72 more bytes)", "x".repeat(128)).into_bytes()
+        );
     }
 
     #[test]
@@ -309,7 +539,7 @@ mod tests {
         assert_eq!(entries[1].argc, 7);
         assert_eq!(
             entries[1].cmd,
-            vec!["MSET", "a", "1", "... (4 more arguments)"]
+            ["MSET", "a", "1", "... (4 more arguments)"].map(|a| a.as_bytes().to_vec())
         );
         assert_eq!(sl.totals(), (2, 2_000, 1_500));
     }

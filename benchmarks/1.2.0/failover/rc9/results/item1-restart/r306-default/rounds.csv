@@ -1,0 +1,4 @@
+round,exit_s,link_up_s,sync_full,sync_partial_ok,result,master_says
+1,1.84,11.3,1,0,full,has the whole stream, to offset 1877152833 (10 ms)
+2,1.20,11.6,1,0,full,has the whole stream, to offset 2952345901 (10 ms)
+3,1.71,11.8,1,0,full,has the whole stream, to offset 3906060319 (10 ms)

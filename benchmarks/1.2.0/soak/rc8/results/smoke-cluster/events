@@ -1,0 +1,16 @@
+1793682786.412324305 reshardfix-start round 1 try 1: 2 slots (0 1) from 10.80.1.9:7001 (995d6d75a259c993c5b0ae137ed2703ff6cff88c) to 10.80.1.8:7001 (5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b), plain redis-cli, hot keys on
+1793682801.521613545 reshardfix-reshard round 1 try 1 exit=1 after 15.34 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:9565'. The copies sent to 10.80.1.8:7001 were deleted there; MIGRATE them again
+1793682801.765500016 reshardfix-interrupted round 1 slot 0 by TRYAGAIN
+1793682802.562620499 reshardfix-before-fix slot 0: 10.80.1.9:7001 134 owner [0->-5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b] master;10.80.1.8:7001 29 - [0-<-995d6d75a259c993c5b0ae137ed2703ff6cff88c] master;10.80.1.5:7001 0 - master;10.80.1.9:7002 0 - replica;10.80.1.8:7002 134 - replica;10.80.1.5:7002 29 - replica;
+1793682803.142427546 reshardfix-fix round 1 slot 0 exit=0 after 0.56 s: >>> No single clear owner for the slot, selecting an owner by # of keys... *** Configuring 10.80.1.9:7001 as the slot owner >>> Case 2: Moving all the 0 slot keys to its owner 10.80.1.9:7001 
+1793682804.040490988 reshardfix-after-fix slot 0: 10.80.1.9:7001 163 owner master;10.80.1.8:7001 0 - master;10.80.1.5:7001 0 - master;10.80.1.9:7002 0 - replica;10.80.1.8:7002 163 - replica;10.80.1.5:7002 0 - replica;
+1793682804.049485020 reshardfix-check-after-fix open-slots=1 covered=1 errors=0
+1793682804.289967341 reshardfix-FIX-FAILED round 1 slot 0 (exit 0): a second fix, then slotfix.py if still open
+1793682804.344025057 reshardfix-fix2 exit=0 
+1793682834.974912698 reshardfix-end round 1 in 48.42 s, cluster-ok after 0.15 s
+1793682905.764390050 reshard-start 2 slots from 10.80.1.8:7001 (5e84742cd41da6b89c1f98be2f8bf1fdc35afc3b, 551266 keys) to 10.80.1.5:7001 (edf44ebed6ce18aefdc8df9b0c66bbdc7bc6c6cb) with redis-cli
+1793682906.777991604 reshard-attempt 1 exit=1 after 0.99 s: clusterManagerMoveSlot failed: TRYAGAIN a key was written while being migrated, and kept here: 'hf:5143'. The copies sent to 10.80.1.5:7001 were deleted there; MIGRATE them again
+1793682908.085911404 reshard-repair slot 5462: {"slot": 5462, "src_keys_before": 62, "dst_keys_before": 49, "importing": "OK", "migrating": "OK", "migrated": 1, "tryagain": 3, "setslot_node": {"10.80.1.5:7001": "OK", "10.80.1.8:7001": "OK", "10.80.1.9:7001": "OK", "10.80.1.9:7002": "OK", "10.80.1.8:7002": "OK", "10.80.1.5:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 111, "seconds": 0.75}
+1793682908.376369405 reshard-done in 2.60 s: 2 slots moved in 1 redis-cli runs, slots begun=2
+1793682908.758108430 reshard-end cluster-ok after 0.16 s
+1793682908.804409909 events-done

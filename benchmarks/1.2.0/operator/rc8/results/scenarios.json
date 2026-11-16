@@ -1,0 +1,182 @@
+[
+ {
+  "id": "upgrade-rep",
+  "title": "rc8: engine upgrade 1.1.3 -> 1.2.0-rc8 (replicated)",
+  "subtitle": "",
+  "loader": "loader-rep",
+  "t0": 1793682607,
+  "t1": 1793682708,
+  "t0s": "05:10:07"
+ },
+ {
+  "id": "upgrade-shd",
+  "title": "rc8: engine upgrade 1.1.3 -> 1.2.0-rc8 (sharded)",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793682716,
+  "t1": 1793682884,
+  "t0s": "05:11:56"
+ },
+ {
+  "id": "upgrade-fx",
+  "title": "rc8: engine upgrade 1.2.0-rc7 -> 1.2.0-rc8 (sharded fx)",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793682894,
+  "t1": 1793683054,
+  "t0s": "05:14:54"
+ },
+ {
+  "id": "fx-loss1",
+  "title": "rc8: fx: same-node force delete of a shard master, try 1",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793683162,
+  "t1": 1793683223,
+  "t0s": "05:19:22"
+ },
+ {
+  "id": "fx-loss2",
+  "title": "rc8: fx: same-node force delete of a shard master, try 2",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793683320,
+  "t1": 1793683381,
+  "t0s": "05:22:00"
+ },
+ {
+  "id": "fx-loss3",
+  "title": "rc8: fx: same-node force delete of a shard master, try 3",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793683480,
+  "t1": 1793683541,
+  "t0s": "05:24:40"
+ },
+ {
+  "id": "fx-loss4",
+  "title": "rc8: fx: same-node force delete of a shard master, try 4",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793683642,
+  "t1": 1793683703,
+  "t0s": "05:27:22"
+ },
+ {
+  "id": "fx-loss5",
+  "title": "rc8: fx: same-node force delete of a shard master, try 5",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793683806,
+  "t1": 1793683867,
+  "t0s": "05:30:06"
+ },
+ {
+  "id": "fx-loss6",
+  "title": "rc8: fx: same-node force delete of a shard master, try 6",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793683971,
+  "t1": 1793684032,
+  "t0s": "05:32:51"
+ },
+ {
+  "id": "fx-graceful",
+  "title": "rc8: fx: graceful delete of a shard master, same node",
+  "subtitle": "",
+  "loader": "loader-fx",
+  "t0": 1793684097,
+  "t1": 1793684158,
+  "t0s": "05:34:57"
+ },
+ {
+  "id": "restart-rc8",
+  "title": "rc8: rolling restart (KividbDbOps), sharded",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793684280,
+  "t1": 1793684452,
+  "t0s": "05:38:00"
+ },
+ {
+  "id": "failover-rc8",
+  "title": "rc8: CLUSTER FAILOVER on every shard's replica in turn",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793684482,
+  "t1": 1793684588,
+  "t0s": "05:41:22"
+ },
+ {
+  "id": "sigkill-rc8",
+  "title": "rc8: kill -9 of a shard master's engine, restarts in place",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793684623,
+  "t1": 1793684664,
+  "t0s": "05:43:43"
+ },
+ {
+  "id": "drain-rc8",
+  "title": "rc8: drain of a node with a shard master",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793684699,
+  "t1": 1793684817,
+  "t0s": "05:44:59"
+ },
+ {
+  "id": "drain-rc8-rep",
+  "title": "rc8: same drain, replicated cluster",
+  "subtitle": "",
+  "loader": "loader-rep",
+  "t0": 1793684699,
+  "t1": 1793684859,
+  "t0s": "05:44:59"
+ },
+ {
+  "id": "reshard-up-rc8",
+  "title": "rc8: spec.shards 3 -> 4 under load",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793684908,
+  "t1": 1793684992,
+  "t0s": "05:48:28"
+ },
+ {
+  "id": "reshard-down-rc8",
+  "title": "rc8: spec.shards 4 -> 3 under load",
+  "subtitle": "",
+  "loader": "loader-shd",
+  "t0": 1793685032,
+  "t1": 1793685086,
+  "t0s": "05:50:32"
+ },
+ {
+  "id": "guard-yes",
+  "title": "rc8: #42 guard: rc8, aof-ack-after-write yes",
+  "subtitle": "",
+  "loader": "loader-g-yes",
+  "t0": 1793685150,
+  "t1": 1793685360,
+  "t0s": "05:52:30"
+ },
+ {
+  "id": "guard-no",
+  "title": "rc8: #42 guard: rc8, aof-ack-after-write no",
+  "subtitle": "",
+  "loader": "loader-g-no",
+  "t0": 1793685372,
+  "t1": 1793685583,
+  "t0s": "05:56:12"
+ },
+ {
+  "id": "guard-113",
+  "title": "rc8: #42 guard: 1.1.3",
+  "subtitle": "",
+  "loader": "loader-g-113",
+  "t0": 1793685601,
+  "t1": 1793685818,
+  "t0s": "06:00:01"
+ }
+]

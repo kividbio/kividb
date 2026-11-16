@@ -1,0 +1,9 @@
+# The versions the results in this folder were produced with: semantic-kernel 1.47.0 installed from its
+# python-1.47.0 tag with its own uv.lock (cd python && uv sync --frozen --extra redis --group dev), plus
+# pandas, which its vector store integration test imports. Python 3.12.3.
+semantic-kernel[redis]==1.47.0
+redis==8.1.0
+redisvl==0.30.0
+pandas==3.1.1
+pytest==9.0.3
+pytest-asyncio==1.4.0

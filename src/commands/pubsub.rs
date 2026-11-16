@@ -110,6 +110,9 @@ fn pubsub_cmd(ctx: &mut Ctx) -> Vec<u8> {
             }
             resp_array(out)
         }
-        _ => resp_error(&format!("ERR unknown PUBSUB subcommand '{}'", sub)),
+        _ => resp_error(&format!(
+            "ERR unknown subcommand '{}'. Try PUBSUB HELP.",
+            String::from_utf8_lossy(ctx.cmd[1])
+        )),
     }
 }

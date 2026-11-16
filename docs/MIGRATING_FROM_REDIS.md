@@ -24,6 +24,14 @@ If you aren't sure whether your application runs scripts, run
 `INFO commandstats` on your Redis and look for `cmdstat_eval`,
 `cmdstat_evalsha` and `cmdstat_fcall`.
 
+Scripts and function libraries run on Lua 5.4, where Redis runs Lua 5.1.
+Most move over unchanged, and `string.format('%d', x)` takes an `x` with a
+fraction as on Redis. One thing to look for: a number divided with `/` is a
+float, written `5.0` and not `5`, so a key or a value built with `..` or
+`tostring` from a division differs. Wrap the division in `math.floor(...)`
+or format it with `string.format('%d', ...)`. The other differences, with
+workarounds, are in [SCRIPTS.md](SCRIPTS.md#lua-54-and-how-it-differs-from-rediss-lua-51).
+
 ## 2. Port and network
 
 - **KiviDB listens on 6380, not 6379**, so the two can run side by side
@@ -45,8 +53,10 @@ you already use carry over, under the same names.
 directive KiviDB doesn't know stops the server, with an error naming it.
 Start from KiviDB's own file and carry over the settings you changed.
 Directives for machinery KiviDB doesn't have (`io-threads`, `hz`,
-`tcp-keepalive`, `lazyfree-*`, `rdbcompression` and similar) are accepted
-with a warning and do nothing.
+`tcp-keepalive`, `lazyfree-lazy-eviction`, `rdbcompression` and similar)
+are accepted with a warning and do nothing. `lazyfree-lazy-expire` and
+`lazyfree-lazy-user-del` are in effect: `lazyfree-lazy-user-del yes` makes
+`DEL` free a large value in the background, as `UNLINK` does.
 
 The ones that behave differently:
 
@@ -54,10 +64,10 @@ The ones that behave differently:
 |---|---|
 | `io-threads` | Accepted, no effect: commands run on every core. `--threads` sets the worker count (default: cores − 2). |
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
-| `appendfsync` | Only `everysec`. `always` and `no` are accepted with a warning. |
+| `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
-| `client-output-buffer-limit` | Not supported: remove it. Pub/Sub subscribers get Redis's default limits. |
-| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`) and vector sets are built in. |
+| `client-output-buffer-limit` | As in Redis, but a replica has no soft limit by default. A replica's hard limit is the same setting as `repl-replica-max-backlog-bytes`, and the last line that sets it wins; during a full sync a replica is held to `repl-replica-sync-max-backlog-bytes` instead. A carried-over `client-output-buffer-limit replica 256mb 64mb 60` takes effect: it turns the 64 MB soft limit on and puts the hard limit at 256 MB. Leave it out to keep KiviDB's defaults. |
+| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets and Bloom filters (`BF.*`) are built in. |
 | Sentinel | No Sentinel. Use replication with your own failover, or cluster mode (`--cluster-enabled yes`), which fails over by itself. |
 
 Run `kividb --help` for the command-line flags.
@@ -76,7 +86,8 @@ can't be read, the server doesn't start, so you never get an empty server by
 mistake.
 
 **Replicate from Redis.** Start KiviDB with `--replicaof <redis-host>
-<redis-port>` (and `masterauth` if your Redis needs a password). It takes a
+<redis-port>` (and `masterauth` if your Redis needs a password). A Valkey
+primary works the same way. It takes a
 full sync from the Redis primary, then follows its writes. When it has
 caught up, point the application at KiviDB and run `REPLICAOF NO ONE` on it.
 This is the way to move with only a moment of downtime. Before you switch
@@ -87,18 +98,52 @@ What the RDB reader takes from Redis:
 - **Every core type:** strings, lists, sets, sorted sets, hashes (including
   hash fields with their own TTLs, Redis 7.4+), and streams (Redis 7.0 to
   8.10 encodings). Key expiry times come across too.
+- **Valkey's files, full syncs and `DUMP` payloads**, Valkey 7.2 to 9.1,
+  including Valkey 9's format (a `VALKEY080` header) and its hashes with
+  field TTLs. Valkey 9.2's format (RDB 81) is refused. So is a file a
+  Valkey cluster node saved during a slot migration into it: finish or
+  cancel the migration and save again. valkey-json documents load as JSON.
 - **RedisJSON documents**, and Lua function libraries (`FUNCTION LOAD`).
 - **Search index definitions and dictionaries are not loaded.** KiviDB keeps
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;
   `FT.CREATE` indexes the keys that are already there.
-- **Other module data** (time series, vector sets, Bloom filters, and so on)
-  is refused, and so is the whole file: KiviDB won't load part of a
-  snapshot. Move those keys with `MIGRATE` instead, or recreate them.
-- **HyperLogLogs aren't usable yet.** KiviDB's HyperLogLog registers aren't
-  in Redis's layout ([#62](https://github.com/kividbio/kividb/issues/62)), so
-  a HyperLogLog copied from Redis gives wrong counts or is refused. Rebuild
-  it with `PFADD` from the source data if you can, or leave those keys on
-  Redis for now.
+- **Bloom filters** load, and answer as they did on Redis: those of
+  RedisBloom 2.4 and later (tested with RDB files of Redis Stack 6.2, 7.2
+  and 7.4, and Redis 8.10). So do `RESTORE` and `MIGRATE` of them,
+  and `BF.SCANDUMP` chunks taken on Redis can be loaded with `BF.LOADCHUNK`.
+  The `bf-*` settings carry over in the config file. Loading is not held
+  to `bloom-max-filter-bytes`; `BF.LOADCHUNK` of a filter over 512 MiB
+  needs it raised first (Redis has no such limit). A filter Redis grew past
+  KiviDB's size limits for clients (65,536 hashes in all its layers, as a
+  filter with `EXPANSION 1` and a small capacity can reach) loads from an
+  RDB file, a full sync or `RESTORE`, and answers; KiviDB's commands add
+  to its layers but do not grow it further.
+- **Other module data** (time series, vector sets, Cuckoo filters,
+  Count-min sketches, Top-K, t-digests) is refused, and so is the whole
+  file: KiviDB won't load part of a snapshot. Move those keys with `MIGRATE`
+  instead, or recreate them.
+- **Dragonfly and KeyDB.** Their RDB files (Dragonfly: `SAVE RDB`) and
+  `DUMP` payloads load, including hash field TTLs (Dragonfly's `HSETEX` and
+  `FIELDEXPIRE`, KeyDB's `EXPIREMEMBER` on a hash) and Dragonfly's JSON
+  documents. KiviDB can replicate from a KeyDB primary, but not from one
+  in active replication (`active-replica yes`): the link ends at its first
+  `RREPLAY`, saying so; move that data by RDB file or with `MIGRATE`. Set
+  and sorted-set members with their own TTLs
+  (Dragonfly's `SADDEX`, KeyDB's `EXPIREMEMBER` on a set or sorted set) have
+  no equivalent, so the file, or the replication link, is refused with the
+  key named. Save Dragonfly's file with `--compression_mode=0`: its
+  compressed blocks aren't read. Dragonfly's own `.dfs` snapshot format
+  isn't read. KeyDB's `DUMP` leaves member TTLs out, so `RESTORE` and
+  `MIGRATE` from KeyDB can't carry them: move hashes with field TTLs by
+  file or by replication.
+- **HyperLogLogs** load and count as they did on Redis. Set
+  `hll-write-format redis` on KiviDB before you switch over: by default it
+  writes new HyperLogLogs in its own format, and `PFMERGE` or a multi-key
+  `PFCOUNT` refuses to combine those with the ones copied from Redis
+  ([PERSISTENCE.md](PERSISTENCE.md)).
+- **Keys of any bytes** move over and work as on Redis (#437, #446). An
+  ACL rule whose key pattern is not UTF-8 is not taken yet: list such rules
+  on the source before you move.
 
 ## 5. Persistence and durability
 
@@ -108,7 +153,8 @@ What the RDB reader takes from Redis:
 - **With the AOF on, a write is answered once its record is in the file**,
   as in Redis: a `kill -9` or an OOM kill loses no acknowledged write while
   the disk keeps up, and a power failure loses up to a second, as with
-  Redis's `appendfsync everysec`. A reply waits at most 5 s for its record;
+  Redis's `appendfsync everysec` (none with `appendfsync always`, which
+  syncs each write before its reply). Under `everysec`, a reply waits at most 5 s for its record;
   if the disk falls further behind than that, replies go out without their
   writes and `aof_acks_before_write` counts them, so size the AOF's disk for
   the write load. Before 1.2 a write was answered once its record was queued,

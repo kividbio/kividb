@@ -1,0 +1,80 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 29K of event 'armv8_pmuv3_0/cycles/P'
+# Event count (approx.): 81455579556
+#
+# Children      Self  Command          Shared Object      Symbol                                               
+# ........  ........  ...............  .................  .....................................................
+#
+   100.00%     0.00%  server           libc.so.6          [.] 0x0000e6d86c5a84c4
+   100.00%     0.00%  server           libc.so.6          [.] 0x0000e6d86c5a8598
+   100.00%     0.00%  server           server             [.] _start
+   100.00%     0.00%  server           server             [.] main
+    99.93%     0.27%  server           server             [.] aeMain
+    63.22%     0.00%  server           [kernel.kallsyms]  [.] el0t_64_sync
+    63.22%     0.00%  server           [kernel.kallsyms]  [.] el0t_64_sync_handler
+    63.18%     2.15%  server           [kernel.kallsyms]  [.] el0_svc
+    60.62%     0.08%  server           [kernel.kallsyms]  [.] do_el0_svc
+    60.52%     0.10%  server           [kernel.kallsyms]  [.] el0_svc_common.constprop.0
+    60.33%     0.20%  server           [kernel.kallsyms]  [.] invoke_syscall
+    51.69%     0.33%  server           server             [.] beforeSleep
+    50.08%     0.54%  server           server             [.] handleClientsWithPendingWrites
+    49.34%     1.00%  server           server             [.] writeToClient
+    47.15%     0.17%  server           server             [.] connSocketWrite
+    46.41%     0.00%  server           libc.so.6          [.] 0x0000e6d86c661e4c
+    44.27%     0.06%  server           [kernel.kallsyms]  [.] __arm64_sys_write
+    44.15%     0.11%  server           [kernel.kallsyms]  [.] ksys_write
+    43.48%     0.43%  server           [kernel.kallsyms]  [.] vfs_write
+    42.52%     0.23%  server           [kernel.kallsyms]  [.] sock_write_iter
+    42.23%     0.08%  server           [kernel.kallsyms]  [.] __sock_sendmsg
+    41.56%     0.06%  server           [kernel.kallsyms]  [.] inet_sendmsg
+    41.49%     0.28%  server           server             [.] connSocketEventHandler
+    41.36%     0.03%  server           [kernel.kallsyms]  [.] tcp_sendmsg
+    41.14%     1.03%  server           server             [.] readQueryFromClient
+    40.52%     0.80%  server           [kernel.kallsyms]  [.] tcp_sendmsg_locked
+    33.42%     0.14%  server           [kernel.kallsyms]  [.] tcp_push
+    33.23%     0.04%  server           [kernel.kallsyms]  [.] __tcp_push_pending_frames
+    33.06%     0.24%  server           [kernel.kallsyms]  [.] tcp_write_xmit
+    29.99%     0.98%  server           [kernel.kallsyms]  [.] __tcp_transmit_skb
+    27.61%     0.03%  server           [kernel.kallsyms]  [.] ip_queue_xmit
+    27.50%     0.47%  server           [kernel.kallsyms]  [.] __ip_queue_xmit
+    26.33%     1.20%  server           server             [.] processInputBuffer
+    19.82%     0.77%  server           server             [.] processCommand
+    16.34%     0.00%  server           [kernel.kallsyms]  [.] ____do_softirq
+    16.34%     0.00%  server           [kernel.kallsyms]  [.] __do_softirq
+    16.34%     0.00%  server           [kernel.kallsyms]  [.] call_on_irq_stack
+    16.34%     0.00%  server           [kernel.kallsyms]  [.] do_softirq_own_stack
+    16.34%     2.47%  server           [kernel.kallsyms]  [.] handle_softirqs
+    14.57%     0.00%  server           [kernel.kallsyms]  [.] __irq_exit_rcu
+    14.57%     0.00%  server           [kernel.kallsyms]  [.] irq_exit_rcu
+    14.11%     0.42%  server           [kernel.kallsyms]  [.] nf_hook_slow
+    13.88%     0.15%  server           [kernel.kallsyms]  [.] ip_output
+    13.74%     0.09%  server           [kernel.kallsyms]  [.] net_rx_action
+    13.64%     0.03%  server           [kernel.kallsyms]  [.] __napi_poll
+    13.48%     0.76%  server           [mlx5_core]        [.] mlx5e_napi_poll
+    13.11%     0.18%  server           [kernel.kallsyms]  [.] ip_finish_output
+    12.87%     0.07%  server           [kernel.kallsyms]  [.] __ip_finish_output
+    12.87%     0.06%  server           server             [.] connSocketRead
+    12.75%     0.18%  server           [kernel.kallsyms]  [.] __ip_local_out
+    12.64%     0.00%  server           libc.so.6          [.] 0x0000e6d86c66124c
+    12.52%     0.50%  server           [kernel.kallsyms]  [.] ip_finish_output2
+    11.96%     0.06%  server           [kernel.kallsyms]  [.] neigh_hh_output
+    11.83%     0.30%  server           [kernel.kallsyms]  [.] __dev_queue_xmit
+    10.70%     0.04%  server           [kernel.kallsyms]  [.] __arm64_sys_read
+    10.62%     0.06%  server           [kernel.kallsyms]  [.] ksys_read
+    10.45%     0.84%  server           server             [.] call
+    10.25%     0.85%  server           [nf_conntrack]     [.] nf_conntrack_in
+    10.08%     0.56%  server           [kernel.kallsyms]  [.] vfs_read
+     9.50%     0.12%  server           [nf_conntrack]     [.] ipv4_conntrack_local
+     9.41%     0.46%  server           [kernel.kallsyms]  [.] __dev_xmit_skb
+     8.83%     0.19%  server           [kernel.kallsyms]  [.] sch_direct_xmit
+     8.82%     0.00%  server           [kernel.kallsyms]  [.] el1_interrupt
+     8.82%     0.00%  server           [kernel.kallsyms]  [.] el1h_64_irq
+     8.82%     0.00%  server           [kernel.kallsyms]  [.] el1h_64_irq_handler
+     8.64%     0.13%  server           [kernel.kallsyms]  [.] sock_read_iter
+     8.49%     0.05%  server           [kernel.kallsyms]  [.] sock_recvmsg
+     7.96%     0.23%  server           [kernel.kallsyms]  [.] dev_hard_start_xmit
+     7.87%     0.52%  server           server             [.] performEvictions

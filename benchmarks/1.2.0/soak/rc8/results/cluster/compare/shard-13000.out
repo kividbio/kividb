@@ -1,0 +1,42 @@
+Traceback (most recent call last):
+  File "/home/azureuser/compare_ro.py", line 28, in <module>
+    runpy.run_path(path, run_name="__main__")
+  File "<frozen runpy>", line 286, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/azureuser/h/soak/harness/compare.py", line 166, in <module>
+    main()
+  File "/home/azureuser/h/soak/harness/compare.py", line 128, in main
+    bad, da, db = diff_keys(a, b, union)
+                  ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/azureuser/h/soak/harness/compare.py", line 84, in diff_keys
+    da.update(fetch(a, ch))
+              ^^^^^^^^^^^^
+  File "/home/azureuser/h/soak/harness/compare.py", line 45, in fetch
+    tt = p.execute()
+         ^^^^^^^^^^^
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/client.py", line 2233, in execute
+    response = conn.retry.call_with_retry(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/retry.py", line 120, in call_with_retry
+    return do()
+           ^^^^
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/client.py", line 2234, in <lambda>
+    lambda: execute(conn, stack, raise_on_error),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/client.py", line 2123, in _execute_pipeline
+    self.raise_first_error(commands, responses)
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/client.py", line 2131, in raise_first_error
+    raise r
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/client.py", line 2113, in _execute_pipeline
+    responses.append(self.parse_response(connection, args[0], **options))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/client.py", line 2142, in parse_response
+    result = Redis.parse_response(self, connection, command_name, **options)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/client.py", line 935, in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/azureuser/venv/lib/python3.12/site-packages/redis/connection.py", line 1437, in read_response
+    raise response
+redis.exceptions.MovedError: Command # 3315 (TYPE s:859810) of pipeline caused error: 11424 10.80.1.5:7002

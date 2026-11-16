@@ -10,8 +10,6 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-use ordered_float::Float;
-
 // ── Minimal RESP client ───────────────────────────────────────────────────────
 
 struct Conn {
@@ -529,10 +527,128 @@ fn test_flushdb_drops_indexes_for_selected_db_only() {
         !names.contains(&"idx:db1"),
         "FLUSHDB on db 1 must drop idx:db1, got {names:?}"
     );
+    // `FT._LIST` lists the selected database's indexes.
+    c.cmds(&["SELECT", "0"]);
+    let list = c.cmds(&["FT._LIST"]);
+    let names: Vec<&str> = list.as_array().iter().map(|v| v.as_str()).collect();
     assert!(
         names.contains(&"idx:db0"),
         "FLUSHDB on db 1 must keep idx:db0, got {names:?}"
     );
+}
+
+/// An index is its database's (#447). `FT._LIST` lists the selected
+/// database's indexes only: it used to list those of every database. From
+/// another database, an index, or an alias of one, is not there: every
+/// command that names one replies as for an index that does not exist, and
+/// none of them reads, changes or drops it.
+#[test]
+fn an_index_is_seen_only_from_its_own_database() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let names = |c: &mut Conn| -> Vec<String> {
+        let mut names: Vec<String> = c
+            .cmds(&["FT._LIST"])
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let create = |c: &mut Conn, name: &str, prefix: &str| {
+        let reply = c.cmds(&[
+            "FT.CREATE",
+            name,
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            prefix,
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "tag",
+            "TAG",
+        ]);
+        assert!(reply.is_ok(), "{reply:?}");
+    };
+    create(&mut c, "idx:zero", "z:");
+    c.cmds(&["HSET", "z:1", "t", "hello", "tag", "a"]);
+    assert!(c.cmds(&["FT.ALIASADD", "al:zero", "idx:zero"]).is_ok());
+
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert!(names(&mut c).is_empty());
+    let missing = |name: &str| format!("SEARCH_INDEX_NOT_FOUND Index not found: {name}");
+    for (args, name) in [
+        (vec!["FT.INFO", "idx:zero"], "idx:zero"),
+        (vec!["FT.SEARCH", "idx:zero", "hello"], "idx:zero"),
+        (vec!["FT.SEARCH", "al:zero", "hello"], "al:zero"),
+        (vec!["FT.AGGREGATE", "idx:zero", "*"], "idx:zero"),
+        (vec!["FT.EXPLAIN", "idx:zero", "hello"], "idx:zero"),
+        (vec!["FT.TAGVALS", "idx:zero", "tag"], "idx:zero"),
+        (vec!["FT.ALIASLIST", "idx:zero"], "idx:zero"),
+        (
+            vec!["FT.ALTER", "idx:zero", "SCHEMA", "ADD", "u", "TEXT"],
+            "idx:zero",
+        ),
+        (vec!["FT.ALIASADD", "al:one", "idx:zero"], "idx:zero"),
+        (vec!["FT.ALIASUPDATE", "al:one", "al:zero"], "al:zero"),
+        (vec!["FT.CURSOR", "READ", "idx:zero", "1"], "idx:zero"),
+        (vec!["FT.DEBUG", "POSTINGS", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "PAGE", "idx:zero", "OFF"], "idx:zero"),
+        (vec!["FT.DEBUG", "COMPACT", "idx:zero", "t"], "idx:zero"),
+        (vec!["FT.DROPINDEX", "idx:zero"], "idx:zero"),
+        (vec!["FT.DROPINDEX", "idx:zero", "DD"], "idx:zero"),
+    ] {
+        let reply = c.cmds(&args);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if *e == missing(name)),
+            "{args:?}: {reply:?}"
+        );
+    }
+    let reply = c.cmds(&["FT.ALIASDEL", "al:zero"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Alias does not exist"),
+        "{reply:?}"
+    );
+
+    create(&mut c, "idx:one", "o:");
+    c.cmds(&["HSET", "o:1", "t", "hello"]);
+    assert_eq!(names(&mut c), ["idx:one"]);
+    assert_eq!(
+        c.cmds(&["FT.SEARCH", "idx:one", "hello", "NOCONTENT"])
+            .as_array()[0]
+            .as_int(),
+        1
+    );
+    // Database 0's alias is not moved to this database's index: it used to
+    // be, and was then gone from database 0.
+    let reply = c.cmds(&["FT.ALIASUPDATE", "al:zero", "idx:one"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == "ERR Alias already exists"),
+        "{reply:?}"
+    );
+
+    // Nothing above reached database 0's index, nor its alias.
+    assert!(c.cmds(&["SELECT", "0"]).is_ok());
+    assert_eq!(names(&mut c), ["idx:zero"]);
+    for index in ["idx:zero", "al:zero"] {
+        let found = c.cmds(&["FT.SEARCH", index, "hello", "NOCONTENT"]);
+        assert_eq!(found.as_array()[0].as_int(), 1, "{index}: {found:?}");
+    }
+    assert_eq!(c.cmds(&["EXISTS", "z:1"]).as_int(), 1);
+    let reply = c.cmds(&["FT.INFO", "idx:one"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if *e == missing("idx:one")),
+        "{reply:?}"
+    );
+    assert!(c.cmds(&["FT.DROPINDEX", "idx:zero"]).is_ok());
+    assert!(names(&mut c).is_empty());
+    assert!(c.cmds(&["SELECT", "1"]).is_ok());
+    assert_eq!(names(&mut c), ["idx:one"]);
 }
 
 #[test]
@@ -1050,18 +1166,18 @@ fn test_ft_spellcheck_uses_incremental_vocab() {
         "newly added word should be found in vocabulary"
     );
 
-    // Document deletion should NOT remove tokens from vocabulary
-    // (this is intentional — see comments in vector/mod.rs).
+    // A word no document holds any more is not offered, as in RediSearch
+    // once its GC has run (#583).
     c.cmds(&["DEL", "doc:1"]);
     let r3 = c.cmds(&["FT.SPELLCHECK", "idx", "helo", "DISTANCE", "1"]);
     let arr3 = r3.as_array();
-    assert!(!arr3.is_empty(), "vocab should retain tokens after delete");
+    assert!(!arr3.is_empty(), "helo is still misspelled");
     let suggestions3 = arr3[0].as_array()[2].as_array();
     assert!(
-        suggestions3
+        !suggestions3
             .iter()
             .any(|s| s.as_array()[1].as_str() == "hello"),
-        "hello should still be in vocab after doc:1 delete (append-only vocab)"
+        "hello is in no document after doc:1 is deleted: {r3:?}"
     );
 }
 
@@ -1884,7 +2000,10 @@ fn test_ft_aggregate_sortby_limit() {
         "3",
     ]);
     let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 3, "LIMIT 3 should return 3 rows");
+    // The total is the number of groups (5), as Redis 8.10 reports it, not
+    // the page; the page is the 3 rows after it.
+    assert_eq!(arr[0].as_int(), 5, "the total is the number of groups");
+    assert_eq!(arr.len() - 1, 3, "LIMIT 3 should return 3 rows");
 
     // Rows should be sorted by category ASC: a, b, c
     let rows: Vec<&[RespValue]> = arr[1..].iter().map(|v| v.as_array()).collect();
@@ -2251,14 +2370,39 @@ fn test_ft_spellcheck_finds_suggestions() {
     assert!(!arr.is_empty(), "should have spell-check results");
 
     // Each entry: ["TERM", term, [[score, suggestion], ...]]
+    // `TERM` is a simple string, as RediSearch sends it (#590).
     let entry = arr[0].as_array();
-    assert_eq!(entry[0].as_str(), "TERM");
+    assert!(
+        matches!(&entry[0], RespValue::SimpleStr(term) if term == "TERM"),
+        "{entry:?}"
+    );
     assert_eq!(entry[1].as_str(), "helo");
     let suggestions = entry[2].as_array();
     assert!(
         !suggestions.is_empty(),
         "should have at least one suggestion"
     );
+
+    // Under RESP3 the reply is a map of `results`, a simple string too
+    // (RediSearch's `RedisModule_ReplyKV_Map(reply, "results")`).
+    let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut reader = BufReader::new(raw.try_clone().unwrap());
+    raw.write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n").unwrap();
+    raw.write_all(b"*3\r\n$13\r\nFT.SPELLCHECK\r\n$3\r\nidx\r\n$4\r\nhelo\r\n")
+        .unwrap();
+    // After what `HELLO` answers: the map, and its one name.
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "+results\r\n" {
+            break;
+        }
+        assert!(lines.len() < 512, "no `+results` in {lines:?}");
+        lines.push(line);
+    }
+    assert_eq!(lines.last().map(String::as_str), Some("%1\r\n"));
 
     // Each suggestion: [score, word]
     let found_hello = suggestions.iter().any(|s| {
@@ -2592,13 +2736,63 @@ fn test_ft_spellcheck_terms_include() {
     }
 }
 
-#[test]
-fn test_ft_hybrid_rrf_default() {
-    let port = free_port();
-    start_server(port);
-    let mut c = Conn::connect(port);
+// ── FT.HYBRID ─────────────────────────────────────────────────────────────────
+//
+// The reply is Redis 8.10's: `total_results N results [row ...] warnings [...]
+// execution_time ms`, each row a flat list of names and values.
 
-    c.cmds(&[
+/// `total_results` and the rows of an FT.HYBRID reply.
+fn hybrid_rows(reply: &RespValue) -> (i64, Vec<Vec<(String, String)>>) {
+    let top = reply.as_array();
+    assert_eq!(top.len(), 8, "{reply:?}");
+    assert_eq!(top[0].as_str(), "total_results");
+    assert_eq!(top[2].as_str(), "results");
+    assert_eq!(top[4].as_str(), "warnings");
+    assert_eq!(top[6].as_str(), "execution_time");
+    assert!(top[7].as_str().parse::<f64>().is_ok(), "{reply:?}");
+    let rows = top[3]
+        .as_array()
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .chunks(2)
+                .map(|kv| {
+                    let value = match &kv[1] {
+                        RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+                        other => other.as_str().to_string(),
+                    };
+                    (kv[0].as_str().to_string(), value)
+                })
+                .collect()
+        })
+        .collect();
+    (top[1].as_int(), rows)
+}
+
+fn row_get<'a>(row: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    row.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+fn row_names(row: &[(String, String)]) -> Vec<&str> {
+    row.iter().map(|(k, _)| k.as_str()).collect()
+}
+
+fn hybrid_keys(rows: &[Vec<(String, String)>]) -> Vec<&str> {
+    rows.iter()
+        .map(|row| row_get(row, "__key").unwrap())
+        .collect()
+}
+
+fn error_text(reply: &RespValue) -> &str {
+    match reply {
+        RespValue::Error(e) => e.trim_start_matches('-'),
+        other => panic!("not an error: {other:?}"),
+    }
+}
+
+/// An index `idx` on `d:` with a TEXT `title` and a 4-dimensional L2 `v`.
+fn hybrid_index(c: &mut Conn, extra: &[&str]) {
+    let mut args = vec![
         "FT.CREATE",
         "idx",
         "ON",
@@ -2607,8 +2801,10 @@ fn test_ft_hybrid_rrf_default() {
         "1",
         "d:",
         "SCHEMA",
-        "title",
-        "TEXT",
+    ];
+    args.extend_from_slice(&["title", "TEXT"]);
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
         "v",
         "VECTOR",
         "FLAT",
@@ -2620,10 +2816,25 @@ fn test_ft_hybrid_rrf_default() {
         "DISTANCE_METRIC",
         "L2",
     ]);
+    assert!(c.cmds(&args).is_ok());
+}
 
+/// `FT.HYBRID` with `words`, then the vector `q` as `PARAMS 2 q`.
+fn hybrid(c: &mut Conn, words: &[&str], q: &[f32]) -> RespValue {
+    let q = pack_f32(q);
+    let mut args: Vec<&[u8]> = words.iter().map(|w| w.as_bytes()).collect();
+    args.extend_from_slice(&[b"PARAMS", b"2", b"q", &q]);
+    c.cmd(&args)
+}
+
+#[test]
+fn test_ft_hybrid_rrf_default() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
     let v_match = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     let v_far = pack_f32(&[0.0, 0.0, 1.0, 0.0]);
-
     c.cmd(&[
         b"HSET",
         b"d:1",
@@ -2635,31 +2846,31 @@ fn test_ft_hybrid_rrf_default() {
     c.cmd(&[b"HSET", b"d:2", b"title", b"python tutorial", b"v", &v_far]);
     c.cmd(&[b"HSET", b"d:3", b"title", b"rust deep dive", b"v", &v_match]);
 
-    // Hybrid: text "rust" + vector near [1,0,0,0]
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    let count = arr[0].as_int();
-    assert!(count >= 2, "should rank at least the two matching docs");
-
-    // The two top results must be d:1 and d:3 (matched text AND vector).
-    let top1 = arr[1].as_str();
-    let top2 = arr[3].as_str();
-    let mut tops = vec![top1, top2];
-    tops.sort();
-    assert_eq!(tops, vec!["d:1", "d:3"], "top two should be d:1 and d:3");
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 3);
+    // Without LOAD a row is the key and the fused score.
+    assert_eq!(row_names(&rows[0]), ["__key", "__score"]);
+    let mut top = hybrid_keys(&rows)[..2].to_vec();
+    top.sort();
+    assert_eq!(
+        top,
+        ["d:1", "d:3"],
+        "matched by text and by vector: {rows:?}"
+    );
+    assert_eq!(hybrid_keys(&rows)[2], "d:2");
 }
 
 #[test]
@@ -2667,33 +2878,9 @@ fn test_ft_hybrid_linear_alpha_text_heavy() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &[]);
     let v_close = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     let v_medium = pack_f32(&[0.7, 0.7, 0.0, 0.0]);
-
     c.cmd(&[
         b"HSET",
         b"d:text",
@@ -2710,68 +2897,34 @@ fn test_ft_hybrid_linear_alpha_text_heavy() {
         b"v",
         &v_close,
     ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // alpha=0.9 → text dominates → d:text wins despite worse vector match
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"COMBINE",
-        b"LINEAR",
-        b"4",
-        b"ALPHA",
-        b"0.9",
-        b"BETA",
-        b"0.1",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(
-        arr[1].as_str(),
-        "d:text",
-        "with ALPHA=0.9 the text-matching doc should rank first"
-    );
-
-    // alpha=0.1 → vector dominates → d:vec wins despite worse text match.
-    // Note: d:vec doesn't match the SEARCH filter so it actually shouldn't
-    // appear at all — text_search filters first, vsim filters by KNN top-k.
-    // This is the right semantics: hybrid is a fusion of two SETS, not
-    // a re-ranking of a single set. Either side can produce a doc.
-    let r2 = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"COMBINE",
-        b"LINEAR",
-        b"4",
-        b"ALPHA",
-        b"0.1",
-        b"BETA",
-        b"0.9",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr2 = r2.as_array();
-    assert_eq!(
-        arr2[1].as_str(),
-        "d:vec",
-        "with BETA=0.9 the vector-closer doc should rank first"
-    );
+    let q = [1.0, 0.0, 0.0, 0.0];
+    let linear = |c: &mut Conn, alpha: &str, beta: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                "LINEAR",
+                "4",
+                "ALPHA",
+                alpha,
+                "BETA",
+                beta,
+            ],
+            &q,
+        );
+        hybrid_rows(&r).1
+    };
+    // The text weighs most: the text match first, for all its far vector.
+    assert_eq!(hybrid_keys(&linear(&mut c, "0.9", "0.1"))[0], "d:text");
+    // The vector weighs most: the closer vector first.
+    assert_eq!(hybrid_keys(&linear(&mut c, "0.1", "0.9"))[0], "d:vec");
 }
 
 #[test]
@@ -2779,78 +2932,532 @@ fn test_ft_hybrid_errors() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
+    let v = [1.0, 0.0, 0.0, 0.0];
 
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    let r = hybrid(
+        &mut c,
+        &["FT.HYBRID", "nosuch", "SEARCH", "x", "VSIM", "@v", "$q"],
+        &v,
+    );
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_INDEX_NOT_FOUND Index not found: nosuch"
+    );
+    assert!(c.cmds(&["FT.HYBRID", "idx", "SEARCH", "x"]).is_error());
     assert!(
         c.cmds(&[
             "FT.HYBRID",
-            "nosuch",
+            "idx",
+            "VSIM",
+            "@v",
+            "$q",
+            "PARAMS",
+            "2",
+            "q",
+            "x"
+        ])
+        .is_error()
+    );
+    let r = c.cmds(&[
+        "FT.HYBRID",
+        "idx",
+        "SEARCH",
+        "@title:x",
+        "VSIM",
+        "@v",
+        "$q",
+        "PARAMS",
+        "0",
+    ]);
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_PARAM_NOT_FOUND Parameter not found `q`"
+    );
+    let r = hybrid(
+        &mut c,
+        &["FT.HYBRID", "idx", "SEARCH", "x", "VSIM", "@title", "$q"],
+        &v,
+    );
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_SYNTAX Expected a VECTOR field `title`"
+    );
+    let r = c.cmds(&[
+        "FT.HYBRID",
+        "idx",
+        "SEARCH",
+        "x",
+        "VSIM",
+        "@v",
+        "$q",
+        "PARAMS",
+        "2",
+        "q",
+        "abc",
+    ]);
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_QUERY_BAD Error parsing vector similarity query: query vector blob size (3) does not match index's expected size (16)."
+    );
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
             "SEARCH",
             "x",
             "VSIM",
             "@v",
             "$q",
-            "PARAMS",
+            "KNN",
+            "4",
+            "K",
             "2",
-            "q",
-            "x"
-        ])
-        .is_error()
+            "EF_RUNTIME",
+            "10",
+        ],
+        &v,
     );
+    assert_eq!(
+        error_text(&r),
+        "SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)"
+    );
+}
 
-    assert!(c.cmds(&["FT.HYBRID", "idx", "SEARCH", "x"]).is_error());
+/// #767: `SCORER` in the `SEARCH` clause, as every RedisVL `HybridQuery`
+/// sends it. An unknown scorer, or one not in capitals, is refused with
+/// Redis's error.
+#[test]
+fn test_ft_hybrid_scorer_unknown() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
+    let v = [1.0, 0.0, 0.0, 0.0];
+    for name in ["NOPE", "tfidf"] {
+        let r = hybrid(
+            &mut c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "SCORER",
+                name,
+                "VSIM",
+                "@v",
+                "$q",
+            ],
+            &v,
+        );
+        assert_eq!(
+            error_text(&r),
+            format!("SEARCH_QUERY_BAD No such scorer {name}")
+        );
+    }
+}
 
-    assert!(
-        c.cmds(&[
-            "FT.HYBRID",
+/// The five documents of the Redis 8.10.2 comparison, as a hash or a JSON
+/// document, under an index `idx` on `d:` with `title`, `tag`, `n` and `v`.
+fn scorer_corpus(c: &mut Conn, json: bool) {
+    let docs: [(&str, &str, &str, &str, [f32; 4]); 5] = [
+        (
+            "1",
+            "rust programming rust",
+            "tech",
+            "1",
+            [1.0, 0.0, 0.0, 0.0],
+        ),
+        ("2", "python tutorial", "tech", "2", [0.0, 0.0, 1.0, 0.0]),
+        (
+            "3",
+            "rust deep dive into the rust compiler internals",
+            "tech",
+            "3",
+            [0.9, 0.1, 0.0, 0.0],
+        ),
+        (
+            "4",
+            "cooking with rust pans",
+            "food",
+            "4",
+            [0.0, 1.0, 0.0, 0.0],
+        ),
+        ("5", "compiler design", "tech", "5", [0.5, 0.5, 0.0, 0.0]),
+    ];
+    let schema: &[&str] = if json {
+        &[
+            "FT.CREATE",
             "idx",
-            "VSIM",
-            "@v",
-            "$q",
-            "PARAMS",
-            "2",
-            "q",
-            "x"
-        ])
-        .is_error()
-    );
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "d:",
+            "SCHEMA",
+            "$.title",
+            "AS",
+            "title",
+            "TEXT",
+            "$.tag",
+            "AS",
+            "tag",
+            "TAG",
+            "$.n",
+            "AS",
+            "n",
+            "NUMERIC",
+            "$.v",
+            "AS",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ]
+    } else {
+        &[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "d:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "tag",
+            "TAG",
+            "n",
+            "NUMERIC",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ]
+    };
+    assert!(c.cmds(schema).is_ok());
+    for (id, title, tag, n, v) in docs {
+        let key = format!("d:{id}");
+        if json {
+            let doc = format!(
+                r#"{{"title":"{title}","tag":"{tag}","n":{n},"v":[{},{},{},{}]}}"#,
+                v[0], v[1], v[2], v[3]
+            );
+            assert!(c.cmds(&["JSON.SET", &key, "$", &doc]).is_ok());
+        } else {
+            let packed = pack_f32(&v);
+            c.cmd(&[
+                b"HSET",
+                key.as_bytes(),
+                b"title",
+                title.as_bytes(),
+                b"tag",
+                tag.as_bytes(),
+                b"n",
+                n.as_bytes(),
+                b"v",
+                &packed,
+            ]);
+        }
+    }
+}
 
-    assert!(
-        c.cmds(&[
+/// (key, text score, vector score, fused score) of each row, as yielded.
+fn scored(rows: &[Vec<(String, String)>]) -> Vec<(String, Option<String>, Option<String>, String)> {
+    rows.iter()
+        .map(|row| {
+            let get = |name| row_get(row, name).map(str::to_string);
+            (
+                get("__key").unwrap(),
+                get("ts"),
+                get("vs"),
+                get("hs").unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn s(v: &str) -> Option<String> {
+    Some(v.to_string())
+}
+
+/// #767: the scorer `SCORER` names scores the text side, and that score is
+/// the one LINEAR fuses. Keys, order and scores as Redis 8.10.2 gives them.
+#[test]
+fn test_ft_hybrid_scorer_linear_matches_redis() {
+    for json in [false, true] {
+        scorer_linear_matches_redis(json);
+    }
+}
+
+fn scorer_linear_matches_redis(json: bool) {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    scorer_corpus(&mut c, json);
+    let linear = |c: &mut Conn, scorer: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:(rust|compiler)",
+                "SCORER",
+                scorer,
+                "YIELD_SCORE_AS",
+                "ts",
+                "VSIM",
+                "@v",
+                "$q",
+                "YIELD_SCORE_AS",
+                "vs",
+                "COMBINE",
+                "LINEAR",
+                "6",
+                "ALPHA",
+                "0.7",
+                "BETA",
+                "0.3",
+                "YIELD_SCORE_AS",
+                "hs",
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        let (total, rows) = hybrid_rows(&r);
+        assert_eq!(total, 5);
+        scored(&rows)
+    };
+    let row = |k: &str, ts: Option<String>, vs: &str, hs: &str| {
+        (k.to_string(), ts, s(vs), hs.to_string())
+    };
+    assert_eq!(
+        linear(&mut c, "BM25STD"),
+        [
+            row("d:5", s("2.0682214534"), "0.666666666667", "1.64775501738"),
+            row("d:3", s("1.88414804122"), "0.980392151921", "1.61302127443"),
+            row("d:1", s("0.754380793747"), "1", "0.828066555623"),
+            row(
+                "d:4",
+                s("0.55313926632"),
+                "0.333333333333",
+                "0.487197486424"
+            ),
+            row("d:2", None, "0.333333333333", "0.1"),
+        ]
+    );
+    assert_eq!(
+        linear(&mut c, "TFIDF"),
+        [
+            row("d:5", s("4"), "0.666666666667", "3"),
+            row("d:3", s("3"), "0.980392151921", "2.39411764558"),
+            row("d:1", s("1"), "1", "1"),
+            row("d:4", s("1"), "0.333333333333", "0.8"),
+            row("d:2", None, "0.333333333333", "0.1"),
+        ]
+    );
+    // Another scorer, another order: BM25 ranks d:3 first.
+    assert_eq!(linear(&mut c, "BM25")[0].0, "d:3");
+    assert_eq!(linear(&mut c, "DISMAX")[0].0, "d:1");
+}
+
+/// #767: RRF ranks the text side by the chosen scorer.
+#[test]
+fn test_ft_hybrid_scorer_rrf_matches_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    scorer_corpus(&mut c, false);
+    let rrf = |c: &mut Conn, scorer: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:(rust|compiler)",
+                "SCORER",
+                scorer,
+                "VSIM",
+                "@v",
+                "$q",
+                "COMBINE",
+                "RRF",
+                "4",
+                "WINDOW",
+                "20",
+                "CONSTANT",
+                "60",
+                "LOAD",
+                "2",
+                "@__key",
+                "@__score",
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        let (_, rows) = hybrid_rows(&r);
+        rows.iter()
+            .map(|row| {
+                (
+                    row_get(row, "__key").unwrap().to_string(),
+                    row_get(row, "__score").unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let got = rrf(&mut c, "TFIDF");
+    let keys: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["d:1", "d:5", "d:3", "d:4", "d:2"]);
+    assert_eq!(got[0].1, "0.032266458496");
+    assert_eq!(got[2].1, "0.0322580645161");
+    assert_eq!(got[4].1, "0.015625");
+    let keys: Vec<String> = rrf(&mut c, "BM25STD").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, ["d:1", "d:5", "d:3", "d:4", "d:2"]);
+}
+
+/// #767: `FILTER` in the `VSIM` clause limits the vector side only, as
+/// RedisVL's filtered `HybridQuery` sends it.
+#[test]
+fn test_ft_hybrid_vsim_filter_matches_redis() {
+    for json in [false, true] {
+        let port = free_port();
+        start_server(port);
+        let mut c = Conn::connect(port);
+        scorer_corpus(&mut c, json);
+        let r = hybrid(
+            &mut c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "SCORER",
+                "BM25STD",
+                "VSIM",
+                "@v",
+                "$q",
+                "FILTER",
+                "@tag:{food}",
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        let (total, rows) = hybrid_rows(&r);
+        assert_eq!(total, 3, "json {json}");
+        assert_eq!(hybrid_keys(&rows), ["d:4", "d:1", "d:3"], "json {json}");
+        let scores: Vec<&str> = rows
+            .iter()
+            .map(|r| row_get(r, "__score").unwrap())
+            .collect();
+        assert_eq!(
+            scores,
+            ["0.032266458496", "0.016393442623", "0.0161290322581"]
+        );
+
+        // Both sides filtered, as RedisVL sends a filter: one document.
+        let r = hybrid(
+            &mut c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "(~@title:(compiler) (@tag:{tech}))",
+                "SCORER",
+                "TFIDF",
+                "VSIM",
+                "@v",
+                "$q",
+                "FILTER",
+                "@tag:{food}",
+                "COMBINE",
+                "RRF",
+                "4",
+                "WINDOW",
+                "20",
+                "CONSTANT",
+                "60",
+                "LOAD",
+                "2",
+                "@title",
+                "@tag",
+                "LIMIT",
+                "0",
+                "4",
+            ],
+            &[0.0, 1.0, 0.0, 0.0],
+        );
+        let (total, rows) = hybrid_rows(&r);
+        assert_eq!(total, 5, "json {json}: {rows:?}");
+        // LOAD shows what it names, without the key or the score.
+        assert_eq!(row_names(&rows[0]), ["title", "tag"], "json {json}");
+        // The first three as Redis ranks them. (The fourth is one of the two
+        // documents only `~` admits, which FT.SEARCH scores otherwise.)
+        let titles: Vec<&str> = rows.iter().map(|r| row_get(r, "title").unwrap()).collect();
+        assert_eq!(
+            titles[..3],
+            [
+                "cooking with rust pans",
+                "compiler design",
+                "rust deep dive into the rust compiler internals",
+            ],
+            "json {json}"
+        );
+    }
+}
+
+/// #767 on a JSON index: the same scorer, the same order as on a hash.
+#[test]
+fn test_ft_hybrid_scorer_on_json() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    scorer_corpus(&mut c, true);
+    for (scorer, method, first) in [
+        ("TFIDF", "LINEAR", "compiler design"),
+        ("BM25STD", "LINEAR", "compiler design"),
+        ("TFIDF", "RRF", "rust programming rust"),
+    ] {
+        let mut words = vec![
             "FT.HYBRID",
             "idx",
             "SEARCH",
-            "@title:x",
+            "@title:(rust|compiler)",
+            "SCORER",
+            scorer,
             "VSIM",
             "@v",
             "$q",
-            "PARAMS",
-            "0"
-        ])
-        .is_error()
-    );
+            "COMBINE",
+            method,
+        ];
+        if method == "LINEAR" {
+            words.extend_from_slice(&["4", "ALPHA", "0.7", "BETA", "0.3"]);
+        } else {
+            words.push("0");
+        }
+        words.extend_from_slice(&["LOAD", "2", "@title", "@tag"]);
+        let (total, rows) = hybrid_rows(&hybrid(&mut c, &words, &[1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(total, 5, "{scorer} {method}");
+        assert_eq!(
+            row_get(&rows[0], "title"),
+            Some(first),
+            "{scorer} {method}: {rows:?}"
+        );
+        assert_eq!(row_get(&rows[4], "title"), Some("python tutorial"));
+    }
 }
 
 #[test]
@@ -2858,68 +3465,41 @@ fn test_ft_hybrid_yield_score_as() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &[]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     c.cmd(&[b"HSET", b"d:1", b"title", b"rust", b"v", &v]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"YIELD_SCORE_AS",
-        b"my_text",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"YIELD_SCORE_AS",
-        b"my_vec",
-        b"COMBINE",
-        b"RRF",
-        b"2",
-        b"YIELD_SCORE_AS",
-        b"my_hybrid",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 1);
-    let row = arr[2].as_array();
-
-    // Field-name presence test — order-agnostic.
-    // The row is a flat array of alternating field/value pairs; collect
-    // the names at even indices and assert each alias is among them.
-    let names: Vec<&str> = (0..row.len()).step_by(2).map(|i| row[i].as_str()).collect();
-    assert!(
-        names.contains(&"my_hybrid"),
-        "my_hybrid missing in {names:?}"
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "YIELD_SCORE_AS",
+            "my_text",
+            "VSIM",
+            "@v",
+            "$q",
+            "YIELD_SCORE_AS",
+            "my_vec",
+            "COMBINE",
+            "RRF",
+            "2",
+            "CONSTANT",
+            "60",
+            "YIELD_SCORE_AS",
+            "my_hybrid",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
     );
-    assert!(names.contains(&"my_text"), "my_text missing in {names:?}");
-    assert!(names.contains(&"my_vec"), "my_vec missing in {names:?}");
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1);
+    // The fused score goes by its name instead of `__score`.
+    assert_eq!(
+        row_names(&rows[0]),
+        ["my_text", "__key", "my_vec", "my_hybrid"]
+    );
+    assert_eq!(row_get(&rows[0], "my_vec"), Some("1"));
 }
 
 #[test]
@@ -2927,87 +3507,39 @@ fn test_ft_hybrid_sortby_text_score() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &[]);
     let v_close = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     let v_far = pack_f32(&[0.0, 0.0, 1.0, 0.0]);
-
     // d:a — strong text match, far vector. d:b — weak text, close vector.
     c.cmd(&[b"HSET", b"d:a", b"title", b"rust rust rust", b"v", &v_far]);
     c.cmd(&[b"HSET", b"d:b", b"title", b"rust", b"v", &v_close]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // SORTBY text_score DESC → d:a first
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"SORTBY",
-        b"2",
-        b"text_score",
-        b"DESC",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(
-        arr[1].as_str(),
-        "d:a",
-        "SORTBY text_score DESC should put d:a first"
-    );
-
-    // SORTBY vsim_score ASC (lower distance = better) → d:b first
-    let r2 = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"SORTBY",
-        b"2",
-        b"vsim_score",
-        b"ASC",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr2 = r2.as_array();
-    assert_eq!(
-        arr2[1].as_str(),
-        "d:b",
-        "SORTBY vsim_score ASC should put d:b first"
-    );
+    let sorted = |c: &mut Conn, by: &str, order: &str| {
+        let r = hybrid(
+            c,
+            &[
+                "FT.HYBRID",
+                "idx",
+                "SEARCH",
+                "@title:rust",
+                "YIELD_SCORE_AS",
+                "ts",
+                "VSIM",
+                "@v",
+                "$q",
+                "YIELD_SCORE_AS",
+                "vs",
+                "SORTBY",
+                "2",
+                by,
+                order,
+            ],
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+        hybrid_rows(&r).1
+    };
+    assert_eq!(hybrid_keys(&sorted(&mut c, "@ts", "DESC"))[0], "d:a");
+    // The vector score is a similarity: higher is closer.
+    assert_eq!(hybrid_keys(&sorted(&mut c, "@vs", "DESC"))[0], "d:b");
 }
 
 #[test]
@@ -3015,68 +3547,43 @@ fn test_ft_hybrid_sortby_loaded_field() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &["price", "NUMERIC"]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[
-        b"HSET", b"d:1", b"title", b"rust", b"price", b"100", b"v", &v,
-    ]);
-    c.cmd(&[
-        b"HSET", b"d:2", b"title", b"rust", b"price", b"200", b"v", &v,
-    ]);
-    c.cmd(&[
-        b"HSET", b"d:3", b"title", b"rust", b"price", b"50", b"v", &v,
-    ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // SORTBY price DESC — d:2 (200), d:1 (100), d:3 (50)
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"SORTBY",
-        b"2",
-        b"price",
-        b"DESC",
-        b"LOAD",
-        b"1",
-        b"@price",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[1].as_str(), "d:2");
-    assert_eq!(arr[3].as_str(), "d:1");
-    assert_eq!(arr[5].as_str(), "d:3");
+    for (key, price) in [("d:1", "100"), ("d:2", "200"), ("d:3", "50")] {
+        c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"title",
+            b"rust",
+            b"price",
+            price.as_bytes(),
+            b"v",
+            &v,
+        ]);
+    }
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+            "SORTBY",
+            "2",
+            "@price",
+            "DESC",
+            "LOAD",
+            "2",
+            "@__key",
+            "@price",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (_, rows) = hybrid_rows(&r);
+    assert_eq!(hybrid_keys(&rows), ["d:2", "d:1", "d:3"]);
 }
 
 #[test]
@@ -3084,66 +3591,30 @@ fn test_ft_hybrid_load_star_returns_all_fields() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &[]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     c.cmd(&[
         b"HSET", b"d:1", b"title", b"rust", b"author", b"Steve", b"v", &v,
     ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"*",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 1);
-    let row = arr[2].as_array();
-    // Scores first (6 elements), then loaded fields. Find "title" and "author".
-    let mut found_title = false;
-    let mut found_author = false;
-    let mut i = 0;
-    while i + 1 < row.len() {
-        match row[i].as_str() {
-            "title" => found_title = row[i + 1].as_str() == "rust",
-            "author" => found_author = row[i + 1].as_str() == "Steve",
-            _ => {}
-        }
-        i += 2;
-    }
-    assert!(found_title, "LOAD * should include title");
-    assert!(found_author, "LOAD * should include author");
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "*",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1);
+    assert_eq!(row_get(&rows[0], "title"), Some("rust"));
+    assert_eq!(row_get(&rows[0], "author"), Some("Steve"));
 }
 
 #[test]
@@ -3151,58 +3622,30 @@ fn test_ft_hybrid_load_specific_fields() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "d:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
+    hybrid_index(&mut c, &[]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
     c.cmd(&[
         b"HSET", b"d:1", b"title", b"rust", b"author", b"Steve", b"secret", b"shh", b"v", &v,
     ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:rust",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"2",
-        b"@title",
-        b"@author",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-    ]);
-    let arr = r.as_array();
-    let row = arr[2].as_array();
-
-    let names: Vec<&str> = (0..row.len()).step_by(2).map(|i| row[i].as_str()).collect();
-    assert!(names.contains(&"title"));
-    assert!(names.contains(&"author"));
-    assert!(!names.contains(&"secret"), "secret should not be loaded");
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:rust",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "2",
+            "@title",
+            "@author",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (_, rows) = hybrid_rows(&r);
+    assert_eq!(row_names(&rows[0]), ["title", "author"]);
 }
 
 #[test]
@@ -3210,146 +3653,94 @@ fn test_ft_hybrid_with_full_pipeline() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "p:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "category",
-        "TAG",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
-    let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[
-        b"HSET",
-        b"p:1",
-        b"title",
-        b"laptop",
-        b"category",
-        b"electronics",
-        b"price",
-        b"1000",
-        b"v",
-        &v,
-    ]);
-    c.cmd(&[
-        b"HSET",
-        b"p:2",
-        b"title",
-        b"phone",
-        b"category",
-        b"electronics",
-        b"price",
-        b"500",
-        b"v",
-        &v,
-    ]);
-    c.cmd(&[
-        b"HSET",
-        b"p:3",
-        b"title",
-        b"tablet",
-        b"category",
-        b"electronics",
-        b"price",
-        b"300",
-        b"v",
-        &v,
-    ]);
-    c.cmd(&[
-        b"HSET",
-        b"p:4",
-        b"title",
-        b"chair",
-        b"category",
-        b"furniture",
-        b"price",
-        b"100",
-        b"v",
-        &v,
-    ]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // GROUPBY category, REDUCE COUNT and AVG, FILTER on count.
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"*",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"2",
-        b"@category",
-        b"@price",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-        b"GROUPBY",
-        b"1",
-        b"@category",
-        b"REDUCE",
-        b"COUNT",
-        b"0",
-        b"AS",
-        b"cnt",
-        b"REDUCE",
-        b"AVG",
-        b"1",
-        b"@price",
-        b"AS",
-        b"avg_price",
-        b"FILTER",
-        b"@cnt > 1",
-    ]);
-    let arr = r.as_array();
-
-    // Only electronics has cnt > 1.
-    assert_eq!(
-        arr[0].as_int(),
-        1,
-        "FILTER @cnt > 1 should leave only electronics"
+    assert!(
+        c.cmds(&[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "p:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "category",
+            "TAG",
+            "price",
+            "NUMERIC",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ])
+        .is_ok()
     );
-    let row = arr[1].as_array();
-
-    // Find category and avg_price in the flat field array
-    let mut cat = "";
-    let mut avg = 0.0;
-    let mut cnt = 0i64;
-    let mut i = 0;
-    while i + 1 < row.len() {
-        match row[i].as_str() {
-            "category" => cat = row[i + 1].as_str(),
-            "avg_price" => avg = row[i + 1].as_str().parse().unwrap_or(0.0),
-            "cnt" => cnt = row[i + 1].as_str().parse().unwrap_or(0),
-            _ => {}
-        }
-        i += 2;
+    let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+    for (key, title, category, price) in [
+        ("p:1", "laptop", "electronics", "1000"),
+        ("p:2", "phone", "electronics", "500"),
+        ("p:3", "tablet", "electronics", "300"),
+        ("p:4", "chair", "furniture", "100"),
+    ] {
+        c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"title",
+            title.as_bytes(),
+            b"category",
+            category.as_bytes(),
+            b"price",
+            price.as_bytes(),
+            b"v",
+            &v,
+        ]);
     }
-    assert_eq!(cat, "electronics");
-    assert_eq!(cnt, 3);
+    // GROUPBY category, REDUCE COUNT and AVG, FILTER on the count.
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "*",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "2",
+            "@category",
+            "@price",
+            "GROUPBY",
+            "1",
+            "@category",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "cnt",
+            "REDUCE",
+            "AVG",
+            "1",
+            "@price",
+            "AS",
+            "avg_price",
+            "FILTER",
+            "@cnt > 1",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1, "FILTER @cnt > 1 should leave only electronics");
+    assert_eq!(row_get(&rows[0], "category"), Some("electronics"));
+    assert_eq!(row_get(&rows[0], "cnt"), Some("3"));
+    let avg: f64 = row_get(&rows[0], "avg_price").unwrap().parse().unwrap();
     assert!((avg - 600.0).abs() < 0.5, "avg should be 600, got {avg}");
 }
 
@@ -3358,78 +3749,36 @@ fn test_ft_hybrid_apply_after_fusion() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "p:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &["price", "NUMERIC"]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[b"HSET", b"p:1", b"title", b"a", b"price", b"100", b"v", &v]);
-    c.cmd(&[b"HSET", b"p:2", b"title", b"a", b"price", b"200", b"v", &v]);
-
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-
-    // APPLY without GROUPBY — adds a computed field to each per-doc row.
-    let r = c.cmd(&[
-        b"FT.HYBRID",
-        b"idx",
-        b"SEARCH",
-        b"@title:a",
-        b"VSIM",
-        b"@v",
-        b"$q",
-        b"LOAD",
-        b"1",
-        b"@price",
-        b"PARAMS",
-        b"2",
-        b"q",
-        &q,
-        b"APPLY",
-        b"@price * 1.1",
-        b"AS",
-        b"with_tax",
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 2);
-
-    // Each result row should include the with_tax field
-    let mut found_with_tax = 0;
-    for row_idx in [2, 4] {
-        let row = arr[row_idx].as_array();
-        for i in (0..row.len()).step_by(2) {
-            if row[i].as_str() == "with_tax" {
-                let v: f64 = row[i + 1].as_str().parse().unwrap();
-                assert!(v > 0.0);
-                found_with_tax += 1;
-            }
-        }
-    }
-    assert_eq!(
-        found_with_tax, 2,
-        "with_tax should be computed for both rows"
+    c.cmd(&[b"HSET", b"d:1", b"title", b"a", b"price", b"100", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:2", b"title", b"a", b"price", b"200", b"v", &v]);
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:a",
+            "VSIM",
+            "@v",
+            "$q",
+            "LOAD",
+            "1",
+            "@price",
+            "APPLY",
+            "@price * 1.1",
+            "AS",
+            "with_tax",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
     );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 2);
+    for row in &rows {
+        let v: f64 = row_get(row, "with_tax").unwrap().parse().unwrap();
+        assert!(v > 0.0);
+    }
 }
 
 #[test]
@@ -3437,60 +3786,106 @@ fn test_ft_hybrid_filter_before_groupby() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-
-    c.cmds(&[
-        "FT.CREATE",
-        "idx",
-        "ON",
-        "HASH",
-        "PREFIX",
-        "1",
-        "p:",
-        "SCHEMA",
-        "title",
-        "TEXT",
-        "price",
-        "NUMERIC",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT32",
-        "DIM",
-        "4",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-
+    hybrid_index(&mut c, &["price", "NUMERIC"]);
     let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
-    c.cmd(&[b"HSET", b"p:1", b"title", b"a", b"price", b"100", b"v", &v]);
-    c.cmd(&[b"HSET", b"p:2", b"title", b"a", b"price", b"200", b"v", &v]);
-    c.cmd(&[b"HSET", b"p:3", b"title", b"a", b"price", b"50", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:1", b"title", b"a", b"price", b"100", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:2", b"title", b"a", b"price", b"200", b"v", &v]);
+    c.cmd(&[b"HSET", b"d:3", b"title", b"a", b"price", b"50", b"v", &v]);
+    // A FILTER after the VSIM clause's own is a step after fusion. The
+    // total counts what it leaves; LIMIT pages it.
+    let r = hybrid(
+        &mut c,
+        &[
+            "FT.HYBRID",
+            "idx",
+            "SEARCH",
+            "@title:a",
+            "VSIM",
+            "@v",
+            "$q",
+            "YIELD_SCORE_AS",
+            "vs",
+            "LOAD",
+            "1",
+            "@price",
+            "FILTER",
+            "@price > 75",
+            "LIMIT",
+            "0",
+            "1",
+        ],
+        &[1.0, 0.0, 0.0, 0.0],
+    );
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 2, "FILTER @price > 75 should drop d:3");
+    assert_eq!(rows.len(), 1);
+}
 
-    let q = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+/// What the server sends back to `commands`, sent at once on a fresh
+/// connection, up to the end of the line after `until`.
+fn raw_replies(port: u16, commands: &[Vec<&[u8]>], until: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for args in commands {
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            buf.extend_from_slice(arg);
+            buf.extend_from_slice(b"\r\n");
+        }
+        stream.write_all(&buf).unwrap();
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let text = String::from_utf8_lossy(&out).into_owned();
+        if let Some(at) = text.find(until)
+            && text[at + until.len()..].contains("\r\n")
+        {
+            return text;
+        }
+        let n = stream.read(&mut chunk).expect(&text);
+        assert!(n > 0, "closed: {text}");
+        out.extend_from_slice(&chunk[..n]);
+    }
+}
 
-    // FILTER as a pipeline clause — runs after fusion, prunes per-doc rows.
-    let r = c.cmd(&[
+/// RESP3: the reply and each row are maps, and the time a double.
+#[test]
+fn test_ft_hybrid_resp3_maps() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    hybrid_index(&mut c, &[]);
+    let v = pack_f32(&[1.0, 0.0, 0.0, 0.0]);
+    c.cmd(&[b"HSET", b"d:1", b"title", b"rust", b"v", &v]);
+    let hybrid: Vec<&[u8]> = vec![
         b"FT.HYBRID",
         b"idx",
         b"SEARCH",
-        b"@title:a",
+        b"@title:rust",
         b"VSIM",
         b"@v",
         b"$q",
-        b"LOAD",
-        b"1",
-        b"@price",
         b"PARAMS",
         b"2",
         b"q",
-        &q,
-        b"FILTER",
-        b"@price > 75",
-    ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 2, "FILTER @price > 75 should drop p:3");
+        &v,
+    ];
+    let raw = raw_replies(port, &[vec![b"HELLO", b"3"], hybrid], "execution_time\r\n");
+    let reply = &raw[raw.find("%4\r\n$13\r\ntotal_results").expect(&raw)..];
+    assert!(
+        reply.starts_with(
+            "%4\r\n$13\r\ntotal_results\r\n:1\r\n$7\r\nresults\r\n*1\r\n%2\r\n$5\r\n__key\r\n$3\r\nd:1\r\n$7\r\n__score\r\n"
+        ),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("$8\r\nwarnings\r\n*0\r\n$14\r\nexecution_time\r\n,"),
+        "{reply}"
+    );
 }
 
 #[test]
@@ -3675,7 +4070,7 @@ fn test_p1_multi_vector_hybrid_with_compaction() {
         b"$q",
         b"COMBINE",
         b"RRF",
-        b"2",
+        b"0",
         b"LIMIT",
         b"0",
         b"5",
@@ -3684,8 +4079,7 @@ fn test_p1_multi_vector_hybrid_with_compaction() {
         b"q",
         &q,
     ]);
-    let arr = r.as_array();
-    let count = arr[0].as_int();
+    let (count, _) = hybrid_rows(&r);
     assert!(count > 0, "hybrid search should return results");
 
     // Delete 100 docs to cross the compaction threshold (>= 64 tombstones,
@@ -3752,14 +4146,10 @@ fn test_p1_multi_vector_hybrid_with_compaction() {
         b"q",
         &q,
     ]);
-    let arr2 = r2.as_array();
-    assert!(
-        arr2[0].as_int() > 0,
-        "search should still work post-compaction"
-    );
+    let (count, rows) = hybrid_rows(&r2);
+    assert!(count > 0, "search should still work post-compaction");
     // No deleted keys in results
-    for i in (1..arr2.len()).step_by(2) {
-        let key = arr2[i].as_str();
+    for key in hybrid_keys(&rows) {
         let n: usize = key.strip_prefix("p:").and_then(|s| s.parse().ok()).unwrap();
         assert!(n >= 100, "deleted key {key} should not appear in results");
     }
@@ -3925,9 +4315,8 @@ fn test_hybrid_picks_correct_vector_field() {
         b"q",
         &q,
     ]);
-    let arr1 = r1.as_array();
     assert_eq!(
-        arr1[1].as_str(),
+        hybrid_keys(&hybrid_rows(&r1).1)[0],
         "p:1",
         "v1-anchored hybrid (vector-only) should rank d:1 first"
     );
@@ -3953,9 +4342,8 @@ fn test_hybrid_picks_correct_vector_field() {
         b"q",
         &q,
     ]);
-    let arr2 = r2.as_array();
     assert_eq!(
-        arr2[1].as_str(),
+        hybrid_keys(&hybrid_rows(&r2).1)[0],
         "p:2",
         "v2-anchored hybrid (vector-only) should rank d:2 first"
     );
@@ -4197,22 +4585,10 @@ fn test_hybrid_full_pipeline_with_geodistance() {
         b"FILTER",
         b"@cnt > 1",
     ]);
-    let arr = r.as_array();
-    assert_eq!(arr[0].as_int(), 1, "only sf has cnt > 1");
-    let row = arr[1].as_array();
-    let mut city = "";
-    let mut cnt = 0i64;
-    let mut i = 0;
-    while i + 1 < row.len() {
-        match row[i].as_str() {
-            "city" => city = row[i + 1].as_str(),
-            "cnt" => cnt = row[i + 1].as_str().parse().unwrap_or(0),
-            _ => {}
-        }
-        i += 2;
-    }
-    assert_eq!(city, "sf");
-    assert_eq!(cnt, 2);
+    let (total, rows) = hybrid_rows(&r);
+    assert_eq!(total, 1, "only sf has cnt > 1");
+    assert_eq!(row_get(&rows[0], "city"), Some("sf"));
+    assert_eq!(row_get(&rows[0], "cnt"), Some("2"));
 }
 
 #[test]
@@ -4298,9 +4674,8 @@ fn test_alter_then_hybrid_on_new_vector_field() {
         b"q",
         &q,
     ]);
-    let arr = r.as_array();
     assert_eq!(
-        arr[1].as_str(),
+        hybrid_keys(&hybrid_rows(&r).1)[0],
         "p:2",
         "hybrid on FT.ALTER-added field should work end-to-end"
     );
@@ -4780,8 +5155,38 @@ fn a_fields_time_is_told_in_full_when_asked_at_once() {
             .as_array()[0]
             .as_int();
         assert_eq!(told.to_string(), at, "HPEXPIRETIME");
+        // Rounded up, as Redis does: (expire + 999) / 1000.
         let told = c.cmds(&["HEXPIRETIME", "h", "FIELDS", "1", "c"]).as_array()[0].as_int();
-        assert_eq!(told, 4102444800, "HEXPIRETIME");
+        assert_eq!(told, 4102444801, "HEXPIRETIME");
+    }
+}
+
+/// A field's time is rounded as Redis's `httlGenericCommand` rounds it:
+/// `HTTL` and `HEXPIRETIME` up to the next second, `HPTTL` and
+/// `HPEXPIRETIME` in whole milliseconds. Not to the nearest second, as a
+/// key's `TTL` and `EXPIRETIME` are (#557).
+#[test]
+fn a_fields_time_is_rounded_up_as_in_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["HSET", "h", "a", "x", "b", "y", "c", "z"]);
+    c.cmds(&["HPEXPIRE", "h", "1400", "FIELDS", "1", "a"]);
+    let told = c.cmds(&["HTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
+    assert_eq!(told, 2, "HTTL of 1400 ms");
+    let told = c.cmds(&["HPTTL", "h", "FIELDS", "1", "a"]).as_array()[0].as_int();
+    assert!((1000..=1400).contains(&told), "HPTTL {told}");
+    // A whole second reads back as itself; a millisecond past it, as the
+    // next.
+    for (at, secs) in [("4102444800000", 4102444800), ("4102444800001", 4102444801)] {
+        c.cmds(&["HPEXPIREAT", "h", at, "FIELDS", "1", "b"]);
+        let told = c.cmds(&["HEXPIRETIME", "h", "FIELDS", "1", "b"]).as_array()[0].as_int();
+        assert_eq!(told, secs, "HEXPIRETIME of {at}");
+        let told = c
+            .cmds(&["HPEXPIRETIME", "h", "FIELDS", "1", "b"])
+            .as_array()[0]
+            .as_int();
+        assert_eq!(told.to_string(), at, "HPEXPIRETIME of {at}");
     }
 }
 
@@ -5717,4 +6122,754 @@ fn test_aggregate_with_knn_keeps_the_nearest() {
     let rows = r.as_array();
     assert_eq!(rows.len(), 2, "{r:?}");
     assert_eq!(rows[1].as_array()[1].as_str(), "near", "{r:?}");
+}
+
+// ── A document that leaves its key leaves its indexes (#619) ────────────────
+
+/// The keys of an `FT.SEARCH … NOCONTENT` reply, sorted.
+fn found(reply: &RespValue) -> Vec<String> {
+    let mut keys: Vec<String> = reply.as_array()[1..]
+        .iter()
+        .map(|key| key.as_str().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A server with three indexes over `doc:`: one of vectors alone and one of
+/// words, `ON HASH`, and one of vectors and words `ON JSON`.
+fn server_with_indexes_over_doc() -> Conn {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for create in [
+        "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+         DISTANCE_METRIC L2",
+        "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT kind TAG",
+        "FT.CREATE json ON JSON PREFIX 1 doc: SCHEMA $.title AS title TEXT $.vec AS vec VECTOR \
+         FLAT 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC L2",
+    ] {
+        let create: Vec<&str> = create.split_whitespace().collect();
+        assert!(c.cmds(&create).is_ok(), "{create:?}");
+    }
+    c
+}
+
+/// The documents of `doc:` each index finds: the hash indexes by a KNN, by
+/// a word and by a tag, the JSON index by a KNN and by a word.
+fn indexed(c: &mut Conn) -> [Vec<String>; 5] {
+    let query = pack_f32(&[0.0, 0.0]);
+    let mut nearest = |index: &str| {
+        found(&c.cmd(&[
+            b"FT.SEARCH",
+            index.as_bytes(),
+            b"*=>[KNN 10 @vec $q]",
+            b"PARAMS",
+            b"2",
+            b"q",
+            &query,
+            b"NOCONTENT",
+            b"DIALECT",
+            b"2",
+        ]))
+    };
+    let (vectors, json_vectors) = (nearest("vectors"), nearest("json"));
+    [
+        vectors,
+        found(&c.cmds(&["FT.SEARCH", "words", "hello", "NOCONTENT"])),
+        found(&c.cmds(&["FT.SEARCH", "words", "@kind:{book}", "NOCONTENT"])),
+        json_vectors,
+        found(&c.cmds(&["FT.SEARCH", "json", "hello", "NOCONTENT"])),
+    ]
+}
+
+/// Put a hash document under `key`, over whatever is there.
+fn hash_document(c: &mut Conn, key: &str) {
+    c.cmds(&["DEL", key]);
+    let vec = pack_f32(&[1.0, 1.0]);
+    let wrote = c.cmd(&[
+        b"HSET",
+        key.as_bytes(),
+        b"vec",
+        &vec,
+        b"title",
+        b"hello",
+        b"kind",
+        b"book",
+    ]);
+    assert_eq!(wrote.as_int(), 3);
+}
+
+/// Put a JSON document under `key`, over whatever is there.
+fn json_document(c: &mut Conn, key: &str) {
+    c.cmds(&["DEL", key]);
+    assert!(
+        c.cmds(&["JSON.SET", key, "$", r#"{"title":"hello","vec":[1,1]}"#])
+            .is_ok()
+    );
+}
+
+/// What the commands below read from: a string, a list, a set, a sorted
+/// set, a set of places, and a JSON document outside the indexes.
+fn sources(c: &mut Conn) {
+    c.cmds(&["SET", "str", "abc"]);
+    c.cmds(&["RPUSH", "list", "3", "1", "2"]);
+    c.cmds(&["SADD", "set", "a", "b"]);
+    c.cmds(&["ZADD", "zset", "1", "a", "2", "b"]);
+    c.cmds(&["GEOADD", "geo", "13.361389", "38.115556", "Palermo"]);
+    c.cmds(&["JSON.SET", "other", "$", r#"{"title":"hello","vec":[1,1]}"#]);
+}
+
+/// Every command that can put a value of another kind over a document, or
+/// delete it: each with a reply that is not an error, so that a case here
+/// cannot pass by having done nothing.
+const WRITES_OVER_A_DOCUMENT: &[&str] = &[
+    "SET doc:1 x",
+    "SET doc:1 x EX 100",
+    "SETEX doc:1 100 x",
+    "PSETEX doc:1 100000 x",
+    "MSET doc:1 x other:2 y",
+    "MSETEX 1 doc:1 x EX 100",
+    "BITOP NOT doc:1 str",
+    "SORT list STORE doc:1",
+    "SORT nothing STORE doc:1",
+    "SUNIONSTORE doc:1 set",
+    "SUNIONSTORE doc:1 nothing",
+    "SINTERSTORE doc:1 set",
+    "SDIFFSTORE doc:1 set",
+    "ZUNIONSTORE doc:1 1 zset",
+    "ZUNIONSTORE doc:1 1 nothing",
+    "ZINTERSTORE doc:1 1 zset",
+    "ZDIFFSTORE doc:1 1 zset",
+    "ZRANGESTORE doc:1 zset 0 -1",
+    "ZRANGESTORE doc:1 nothing 0 -1",
+    "GEOSEARCHSTORE doc:1 geo FROMLONLAT 15 37 BYRADIUS 200 km",
+    "GEOSEARCHSTORE doc:1 nothing FROMLONLAT 15 37 BYRADIUS 200 km",
+    "GEORADIUS geo 15 37 200 km STORE doc:1",
+    "GEORADIUS geo 15 37 200 km STOREDIST doc:1",
+    "RENAME str doc:1",
+    "COPY str doc:1 REPLACE",
+    "DEL doc:1",
+    "UNLINK doc:1",
+    "RENAME doc:1 elsewhere",
+    "MOVE doc:1 1",
+];
+
+/// A command that puts a string, a list, a set or a sorted set over a hash,
+/// or deletes it, takes the document out of every index: of vectors, of
+/// words, of tags. A KNN went on returning the key after `SETEX`, `MSET`,
+/// `BITOP`, and every command that stores a result (#619).
+#[test]
+fn a_hash_written_over_by_any_command_leaves_its_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    let gone: [Vec<String>; 5] = Default::default();
+    for command in WRITES_OVER_A_DOCUMENT {
+        sources(&mut c);
+        hash_document(&mut c, "doc:1");
+        let [vectors, words, tags, ..] = indexed(&mut c);
+        assert_eq!(
+            [vectors, words, tags],
+            [["doc:1"], ["doc:1"], ["doc:1"]],
+            "before {command}"
+        );
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = c.cmds(&args);
+        assert!(!reply.is_error(), "{command}: {reply:?}");
+        assert_eq!(indexed(&mut c), gone, "after {command}");
+        c.cmds(&["SELECT", "1"]);
+        c.cmds(&["DEL", "doc:1"]);
+        c.cmds(&["SELECT", "0"]);
+    }
+}
+
+/// The same of a JSON document.
+#[test]
+fn a_json_document_written_over_by_any_command_leaves_its_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    let gone: [Vec<String>; 5] = Default::default();
+    for command in WRITES_OVER_A_DOCUMENT {
+        sources(&mut c);
+        json_document(&mut c, "doc:1");
+        let [.., vectors, words] = indexed(&mut c);
+        assert_eq!([vectors, words], [["doc:1"], ["doc:1"]], "before {command}");
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = c.cmds(&args);
+        assert!(!reply.is_error(), "{command}: {reply:?}");
+        assert_eq!(indexed(&mut c), gone, "after {command}");
+        c.cmds(&["SELECT", "1"]);
+        c.cmds(&["DEL", "doc:1"]);
+        c.cmds(&["SELECT", "0"]);
+    }
+}
+
+/// A document of one kind put over one of the other leaves the indexes of
+/// the kind it was, and is in those of the kind it is.
+#[test]
+fn a_document_written_over_by_one_of_another_kind_changes_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    sources(&mut c);
+    hash_document(&mut c, "doc:1");
+    assert_eq!(c.cmds(&["COPY", "other", "doc:1", "REPLACE"]).as_int(), 1);
+    let [vectors, words, tags, json_vectors, json_words] = indexed(&mut c);
+    assert!(vectors.is_empty() && words.is_empty() && tags.is_empty());
+    assert_eq!([json_vectors, json_words], [["doc:1"], ["doc:1"]]);
+
+    hash_document(&mut c, "doc:2");
+    assert!(c.cmds(&["RENAME", "doc:2", "doc:1"]).is_ok());
+    let [vectors, words, tags, json_vectors, json_words] = indexed(&mut c);
+    assert_eq!([vectors, words, tags], [["doc:1"], ["doc:1"], ["doc:1"]]);
+    assert!(json_vectors.is_empty() && json_words.is_empty());
+}
+
+/// A command that takes a document out of its key and puts one back, or
+/// that leaves it where it is, leaves it in its indexes.
+#[test]
+fn a_document_that_stays_under_its_key_stays_in_its_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    sources(&mut c);
+    let there = [vec!["doc:1".to_string()], vec!["doc:1".to_string()]];
+    let payload = {
+        hash_document(&mut c, "doc:1");
+        match c.cmds(&["DUMP", "doc:1"]) {
+            RespValue::Bulk(payload) => payload,
+            other => panic!("DUMP: {other:?}"),
+        }
+    };
+    let steps: &[&[&[u8]]] = &[
+        &[b"HSET", b"doc:1", b"more", b"fields"],
+        &[b"HDEL", b"doc:1", b"kind"],
+        &[b"EXPIRE", b"doc:1", b"1000"],
+        &[b"PERSIST", b"doc:1"],
+        &[b"RESTORE", b"doc:1", b"0", &payload, b"REPLACE"],
+        &[b"COPY", b"doc:1", b"doc:1", b"REPLACE"],
+        &[b"SET", b"doc:1", b"x", b"NX"],
+        &[b"SETNX", b"doc:1", b"x"],
+        &[b"MSETNX", b"doc:1", b"x"],
+        &[b"SUNIONSTORE", b"elsewhere", b"set"],
+        &[b"MOVE", b"doc:1", b"0"],
+    ];
+    for step in steps {
+        hash_document(&mut c, "doc:1");
+        c.cmd(step);
+        let [vectors, words, ..] = indexed(&mut c);
+        assert_eq!(
+            [vectors, words],
+            there,
+            "after {}",
+            String::from_utf8_lossy(&step.concat())
+        );
+    }
+
+    // To a database that has the key already: it stays where it was.
+    hash_document(&mut c, "doc:1");
+    c.cmds(&["SELECT", "1"]);
+    c.cmds(&["SET", "doc:1", "taken"]);
+    c.cmds(&["SELECT", "0"]);
+    assert_eq!(c.cmds(&["MOVE", "doc:1", "1"]).as_int(), 0);
+    let [vectors, words, ..] = indexed(&mut c);
+    assert_eq!([vectors, words], there, "after a MOVE that moved nothing");
+
+    // Out and back in one transaction.
+    hash_document(&mut c, "doc:1");
+    c.cmds(&["MULTI"]);
+    c.cmds(&["RENAME", "doc:1", "away"]);
+    c.cmds(&["RENAME", "away", "doc:1"]);
+    assert_eq!(c.cmds(&["EXEC"]).as_array().len(), 2);
+    let [vectors, words, ..] = indexed(&mut c);
+    assert_eq!([vectors, words], there, "after a transaction");
+
+    // Deleted and written again, as a document and then as a string.
+    c.cmds(&["MULTI"]);
+    c.cmds(&["DEL", "doc:1"]);
+    c.cmds(&["HSET", "doc:1", "title", "hello"]);
+    c.cmds(&["EXEC"]);
+    assert_eq!(indexed(&mut c)[1], ["doc:1"]);
+    c.cmds(&["MULTI"]);
+    c.cmds(&["DEL", "doc:1"]);
+    c.cmds(&["SETEX", "doc:1", "100", "x"]);
+    c.cmds(&["EXEC"]);
+    assert!(indexed(&mut c)[1].is_empty());
+}
+
+#[test]
+fn a_document_written_over_leaves_an_index_made_after_the_others_were_dropped() {
+    let mut c = server_with_indexes_over_doc();
+    for index in ["vectors", "words", "json"] {
+        assert!(c.cmds(&["FT.DROPINDEX", index]).is_ok(), "{index}");
+    }
+    // No index is left: a document written over has none to leave.
+    hash_document(&mut c, "doc:1");
+    assert!(c.cmds(&["SETEX", "doc:1", "100", "x"]).is_ok());
+
+    let create = "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 \
+                  DIM 2 DISTANCE_METRIC L2";
+    let create: Vec<&str> = create.split_whitespace().collect();
+    assert!(c.cmds(&create).is_ok());
+    let query = pack_f32(&[0.0, 0.0]);
+    let nearest = |c: &mut Conn| {
+        found(&c.cmd(&[
+            b"FT.SEARCH",
+            b"vectors",
+            b"*=>[KNN 10 @vec $q]",
+            b"PARAMS",
+            b"2",
+            b"q",
+            &query,
+            b"NOCONTENT",
+            b"DIALECT",
+            b"2",
+        ]))
+    };
+    assert!(nearest(&mut c).is_empty());
+    hash_document(&mut c, "doc:1");
+    assert_eq!(nearest(&mut c), ["doc:1"]);
+    assert!(c.cmds(&["SETEX", "doc:1", "100", "x"]).is_ok());
+    assert!(nearest(&mut c).is_empty(), "the index still holds doc:1");
+}
+
+/// Wait for every index to have let go of every document: at once for a
+/// command that deletes, within a sweep for a time to live.
+fn wait_until_none_is_indexed(c: &mut Conn, after: &str) {
+    let gone: [Vec<String>; 5] = Default::default();
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    while indexed(c) != gone {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "after {after}: {:?}",
+            indexed(c)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A document leaves its indexes too when its time to live ends, when its
+/// last field goes, and when its database is swapped for another: none of
+/// these says so itself any more, the store does.
+#[test]
+fn a_document_that_expires_or_is_emptied_leaves_its_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    for command in [
+        "PEXPIRE doc:1 1",
+        "EXPIRE doc:1 -1",
+        "PEXPIREAT doc:1 1",
+        "SET doc:1 x PXAT 1",
+        "HDEL doc:1 vec title kind",
+        "HPEXPIRE doc:1 1 FIELDS 3 vec title kind",
+        "HGETDEL doc:1 FIELDS 3 vec title kind",
+        "SWAPDB 0 1",
+    ] {
+        hash_document(&mut c, "doc:1");
+        let [vectors, words, tags, ..] = indexed(&mut c);
+        assert_eq!(
+            [vectors, words, tags],
+            [["doc:1"], ["doc:1"], ["doc:1"]],
+            "before {command}"
+        );
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = c.cmds(&args);
+        assert!(!reply.is_error(), "{command}: {reply:?}");
+        wait_until_none_is_indexed(&mut c, command);
+        c.cmds(&["SELECT", "1"]);
+        c.cmds(&["DEL", "doc:1"]);
+        c.cmds(&["SELECT", "0"]);
+    }
+    for command in ["PEXPIRE doc:1 1", "JSON.DEL doc:1 $", "JSON.FORGET doc:1"] {
+        json_document(&mut c, "doc:1");
+        let [.., vectors, words] = indexed(&mut c);
+        assert_eq!([vectors, words], [["doc:1"], ["doc:1"]], "before {command}");
+        let args: Vec<&str> = command.split_whitespace().collect();
+        let reply = c.cmds(&args);
+        assert!(!reply.is_error(), "{command}: {reply:?}");
+        wait_until_none_is_indexed(&mut c, command);
+    }
+}
+
+/// `FT.DROPINDEX … DD` deletes the index's documents: they leave the other
+/// indexes that cover them.
+#[test]
+fn a_document_deleted_with_its_index_leaves_the_other_indexes() {
+    let mut c = server_with_indexes_over_doc();
+    hash_document(&mut c, "doc:1");
+    assert!(c.cmds(&["FT.DROPINDEX", "words", "DD"]).is_ok());
+    assert_eq!(c.cmds(&["EXISTS", "doc:1"]).as_int(), 0);
+    let query = pack_f32(&[0.0, 0.0]);
+    let nearest = c.cmd(&[
+        b"FT.SEARCH",
+        b"vectors",
+        b"*=>[KNN 10 @vec $q]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &query,
+        b"NOCONTENT",
+        b"DIALECT",
+        b"2",
+    ]);
+    assert!(found(&nearest).is_empty(), "{nearest:?}");
+}
+
+/// `FLUSHDB` and `FLUSHALL` take the indexes with the documents. An index
+/// made afterwards is told of what leaves it, as one made first is.
+#[test]
+fn a_document_written_over_leaves_an_index_made_after_a_flush() {
+    let mut c = server_with_indexes_over_doc();
+    for flush in ["FLUSHDB", "FLUSHALL"] {
+        hash_document(&mut c, "doc:1");
+        assert!(c.cmds(&[flush]).is_ok());
+        assert_eq!(c.cmds(&["FT._LIST"]).as_array().len(), 0, "{flush}");
+
+        let create = "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE \
+                      FLOAT32 DIM 2 DISTANCE_METRIC L2";
+        let create: Vec<&str> = create.split_whitespace().collect();
+        assert!(c.cmds(&create).is_ok());
+        let query = pack_f32(&[0.0, 0.0]);
+        let nearest = |c: &mut Conn| {
+            found(&c.cmd(&[
+                b"FT.SEARCH",
+                b"vectors",
+                b"*=>[KNN 10 @vec $q]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &query,
+                b"NOCONTENT",
+                b"DIALECT",
+                b"2",
+            ]))
+        };
+        assert!(nearest(&mut c).is_empty(), "after {flush}");
+        hash_document(&mut c, "doc:1");
+        assert_eq!(nearest(&mut c), ["doc:1"], "after {flush}");
+        assert!(c.cmds(&["SETEX", "doc:1", "100", "x"]).is_ok());
+        assert!(nearest(&mut c).is_empty(), "after {flush} and SETEX");
+    }
+}
+
+/// Searches run while other clients write documents, write over them and
+/// delete them. A document nothing touches is in every reply, no reply is
+/// an error, and once the writers are done the indexes hold the documents
+/// that are left and no others.
+#[test]
+fn searches_alongside_writes_over_documents_see_what_is_there() {
+    const WRITERS: usize = 3;
+    const KEYS: usize = 8;
+    const ROUNDS: usize = 150;
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for create in [
+        "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+         DISTANCE_METRIC L2",
+        "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT kind TAG",
+    ] {
+        let create: Vec<&str> = create.split_whitespace().collect();
+        assert!(c.cmds(&create).is_ok(), "{create:?}");
+    }
+    let steady: Vec<String> = (0..4).map(|i| format!("doc:steady{i}")).collect();
+    for key in &steady {
+        hash_document(&mut c, key);
+    }
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let searchers: Vec<_> = (0..2)
+        .map(|_| {
+            let (done, steady) = (std::sync::Arc::clone(&done), steady.clone());
+            thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let query = pack_f32(&[0.0, 0.0]);
+                let mut searches = 0usize;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let nearest = c.cmd(&[
+                        b"FT.SEARCH",
+                        b"vectors",
+                        b"*=>[KNN 100 @vec $q]",
+                        b"PARAMS",
+                        b"2",
+                        b"q",
+                        &query,
+                        b"NOCONTENT",
+                        b"LIMIT",
+                        b"0",
+                        b"100",
+                        b"DIALECT",
+                        b"2",
+                    ]);
+                    let worded = c.cmds(&[
+                        "FT.SEARCH",
+                        "words",
+                        "hello",
+                        "NOCONTENT",
+                        "LIMIT",
+                        "0",
+                        "100",
+                    ]);
+                    let tagged = c.cmds(&[
+                        "FT.SEARCH",
+                        "words",
+                        "@kind:{book}",
+                        "NOCONTENT",
+                        "LIMIT",
+                        "0",
+                        "100",
+                    ]);
+                    for reply in [&nearest, &worded, &tagged] {
+                        assert!(!reply.is_error(), "{reply:?}");
+                        let keys = found(reply);
+                        for key in &steady {
+                            assert!(keys.contains(key), "{key} is not in {keys:?}");
+                        }
+                    }
+                    searches += 1;
+                }
+                searches
+            })
+        })
+        .collect();
+
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                for round in 0..ROUNDS {
+                    for key in 0..KEYS {
+                        let name = format!("doc:w{writer}k{key}");
+                        hash_document(&mut c, &name);
+                        // The last round leaves the even keys documents.
+                        if round + 1 == ROUNDS && key % 2 == 0 {
+                            continue;
+                        }
+                        let reply = match (round + key) % 4 {
+                            0 => c.cmds(&["SET", &name, "x"]),
+                            1 => c.cmds(&["DEL", &name]),
+                            2 => c.cmds(&["SETEX", &name, "100", "x"]),
+                            _ => c.cmds(&["SUNIONSTORE", &name, "nothing"]),
+                        };
+                        assert!(!reply.is_error(), "{reply:?}");
+                    }
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().expect("a writer");
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for searcher in searchers {
+        assert!(searcher.join().expect("a searcher") > 0);
+    }
+
+    let mut left = steady;
+    for writer in 0..WRITERS {
+        for key in (0..KEYS).step_by(2) {
+            left.push(format!("doc:w{writer}k{key}"));
+        }
+    }
+    left.sort();
+    let query = pack_f32(&[0.0, 0.0]);
+    let nearest = found(&c.cmd(&[
+        b"FT.SEARCH",
+        b"vectors",
+        b"*=>[KNN 100 @vec $q]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &query,
+        b"NOCONTENT",
+        b"LIMIT",
+        b"0",
+        b"100",
+        b"DIALECT",
+        b"2",
+    ]));
+    assert_eq!(nearest, left, "the index of vectors");
+    for query in ["hello", "@kind:{book}"] {
+        let reply = c.cmds(&[
+            "FT.SEARCH",
+            "words",
+            query,
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "100",
+        ]);
+        assert_eq!(found(&reply), left, "{query}");
+    }
+}
+
+/// `FT.INFO`'s `num_docs` of the three indexes of
+/// [`server_with_indexes_over_doc`]: the vectors, the words, the JSON one.
+fn num_docs(c: &mut Conn) -> [i64; 3] {
+    ["vectors", "words", "json"].map(|index| {
+        let info = c.cmds(&["FT.INFO", index]);
+        let info = info.as_array();
+        let at = info
+            .iter()
+            .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+            .unwrap_or_else(|| panic!("no num_docs for {index}: {info:?}"));
+        info[at + 1].as_int()
+    })
+}
+
+/// `num_docs` is read off the documents each index holds, an index of
+/// vectors alone too, not counted by a walk of the database (#590): it
+/// follows every way a document comes under a key of the index or leaves
+/// it.
+#[test]
+fn num_docs_follows_the_documents_of_each_index() {
+    let mut c = server_with_indexes_over_doc();
+    assert_eq!(num_docs(&mut c), [0, 0, 0]);
+    hash_document(&mut c, "doc:1");
+    hash_document(&mut c, "doc:2");
+    json_document(&mut c, "doc:3");
+    hash_document(&mut c, "other:1");
+    let step = |c: &mut Conn, commands: &[&str], docs: [i64; 3]| {
+        for command in commands {
+            let args: Vec<&str> = command.split_whitespace().collect();
+            let reply = c.cmds(&args);
+            assert!(!reply.is_error(), "{command}: {reply:?}");
+        }
+        // An expiry takes its key out a moment after its time.
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while num_docs(c) != docs {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "after {commands:?}: {:?}, not {docs:?}",
+                num_docs(c)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    step(&mut c, &[], [2, 2, 1]);
+    // Written again, and a field at a time: the same document.
+    step(
+        &mut c,
+        &["HSET doc:1 title again", "HDEL doc:1 kind"],
+        [2, 2, 1],
+    );
+    step(&mut c, &["JSON.SET doc:3 $.title \"again\""], [2, 2, 1]);
+    // Written over, and deleted.
+    step(&mut c, &["SET doc:2 x"], [1, 1, 1]);
+    step(&mut c, &["DEL doc:2"], [1, 1, 1]);
+    hash_document(&mut c, "doc:2");
+    step(&mut c, &[], [2, 2, 1]);
+    step(&mut c, &["UNLINK doc:2 doc:3"], [1, 1, 0]);
+    json_document(&mut c, "doc:3");
+    step(&mut c, &[], [1, 1, 1]);
+    // Renamed out of the index's keys and back, and over another kind.
+    step(&mut c, &["RENAME doc:1 away:1"], [0, 0, 1]);
+    step(&mut c, &["RENAME away:1 doc:1"], [1, 1, 1]);
+    step(&mut c, &["RENAME other:1 doc:3"], [2, 2, 0]);
+    step(
+        &mut c,
+        &["COPY doc:3 doc:4", "COPY doc:3 other:2"],
+        [3, 3, 0],
+    );
+    // To another database, whose keys the indexes do not cover, and back.
+    step(&mut c, &["MOVE doc:4 1"], [2, 2, 0]);
+    step(&mut c, &["SELECT 1", "MOVE doc:4 0", "SELECT 0"], [3, 3, 0]);
+    // The index of vectors alone is given a field that needs ids: it
+    // goes on counting the documents it had.
+    step(
+        &mut c,
+        &["FT.ALTER vectors SKIPINITIALSCAN SCHEMA ADD title TEXT"],
+        [3, 3, 0],
+    );
+    // A time to live that ends, of the key and of every field of it.
+    step(&mut c, &["PEXPIRE doc:4 1"], [2, 2, 0]);
+    step(
+        &mut c,
+        &["HPEXPIRE doc:3 1 FIELDS 3 vec title kind"],
+        [1, 1, 0],
+    );
+    json_document(&mut c, "doc:5");
+    step(&mut c, &["PEXPIRE doc:5 1"], [1, 1, 0]);
+    json_document(&mut c, "doc:5");
+    step(&mut c, &["JSON.DEL doc:5 $"], [1, 1, 0]);
+    // The databases swapped: the indexes hold what theirs holds now.
+    step(&mut c, &["SWAPDB 0 1"], [0, 0, 0]);
+    hash_document(&mut c, "doc:6");
+    step(&mut c, &["SWAPDB 0 1"], [1, 1, 0]);
+    step(&mut c, &["SWAPDB 0 1"], [1, 1, 0]);
+    // An index made over documents that are there counts them.
+    json_document(&mut c, "doc:7");
+    for index in ["vectors", "json"] {
+        assert!(c.cmds(&["FT.DROPINDEX", index]).is_ok());
+    }
+    step(
+        &mut c,
+        &[
+            "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE json ON JSON PREFIX 1 doc: SCHEMA $.vec AS vec VECTOR FLAT 6 TYPE FLOAT32 \
+             DIM 2 DISTANCE_METRIC L2",
+        ],
+        [1, 1, 1],
+    );
+    // A flush takes the indexes with the documents: made again, they hold
+    // the documents written since.
+    assert!(c.cmds(&["FLUSHDB"]).is_ok());
+    hash_document(&mut c, "doc:8");
+    step(
+        &mut c,
+        &[
+            "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT kind TAG",
+            "FT.CREATE json ON JSON PREFIX 1 doc: SCHEMA $.vec AS vec VECTOR FLAT 6 TYPE FLOAT32 \
+             DIM 2 DISTANCE_METRIC L2",
+        ],
+        [1, 1, 0],
+    );
+    // `FLUSHALL` as well.
+    assert!(c.cmds(&["FLUSHALL"]).is_ok());
+    hash_document(&mut c, "doc:8");
+    hash_document(&mut c, "doc:10");
+    step(
+        &mut c,
+        &[
+            "FT.CREATE vectors ON HASH PREFIX 1 doc: SCHEMA vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+             DISTANCE_METRIC L2",
+            "FT.CREATE words ON HASH PREFIX 1 doc: SCHEMA title TEXT kind TAG",
+            "FT.CREATE json ON JSON PREFIX 1 doc: SCHEMA $.vec AS vec VECTOR FLAT 6 TYPE FLOAT32 \
+             DIM 2 DISTANCE_METRIC L2",
+        ],
+        [2, 2, 0],
+    );
+    step(&mut c, &["DEL doc:10"], [1, 1, 0]);
+    // An index told not to look at the documents that are there counts
+    // those written from then on, as RediSearch does.
+    for (index, schema) in [
+        (
+            "late",
+            "vec VECTOR FLAT 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC L2",
+        ),
+        ("late-words", "title TEXT"),
+    ] {
+        let create =
+            format!("FT.CREATE {index} ON HASH PREFIX 1 doc: SKIPINITIALSCAN SCHEMA {schema}");
+        let create: Vec<&str> = create.split_whitespace().collect();
+        assert!(c.cmds(&create).is_ok(), "{create:?}");
+    }
+    let late = |c: &mut Conn| {
+        ["late", "late-words"].map(|index| {
+            let info = c.cmds(&["FT.INFO", index]);
+            let info = info.as_array();
+            let at = info
+                .iter()
+                .position(|item| matches!(item, RespValue::Bulk(name) if name == b"num_docs"))
+                .unwrap();
+            info[at + 1].as_int()
+        })
+    };
+    assert_eq!(late(&mut c), [0, 0]);
+    hash_document(&mut c, "doc:9");
+    assert_eq!(late(&mut c), [1, 1]);
+    step(&mut c, &[], [2, 2, 0]);
+    // A vector field added walks the documents, and the index counts each
+    // one it meets.
+    let alter = "FT.ALTER late SCHEMA ADD other VECTOR FLAT 6 TYPE FLOAT32 DIM 2 \
+                 DISTANCE_METRIC L2";
+    let alter: Vec<&str> = alter.split_whitespace().collect();
+    assert!(c.cmds(&alter).is_ok(), "{alter:?}");
+    assert_eq!(late(&mut c), [2, 1]);
 }

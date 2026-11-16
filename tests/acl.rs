@@ -865,24 +865,26 @@ fn test_acl_log_empty_initially() {
     assert_eq!(result.as_array().len(), 0);
 }
 
+/// A failed AUTH is logged: reason `auth`, the command as the client sent
+/// it as the object, as in Redis. A command refused for want of AUTH is
+/// not: no user was refused anything.
 #[test]
-fn test_acl_log_records_noauth_attempt() {
+fn test_acl_log_records_a_failed_auth_and_not_a_noauth() {
     let port = free_port();
     start_server_with_pass(port, "secret");
     let mut c = Conn::connect(port);
 
-    // Try a command without authenticating
-    c.cmds(&["GET", "somekey"]); // will fail with NOAUTH
-
-    // Now authenticate and check log
-    c.cmds(&["AUTH", "secret"]);
+    c.cmds(&["GET", "somekey"]); // NOAUTH
+    assert!(c.cmds(&["AUTH", "wrong"]).is_error());
+    assert!(c.cmds(&["AUTH", "secret"]).is_ok());
     let log = c.cmds(&["ACL", "LOG"]);
     let entries = log.as_array();
-
-    assert!(
-        !entries.is_empty(),
-        "ACL LOG should have recorded the NOAUTH attempt"
-    );
+    assert_eq!(entries.len(), 1, "{log:?}");
+    let entry = entries[0].as_array();
+    assert_eq!(entry[3].as_str(), "auth");
+    assert_eq!(entry[5].as_str(), "toplevel");
+    assert_eq!(entry[7].as_str(), "AUTH");
+    assert_eq!(entry[9].as_str(), "default");
 }
 
 #[test]
@@ -891,7 +893,7 @@ fn test_acl_log_reset_clears() {
     start_server_with_pass(port, "secret");
     let mut c = Conn::connect(port);
 
-    c.cmds(&["GET", "key"]); // NOAUTH
+    c.cmds(&["AUTH", "wrong"]);
     c.cmds(&["AUTH", "secret"]);
 
     // Verify there's something in the log
@@ -910,16 +912,17 @@ fn test_acl_log_with_count() {
     start_server_with_pass(port, "secret");
     let mut c = Conn::connect(port);
 
-    // Generate 3 auth failures
-    for _ in 0..3 {
-        c.cmds(&["GET", "key"]);
+    // Three failed AUTHs as three users: three entries (the same failure
+    // again would be counted in one).
+    for user in ["u1", "u2", "u3"] {
+        c.cmds(&["AUTH", user, "x"]);
     }
     c.cmds(&["AUTH", "secret"]);
 
     let all = c.cmds(&["ACL", "LOG"]).as_array().len();
     let limited = c.cmds(&["ACL", "LOG", "1"]).as_array().len();
 
-    assert!(all >= 1);
+    assert_eq!(all, 3);
     assert_eq!(limited, 1, "ACL LOG 1 should return exactly 1 entry");
 }
 
@@ -1488,12 +1491,14 @@ fn test_dangerous_category_denies_what_it_names() {
         "DEBUG",
         "SHUTDOWN",
         "REPLICAOF",
-        "ACL",
+        "ACL|LIST",
         "ACL|SETUSER",
         "CLUSTER|RESET",
         "CLUSTER|FORGET",
         "CLUSTER|MIGRATION",
         "CLUSTER|SYNCSLOTS",
+        "CLUSTER|DROPORPHANS",
+        "CLUSTER|ORPHANSLOTS",
         "CLIENT|KILL",
         "BACKUP|START",
         "HOTKEYS|START",
@@ -1516,6 +1521,9 @@ fn test_dangerous_category_denies_what_it_names() {
         "PING",
         "LMOVEM",
         "HIMPORT|PREPARE",
+        // Not administrative in Redis (#566).
+        "ACL|WHOAMI",
+        "ACL|CAT",
     ] {
         assert!(allowed(&user, kept), "{kept} should be allowed");
     }
@@ -1994,7 +2002,7 @@ fn test_channel_patterns_are_enforced() {
     assert!(
         log.as_array().iter().any(|entry| {
             let entry = entry.as_array();
-            entry[9].as_str() == "channel" && entry[13].as_str() == "secret"
+            entry[3].as_str() == "channel" && entry[7].as_str() == "secret"
         }),
         "a refused channel is logged: {log:?}"
     );
@@ -2142,4 +2150,448 @@ fn acl_genpass_gives_a_digit_per_four_bits() {
         assert!(pass.chars().all(|ch| ch.is_ascii_hexdigit()), "{pass:?}");
     }
     assert_eq!(c.cmds(&["ACL", "GENPASS"]).as_str().len(), 64);
+}
+
+/// `SORT` and `SORT_RO` read keys of their own through a `BY` pattern with a
+/// `*` and a `GET` pattern other than `#`, named by the list's elements. A
+/// user who may read only some keys is refused them, as in Redis; one who may
+/// read every key is not, and `GET #` and a `BY` with no `*` read nothing.
+#[test]
+fn sort_patterns_need_read_access_to_every_key() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    assert!(admin.cmds(&["SET", "other:s", "value-s"]).is_ok());
+    admin.cmds(&["HSET", "other:h", "field", "value-h"]);
+    admin.cmds(&["SET", "app:w", "1"]);
+    assert!(
+        admin
+            .cmds(&["ACL", "SETUSER", "app", "on", ">apppass", "+@all", "~app:*"])
+            .is_ok()
+    );
+    assert!(
+        admin
+            .cmds(&[
+                "ACL",
+                "SETUSER",
+                "reader",
+                "on",
+                ">readpass",
+                "+@all",
+                "%R~*"
+            ])
+            .is_ok()
+    );
+
+    let mut app = Conn::connect(port);
+    assert!(app.cmds(&["AUTH", "app", "apppass"]).is_ok());
+    app.cmds(&["RPUSH", "app:list", "other:s"]);
+    app.cmds(&["RPUSH", "app:hashes", "other:h"]);
+
+    for command in ["SORT", "SORT_RO"] {
+        let reply = app.cmds(&[command, "app:list", "BY", "nosort", "GET", "*"]);
+        assert!(
+            reply.error_str().contains("GET option of SORT denied"),
+            "{command} GET *: {reply:?}"
+        );
+        let reply = app.cmds(&[command, "app:hashes", "BY", "nosort", "GET", "*->field"]);
+        assert!(
+            reply.error_str().contains("GET option of SORT denied"),
+            "{command} GET *->field: {reply:?}"
+        );
+        let reply = app.cmds(&[command, "app:list", "BY", "*"]);
+        assert!(
+            reply.error_str().contains("BY option of SORT denied"),
+            "{command} BY *: {reply:?}"
+        );
+        // Nothing but the list itself is read.
+        let reply = app.cmds(&[command, "app:list", "BY", "nosort", "GET", "#"]);
+        assert_eq!(reply.as_array().len(), 1, "{command} GET #: {reply:?}");
+        let reply = app.cmds(&[command, "app:list", "BY", "constant", "ALPHA"]);
+        assert_eq!(
+            reply.as_array().len(),
+            1,
+            "{command} BY constant: {reply:?}"
+        );
+    }
+
+    let mut reader = Conn::connect(port);
+    assert!(reader.cmds(&["AUTH", "reader", "readpass"]).is_ok());
+    let reply = reader.cmds(&["SORT", "app:list", "BY", "nosort", "GET", "*"]);
+    assert_eq!(
+        reply.as_array().len(),
+        1,
+        "a user who may read every key: {reply:?}"
+    );
+    assert_eq!(reply.as_array()[0].as_str(), "value-s");
+}
+
+/// `SORT` and `GEORADIUS` write to the destination of their last `STORE`, and
+/// an `XREADGROUP` group or consumer may be named `STREAMS`: the ACL checks the
+/// keys the command really uses, not the first word that looks like one.
+#[test]
+fn the_keys_checked_are_the_keys_used() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    admin.cmds(&["SET", "other:s", "value"]);
+    admin.cmds(&["XADD", "other:stream", "*", "f", "value"]);
+    assert!(
+        admin
+            .cmds(&["XGROUP", "CREATE", "other:stream", "g", "0"])
+            .is_ok()
+    );
+    assert!(
+        admin
+            .cmds(&[
+                "ACL", "SETUSER", "app", "on", ">apppass", "+@all", "~app:*", "~STREAMS"
+            ])
+            .is_ok()
+    );
+    let mut app = Conn::connect(port);
+    assert!(app.cmds(&["AUTH", "app", "apppass"]).is_ok());
+    app.cmds(&["RPUSH", "app:list", "a"]);
+    app.cmds(&["GEOADD", "app:geo", "13.361389", "38.115556", "palermo"]);
+
+    let attempts: &[&[&str]] = &[
+        &[
+            "SORT", "app:list", "ALPHA", "STORE", "app:ok", "STORE", "other:s",
+        ],
+        &[
+            "SORT", "app:list", "GET", "#", "STORE", "app:ok", "STORE", "other:s",
+        ],
+        &[
+            "GEORADIUS",
+            "app:geo",
+            "15",
+            "37",
+            "500",
+            "km",
+            "STORE",
+            "app:ok",
+            "STORE",
+            "other:s",
+        ],
+        &[
+            "GEORADIUS",
+            "app:geo",
+            "15",
+            "37",
+            "500",
+            "km",
+            "STOREDIST",
+            "app:ok",
+            "STOREDIST",
+            "other:s",
+        ],
+        &[
+            "GEORADIUSBYMEMBER",
+            "app:geo",
+            "palermo",
+            "500",
+            "km",
+            "STORE",
+            "app:ok",
+            "STORE",
+            "other:s",
+        ],
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "STREAMS",
+            "STREAMS",
+            "other:stream",
+            ">",
+        ],
+    ];
+    for attempt in attempts {
+        let reply = app.cmds(attempt);
+        assert!(
+            reply.error_str().starts_with("NOPERM"),
+            "{attempt:?}: {reply:?}"
+        );
+    }
+    assert_eq!(admin.cmds(&["GET", "other:s"]).as_str(), "value");
+
+    // The keys of their own are still theirs.
+    let reply = app.cmds(&[
+        "SORT", "app:list", "ALPHA", "STORE", "app:x", "STORE", "app:y",
+    ]);
+    assert_eq!(reply.as_int(), 1, "{reply:?}");
+    let reply = app.cmds(&[
+        "GEORADIUS",
+        "app:geo",
+        "15",
+        "37",
+        "500",
+        "km",
+        "STORE",
+        "app:x",
+    ]);
+    assert_eq!(reply.as_int(), 1, "{reply:?}");
+}
+
+/// Commands that write only with some arguments (GEORADIUS / GEORADIUSBYMEMBER
+/// with STORE / STOREDIST, and MIGRATE, which removes the key from this node)
+/// must be treated as writes everywhere the ACL decides access:
+///   * a read-only key grant (`%R~*`) must not let them write their key;
+///   * `+@read` must not grant them (they belong to `@write`);
+///   * `-@write` must remove them, and FUNCTION's loading subcommands.
+#[test]
+fn write_by_argument_commands_are_writes_for_acl() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    admin.cmds(&["GEOADD", "geo", "13.361389", "38.115556", "palermo"]);
+    admin.cmds(&["SET", "victim", "ORIGINAL"]);
+    admin.cmds(&["SET", "mig", "MOVEME"]);
+    // Read-only on every key, every command allowed.
+    assert!(
+        admin
+            .cmds(&["ACL", "SETUSER", "ro", "on", ">p", "+@all", "%R~*"])
+            .is_ok()
+    );
+    // The @read category, every key.
+    assert!(
+        admin
+            .cmds(&["ACL", "SETUSER", "rd", "on", ">p", "+@read", "~*"])
+            .is_ok()
+    );
+    // Everything but @write, every key.
+    assert!(
+        admin
+            .cmds(&["ACL", "SETUSER", "nw", "on", ">p", "+@all", "-@write", "~*"])
+            .is_ok()
+    );
+
+    // Each attempt must be refused (NOPERM) for each restricted user. MIGRATE
+    // is refused by the ACL before any connection to the destination, so a
+    // closed port is fine.
+    let attempts: &[&[&str]] = &[
+        &[
+            "GEORADIUS",
+            "geo",
+            "15",
+            "37",
+            "500",
+            "km",
+            "STORE",
+            "victim",
+        ],
+        &[
+            "GEORADIUSBYMEMBER",
+            "geo",
+            "palermo",
+            "500",
+            "km",
+            "STOREDIST",
+            "victim",
+        ],
+        &["MIGRATE", "127.0.0.1", "1", "mig", "0", "100"],
+    ];
+    for uname in ["ro", "rd", "nw"] {
+        let mut u = Conn::connect(port);
+        assert!(u.cmds(&["AUTH", uname, "p"]).is_ok());
+        for attempt in attempts {
+            let reply = u.cmds(attempt);
+            assert!(
+                reply.error_str().starts_with("NOPERM"),
+                "user {uname}, {attempt:?}: {reply:?}"
+            );
+        }
+    }
+    // FUNCTION's loading subcommands are in @write, so -@read's `rd` and
+    // -@write's `nw` are both refused.
+    for uname in ["rd", "nw"] {
+        let mut u = Conn::connect(port);
+        assert!(u.cmds(&["AUTH", uname, "p"]).is_ok());
+        let reply = u.cmds(&[
+            "FUNCTION",
+            "LOAD",
+            "#!lua name=lib\nredis.register_function('f', function() return 1 end)",
+        ]);
+        assert!(
+            reply.error_str().starts_with("NOPERM"),
+            "user {uname} FUNCTION LOAD: {reply:?}"
+        );
+    }
+
+    // Nothing was overwritten or removed.
+    assert_eq!(admin.cmds(&["GET", "victim"]).as_str(), "ORIGINAL");
+    assert_eq!(admin.cmds(&["EXISTS", "mig"]).as_int(), 1);
+
+    // GEORADIUS is a write command even though it only writes with STORE (as
+    // Redis flags it), so `+@read` does not grant it at all — a read-only
+    // caller uses GEORADIUS_RO. But a plain GEORADIUS (no STORE) only reads
+    // its source key, so the all-commands, read-only-keys user may run it:
+    // the per-key check, not the command, is what the STORE destination trips.
+    let mut ro = Conn::connect(port);
+    assert!(ro.cmds(&["AUTH", "ro", "p"]).is_ok());
+    let reply = ro.cmds(&["GEORADIUS", "geo", "15", "37", "500", "km"]);
+    assert!(
+        !reply.is_error(),
+        "plain GEORADIUS (no STORE) must stay a read for +@all %R~*: {reply:?}"
+    );
+}
+
+/// The category lists place these commands as Redis does: the write-by-argument
+/// commands in `@write` and out of `@read`, and FUNCTION's loading subcommands
+/// in `@write`.
+#[test]
+fn write_by_argument_command_categories() {
+    let cat = kividb::commands::server::acl_cat_commands_pub;
+    let read: Vec<String> = cat("read").iter().map(|c| c.to_ascii_uppercase()).collect();
+    let write: Vec<String> = cat("write")
+        .iter()
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    for c in ["GEORADIUS", "GEORADIUSBYMEMBER", "MIGRATE"] {
+        assert!(write.contains(&c.to_string()), "@write should contain {c}");
+        assert!(
+            !read.contains(&c.to_string()),
+            "@read should not contain {c}"
+        );
+    }
+    for c in [
+        "FUNCTION|LOAD",
+        "FUNCTION|DELETE",
+        "FUNCTION|FLUSH",
+        "FUNCTION|RESTORE",
+    ] {
+        assert!(write.contains(&c.to_string()), "@write should contain {c}");
+    }
+    // The read-only geo variants stay reads.
+    for c in ["GEORADIUS_RO", "GEORADIUSBYMEMBER_RO", "GEOSEARCH"] {
+        assert!(read.contains(&c.to_string()), "@read should contain {c}");
+        assert!(
+            !write.contains(&c.to_string()),
+            "@write should not contain {c}"
+        );
+    }
+}
+
+/// `@connection` holds what it holds in Redis 7.4 to 8.10 and Valkey:
+/// `COMMAND` and its subcommands, `SELECT`, `READONLY`, `READWRITE`,
+/// `ASKING`, `WAIT` and `WAITAOF` too (#392). redis-py's cluster client runs
+/// `COMMAND` as it connects; OpenViking's gateway gives its user
+/// `+@connection` for that, and every cluster connection was refused.
+#[test]
+fn test_connection_category_is_redis_s() {
+    let cat = kividb::commands::server::acl_cat_commands_pub;
+    let connection = cat("connection");
+    for command in [
+        "ASKING",
+        "AUTH",
+        "CLIENT",
+        "COMMAND",
+        "ECHO",
+        "HELLO",
+        "PING",
+        "QUIT",
+        "READONLY",
+        "READWRITE",
+        "RESET",
+        "SELECT",
+        "WAIT",
+        "WAITAOF",
+    ] {
+        assert!(connection.contains(&command), "{command}: {connection:?}");
+    }
+    // They are in no data category in Redis, nor in @read or @write.
+    for category in ["keyspace", "read", "write"] {
+        for command in ["COMMAND", "SELECT", "WAIT", "WAITAOF"] {
+            assert!(
+                !cat(category).contains(&command),
+                "{command} in @{category}"
+            );
+        }
+    }
+
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    let r = admin.cmds(&["ACL", "SETUSER", "conn", "on", ">pw", "+@connection"]);
+    assert!(r.is_ok(), "{r:?}");
+
+    let listed: Vec<String> = admin
+        .cmds(&["ACL", "CAT", "connection"])
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_ascii_lowercase())
+        .collect();
+    for command in [
+        "command",
+        "select",
+        "readonly",
+        "readwrite",
+        "asking",
+        "wait",
+        "waitaof",
+    ] {
+        assert!(listed.iter().any(|c| c == command), "{command}: {listed:?}");
+    }
+
+    // What COMMAND INFO reports, as Redis does.
+    let categories = |c: &mut Conn, name: &str| -> Vec<String> {
+        let reply = c.cmds(&["COMMAND", "INFO", name]);
+        let mut list: Vec<String> = reply.as_array()[0].as_array()[6]
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect();
+        list.sort();
+        list
+    };
+    assert_eq!(categories(&mut admin, "command"), ["@connection", "@slow"]);
+    for name in ["select", "readonly", "readwrite", "asking"] {
+        assert_eq!(
+            categories(&mut admin, name),
+            ["@connection", "@fast"],
+            "{name}"
+        );
+    }
+    for name in ["wait", "waitaof"] {
+        assert_eq!(
+            categories(&mut admin, name),
+            ["@blocking", "@connection", "@slow"],
+            "{name}"
+        );
+    }
+
+    let mut user = Conn::connect(port);
+    assert!(user.cmds(&["AUTH", "conn", "pw"]).is_ok());
+    let all = user.cmds(&["COMMAND"]);
+    assert!(
+        all.as_array().len() > 300,
+        "COMMAND gave {} entries",
+        all.as_array().len()
+    );
+    assert!(user.cmds(&["COMMAND", "COUNT"]).as_int() > 300);
+    for command in [
+        vec!["COMMAND", "INFO", "get"],
+        vec!["COMMAND", "DOCS", "get"],
+        vec!["COMMAND", "LIST"],
+        vec!["COMMAND", "GETKEYS", "SET", "k", "v"],
+        vec!["COMMAND", "GETKEYSANDFLAGS", "SET", "k", "v"],
+        vec!["COMMAND", "HELP"],
+        vec!["SELECT", "1"],
+        vec!["READONLY"],
+        vec!["READWRITE"],
+        vec!["ASKING"],
+        vec!["WAIT", "0", "0"],
+        vec!["WAITAOF", "0", "0", "0"],
+    ] {
+        let reply = user.cmds(&command);
+        assert!(
+            !(reply.is_error() && reply.error_str().starts_with("NOPERM")),
+            "{command:?}: {reply:?}"
+        );
+    }
+    assert!(user.cmds(&["SELECT", "0"]).is_ok());
+    // And nothing more than the category.
+    let reply = user.cmds(&["GET", "k"]);
+    assert!(reply.error_str().starts_with("NOPERM"), "{reply:?}");
+    let reply = user.cmds(&["CONFIG", "GET", "maxmemory"]);
+    assert!(reply.error_str().starts_with("NOPERM"), "{reply:?}");
 }

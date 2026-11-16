@@ -1,0 +1,9 @@
+NAME                                               CLUSTER   OP        PHASE       AGE
+kividbdbops.kividb.io/rep-q1-023732                rep       restart   Completed   58m
+kividbdbops.kividb.io/rep-q2-023732                rep       restart   Completed   58m
+kividbdbops.kividb.io/rep-rep-restart-rc7-023419   rep       restart   Completed   61m
+kividbdbops.kividb.io/shd-restart-rc7-015632       shd       restart   Completed   99m
+
+NAME                                     CLUSTER   PHASE       OBJECT KEY                                   AGE
+kividbsnapshot.kividb.io/rep-bk-032310   rep       Succeeded   e2e/e2e.rep/rep-0-20261102T215312Z.tar.gz    13m
+kividbsnapshot.kividb.io/shd-bk-032435   shd       Succeeded   e2e/e2e.shd/20261102T215436Z/manifest.json   11m

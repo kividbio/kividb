@@ -1,0 +1,52 @@
+{
+ "mode": "cluster",
+ "writers": 16,
+ "duration_s": 60.0,
+ "acked": 601447,
+ "unacked_errors": 0,
+ "lost_acked": 336,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": 20.047,
+ "lost_ack_time_last": 20.142,
+ "lost_sample": [
+  "ack:0:12316",
+  "ack:0:12323",
+  "ack:0:12327",
+  "ack:0:12330",
+  "ack:0:12334",
+  "ack:0:12338",
+  "ack:0:12340",
+  "ack:0:12341",
+  "ack:0:12344",
+  "ack:0:12345",
+  "ack:0:12348",
+  "ack:0:12349",
+  "ack:0:12352",
+  "ack:0:12353",
+  "ack:0:12356",
+  "ack:0:12357",
+  "ack:0:12363",
+  "ack:0:12367",
+  "ack:0:12370",
+  "ack:0:12374"
+ ],
+ "events": [
+  [
+   20.013,
+   "CLUSTER FAILOVER FORCE on replica"
+  ]
+ ],
+ "recovery": {
+  "event_t": 20.013,
+  "pre_event_ok_per_100ms_median": 1000,
+  "first_error_t": null,
+  "last_error_t": null,
+  "writes_below_80pct_from_t": 20.1,
+  "throughput_back_t": 20.3,
+  "recovery_s": 0.29
+ },
+ "error_kinds": {}
+}

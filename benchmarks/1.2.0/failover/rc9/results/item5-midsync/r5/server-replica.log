@@ -1,0 +1,404 @@
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:04:03.979Z 96769 [INFO] KiviDB 1.2.0-rc9 starting: pid 96769, default build, config file '/mnt/kv/node.conf'
+2026-11-03T08:04:03.979Z 96769 [INFO] I/O model      : io_uring
+2026-11-03T08:04:03.980Z 96769 [INFO] Shards per DB  : 64
+2026-11-03T08:04:03.980Z 96769 [INFO] I/O model      : io_uring
+2026-11-03T08:04:03.980Z 96769 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T08:04:03.980Z 96769 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T08:04:03.984Z 96769 [INFO] Replication: Full resync from 384f807a590c378bc973f5ada73f7a5c915c6ff9 offset=0
+2026-11-03T08:04:03.984Z 96769 [INFO] Replication: Receiving full-sync payload (76 bytes)...
+2026-11-03T08:04:03.984Z 96769 [INFO] Replication: Full sync loaded: 0 keys (0 with a TTL), replacing 0 local keys
+2026-11-03T08:04:03.985Z 96769 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T08:04:03.987Z 96769 [INFO] AOF: rebased onto dump.kdb (generation 1) — log is now the delta
+2026-11-03T08:04:03.987Z 96769 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T08:04:10.286Z 96769 [WARN] Replication: Replication link to 10.91.1.11:6379 failed: Connection reset by peer (os error 104) — retrying every 1s
+2026-11-03T08:04:13.924Z 96769 [WARN] Replication: Dropped the 1979758 local keys before loading 3400000 from the master
+2026-11-03T08:04:13.980Z 96769 [INFO] AOF: auto-checkpoint: 609.91 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T08:04:14.047Z 96769 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T08:04:19.266Z 96769 [INFO] Replication: Full sync loaded: 3400000 keys (0 with a TTL), replacing 1979758 local keys
+2026-11-03T08:04:19.484Z 96769 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T08:04:20.525Z 96769 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T08:04:20.525Z 96769 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T08:04:20.526Z 96769 [INFO] Replication: Backlog restarted at offset 1098269939 (it ended at 639533790)
+2026-11-03T08:04:24.048Z 96769 [INFO] AOF: auto-checkpoint: 79.18 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+2026-11-03T08:04:25.188Z 96769 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T08:04:35.188Z 96769 [INFO] AOF: auto-checkpoint: 267.08 MB is 100%+ above the 26.36 MB baseline — folding into dump.kdb
+2026-11-03T08:04:36.534Z 96769 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+=== round 1: clean stop 2026-11-03T08:04:43.846Z
+2026-11-03T08:04:44.082Z 96769 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T08:04:44.082Z 96769 [INFO] Writing final snapshot...
+2026-11-03T08:04:45.491Z 96769 [INFO] AOF: rebased onto dump.kdb (generation 6) — log is now the delta
+2026-11-03T08:04:45.491Z 96769 [INFO] Goodbye.
+=== round 1: start, full sync expected 2026-11-03T08:04:52.317Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:04:52.590Z 99038 [INFO] KiviDB 1.2.0-rc9 starting: pid 99038, default build, config file '/mnt/kv/node.conf'
+2026-11-03T08:04:52.590Z 99038 [INFO] I/O model      : io_uring
+2026-11-03T08:04:52.591Z 99038 [INFO] Shards per DB  : 64
+2026-11-03T08:04:52.591Z 99038 [INFO] I/O model      : io_uring
+2026-11-03T08:04:52.591Z 99038 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T08:04:59.132Z 99038 [INFO] Loaded 3635711 keys from snapshot (88488 with a TTL)
+2026-11-03T08:04:59.132Z 99038 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T08:04:59.242Z 99038 [INFO] Replication: Loaded dataset is offset 1678195674 of 384f807a590c378bc973f5ada73f7a5c915c6ff9 — a partial resync will be asked for
+2026-11-03T08:04:59.242Z 99038 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T08:04:59.242Z 99038 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T08:05:01.520Z 99038 [INFO] Replication: Full resync from 384f807a590c378bc973f5ada73f7a5c915c6ff9 offset=1979299480
+2026-11-03T08:05:01.520Z 99038 [INFO] Replication: Receiving full-sync payload (1313243521 bytes)...
+=== round 1: SIGTERM mid sync 2026-11-03T08:05:01.795Z
+2026-11-03T08:05:02.316Z 99038 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T08:05:03.316Z 99038 [WARN] Shutdown: this replica is in the middle of a full sync, and its dataset is only part of the master's: the final save is skipped, so that dump.kdb (and its resync point) stays the last good one. The next start syncs again
+=== round 1: start after the stop 2026-11-03T08:05:05.158Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:05:05.433Z 99776 [INFO] KiviDB 1.2.0-rc9 starting: pid 99776, default build, config file '/mnt/kv/node.conf'
+2026-11-03T08:05:05.433Z 99776 [INFO] I/O model      : io_uring
+2026-11-03T08:05:05.434Z 99776 [INFO] Shards per DB  : 64
+2026-11-03T08:05:05.434Z 99776 [INFO] I/O model      : io_uring
+2026-11-03T08:05:05.434Z 99776 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T08:05:11.939Z 99776 [INFO] Loaded 3635581 keys from snapshot (88488 with a TTL)
+2026-11-03T08:05:11.939Z 99776 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T08:05:12.051Z 99776 [INFO] Replication: Loaded dataset is offset 1678195674 of 384f807a590c378bc973f5ada73f7a5c915c6ff9 — a partial resync will be asked for
+2026-11-03T08:05:12.051Z 99776 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T08:05:12.051Z 99776 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T08:05:14.301Z 99776 [INFO] Replication: Full resync from 384f807a590c378bc973f5ada73f7a5c915c6ff9 offset=2300548725
+2026-11-03T08:05:14.301Z 99776 [INFO] Replication: Receiving full-sync payload (1327382740 bytes)...
+2026-11-03T08:05:16.641Z 99776 [WARN] Replication: Dropped the 3635502 local keys before loading 3641110 from the master
+2026-11-03T08:05:23.146Z 99776 [INFO] Replication: Full sync loaded: 3641066 keys (97819 with a TTL), replacing 3635502 local keys
+2026-11-03T08:05:23.174Z 99776 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T08:05:24.615Z 99776 [INFO] AOF: rebased onto dump.kdb (generation 7) — log is now the delta
+2026-11-03T08:05:24.616Z 99776 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+=== round 2: clean stop 2026-11-03T08:05:29.494Z
+2026-11-03T08:05:29.735Z 99776 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T08:05:29.735Z 99776 [INFO] Writing final snapshot...
+2026-11-03T08:05:31.292Z 99776 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-03T08:05:31.293Z 99776 [INFO] Goodbye.
+=== round 2: start, full sync expected 2026-11-03T08:05:38.269Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:05:38.544Z 101416 [INFO] KiviDB 1.2.0-rc9 starting: pid 101416, default build, config file '/mnt/kv/node.conf'
+2026-11-03T08:05:38.544Z 101416 [INFO] I/O model      : io_uring
+2026-11-03T08:05:38.545Z 101416 [INFO] Shards per DB  : 64
+2026-11-03T08:05:38.545Z 101416 [INFO] I/O model      : io_uring
+2026-11-03T08:05:38.545Z 101416 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T08:05:46.229Z 101416 [INFO] Loaded 3680554 keys from snapshot (144333 with a TTL)
+2026-11-03T08:05:46.230Z 101416 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T08:05:46.340Z 101416 [INFO] Replication: Loaded dataset is offset 2697426999 of 384f807a590c378bc973f5ada73f7a5c915c6ff9 — a partial resync will be asked for
+2026-11-03T08:05:46.341Z 101416 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T08:05:46.341Z 101416 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T08:05:48.876Z 101416 [INFO] Replication: Full resync from 384f807a590c378bc973f5ada73f7a5c915c6ff9 offset=3026972098
+2026-11-03T08:05:48.876Z 101416 [INFO] Replication: Receiving full-sync payload (1406431549 bytes)...
+2026-11-03T08:05:51.431Z 101416 [WARN] Replication: Dropped the 3680536 local keys before loading 3679732 from the master
+=== round 2: SIGTERM mid sync 2026-11-03T08:05:51.933Z
+2026-11-03T08:05:52.207Z 101416 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T08:05:52.207Z 101416 [WARN] Shutdown: this replica is in the middle of a full sync, and its dataset is only part of the master's: the final save is skipped, so that dump.kdb (and its resync point) stays the last good one. The next start syncs again
+=== round 2: start after the stop 2026-11-03T08:05:54.086Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:05:54.361Z 102283 [INFO] KiviDB 1.2.0-rc9 starting: pid 102283, default build, config file '/mnt/kv/node.conf'
+2026-11-03T08:05:54.361Z 102283 [INFO] I/O model      : io_uring
+2026-11-03T08:05:54.362Z 102283 [INFO] Shards per DB  : 64
+2026-11-03T08:05:54.362Z 102283 [INFO] I/O model      : io_uring
+2026-11-03T08:05:54.362Z 102283 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T08:06:01.998Z 102283 [INFO] Loaded 3680517 keys from snapshot (144333 with a TTL)
+2026-11-03T08:06:01.998Z 102283 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T08:06:02.104Z 102283 [INFO] Replication: Loaded dataset is offset 2697426999 of 384f807a590c378bc973f5ada73f7a5c915c6ff9 — a partial resync will be asked for
+2026-11-03T08:06:02.104Z 102283 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T08:06:02.104Z 102283 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T08:06:04.543Z 102283 [INFO] Replication: Full resync from 384f807a590c378bc973f5ada73f7a5c915c6ff9 offset=3422510865
+2026-11-03T08:06:04.543Z 102283 [INFO] Replication: Receiving full-sync payload (1410190126 bytes)...
+2026-11-03T08:06:07.179Z 102283 [WARN] Replication: Dropped the 3680506 local keys before loading 3680458 from the master
+2026-11-03T08:06:15.145Z 102283 [INFO] Replication: Full sync loaded: 3680447 keys (144265 with a TTL), replacing 3680506 local keys
+2026-11-03T08:06:15.177Z 102283 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T08:06:16.750Z 102283 [INFO] AOF: rebased onto dump.kdb (generation 9) — log is now the delta
+2026-11-03T08:06:16.751Z 102283 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.
+2026-11-03T08:06:22.104Z 102283 [INFO] AOF: auto-checkpoint: 424.51 MB is 100%+ above the 0.00 MB baseline — folding into dump.kdb
+=== round 3: clean stop 2026-11-03T08:06:22.506Z
+2026-11-03T08:06:22.746Z 102283 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T08:06:22.746Z 102283 [INFO] Writing final snapshot...
+2026-11-03T08:06:23.739Z 102283 [INFO] AOF: rebased onto dump.kdb (generation 10) — log is now the delta
+=== restarted by hand after the round-3 hang 2026-11-03T08:12:05.103Z
+                                                                                     
+                                                                                                    
+                                                   :::.                                     
+                                .:-==-:.       :#%@%%%@%%=                                  
+                          -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+                      :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+                    +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+                  =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+                .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+               -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+              .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+              +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+              %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+              @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+              %%:::::::::::::::::::::::::::::+%@%-                          .               
+              =@*::::::::::::::::::::::::::*%@@*                                            
+               *@*::::=+:::::::::::::::-*%@@%%:                                             
+                *@#-:##::::::::::-=+*%@@@@%*.                                               
+                 :#@%@*::::::*%@@@%%@@@%*:                                                  
+                   .*%%=:::*%%%%%%%@@%+                                                     
+                     .#@@@%*-   .#%@*.                                                      
+                      .#@*        :%@%:                                                     
+                        %@*         =%@#                                                    
+                         #@#          +%%+                                                  
+                          *%%+:...     .*@%*:....                                           
+                       *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+                               .+-            :+.                                           
+                                                                                                    
+    
+  KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+  https://kividb.io
+
+  Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+
+  * Version        : 1.2.0-rc9
+  * Mode           : standalone
+  * OS             : linux x86_64
+  * Memory         : 31GiB available
+  * CPUs           : 8 cores detected
+  * Listening on   : 0.0.0.0:6379
+  * Worker threads : 6
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+  * Databases      : 16
+  * ACL file       : none
+
+2026-11-03T08:12:05.106Z 117966 [INFO] KiviDB 1.2.0-rc9 starting: pid 117966, default build, config file '/mnt/kv/node.conf'
+2026-11-03T08:12:05.107Z 117966 [INFO] I/O model      : io_uring
+2026-11-03T08:12:05.108Z 117966 [INFO] Shards per DB  : 64
+2026-11-03T08:12:05.108Z 117966 [INFO] I/O model      : io_uring
+2026-11-03T08:12:05.108Z 117966 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T08:12:12.967Z 117966 [INFO] Loaded 3673254 keys from snapshot (159652 with a TTL)
+2026-11-03T08:12:12.967Z 117966 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T08:12:12.967Z 117966 [INFO] Found appendonly.aof — recovering from the append-only file
+2026-11-03T08:12:12.968Z 117966 [INFO] AOF replay: 248 commands, 3673006 keys, 0.01 MB in 0.00s
+2026-11-03T08:12:13.057Z 117966 [INFO] Replication: Connecting to master 10.91.1.11:6379...
+2026-11-03T08:12:13.057Z 117966 [INFO] Ready to accept connections on 0.0.0.0:6379
+2026-11-03T08:12:14.544Z 117966 [INFO] Replication: Full resync from 384f807a590c378bc973f5ada73f7a5c915c6ff9 offset=3871855605
+2026-11-03T08:12:14.544Z 117966 [INFO] Replication: Receiving full-sync payload (1387198947 bytes)...
+2026-11-03T08:12:16.962Z 117966 [WARN] Replication: Dropped the 3673006 local keys before loading 3531030 from the master
+2026-11-03T08:12:23.268Z 117966 [INFO] Replication: Full sync loaded: 3531030 keys (17428 with a TTL), replacing 3673006 local keys
+2026-11-03T08:12:23.294Z 117966 [INFO] Replication: AOF is on — rebasing it onto the synced dataset
+2026-11-03T08:12:24.835Z 117966 [INFO] AOF: rebased onto dump.kdb (generation 11) — log is now the delta
+2026-11-03T08:12:24.835Z 117966 [INFO] Replication: Synced with 10.91.1.11:6379. Entering command stream.

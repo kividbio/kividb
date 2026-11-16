@@ -1,0 +1,14 @@
+scenario,full,partial,shut_ok,shut_bad,skipped,loaded0,full_pods,shutdown_waits
+upgrade-shd,3,6,0,0,0,0,shd-0-0 shd-1-0 shd-2-0,
+restart-rc9,0,9,0,0,0,0,,
+failover-rc9,0,3,0,0,0,0,,
+graceful1,0,2,0,0,0,0,,
+graceful2,0,2,0,0,0,0,,
+forcedel1,0,1,1,0,0,0,,shd-0-0:10ms
+forcedel2,0,1,1,0,0,0,,shd-1-0:10ms
+forcedel3,0,1,1,0,0,0,,shd-2-1:10ms
+sigkill-rc9,0,1,0,0,0,0,,
+reshard-up-rc9,1,0,0,0,0,0,shd-3-1,
+reshard-down-rc9,1,0,0,0,0,0,shd-3-1,
+guard-yes,0,1,0,0,0,0,,
+guard-no,1,0,0,0,0,0,g-no-0,

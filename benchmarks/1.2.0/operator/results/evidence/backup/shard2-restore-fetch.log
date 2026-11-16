@@ -1,0 +1,5 @@
+total 33008
+drwxrwxrwx    2 root     root          4096 Nov  2 21:54 .
+drwxr-xr-x    1 root     root          4096 Nov  2 21:54 ..
+-rw-------    1 curl_user curl_group        16 Nov  2 21:54 appendonly.aof
+-rw-------    1 curl_user curl_group  33785708 Nov  2 21:54 dump.kdb

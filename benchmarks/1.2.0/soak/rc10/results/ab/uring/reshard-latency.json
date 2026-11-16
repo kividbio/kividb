@@ -1,0 +1,325 @@
+[
+ {
+  "round": 1,
+  "src_shard": "3000",
+  "dst_shard": "8000",
+  "exit": 0,
+  "seconds": 106.4,
+  "source_baseline_60s": {
+   "ops": 30000,
+   "errors": 0,
+   "p50_us": 712,
+   "p99_us": 2207,
+   "p999_us": 22220,
+   "worst_us": 31642
+  },
+  "source": {
+   "ops": 53177,
+   "errors": 0,
+   "p50_us": 27055,
+   "p99_us": 1031688,
+   "p999_us": 1221714,
+   "worst_us": 1326095
+  },
+  "source_service": {
+   "ops": 53177,
+   "errors": 0,
+   "p50_us": 1781,
+   "p99_us": 61071,
+   "p999_us": 66216,
+   "worst_us": 95397
+  },
+  "source_service_baseline_60s": {
+   "ops": 30000,
+   "errors": 0,
+   "p50_us": 710,
+   "p99_us": 1749,
+   "p999_us": 22219,
+   "worst_us": 31641
+  },
+  "source_1s": {
+   "seconds": 107,
+   "p99_us_median_1s": 605183,
+   "p99_us_worst_1s": 1283071,
+   "seconds_with_stall": 107,
+   "max_stalled_conns": 5
+  },
+  "destination": {
+   "ops": 53178,
+   "errors": 0,
+   "p50_us": 709,
+   "p99_us": 3947,
+   "p999_us": 21985,
+   "worst_us": 39150
+  },
+  "destination_1s": {
+   "seconds": 107,
+   "p99_us_median_1s": 3427,
+   "p99_us_worst_1s": 29135,
+   "seconds_with_stall": 0,
+   "max_stalled_conns": 0
+  },
+  "third_shard": {
+   "ops": 53177,
+   "errors": 0,
+   "p50_us": 736,
+   "p99_us": 3960,
+   "p999_us": 17476,
+   "worst_us": 35167
+  },
+  "third_shard_1s": {
+   "seconds": 107,
+   "p99_us_median_1s": 3397,
+   "p99_us_worst_1s": 25391,
+   "seconds_with_stall": 0,
+   "max_stalled_conns": 0
+  },
+  "mixed": {
+   "ops_per_s_median": 45530,
+   "p99_us_median_1s": 42827775,
+   "max_us": 67108863,
+   "errors": 7
+  },
+  "cmd_source": {
+   "cluster|getkeysinslot": {
+    "calls": 2292,
+    "mean_us": 33702.5
+   },
+   "cluster|info": {
+    "calls": 90,
+    "mean_us": 731.3
+   },
+   "cluster|nodes": {
+    "calls": 2,
+    "mean_us": 247.5
+   },
+   "cluster|setslot": {
+    "calls": 256,
+    "mean_us": 30838.2
+   },
+   "cluster|slots": {
+    "calls": 355,
+    "mean_us": 475.4
+   },
+   "migrate": {
+    "calls": 2164,
+    "mean_us": 5339.0
+   }
+  },
+  "cmd_destination": {
+   "asking": {
+    "calls": 21392,
+    "mean_us": 3.8
+   },
+   "cluster|info": {
+    "calls": 90,
+    "mean_us": 553.1
+   },
+   "cluster|nodes": {
+    "calls": 2,
+    "mean_us": 249.5
+   },
+   "cluster|setslot": {
+    "calls": 256,
+    "mean_us": 1724.5
+   },
+   "cluster|slots": {
+    "calls": 318,
+    "mean_us": 320.2
+   },
+   "restore": {
+    "calls": 21056,
+    "mean_us": 11.1
+   }
+  },
+  "slowlog_source": {
+   "INCRBY": {
+    "n": 115,
+    "median_us": 36785,
+    "max_us": 63343
+   },
+   "INFO": {
+    "n": 11,
+    "median_us": 21502,
+    "max_us": 28409
+   },
+   "HGET": {
+    "n": 101,
+    "median_us": 37847,
+    "max_us": 78221
+   },
+   "CLUSTER SETSLOT": {
+    "n": 128,
+    "median_us": 59880,
+    "max_us": 93856
+   },
+   "GET": {
+    "n": 698,
+    "median_us": 38743,
+    "max_us": 70364
+   },
+   "CLUSTER GETKEYSINSLOT": {
+    "n": 2026,
+    "median_us": 37779,
+    "max_us": 68522
+   },
+   "SET": {
+    "n": 569,
+    "median_us": 36645,
+    "max_us": 83471
+   },
+   "HSET": {
+    "n": 293,
+    "median_us": 36386,
+    "max_us": 64634
+   },
+   "MIGRATE": {
+    "n": 276,
+    "median_us": 14611,
+    "max_us": 63331
+   },
+   "LTRIM": {
+    "n": 88,
+    "median_us": 35706,
+    "max_us": 59868
+   },
+   "ZADD": {
+    "n": 97,
+    "median_us": 37462,
+    "max_us": 92209
+   },
+   "LPUSH": {
+    "n": 181,
+    "median_us": 40257,
+    "max_us": 61735
+   },
+   "RPOP": {
+    "n": 17,
+    "median_us": 43101,
+    "max_us": 60829
+   },
+   "ZINCRBY": {
+    "n": 49,
+    "median_us": 33619,
+    "max_us": 60329
+   },
+   "LRANGE": {
+    "n": 91,
+    "median_us": 37039,
+    "max_us": 59921
+   },
+   "HGETALL": {
+    "n": 45,
+    "median_us": 35965,
+    "max_us": 61445
+   },
+   "ZRANGEBYSCORE": {
+    "n": 34,
+    "median_us": 35213,
+    "max_us": 60189
+   },
+   "SREM": {
+    "n": 41,
+    "median_us": 34644,
+    "max_us": 61400
+   },
+   "HTTL": {
+    "n": 30,
+    "median_us": 38324,
+    "max_us": 59586
+   },
+   "ZREVRANGE": {
+    "n": 32,
+    "median_us": 41131,
+    "max_us": 60168
+   },
+   "SCARD": {
+    "n": 37,
+    "median_us": 33764,
+    "max_us": 83407
+   },
+   "SISMEMBER": {
+    "n": 36,
+    "median_us": 36556,
+    "max_us": 66334
+   },
+   "SADD": {
+    "n": 124,
+    "median_us": 40166,
+    "max_us": 61855
+   },
+   "HEXPIRE": {
+    "n": 30,
+    "median_us": 33585,
+    "max_us": 60526
+   },
+   "DEL": {
+    "n": 29,
+    "median_us": 37656,
+    "max_us": 58053
+   },
+   "EXPIRE": {
+    "n": 59,
+    "median_us": 34892,
+    "max_us": 68168
+   },
+   "CLUSTER SLOTS": {
+    "n": 1,
+    "median_us": 52863,
+    "max_us": 52863
+   }
+  },
+  "slowlog_destination": {
+   "SET": {
+    "n": 18,
+    "median_us": 30633,
+    "max_us": 35280
+   },
+   "GET": {
+    "n": 9,
+    "median_us": 21572,
+    "max_us": 29251
+   },
+   "INFO": {
+    "n": 11,
+    "median_us": 27816,
+    "max_us": 37918
+   },
+   "INCRBY": {
+    "n": 2,
+    "median_us": 28814,
+    "max_us": 28814
+   },
+   "CLUSTER SETSLOT": {
+    "n": 5,
+    "median_us": 15409,
+    "max_us": 21759
+   },
+   "SADD": {
+    "n": 2,
+    "median_us": 29523,
+    "max_us": 29523
+   },
+   "LPUSH": {
+    "n": 3,
+    "median_us": 29529,
+    "max_us": 30376
+   },
+   "ZADD": {
+    "n": 2,
+    "median_us": 14373,
+    "max_us": 14373
+   },
+   "HGET": {
+    "n": 1,
+    "median_us": 12710,
+    "max_us": 12710
+   },
+   "HSET": {
+    "n": 2,
+    "median_us": 28811,
+    "max_us": 28811
+   }
+  }
+ }
+]

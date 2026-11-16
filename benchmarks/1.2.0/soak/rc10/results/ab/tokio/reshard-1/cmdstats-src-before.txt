@@ -1,0 +1,5 @@
+cmdstat_cluster|addslots:calls=1,usec=1433,usec_per_call=1433.00,rejected_calls=0,failed_calls=0
+cmdstat_cluster|info:calls=173,usec=117621,usec_per_call=679.89,rejected_calls=0,failed_calls=0
+cmdstat_cluster|nodes:calls=9,usec=2492,usec_per_call=276.89,rejected_calls=0,failed_calls=0
+cmdstat_cluster|set-config-epoch:calls=1,usec=700,usec_per_call=700.00,rejected_calls=0,failed_calls=0
+cmdstat_cluster|slots:calls=145,usec=38124,usec_per_call=262.92,rejected_calls=0,failed_calls=0

@@ -1,0 +1,4 @@
+2026-11-03T03:17:36Z  dragonfly  [dragonfly v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87]
+    ~/bin/dragonfly --port 6379 --bind 0.0.0.0 --dbfilename  --logtostderr
+up: dragonfly
+stopped

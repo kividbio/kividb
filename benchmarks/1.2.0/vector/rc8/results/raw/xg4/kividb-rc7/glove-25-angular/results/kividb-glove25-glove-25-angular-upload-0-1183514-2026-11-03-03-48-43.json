@@ -1,0 +1,114 @@
+{
+  "params": {
+    "experiment": "kividb-glove25",
+    "dataset": "glove-25-angular",
+    "parallel": 100,
+    "batch_size": 64
+  },
+  "results": {
+    "upload_time": 29.880751485,
+    "total_time": 30.178425977000003,
+    "upload_count": 1183514,
+    "memory_usage": {
+      "used_memory": [
+        1235601634
+      ],
+      "index_memory_bytes": null,
+      "index_info": [
+        "index_name",
+        "idx:kividb-glove25",
+        "index_options",
+        [],
+        "index_definition",
+        [
+          "key_type",
+          "HASH",
+          "prefixes",
+          [
+            "kividb-glove25:"
+          ],
+          "default_score",
+          "1"
+        ],
+        "attributes",
+        [
+          [
+            "identifier",
+            "vector",
+            "attribute",
+            "vector",
+            "type",
+            "VECTOR",
+            "algorithm",
+            "HNSW",
+            "data_type",
+            "FLOAT32",
+            "dim",
+            25,
+            "distance_metric",
+            "COSINE",
+            "M",
+            16,
+            "ef_construction",
+            256
+          ]
+        ],
+        "num_docs",
+        1183514,
+        "max_doc_id",
+        1183514,
+        "num_terms",
+        0,
+        "num_records",
+        0,
+        "text_terms_bytes",
+        0,
+        "text_postings_bytes",
+        0,
+        "text_docs_bytes",
+        0,
+        "indexing",
+        0,
+        "percent_indexed",
+        "1",
+        "hash_indexing_failures",
+        0,
+        "index_on",
+        "hash",
+        "prefixes",
+        [
+          "kividb-glove25:"
+        ],
+        "num_fields",
+        "1",
+        "fields",
+        [
+          "vector (VECTOR HNSW(M=16,ef=256) DIM=25 COSINE)"
+        ],
+        "hnsw_live_count",
+        "1183514",
+        "hnsw_tombstone_count",
+        "0",
+        "hnsw_tombstone_ratio",
+        "0.0000",
+        "hnsw_compaction_in_progress",
+        "0",
+        "hnsw_indexes",
+        [
+          [
+            "field",
+            "vector",
+            "live_count",
+            "1183514",
+            "tombstone_count",
+            "0",
+            "tombstone_ratio",
+            "0.0000",
+            "compaction_in_progress",
+            "0"
+          ]
+        ]
+      ]
+    }
+  }
+}

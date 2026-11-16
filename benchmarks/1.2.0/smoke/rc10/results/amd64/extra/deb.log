@@ -1,0 +1,12 @@
+PASS: deb: dpkg -i
+PASS: deb: server up on the packaged port 6380
+PASS: deb: unit enabled
+PASS: deb: MainPID 57144 runs as user kividb
+PASS: deb: kividb is a system user with nologin (kividb:x:997:988:KiviDB:/var/lib/kividb:/usr/sbin/nologin)
+PASS: deb: /var/lib/kividb owned by kividb
+PASS: deb: INFO server kividb_version 1.2.0-rc10
+PASS: deb: PING/SET/GET
+PASS: deb: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: deb-amd64 plain redis-benchmark: 6 tests (	100200	112612	109769	110741	112233	105932 )
+PASS: deb: SAVE writes into /var/lib/kividb (appendonly.aof dump.kdb kividb.lock )
+PASS: deb: purge stops the service

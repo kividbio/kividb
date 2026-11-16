@@ -1,0 +1,13 @@
+kividb-rc8: ref=082dab3d8929c180bccf993835e28992ea054fb5 commit=082dab3d8929c180bccf993835e28992ea054fb5 from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)
+  version: kividb 1.2.0-rc8
+  sha256: ef2208fd547bb06348560dc1f0bce48302debc098e16de58ff37431bbbcf1260
+kividb-rc7: ref=v1.2.0-rc7 commit=598b74d20ec04de5a0ff74001324907562806c3c from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)
+  version: kividb 1.2.0-rc7
+  sha256: 331196d0d415312c790cab3ba29d4f73b917a169dbe1db54931057c40ee3dc3b
+
+competitors:
+Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=7fec7ff4b6c82936
+dragonfly v2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87
+Garnet v2.2.5 on Microsoft.NETCore.App 10.0.14
+7.0.0-1017-azure
+Model name:                              Neoverse-N1

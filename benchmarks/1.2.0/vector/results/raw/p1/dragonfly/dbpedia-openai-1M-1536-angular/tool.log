@@ -1,0 +1,103 @@
+1793633473.651 RUN ./vector-db-benchmark --host 10.90.1.4 --engines-file dragonfly-engine.json --engines dragonfly-m16-ef128 --datasets dbpedia-openai-1M-1536-angular --skip-if-exists false 
+1793633473.659 vector-db-benchmark 0.2.0 (git d22d44e8b46009a800a59e952710166ece2e38a1)
+1793633473.660 Found 1 datasets, 1 engines
+1793633473.662 
+1793633473.664 ============================================================
+1793633473.666 Running experiment (1/1): dragonfly-m16-ef128 - dbpedia-openai-1M-1536-angular
+1793633473.668 ============================================================
+1793633473.670 Experiment stage: Configure
+1793633473.672 Using algorithm hnsw with config {'M': 16, 'EF_CONSTRUCTION': 128}
+1793633473.909 Experiment stage: Upload
+1793633473.911 Reading dataset from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633473.913 WARNING: dataset 'dbpedia-openai-1M-1536-angular' declares vector_count 1000000 but its corpus holds only 999000 vectors. Benchmarks will run over the 999000 vectors that exist; fix vector_count in datasets/datasets.json (it is what --list-datasets reports).
+1793633483.808 Read 999000 vectors (1536d) in 9.899s (100920 vectors/sec)
+1793633483.812 Starting upload with 16 threads, batch size 64...
+1793633633.727 Upload time: 149.919s (6664 records/sec)
+1793633633.729 Indexing complete (num_docs=999000/999000, indexing=false, percent_indexed=1.00, state=absent) in 0.0s
+1793633633.731 Index time: 0.002s, Total time (read+upload+index): 159.820s
+1793633634.164 Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-upload-0-999000-2026-11-02-15-33-54.json"
+1793633634.174 Experiment stage: Search
+1793633634.175 	Running search 0: ef=64, parallel=1
+1793633634.177 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633636.665 	  rep 1/3: QPS 403.3
+1793633636.667 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633639.173 	  rep 2/3: QPS 400.6
+1793633639.175 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633641.628 	  rep 3/3: QPS 409.7
+1793633641.630 	→ QPS: 409.7, Recall: 0.9169, Precision@returned: 0.9169, MRR: 0.9990, NDCG: 0.9390 (best of reps)
+1793633641.632 	Running search 1: ef=128, parallel=1
+1793633641.634 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633644.497 	  rep 1/3: QPS 350.1
+1793633644.499 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633647.350 	  rep 2/3: QPS 352.1
+1793633647.352 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633650.242 	  rep 3/3: QPS 347.4
+1793633650.244 	→ QPS: 352.1, Recall: 0.9384, Precision@returned: 0.9384, MRR: 1.0000, NDCG: 0.9552 (best of reps)
+1793633650.246 	Running search 2: ef=256, parallel=1
+1793633650.247 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633654.891 	  rep 1/3: QPS 215.8
+1793633654.892 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633659.446 	  rep 2/3: QPS 220.2
+1793633659.448 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633663.821 	  rep 3/3: QPS 229.4
+1793633663.823 	→ QPS: 229.4, Recall: 0.9728, Precision@returned: 0.9728, MRR: 1.0000, NDCG: 0.9803 (best of reps)
+1793633663.825 	Running search 3: ef=128, parallel=16
+1793633663.827 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633664.120 	  rep 1/3: QPS 3499.0
+1793633664.122 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633664.422 	  rep 2/3: QPS 3455.5
+1793633664.424 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633664.724 	  rep 3/3: QPS 3464.7
+1793633664.726 	→ QPS: 3499.0, Recall: 0.9384, Precision@returned: 0.9384, MRR: 1.0000, NDCG: 0.9552 (best of reps)
+1793633664.728 	Running search 4: ef=128, parallel=100
+1793633664.730 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633664.898 	  rep 1/3: QPS 6554.0
+1793633664.900 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633665.068 	  rep 2/3: QPS 6716.4
+1793633665.070 	Reading queries from /home/azureuser/vdbx/datasets/dbpedia-openai-1M-1536-angular/dbpedia_openai_1M...
+1793633665.238 	  rep 3/3: QPS 6673.4
+1793633665.240 	→ QPS: 6716.4, Recall: 0.9384, Precision@returned: 0.9384, MRR: 1.0000, NDCG: 0.9552 (best of reps)
+1793633665.247 	Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-search-0-43126-2026-11-02-15-34-25.json"
+1793633665.252 	Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-search-1-43126-2026-11-02-15-34-25.json"
+1793633665.258 	Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-search-2-43126-2026-11-02-15-34-25.json"
+1793633665.263 	Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-search-3-43126-2026-11-02-15-34-25.json"
+1793633665.269 	Results saved to: "/home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-search-4-43126-2026-11-02-15-34-25.json"
+1793633665.271 -----------------------------------------------------------------------------------------------
+1793633665.273 Recall     Precision  MRR      NDCG     QPS        P50 (ms)     P90 (ms)     P95 (ms)    
+1793633665.275 -----------------------------------------------------------------------------------------------
+1793633665.277 0.9728     0.9728     1.0000   0.9803   229.4      4.426        5.417        5.609       
+1793633665.279 0.9384     0.9384     1.0000   0.9552   6716.4     13.907       18.927       20.322      
+1793633665.280 0.9169     0.9169     0.9990   0.9390   409.7      2.459        2.883        2.990       
+1793633665.282 
+1793633665.284 
+1793633665.286 QPS vs Precision Trade-off - dragonfly-m16-ef128 - dbpedia-openai-1M-1536-angular (up and to the right is better):
+1793633665.288 
+1793633665.290     6716 │                       ●                                    
+1793633665.292     6106 │                                                            
+1793633665.294     5495 │                                                            
+1793633665.296     4885 │                                                            
+1793633665.297     4274 │                                                            
+1793633665.299     3664 │                                                            
+1793633665.301     3053 │                                                            
+1793633665.303     2442 │                                                            
+1793633665.305     1832 │                                                            
+1793633665.307     1221 │                                                            
+1793633665.309      611 │●                                                           
+1793633665.311        0 │                                                           ●
+1793633665.313          └────────────────────────────────────────────────────────────
+1793633665.315           0.917          0.936          0.954          0.973          
+1793633665.317         Precision (0.0 = 0%, 1.0 = 100%)
+1793633665.318 
+1793633665.320 THROUGHPUT vs CONCURRENCY (saturation curve):
+1793633665.322   ef=128 — peak 6716.4 QPS @ parallel 100 (still climbing at top of swept range — sweep higher to find the knee)
+1793633665.324     parallel         QPS     p50 ms     p90 ms     p95 ms     p99 ms    sat?
+1793633665.326            1       352.1      2.849      3.380      3.530      4.044       -
+1793633665.327           16      3499.0      4.450      4.910      5.096      6.222       -
+1793633665.329          100      6716.4     13.907     18.927     20.322     25.827       -
+1793633665.331 
+1793633665.333 ================================================================================
+1793633665.335 Results saved to:  /home/azureuser/vdbx/results
+1793633665.337 Summary saved to:  /home/azureuser/vdbx/results/dragonfly-m16-ef128-dbpedia-openai-1M-1536-angular-summary.json
+1793633665.339 Experiment stage: Cleanup (deleting index and data)
+1793633670.447 Experiment stage: Done
+1793633670.453 EXIT 0

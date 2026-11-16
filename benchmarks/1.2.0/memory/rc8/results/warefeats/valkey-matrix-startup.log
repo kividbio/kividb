@@ -1,0 +1,43 @@
+    image: valkey/valkey:9.1.3
+      - seccomp=./seccomp-io-uring.json
+      memlock: -1
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 * oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 * Valkey version=9.1.3, bits=64, commit=00000000, modified=0, pid=7, just started
+engine-1  | 7:M 03 Nov 2026 04:09:52.157 * Configuration loaded
+engine-1  | 7:M 03 Nov 2026 04:09:52.158 * Increased maximum number of open files to 10032 (it was originally set to 1024).
+engine-1  | 7:M 03 Nov 2026 04:09:52.188 * monotonic clock: X86 TSC @ 2600.31 ticks/us
+engine-1  | 7:M 03 Nov 2026 04:09:52.188 * Running mode=standalone, port=6379.
+engine-1  | 7:M 03 Nov 2026 04:09:52.190 * Static Module 'lua' successfully loaded
+engine-1  | 7:M 03 Nov 2026 04:09:52.190 * Server initialized
+engine-1  | 7:M 03 Nov 2026 04:09:52.190 * Ready to accept connections tcp
+# Server
+redis_version:7.2.4
+server_name:valkey
+valkey_version:9.1.3
+valkey_release_stage:ga
+redis_git_sha1:00000000
+redis_git_dirty:0
+redis_build_id:c6bf8b7f8673e9eb
+server_mode:standalone
+os:Linux 7.0.0-1017-azure x86_64
+arch_bits:64
+monotonic_clock:X86 TSC @ 2600.31 ticks/us
+multiplexing_api:epoll
+gcc_version:14.2.0
+process_id:7
+process_supervised:no
+run_id:f61201793eb8ae8bb5e9bf8957791660329bdee5
+tcp_port:6379
+server_time_usec:1793678994867741
+uptime_in_seconds:2
+uptime_in_days:0
+hz:10
+configured_hz:10
+clients_hz:10
+lru_clock:15294098
+executable:/data/valkey-server
+config_file:
+io_threads_active:0
+availability_zone:
+listener0:name=tcp,bind=0.0.0.0,port=6379

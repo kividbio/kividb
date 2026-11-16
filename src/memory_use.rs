@@ -130,6 +130,13 @@ pub fn note(delta: isize) {
     count(delta);
 }
 
+/// Count `delta` bytes as allocated by some other thread than the calling
+/// one: for a test that has the eviction it watches find other threads
+/// writing meanwhile (`eviction::others_allocate`).
+pub fn note_by_another_thread(delta: isize) {
+    COUNTS[SHARED].0.fetch_add(delta, Ordering::Relaxed);
+}
+
 /// Bytes allocated and not yet freed, by the whole process.
 pub fn allocated() -> usize {
     // The counters that have been given out, and the shared one.
@@ -190,6 +197,24 @@ static NOT_COUNTED: Shared = Shared(AtomicIsize::new(0));
 #[inline]
 pub fn not_counted_add(bytes: usize) {
     NOT_COUNTED.0.fetch_add(bytes as isize, Ordering::Relaxed);
+    let _ = LEFT_OUT_HERE.try_with(|here| here.set(here.get().wrapping_add(bytes)));
+}
+
+thread_local! {
+    /// What the calling thread has counted as not to be evicted for
+    /// ([`not_counted_add`]), all told: see [`counted_by_this_thread`].
+    static LEFT_OUT_HERE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// [`allocated_by_this_thread`], less what this thread has counted as not
+/// to be evicted for: what it has added to [`counted`] (taken from it, if
+/// negative), not moved by what other threads do meanwhile. A key evicted
+/// here that a snapshot still holds is not freed, but is no longer counted
+/// either (#284): it is given back, as far as `maxmemory` is concerned.
+/// `None` while the thread shares the last counter.
+pub fn counted_by_this_thread() -> Option<isize> {
+    let left_out = LEFT_OUT_HERE.try_with(Cell::get).ok()?;
+    allocated_by_this_thread().map(|allocated| allocated.wrapping_sub(left_out as isize))
 }
 
 /// Take back `bytes` [`not_counted_add`] counted.
@@ -312,8 +337,15 @@ pub fn over(limit: usize) -> bool {
 mod tests {
     use super::*;
 
+    /// Held by each test here that measures what the whole process has
+    /// allocated: they move it by hundreds of megabytes, far more than the
+    /// other's margin. Run at once, one's 256 MB block, or the other's
+    /// blocks in flight, were counted in the other's change (#420).
+    static WHOLE_PROCESS: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
     #[test]
     fn what_is_allocated_is_counted_and_what_is_freed_is_not() {
+        let _alone = WHOLE_PROCESS.lock();
         // Other tests allocate at the same time: look for a change far
         // larger than anything they do.
         const SIZE: usize = 256 << 20;
@@ -333,11 +365,31 @@ mod tests {
         );
     }
 
+    /// What a thread counts as not to be evicted for comes off its own
+    /// share of memory use, as it comes off the whole (#520): a key it
+    /// evicts that a snapshot holds is given back as far as `maxmemory` is
+    /// concerned. Other threads' doing so does not move it.
+    #[test]
+    fn what_a_thread_leaves_out_comes_off_its_own_share() {
+        let _alone = WHOLE_PROCESS.lock();
+        const HELD: usize = 1 << 20;
+        let before = counted_by_this_thread().expect("a counter of its own");
+        not_counted_add(HELD);
+        let after = counted_by_this_thread().unwrap();
+        assert_eq!(before - after, HELD as isize);
+        // Starting a thread allocates a little here, and that is all.
+        std::thread::spawn(|| not_counted_add(HELD)).join().unwrap();
+        let then = counted_by_this_thread().unwrap();
+        assert!(then.abs_diff(after) < 64 << 10, "{after}, then {then}");
+        counted_again(2 * HELD);
+    }
+
     /// Many threads allocating and freeing each other's blocks at once come
     /// out even: each adds to a counter of its own, and the sum is what
     /// counts.
     #[test]
     fn threads_that_free_each_others_blocks_come_out_even() {
+        let _alone = WHOLE_PROCESS.lock();
         const BLOCK: usize = 1 << 20;
         let before = allocated();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();

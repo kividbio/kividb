@@ -1,0 +1,69 @@
+== h-and-m-2048-angular-filters kividb-rc4 start 15:34:40
+exit=0 h-and-m-2048-angular-filters kividb-rc4 15:41:57
+kividb-rc4 peak_rss_kb=2286328
+== h-and-m-2048-angular-filters kividb-cand start 15:42:04
+exit=0 h-and-m-2048-angular-filters kividb-cand 15:49:23
+kividb-cand peak_rss_kb=2283308
+== h-and-m-2048-angular-filters dragonfly start 15:49:30
+exit=0 h-and-m-2048-angular-filters dragonfly 16:00:40
+dragonfly peak_rss_kb=1535020
+== h-and-m-2048-angular-filters redis-mt start 16:00:47
+redis-mt: io-threads 8  search-workers 16 
+exit=0 h-and-m-2048-angular-filters redis-mt 16:13:50
+redis-mt peak_rss_kb=2391764
+== h-and-m-2048-angular-filters redis start 16:13:57
+redis: io-threads 1  search-workers 16 
+exit=0 h-and-m-2048-angular-filters redis 16:26:59
+redis peak_rss_kb=2375884
+== dbpedia-openai-100K-1536-angular kividb-rc4 start 16:27:05
+exit=0 dbpedia-openai-100K-1536-angular kividb-rc4 16:29:03
+kividb-rc4 peak_rss_kb=1308176
+== dbpedia-openai-100K-1536-angular kividb-cand start 16:29:10
+exit=0 dbpedia-openai-100K-1536-angular kividb-cand 16:31:07
+kividb-cand peak_rss_kb=1308764
+== dbpedia-openai-100K-1536-angular dragonfly start 16:31:13
+exit=0 dbpedia-openai-100K-1536-angular dragonfly 16:33:37
+dragonfly peak_rss_kb=869440
+== dbpedia-openai-100K-1536-angular redis-mt start 16:33:44
+redis-mt: io-threads 8  search-workers 16 
+exit=0 dbpedia-openai-100K-1536-angular redis-mt 16:35:42
+redis-mt peak_rss_kb=1488556
+== dbpedia-openai-100K-1536-angular redis start 16:35:48
+redis: io-threads 1  search-workers 16 
+exit=0 dbpedia-openai-100K-1536-angular redis 16:37:45
+redis peak_rss_kb=1480912
+== glove-25-angular kividb-rc4 start 16:37:52
+exit=0 glove-25-angular kividb-rc4 16:38:42
+kividb-rc4 peak_rss_kb=1312676
+== glove-25-angular kividb-cand start 16:38:48
+exit=0 glove-25-angular kividb-cand 16:39:40
+kividb-cand peak_rss_kb=1311556
+== glove-25-angular dragonfly start 16:39:47
+exit=0 glove-25-angular dragonfly 16:40:31
+dragonfly peak_rss_kb=1309860
+== glove-25-angular redis-mt start 16:40:38
+redis-mt: io-threads 8  search-workers 16 
+exit=0 glove-25-angular redis-mt 16:41:58
+redis-mt peak_rss_kb=1347960
+== glove-25-angular redis start 16:42:04
+redis: io-threads 1  search-workers 16 
+exit=0 glove-25-angular redis 16:43:23
+redis peak_rss_kb=1316972
+== dbpedia-openai-1M-1536-angular kividb-rc4 start 16:43:30
+exit=0 dbpedia-openai-1M-1536-angular kividb-rc4 16:48:09
+kividb-rc4 peak_rss_kb=12898908
+== dbpedia-openai-1M-1536-angular kividb-cand start 16:48:16
+exit=0 dbpedia-openai-1M-1536-angular kividb-cand 16:52:56
+kividb-cand peak_rss_kb=12898264
+== dbpedia-openai-1M-1536-angular dragonfly start 16:53:03
+exit=0 dbpedia-openai-1M-1536-angular dragonfly 16:56:26
+dragonfly peak_rss_kb=8329960
+== dbpedia-openai-1M-1536-angular redis-mt start 16:56:33
+redis-mt: io-threads 8  search-workers 16 
+exit=0 dbpedia-openai-1M-1536-angular redis-mt 17:00:28
+redis-mt peak_rss_kb=14132332
+== dbpedia-openai-1M-1536-angular redis start 17:00:34
+redis: io-threads 1  search-workers 16 
+exit=0 dbpedia-openai-1M-1536-angular redis 17:04:28
+redis peak_rss_kb=14090424
+SUITE DONE p2 17:04:35

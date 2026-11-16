@@ -1,0 +1,7 @@
+shd-0-0 master -> slave sync_full+0 sync_partial_ok+0 sync_partial_err+0 
+shd-0-1 slave -> master sync_full+0 sync_partial_ok+1 sync_partial_err+0 
+shd-1-0 master -> slave sync_full+0 sync_partial_ok+0 sync_partial_err+0 
+shd-1-1 slave -> master sync_full+0 sync_partial_ok+1 sync_partial_err+0 
+shd-2-0 master -> slave sync_full+0 sync_partial_ok+0 sync_partial_err+0 
+shd-2-1 slave -> master sync_full+0 sync_partial_ok+1 sync_partial_err+0 
+TOTAL sync_full+0 sync_partial_ok+3 sync_partial_err+0

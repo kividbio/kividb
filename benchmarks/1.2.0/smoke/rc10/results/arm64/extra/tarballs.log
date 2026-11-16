@@ -1,0 +1,34 @@
+PASS: tarball-default: binary is aarch64 (ELF 64-bit LSB pie executable, ARM aarch64)
+PASS: tarball-default: --version [kividb 1.2.0-rc10]
+PASS: tarball-default: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-default: PING/SET/GET
+PASS: tarball-default: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: tarball-default plain redis-benchmark: 6 tests (	59665	60060	60277	60422	61349	61087 )
+PASS: tarball-lua: binary is aarch64 (ELF 64-bit LSB pie executable, ARM aarch64)
+PASS: tarball-lua: --version [kividb 1.2.0-rc10]
+PASS: tarball-lua: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-lua: PING/SET/GET
+PASS: tarball-lua: EVAL works
+PASS: tarball-lua plain redis-benchmark: 6 tests (	60827	59417	58892	59737	59206	60313 )
+PASS: tarball-tls: binary is aarch64 (ELF 64-bit LSB pie executable, ARM aarch64)
+PASS: tarball-tls: --version [kividb 1.2.0-rc10]
+PASS: tarball-tls: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-tls: PING/SET/GET
+PASS: tarball-tls: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: tarball-tls plain redis-benchmark: 6 tests (	59916	59488	59523	59066	59382	58651 )
+PASS: tarball-tls: TLS PING with a self-signed cert, no client cert
+PASS: tarball-tls: TLS SET/GET
+PASS: tarball-tls: plaintext on the TLS port refused
+PASS: tarball-tls: TLS client that does not trust the cert fails verification
+PASS: tarball-tls tls redis-benchmark: 6 tests (	42408	40160	40535	40290	41806	42607 )
+PASS: tarball-full: binary is aarch64 (ELF 64-bit LSB pie executable, ARM aarch64)
+PASS: tarball-full: --version [kividb 1.2.0-rc10]
+PASS: tarball-full: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-full: PING/SET/GET
+PASS: tarball-full: EVAL works
+PASS: tarball-full plain redis-benchmark: 6 tests (	55370	55005	54914	55586	55463	57670 )
+PASS: tarball-full: TLS PING with a self-signed cert, no client cert
+PASS: tarball-full: TLS SET/GET
+PASS: tarball-full: plaintext on the TLS port refused
+PASS: tarball-full: TLS client that does not trust the cert fails verification
+PASS: tarball-full tls redis-benchmark: 6 tests (	35893	35360	35161	35536	36140	35842 )

@@ -1,0 +1,128 @@
+{
+ "mode": "cluster",
+ "writers": 16,
+ "duration_s": 240.0,
+ "acked": 373189,
+ "unacked_errors": 261,
+ "lost_acked": 17,
+ "wrong_value": 0,
+ "wait_n": 0,
+ "wait_acked": 0,
+ "wait_acked_lost": 0,
+ "lost_ack_time_first": 33.107,
+ "lost_ack_time_last": 227.148,
+ "lost_sample": [
+  "ack:3:7958",
+  "ack:4:11404",
+  "ack:4:14376",
+  "ack:5:11627",
+  "ack:5:14155",
+  "ack:6:14731",
+  "ack:6:22080",
+  "ack:7:14512",
+  "ack:8:5206",
+  "ack:9:4657",
+  "ack:9:19249",
+  "ack:10:7152",
+  "ack:11:3271",
+  "ack:12:17878",
+  "ack:14:21300",
+  "ack:15:17692",
+  "ack:15:21123"
+ ],
+ "events": [
+  [
+   60.337,
+   "failover-start slot=3000 master=10.70.1.9:7001 replica=10.70.1.10:7002"
+  ],
+  [
+   60.365,
+   "failover-reply OK"
+  ],
+  [
+   60.623,
+   "failover-promoted 10.70.1.10:7002 after 0.04 s"
+  ],
+  [
+   62.785,
+   "failover-old-master-replica 10.70.1.9:7001 after 1.91 s"
+  ],
+  [
+   63.185,
+   "failover-end cluster-ok after 0.16 s"
+  ],
+  [
+   63.454,
+   "kill9-start slot=8000 master=10.70.1.10:7001 replica=10.70.1.7:7002"
+  ],
+  [
+   64.156,
+   "kill9-killed 10.70.1.10:7001"
+  ],
+  [
+   69.747,
+   "kill9-promoted 10.70.1.7:7002 after 5.43 s"
+  ],
+  [
+   91.468,
+   "kill9-restarted 10.70.1.10:7001"
+  ],
+  [
+   94.858,
+   "kill9-rejoined 10.70.1.10:7001 as replica after 3.21 s"
+  ],
+  [
+   95.42,
+   "kill9-end cluster-ok after 0.23 s"
+  ],
+  [
+   120.101,
+   "reshard-start 2 slots from 10.70.1.10:7002 (9640fb6cf7ca927ae78af9e35f36f4d268f7414e, 507564 keys) to 10.70.1.7:7002 (2c3fe4602d1e82afadebcb8d77a15f993c811bb7) with redis-cli"
+  ],
+  [
+   120.208,
+   "reshard-done exit=1 in 0.10 s, slots begun=1 keys moved=0"
+  ],
+  [
+   120.609,
+   "reshard-end cluster-ok after 0.16 s"
+  ],
+  [
+   180.431,
+   "import-start CLUSTER MIGRATION IMPORT 10923 10950 on 10.70.1.10:7002 (9640fb6cf7ca927ae78af9e35f36f4d268f7414e, 543902 keys), source 10.70.1.7:7001 (c9effd8045d7d685754324fb04c9ae83c59b7c86, 543944 keys)"
+  ],
+  [
+   180.444,
+   "import-id b6ed9a16a5beef7b3fc55dad06d970e3ffc70351"
+  ],
+  [
+   181.023,
+   "import-done in 0.57 s: id b6ed9a16a5beef7b3fc55dad06d970e3ffc70351 slots 10923-10950 source c9effd8045d7d685754324fb04c9ae83c59b7c86 dest 9640fb6cf7ca927ae78af9e35f36f4d268f7414e operation import state completed last_error  retries 0 create_time 1793650544347 start_time 1793650544347 end_time 1793650544488 write_pause_ms 0 capture_pause_ms 0"
+  ],
+  [
+   181.063,
+   "import-keys source 541428 dest 547084"
+  ],
+  [
+   181.415,
+   "import-end cluster-ok after 0.12 s"
+  ],
+  [
+   191.488,
+   "events-done"
+  ]
+ ],
+ "recovery": {
+  "event_t": 60.337,
+  "pre_event_ok_per_100ms_median": 160,
+  "first_error_t": 64.2,
+  "last_error_t": 69.60000000000001,
+  "writes_below_80pct_from_t": 60.300000000000004,
+  "throughput_back_t": 60.5,
+  "recovery_s": 0.16
+ },
+ "error_kinds": {
+  "ConnectionError:Error": 245,
+  "ClusterDownError:The": 16
+ }
+}

@@ -1,0 +1,30 @@
+2026-11-02T21:35:17Z   Normal    Killing                  g-bad-1                         Stopping container kividb
+2026-11-02T21:35:17Z   Normal    Killing                  g-bad-1                         Stopping container agent
+2026-11-02T21:35:18Z   Normal    SuccessfulCreate         g-bad                           Create Pod g-bad-1 in StatefulSet g-bad successful
+2026-11-02T21:35:18Z   Normal    Scheduled                g-bad-1                         Successfully assigned e2e/g-bad-1 to aks-nodepool1-15662409-vmss000000
+2026-11-02T21:35:18Z   Normal    Pulled                   g-bad-1                         Container image "ACR.azurecr.io/kividb:v1.2.0-rc7-badver" already present on machine and can be accessed by the pod
+2026-11-02T21:35:18Z   Normal    Created                  g-bad-1                         Container created
+2026-11-02T21:35:18Z   Normal    Started                  g-bad-1                         Container started
+2026-11-02T21:35:18Z   Normal    Pulled                   g-bad-1                         Container image "ACR.azurecr.io/kividb-operator-agent:0.7.0-afc6f49" already present on machine and can be accessed by the pod
+2026-11-02T21:35:18Z   Normal    Created                  g-bad-1                         Container created
+2026-11-02T21:35:18Z   Normal    Started                  g-bad-1                         Container started
+2026-11-02T21:35:19Z   Warning   Unhealthy                g-bad-1                         Readiness probe failed: Get "http://10.244.0.54:8081/readyz": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+2026-11-02T21:35:23Z   Warning   Unhealthy                g-bad-1                         Liveness probe failed: Get "http://10.244.0.54:8081/livez": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+2026-11-02T21:35:55Z   Warning   MasterRestartedBehind    g-bad                           g-bad-1 restarted and came back as the master at replication offset 0, behind the 70880197 it had reached and behind g-bad-0 (offset 71011619), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-02T21:35:55Z   Warning   Failover                 g-bad                           master g-bad-1 restarted behind its replicas; promoted g-bad-0
+2026-11-02T21:35:17Z   Normal    Killing                  g-bad-1                      Stopping container kividb
+2026-11-02T21:35:17Z   Normal    Killing                  g-bad-1                      Stopping container agent
+2026-11-02T21:35:18Z   Normal    Scheduled                g-bad-1                      Successfully assigned e2e/g-bad-1 to aks-nodepool1-15662409-vmss000000
+2026-11-02T21:35:18Z   Normal    Pulled                   g-bad-1                      Container image "ACR.azurecr.io/kividb:v1.2.0-rc7-badver" already present on machine and can be accessed by the pod
+2026-11-02T21:35:18Z   Normal    Created                  g-bad-1                      Container created
+2026-11-02T21:35:18Z   Normal    Started                  g-bad-1                      Container started
+2026-11-02T21:35:18Z   Normal    Pulled                   g-bad-1                      Container image "ACR.azurecr.io/kividb-operator-agent:0.7.0-afc6f49" already present on machine and can be accessed by the pod
+2026-11-02T21:35:18Z   Normal    Created                  g-bad-1                      Container created
+2026-11-02T21:35:18Z   Normal    Started                  g-bad-1                      Container started
+2026-11-02T21:35:19Z   Warning   Unhealthy                g-bad-1                      Readiness probe failed: Get "http://10.244.0.54:8081/readyz": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+2026-11-02T21:35:23Z   Warning   Unhealthy                g-bad-1                      Liveness probe failed: Get "http://10.244.0.54:8081/livez": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+2026-11-02T21:35:18Z   Normal    SuccessfulCreate         g-bad                        Create Pod g-bad-1 in StatefulSet g-bad successful
+2026-11-02T21:35:55Z   Warning   MasterRestartedBehind    g-bad                        g-bad-1 restarted and came back as the master at replication offset 0, behind the 70880197 it had reached and behind g-bad-0 (offset 71011619), which holds writes it lost; failing over rather than resyncing the replicas from its older data
+2026-11-02T21:35:55Z   Warning   Failover                 g-bad                        master g-bad-1 restarted behind its replicas; promoted g-bad-0
+2026-11-02T21:37:51Z   Warning   FailedPreStopHook        g-bad-1                      PreStopHook failed
+2026-11-02T21:37:51Z   Warning   FailedPreStopHook        g-bad-1                      PreStopHook failed

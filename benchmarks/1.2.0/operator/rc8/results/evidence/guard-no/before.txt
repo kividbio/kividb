@@ -1,0 +1,4 @@
+master g-no-1 ip 10.244.3.152
+g-no-0 kividb_version:1.2.0-rc8 run_id:000000000d8f302900000000deadbeee0d8f3028 keys=436496 role:slave master_host:10.244.3.152 master_link_status:up aof_enabled:1  ack=[aof-ack-after-write no ]
+g-no-1 kividb_version:1.2.0-rc8 run_id:0000000034d6e22500000000deadbeee34d6e224 keys=436560 role:master master_replid:cac5f24ecea770d1204745c8998ea0f3a1047be9 master_repl_offset:17241701 aof_enabled:1  ack=[aof-ack-after-write no ]
+--- new pod Ready, operator opdown 05:57:07

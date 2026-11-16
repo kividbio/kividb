@@ -1,0 +1,44 @@
+# lpop-tail.sh on the suite's server/client pair (koreacentral), 2026-11-02: the 1.2.0 candidate (75482abb) and rc4, alternating
+== kividb-cand
+activedefrag yes: OK
+Totals    4676233.93         0.00         0.00         0.42430         0.42300         0.75100         1.03100   1293386.42 
+activedefrag=yes run 1: 5736549 ops/s p50 0.335 p99 0.543 p99.9 0.879 max 135.167 ms
+activedefrag=yes run 2: 4474098 ops/s p50 0.335 p99 0.575 p99.9 50.175 max 138.239 ms
+activedefrag=yes run 3: 4563104 ops/s p50 0.335 p99 0.567 p99.9 77.823 max 98.303 ms
+== kividb-rc4
+activedefrag yes: OK
+Totals    4641619.41         0.00         0.00         0.42200         0.41500         0.75100         1.03900   1283812.49 
+activedefrag=yes run 1: 5512755 ops/s p50 0.343 p99 0.551 p99.9 0.863 max 140.287 ms
+activedefrag=yes run 2: 4791024 ops/s p50 0.343 p99 0.583 p99.9 53.247 max 111.103 ms
+activedefrag=yes run 3: 4217788 ops/s p50 0.343 p99 0.583 p99.9 75.263 max 90.623 ms
+== kividb-cand
+activedefrag yes: OK
+Totals    4630874.71         0.00         0.00         0.42539         0.42300         0.75100         1.05500   1280840.65 
+activedefrag=yes run 1: 5479054 ops/s p50 0.343 p99 0.551 p99.9 0.903 max 167.935 ms
+activedefrag=yes run 2: 4539366 ops/s p50 0.335 p99 0.567 p99.9 51.711 max 123.391 ms
+activedefrag=yes run 3: 4299222 ops/s p50 0.343 p99 0.599 p99.9 51.967 max 98.815 ms
+== kividb-rc4
+activedefrag yes: OK
+Totals    4613459.56         0.00         0.00         0.42886         0.42300         0.75100         1.14300   1276023.84 
+activedefrag=yes run 1: 5496866 ops/s p50 0.343 p99 0.551 p99.9 0.831 max 141.311 ms
+activedefrag=yes run 2: 4430315 ops/s p50 0.343 p99 0.599 p99.9 49.407 max 109.567 ms
+activedefrag=yes run 3: 4362240 ops/s p50 0.335 p99 0.583 p99.9 71.679 max 100.351 ms
+
+# lpop-perf.sh kividb-cand-fp: perf during the second LPOP run
+profiled run: 4338721 ops/s p99.9 50.431 max 107.519 ms
+samples 18614614596: under malloc_consolidate 7.2%, under free 13.4%, under malloc 0.0%
+     6.75%  [.] __memmove_evex_unaligned_erms
+     5.21%  [.] malloc_consolidate
+     5.01%  [.] kividb::commands::lists::handle
+     4.32%  [.] kividb::commands::handler::run_command
+     3.52%  [.] _int_free
+     3.24%  [k] _raw_spin_unlock_irqrestore
+     2.94%  [.] kividb::server_uring::handle_client::{closure#0}
+     2.92%  [.] kividb::write_order::lock_keys::<core::iter::adapters::map::Map<kividb::keyspec::KeyIter, kividb::commands::handler::run_command::{closure#14}>>
+     2.80%  [.] <alloc::collections::vec_deque::VecDeque<alloc::sync::Arc<[u8]>>>::pop_front
+     2.60%  [k] handle_softirqs
+     2.47%  [.] kividb::commands::handler::settle_written_keys
+     2.44%  [k] irqentry_exit
+     2.37%  [.] <parking_lot::raw_rwlock::RawRwLock as lock_api::rwlock::RawRwLock>::lock_shared
+     2.22%  [.] <hashbrown::raw::RawTable<kividb::store::entry::Slot>>::find::<<kividb::store::shard_map::ShardMap>::find::{closure#0}>
+     1.69%  [.] unlink_chunk.isra.0

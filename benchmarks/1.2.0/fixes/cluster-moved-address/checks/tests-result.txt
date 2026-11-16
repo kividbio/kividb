@@ -1,0 +1,5 @@
+lib cluster patched: exit 0
+tests/cluster.rs patched run1: exit 0
+lib cluster base: exit 0
+tests/cluster.rs base run1: exit 0
+CHECKS-DONE

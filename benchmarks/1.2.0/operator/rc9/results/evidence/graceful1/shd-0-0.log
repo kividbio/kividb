@@ -1,0 +1,17 @@
+2026-11-03T07:31:40.975013239Z 2026-11-03T07:31:40.974Z 1 [INFO] Cluster: Manual failover: starting election at epoch 15 to replace 2e4fa5855bcbaa3f27f095f776b037e66709991e
+2026-11-03T07:31:41.039976973Z 2026-11-03T07:31:41.039Z 1 [INFO] Cluster: Won election at epoch 15 (3 votes, quorum 2)
+2026-11-03T07:31:41.051717976Z 2026-11-03T07:31:41.051Z 1 [INFO] Replication: Promoted; the stream a8e8b1617baa45b6fd95741b0e05348a369775be goes on as 666459345e1ae053b3b5b5b202ee52ea28eb278d from offset 6286370 — its replicas can be continued
+2026-11-03T07:31:41.055637938Z 2026-11-03T07:31:41.055Z 1 [INFO] Replication: Partial resync for <ip>:37026: continuing from offset 6286370 (640 bytes of backlog)
+2026-11-03T07:31:41.147816078Z 2026-11-03T07:31:41.147Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:31:41.149867278Z 2026-11-03T07:31:41.149Z 1 [WARN] Replication: Master closed the connection — reconnecting
+2026-11-03T07:31:41.350150914Z 2026-11-03T07:31:41.350Z 1 [INFO] Replication: Superseded during reconnect backoff — stopping
+2026-11-03T07:31:44.130912370Z 2026-11-03T07:31:44.130Z 1 [INFO] Replication: Partial resync for <ip>:44190: continuing from offset 6287216 (33080 bytes of backlog)
+2026-11-03T07:34:03.987317238Z 2026-11-03T07:34:03.987Z 1 [INFO] Cluster: Voted for 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 to take over from 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 at epoch 16 (manual failover)
+2026-11-03T07:34:09.140238735Z 2026-11-03T07:34:09.140Z 1 [WARN] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 marked FAIL by quorum
+2026-11-03T07:34:09.181429452Z 2026-11-03T07:34:09.180Z 1 [INFO] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 is reachable again — clearing FAIL
+2026-11-03T07:36:18.480135854Z 2026-11-03T07:36:18.480Z 1 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T07:37:04.156800433Z 2026-11-03T07:37:04.156Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:37:04.166957947Z 2026-11-03T07:37:04.166Z 1 [INFO] Replication: Shutdown: replica <ip>:6380 has the whole stream, to offset 9443593 (10 ms); it can be continued after the restart
+2026-11-03T07:37:04.166976782Z 2026-11-03T07:37:04.166Z 1 [INFO] Writing final snapshot...
+2026-11-03T07:37:04.256040160Z 2026-11-03T07:37:04.255Z 1 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T07:37:04.256414334Z 2026-11-03T07:37:04.256Z 1 [INFO] Goodbye.

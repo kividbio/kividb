@@ -29,7 +29,14 @@ pub fn record_lost_aof_record() {
 /// Runtime AOF toggle. Set by CONFIG SET appendonly.
 /// The AOF writer task is always running — this flag gates whether
 /// commands are sent to it. Flipping to false drains the channel
-/// naturally; flipping to true immediately starts routing writes.
+/// naturally; flipping to true immediately starts routing writes, so
+/// the log is opened first (see [`open_log`]).
+///
+/// The rule: while this is on, the log is open (`LOG` holds it). It is
+/// opened before the flag first goes up, at startup or by `CONFIG SET
+/// appendonly yes`, and never closed. A checkpoint's turn-over waits for
+/// whoever holds the log to reach its mark: with no log, it would wait for
+/// ever.
 pub static AOF_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ── Preamble framing ─────────────────────────────────────────────────────────
@@ -249,14 +256,31 @@ static TURN_OVER_WAITERS: parking_lot::Mutex<
 > = parking_lot::Mutex::new(Vec::new());
 
 /// The log a turn-over moved aside, as the writer leaves it to the
-/// checkpoint: `None` if it needs nothing more.
-type OldLog = Option<std::fs::File>;
+/// checkpoint, with the number of the turn-over (see [`OLD_LOG_UNSYNCED`]):
+/// `None` if it needs nothing more.
+type OldLog = Option<(std::fs::File, u64)>;
 
 /// Set from a turn-over until the old log it moved aside is synced: the
 /// writer does not sync the new log before then. Records in the new log
 /// come after those in the old one, and a power failure must not keep them
 /// and lose the old one's last records.
-static OLD_LOG_UNSYNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// The number of the turn-over (see [`TURN_OVERS`]), 0 for none, and cleared
+/// only by a sync made after that turn-over: one that found an earlier
+/// turn-over's number, and synced that one's old log, must not clear the
+/// mark of a turn-over made while it synced. The writer did, and reported
+/// the records after the second synced with its renames not on the disk
+/// (#529).
+static OLD_LOG_UNSYNCED: AtomicU64 = AtomicU64::new(0);
+
+/// Turn-overs made in this process, numbering them for [`OLD_LOG_UNSYNCED`].
+static TURN_OVERS: AtomicU64 = AtomicU64::new(0);
+
+/// Clear [`OLD_LOG_UNSYNCED`] after a sync of the old log begun when it read
+/// `seen`: only if no turn-over has been made since.
+fn old_log_synced(seen: u64) {
+    let _ = OLD_LOG_UNSYNCED.compare_exchange(seen, 0, Ordering::AcqRel, Ordering::Acquire);
+}
 
 /// The start of a turn-over mark. No record begins with a zero byte.
 const TURN_OVER_MARK: &[u8] = b"\0kividb-aof-turn-over\0";
@@ -271,6 +295,30 @@ fn turn_over_mark(generation: u64) -> Vec<u8> {
 fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
     let rest = item.strip_prefix(TURN_OVER_MARK)?;
     Some(u64::from_le_bytes(rest.try_into().ok()?))
+}
+
+// ── Vector set quantization in the log ───────────────────────────────────────
+
+/// Follows a `VADD` whose options were kept; 1.2 skips it as unknown.
+pub(crate) const VSET_QUANT_MARKER: &[u8] = b"*1\r\n$21\r\nKIVIDB.AOF-VSET-QUANT\r\n";
+
+/// The marker's one argument: clients cannot send it.
+const VSET_QUANT_MARKER_NAME: &[u8] = b"KIVIDB.AOF-VSET-QUANT";
+
+fn is_vset_quant_marker(cmd: &[Vec<u8>]) -> bool {
+    matches!(cmd, [name] if name.as_slice() == VSET_QUANT_MARKER_NAME)
+}
+
+/// Whether a stream payload ends with a `VADD` that needs the marker.
+pub(crate) fn needs_vset_quant_marker(payload: &[u8]) -> bool {
+    // Most payloads are no `VADD`: not parsed.
+    if !payload.windows(4).any(|w| w.eq_ignore_ascii_case(b"VADD")) {
+        return false;
+    }
+    parse_aof_commands(payload)
+        .0
+        .last()
+        .is_some_and(|cmd| crate::vector::quant::carries_quant_option(cmd))
 }
 
 // ── Written before it is acknowledged ────────────────────────────────────────
@@ -300,6 +348,449 @@ struct Log {
 
 static LOG: parking_lot::Mutex<Option<Log>> = parking_lot::const_mutex(None);
 
+/// The queue, while no log is open: the AOF has been off since the start.
+/// See [`open_log`].
+static UNOPENED: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>> =
+    parking_lot::const_mutex(None);
+
+/// Set when the dataset has moved on without the open log: a dump was saved
+/// with the AOF off (see [`dump_saved_without_log`]), or a replica's full
+/// sync replaced the dataset. Cleared when a checkpoint turns the log over,
+/// or a new log is started. While it is set, the AOF turned on again starts
+/// a new log (see [`open_log`]).
+static LOG_SUPERSEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The dataset has moved on without the log. See [`LOG_SUPERSEDED`].
+pub fn log_superseded() {
+    LOG_SUPERSEDED.store(true, Ordering::Relaxed);
+}
+
+/// Get the log ready for `CONFIG SET appendonly yes`, with the turn of the
+/// checkpoint that follows held. Call before the flag goes up, so that a
+/// record logged once it is up has a file to go to. A file that cannot be
+/// made is an error for the caller, not an exit: the AOF stays off.
+///
+/// The log starts again, empty (see [`start_new_log`]), unless it is the one
+/// this process has had open all along and nothing has moved on without it
+/// (#350). An `appendonly.aof` left by an earlier run with the AOF on is not
+/// the dataset this process serves, and the log kept through `appendonly no`
+/// is older than a `SAVE` made since. Appended to, either became the enable's
+/// `appendonly.aof.prev`, and a crash before the enable's snapshot was on
+/// disk replayed it on top of the newer data: overwritten values, and keys
+/// deleted since, came back. Otherwise the open log is kept: with the dump it
+/// continues from, it holds what was written while the AOF was on. Kept, it
+/// must also be one recovery would replay over the dump on disk (see
+/// [`DumpOnDisk`]).
+pub fn open_log(_turn: &CheckpointTurn) -> std::io::Result<()> {
+    let made = |e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("a new {AOF_PATH} cannot be made: {e}"))
+    };
+    let mut log = LOG.lock();
+    if let Some(log) = log.as_mut() {
+        let on_disk = DumpOnDisk::read(std::path::Path::new("dump.kdb").exists());
+        if LOG_SUPERSEDED.load(Ordering::Relaxed) || on_disk.age_of(AOF_PATH) != LogAge::GoesOn {
+            // What is still queued goes to the old log, and the barriers in
+            // it are answered. No turn-over mark is: the turn is held.
+            write_queued(&mut log.file, &mut log.rx, None);
+            log.file = start_new_log(NewLogWhy::Enable, &[]).map_err(made)?;
+        }
+        return Ok(());
+    }
+    let mut unopened = UNOPENED.lock();
+    let Some(rx) = unopened.take() else {
+        return Err(std::io::Error::other("the AOF writer has not started yet"));
+    };
+    match start_new_log(NewLogWhy::EnableOverEarlierRun, &[]) {
+        Ok(file) => {
+            *log = Some(Log { rx, file });
+            Ok(())
+        }
+        Err(e) => {
+            *unopened = Some(rx);
+            Err(made(e))
+        }
+    }
+}
+
+/// A new, empty log in place of `appendonly.aof`, with nothing an earlier
+/// log left beside it: the log of an AOF turned on at runtime (see
+/// [`open_log`]).
+///
+/// It is a delta on the save number of the dump on disk, with no records:
+/// from here, `dump.kdb` alone is what a restart loads, and the records
+/// logged from now on go on top of it. A dump whose save number on disk is
+/// not its own (a save with the AOF off in 1.2.0 wrote none) is given one
+/// first, or recovery would read the new log as older than the dump and
+/// leave it out (see [`DumpOnDisk`]). It is written and synced under a name
+/// of its own and
+/// then takes the log's name, so a crash leaves the old log or the whole new
+/// one. Cut to nothing in place instead, a crash right after the cut left an
+/// empty log, which recovery reads as a turn-over stopped part-way: with an
+/// `appendonly.aof.prev` from an earlier run there, that was replayed in the
+/// log's place.
+///
+/// Only once the new log has the name are an old log and a turn-over's
+/// leftovers removed. Stopped in between, an `appendonly.aof.prev` still
+/// there goes with the dump on disk: recovery removes it, as the leftover of
+/// a checkpoint that finished. Removed first, a crash in between left the old
+/// log without the records it continues from. The turn-over's notes go
+/// before `appendonly.aof.prev`: left without it, they stopped the next start
+/// (see [`settle_turn_over`]).
+///
+/// Before anything is replaced or removed, the old logs that hold records
+/// are kept under names of their own (see [`keep_aside`]), and the directory
+/// synced: they may hold writes that are nowhere else, and the server never
+/// deletes them. `why` decides what the warning says (see [`kept_warning`]).
+///
+/// `added` is what the new log starts with, after its header: the records
+/// of an old log that go on from the dump (see [`LogAge::AddedToFrom`]);
+/// usually nothing.
+fn start_new_log(why: NewLogWhy, added: &[u8]) -> std::io::Result<std::fs::File> {
+    let mut kept = Vec::new();
+    // A turn-over's new log only ever holds a header (see
+    // [`prepare_new_log`]), and is not kept then; one that holds more is.
+    for path in [AOF_PREV_PATH, AOF_PATH, TURN_OVER_TMP] {
+        if let Some(name) = keep_aside(path)? {
+            kept.push((path, name));
+        }
+    }
+    if !kept.is_empty() {
+        sync_dir()?;
+    }
+    for (path, name) in &kept {
+        // Never loaded: what `why` says of the logs is not true of it.
+        let why = if *path == TURN_OVER_TMP {
+            NewLogWhy::Older
+        } else {
+            why
+        };
+        log_warn!("{}", kept_warning(why, path, name));
+    }
+    let file = write_new_log(added)?;
+    remove_log_leftovers()?;
+    LOG_SUPERSEDED.store(false, Ordering::Relaxed);
+    Ok(file)
+}
+
+/// Why a log is kept aside and a new one started (see [`start_new_log`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewLogWhy {
+    /// `CONFIG SET appendonly yes`, over the log this process has had open,
+    /// which the dataset has moved on from: its writes were applied here.
+    Enable,
+    /// `CONFIG SET appendonly yes`, with the AOF off since the start, over a
+    /// log an earlier run left: it was never loaded.
+    EnableOverEarlierRun,
+    /// At a start: older than `dump.kdb`, and not replayed.
+    Older,
+    /// At a start: older than `dump.kdb`, but `appendonly.aof` (and the old
+    /// log, with `prev`) was added to after the dump was saved with the AOF
+    /// off, and what was added has been replayed. With `log_whole`, all of
+    /// `appendonly.aof` was: a log made, or written to, after that save
+    /// (#363).
+    AddedTo { prev: bool, log_whole: bool },
+    /// At a start, or a turn-over: the old log of a checkpoint that
+    /// finished, removed, with `dump.kdb.gen` that of a save with the AOF
+    /// off. Its records may be in the dump, or in the log, or in neither
+    /// (#368).
+    FinishedBesideSaveWithAofOff,
+}
+
+/// The warning for the log at `path`, kept as `name`. Whether its writes
+/// are in the dataset decides what it says to do with them. It used to say
+/// they were not, whatever the case, and to send the file to the server:
+/// done with a log whose writes had been replayed, or were made by this very
+/// server, it applied them twice (#359).
+fn kept_warning(why: NewLogWhy, path: &str, name: &str) -> String {
+    let kept = format!("It is kept as {name}, which the server never removes.");
+    let apply = format!(
+        "Writes in it that are not in dump.kdb are not in the dataset. To apply those, send them \
+         to the server (`tail -c +17 {name} | redis-cli --pipe` for a file that starts with \
+         KIVIDLT1, `redis-cli --pipe < {name}` for one that starts with `*`), leaving out what \
+         dump.kdb holds, which would be applied twice; remove the file once it is not needed"
+    );
+    match why {
+        NewLogWhy::Enable => format!(
+            "AOF: {path} no longer goes on from dump.kdb (a save with the AOF off, or a full \
+             sync, came since), and the AOF turned on starts a new log. {kept} Its writes are \
+             already in the dataset: this server made them or replayed them (or a full sync \
+             replaced them with its master's dataset). Do not send them to the server, which \
+             would apply them twice; remove the file once it is not needed"
+        ),
+        NewLogWhy::EnableOverEarlierRun => format!(
+            "AOF: {path} was left by an earlier run and is not part of this dataset, and the AOF \
+             turned on starts a new log. {kept} {apply}"
+        ),
+        NewLogWhy::AddedTo {
+            log_whole: true, ..
+        } if path == AOF_PATH => format!(
+            "AOF: {path} was written to after dump.kdb was saved with the AOF off, and the log \
+             starts again on dump.kdb with its records. {kept} All of its records have been \
+             replayed, and are in the dataset: do not send the file to the server, which would \
+             apply them twice. Remove the file once it is not needed"
+        ),
+        NewLogWhy::AddedTo { prev, .. } if path != AOF_PREV_PATH || prev => format!(
+            "AOF: {path} was added to after dump.kdb was saved with the AOF off, and the log \
+             starts again on dump.kdb with what was added. {kept} What was added to it since that \
+             save has been replayed, and is in the dataset: do not send the file to the server, \
+             which would apply those writes twice. What it held before that save is older than \
+             dump.kdb and was not replayed: if writes from then are missing, read the file (RESP, \
+             after a 16-byte header if it starts with KIVIDLT1) and send only those. Remove the \
+             file once it is not needed"
+        ),
+        NewLogWhy::FinishedBesideSaveWithAofOff => format!(
+            "AOF: {path} was left by a checkpoint, beside a log that goes on from dump.kdb, and \
+             dump.kdb.gen is that of a save with the AOF off. {kept} Its records may be in \
+             dump.kdb or in the log already, or in neither: do not send the whole file to the \
+             server, which could apply writes twice. If writes from it are missing, read it \
+             (RESP, after a 16-byte header if it starts with KIVIDLT1) and send only those; \
+             remove the file once it is not needed"
+        ),
+        NewLogWhy::Older | NewLogWhy::AddedTo { .. } => {
+            format!("AOF: {path} is older than dump.kdb and is not replayed. {kept} {apply}")
+        }
+    }
+}
+
+/// What the names of the logs kept aside start with (see [`keep_aside`]).
+const KEPT_PREFIX: &str = "superseded.";
+
+/// Keep the log at `path` under a name of its own, `superseded.<ms>.<n>.<path>`,
+/// before it is replaced or removed. A log that recovery leaves out, or that
+/// an enable starts again from, may hold acknowledged writes that are in no
+/// dump: of a run whose dataset the next one did not load, or made after a
+/// save the log cannot be told apart from. It used to be overwritten, and
+/// they were gone. A hard link, so nothing is copied; a copy, synced, where
+/// links cannot be made. One with no record in it (empty, or a header alone)
+/// is not kept. The caller syncs the directory.
+fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
+    let len = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let header = if aof_delta_generation(&read_head(path)).is_some() {
+        AOF_DELTA_HEADER_LEN as u64
+    } else {
+        0
+    };
+    if len <= header {
+        return Ok(None);
+    }
+    // Kept already, by an attempt that did not get to remove it (its removal
+    // failed, or the process stopped): not kept again. Each start or
+    // checkpoint that could not remove it added another copy (#375). Only a
+    // copy of the same name with the very same bytes counts; the caller
+    // syncs the directory before anything is removed, as for a new one.
+    let suffix = format!(".{path}");
+    for (kept, kept_len) in kept_logs() {
+        if kept_len == len && kept.ends_with(&suffix) && same_bytes(path, &kept).unwrap_or(false) {
+            // Synced first: a copy stopped between its write and its sync
+            // reads whole from the page cache, but may not be on disk.
+            std::fs::File::open(&kept)?.sync_all()?;
+            return Ok(Some(kept));
+        }
+    }
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |at| at.as_millis());
+    let name = format!(
+        "{KEPT_PREFIX}{ms}.{}.{path}",
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    if std::fs::hard_link(path, &name).is_err() {
+        copy_synced(path, &name, |from, to| std::fs::copy(from, to))?;
+    }
+    Ok(Some(name))
+}
+
+/// Whether the files `a` and `b` hold the same bytes, read in full.
+fn same_bytes(a: &str, b: &str) -> std::io::Result<bool> {
+    use std::io::Read;
+    fn fill(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        Ok(filled)
+    }
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let (n, m) = (fill(&mut fa, &mut ba)?, fill(&mut fb, &mut bb)?);
+        if ba[..n] != bb[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Copy `from` to `to` with `copy` ([`std::fs::copy`], or a test's) and sync
+/// the copy. If either fails, what was copied is removed: named like a log
+/// kept aside, a partial copy was listed at every start as one, and each
+/// failed attempt left another (#359).
+fn copy_synced(
+    from: &str,
+    to: &str,
+    copy: impl FnOnce(&str, &str) -> std::io::Result<u64>,
+) -> std::io::Result<()> {
+    let copied = copy(from, to).and_then(|_| std::fs::File::open(to)?.sync_all());
+    if copied.is_err() {
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
+/// The logs kept aside (see [`keep_aside`]) in the data directory, by name,
+/// with their sizes.
+fn kept_logs() -> Vec<(String, u64)> {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return Vec::new();
+    };
+    let mut kept: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with(KEPT_PREFIX) && name.contains(AOF_PATH)).then(|| {
+                let len = entry.metadata().map_or(0, |meta| meta.len());
+                (name, len)
+            })
+        })
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// How many logs kept aside are in the data directory, and their bytes:
+/// `aof_superseded_files` and `aof_superseded_bytes` in `INFO persistence`.
+/// A kept log that is a hard link to a log still in use shares its blocks
+/// with it until that log is replaced.
+pub fn kept_logs_size() -> (usize, u64) {
+    let kept = kept_logs();
+    (kept.len(), kept.iter().map(|(_, len)| len).sum())
+}
+
+/// Say, at every start, which logs kept aside are still in the data
+/// directory: the server never removes them, and they are not to pile up
+/// unnoticed.
+fn warn_of_kept_logs() {
+    let kept: Vec<String> = kept_logs().into_iter().map(|(name, _)| name).collect();
+    if kept.is_empty() {
+        return;
+    }
+    log_warn!(
+        "AOF: {} log(s) kept aside, never replayed and never removed by the server, are in the \
+         data directory: {}. Each may hold writes that are not in dump.kdb (see the warning \
+         logged when it was kept); remove them once they are not needed",
+        kept.len(),
+        kept.join(", ")
+    );
+}
+
+/// A new log, a delta on the dump on disk with `added` as its records
+/// (usually none), written and synced under a name of its own and then given
+/// the log's.
+fn write_new_log(added: &[u8]) -> std::io::Result<std::fs::File> {
+    use std::io::Write;
+    let generation = generation_of_dump_on_disk()?;
+    let tmp = format!("{AOF_PATH}.tmp");
+    let made = (|| -> std::io::Result<std::fs::File> {
+        remove_if_there(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(&delta_header(generation))?;
+        file.write_all(added)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, AOF_PATH)?;
+        Ok(file)
+    })();
+    let file = made.inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    sync_dir()?;
+    Ok(file)
+}
+
+/// The log of a start with the AOF on. One that is not there, or empty, is
+/// made as a delta on the dump on disk: opened with no header, as it was, it
+/// was a log of an age no recovery could tell, and replayed over a dump saved
+/// later with the AOF off, it applied its writes twice. Anything else at the
+/// log's name (a link, a directory) is opened as it is, and fails as it would.
+fn open_log_at_start() -> std::io::Result<std::fs::File> {
+    let make = match std::fs::symlink_metadata(AOF_PATH) {
+        Ok(meta) => meta.is_file() && meta.len() == 0,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(e),
+    };
+    if make {
+        return write_new_log(&[]);
+    }
+    open_aof()
+}
+
+/// Remove what an old log left beside the log: a turn-over's notes, then
+/// the old log itself.
+fn remove_log_leftovers() -> std::io::Result<()> {
+    for left in [TURN_OVER_TMP, TURN_OVER_APPENDING, AOF_PREV_PATH] {
+        failpoint("new-log-removing");
+        remove_if_there(left)?;
+    }
+    sync_dir()
+}
+
+fn remove_if_there(path: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The save number of the `dump.kdb` on disk, given it one if the number on
+/// disk is not its own: past every number on disk, logs included, so that no
+/// log left there reads as going with it.
+fn generation_of_dump_on_disk() -> std::io::Result<u64> {
+    if !std::path::Path::new("dump.kdb").exists() {
+        return Ok(read_generation());
+    }
+    let found = file_fingerprint("dump.kdb")?;
+    match read_saved() {
+        Some(saved) if saved.dump == found => Ok(saved.number),
+        _ => {
+            let generation = next_generation();
+            // No log on disk goes with it. The logs are as they are: the
+            // caller is about to replace them, and may hold the open one.
+            write_saved(generation, found, Some(logs_on_disk()?))?;
+            sync_dir()?;
+            log_warn!(
+                "AOF: {AOF_GEN_PATH} did not describe dump.kdb (saved with the AOF off by an \
+                 earlier release, or replaced) — dump.kdb is now save number {generation}"
+            );
+            Ok(generation)
+        }
+    }
+}
+
+/// A dump was put in place with the AOF off, by a save or a checkpoint that
+/// found the AOF off: the open log no longer goes on from it, and the next
+/// enable starts a new one (#350). The files are left alone, as with the AOF
+/// off they always were: the dump's save number, past every log's, and its
+/// mark that no log goes with it (see [`install_dump`]) are what keep a
+/// start with the AOF on from replaying them over it (#354).
+pub(crate) fn dump_saved_without_log() {
+    LOG_SUPERSEDED.store(true, Ordering::Relaxed);
+}
+
 /// Wakes the writer thread: a record or a barrier has been queued. Kept as a
 /// permit if it is busy, so nothing queued is left behind.
 static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
@@ -311,12 +802,26 @@ static QUEUED: std::sync::LazyLock<tokio::sync::Notify> =
 /// connection that sent the record writes it before it replies (see
 /// [`written`]), and woken, the thread took the lock first and left the
 /// connection waiting to be woken in turn — a quarter of the writes a
-/// second. What no reply waits for (an expiry's delete, a replica's stream)
-/// is written with the next connection's, or by the writer's next sync, a
-/// second at most.
+/// second. What no reply waits for (an expiry's delete) is written with the
+/// next connection's, or by the writer's next sync, a second at most. A
+/// replica's stream has no connection's to go with: its applier wakes the
+/// writer itself, once a batch ([`stream_applied`]).
 #[inline]
 pub fn records_queued() {
     if !acks_wait() {
+        QUEUED.notify_one();
+    }
+}
+
+/// A replica has applied a batch of its master's stream. Its records have no
+/// reply waiting for them to write them, and a read-only replica takes no
+/// writes of its own whose replies would: the writer thread writes them. Left to the
+/// writer's sync once a second, a replica under sustained writes fell behind
+/// its master, its queue (and with it its memory) grew by the second, and
+/// its checkpoints, queued behind the backlog, did not finish for minutes.
+#[inline]
+pub fn stream_applied() {
+    if WRITER_RUNNING.load(Ordering::Acquire) {
         QUEUED.notify_one();
     }
 }
@@ -353,22 +858,93 @@ pub fn set_ack_after_write(on: bool) {
     ACK_AFTER_WRITE.store(on, Ordering::Relaxed);
 }
 
+/// `appendfsync always`: whether a reply to a write waits for its record to
+/// be synced to disk, not only written to the file (#513). It was accepted,
+/// and the file synced once a second all the same: a power failure could
+/// lose a second of writes their clients had been told were made.
+static FSYNC_ALWAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fsync_always(on: bool) {
+    FSYNC_ALWAYS.store(on, Ordering::Relaxed);
+    // Replies already waiting for a sync get it, whatever the setting now;
+    // the writer is woken to look at the setting again (see
+    // [`run_aof_writer`]).
+    SYNC_WANTED.notify_one();
+    QUEUED.notify_one();
+}
+
+#[inline]
+fn fsync_always() -> bool {
+    FSYNC_ALWAYS.load(Ordering::Relaxed)
+}
+
+/// Under `appendfsync always`: the barriers whose records are in the file
+/// and wait for it to be synced. Added to with the log locked, and taken
+/// with it locked too, so that what the barriers taken stand for is in the
+/// file then. The writer thread syncs for them ([`sync_for_replies`]).
+static UNSYNCED_BARRIERS: parking_lot::Mutex<Vec<u64>> = parking_lot::const_mutex(Vec::new());
+
+/// Wakes the writer thread to sync for [`UNSYNCED_BARRIERS`].
+static SYNC_WANTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Whether the writer thread has to listen for [`SYNC_WANTED`]: under
+/// `appendfsync always`, or while barriers handed to it under `always` are
+/// still waiting. Not otherwise: `everysec` costs what it did.
+fn syncs_for_replies() -> bool {
+    fsync_always() || !UNSYNCED_BARRIERS.lock().is_empty()
+}
+
+/// A sync of the AOF failed under `appendfsync always`: the server stops
+/// rather than acknowledge writes that may not be on disk, as Redis does.
+/// Never carried on from. Linux reports a failed writeback once to each open
+/// file, and every handle of the log shares one: a failure logged and
+/// passed over would leave the next sync to return success and its replies
+/// to go out with their writes lost.
+fn sync_failed_under_always(what: &str, e: &std::io::Error) -> ! {
+    log_fatal!(
+        "AOF: {what} failed under appendfsync always: {e} — exiting rather than acknowledge writes that may not be on disk"
+    );
+    std::process::exit(1);
+}
+
 /// Whether a connection's replies may have to wait for the AOF: it is on,
-/// and acknowledges after writing.
+/// and acknowledges after writing — always under `appendfsync always`,
+/// whatever `aof-ack-after-write` says.
 #[inline]
 pub fn acks_wait() -> bool {
-    AOF_ENABLED.load(Ordering::Relaxed) && ACK_AFTER_WRITE.load(Ordering::Relaxed)
+    AOF_ENABLED.load(Ordering::Relaxed)
+        && (ACK_AFTER_WRITE.load(Ordering::Relaxed) || fsync_always())
 }
 
 /// Whether a command may write a record its reply should wait for: a write,
 /// or a script or a transaction that may make some.
 #[inline]
-pub fn may_log(name: &[u8]) -> bool {
-    crate::replication::is_write_command_bytes(name)
-        || name.eq_ignore_ascii_case(b"EVAL")
-        || name.eq_ignore_ascii_case(b"EVALSHA")
-        || name.eq_ignore_ascii_case(b"FCALL")
-        || name.eq_ignore_ascii_case(b"EXEC")
+pub fn may_log(cmd: &[&[u8]]) -> bool {
+    let Some(&cmd0) = cmd.first() else {
+        return false;
+    };
+    // A write by name, the most of them, is told by its name alone.
+    if crate::replication::is_write_command_bytes(cmd0) {
+        return true;
+    }
+    // The rest, told apart by length first: most commands are none of them.
+    let is = |name: &str| cmd0.eq_ignore_ascii_case(name.as_bytes());
+    // Writes only with some arguments (`GEORADIUS ... STORE`, `MIGRATE`,
+    // `FUNCTION LOAD`): judged by them, so the reply waits for the record
+    // like any other write's.
+    let by_arguments =
+        |name: &str| is(name) && crate::replication::command_mutates_for_replication(name, cmd);
+    // EVAL, EVALSHA, FCALL and EXEC may write from what they run.
+    match cmd0.len() {
+        4 => is("EVAL") || is("EXEC"),
+        5 => is("FCALL"),
+        6 => by_arguments("SCRIPT"),
+        7 => is("EVALSHA") || by_arguments("MIGRATE"),
+        8 => by_arguments("FUNCTION"),
+        9 => by_arguments("GEORADIUS"),
+        17 => by_arguments("GEORADIUSBYMEMBER"),
+        _ => false,
+    }
 }
 
 /// How long a reply to a write waits for its records to reach the file
@@ -400,7 +976,24 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     if write_what_is_queued(false).is_none() {
         QUEUED.notify_one();
     }
-    if tokio::time::timeout(ACK_WAIT_LIMIT, wait).await.is_err() {
+    let mut wait = wait;
+    loop {
+        if tokio::time::timeout(ACK_WAIT_LIMIT, &mut wait)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        // Under `appendfsync always` a reply is never sent ahead of its
+        // write: it waits for as long as the disk takes.
+        if fsync_always() {
+            log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "AOF: a reply has waited over 5 s for its write to be synced to {AOF_PATH} (appendfsync always): the disk is behind"
+            );
+            continue;
+        }
         BARRIERS.lock().remove(&id);
         AOF_ACKS_BEFORE_WRITE.fetch_add(1, Ordering::Relaxed);
         log_throttled!(
@@ -408,6 +1001,7 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
             crate::loglevel::WARN,
             "AOF: a reply waited 5 s for its write to reach {AOF_PATH} and was sent without it"
         );
+        return;
     }
 }
 
@@ -556,26 +1150,49 @@ pub fn request_flush() {
     }
 }
 
-pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
-    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(1);
+/// Set the AOF's queue up, and with the AOF on its log, and return the
+/// writer for a thread of its own to run. Called before that thread is
+/// spawned: a `CONFIG SET appendonly yes` that came before the thread got
+/// going found no queue to open a log for ("the AOF writer has not started
+/// yet"), and a log that cannot be opened stops the server before it serves.
+pub fn start_aof_writer(
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let (flush_tx, flush_rx) = tokio::sync::mpsc::channel::<()>(1);
     let _ = FLUSH_TX.set(flush_tx);
 
-    // A server asked to keep an append-only file that cannot open one must
-    // not run: it would accept writes and keep none of them. (This used to be
-    // a panic in this task alone — the server carried on, serving, with
-    // nothing being logged.)
-    let file = match open_aof() {
-        Ok(file) => file,
-        Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
-    };
-    *LOG.lock() = Some(Log { rx, file });
+    if AOF_ENABLED.load(Ordering::Relaxed) {
+        // A server asked to keep an append-only file that cannot open one must
+        // not run: it would accept writes and keep none of them. (This used to be
+        // a panic in this task alone — the server carried on, serving, with
+        // nothing being logged.)
+        let file = match open_log_at_start() {
+            Ok(file) => file,
+            Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be opened for appending: {e}")),
+        };
+        *LOG.lock() = Some(Log { rx, file });
+        *UNOPENED.lock() = None;
+    } else {
+        // With the AOF off, no file is opened or needed until `CONFIG SET
+        // appendonly yes` (see [`open_log`]). Opened whatever the setting, it
+        // was made in every data directory, and one that could not be written
+        // stopped a server that was never going to write it (#47). A log
+        // already open is another server's, in a process that runs several
+        // (the tests do): left alone.
+        *UNOPENED.lock() = Some(rx);
+    }
     WRITER_RUNNING.store(true, Ordering::Release);
 
     // Whatever survived startup (an AOF that was just replayed, or nothing) is
     // the baseline the first growth ratio is measured against. The writer opens
     // *after* recovery on every startup path, so this sees the post-replay size.
     record_base_size();
+    run_aof_writer(flush_rx)
+}
 
+/// The writer's loop: the second's sync, a sync asked for, and what is
+/// queued that no connection writes.
+async fn run_aof_writer(mut flush_rx: tokio::sync::mpsc::Receiver<()>) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -586,6 +1203,9 @@ pub async fn start_aof_writer(rx: mpsc::UnboundedReceiver<Vec<u8>>) {
             }
             Some(()) = flush_rx.recv() => {
                 do_fsync();
+            }
+            () = SYNC_WANTED.notified(), if syncs_for_replies() => {
+                sync_for_replies();
             }
             () = QUEUED.notified() => {
                 let released = write_what_is_queued(true).unwrap_or(false);
@@ -651,8 +1271,10 @@ fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
     let old = std::mem::replace(file, open_aof()?);
     match moved? {
         MovedAside::ToSync => {
-            OLD_LOG_UNSYNCED.store(true, Ordering::Release);
-            Ok(Some(old))
+            // With the log locked: turn-overs are numbered in the order made.
+            let number = TURN_OVERS.fetch_add(1, Ordering::Relaxed) + 1;
+            OLD_LOG_UNSYNCED.store(number, Ordering::Release);
+            Ok(Some((old, number)))
         }
         MovedAside::Synced => Ok(None),
     }
@@ -662,13 +1284,35 @@ fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
 /// directory that has both logs under their new names. The writer syncs the
 /// new log again once they are.
 fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
-    let Some(old) = old else {
+    let Some((old, number)) = old else {
         return Ok(());
     };
     failpoint("turn-over-syncing");
-    let synced = old.sync_data().and_then(|()| sync_dir());
-    OLD_LOG_UNSYNCED.store(false, Ordering::Release);
+    let synced = if injected_failure("turn-over-sync-fails") {
+        Err(std::io::Error::other("failure injected by a test"))
+    } else {
+        old.sync_data().and_then(|()| sync_dir())
+    };
+    match &synced {
+        Ok(()) => old_log_synced(number),
+        Err(e) if fsync_always() => {
+            sync_failed_under_always(&format!("the sync of {AOF_PREV_PATH}"), e)
+        }
+        // Left set: the new log is not synced ahead of the old one, and the
+        // second's sync tries the old one again (see [`do_fsync`]).
+        Err(_) => {}
+    }
     synced
+}
+
+/// Sync the old log a turn-over moved aside, and the directory.
+fn sync_old_log() -> std::io::Result<()> {
+    match std::fs::File::open(AOF_PREV_PATH) {
+        Ok(old) => old.sync_data()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    sync_dir()
 }
 
 /// Write `first` and whatever else is queued, turning the log over at each
@@ -683,6 +1327,7 @@ fn write_queued(
     let mut wrote = false;
     let mut released = false;
     let mut barriers = Vec::new();
+    let mut drained = 0usize;
     loop {
         let mut batch = Vec::new();
         let mark = match first.take() {
@@ -699,11 +1344,39 @@ fn write_queued(
             },
             None => drain_into(&mut batch, rx, &mut barriers),
         };
+        // A batch that stopped at the cap left more queued. Going on with it
+        // here, not on the next pass: what no reply waits for (a replica's
+        // stream) may have no next pass but the second's sync, and one batch
+        // a second fell behind 40 MB/s of writes, with the queue, and the
+        // turn-over of a checkpoint behind it, growing without end. Not for
+        // ever, though: with writes coming faster than the disk takes them
+        // the queue never empties, and whoever holds the log would keep it,
+        // the second's sync waiting behind. Past a budget, the writer thread
+        // is woken to go on, and the sync gets its turn.
+        let more_queued = batch.len() >= MAX_AOF_BATCH_BYTES;
+        drained += batch.len();
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
-        release_barriers(&mut barriers);
+        // Under `appendfsync always`, the replies the barriers stand for go
+        // out once what is before them is on the disk. The writer thread
+        // syncs, not the connection's: a sync takes milliseconds, and a
+        // connection's thread serves others meanwhile. Every barrier that
+        // comes in while it syncs is answered by the next sync: a group
+        // commit.
+        if !barriers.is_empty() && fsync_always() {
+            UNSYNCED_BARRIERS.lock().append(&mut barriers);
+            SYNC_WANTED.notify_one();
+        } else {
+            release_barriers(&mut barriers);
+        }
         let Some(generation) = mark else {
+            if more_queued {
+                if drained < MAX_AOF_PASS_BYTES {
+                    continue;
+                }
+                QUEUED.notify_one();
+            }
             return (wrote, released);
         };
         let result = perform_turn_over(file);
@@ -757,6 +1430,17 @@ const TURN_OVER_APPENDING: &str = "appendonly.aof.prev.len";
 fn prepare_new_log(generation: u64) -> std::io::Result<()> {
     use std::io::Write;
     settle_turn_over()?;
+    // The old log of a checkpoint that finished is removed by the turn-over
+    // (see [`move_log_aside`]), and may have to be kept aside first: that
+    // links or copies it, and syncs the directory, so it is done here, with
+    // nothing locked (#375). The turn is held from here to the turn-over, and
+    // nothing else changes the save number, the dump or the old log: the
+    // turn-over sees what this saw.
+    FINISHED_OLD_LOG_KEPT.store(false, Ordering::Relaxed);
+    if std::path::Path::new(AOF_PREV_PATH).exists() && checkpoint_completed(&read_head(AOF_PATH)) {
+        keep_finished_old_log()?;
+        FINISHED_OLD_LOG_KEPT.store(true, Ordering::Relaxed);
+    }
     let mut fresh = std::fs::File::create(TURN_OVER_TMP)?;
     fresh.write_all(AOF_DELTA_MAGIC)?;
     fresh.write_all(&generation.to_le_bytes())?;
@@ -791,7 +1475,17 @@ fn move_log_aside() -> std::io::Result<MovedAside> {
             // Left by a checkpoint that finished, all but removing it: what
             // it holds is in the snapshot. Added to, it would be replayed
             // on top of that snapshot, should this checkpoint not finish.
-            std::fs::remove_file(prev)?;
+            // Kept aside first if it had to be, by [`prepare_new_log`]: only
+            // removed here. Not kept when it had to be, it is not removed,
+            // and the turn-over fails with nothing lost.
+            if !FINISHED_OLD_LOG_KEPT.swap(false, Ordering::Relaxed)
+                && read_saved().is_some_and(|saved| saved.alone)
+            {
+                return Err(std::io::Error::other(format!(
+                    "{AOF_PREV_PATH}, left by a checkpoint that finished, was not kept aside"
+                )));
+            }
+            remove_if_there(AOF_PREV_PATH)?;
         }
     }
     if prev.exists() {
@@ -896,11 +1590,53 @@ fn recover_turn_over() {
                 "{AOF_PATH} could not be put back after an interrupted checkpoint: {e}"
             ));
         }
-    } else if let Err(e) = std::fs::remove_file(TURN_OVER_TMP)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        log_warn!("AOF: {TURN_OVER_TMP} could not be removed: {e}");
+    } else {
+        // A turn-over's new log, never put in place: only ever a header (see
+        // [`prepare_new_log`]). One that holds more is kept aside first: no
+        // log is removed with records that may be nowhere else.
+        let kept = keep_aside(TURN_OVER_TMP).and_then(|kept| {
+            if let Some(name) = &kept {
+                sync_dir()?;
+                log_warn!("{}", kept_warning(NewLogWhy::Older, TURN_OVER_TMP, name));
+            }
+            Ok(kept)
+        });
+        let removed = kept.and_then(|_| remove_if_there(TURN_OVER_TMP));
+        if let Err(e) = removed {
+            log_warn!("AOF: {TURN_OVER_TMP} could not be removed: {e}");
+        }
     }
+}
+
+/// Set by [`prepare_new_log`] once the old log of a checkpoint that
+/// finished, which the turn-over removes, has been kept aside if it had to
+/// be (see [`keep_finished_old_log`]).
+static FINISHED_OLD_LOG_KEPT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Before `appendonly.aof.prev`, left by a checkpoint that finished (see
+/// [`checkpoint_completed`]), is removed: the dump holds its records, unless
+/// `dump.kdb.gen` is that of a save with the AOF off, which did not turn the
+/// log over. Then it is kept aside first (#368). A save with the AOF off
+/// that took the number of a turn-over's new log (`next_generation` did not
+/// count it) made the old log read as that of a finished checkpoint, and it
+/// was deleted with writes a run with the AOF off had never loaded. With
+/// any other `dump.kdb.gen`, nothing is done.
+fn keep_finished_old_log() -> std::io::Result<()> {
+    if read_saved().is_some_and(|saved| saved.alone)
+        && let Some(name) = keep_aside(AOF_PREV_PATH)?
+    {
+        sync_dir()?;
+        log_warn!(
+            "{}",
+            kept_warning(
+                NewLogWhy::FinishedBesideSaveWithAofOff,
+                AOF_PREV_PATH,
+                &name
+            )
+        );
+    }
+    Ok(())
 }
 
 /// Write `bytes` to `path` so that a crash leaves the old file or the whole
@@ -939,6 +1675,10 @@ fn sync_dir() -> std::io::Result<()> {
 /// large buffer; whatever is left stays queued and goes out on the next pass.
 const MAX_AOF_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
+/// How much one pass over the queue writes, at most, before it lets the log
+/// go (see [`write_queued`]): about a second of a fast disk's writes.
+const MAX_AOF_PASS_BYTES: usize = 64 * 1024 * 1024;
+
 /// How long the writer stays away from its queue after a write. It adds this
 /// much, at most, to how long a record written under load waits to reach
 /// the file — next to the second it may wait for the `fsync`.
@@ -970,12 +1710,82 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) {
         return;
     }
     if let Err(e) = file.write_all(batch) {
+        // Replies wait for this write and its sync: none can be sent
+        // without it, nor with it lost. Redis exits too.
+        if fsync_always() {
+            log_fatal!(
+                "AOF: write to {AOF_PATH} failed under appendfsync always: {e} — exiting rather than acknowledge writes that are not on disk"
+            );
+            std::process::exit(1);
+        }
         log_throttled!(
             10,
             crate::loglevel::ERROR,
             "AOF: write to {AOF_PATH} failed: {e} — writes are not being made durable; check free disk space and permissions on the data directory"
         );
     }
+}
+
+/// `appendfsync always`: sync the file for the replies waiting for it, and
+/// then answer them (#513). On a handle of its own, outside the lock:
+/// connections go on writing meanwhile, and what they write is synced next.
+fn sync_for_replies() {
+    let (mut barriers, written, file) = {
+        let log = LOG.lock();
+        let barriers = std::mem::take(&mut *UNSYNCED_BARRIERS.lock());
+        // What the sync covers, as in [`do_fsync`]: `WAITAOF` and the
+        // second's sync see it synced.
+        let written = AOF_WRITTEN.load(Ordering::Relaxed);
+        match log.as_ref() {
+            Some(log) => (barriers, written, Some(log.file.try_clone())),
+            // The AOF turned off since: nothing to sync.
+            None => (barriers, written, None),
+        }
+    };
+    if barriers.is_empty() {
+        return;
+    }
+    match file {
+        Some(Ok(file)) => {
+            // A test holds the sync for these replies here: only here, not
+            // in the second's sync (`do_fsync`), which answers no reply. Held
+            // there too, a tick that came first took the hit the test
+            // waited for, and the replies' sync then waited at the next one,
+            // which the test never let go of (#515).
+            failpoint("aof-fsync-before-reply");
+            sync_before_reply(&file);
+            AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
+        }
+        Some(Err(e)) => sync_failed_under_always(&format!("opening {AOF_PATH} to sync"), &e),
+        None => {}
+    }
+    release_barriers(&mut barriers);
+}
+
+/// `appendfsync always`: sync what has been written, before the replies
+/// that wait for it are sent — and first the old log of a turn-over the
+/// checkpoint has yet to sync, with the directory: the records after a
+/// turn-over must not be on the disk without those before it, nor in a
+/// new log whose name may not be. A sync that fails ends the server, as in
+/// Redis: it can neither reply nor keep the promise.
+fn sync_before_reply(file: &std::fs::File) {
+    let synced = (|| {
+        if OLD_LOG_UNSYNCED.load(Ordering::Acquire) != 0 {
+            sync_old_log()?;
+        }
+        file.sync_data()
+    })();
+    if let Err(e) = synced {
+        sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
+    }
+}
+
+/// Shutdown, with no snapshot to carry the writes (`SHUTDOWN NOSAVE`, or a
+/// final save that failed): the AOF is all the process leaves of them, so
+/// what is queued is written and the file synced before the process exits,
+/// as Redis flushes and syncs its AOF. Nothing with the AOF off.
+pub fn sync_for_shutdown() {
+    do_fsync();
 }
 
 /// Write what is queued and sync the file — on a handle of its own, outside
@@ -1013,10 +1823,37 @@ fn do_fsync() {
     if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
-    // Not ahead of the old log a turn-over has just moved aside: the next
-    // second's sync covers this, once the checkpoint has synced that one.
-    if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+    // A test holds the sync here, as a slow disk would: `WAITAOF` waits.
+    failpoint("fsync");
+    // Under `appendfsync always`, a sync that fails stops the server, here
+    // as for a reply: logged and passed over, its error would be gone for
+    // the next sync, which would answer replies with their writes lost.
+    if fsync_always() {
+        sync_before_reply(&file);
+        AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
         return;
+    }
+    // Not ahead of the old log a turn-over has moved aside. The checkpoint
+    // syncs that one; if its sync failed, or has yet to be made, it is made
+    // here. Marked synced only if no turn-over was made meanwhile: what this
+    // synced may not be the old log of that one, nor its renames.
+    let seen = OLD_LOG_UNSYNCED.load(Ordering::Acquire);
+    if seen != 0 {
+        match sync_old_log() {
+            Ok(()) => {
+                // A test holds the writer here, as a slow disk would.
+                failpoint("old-log-synced");
+                old_log_synced(seen);
+            }
+            Err(e) => {
+                log_throttled!(
+                    10,
+                    crate::loglevel::ERROR,
+                    "AOF: fsync of {AOF_PREV_PATH} failed: {e} — writes acknowledged since the last good fsync may be lost on power failure; check the disk"
+                );
+                return;
+            }
+        }
     }
 
     if let Err(e) = file.sync_data() {
@@ -1040,6 +1877,13 @@ fn do_fsync() {
 /// they are no longer held, for the writer to have done it.
 fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
     let queued = if WRITER_RUNNING.load(Ordering::Acquire) {
+        // Whoever holds the log takes the mark: the AOF being on, it is open
+        // (see [`AOF_ENABLED`]). With none, nothing would take it, and the
+        // wait below would never end.
+        debug_assert!(
+            LOG.try_lock().is_none_or(|log| log.is_some()),
+            "a turn-over with no log open"
+        );
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         TURN_OVER_WAITERS.lock().push((generation, done_tx));
         send_to_global_writer(turn_over_mark(generation));
@@ -1186,14 +2030,23 @@ fn checkpoint_inner(
     at_cut();
     let frozen = crate::snapshot::freeze_dataset_for_disk(store, Some(index_store));
     let turn_over = match (&frozen, aof_on) {
-        (Ok(_), true) => Some(turn_over_aof(generation)),
+        (Ok(_), true) => {
+            // The new log goes on from the dataset captured: cleared here,
+            // with writes held, so that a full sync's swap after the cut
+            // keeps its mark.
+            LOG_SUPERSEDED.store(false, Ordering::Relaxed);
+            Some(turn_over_aof(generation))
+        }
         _ => None,
     };
     drop(cut);
     let held = started.elapsed();
     let frozen = frozen?;
-    if let Some(turned) = turn_over {
-        turned()?;
+    if let Some(turned) = turn_over
+        && let Err(e) = turned()
+    {
+        LOG_SUPERSEDED.store(true, Ordering::Relaxed);
+        return Err(e);
     }
     failpoint("checkpoint-turned-over");
     if held > std::time::Duration::from_millis(100) {
@@ -1203,33 +2056,10 @@ fn checkpoint_inner(
         );
     }
 
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp_path = format!(
-        "dump.kdb.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let written = (|| -> std::io::Result<()> {
-        frozen.write_file(&tmp_path)?;
-        // The save number, and which dump it is the number of, take their
-        // name before the dump takes its own: a crash between the two leaves
-        // a number that does not describe the dump there, which recovery
-        // reads as a checkpoint that did not finish.
-        let (len, hash) = file_fingerprint(&tmp_path)?;
-        let gen_tmp = format!("{AOF_GEN_PATH}.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&gen_tmp)?;
-            file.write_all(&generation.to_le_bytes())?;
-            file.write_all(&len.to_le_bytes())?;
-            file.write_all(&hash.to_le_bytes())?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&gen_tmp, AOF_GEN_PATH)?;
-        std::fs::rename(&tmp_path, "dump.kdb")?;
-        // On disk before the old log goes.
-        sync_dir()
-    })();
+    let tmp_path = temp_dump_name();
+    let written = frozen
+        .write_file(&tmp_path)
+        .and_then(|()| install_dump(&tmp_path, generation, !aof_on));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp_path);
         log_warn!(
@@ -1247,6 +2077,10 @@ fn checkpoint_inner(
         }
         record_base_size();
         log_info!("AOF: rebased onto dump.kdb (generation {generation}) — log is now the delta");
+    } else {
+        // A `CONFIG SET appendonly no` came before this checkpoint read the
+        // setting: its dump is one saved with the AOF off.
+        dump_saved_without_log();
     }
     failpoint("checkpoint-finished");
     Ok(())
@@ -1255,45 +2089,480 @@ fn checkpoint_inner(
 /// The length of a file and a hash of its first and last 64 KiB: enough to
 /// tell one dump from another.
 fn file_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
-    use std::io::{Read, Seek, SeekFrom};
-    const EDGE: u64 = 64 * 1024;
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let mut sample = Vec::with_capacity((2 * EDGE) as usize);
-    (&mut file).take(EDGE).read_to_end(&mut sample)?;
+    fingerprint_of_first(&file, len)
+}
+
+/// How much of each end of a file [`file_fingerprint`] hashes.
+const EDGE: u64 = 64 * 1024;
+
+/// [`file_fingerprint`] of a file that holds `buf`.
+fn fingerprint_of_bytes(buf: &[u8]) -> (u64, u64) {
+    let len = buf.len() as u64;
+    let mut sample = buf[..EDGE.min(len) as usize].to_vec();
     if len > EDGE {
-        file.seek(SeekFrom::Start(len - EDGE.min(len - EDGE)))?;
-        file.read_to_end(&mut sample)?;
+        let from = len - EDGE.min(len - EDGE);
+        sample.extend_from_slice(&buf[from as usize..]);
+    }
+    (len, xxhash_rust::xxh3::xxh3_64(&sample))
+}
+
+/// The header of a delta log for save number `generation`.
+fn delta_header(generation: u64) -> [u8; AOF_DELTA_HEADER_LEN] {
+    let mut header = [0; AOF_DELTA_HEADER_LEN];
+    header[..8].copy_from_slice(AOF_DELTA_MAGIC);
+    header[8..].copy_from_slice(&generation.to_le_bytes());
+    header
+}
+
+/// [`file_fingerprint`] of the first `len` bytes of `file`: its fingerprint
+/// when it was that long, if it has only been added to since. From the
+/// start of the file, wherever it was read up to: called again on the same
+/// file, for the next length recorded, it went on from where the last call
+/// stopped, and a log added to after a save matched only the first length
+/// tried.
+fn fingerprint_of_first(mut file: &std::fs::File, len: u64) -> std::io::Result<(u64, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let mut sample = Vec::with_capacity((2 * EDGE) as usize);
+    (&mut file).take(EDGE.min(len)).read_to_end(&mut sample)?;
+    if len > EDGE {
+        let from = len - EDGE.min(len - EDGE);
+        file.seek(SeekFrom::Start(from))?;
+        (&mut file).take(len - from).read_to_end(&mut sample)?;
     }
     Ok((len, xxhash_rust::xxh3::xxh3_64(&sample)))
+}
+
+/// [`file_fingerprint`] of a log; one that is not there reads as empty.
+fn log_fingerprint(path: &str) -> std::io::Result<(u64, u64)> {
+    match file_fingerprint(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((0, xxhash_rust::xxh3::xxh3_64(&[])))
+        }
+        found => found,
+    }
+}
+
+/// `appendonly.aof` and `appendonly.aof.prev` as recorded beside a dump
+/// saved with the AOF off: their fingerprints, and the save numbers in their
+/// headers ([`NO_HEADER`] for one with none, or not there).
+type LogsAtSave = ([(u64, u64); 2], [u64; 2]);
+
+/// The save number recorded for a log with no header, or none at all.
+const NO_HEADER: u64 = u64::MAX;
+
+/// `appendonly.aof` and `appendonly.aof.prev` as they are on disk now.
+fn logs_on_disk() -> std::io::Result<LogsAtSave> {
+    let number = |path| aof_delta_generation(&read_head(path)).unwrap_or(NO_HEADER);
+    Ok((
+        [log_fingerprint(AOF_PATH)?, log_fingerprint(AOF_PREV_PATH)?],
+        [number(AOF_PATH), number(AOF_PREV_PATH)],
+    ))
+}
+
+/// The logs as a save with the AOF off leaves them, to be recorded beside
+/// its dump (see [`DumpOnDisk`]). What was queued for the open log before
+/// the AOF went off is written first, and the log synced: records of writes
+/// the dump holds, which would otherwise reach the log after it was
+/// recorded, and read as added to it since.
+fn logs_as_saved() -> std::io::Result<LogsAtSave> {
+    if let Some(log) = LOG.lock().as_mut() {
+        write_queued(&mut log.file, &mut log.rx, None);
+        // Not synced, it is shorter after a power cut than recorded: read
+        // as changed, it is replayed, as when nothing was recorded. Under
+        // `appendfsync always` a failure is not passed over (see
+        // [`sync_failed_under_always`]).
+        if let Err(e) = log.file.sync_data()
+            && fsync_always()
+        {
+            sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
+        }
+    }
+    logs_on_disk()
+}
+
+/// The name a dump is written under before [`install_dump`] puts it in
+/// place, `dump.kdb.<pid>.<n>.tmp`: one of its own for each writer, since a
+/// checkpoint and a save with the AOF off can overlap, and two writing one
+/// file would interleave.
+pub(crate) fn temp_dump_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "dump.kdb.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Whether `name` is one of [`temp_dump_name`]'s, of any process.
+fn is_temp_dump(name: &str) -> bool {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("dump.kdb.")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(pid, n)| number(pid) && number(n))
+}
+
+/// Remove the dumps that saves cut short (a kill -9, the OOM killer, a
+/// Kubernetes liveness probe) left in the data directory, naming each in
+/// the log. Each is as big as the dataset, and nothing reads it: recovery
+/// goes by `dump.kdb` and the save number beside it. Left there, each crash
+/// during a save added one, until the volume was full (#545).
+///
+/// Only at start, by the process holding the data directory's lock, and
+/// before it saves anything: every such file is then another process's, one
+/// with this pid included, as every start in a container has the same.
+pub fn remove_cut_short_dumps() {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return;
+    };
+    let mut cut_short: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            is_temp_dump(&name).then(|| (name, entry.metadata().map_or(0, |meta| meta.len())))
+        })
+        .collect();
+    cut_short.sort();
+    for (name, len) in cut_short {
+        match std::fs::remove_file(&name) {
+            Ok(()) => log_warn!(
+                "Removed {name} ({len} bytes), the dump of a save that did not finish: nothing \
+                 reads it"
+            ),
+            Err(e) => log_warn!(
+                "Can't remove {name}, the dump of a save that did not finish ({e}): nothing \
+                 reads it, remove it by hand"
+            ),
+        }
+    }
+}
+
+/// Put the dump written to `tmp` in place as save number `generation`, with
+/// the checkpoint's turn held. The save number, and which dump it is the
+/// number of, take their name before the dump takes its own: a crash between
+/// the two leaves a number that does not describe the dump there, which
+/// recovery reads as a checkpoint that did not finish. `alone`: saved with
+/// the AOF off, no log on disk goes with it.
+///
+/// The directory is synced between the two renames (#359). A power cut
+/// could otherwise keep the dump's rename and lose the number's: an old
+/// number beside a new dump, which recovery reads as a dump replaced since,
+/// and leaves out the logs that go on from it.
+pub(crate) fn install_dump(tmp: &str, generation: u64, alone: bool) -> std::io::Result<()> {
+    let logs = if alone { Some(logs_as_saved()?) } else { None };
+    write_saved(generation, file_fingerprint(tmp)?, logs)?;
+    sync_dir()?;
+    failpoint("dump-installing");
+    std::fs::rename(tmp, "dump.kdb")?;
+    // On disk before the old log goes.
+    sync_dir()
+}
+
+/// Write `dump.kdb.gen`, synced (the directory is not):
+///
+/// | bytes | what |
+/// |---|---|
+/// | 0..8 | save number `generation` |
+/// | 8..24 | the fingerprint of its dump, `(len, hash)` |
+/// | 24 | 1 if no log on disk goes with that dump (`logs` given), else 0 |
+/// | 25..41, 41..57 | with 1: the fingerprints of `appendonly.aof` and `appendonly.aof.prev` at that save, an absent one as empty |
+/// | 57..65, 65..73 | with 1: the save numbers in their headers, [`NO_HEADER`] for none |
+///
+/// Releases before 1.2.1 read the first 24 bytes only.
+fn write_saved(
+    generation: u64,
+    (len, hash): (u64, u64),
+    logs: Option<LogsAtSave>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let gen_tmp = format!("{AOF_GEN_PATH}.tmp");
+    {
+        let mut file = std::fs::File::create(&gen_tmp)?;
+        file.write_all(&generation.to_le_bytes())?;
+        file.write_all(&len.to_le_bytes())?;
+        file.write_all(&hash.to_le_bytes())?;
+        file.write_all(&[u8::from(logs.is_some())])?;
+        if let Some((fingerprints, numbers)) = logs {
+            for (log_len, log_hash) in fingerprints {
+                file.write_all(&log_len.to_le_bytes())?;
+                file.write_all(&log_hash.to_le_bytes())?;
+            }
+            for number in numbers {
+                file.write_all(&number.to_le_bytes())?;
+            }
+        }
+        file.sync_all()?;
+    }
+    std::fs::rename(&gen_tmp, AOF_GEN_PATH)
+}
+
+/// `dump.kdb.gen` (see [`write_saved`]).
+struct Saved {
+    number: u64,
+    /// The fingerprint of the dump it was written for.
+    dump: (u64, u64),
+    /// No log on disk goes with that dump: it was saved with the AOF off.
+    alone: bool,
+    /// With `alone`, the logs as they were at that save. Not in the file of
+    /// a save made before they were recorded.
+    logs: Option<[(u64, u64); 2]>,
+    /// With `logs`, the save numbers in their headers then. Not in the file
+    /// of a save made before they were recorded.
+    numbers: Option<[u64; 2]>,
+}
+
+fn read_saved() -> Option<Saved> {
+    let saved = std::fs::read(AOF_GEN_PATH).ok()?;
+    let field = |at: usize| Some(u64::from_le_bytes(saved.get(at..at + 8)?.try_into().ok()?));
+    let pair = |at: usize| Some((field(at)?, field(at + 8)?));
+    let alone = saved.get(24) == Some(&1);
+    let logs = if alone {
+        pair(25).zip(pair(41)).map(|(log, prev)| [log, prev])
+    } else {
+        None
+    };
+    let numbers = logs.and(pair(57)).map(|(log, prev)| [log, prev]);
+    Some(Saved {
+        number: field(0)?,
+        dump: pair(8)?,
+        alone,
+        logs,
+        numbers,
+    })
+}
+
+/// The first bytes of a log, enough for its header; empty if there is none.
+fn read_head(path: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file
+            .take(AOF_DELTA_HEADER_LEN as u64)
+            .read_to_end(&mut head);
+    }
+    head
 }
 
 /// Whether the checkpoint that left `appendonly.aof.prev` behind finished:
 /// the save number on disk is the one the log goes on from, and it was
 /// written for the `dump.kdb` that is there.
 fn checkpoint_completed(log: &[u8]) -> bool {
-    let Ok(saved) = std::fs::read(AOF_GEN_PATH) else {
+    let Some(saved) = read_saved() else {
         return false;
     };
-    if saved.len() < 24 {
-        return false;
-    }
-    let number = u64::from_le_bytes(saved[0..8].try_into().unwrap_or_default());
-    let len = u64::from_le_bytes(saved[8..16].try_into().unwrap_or_default());
-    let hash = u64::from_le_bytes(saved[16..24].try_into().unwrap_or_default());
-    aof_delta_generation(log) == Some(number)
-        && file_fingerprint("dump.kdb").is_ok_and(|found| found == (len, hash))
+    aof_delta_generation(log) == Some(saved.number)
+        && file_fingerprint("dump.kdb").is_ok_and(|found| found == saved.dump)
 }
 
-/// The save number for a checkpoint that has its turn: past the one on disk,
-/// and past any this process chose before. A checkpoint that failed wrote
-/// none, and the next does not take its number again.
-fn next_generation() -> u64 {
+/// The save number for a checkpoint or a save that has its turn: past the
+/// one on disk, past any this process chose before (a checkpoint that failed
+/// wrote none, and the next does not take its number again), and past the
+/// number of any log on disk, so that a new dump never shares its number
+/// with a log that does not go with it.
+pub(crate) fn next_generation() -> u64 {
+    // A turn-over's new log too, left by one that stopped: the next start
+    // with the AOF on puts it in place. A save that took its number made
+    // the old log beside it read as that of a finished checkpoint (#368).
+    let logs = [AOF_PATH, AOF_PREV_PATH, TURN_OVER_TMP]
+        .into_iter()
+        .filter_map(|path| aof_delta_generation(&read_head(path)))
+        .max()
+        .unwrap_or(0);
     let next = read_generation()
         .max(LAST_GENERATION.load(Ordering::Relaxed))
+        .max(logs)
         .saturating_add(1);
     LAST_GENERATION.store(next, Ordering::Relaxed);
     next
+}
+
+/// The `dump.kdb` on disk, as recovery sees it next to a log: which logs it
+/// is newer than, and so must not have replayed on top of it (#354).
+///
+/// A log is a delta on the dump of its save number: `dump.kdb.gen` holds the
+/// number of the dump on disk and its fingerprint. Saves with the AOF off in
+/// 1.2.0 wrote a new `dump.kdb` and left `dump.kdb.gen` as it was: its number
+/// is then the old log's, and its fingerprint not the dump's. Comparing the
+/// numbers alone, recovery took the log for one going on from the dump and
+/// replayed it on top of the newer data: writes applied twice, deletions
+/// undone.
+///
+/// The fingerprint is what tells them apart, and where it does not match,
+/// the number still says something. A checkpoint stopped between writing its
+/// number and putting its dump in place leaves the number of its new log,
+/// beside the old log, which goes with the dump that is there: both are
+/// replayed. A number that is a log's own while its dump is not there means
+/// that dump was replaced since: the log is older. A dump saved with the AOF
+/// off is marked as one no log on disk goes with, and the logs as they were
+/// at that save are recorded beside it: a log with no header (made by 1.2.0)
+/// that is still as it was then is older too. When in doubt (no number, a
+/// log with no header beside a dump not so marked, or changed since), a log
+/// is replayed, as before.
+///
+/// A log can be added to after such a save: 1.2.0, started with the AOF on,
+/// adds to the log it finds, replaying it first if it has no header and
+/// leaving it out if its number is older (#359). What was added goes on from
+/// the dump, and is replayed: with a log with no header, the whole log, as
+/// 1.2.0 did; with an older number, only what was added.
+///
+/// A log left out is never lost: it is kept aside (see [`keep_aside`]).
+struct DumpOnDisk {
+    /// `dump.kdb` was there and was loaded.
+    kdb: bool,
+    /// `dump.kdb.gen`, and whether it was written for the `dump.kdb` there.
+    saved: Option<(Saved, bool)>,
+}
+
+/// What recovery makes of a log beside the dump on disk (see [`DumpOnDisk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogAge {
+    /// It goes on from the dump, or nothing says otherwise: replayed.
+    GoesOn,
+    /// It goes with a dump that has been replaced since: left out.
+    Older,
+    /// Older, but added to since the dump was saved with the AOF off, from
+    /// this byte on: what follows goes on from the dump.
+    AddedToFrom(u64),
+}
+
+impl DumpOnDisk {
+    fn read(kdb: bool) -> Self {
+        let saved = read_saved().map(|saved| {
+            let own = file_fingerprint("dump.kdb").is_ok_and(|found| found == saved.dump);
+            (saved, own)
+        });
+        DumpOnDisk { kdb, saved }
+    }
+
+    /// The log at `path` (the log, or the old log), against the dump.
+    fn age_of(&self, path: &str) -> LogAge {
+        let Some((saved, own)) = self.saved.as_ref().filter(|_| self.kdb) else {
+            return LogAge::GoesOn;
+        };
+        let head = read_head(path);
+        match (aof_delta_generation(&head), *own) {
+            // The number is this dump's: an older log goes with an older
+            // one, unless it was added to after this dump was saved.
+            (Some(log), true) if log < saved.number => {
+                if written_since_a_save_with_no_log(path, saved) {
+                    LogAge::AddedToFrom(AOF_DELTA_HEADER_LEN as u64)
+                } else {
+                    match added_to_since(path, saved) {
+                        Some(from) => LogAge::AddedToFrom(from),
+                        None => LogAge::Older,
+                    }
+                }
+            }
+            // No log goes with this dump: one with no header is older, if it
+            // is as it was when the dump was saved.
+            (None, true) if saved.alone && !head.is_empty() => {
+                let as_saved = saved.logs.is_some_and(|logs| {
+                    file_fingerprint(path).is_ok_and(|found| logs.contains(&found))
+                });
+                if as_saved {
+                    LogAge::Older
+                } else {
+                    LogAge::GoesOn
+                }
+            }
+            // The number is the log's own, and its dump is gone.
+            (Some(log), false) if log == saved.number => LogAge::Older,
+            _ => LogAge::GoesOn,
+        }
+    }
+}
+
+impl DumpOnDisk {
+    /// Whether the log `buf`, which [`DumpOnDisk::age_of`] says goes on from
+    /// the dump, is replayed, on its own, beside an old log that is older
+    /// than the dump (#363). Left out with the old log, its records were only
+    /// in the copy kept aside. It is when it holds records, the dump is the
+    /// one `dump.kdb.gen` was written for, and it is a log with no header (as
+    /// without the old log, it is replayed whole), or one made after the
+    /// save, when there was no log: 1.2.0 makes a delta on the next number
+    /// then, for an old log with no log beside it, and adds to it.
+    fn replayed_beside_an_older_old_log(&self, buf: &[u8]) -> bool {
+        let Some((saved, own)) = self.saved.as_ref().filter(|_| self.kdb) else {
+            return false;
+        };
+        if !*own || buf.len() <= records_start(buf) || buf.starts_with(AOF_MAGIC) {
+            return false;
+        }
+        // A delta on this dump's number is never here: `checkpoint_completed`
+        // is true for it, and the old log is not judged at all. One on a
+        // number below it, made after the save, is added to (see
+        // [`written_since_a_save_with_no_log`]); this is one above it.
+        match aof_delta_generation(buf) {
+            None => true,
+            Some(_) => saved.logs.is_some_and(|logs| logs[0].0 == 0),
+        }
+    }
+}
+
+/// Whether the delta at `path`, holding records, was made after the dump of
+/// `saved` was saved with the AOF off, when there was no such log: all its
+/// records were written since, whatever the number in its header. 1.2.0 puts
+/// a turn-over's new log left from before the save in place, a delta on a
+/// number below the save's, and adds to it; read as older than the dump, the
+/// log was left out with those writes.
+///
+/// Only for the log. An old log made after such a save, a delta below its
+/// number, is not reached: 1.2.0 starts a log with no header where there is
+/// none, and its turn-overs give the new log a number past the save's.
+fn written_since_a_save_with_no_log(path: &str, saved: &Saved) -> bool {
+    let Some(logs) = saved.logs.filter(|_| saved.alone && path == AOF_PATH) else {
+        return false;
+    };
+    logs[0].0 == 0
+        && std::fs::metadata(path).is_ok_and(|meta| meta.len() > AOF_DELTA_HEADER_LEN as u64)
+}
+
+/// Where what was added to the log at `path` since the dump of `saved` was
+/// saved with the AOF off starts, if it has only been added to since: it is
+/// longer now, and its first bytes are those recorded at that save. Either
+/// name counts, as a checkpoint renames the log to the old log's.
+///
+/// An old log that was there at that save, as an old log, has been added to
+/// by a turn-over: 1.2.0's adds the log's records to an old log it still
+/// needs, the log's records from before the save among them, which the dump
+/// holds. Those come first, and are skipped: only once they are found to be
+/// what the log held at the save. If that cannot be told (the save did not
+/// record the log's header, or they are not), `None`: the old log is older
+/// than the dump, and kept aside whole. Replayed from where it was, it
+/// applied the log's records a second time.
+fn added_to_since(path: &str, saved: &Saved) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let logs = saved.logs?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let (which, was) = logs
+        .into_iter()
+        .enumerate()
+        .find_map(|(which, (was, hash))| {
+            let added_to = was >= AOF_DELTA_HEADER_LEN as u64
+                && was < len
+                && fingerprint_of_first(&file, was).is_ok_and(|found| found == (was, hash));
+            added_to.then_some((which, was))
+        })?;
+    if path != AOF_PREV_PATH || which != 1 {
+        return Some(was);
+    }
+    let (log_was, log_hash) = logs[0];
+    if log_was == 0 {
+        // No log then: what was added came after.
+        return Some(was);
+    }
+    let mut then = match saved.numbers?[0] {
+        NO_HEADER => Vec::new(),
+        number => delta_header(number).to_vec(),
+    };
+    let records = log_was.checked_sub(then.len() as u64)?;
+    file.seek(SeekFrom::Start(was)).ok()?;
+    (&mut file).take(records).read_to_end(&mut then).ok()?;
+    (fingerprint_of_bytes(&then) == (log_was, log_hash)).then_some(was + records)
 }
 
 fn read_generation() -> u64 {
@@ -1311,15 +2580,12 @@ fn aof_delta_generation(buf: &[u8]) -> Option<u64> {
     buf[8..16].try_into().ok().map(u64::from_le_bytes)
 }
 
-/// The dump is newer than this AOF delta (SAVE wrote dump, crashed before the
-/// log was reset). Replaying the old delta would double-apply. Skip it.
-fn aof_delta_is_stale(buf: &[u8]) -> bool {
-    match aof_delta_generation(buf) {
-        Some(aof_gen) => {
-            let dump_gen = read_generation();
-            dump_gen > 0 && aof_gen < dump_gen
-        }
-        None => false,
+/// Where the records of a log start: after its delta header, if it has one.
+fn records_start(buf: &[u8]) -> usize {
+    if aof_delta_generation(buf).is_some() {
+        AOF_DELTA_HEADER_LEN
+    } else {
+        0
     }
 }
 
@@ -1650,6 +2916,24 @@ fn classify_tail(rest: &[u8]) -> Tail {
         }
     }
 
+    // Zeros to the end of the file: what a power loss leaves where the last
+    // writes were. The file system recorded the file's new length, and the
+    // data never reached the disk (ext4 commits the size first). Those
+    // writes were never synced, so cut off with whatever record they end;
+    // a server refused to start over them. Zeros with anything after them
+    // are not a tail: a hole in the middle of the log is damage.
+    let end = rest
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(0, |last| last + 1);
+    if end < rest.len() {
+        return if end == 0 {
+            Tail::Truncated
+        } else {
+            classify_tail(&rest[..end])
+        };
+    }
+
     if rest.first() != Some(&b'*') {
         return Tail::Corrupt;
     }
@@ -1689,6 +2973,12 @@ fn classify_tail(rest: &[u8]) -> Tail {
 /// KiviDB.
 pub(crate) fn fatal_persistence(what: &str) -> ! {
     log_fatal!("{what}");
+    // Keys outside database 0 of a cluster node: the file is fine, the
+    // node cannot serve them (#484).
+    if what.contains(crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0) {
+        log_fatal!("{}.", crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+        std::process::exit(1);
+    }
     log_fatal!(
         "Refusing to start with an empty dataset in place of one that could not be \
          loaded. Fix the file (or its permissions), or move it out of the working directory \
@@ -1793,8 +3083,11 @@ pub fn replay_aof(
     // replayed after `t` as an INCR of a missing key, `1` with no time to
     // live, for good. The preamble's keys too, past their time or not. And no key is
     // swept meanwhile, by the expiry threads, which run from before the load.
+    // Nor does a `PEXPIREAT` whose moment has come delete its key: it sets
+    // it, and the writes after it go into the key (`expiry::replay`).
     let _hold = crate::expiry::hold();
     let _loading = crate::expiry::Loading::start();
+    let _replay = crate::expiry::replay();
     let buf = std::fs::read(path)?;
     let mut stats = ReplayStats {
         bytes: buf.len() as u64,
@@ -1860,7 +3153,8 @@ pub fn replay_aof(
     };
 
     if let Some(image) = image {
-        let loaded = crate::snapshot::load_snapshot_from(image)?;
+        let loaded = crate::snapshot::load_snapshot_bytes(image)
+            .map_err(|e| crate::snapshot::refusal_of_file(e, "the AOF's preamble"))?;
         let crate::snapshot::LoadedSnapshot {
             dbs,
             index_schemas,
@@ -1884,7 +3178,12 @@ pub fn replay_aof(
 
     let _indexing = DeferIndexing::start();
 
-    for (cmd, live) in commands.into_iter().zip(live) {
+    let mut records = commands.into_iter().zip(live).peekable();
+    while let Some((cmd, live)) = records.next() {
+        // Read with the record before it, below.
+        if is_vset_quant_marker(&cmd) {
+            continue;
+        }
         // What is left of a transaction here is whole: its commands are
         // applied in order, and nothing runs beside a replay to see them
         // half done. Its `MULTI` and `EXEC` have nothing more to do.
@@ -1896,6 +3195,15 @@ pub fn replay_aof(
             continue;
         }
         stats.commands += 1;
+        // Without its marker, a `VADD` is 1.2's, which stored f32.
+        let marked = records
+            .peek()
+            .is_some_and(|(next, _)| is_vset_quant_marker(next));
+        let cmd = if marked {
+            cmd
+        } else {
+            crate::vector::quant::without_quant_options(cmd).0
+        };
         if env
             .apply_command(
                 cmd,
@@ -1963,6 +3271,9 @@ pub struct LocalRecovery {
     /// file was replayed on top of it. Only then does a resync point saved
     /// beside the dump describe what was loaded.
     pub exact_dump: bool,
+    /// The fingerprint of the `dump.kdb` that was loaded, if one was: what a
+    /// point or marker saved beside it must match (#303).
+    pub dump_fingerprint: Option<crate::replication::DumpFingerprint>,
 }
 
 /// Load `dump.kdb` (or `dump.rdb`) first, then replay the AOF on top.
@@ -1993,6 +3304,7 @@ pub fn recover_local(
         index_names: Vec::new(),
         hnsw_loaded: false,
         exact_dump: false,
+        dump_fingerprint: None,
     };
 
     // `preload-file`: load exactly this, and nothing else. An operator who
@@ -2024,15 +3336,21 @@ pub fn recover_local(
         }
     }
 
+    warn_of_kept_logs();
     let kdb_path = std::path::Path::new("dump.kdb");
     let rdb_path = std::path::Path::new("dump.rdb");
     let mut dump_loaded = false;
+    // `dump.kdb` was loaded, even with nothing in it: what the logs are
+    // checked against (see [`DumpOnDisk`]).
+    let mut kdb_loaded = false;
 
     if kdb_path.exists() {
         log_info!("Found dump.kdb — loading native snapshot");
-        match crate::snapshot::load_snapshot("dump.kdb") {
-            Ok(loaded) => {
+        match crate::replication::load_dump("dump.kdb") {
+            Ok((loaded, fingerprint)) => {
+                kdb_loaded = true;
                 recovery.exact_dump = true;
+                recovery.dump_fingerprint = Some(fingerprint);
                 let crate::snapshot::LoadedSnapshot {
                     dbs,
                     index_schemas,
@@ -2087,17 +3405,91 @@ pub fn recover_local(
         recover_turn_over();
     }
     if should_recover_from_aof(aof_enabled) {
-        let buf = match std::fs::read(AOF_PATH) {
+        let mut buf = match std::fs::read(AOF_PATH) {
             Ok(buf) => buf,
             Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be read: {e}")),
         };
+        // The logs are replayed only over the dump they go on from (#354).
+        let on_disk = DumpOnDisk::read(kdb_loaded);
+        let older_than_dump = |what: &str| {
+            log_warn!(
+                "AOF: {what} older than dump.kdb (saved since, with the AOF off, or replaced) — \
+                 not replayed: replayed on top of it, writes the dump holds would be applied \
+                 twice. The old log is kept aside, and {AOF_PATH} starts again on dump.kdb"
+            );
+        };
+        // Left out: it starts again on the dump, empty, before anything is
+        // logged. Left as it was, what is written from now on would go after
+        // the old records, and be left out with them at the next start.
+        let mut left_out = false;
         // A checkpoint turned the log over and was stopped before its
         // snapshot reached the disk: the old log, then the new one, on top of
         // the old snapshot. One that did finish only left the old log behind.
         let mut resumed_checkpoint = false;
+        // What an older log had added to it after the dump was saved with the
+        // AOF off, its name, and whether it is all of the log: it goes on
+        // from the dump (see [`LogAge::AddedToFrom`]).
+        let mut added: Option<(&str, bool, Vec<u8>)> = None;
         if std::path::Path::new(AOF_PREV_PATH).exists() {
-            if checkpoint_completed(&buf) {
-                let _ = std::fs::remove_file(AOF_PREV_PATH);
+            // None: the checkpoint that left it behind finished.
+            let prev_age = (!checkpoint_completed(&buf)).then(|| on_disk.age_of(AOF_PREV_PATH));
+            if prev_age.is_none() {
+                // With a dump saved with the AOF off, the old log may hold
+                // writes it does not: it is not removed without a copy, and
+                // the server does not start without one. Otherwise the dump
+                // holds them, and an old log that cannot be removed is left
+                // in place (#375). Until it is removed, each turn-over fails
+                // on it, and so does each checkpoint: the warning says so.
+                if let Err(e) = keep_finished_old_log() {
+                    log_fatal!(
+                        "{AOF_PREV_PATH}, left by a checkpoint that finished, cannot be kept \
+                         aside: {e}. dump.kdb was saved with the AOF off since, and may not hold \
+                         its writes, so it is not removed without a copy. Free disk space in the \
+                         data directory, or move {AOF_PREV_PATH} out of it, and start again"
+                    );
+                    std::process::exit(1);
+                }
+                if let Err(e) = remove_if_there(AOF_PREV_PATH) {
+                    log_warn!(
+                        "AOF: {AOF_PREV_PATH}, left by a checkpoint that finished, could not be \
+                         removed: {e} — it is left in place. dump.kdb holds its writes. Until it is \
+                         removed, every checkpoint fails (INFO persistence shows \
+                         aof_last_bgrewrite_status:err) and {AOF_PATH} keeps growing: fix the \
+                         permissions of the data directory, and the next checkpoint removes it, or \
+                         remove {AOF_PREV_PATH} by hand"
+                    );
+                }
+            } else if prev_age == Some(LogAge::Older) {
+                // The log is judged on its own. What was added to it since
+                // the dump was saved goes on from the dump (#359), and so
+                // does a log that, alone, would be replayed (#363): left out
+                // with the old log, their records were only in the copies
+                // kept aside.
+                match on_disk.age_of(AOF_PATH) {
+                    LogAge::AddedToFrom(from) => {
+                        added = Some((
+                            AOF_PATH,
+                            false,
+                            buf.get(from as usize..).unwrap_or_default().to_vec(),
+                        ));
+                    }
+                    LogAge::GoesOn if on_disk.replayed_beside_an_older_old_log(&buf) => {
+                        added = Some((AOF_PATH, true, buf[records_start(&buf)..].to_vec()));
+                    }
+                    _ => {
+                        older_than_dump(&format!("{AOF_PREV_PATH} and {AOF_PATH} are"));
+                        left_out = true;
+                    }
+                }
+            } else if let Some(LogAge::AddedToFrom(from)) = prev_age {
+                // And the log goes on from what was added.
+                let prev = match std::fs::read(AOF_PREV_PATH) {
+                    Ok(prev) => prev,
+                    Err(e) => fatal_persistence(&format!("{AOF_PREV_PATH} cannot be read: {e}")),
+                };
+                let mut both = prev.get(from as usize..).unwrap_or_default().to_vec();
+                both.extend_from_slice(&buf[records_start(&buf)..]);
+                added = Some((AOF_PREV_PATH, true, both));
             } else {
                 log_warn!(
                     "AOF: a checkpoint did not finish — replaying {AOF_PREV_PATH} and then \
@@ -2127,6 +3519,8 @@ pub fn recover_local(
         if let (Some(aof_generation), dump_generation) =
             (aof_delta_generation(&buf), read_generation())
             && !resumed_checkpoint
+            && !left_out
+            && added.is_none()
             && dump_generation > 0
             && aof_generation > dump_generation
         {
@@ -2136,12 +3530,55 @@ pub fn recover_local(
                  made between those saves are in neither"
             ));
         }
-        if dump_loaded && aof_delta_is_stale(&buf) {
-            log_info!(
-                "AOF delta is older than dump.kdb — skipping it so commands \
-                 already in the snapshot are not applied twice"
-            );
-        } else {
+        if !left_out && !resumed_checkpoint && added.is_none() {
+            match on_disk.age_of(AOF_PATH) {
+                LogAge::Older => {
+                    older_than_dump(&format!("{AOF_PATH} is"));
+                    left_out = true;
+                }
+                LogAge::AddedToFrom(from) => {
+                    added = Some((
+                        AOF_PATH,
+                        false,
+                        buf.get(from as usize..).unwrap_or_default().to_vec(),
+                    ));
+                }
+                LogAge::GoesOn => {}
+            }
+        }
+        // The records added go on from the dump: the log starts again on it
+        // with them, and is replayed. The old logs are kept aside, whole.
+        if let Some((name, log_whole, added)) = added {
+            if name == AOF_PATH && log_whole {
+                log_warn!(
+                    "AOF: {AOF_PATH} was written to after dump.kdb was saved with the AOF off (by \
+                     an earlier release started with the AOF on) — it is replayed on top of \
+                     dump.kdb, all of it, as that release replayed it; {AOF_PREV_PATH}, older \
+                     than dump.kdb, is not"
+                );
+            } else {
+                log_warn!(
+                    "AOF: {name} was added to after dump.kdb was saved with the AOF off (by an \
+                     earlier release started with the AOF on) — what was added is replayed on \
+                     top of dump.kdb; the records from before that save, which dump.kdb holds, \
+                     are not"
+                );
+            }
+            let why = NewLogWhy::AddedTo {
+                prev: name == AOF_PREV_PATH,
+                log_whole,
+            };
+            if let Err(e) = start_new_log(why, &added) {
+                fatal_persistence(&format!(
+                    "{AOF_PATH} cannot be started again on dump.kdb with what was added to it: {e}"
+                ));
+            }
+            buf = match std::fs::read(AOF_PATH) {
+                Ok(buf) => buf,
+                Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be read: {e}")),
+            };
+        }
+        if !left_out {
             if dump_loaded {
                 log_info!("Replaying {AOF_PATH} on top of the snapshot (writes since the dump)");
                 if aof_delta_generation(&buf).is_none() {
@@ -2169,15 +3606,21 @@ pub fn recover_local(
                     repl_state,
                     dump_loaded,
                 );
-                if recovery.index_names.is_empty() {
-                    recovery.index_names = names;
-                }
+                // Every index there is now, not the snapshot's alone: one
+                // created since the dump is in the log, and its documents
+                // are indexed by the walk after this as well.
+                recovery.index_names = names;
                 // Delta writes are not in the snapshot's HNSW graph: the
                 // backfill after this brings it up to date with the keys.
                 if dump_loaded {
                     recovery.hnsw_loaded = false;
                 }
             }
+        }
+        if left_out && let Err(e) = start_new_log(NewLogWhy::Older, &[]) {
+            fatal_persistence(&format!(
+                "{AOF_PATH} is older than dump.kdb and cannot be started again on it: {e}"
+            ));
         }
     }
 
@@ -2217,18 +3660,49 @@ fn preload(
         }
         other => return Err(invalid(format!("unknown preload type '{other}'"))),
     };
+    // A file of a Dragonfly snapshot in Dragonfly's own format, by its name:
+    // `dump-<time>-summary.dfs` and a `dump-<time>-NNNN.dfs` for each shard.
+    // Each is an RDB file, and before Dragonfly 1.32 nothing in them says
+    // what they are: the summary loaded as an empty dataset, a shard's file
+    // as that shard's keys (#444).
+    if base
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dfs"))
+    {
+        return Err(invalid(format!(
+            "{} is a file of a Dragonfly snapshot in Dragonfly's own format (.dfs), which \
+             keeps each shard's keys in a file of its own; save one in RDB format \
+             (Dragonfly's SAVE RDB) and load that",
+            base.display()
+        )));
+    }
 
     log_info!("preload-file: loading {}", base.display());
     let base_str = base.to_string_lossy();
+    // Redis's header or Valkey 9's (`VALKEY080`).
     let is_redis_rdb = std::fs::File::open(&base)
         .and_then(|mut f| {
-            let mut magic = [0u8; 5];
+            let mut magic = [0u8; 6];
             std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic)
         })
-        .is_ok_and(|magic| &magic == b"REDIS");
+        .is_ok_and(|magic| crate::snapshot::is_rdb_header(&magic));
     let mut index_names = Vec::new();
     let keys = if is_redis_rdb {
         let (dbs, expiries, functions) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
+        // A Dragonfly file with no keys at all is what the summary file of a
+        // snapshot in Dragonfly's own format is, renamed; up to Dragonfly
+        // 1.31 nothing else tells them apart. Either way there is nothing to
+        // start from.
+        if dbs.iter().all(|db| db.is_empty())
+            && crate::snapshot::rdb_written_by_dragonfly(&base_str)?
+        {
+            return Err(invalid(format!(
+                "{} was written by Dragonfly and holds no keys: it is the summary file of \
+                 a snapshot in Dragonfly's own format (.dfs), or a snapshot of an empty \
+                 Dragonfly. Save the data in RDB format (Dragonfly's SAVE RDB) and load that",
+                base.display()
+            )));
+        }
         crate::snapshot::restore_functions(functions)?;
         let keys = crate::snapshot::restore_into_store(dbs, store);
         crate::snapshot::restore_expiries_into_store(expiries, store);
@@ -2279,7 +3753,7 @@ fn preload(
         }
         // An index created during the backup window is in the replayed
         // commands, not in the base snapshot.
-        index_names = index_store.read().keys().cloned().collect();
+        index_names = crate::vector::index_names(index_store);
     }
     Ok(index_names)
 }
@@ -2387,7 +3861,7 @@ pub fn recover_from_aof(
         Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be loaded: {e}")),
     }
 
-    index_store.read().keys().cloned().collect()
+    crate::vector::index_names(index_store)
 }
 
 // ── Test hooks ───────────────────────────────────────────────────────────────
@@ -2399,18 +3873,7 @@ pub fn recover_from_aof(
 /// (`n` counts from 1 for each name) and waits while the file is there. Read
 /// once; unset, a step costs a load and a branch.
 pub(crate) fn failpoint(name: &'static str) {
-    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let names = NAMES.get_or_init(|| {
-        std::env::var("KIVIDB_TEST_FAILPOINTS")
-            .map(|list| {
-                list.split(',')
-                    .map(|name| name.trim().to_string())
-                    .filter(|name| !name.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-    if !names.iter().any(|n| n == name) {
+    if !failpoint_named(name) {
         return;
     }
     static HITS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
@@ -2432,9 +3895,49 @@ pub(crate) fn failpoint(name: &'static str) {
         return;
     }
     log_warn!("Test failpoint {path} reached — waiting for it to be removed");
-    while std::path::Path::new(&path).exists() {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // Off the runtime: a tokio worker held here for as long as a test likes
+    // must not take the polling of every other client with it.
+    crate::cluster::migration::off_the_runtime(|| {
+        while std::path::Path::new(&path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// Whether `KIVIDB_TEST_FAILPOINTS` names `name`. Read once.
+fn failpoint_named(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            std::env::var("KIVIDB_TEST_FAILPOINTS")
+                .map(|list| {
+                    list.split(',')
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|n| n == name)
+}
+
+/// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to fail.
+pub(crate) fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// A fault a test injects, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to be.
+pub(crate) fn injected(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// What a node did before, that a test has it do again, named in
+/// `KIVIDB_TEST_FAILPOINTS` as a [`failpoint`] is: whether it is to.
+pub(crate) fn test_behaves_as_before(name: &str) -> bool {
+    failpoint_named(name)
 }
 
 // ── Checkpoint in progress ───────────────────────────────────────────────────
@@ -2444,6 +3947,201 @@ pub(crate) fn failpoint(name: &'static str) {
 /// runs.
 pub static REWRITE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod kept_file_tests {
+    use super::*;
+
+    fn in_temp(name: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name).to_str().unwrap().to_string();
+        (dir, path)
+    }
+
+    /// A copy that fails part-way leaves nothing named like a kept log
+    /// behind (#359): every start listed it, and each attempt added one.
+    #[test]
+    fn a_copy_that_fails_leaves_no_partial_file() {
+        let (dir, from) = in_temp("appendonly.aof");
+        std::fs::write(&from, b"*1\r\n$4\r\nPING\r\n").unwrap();
+        let to = dir
+            .path()
+            .join("superseded.1.0.appendonly.aof")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let failed = copy_synced(&from, &to, |_, to| {
+            std::fs::write(to, b"*1\r\n$4")?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert!(
+            !std::path::Path::new(&to).exists(),
+            "the partial copy was left"
+        );
+        // And one that works is kept, whole.
+        copy_synced(&from, &to, |from, to| std::fs::copy(from, to)).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), std::fs::read(&from).unwrap());
+    }
+
+    /// Same bytes, read in full: not just the same length, or the same ends.
+    #[test]
+    fn same_bytes_reads_all_of_both_files() {
+        let (dir, a) = in_temp("a");
+        let b = dir.path().join("b").to_str().unwrap().to_string();
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+        assert!(same_bytes(&a, &b).unwrap());
+        let mut middle = bytes.clone();
+        middle[100_000] ^= 1;
+        std::fs::write(&b, &middle).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap());
+        std::fs::write(&b, &bytes[..199_999]).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap());
+    }
+
+    /// The fingerprint of a log's first bytes is the one it had when it was
+    /// that long, at every size around the sampled edges.
+    #[test]
+    fn a_log_added_to_has_its_old_fingerprint_at_its_old_length() {
+        let (_dir, path) = in_temp("appendonly.aof");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        for was in [0, 16, 1000, 65_536, 65_537, 131_072, 131_073, 200_000] {
+            std::fs::write(&path, &bytes[..was]).unwrap();
+            let then = file_fingerprint(&path).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            assert_eq!(
+                fingerprint_of_first(&file, was as u64).unwrap(),
+                then,
+                "{was}"
+            );
+        }
+        // One handle, several lengths, in any order.
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        for was in [1000u64, 16, 200_000, 16] {
+            assert_eq!(
+                fingerprint_of_first(&file, was).unwrap(),
+                fingerprint_of_bytes(&bytes[..was as usize]),
+                "{was}"
+            );
+        }
+        // And a file's fingerprint is that of what it holds.
+        for len in [0, 16, 65_536, 65_537, 131_073, 300_000] {
+            std::fs::write(&path, &bytes[..len]).unwrap();
+            assert_eq!(
+                fingerprint_of_bytes(&bytes[..len]),
+                file_fingerprint(&path).unwrap(),
+                "{len}"
+            );
+        }
+        // An absent log is recorded as an empty one.
+        std::fs::write(&path, b"").unwrap();
+        let empty = file_fingerprint(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(log_fingerprint(&path).unwrap(), empty);
+    }
+}
+
+#[cfg(test)]
+mod kept_warning_tests {
+    use super::*;
+
+    const NAME: &str = "superseded.1.0.appendonly.aof";
+
+    fn says_to_apply(warning: &str) -> bool {
+        warning.contains("redis-cli --pipe")
+    }
+
+    /// A kept log whose writes are in the dataset is never to be sent to
+    /// the server again: its warning says so, and gives no command for it.
+    #[test]
+    fn a_log_whose_writes_are_in_the_dataset_is_not_to_be_applied() {
+        let enable = kept_warning(NewLogWhy::Enable, AOF_PATH, NAME);
+        assert!(enable.contains("already in the dataset"), "{enable}");
+        assert!(!says_to_apply(&enable), "{enable}");
+        let added = kept_warning(
+            NewLogWhy::AddedTo {
+                prev: false,
+                log_whole: false,
+            },
+            AOF_PATH,
+            NAME,
+        );
+        assert!(added.contains("has been replayed"), "{added}");
+        assert!(!says_to_apply(&added), "{added}");
+        // All of the log replayed (#363): with the old log added to, or the
+        // log judged on its own.
+        for prev in [false, true] {
+            let whole = kept_warning(
+                NewLogWhy::AddedTo {
+                    prev,
+                    log_whole: true,
+                },
+                AOF_PATH,
+                NAME,
+            );
+            assert!(
+                whole.contains("All of its records have been replayed"),
+                "{whole}"
+            );
+            assert!(!whole.contains("was not replayed"), "{whole}");
+            assert!(!says_to_apply(&whole), "{whole}");
+        }
+        let prev_added = kept_warning(
+            NewLogWhy::AddedTo {
+                prev: true,
+                log_whole: true,
+            },
+            AOF_PREV_PATH,
+            NAME,
+        );
+        assert!(prev_added.contains("has been replayed"), "{prev_added}");
+        assert!(!says_to_apply(&prev_added), "{prev_added}");
+    }
+
+    /// The old log of a finished checkpoint beside a save with the AOF off
+    /// may hold records the dataset has: no command to send it whole (#368).
+    #[test]
+    fn an_old_log_kept_beside_a_save_with_the_aof_off_is_not_to_be_sent_whole() {
+        let warning = kept_warning(NewLogWhy::FinishedBesideSaveWithAofOff, AOF_PREV_PATH, NAME);
+        assert!(!says_to_apply(&warning), "{warning}");
+        assert!(warning.contains("send only those"), "{warning}");
+        assert!(warning.contains(NAME), "{warning}");
+    }
+
+    /// One whose writes were never loaded says how to apply them.
+    #[test]
+    fn a_log_not_loaded_says_how_to_apply_its_writes() {
+        for (why, path) in [
+            (NewLogWhy::Older, AOF_PATH),
+            (NewLogWhy::Older, AOF_PREV_PATH),
+            (NewLogWhy::EnableOverEarlierRun, AOF_PATH),
+            // The old log beside a log added to, itself not added to.
+            (
+                NewLogWhy::AddedTo {
+                    prev: false,
+                    log_whole: false,
+                },
+                AOF_PREV_PATH,
+            ),
+            (
+                NewLogWhy::AddedTo {
+                    prev: false,
+                    log_whole: true,
+                },
+                AOF_PREV_PATH,
+            ),
+        ] {
+            let warning = kept_warning(why, path, NAME);
+            assert!(says_to_apply(&warning), "{why:?} {path}: {warning}");
+            assert!(warning.contains("not in the dataset"), "{warning}");
+            assert!(warning.contains(NAME), "{warning}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod replay_parse_tests {
@@ -2473,6 +4171,42 @@ mod replay_parse_tests {
         ] {
             assert_eq!(classify_tail(damaged), Tail::Corrupt, "{damaged:?}");
         }
+    }
+
+    /// A power loss leaves zeros where the last, unsynced, writes were: the
+    /// file's length reached the disk and its data did not. That is a
+    /// truncation, after a whole record or in the middle of one; zeros with
+    /// something after them are a hole, and damage.
+    #[test]
+    fn zeros_to_the_end_of_the_file_are_a_truncation() {
+        let whole = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n";
+        assert_eq!(classify_tail(&[0u8; 316]), Tail::Truncated);
+        for cut in 1..whole.len() {
+            let mut torn = whole[..cut].to_vec();
+            torn.extend_from_slice(&[0u8; 64]);
+            assert_eq!(classify_tail(&torn), Tail::Truncated, "cut at {cut}");
+        }
+        let mut hole = vec![0u8; 64];
+        hole.extend_from_slice(whole);
+        assert_eq!(classify_tail(&hole), Tail::Corrupt);
+        let mut damaged = b"not a record".to_vec();
+        damaged.extend_from_slice(&[0u8; 64]);
+        assert_eq!(classify_tail(&damaged), Tail::Corrupt);
+    }
+
+    /// Replayed, a log ending in zeros loads every whole record and is cut
+    /// where the zeros start.
+    #[test]
+    fn a_log_ending_in_zeros_is_cut_where_they_start() {
+        let mut buf = enc(&["SET", "a", "1"]);
+        buf.extend_from_slice(&enc(&["SET", "b", "2"]));
+        let valid = buf.len();
+        buf.extend_from_slice(b"*3\r\n$3\r\nSE");
+        buf.extend_from_slice(&[0u8; 4096]);
+        let (commands, consumed) = parse_aof_commands(&buf);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(consumed, valid);
+        assert_eq!(classify_tail(&buf[consumed..]), Tail::Truncated);
     }
 
     fn enc(parts: &[&str]) -> Vec<u8> {
@@ -2825,5 +4559,910 @@ mod record_group_tests {
         // A script that writes nothing queues nothing.
         drop(RecordGroup::begin(&sent));
         assert_eq!(sent.0.lock().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    /// A queue holding more than one batch is written whole in one call: a
+    /// replica's stream, with no reply to write it, has only the writer's
+    /// passes, and one batch a pass fell behind sustained writes.
+    #[test]
+    fn everything_queued_is_written_not_one_batch_of_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; 64 * 1024];
+        let records = 3 * MAX_AOF_BATCH_BYTES / record.len() + 7;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        let (wrote, released) = write_queued(&mut file, &mut rx, None);
+        assert!(wrote);
+        assert!(!released);
+        assert!(rx.try_recv().is_err(), "nothing is left queued");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
+    }
+
+    /// One pass lets the log go after its budget, so that a queue fed
+    /// faster than the disk takes it does not keep the second's sync out;
+    /// the rest goes on the next.
+    #[test]
+    fn a_pass_stops_at_its_budget_and_the_next_takes_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let record = vec![b'x'; MAX_AOF_BATCH_BYTES];
+        let records = MAX_AOF_PASS_BYTES / record.len() + 3;
+        for _ in 0..records {
+            tx.send(record.clone()).expect("send");
+        }
+        write_queued(&mut file, &mut rx, None);
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, MAX_AOF_PASS_BYTES as u64, "one pass writes its budget");
+        write_queued(&mut file, &mut rx, None);
+        assert!(rx.try_recv().is_err(), "the next pass takes the rest");
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(len, (records * record.len()) as u64);
+    }
+}
+
+/// Time series commands in an AOF: those written by 1.2.0, with what that
+/// version accepted and 1.2.1 refuses from a client (#565), a chunk size
+/// out of bounds, `IGNORE`, replayed rather than the series lost, and its
+/// `TS.INCRBY` records read as it read them; and 1.2.1's, replayed as they
+/// ran.
+#[cfg(test)]
+mod ts_option_replay_tests {
+    use super::past_deadline_replay_tests::{replayed, replayed_with_index};
+    use crate::store::ValueRef;
+
+    /// `TS.INCRBY` records as 1.2.0 wrote them, `TIMESTAMP <time>` at the
+    /// end, read as 1.2.0 read them: each sample at its time, the options
+    /// passed over, no trim to the retention, and the records after them
+    /// applied. A word before the time that takes it when read with the
+    /// rest changes nothing. A record of 1.2.1, behind its mark, is read
+    /// with its options and trims.
+    #[test]
+    fn incrby_records_of_1_2_0_are_read_as_1_2_0_read_them() {
+        let store = replayed(&[
+            vec!["TS.INCRBY", "a", "1", "LABELS", "x", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "a", "1", "TIMESTAMP", "50"],
+            vec!["TS.INCRBY", "b", "1", "RETENTION", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "c", "1", "ENCODING", "TIMESTAMP", "42"],
+            vec![
+                "TS.INCRBY",
+                "d",
+                "1",
+                "RETENTION",
+                "100",
+                "LABELS",
+                "x",
+                "y",
+                "z",
+                "TIMESTAMP",
+                "42",
+            ],
+            vec!["TS.INCRBY", "e", "1", "DUPLICATE_POLICY", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "f", "1", "LABELS", "a", "b", "TIMESTAMP", "42"],
+            // Read cleanly too, these were trimmed and given options.
+            vec!["TS.CREATE", "r", "RETENTION", "10"],
+            vec!["TS.INCRBY", "r", "1", "TIMESTAMP", "1"],
+            vec!["TS.INCRBY", "r", "1", "RETENTION", "10", "TIMESTAMP", "100"],
+            // 1.2.1's.
+            vec![
+                "TS.INCRBY",
+                "m",
+                "1",
+                "timestamp",
+                "5",
+                "RETENTION",
+                "10",
+                "LABELS",
+                "a",
+                "b",
+            ],
+            vec!["TS.INCRBY", "m", "1", "timestamp", "100"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let samples = |key: &str| {
+            series(key)
+                .samples
+                .iter()
+                .map(|(t, v)| (*t, *v))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(samples("a"), [(42, 1.0), (50, 2.0)]);
+        for key in ["a", "b", "c", "d", "e", "f"] {
+            let s = series(key);
+            assert!(s.labels.is_empty(), "{key}");
+            assert_eq!(s.retention, 0, "{key}");
+            assert_eq!(s.samples.get(&42), Some(&1.0), "{key}");
+        }
+        assert_eq!(samples("r"), [(1, 1.0), (100, 2.0)]);
+        let m = series("m");
+        assert_eq!(m.retention, 10);
+        assert_eq!(m.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(samples("m"), [(100, 2.0)]);
+    }
+
+    /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
+    /// `TS.INCRBY` as the feed writes it, with a word left over from
+    /// `LABELS`: replayed as they ran.
+    /// A time above `i64::MAX`, which 1.2.0 took: in its log as given
+    /// (`TS.ADD`, `TS.MADD`), or, from `TS.INCRBY`, as the negative number
+    /// it replied. Replayed, each sample at the time 1.2.0 kept (#592).
+    #[test]
+    fn times_above_i64_max_of_1_2_0_replay() {
+        let max = u64::MAX.to_string();
+        let below = (u64::MAX - 1).to_string();
+        let store = replayed(&[
+            vec!["TS.ADD", "h", below.as_str(), "1"],
+            vec!["TS.MADD", "h", max.as_str(), "2"],
+            vec!["TS.INCRBY", "i", "1", "TIMESTAMP", "-1"],
+        ]);
+        let samples = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner
+                    .read()
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (*t, *v))
+                    .collect::<Vec<_>>(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert_eq!(samples("h"), [(u64::MAX - 1, 1.0), (u64::MAX, 2.0)]);
+        assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
+    }
+
+    /// A compaction's destination past its time (its `DEL` not yet in the
+    /// log), deleted, made again and given its source again; and a source
+    /// renamed. Replayed, the links are as the master had them (#593).
+    #[test]
+    fn compaction_links_replay_as_they_ran() {
+        let store = replayed(&[
+            vec!["TS.CREATE", "s"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "1", "1"],
+            vec!["PEXPIREAT", "d", "1"],
+            vec!["TS.ADD", "s", "15", "1"],
+            vec!["DEL", "d"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "25", "1"],
+            vec!["RENAME", "s", "s2"],
+            vec!["TS.ADD", "s2", "35", "1"],
+            // A destination renamed onto another of its source's.
+            vec!["TS.CREATE", "w"],
+            vec!["TS.CREATE", "a"],
+            vec!["TS.CREATE", "b"],
+            vec!["TS.CREATERULE", "w", "a", "AGGREGATION", "sum", "10"],
+            vec!["TS.CREATERULE", "w", "b", "AGGREGATION", "sum", "10"],
+            vec!["RENAME", "a", "b"],
+            vec!["TS.ADD", "w", "1", "1"],
+            vec!["TS.ADD", "w", "15", "1"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let s = series("s2");
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].dest_key, "d");
+        let d = series("d");
+        assert_eq!(d.source.as_deref(), Some("s2"));
+        assert_eq!(
+            d.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
+            [(10, 1.0), (20, 1.0)]
+        );
+        let w = series("w");
+        assert_eq!(w.rules.len(), 1);
+        assert_eq!(w.rules[0].dest_key, "b");
+        assert_eq!(series("b").source.as_deref(), Some("w"));
+        assert_eq!(series("b").samples.get(&0), Some(&1.0));
+    }
+
+    #[test]
+    fn options_replay_as_they_ran() {
+        let (store, index) = replayed_with_index(&[
+            vec!["TS.CREATE", "k", "LABELS", "a", "b"],
+            vec!["TS.ALTER", "k", "LABELS"],
+            vec!["TS.CREATE", "d", "DUPLICATE_POLICY", "BLOCK"],
+            vec!["TS.ADD", "d", "1", "1"],
+            vec!["TS.ADD", "d", "1", "5", "ON_DUPLICATE", "SUM"],
+            vec!["TS.INCRBY", "c", "2", "timestamp", "9", "LABELS", "x"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert!(series("k").labels.is_empty());
+        let indexed = |entry: &str| {
+            crate::read_lock!(index)
+                .get(entry)
+                .is_some_and(|keys| !keys.is_empty())
+        };
+        assert!(!indexed("a=b"));
+        let d = series("d");
+        assert_eq!(d.samples.get(&1), Some(&6.0));
+        assert_eq!(d.duplicate_policy, crate::types::DuplicatePolicy::Block);
+        let c = series("c");
+        assert_eq!(c.samples.get(&9), Some(&2.0));
+        assert!(c.labels.is_empty());
+    }
+
+    #[test]
+    fn words_an_older_version_passed_over_are_passed_over_again() {
+        let store = replayed(&[
+            vec![
+                "TS.CREATE",
+                "k",
+                "RETENTION",
+                "5000",
+                "FOO",
+                "LABELS",
+                "a",
+                "b",
+            ],
+            vec!["TS.ALTER", "k", "CHUNK", "SIZE", "100"],
+            vec!["TS.INCRBY", "c", "1", "BOGUS", "TIMESTAMP", "7"],
+            vec!["TS.ADD", "k", "10", "1.5", "IGNORE", "5", "0.5"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let k = series("k");
+        assert_eq!(k.retention, 5000);
+        assert_eq!(k.chunk_size, 100);
+        assert_eq!(k.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(k.samples.get(&10), Some(&1.5));
+        let c = series("c");
+        assert_eq!(c.samples.get(&7), Some(&1.0));
+    }
+}
+
+/// A deadline the log gave a key, or a hash field, and the writes made to
+/// it after that while it lived: replayed once the deadline has passed.
+#[cfg(test)]
+mod past_deadline_replay_tests {
+    use super::*;
+    use crate::commands::helpers::{delete_key_if_expired, is_expired, now_ms};
+    use crate::store::{Store, ValueRef};
+
+    fn record(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    /// `records`, written to an AOF and replayed into a new store.
+    pub(super) fn replayed(records: &[Vec<&str>]) -> Store {
+        replayed_with_index(records).0
+    }
+
+    /// [`replayed`], and the time series label index the replay built.
+    pub(super) fn replayed_with_index(
+        records: &[Vec<&str>],
+    ) -> (Store, crate::store::SharedTsIndex) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        let log: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
+        std::fs::write(&path, log).expect("write");
+        let store = crate::store::new_store(1);
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = std::sync::Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let config = std::sync::Arc::new(crate::config::Config::default());
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let repl_state = std::sync::Arc::new(crate::replication::ReplState::new_master());
+        let stats = replay_aof(
+            &path.to_string_lossy(),
+            &store,
+            &index_store,
+            &dict_store,
+            &wait_table,
+            &ts_index,
+            &config,
+            &compaction_tx,
+            &repl_state,
+            false,
+        )
+        .expect("replay");
+        assert_eq!(stats.errors, 0, "every record applied");
+        (store, ts_index)
+    }
+
+    fn expires(store: &Store, key: &str) -> Option<u64> {
+        crate::store::get_shard(&store[0], key).read().expires(key)
+    }
+
+    fn hash_fields(store: &Store, key: &str) -> Vec<String> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        let mut fields: Vec<String> = match map.peek_expiring(key) {
+            Some((ValueRef::Hash(h), _)) => h.read().keys().cloned().collect(),
+            Some((ValueRef::HashEx(h), _)) => h.read().fields.keys().cloned().collect(),
+            other => panic!(
+                "{key} is not a hash: {:?}",
+                other.map(|(v, _)| v.type_name())
+            ),
+        };
+        fields.sort();
+        fields
+    }
+
+    fn string(store: &Store, key: &str) -> Vec<u8> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::String(b), _)) => b.to_vec(),
+            _ => panic!("{key} is not a string"),
+        }
+    }
+
+    fn list_len(store: &Store, key: &str) -> usize {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::List(l), _)) => l.read().len(),
+            _ => panic!("{key} is not a list"),
+        }
+    }
+
+    /// `HSET h f0 v0`, `PEXPIREAT h t`, `HSET h f1 v1`, `t` gone: the
+    /// replay deleted `h` at its `PEXPIREAT`, and the `HSET` made it again
+    /// of `f1` alone, with no time to live, for good. The same of a string
+    /// and a list. Now each keeps its deadline and every write, and is past
+    /// its time once the replay is over.
+    #[test]
+    fn a_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_key() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["SELECT", "0"],
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &past],
+            vec!["HSET", "h", "f1", "v1"],
+            vec!["SET", "s", "v"],
+            vec!["PEXPIREAT", "s", &past],
+            vec!["APPEND", "s", "x"],
+            vec!["RPUSH", "l", "a"],
+            vec!["PEXPIREAT", "l", &past],
+            vec!["RPUSH", "l", "b"],
+        ]);
+        let at: u64 = past.parse().unwrap();
+        for key in ["h", "s", "l"] {
+            assert_eq!(expires(&store, key), Some(at), "{key} kept its deadline");
+            assert!(is_expired(&store, 0, key), "{key} is past it");
+        }
+        assert_eq!(hash_fields(&store, "h"), ["f0", "f1"]);
+        assert_eq!(string(&store, "s"), b"vx");
+        assert_eq!(list_len(&store, "l"), 2);
+        // And it goes the way any key past its time goes.
+        for key in ["h", "s", "l"] {
+            assert!(delete_key_if_expired(&store, 0, key), "{key}");
+            assert_eq!(expires(&store, key), None);
+            assert!(
+                crate::store::get_shard(&store[0], key)
+                    .read()
+                    .peek_expiring(key)
+                    .is_none()
+            );
+        }
+    }
+
+    /// The same with a deadline still ahead: kept, with every write.
+    #[test]
+    fn a_deadline_still_ahead_is_kept_with_every_write() {
+        let ahead = (now_ms() + 3_600_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &ahead],
+            vec!["HSET", "h", "f1", "v1"],
+            vec!["SET", "s", "v"],
+            vec!["PEXPIREAT", "s", &ahead],
+            vec!["APPEND", "s", "x"],
+            vec!["RPUSH", "l", "a"],
+            vec!["PEXPIREAT", "l", &ahead],
+            vec!["RPUSH", "l", "b"],
+        ]);
+        let at: u64 = ahead.parse().unwrap();
+        for key in ["h", "s", "l"] {
+            assert_eq!(expires(&store, key), Some(at), "{key}");
+            assert!(!is_expired(&store, 0, key), "{key}");
+        }
+        assert_eq!(hash_fields(&store, "h"), ["f0", "f1"]);
+        assert_eq!(string(&store, "s"), b"vx");
+        assert_eq!(list_len(&store, "l"), 2);
+    }
+
+    /// The field of a hash, its value and whether it has a deadline, past
+    /// its time or not.
+    fn field(store: &Store, key: &str, field: &str) -> (Option<Vec<u8>>, Option<bool>) {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.peek_expiring(key) {
+            Some((ValueRef::HashEx(h), _)) => {
+                let h = h.read();
+                (
+                    h.fields.get(field).map(|v| v.to_vec()),
+                    h.expiries.get(field).map(|_| h.is_field_expired(field)),
+                )
+            }
+            Some((ValueRef::Hash(h), _)) => (h.read().get(field).map(|v| v.to_vec()), None),
+            _ => (None, None),
+        }
+    }
+
+    /// `HPEXPIREAT h t FIELDS 1 g` and an `HINCRBY h g 1` made while `g`
+    /// lived, `t` gone: the replay deleted `g` at the `HPEXPIREAT`, and the
+    /// `HINCRBY` made it again, `1` with no deadline, for good. So with
+    /// `HSETEX ... PXAT t` and `HGETEX ... PXAT t`. Now `g` keeps its deadline
+    /// and the increment, and is past its time once the replay is over. An
+    /// `HSET` after it takes the deadline away, as it did on the master.
+    ///
+    /// A field the master expired is in the log as its `HDEL`, before the
+    /// write that found it gone: `z`, incremented after its deadline, is `1`
+    /// with no deadline, as on the master.
+    #[test]
+    fn a_field_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_field() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "keep", "1", "g", "5", "f", "v0"],
+            vec!["HPEXPIREAT", "h", &past, "FIELDS", "2", "g", "f"],
+            vec!["HINCRBY", "h", "g", "1"],
+            vec!["HSET", "h", "f", "v1"],
+            vec!["HSETEX", "x", "PXAT", &past, "FIELDS", "1", "n", "1.5"],
+            vec!["HINCRBYFLOAT", "x", "n", "1"],
+            vec!["HSET", "y", "keep", "1", "m", "7"],
+            vec!["HGETEX", "y", "PXAT", &past, "FIELDS", "1", "m"],
+            vec!["HINCRBY", "y", "m", "1"],
+            vec!["HSET", "h", "z", "5"],
+            vec!["HPEXPIREAT", "h", &past, "FIELDS", "1", "z"],
+            vec!["HDEL", "h", "z"],
+            vec!["HINCRBY", "h", "z", "1"],
+        ]);
+        assert_eq!(field(&store, "h", "z"), (Some(b"1".to_vec()), None));
+        assert_eq!(field(&store, "h", "g"), (Some(b"6".to_vec()), Some(true)));
+        assert_eq!(field(&store, "h", "f").0, Some(b"v1".to_vec()));
+        assert_eq!(
+            field(&store, "h", "f").1,
+            None,
+            "HSET took f's deadline away"
+        );
+        assert_eq!(field(&store, "h", "keep"), (Some(b"1".to_vec()), None));
+        assert_eq!(field(&store, "x", "n"), (Some(b"2.5".to_vec()), Some(true)));
+        assert_eq!(field(&store, "y", "m"), (Some(b"8".to_vec()), Some(true)));
+        // Outside the replay the field is past its time, and a sweep of the
+        // hash takes it.
+        for (key, gone) in [("h", "g"), ("x", "n"), ("y", "m")] {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            if let Some((ValueRef::HashEx(h), _)) = map.peek_expiring(key) {
+                let mut h = h.write();
+                assert_eq!(h.sweep_expired(), 1, "{key}");
+                assert!(!h.fields.contains_key(gone), "{key}");
+            } else {
+                panic!("{key} is not a hash with field deadlines");
+            }
+        }
+    }
+
+    /// Outside a replay a field deadline that has passed still deletes the
+    /// field on the spot.
+    #[test]
+    fn outside_a_replay_a_field_deadline_that_has_passed_deletes_the_field() {
+        let mut inner = crate::types::HashInner::new();
+        inner
+            .fields
+            .insert("g".to_string(), std::sync::Arc::from(&b"5"[..]));
+        inner
+            .expiries
+            .insert("g".to_string(), crate::types::field_now() - 1);
+        {
+            let _replay = crate::expiry::replay();
+            assert!(!inner.is_field_expired("g"));
+            assert_eq!(inner.sweep_expired(), 0);
+        }
+        assert!(inner.is_field_expired("g"));
+        assert_eq!(inner.sweep_expired(), 1);
+    }
+
+    /// A `DEL` in the log still deletes: what the master expired is said
+    /// by it, and a write after it makes a new key, as on the master.
+    #[test]
+    fn a_del_after_the_deadline_still_deletes() {
+        let past = (now_ms() - 5_000).to_string();
+        let store = replayed(&[
+            vec!["HSET", "h", "f0", "v0"],
+            vec!["PEXPIREAT", "h", &past],
+            vec!["UNLINK", "h"],
+            vec!["HSET", "h", "f1", "v1"],
+        ]);
+        assert_eq!(expires(&store, "h"), None);
+        assert_eq!(hash_fields(&store, "h"), ["f1"]);
+    }
+}
+
+#[cfg(test)]
+mod may_log_tests {
+    use super::may_log;
+
+    fn logs(cmd: &[&str]) -> bool {
+        let cmd: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+        may_log(&cmd)
+    }
+
+    /// A reply waits for the AOF for a write by name, a script or a
+    /// transaction, and a write by argument only with the arguments that
+    /// write; never for a read.
+    #[test]
+    fn writes_are_told_by_name_or_by_their_arguments() {
+        for write in [
+            &["SET", "k", "v"][..],
+            &["incr", "k"],
+            &["eval", "return 1", "0"],
+            &["EVALSHA", "x", "0"],
+            &["fcall", "f", "0"],
+            &["EXEC"],
+            &["GEORADIUS", "k", "15", "37", "200", "km", "STORE", "d"],
+            &["georadiusbymember", "k", "m", "200", "km", "storedist", "d"],
+            &["MIGRATE", "h", "1", "k", "0", "100"],
+            &["SCRIPT", "LOAD", "return 1"],
+            &["FUNCTION", "FLUSH"],
+        ] {
+            assert!(logs(write), "{write:?}");
+        }
+        for read in [
+            &["GET", "k"][..],
+            &["PING"],
+            &["GEORADIUS", "k", "15", "37", "200", "km"],
+            &["GEORADIUSBYMEMBER", "k", "store", "200", "km"],
+            &["FUNCTION", "LIST"],
+            &["SCRIPT", "EXISTS", "x"],
+            &["EVAL_RO", "return 1", "0"],
+        ] {
+            assert!(!logs(read), "{read:?}");
+        }
+    }
+}
+
+/// A marker keeps its own `VADD`'s options; unmarked ones replay as 1.2.
+#[cfg(test)]
+mod vset_quant_marker_tests {
+    use super::*;
+    use crate::store::{Store, ValueRef};
+    use crate::vector::quant::{Quant, StoredVector};
+
+    fn record(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    fn vadd_e(key: &str, element: &str, option: &str) -> Vec<u8> {
+        let mut parts = vec!["VADD", key, "VALUES", "3", "3", "-4", "0.5", element];
+        if !option.is_empty() {
+            parts.push(option);
+        }
+        record(&parts)
+    }
+
+    fn vadd(key: &str, option: &str) -> Vec<u8> {
+        vadd_e(key, "e", option)
+    }
+
+    const M: &[u8] = VSET_QUANT_MARKER;
+
+    /// `log` replayed into a new store.
+    fn replay(log: &[u8]) -> (Store, ReplayStats) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        std::fs::write(&path, log).expect("write");
+        let store = crate::store::new_store(1);
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let stats = replay_aof(
+            &path.to_string_lossy(),
+            &store,
+            &crate::vector::new_index_store(),
+            &crate::vector::new_dict_store(),
+            &std::sync::Arc::new(crate::wait_table::WaitTable::new()),
+            &crate::store::new_ts_index(),
+            &std::sync::Arc::new(crate::config::Config::default()),
+            &compaction_tx,
+            &std::sync::Arc::new(crate::replication::ReplState::new_master()),
+            false,
+        )
+        .expect("replay");
+        (store, stats)
+    }
+
+    /// The set's quantization, whether it was asked for, and `element`'s storage.
+    fn set(store: &Store, key: &str, element: &str) -> Option<(Quant, bool, &'static str)> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.get(key.as_bytes()) {
+            Some(ValueRef::VectorSet(vs)) => {
+                let vs = vs.read();
+                let name = crate::key_bytes::KeyBytes::from(element.as_bytes());
+                let stored = match vs.entries.get(&name).map(|e| &e.vector) {
+                    Some(StoredVector::F32(_)) => "f32",
+                    Some(StoredVector::Q8 { .. }) => "int8",
+                    Some(StoredVector::Bin { .. }) => "bin",
+                    None => "none",
+                };
+                Some((vs.quant, vs.quant_chosen, stored))
+            }
+            _ => None,
+        }
+    }
+
+    fn quant(store: &Store, key: &str) -> Option<(Quant, bool)> {
+        set(store, key, "e").map(|(q, chosen, _)| (q, chosen))
+    }
+
+    fn delta(records: &[u8]) -> Vec<u8> {
+        let mut log = delta_header(7).to_vec();
+        log.extend_from_slice(records);
+        log
+    }
+
+    #[test]
+    fn the_marker_is_one_record_no_client_can_send() {
+        assert_eq!(
+            M,
+            crate::resp::write::encode_resp_command(&[VSET_QUANT_MARKER_NAME.to_vec()])
+        );
+        let (cmds, used) = parse_aof_commands(M);
+        assert_eq!(used, M.len());
+        assert!(is_vset_quant_marker(&cmds[0]));
+        assert!(!crate::commands::arity::is_known("KIVIDB.AOF-VSET-QUANT"));
+    }
+
+    #[test]
+    fn a_log_of_1_2_replays_as_1_2_stored_it() {
+        let records = [vadd("a", "Q8"), vadd("b", "BIN"), vadd("c", "NOQUANT")].concat();
+        for log in [records.clone(), delta(&records)] {
+            let (store, stats) = replay(&log);
+            assert_eq!((stats.errors, stats.commands), (0, 3));
+            for key in ["a", "b", "c"] {
+                assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_vadd_replays_as_asked() {
+        let records = [
+            vadd("a", "Q8"),
+            M.to_vec(),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(
+            (stats.errors, stats.commands),
+            (0, 3),
+            "a marker is no command"
+        );
+        assert_eq!(set(&store, "a", "e"), Some((Quant::Q8, true, "int8")));
+        assert_eq!(set(&store, "b", "e"), Some((Quant::Bin, true, "bin")));
+        assert_eq!(set(&store, "c", "e"), Some((Quant::F32, true, "f32")));
+    }
+
+    /// Only the record just before a marker is marked, and only a `VADD`.
+    #[test]
+    fn a_marker_never_reaches_past_its_own_record() {
+        let records = [
+            // At the start: nothing before it.
+            M.to_vec(),
+            vadd("first", "Q8"),
+            // 1.2's, then a 1.3 one after it.
+            vadd("old", "BIN"),
+            vadd("new", "BIN"),
+            M.to_vec(),
+            // After another command, or a `VADD` with no option.
+            record(&["SET", "s", "1"]),
+            M.to_vec(),
+            vadd("after_set", "Q8"),
+            vadd("plain", ""),
+            M.to_vec(),
+            vadd("after_plain", "Q8"),
+            // Two in a row mark one record.
+            vadd("twice", "Q8"),
+            M.to_vec(),
+            M.to_vec(),
+            vadd("after_twice", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for key in [
+            "first",
+            "old",
+            "after_set",
+            "plain",
+            "after_plain",
+            "after_twice",
+        ] {
+            assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+        }
+        assert_eq!(quant(&store, "new"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "twice"), Some((Quant::Q8, true)));
+    }
+
+    /// Cut while being written, the marker is dropped and its `VADD` replays as f32.
+    #[test]
+    fn a_torn_marker_leaves_its_vadd_f32() {
+        for option in ["Q8", "BIN", "NOQUANT"] {
+            for cut in [1, 10, M.len() - 1] {
+                let mut log = delta(&vadd("a", option));
+                let whole = log.len();
+                log.extend_from_slice(&M[..cut]);
+                let (store, stats) = replay(&log);
+                assert!(stats.truncated_tail, "{option} {cut}");
+                assert_eq!(stats.valid_len as usize, whole, "{option} {cut}");
+                assert_eq!(
+                    set(&store, "a", "e"),
+                    Some((Quant::F32, false, "f32")),
+                    "{option} {cut}"
+                );
+            }
+        }
+    }
+
+    /// A later `VADD` follows the set, marked or not: only creation reads the marker.
+    #[test]
+    fn a_later_vadd_follows_the_set() {
+        let records = [
+            vadd_e("q", "e", "Q8"),
+            M.to_vec(),
+            vadd_e("q", "unmarked", "Q8"),
+            vadd_e("q", "other", "BIN"),
+            vadd_e("q", "none", ""),
+            vadd_e("f", "e", "Q8"),
+            vadd_e("f", "marked", "Q8"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for element in ["e", "unmarked", "other", "none"] {
+            assert_eq!(
+                set(&store, "q", element),
+                Some((Quant::Q8, true, "int8")),
+                "{element}"
+            );
+        }
+        for element in ["e", "marked"] {
+            assert_eq!(
+                set(&store, "f", element),
+                Some((Quant::F32, false, "f32")),
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_inside_a_transaction() {
+        let records = [
+            record(&["MULTI"]),
+            vadd("a", "Q8"),
+            M.to_vec(),
+            record(&["SET", "s", "1"]),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            record(&["EXEC"]),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        assert_eq!(quant(&store, "a"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "b"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "c"), Some((Quant::F32, false)));
+
+        // Its `EXEC` never written: dropped whole, markers too.
+        let whole = delta(&vadd("x", "Q8"));
+        let mut log = whole.clone();
+        log.extend([record(&["MULTI"]), vadd("y", "Q8"), M.to_vec()].concat());
+        let (store, stats) = replay(&log);
+        assert!(stats.truncated_tail);
+        assert_eq!(stats.valid_len as usize, whole.len());
+        assert_eq!(quant(&store, "x"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "y"), None);
+    }
+
+    /// A flush skips the `VADD` before it; its marker reaches nothing further.
+    #[test]
+    fn a_flush_after_a_marked_vadd() {
+        let records = [
+            vadd("gone", "Q8"),
+            M.to_vec(),
+            record(&["FLUSHALL"]),
+            vadd("kept", "Q8"),
+            M.to_vec(),
+            vadd("unmarked", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(quant(&store, "gone"), None);
+        assert_eq!(quant(&store, "kept"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "unmarked"), Some((Quant::F32, false)));
+    }
+
+    /// The draft form, with an argument, marks nothing.
+    #[test]
+    fn a_marker_with_arguments_is_no_marker() {
+        let records = [
+            vadd("a", "Q8"),
+            record(&["KIVIDB.AOF-VSET-QUANT", "1"]),
+            vadd("b", "Q8"),
+        ]
+        .concat();
+        let (store, _) = replay(&delta(&records));
+        assert_eq!(quant(&store, "a"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "b"), Some((Quant::F32, false)));
+    }
+
+    /// What a backup increment adds after a stream payload.
+    #[test]
+    fn payloads_that_need_a_marker() {
+        let select = record(&["SELECT", "0"]);
+        for (payload, needs) in [
+            (vadd("a", "Q8"), true),
+            ([select.clone(), vadd("a", "bin")].concat(), true),
+            (vadd("a", "NOQUANT"), true),
+            (vadd("a", ""), false),
+            ([vadd("a", "Q8"), select.clone()].concat(), false),
+            (record(&["SET", "VADD", "Q8"]), false),
+            (record(&["VREM", "a", "Q8"]), false),
+        ] {
+            assert_eq!(
+                needs_vset_quant_marker(&payload),
+                needs,
+                "{}",
+                String::from_utf8_lossy(&payload)
+            );
+        }
     }
 }

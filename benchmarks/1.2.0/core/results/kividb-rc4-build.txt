@@ -1,0 +1,1 @@
+ref=v1.2.0-rc4 commit=a6b1bf388582dd6b343b34471864145c97dab74d from=source cargo build --release RUSTFLAGS=-C target-feature=+lse rustc=rustc 1.99.1 (58cf8f9c3 2026-10-13)

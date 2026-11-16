@@ -15,6 +15,7 @@ import math
 import threading
 import subprocess
 import socket
+import tempfile
 import redis
 import pytest
 from typing import Any, Generator
@@ -214,7 +215,9 @@ def _info_array(reply, **_options):
 
 
 def _one_search_shape(client: redis.Redis) -> redis.Redis:
-    for command in ("FT.SEARCH", "FT.AGGREGATE", "FT.HYBRID"):
+    # Not FT.HYBRID: its reply is a map under RESP3 and its pairs under RESP2,
+    # with no document ids to put in an array; its tests read either.
+    for command in ("FT.SEARCH", "FT.AGGREGATE"):
         client.set_response_callback(command, _search_array)
     client.set_response_callback("FT.INFO", _info_array)
     return client
@@ -300,6 +303,9 @@ def kivi_server():
 
     proc = subprocess.Popen(
         cmd,
+        # A directory of its own: one engine to a data directory, and the
+        # tests that start servers of their own start them elsewhere.
+        cwd=tempfile.mkdtemp(prefix="kividb-e2e-"),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

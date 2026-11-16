@@ -1,0 +1,2 @@
+shd-0-1 155524 master
+shd-0-0 155531 slave

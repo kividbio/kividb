@@ -1,0 +1,72 @@
+== start 07:22:37
+shd-0-0 uptime_in_seconds:91 sync_full:1 sync_partial_ok:0 sync_partial_err:0 role:master master_repl_offset:762653 
+shd-0-1 uptime_in_seconds:101 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:101 sync_full:1 sync_partial_ok:0 sync_partial_err:0 role:master master_repl_offset:768467 
+shd-1-1 uptime_in_seconds:100 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:96 sync_full:1 sync_partial_ok:0 sync_partial_err:0 role:master master_repl_offset:767505 
+shd-2-1 uptime_in_seconds:100 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+== after upgrade-shd 07:25:40
+shd-0-0 uptime_in_seconds:54 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-0-1 uptime_in_seconds:117 sync_full:1 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:2628242 
+shd-1-0 uptime_in_seconds:76 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-1 uptime_in_seconds:136 sync_full:1 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:2633245 
+shd-2-0 uptime_in_seconds:97 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-1 uptime_in_seconds:156 sync_full:1 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:2628652 
+== after restart-rc9 07:28:47
+shd-0-0 uptime_in_seconds:160 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4529629 
+shd-0-1 uptime_in_seconds:100 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:141 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4529500 
+shd-1-1 uptime_in_seconds:79 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:121 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4528653 
+shd-2-1 uptime_in_seconds:48 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+== failover-rc9 before 07:28:49
+shd-0-0 uptime_in_seconds:161 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4540749 
+shd-0-1 uptime_in_seconds:102 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:143 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4540620 
+shd-1-1 uptime_in_seconds:80 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:122 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:master master_repl_offset:4540173 
+shd-2-1 uptime_in_seconds:49 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+== failover-rc9 after 07:30:37
+shd-0-0 uptime_in_seconds:269 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-0-1 uptime_in_seconds:210 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:5698846 
+shd-1-0 uptime_in_seconds:251 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-1-1 uptime_in_seconds:189 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:5699423 
+shd-2-0 uptime_in_seconds:231 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-2-1 uptime_in_seconds:158 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:5701870 
+== after failover-rc9 07:30:54
+shd-0-0 uptime_in_seconds:286 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-0-1 uptime_in_seconds:227 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:5787860 
+shd-1-0 uptime_in_seconds:268 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-1-1 uptime_in_seconds:205 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:5785011 
+shd-2-0 uptime_in_seconds:247 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-2-1 uptime_in_seconds:174 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:5786658 
+== after deletes 07:44:56
+shd-0-0 uptime_in_seconds:472 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:13763829 
+shd-0-1 uptime_in_seconds:792 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:292 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:13880205 
+shd-1-1 uptime_in_seconds:648 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:1089 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-2-1 uptime_in_seconds:112 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:13754934 
+== after sigkill-rc9 07:46:17
+shd-0-0 uptime_in_seconds:64 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:410112 
+shd-0-1 uptime_in_seconds:874 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:373 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:14529316 
+shd-1-1 uptime_in_seconds:729 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:1171 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-2-1 uptime_in_seconds:193 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:14402583 
+== after reshard-up-rc9 07:48:02
+shd-0-0 uptime_in_seconds:169 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:2618360 
+shd-0-1 uptime_in_seconds:978 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:478 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:16763017 
+shd-1-1 uptime_in_seconds:834 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:1275 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-2-1 uptime_in_seconds:298 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:16622822 
+shd-3-0 uptime_in_seconds:73 sync_full:1 sync_partial_ok:0 sync_partial_err:0 role:master master_repl_offset:22635752 
+shd-3-1 uptime_in_seconds:73 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+== after reshard-down-rc9 07:49:24
+shd-0-0 uptime_in_seconds:251 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:10902333 
+shd-0-1 uptime_in_seconds:1061 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-1-0 uptime_in_seconds:561 sync_full:0 sync_partial_ok:1 sync_partial_err:0 role:master master_repl_offset:25134301 
+shd-1-1 uptime_in_seconds:917 sync_full:0 sync_partial_ok:0 sync_partial_err:0 role:slave 
+shd-2-0 uptime_in_seconds:1358 sync_full:0 sync_partial_ok:2 sync_partial_err:0 role:slave 
+shd-2-1 uptime_in_seconds:381 sync_full:1 sync_partial_ok:1 sync_partial_err:1 role:master master_repl_offset:24927201 

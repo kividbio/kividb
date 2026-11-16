@@ -367,14 +367,6 @@ impl Entry {
         unsafe { std::slice::from_raw_parts(self.base().add(key_at(klen, self.has_ttl())), klen) }
     }
 
-    /// The key, as the `&str` it was made from.
-    #[inline]
-    pub(super) fn key_str<'a>(self) -> &'a str {
-        // SAFETY: every key is made from a `&str` (`ShardMap::insert` and
-        // friends take one).
-        unsafe { std::str::from_utf8_unchecked(self.key()) }
-    }
-
     /// The value, for as long as the entry lives.
     #[inline(always)]
     pub(super) fn value<'a>(self) -> ValueRef<'a> {
@@ -585,6 +577,12 @@ impl Entry {
         }
     }
 
+    /// What the entry's block adds to `memory_use::allocated`: a slab's
+    /// block at its class's size.
+    pub(super) fn block_bytes(self) -> usize {
+        allocated_size(self.size())
+    }
+
     #[inline]
     pub(super) fn holders(self) -> u32 {
         self.header().word.load(Ordering::Acquire) & HOLDERS
@@ -659,6 +657,11 @@ impl Entry {
     #[cold]
     #[inline(never)]
     fn left_held(self, bytes: bool) {
+        // A test that has a snapshot's hold counted, as before #284: memory
+        // evicting keys does not give back, for eviction to stop at.
+        if crate::aof::test_behaves_as_before("snapshot-held-counted") {
+            return;
+        }
         let bytes = bytes && self.string_bytes().is_some_and(SharedBytes::is_unique);
         crate::memory_use::not_counted_add(self.held_size(bytes));
         let flags = LEFT_HELD | if bytes { LEFT_HELD_BYTES } else { 0 };
@@ -745,10 +748,11 @@ impl Entry {
             // is the value's move; the old block is freed without dropping
             // it.
             unsafe { std::ptr::copy_nonoverlapping(self.base(), to.as_ptr(), size) };
-            return Relocation::Moved {
+            return Relocation::Moved(Moving {
                 to: Entry(to.cast()),
-                left: Left(self.0.cast(), size),
-            };
+                from: self.0.cast(),
+                size,
+            });
         }
         // SAFETY: as above, nothing else reads the value.
         let value = unsafe {
@@ -768,13 +772,40 @@ impl Entry {
 pub(super) enum Relocation {
     Stays,
     Held,
-    /// The entry moved to `to`; `left` is the old block.
-    Moved {
-        to: Entry,
-        left: Left,
-    },
+    /// The entry is copied; the store is to point to the copy.
+    Moved(Moving),
     /// The entry stayed; its string's bytes moved, and this is the old block.
     BytesMoved(SharedBytes),
+}
+
+/// An entry copied by compaction that the store does not point to yet.
+/// Dropped before [`Moving::done`], as when a panic unwinds, it frees the
+/// copy and leaves the old block, which the store still points to.
+pub(super) struct Moving {
+    to: Entry,
+    from: NonNull<u8>,
+    size: usize,
+}
+
+impl Moving {
+    /// The copy.
+    pub(super) fn to(&self) -> Entry {
+        self.to
+    }
+
+    /// The store points to the copy now: the old block is what is left.
+    pub(super) fn done(self) -> Left {
+        let moving = std::mem::ManuallyDrop::new(self);
+        Left(moving.from, moving.size)
+    }
+}
+
+impl Drop for Moving {
+    fn drop(&mut self) {
+        // SAFETY: nothing points to the copy; its value is still the old
+        // block's, so it is freed without being dropped.
+        unsafe { deallocate(self.to.0.cast(), self.size) };
+    }
 }
 
 /// An entry's block left behind by compaction, freed when dropped.
@@ -804,8 +835,8 @@ impl EntryRef {
         EntryRef(entry)
     }
 
-    pub fn key(&self) -> &str {
-        self.0.key_str()
+    pub fn key(&self) -> &[u8] {
+        self.0.key()
     }
 
     pub fn value(&self) -> ValueRef<'_> {
@@ -844,14 +875,21 @@ impl Drop for EntryRef {
 pub struct Taken(Entry);
 
 impl Taken {
+    /// Whether the value is a string kept in the entry itself, freed with
+    /// it at once.
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        self.0.form() == INLINE
+    }
+
     /// # Safety
     /// The caller gives this the table's hold.
     pub(super) unsafe fn new(entry: Entry) -> Self {
         Taken(entry)
     }
 
-    pub fn key(&self) -> &str {
-        self.0.key_str()
+    pub fn key(&self) -> &[u8] {
+        self.0.key()
     }
 
     pub fn value(&self) -> ValueRef<'_> {
@@ -958,11 +996,26 @@ impl Slot {
         Slot(self.0 & !ADDRESS | at)
     }
 
+    /// The slot's bits, for tests that check one is unchanged.
+    #[cfg(test)]
+    pub(super) fn raw(self) -> u64 {
+        self.0
+    }
+
     /// The fragment of this slot's key's hash, as a hash that has it: what
     /// a slot for another entry of the same key is made with.
     #[inline]
     pub(super) fn hash_part(self) -> u64 {
         (self.0 >> 52) << 32
+    }
+
+    /// Where this slot's key comes in a scan of its table: the fragment of
+    /// its hash, below `SCAN_POSITIONS`. Read from the slot alone, without
+    /// a visit to the entry, and the key's for as long as it is in the
+    /// table: the table growing or shrinking moves the slot, not this.
+    #[inline(always)]
+    pub(super) fn scan_position(self) -> usize {
+        (self.0 >> 52) as usize
     }
 
     #[inline(always)]

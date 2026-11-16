@@ -1,0 +1,8 @@
+r1-rc7-ttl: loaded=549810119 replica_at_drop=549810133 behind=-14 partial=1 full=1
+r1-rc7-nottl: loaded=575486066 replica_at_drop=575486066 behind=0 partial=1 full=0
+r1-rc6-ttl: loaded=549815888 replica_at_drop=549815888 behind=0 partial=1 full=0
+r1-rc6-nottl: loaded=575485315 replica_at_drop=575485315 behind=0 partial=1 full=0
+r2-rc7-ttl: loaded=549811799 replica_at_drop=549811813 behind=-14 partial=0 full=1
+r2-rc7-nottl: loaded=575482483 replica_at_drop=575482483 behind=0 partial=1 full=0
+r2-rc6-ttl: loaded=549810312 replica_at_drop=549810312 behind=0 partial=1 full=0
+r2-rc6-nottl: loaded=575480931 replica_at_drop=575480945 behind=-14 partial=0 full=1

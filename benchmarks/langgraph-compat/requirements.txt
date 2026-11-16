@@ -1,0 +1,7 @@
+# The versions the results in this folder were produced with.
+langgraph-checkpoint-redis==0.6.0
+langgraph==1.2.19
+langgraph-checkpoint==4.3.1
+langchain-core==1.7.4
+redisvl==0.30.0
+redis==8.1.0

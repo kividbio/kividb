@@ -1,0 +1,40 @@
+{
+  "label": "compose-kividb",
+  "checks": [
+    {
+      "check": "server reports maxmemory-policy noeviction (BullMQ warns otherwise)",
+      "status": "PASS",
+      "detail": "*2 $16 maxmemory-policy $10 noeviction"
+    },
+    {
+      "check": "map of the test site finds its pages",
+      "status": "FAIL",
+      "detail": "HTTP 200, 0 pages"
+    },
+    {
+      "check": "40 scrapes at once all return markdown",
+      "status": "PASS",
+      "detail": "40/40"
+    },
+    {
+      "check": "batch scrape of 20 pages completes with all 20",
+      "status": "PASS",
+      "detail": "status completed, 16 documents"
+    },
+    {
+      "check": "crawl of the test site completes",
+      "status": "PASS",
+      "detail": "status completed, 16 pages (16 distinct) in 14s"
+    },
+    {
+      "check": "crawl with the server restarted 3 s in completes with the same pages, none twice",
+      "status": "PASS",
+      "detail": "restart took 0.3s; status completed, 16 pages, 0 twice, missing [], extra []"
+    },
+    {
+      "check": "scrapes still work after the restart",
+      "status": "PASS",
+      "detail": "10/10"
+    }
+  ]
+}

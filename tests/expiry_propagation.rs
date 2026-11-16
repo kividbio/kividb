@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{free_port, restart_verified, start_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,34 +135,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`: asked with a socket that is bound and never
-/// listens (see `tests/resync.rs`).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing listens on, outside the range handed to outgoing
-/// connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(41);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn kividb(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -202,9 +177,9 @@ struct Server {
 impl Server {
     fn start(extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = kividb(&dir, port, &args, &[]);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| kividb(&dir, port, &args, &[]));
         let server = Server {
             port,
             dir,
@@ -249,7 +224,16 @@ impl Server {
     /// connection made the moment it comes up can be reset (master does the
     /// same): it is tried again.
     fn restart(&mut self) {
-        self.child = kividb(&self.dir, self.port, &self.args, &self.env);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters): `self.port` is the one it is on. Whoever was pointed at
+        // the old port has to be pointed at `self.port` again.
+        let (child, port, _) = restart_verified(
+            |port| kividb(&self.dir, port, &self.args, &self.env),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
@@ -595,6 +579,177 @@ fn active_expiry_does_not_run_beside_the_replay() {
     assert_eq!(server.conn().cmd(&["DBSIZE"]).i(), 0);
 }
 
+/// Milliseconds since the Unix epoch, now.
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// A key given a deadline, and then written to while it lived, of each
+/// kind: `HSET h f0 v0`, a deadline, `HSET h f1 v1`; a string `APPEND`ed to;
+/// a list pushed to; a sorted set added to. The deadline each by another of
+/// `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT`, `ms` ahead (at least);
+/// all four go into the log as `PEXPIREAT`. Returns the latest deadline.
+fn written_after_their_deadlines(c: &mut Conn, prefix: &str, ms: u64) -> u64 {
+    let (h, s, l, z) = (
+        format!("{prefix}:h"),
+        format!("{prefix}:s"),
+        format!("{prefix}:l"),
+        format!("{prefix}:z"),
+    );
+    let secs = ms.div_ceil(1000);
+    let now = unix_ms_now();
+    assert_eq!(c.cmd(&["HSET", &h, "f0", "v0"]).i(), 1);
+    assert_eq!(c.cmd(&["PEXPIRE", &h, &ms.to_string()]).i(), 1);
+    assert_eq!(c.cmd(&["HSET", &h, "f1", "v1"]).i(), 1);
+    assert_eq!(c.cmd(&["SET", &s, "v"]).s(), "OK");
+    assert_eq!(c.cmd(&["PEXPIREAT", &s, &(now + ms).to_string()]).i(), 1);
+    assert_eq!(c.cmd(&["APPEND", &s, "x"]).i(), 2);
+    assert_eq!(c.cmd(&["RPUSH", &l, "a"]).i(), 1);
+    assert_eq!(c.cmd(&["EXPIRE", &l, &secs.to_string()]).i(), 1);
+    assert_eq!(c.cmd(&["RPUSH", &l, "b"]).i(), 2);
+    let at_secs = now / 1000 + secs + 1;
+    assert_eq!(c.cmd(&["ZADD", &z, "1", "a"]).i(), 1);
+    assert_eq!(c.cmd(&["EXPIREAT", &z, &at_secs.to_string()]).i(), 1);
+    assert_eq!(c.cmd(&["ZADD", &z, "2", "b"]).i(), 1);
+    (at_secs * 1000).max(now + secs * 1000).max(now + ms)
+}
+
+/// What [`written_after_their_deadlines`] wrote under `prefix` is all
+/// there, with its deadline ahead.
+fn assert_whole(c: &mut Conn, prefix: &str) {
+    let h = format!("{prefix}:h");
+    let mut fields: Vec<String> = c
+        .cmd(&["HKEYS", &h])
+        .arr()
+        .iter()
+        .map(|f| f.s().to_string())
+        .collect();
+    fields.sort();
+    assert_eq!(fields, ["f0", "f1"], "{h}");
+    assert_eq!(c.cmd(&["GET", &format!("{prefix}:s")]).s(), "vx");
+    assert_eq!(c.cmd(&["LLEN", &format!("{prefix}:l")]).i(), 2);
+    assert_eq!(c.cmd(&["ZCARD", &format!("{prefix}:z")]).i(), 2);
+    for kind in ["h", "s", "l", "z"] {
+        let key = format!("{prefix}:{kind}");
+        assert!(c.cmd(&["PTTL", &key]).i() > 0, "{key} kept its deadline");
+    }
+}
+
+/// `HSET h f0 v0`, `PEXPIRE h t`, `HSET h f1 v1`, killed before `t`, and
+/// restarted after it. The log holds `PEXPIREAT h t` and then the `HSET`:
+/// the replay took a moment that had come as one that deletes the key, and
+/// the `HSET` after it made the key again of `f1` alone, with no time to
+/// live, for good. A string came back as what was appended to it, a list as
+/// what was pushed after. Redis sets the deadline while it loads, and the
+/// key goes once the load is done. Keys whose deadline is still ahead keep
+/// it, and every write.
+#[test]
+fn a_write_after_a_deadline_does_not_bring_the_key_back_after_a_restart() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let latest = written_after_their_deadlines(&mut c, "gone", 1500);
+    written_after_their_deadlines(&mut c, "live", 3_600_000);
+    wait_until("the writes to reach the AOF", 10, || {
+        let aof = server.aof();
+        count(&aof, b"PEXPIREAT") >= 8 && count(&aof, b"$4\r\nZADD\r\n") >= 4
+    });
+    server.kill();
+    assert_eq!(count(&server.aof(), b"UNLINK"), 0, "nothing expired yet");
+    let wait = latest.saturating_sub(unix_ms_now()) + 300;
+    std::thread::sleep(Duration::from_millis(wait));
+
+    server.restart();
+    let mut c = server.conn();
+    for kind in ["h", "s", "l", "z"] {
+        let key = format!("gone:{kind}");
+        assert_eq!(c.cmd(&["EXISTS", &key]).i(), 0, "{key} came back");
+        assert_eq!(c.cmd(&["TYPE", &key]).s(), "none", "{key}");
+    }
+    assert_whole(&mut c, "live");
+    // Taken out once the server is up, each with its `DEL` in the log: a
+    // second restart finds them gone by the log itself.
+    wait_until("the expired keys' DELs to reach the AOF", 20, || {
+        let aof = server.aof();
+        ["h", "s", "l", "z"]
+            .iter()
+            .all(|kind| deletions(&aof, &format!("gone:{kind}")) == 1)
+    });
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 4, "only live:* is left");
+    server.kill();
+    server.restart();
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 4);
+    assert_whole(&mut c, "live");
+}
+
+/// The bug's own sequence, with nothing else in the dataset: after the
+/// restart the database is empty, as in Redis.
+#[test]
+fn a_write_after_a_deadline_leaves_an_empty_database_after_a_restart() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    let latest = written_after_their_deadlines(&mut c, "k", 1200);
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&server.aof(), b"$4\r\nZADD\r\n") >= 2
+    });
+    server.kill();
+    let wait = latest.saturating_sub(unix_ms_now()) + 300;
+    std::thread::sleep(Duration::from_millis(wait));
+    server.restart();
+    let mut c = server.conn();
+    wait_until("the keys past their time to go", 20, || {
+        c.cmd(&["DBSIZE"]).i() == 0
+    });
+    for kind in ["h", "s", "l", "z"] {
+        assert_eq!(c.cmd(&["PTTL", &format!("k:{kind}")]).i(), -2);
+    }
+}
+
+/// The same of a hash field: `HPEXPIRE h 1200 FIELDS 1 g`, an `HINCRBY h g
+/// 1` while `g` lived, killed and restarted after the deadline. The replay
+/// deleted `g` at its `HPEXPIREAT` and the `HINCRBY` made it again, `1`
+/// with no deadline, for good. An `HSET` of a field after its deadline
+/// takes the deadline away (on the master too): that field stays.
+#[test]
+fn a_write_after_a_field_deadline_does_not_bring_the_field_back_after_a_restart() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&["HSET", "h", "keep", "1", "g", "5", "f", "v0"]).i(),
+        3
+    );
+    assert_eq!(
+        c.cmd(&["HPEXPIRE", "h", "1200", "FIELDS", "2", "g", "f"]),
+        V::Arr(vec![V::Int(1), V::Int(1)])
+    );
+    assert_eq!(c.cmd(&["HINCRBY", "h", "g", "1"]).i(), 6);
+    assert_eq!(c.cmd(&["HSET", "h", "f", "v1"]).i(), 0);
+    assert_eq!(c.cmd(&["HSET", "live", "g", "5"]).i(), 1);
+    assert_eq!(
+        c.cmd(&["HPEXPIRE", "live", "3600000", "FIELDS", "1", "g"]),
+        V::Arr(vec![V::Int(1)])
+    );
+    assert_eq!(c.cmd(&["HINCRBY", "live", "g", "1"]).i(), 6);
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&server.aof(), b"HINCRBY") >= 2
+    });
+    server.kill();
+    std::thread::sleep(Duration::from_millis(1500));
+    server.restart();
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["HGET", "h", "g"]), V::Nil, "g came back");
+    assert_eq!(c.cmd(&["HGET", "h", "f"]).s(), "v1");
+    assert_eq!(c.cmd(&["HGET", "h", "keep"]).s(), "1");
+    wait_until("the field past its time to go", 20, || {
+        c.cmd(&["HLEN", "h"]).i() == 2
+    });
+    assert_eq!(c.cmd(&["HGET", "live", "g"]).s(), "6");
+    assert!(c.cmd(&["HPTTL", "live", "FIELDS", "1", "g"]).arr()[0].i() > 0);
+}
+
 /// Active expiry in the middle of a script: the script is one step, and a
 /// key it set comes due, by the clock, while it runs. The sweep used to take
 /// the key out under the script, whose `INCR` then made it again, `1` with
@@ -868,6 +1023,45 @@ fn expired_keys_reach_the_replica_as_deletions() {
     wait_until("the master's DEL of held", 20, || {
         r.cmd(&["DBSIZE"]).i() == 0
     });
+}
+
+/// A key a replica watched once its time had run out, and which its master
+/// then writes without a `DEL` before it: the master's transaction runs at
+/// a time the key was alive (#662), so it writes over the key. The watch
+/// holds and the `EXEC` runs, as in Redis 8.10, where `touchWatchedKey`
+/// leaves a watch on a key that had expired when it was watched as it is
+/// while the key is there (#666). See tests/exec_clock.rs for the `DEL`.
+#[test]
+fn a_replica_watch_on_an_expired_key_holds_when_its_master_writes_it_without_a_del() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    assert_eq!(m.cmd(&["SET", "k", "old", "PX", "300"]).s(), "OK");
+    wait_caught_up(&mut m, &mut r);
+
+    let mut writer = master.conn();
+    let exec = std::thread::spawn(move || {
+        assert_eq!(writer.cmd(&["MULTI"]).s(), "OK");
+        assert_eq!(writer.cmd(&["DEBUG", "SLEEP", "0.8"]).s(), "QUEUED");
+        assert_eq!(writer.cmd(&["SET", "k", "new"]).s(), "QUEUED");
+        writer.cmd(&["EXEC"])
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    // Past its time on the replica, which still has it.
+    assert_eq!(r.cmd(&["WATCH", "k"]).s(), "OK");
+    assert_eq!(r.cmd(&["PTTL", "k"]).i(), -2);
+    let ran = exec.join().unwrap();
+    assert_eq!(ran.arr().len(), 2, "{ran:?}");
+    wait_caught_up(&mut m, &mut r);
+    assert_eq!(replica.conn().cmd(&["GET", "k"]).s(), "new");
+
+    assert_eq!(r.cmd(&["MULTI"]).s(), "OK");
+    assert_eq!(r.cmd(&["GET", "k"]).s(), "QUEUED");
+    assert_eq!(r.cmd(&["EXEC"]), V::Arr(vec![V::Str("new".into())]));
+    assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
 }
 
 /// Writes from many clients to keys that expire as they are written: the
@@ -1654,6 +1848,90 @@ fn a_replica_of_a_master_that_sends_deletions_waits_for_them() {
     }
 }
 
+/// A replica applying its master's live stream keeps a key whose
+/// `PEXPIREAT` reaches it after its moment, as Redis does
+/// (`checkAlreadyExpired` is false on a replica): the key is hidden from
+/// reads past its time, and the master's `DEL`, or its next writes to the
+/// key, say what it is (#665). The replica deleted it: the `HSET` after it
+/// made a new key `{f1}` with no time to live, and a `PERSIST` (which the
+/// master answered 1, and so sent) found nothing to take a time from, where
+/// the master had `{f0, f1}`.
+#[test]
+fn a_replica_keeps_a_key_whose_pexpireat_comes_after_its_moment() {
+    let past = (unix_ms_now() - 10_000).to_string();
+    let commands: Vec<Vec<String>> = vec![
+        vec!["SELECT".into(), "0".into()],
+        ["HSET", "h", "f0", "v0"].map(String::from).to_vec(),
+        vec!["PEXPIREAT".into(), "h".into(), past.clone()],
+        ["HSET", "h", "f1", "v1"].map(String::from).to_vec(),
+        ["HSET", "p", "f0", "v0"].map(String::from).to_vec(),
+        vec!["PEXPIREAT".into(), "p".into(), past],
+        ["HSET", "p", "f1", "v1"].map(String::from).to_vec(),
+        ["PERSIST", "p"].map(String::from).to_vec(),
+        ["SET", "done", "1"].map(String::from).to_vec(),
+    ];
+    let master = StandIn::start(info_of("1.2.0", 100, true), empty_payload(), commands);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_until("the stream to be applied", 30, || {
+        r.cmd(&["EXISTS", "done"]) == V::Int(1)
+    });
+    // Kept with its time, which has passed: hidden, and left for the DEL.
+    assert_eq!(r.cmd(&["HKEYS", "h"]), V::Arr(vec![]));
+    assert_eq!(r.cmd(&["PTTL", "h"]).i(), -2);
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 3);
+    // Kept, written to, and its time taken away: what the master has.
+    assert_eq!(
+        r.cmd(&["HKEYS", "p"]),
+        V::Arr(vec![V::Str("f0".into()), V::Str("f1".into())])
+    );
+    assert_eq!(r.cmd(&["PTTL", "p"]).i(), -1);
+    assert_eq!(r.info("stats", "expired_keys"), "0");
+}
+
+/// A replica that lags past a time to live its master set, then wrote over
+/// and took away (#665): `PEXPIRE`, `INCR`, `PERSIST` on the master while the
+/// replica is stopped (SIGSTOP). The `PEXPIREAT` the master sent reaches the
+/// replica after its moment. The replica deleted the key, and the `INCR`
+/// after it made `1` where the master has `6`, for good. The same for
+/// `GETEX … PX` and `EXPIRE`.
+#[cfg(unix)]
+#[test]
+fn a_replica_that_lags_past_a_ttl_keeps_the_key_as_the_master_does() {
+    let master = Server::start(&[]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    for k in ["pexpire", "getex", "expire"] {
+        assert_eq!(m.cmd(&["SET", k, "5"]).s(), "OK");
+    }
+    wait_caught_up(&mut m, &mut r);
+
+    replica.signal(libc::SIGSTOP);
+    assert_eq!(m.cmd(&["PEXPIRE", "pexpire", "100"]).i(), 1);
+    assert_eq!(m.cmd(&["GETEX", "getex", "PX", "100"]).s(), "5");
+    assert_eq!(m.cmd(&["EXPIRE", "expire", "1"]).i(), 1);
+    for k in ["pexpire", "getex", "expire"] {
+        assert_eq!(m.cmd(&["INCR", k]).i(), 6);
+        assert_eq!(m.cmd(&["PERSIST", k]).i(), 1);
+    }
+    // Past every deadline above before the replica reads its stream.
+    std::thread::sleep(Duration::from_millis(1500));
+    replica.signal(libc::SIGCONT);
+
+    wait_caught_up(&mut m, &mut r);
+    for k in ["pexpire", "getex", "expire"] {
+        for (who, c) in [("master", &mut m), ("replica", &mut r)] {
+            assert_eq!(c.cmd(&["GET", k]), V::Str("6".into()), "{who} {k}");
+            assert_eq!(c.cmd(&["PTTL", k]).i(), -1, "{who} {k}");
+        }
+    }
+    assert_same(&mut m, &mut r);
+    drop(master);
+}
+
 /// A replica holding keys that expired under a master that never deleted
 /// them (here written by a stand-in that sends no `DEL`s, as a 1.1.3 replica
 /// of a 1.1.2 master kept them), restarted from its AOF and continued by a
@@ -1769,4 +2047,218 @@ fn a_replica_of_a_real_1_1_2_master_converges_and_stays_so_after_the_upgrade() {
         || m.cmd(&["DBSIZE"]).i() == 1 && r.cmd(&["DBSIZE"]).i() == 1,
     );
     assert_eq!(r.cmd(&["GET", "keep"]).s(), "v");
+}
+
+#[test]
+fn debug_set_active_expire_0_stops_the_sweep() {
+    let server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
+    for i in 0..5 {
+        assert_eq!(
+            c.cmd(&["SET", &format!("k:{i}"), "v", "PX", "50"]).s(),
+            "OK"
+        );
+    }
+    assert_eq!(c.cmd(&["HSET", "h", "f", "v"]).i(), 1);
+    assert_eq!(
+        c.cmd(&["HPEXPIRE", "h", "50", "FIELDS", "1", "f"]).arr(),
+        [V::Int(1)]
+    );
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 6);
+    assert_eq!(c.info("stats", "expired_keys_active"), "0");
+    assert_eq!(c.info("stats", "expired_subkeys"), "0");
+    assert!(
+        c.cmd(&["DEBUG", "OBJECT", "k:0"])
+            .s()
+            .starts_with("Value at:")
+    );
+    assert_eq!(c.cmd(&["GET", "k:0"]), V::Nil);
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 5);
+    wait_until("k:0's DEL in the AOF", 10, || {
+        deletions(&server.aof(), "k:0") == 1
+    });
+    assert!((1..5).all(|i| deletions(&server.aof(), &format!("k:{i}")) == 0));
+
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1abc"]).s(), "OK");
+    wait_until("the sweep to delete the rest", 10, || {
+        c.cmd(&["DBSIZE"]).i() == 0
+            && c.info("stats", "expired_keys_active") == "4"
+            && c.info("stats", "expired_subkeys") == "1"
+    });
+}
+
+#[test]
+fn debug_pause_cron_1_stops_the_sweep() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["DEBUG", "PAUSE-CRON", "1"]).s(), "OK");
+    assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");
+    assert_eq!(c.cmd(&["SET", "k", "v", "PX", "50"]).s(), "OK");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 1);
+
+    assert_eq!(c.cmd(&["DEBUG", "PAUSE-CRON", "0"]).s(), "OK");
+    wait_until("the sweep to delete k", 10, || {
+        c.cmd(&["DBSIZE"]).i() == 0 && c.info("stats", "expired_keys_active") == "1"
+    });
+}
+
+/// `DUMP key`'s payload, as bytes: `Conn::cmd` reads replies as text.
+fn dump(c: &mut Conn, key: &str) -> Vec<u8> {
+    let cmd = format!("*2\r\n$4\r\nDUMP\r\n${}\r\n{key}\r\n", key.len());
+    c.writer.write_all(cmd.as_bytes()).unwrap();
+    let mut line = String::new();
+    c.reader.read_line(&mut line).unwrap();
+    let len: usize = line
+        .trim_end()
+        .strip_prefix('$')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("DUMP {key}: {line:?}"));
+    let mut payload = vec![0u8; len + 2];
+    c.reader.read_exact(&mut payload).unwrap();
+    payload.truncate(len);
+    payload
+}
+
+/// `args` as a RESP command.
+fn resp(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// `PEXPIRETIME` of each of `keys`.
+fn pexpiretimes(c: &mut Conn, keys: &[String]) -> Vec<i64> {
+    keys.iter()
+        .map(|key| c.cmd(&["PEXPIRETIME", key]).i())
+        .collect()
+}
+
+/// `commands`, each given a relative time to live, run on a master with an
+/// AOF and a replica: every key in `keys` then has, on the replica and
+/// after a replay of the AOF, the very `PEXPIRETIME` it has on the master.
+/// `prepare` runs first, on the master, and gives the commands.
+fn deadlines_reach_the_readers(keys: &[String], prepare: impl FnOnce(&mut Conn) -> Vec<Vec<u8>>) {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_link_up(&mut r);
+    let commands = prepare(&mut m);
+    for chunk in commands.chunks(500) {
+        m.writer.write_all(&chunk.concat()).unwrap();
+        for _ in chunk {
+            let reply = m.read();
+            assert!(!matches!(reply, V::Err(_)), "{reply:?}");
+        }
+    }
+    let want = pexpiretimes(&mut m, keys);
+    assert!(want.iter().all(|at| *at > 0), "every key has a deadline");
+
+    let differ = |got: &[i64]| -> Vec<String> {
+        keys.iter()
+            .zip(want.iter().zip(got))
+            .filter(|(_, (w, g))| w != g)
+            .take(5)
+            .map(|(key, (w, g))| format!("{key}: {g}, master {w}"))
+            .collect()
+    };
+    wait_caught_up(&mut m, &mut r);
+    let wrong = differ(&pexpiretimes(&mut r, keys));
+    assert!(wrong.is_empty(), "the replica: {wrong:?}");
+
+    // Every write is in the AOF: the replica, fed the same stream, has it.
+    std::thread::sleep(Duration::from_millis(1_500));
+    drop(m);
+    master.kill();
+    master.restart();
+    let wrong = differ(&pexpiretimes(&mut master.conn(), keys));
+    assert!(wrong.is_empty(), "after an AOF replay: {wrong:?}");
+}
+
+/// A `RESTORE` with a relative time to live reaches a replica and the AOF
+/// as the very deadline the master gave the key: their `PEXPIRETIME` is
+/// the master's. It was sent as a deadline worked out again from the clock
+/// after the command, a millisecond later whenever the clock had ticked
+/// meanwhile (#602).
+#[test]
+fn a_relative_restore_reaches_a_replica_and_the_aof_as_the_masters_deadline() {
+    let keys: Vec<String> = (0..3_000).map(|i| format!("r:{i}")).collect();
+    deadlines_reach_the_readers(&keys, |m| {
+        assert_eq!(m.cmd(&["SET", "src", "v"]).s(), "OK");
+        let payload = dump(m, "src");
+        keys.iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let ttl = (3_600_000 + i * 7).to_string();
+                resp(&[b"RESTORE", key.as_bytes(), ttl.as_bytes(), &payload])
+            })
+            .collect()
+    });
+}
+
+/// The same for `SET` with `EX` and `PX`, `SETEX`, `PSETEX` and `MSETEX`:
+/// each is sent with the deadline the key was given, read back, not worked
+/// out again from the clock (#602).
+#[test]
+fn a_relative_set_reaches_a_replica_and_the_aof_as_the_masters_deadline() {
+    let keys: Vec<String> = (0..3_000).map(|i| format!("s:{i}")).collect();
+    deadlines_reach_the_readers(&keys, |_| {
+        keys.chunks(2)
+            .enumerate()
+            .flat_map(|(i, pair)| {
+                let (a, b) = (pair[0].as_bytes(), pair[1].as_bytes());
+                let ms = (3_600_000 + i * 7).to_string();
+                let secs = (3_600 + i).to_string();
+                let (ms, secs) = (ms.as_bytes(), secs.as_bytes());
+                match i % 5 {
+                    0 => vec![
+                        resp(&[b"SET", a, b"v", b"PX", ms]),
+                        resp(&[b"SET", b, b"v", b"EX", secs]),
+                    ],
+                    1 => vec![
+                        resp(&[b"SETEX", a, secs, b"v"]),
+                        resp(&[b"PSETEX", b, ms, b"v"]),
+                    ],
+                    2 => vec![resp(&[b"MSETEX", b"2", a, b"v", b, b"v", b"PX", ms])],
+                    3 => vec![resp(&[b"MSETEX", b"2", a, b"v", b, b"v", b"EX", secs])],
+                    _ => vec![
+                        resp(&[b"SET", a, b"v", b"NX", b"PX", ms]),
+                        resp(&[b"SET", b, b"v", b"GET", b"PX", ms]),
+                    ],
+                }
+            })
+            .collect()
+    });
+}
+
+/// Inside a script, whose commands keep time by the clock as the script
+/// began: a `SET ... PX` reaches a replica and the AOF as the deadline the
+/// key was given by that clock. It was sent worked out from the clock as it
+/// was after the command, later by however long the script had run (#602).
+#[cfg(feature = "lua")]
+#[test]
+fn a_relative_set_in_a_script_reaches_a_replica_and_the_aof_as_the_masters_deadline() {
+    let keys: Vec<String> = (0..200).map(|i| format!("{{l}}:{i}")).collect();
+    deadlines_reach_the_readers(&keys, |_| {
+        // Each key set after a few milliseconds of work, so that the script
+        // runs for a good while after its clock was read.
+        const SCRIPT: &[u8] = b"for i = 1, #KEYS do \
+              local x = 0 for j = 1, 20000 do x = x + j end \
+              if i % 2 == 0 then redis.call('SET', KEYS[i], 'v', 'PX', ARGV[1]) \
+              else redis.call('SET', KEYS[i], 'v', 'EX', ARGV[2]) end \
+            end return 1";
+        let n = keys.len().to_string();
+        let mut args: Vec<&[u8]> = vec![b"EVAL", SCRIPT, n.as_bytes()];
+        args.extend(keys.iter().map(|key| key.as_bytes()));
+        args.push(b"3600000");
+        args.push(b"3600");
+        vec![resp(&args)]
+    });
 }

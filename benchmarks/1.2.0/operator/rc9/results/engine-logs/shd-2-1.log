@@ -1,0 +1,279 @@
+2026-11-03T07:22:58.241703724Z 2026-11-03T07:22:58.241Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:22:58.242749746Z 2026-11-03T07:22:58.241Z 1 [INFO] Writing final snapshot...
+2026-11-03T07:22:58.266222821Z 2026-11-03T07:22:58.266Z 1 [INFO] AOF: rebased onto dump.kdb (generation 2) — log is now the delta
+2026-11-03T07:22:58.266489842Z 2026-11-03T07:22:58.266Z 1 [INFO] Goodbye.
+2026-11-03T07:23:04.099537322Z                                                                                      
+2026-11-03T07:23:04.099590586Z                                                                                                     
+2026-11-03T07:23:04.099599134Z                                                    :::.                                     
+2026-11-03T07:23:04.099600582Z                                 .:-==-:.       :#%@%%%@%%=                                  
+2026-11-03T07:23:04.099601730Z                           -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+2026-11-03T07:23:04.099602821Z                       :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+2026-11-03T07:23:04.099603883Z                     +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+2026-11-03T07:23:04.099605001Z                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+2026-11-03T07:23:04.099606580Z                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+2026-11-03T07:23:04.099607994Z                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+2026-11-03T07:23:04.099609154Z               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+2026-11-03T07:23:04.099610435Z               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+2026-11-03T07:23:04.099611479Z               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+2026-11-03T07:23:04.099612509Z               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+2026-11-03T07:23:04.099613550Z               %%:::::::::::::::::::::::::::::+%@%-                          .               
+2026-11-03T07:23:04.099617271Z               =@*::::::::::::::::::::::::::*%@@*                                            
+2026-11-03T07:23:04.099618412Z                *@*::::=+:::::::::::::::-*%@@%%:                                             
+2026-11-03T07:23:04.099619473Z                 *@#-:##::::::::::-=+*%@@@@%*.                                               
+2026-11-03T07:23:04.099620590Z                  :#@%@*::::::*%@@@%%@@@%*:                                                  
+2026-11-03T07:23:04.099621637Z                    .*%%=:::*%%%%%%%@@%+                                                     
+2026-11-03T07:23:04.099622734Z                      .#@@@%*-   .#%@*.                                                      
+2026-11-03T07:23:04.099623878Z                       .#@*        :%@%:                                                     
+2026-11-03T07:23:04.099624851Z                         %@*         =%@#                                                    
+2026-11-03T07:23:04.099625943Z                          #@#          +%%+                                                  
+2026-11-03T07:23:04.099626913Z                           *%%+:...     .*@%*:....                                           
+2026-11-03T07:23:04.099627890Z                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+2026-11-03T07:23:04.099628879Z                                .+-            :+.                                           
+2026-11-03T07:23:04.099633380Z                                                                                                     
+2026-11-03T07:23:04.099634600Z     
+2026-11-03T07:23:04.100108763Z 2026-11-03T07:23:04.099Z 1 [INFO] KiviDB 1.2.0-rc9 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-03T07:23:04.100119597Z 2026-11-03T07:23:04.099Z 1 [INFO] I/O model      : io_uring
+2026-11-03T07:23:04.100130797Z   KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+2026-11-03T07:23:04.100133096Z   https://kividb.io
+2026-11-03T07:23:04.100134555Z 
+2026-11-03T07:23:04.100136368Z   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+2026-11-03T07:23:04.100137819Z 
+2026-11-03T07:23:04.100139864Z   * Version        : 1.2.0-rc9
+2026-11-03T07:23:04.100141356Z   * Mode           : cluster
+2026-11-03T07:23:04.100143254Z   * OS             : linux x86_64
+2026-11-03T07:23:04.100144854Z   * Memory         : 15GiB available
+2026-11-03T07:23:04.100146473Z   * CPUs           : 4 cores detected
+2026-11-03T07:23:04.100148131Z   * Listening on   : <ip>:6380
+2026-11-03T07:23:04.100149868Z   * Cluster bus    : <ip>:16380
+2026-11-03T07:23:04.100151235Z   * Node timeout   : 5000ms
+2026-11-03T07:23:04.100152737Z   * Node ID        : (printed after cluster init)
+2026-11-03T07:23:04.100161627Z   * Worker threads : 2
+2026-11-03T07:23:04.100163500Z   * AOF            : enabled
+2026-11-03T07:23:04.100165153Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-03T07:23:04.100166828Z   * Databases      : 16
+2026-11-03T07:23:04.100168739Z   * ACL file       : /etc/kividb/acl/users.acl
+2026-11-03T07:23:04.100170224Z 
+2026-11-03T07:23:04.108050714Z 2026-11-03T07:23:04.107Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-03T07:23:04.108486493Z 2026-11-03T07:23:04.108Z 1 [INFO] Cluster: Node ID        : cc71136b847ed9ab626bc92af2add3fd463b6b30
+2026-11-03T07:23:04.108492620Z 2026-11-03T07:23:04.108Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-03T07:23:04.108494870Z 2026-11-03T07:23:04.108Z 1 [INFO] Shards per DB  : 32
+2026-11-03T07:23:04.108496538Z 2026-11-03T07:23:04.108Z 1 [INFO] I/O model      : io_uring
+2026-11-03T07:23:04.108498233Z 2026-11-03T07:23:04.108Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T07:23:04.127344914Z 2026-11-03T07:23:04.127Z 1 [INFO] Loaded 25670 keys from snapshot (0 with a TTL)
+2026-11-03T07:23:04.132680983Z 2026-11-03T07:23:04.132Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T07:23:04.137016923Z 2026-11-03T07:23:04.136Z 1 [INFO] Replication: Loaded dataset is offset 968249 of c206c94452a0fe9f8b901088de225844c0a5be5d — a partial resync will be asked for
+2026-11-03T07:23:04.137424286Z 2026-11-03T07:23:04.137Z 1 [INFO] Cluster: Bus listener bound on <ip>:16380
+2026-11-03T07:23:04.137429267Z 2026-11-03T07:23:04.137Z 1 [INFO] Cluster: Restored replica role of master 5268afb5aecadead861d06e88aaa154a767b28d2 → restarting replication client
+2026-11-03T07:23:04.137610145Z 2026-11-03T07:23:04.137Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T07:23:04.137615076Z 2026-11-03T07:23:04.137Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T07:23:04.138035324Z 2026-11-03T07:23:04.137Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:23:04.138101058Z 2026-11-03T07:23:04.138Z 1 [INFO] Ready to accept connections on <ip>:6380
+2026-11-03T07:23:04.140252615Z 2026-11-03T07:23:04.140Z 1 [INFO] Replication: Partial resync: continuing from offset 968249 — no dataset transfer
+2026-11-03T07:23:04.140749130Z 2026-11-03T07:23:04.140Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.
+2026-11-03T07:23:15.250610077Z 2026-11-03T07:23:15.250Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-2-1.shd-2-headless.e2e.svc
+2026-11-03T07:23:19.749543200Z 2026-11-03T07:23:19.749Z 1 [WARN] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 marked FAIL (reported by 91c7de14cffd8b51a9959a87ccaf1432f2de05a7)
+2026-11-03T07:23:25.108536246Z 2026-11-03T07:23:25.108Z 1 [INFO] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 is reachable again — clearing FAIL
+2026-11-03T07:23:39.203695427Z 2026-11-03T07:23:39.203Z 1 [WARN] Cluster: Node 2e4fa5855bcbaa3f27f095f776b037e66709991e marked FAIL (reported by 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933)
+2026-11-03T07:23:44.851782796Z 2026-11-03T07:23:44.850Z 1 [INFO] Cluster: Node 2e4fa5855bcbaa3f27f095f776b037e66709991e is reachable again — clearing FAIL
+2026-11-03T07:23:54.295898981Z 2026-11-03T07:23:54.295Z 1 [INFO] Cluster: Manual failover: starting election at epoch 6 to replace 5268afb5aecadead861d06e88aaa154a767b28d2
+2026-11-03T07:23:54.339749509Z 2026-11-03T07:23:54.339Z 1 [INFO] Cluster: Won election at epoch 6 (3 votes, quorum 2)
+2026-11-03T07:23:54.345026520Z 2026-11-03T07:23:54.344Z 1 [INFO] Replication: Promoted; the stream c206c94452a0fe9f8b901088de225844c0a5be5d goes on as 5451410fd0551249b588a744e5d9762c136b17a8 from offset 1550706 — its replicas can be continued
+2026-11-03T07:23:54.352186326Z 2026-11-03T07:23:54.352Z 1 [INFO] Replication: Channel replica registered: <ip>:45826
+2026-11-03T07:23:54.356659171Z 2026-11-03T07:23:54.356Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T07:23:54.413058898Z 2026-11-03T07:23:54.412Z 1 [INFO] Replication: Replica <ip>:45826 is streaming: its queue peaked at 80 bytes during the full sync (repl-replica-sync-max-backlog-bytes 1073741824, repl-replica-max-backlog-bytes 268435456)
+2026-11-03T07:23:54.494766044Z 2026-11-03T07:23:54.494Z 1 [INFO] Replication: Command stream from <ip>:6380 superseded (epoch 1) — dropping connection
+2026-11-03T07:23:54.494793200Z 2026-11-03T07:23:54.494Z 1 [INFO] Replication: Replication session for <ip>:6380 superseded — stopping replication client
+2026-11-03T07:23:56.124545816Z 2026-11-03T07:23:56.124Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:24:00.748951045Z 2026-11-03T07:24:00.748Z 1 [WARN] Cluster: Node 5268afb5aecadead861d06e88aaa154a767b28d2 marked FAIL (reported by 91c7de14cffd8b51a9959a87ccaf1432f2de05a7)
+2026-11-03T07:24:03.922073810Z 2026-11-03T07:24:03.921Z 1 [INFO] Replication: Partial resync for <ip>:56824: continuing from offset 1569983 (83320 bytes of backlog)
+2026-11-03T07:24:04.924481445Z 2026-11-03T07:24:04.923Z 1 [INFO] Cluster: Node 5268afb5aecadead861d06e88aaa154a767b28d2 is reachable again — clearing FAIL
+2026-11-03T07:24:14.300931231Z 2026-11-03T07:24:14.300Z 1 [INFO] Cluster: Voted for 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 to take over from 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 at epoch 7 (manual failover)
+2026-11-03T07:24:20.950641357Z 2026-11-03T07:24:20.950Z 1 [WARN] Cluster: Node 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 marked FAIL (reported by 2e4fa5855bcbaa3f27f095f776b037e66709991e)
+2026-11-03T07:24:25.175994054Z 2026-11-03T07:24:25.175Z 1 [INFO] Cluster: Node 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 is reachable again — clearing FAIL
+2026-11-03T07:24:34.295492698Z 2026-11-03T07:24:34.295Z 1 [INFO] Cluster: Voted for 2e4fa5855bcbaa3f27f095f776b037e66709991e to take over from 0400792f2f4c129d42e926ec8e9dd114d031d450 at epoch 8 (manual failover)
+2026-11-03T07:24:40.904063172Z 2026-11-03T07:24:40.903Z 1 [WARN] Cluster: Node 0400792f2f4c129d42e926ec8e9dd114d031d450 marked FAIL (reported by 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933)
+2026-11-03T07:24:47.294038158Z 2026-11-03T07:24:47.293Z 1 [INFO] Cluster: Node 0400792f2f4c129d42e926ec8e9dd114d031d450 is reachable again — clearing FAIL
+2026-11-03T07:26:02.204638677Z 2026-11-03T07:26:02.204Z 1 [WARN] Cluster: Node 0400792f2f4c129d42e926ec8e9dd114d031d450 marked FAIL (reported by 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933)
+2026-11-03T07:26:09.043391493Z 2026-11-03T07:26:09.042Z 1 [INFO] Cluster: Node 0400792f2f4c129d42e926ec8e9dd114d031d450 is reachable again — clearing FAIL
+2026-11-03T07:26:37.408373793Z 2026-11-03T07:26:37.408Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:26:42.201339652Z 2026-11-03T07:26:42.201Z 1 [WARN] Cluster: Node 5268afb5aecadead861d06e88aaa154a767b28d2 marked FAIL (reported by 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933)
+2026-11-03T07:26:46.526519535Z 2026-11-03T07:26:46.525Z 1 [INFO] Replication: Partial resync for <ip>:52764: continuing from offset 3231536 (97600 bytes of backlog)
+2026-11-03T07:26:47.528007527Z 2026-11-03T07:26:47.526Z 1 [INFO] Cluster: Node 5268afb5aecadead861d06e88aaa154a767b28d2 is reachable again — clearing FAIL
+2026-11-03T07:26:58.117468551Z 2026-11-03T07:26:58.116Z 1 [INFO] Cluster: Voted for 0400792f2f4c129d42e926ec8e9dd114d031d450 to take over from 2e4fa5855bcbaa3f27f095f776b037e66709991e at epoch 9 (manual failover)
+2026-11-03T07:27:07.239421383Z 2026-11-03T07:27:07.239Z 1 [WARN] Cluster: Node 2e4fa5855bcbaa3f27f095f776b037e66709991e marked FAIL by quorum
+2026-11-03T07:27:08.297252865Z 2026-11-03T07:27:08.295Z 1 [INFO] Cluster: Node 2e4fa5855bcbaa3f27f095f776b037e66709991e is reachable again — clearing FAIL
+2026-11-03T07:27:23.133052112Z 2026-11-03T07:27:23.131Z 1 [INFO] Cluster: Voted for 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 to take over from 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 at epoch 10 (manual failover)
+2026-11-03T07:27:43.124538574Z 2026-11-03T07:27:43.124Z 1 [INFO] Cluster: Manual failover requested by 5268afb5aecadead861d06e88aaa154a767b28d2 — writes paused, replica must reach offset 3933643
+2026-11-03T07:27:43.127035188Z 2026-11-03T07:27:43.125Z 1 [INFO] Cluster: Voted for 5268afb5aecadead861d06e88aaa154a767b28d2 to take over from cc71136b847ed9ab626bc92af2add3fd463b6b30 at epoch 11 (manual failover)
+2026-11-03T07:27:43.240760958Z 2026-11-03T07:27:43.239Z 1 [INFO] Cluster: Slots of this shard are now owned by 5268afb5aecadead861d06e88aaa154a767b28d2 — following it as a replica
+2026-11-03T07:27:43.240785615Z 2026-11-03T07:27:43.239Z 1 [INFO] Replication: This node's dataset is offset 3933643 of its own stream 5451410fd0551249b588a744e5d9762c136b17a8: a master that continues that stream can continue this node
+2026-11-03T07:27:43.240794308Z 2026-11-03T07:27:43.240Z 1 [INFO] Replication: Replica <ip>:52764 disconnected: this node is now a replica itself
+2026-11-03T07:27:43.240797874Z 2026-11-03T07:27:43.240Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:27:43.241066839Z 2026-11-03T07:27:43.240Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:27:43.246312003Z 2026-11-03T07:27:43.246Z 1 [INFO] Replication: The master continues 5451410fd0551249b588a744e5d9762c136b17a8 as dbedecdef75c3ac8bcf93fdc0e8376589aaa8887
+2026-11-03T07:27:43.246328530Z 2026-11-03T07:27:43.246Z 1 [INFO] Replication: Partial resync: continuing from offset 3933643 — no dataset transfer
+2026-11-03T07:27:43.246495273Z 2026-11-03T07:27:43.246Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.
+2026-11-03T07:27:47.564934201Z 2026-11-03T07:27:47.564Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:27:47.564952642Z 2026-11-03T07:27:47.564Z 1 [INFO] Writing final snapshot...
+2026-11-03T07:27:47.623902160Z 2026-11-03T07:27:47.623Z 1 [INFO] AOF: rebased onto dump.kdb (generation 3) — log is now the delta
+2026-11-03T07:27:47.624098109Z 2026-11-03T07:27:47.624Z 1 [INFO] Goodbye.
+2026-11-03T07:27:59.474702992Z 2026-11-03T07:27:59.474Z 1 [INFO] KiviDB 1.2.0-rc9 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-03T07:27:59.474739910Z 2026-11-03T07:27:59.474Z 1 [INFO] I/O model      : io_uring
+2026-11-03T07:27:59.474756268Z                                                                                      
+2026-11-03T07:27:59.474758610Z                                                                                                     
+2026-11-03T07:27:59.474760352Z                                                    :::.                                     
+2026-11-03T07:27:59.474761587Z                                 .:-==-:.       :#%@%%%@%%=                                  
+2026-11-03T07:27:59.474762769Z                           -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+2026-11-03T07:27:59.474763923Z                       :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+2026-11-03T07:27:59.474765070Z                     +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+2026-11-03T07:27:59.474766351Z                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+2026-11-03T07:27:59.474768110Z                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+2026-11-03T07:27:59.474769612Z                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+2026-11-03T07:27:59.474770860Z               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+2026-11-03T07:27:59.474772076Z               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+2026-11-03T07:27:59.474773228Z               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+2026-11-03T07:27:59.474774284Z               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+2026-11-03T07:27:59.474775443Z               %%:::::::::::::::::::::::::::::+%@%-                          .               
+2026-11-03T07:27:59.474776565Z               =@*::::::::::::::::::::::::::*%@@*                                            
+2026-11-03T07:27:59.474777737Z                *@*::::=+:::::::::::::::-*%@@%%:                                             
+2026-11-03T07:27:59.474778892Z                 *@#-:##::::::::::-=+*%@@@@%*.                                               
+2026-11-03T07:27:59.474779908Z                  :#@%@*::::::*%@@@%%@@@%*:                                                  
+2026-11-03T07:27:59.474781000Z                    .*%%=:::*%%%%%%%@@%+                                                     
+2026-11-03T07:27:59.474782167Z                      .#@@@%*-   .#%@*.                                                      
+2026-11-03T07:27:59.474783258Z                       .#@*        :%@%:                                                     
+2026-11-03T07:27:59.474784350Z                         %@*         =%@#                                                    
+2026-11-03T07:27:59.474785517Z                          #@#          +%%+                                                  
+2026-11-03T07:27:59.474786684Z                           *%%+:...     .*@%*:....                                           
+2026-11-03T07:27:59.474793515Z                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+2026-11-03T07:27:59.474794801Z                                .+-            :+.                                           
+2026-11-03T07:27:59.474796013Z                                                                                                     
+2026-11-03T07:27:59.474797161Z     
+2026-11-03T07:27:59.474798572Z   KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+2026-11-03T07:27:59.474800215Z   https://kividb.io
+2026-11-03T07:27:59.474801173Z 
+2026-11-03T07:27:59.474802401Z   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+2026-11-03T07:27:59.474803362Z 
+2026-11-03T07:27:59.474804657Z   * Version        : 1.2.0-rc9
+2026-11-03T07:27:59.474805780Z   * Mode           : cluster
+2026-11-03T07:27:59.474807364Z   * OS             : linux x86_64
+2026-11-03T07:27:59.474808445Z   * Memory         : 15GiB available
+2026-11-03T07:27:59.474810221Z   * CPUs           : 4 cores detected
+2026-11-03T07:27:59.474812043Z   * Listening on   : <ip>:6380
+2026-11-03T07:27:59.474813691Z   * Cluster bus    : <ip>:16380
+2026-11-03T07:27:59.474815321Z   * Node timeout   : 5000ms
+2026-11-03T07:27:59.474816943Z   * Node ID        : (printed after cluster init)
+2026-11-03T07:27:59.474818511Z   * Worker threads : 2
+2026-11-03T07:27:59.474820106Z   * AOF            : enabled
+2026-11-03T07:27:59.474821958Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-03T07:27:59.474823681Z   * Databases      : 16
+2026-11-03T07:27:59.474825539Z   * ACL file       : /etc/kividb/acl/users.acl
+2026-11-03T07:27:59.474827387Z 
+2026-11-03T07:27:59.489248118Z 2026-11-03T07:27:59.489Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-03T07:27:59.489702339Z 2026-11-03T07:27:59.489Z 1 [INFO] Cluster: Node ID        : cc71136b847ed9ab626bc92af2add3fd463b6b30
+2026-11-03T07:27:59.489714216Z 2026-11-03T07:27:59.489Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-03T07:27:59.489716345Z 2026-11-03T07:27:59.489Z 1 [INFO] Shards per DB  : 32
+2026-11-03T07:27:59.489717993Z 2026-11-03T07:27:59.489Z 1 [INFO] I/O model      : io_uring
+2026-11-03T07:27:59.489719976Z 2026-11-03T07:27:59.489Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T07:27:59.550254753Z 2026-11-03T07:27:59.550Z 1 [INFO] Loaded 101350 keys from snapshot (0 with a TTL)
+2026-11-03T07:27:59.555034469Z 2026-11-03T07:27:59.554Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T07:27:59.559764365Z 2026-11-03T07:27:59.559Z 1 [INFO] Replication: Loaded dataset is offset 3980720 of dbedecdef75c3ac8bcf93fdc0e8376589aaa8887 — a partial resync will be asked for
+2026-11-03T07:27:59.560107080Z 2026-11-03T07:27:59.560Z 1 [INFO] Cluster: Bus listener bound on <ip>:16380
+2026-11-03T07:27:59.560113071Z 2026-11-03T07:27:59.560Z 1 [INFO] Cluster: Restored replica role of master 5268afb5aecadead861d06e88aaa154a767b28d2 → restarting replication client
+2026-11-03T07:27:59.560114544Z 2026-11-03T07:27:59.560Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T07:27:59.560116088Z 2026-11-03T07:27:59.560Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T07:27:59.562112133Z 2026-11-03T07:27:59.561Z 1 [INFO] Replication: Connecting to master <ip>:6380...
+2026-11-03T07:27:59.562121559Z 2026-11-03T07:27:59.561Z 1 [INFO] Ready to accept connections on <ip>:6380
+2026-11-03T07:27:59.573161302Z 2026-11-03T07:27:59.573Z 1 [INFO] Replication: Partial resync: continuing from offset 3980720 — no dataset transfer
+2026-11-03T07:27:59.573713000Z 2026-11-03T07:27:59.573Z 1 [INFO] Replication: Synced with <ip>:6380. Entering command stream.
+2026-11-03T07:28:10.155240402Z 2026-11-03T07:28:10.155Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-2-1.shd-2-headless.e2e.svc
+2026-11-03T07:30:00.866802193Z 2026-11-03T07:30:00.866Z 1 [INFO] Cluster: Manual failover: starting election at epoch 14 to replace 5268afb5aecadead861d06e88aaa154a767b28d2
+2026-11-03T07:30:00.962666723Z 2026-11-03T07:30:00.962Z 1 [INFO] Cluster: Won election at epoch 14 (3 votes, quorum 2)
+2026-11-03T07:30:00.972387861Z 2026-11-03T07:30:00.972Z 1 [INFO] Replication: Promoted; the stream dbedecdef75c3ac8bcf93fdc0e8376589aaa8887 goes on as 4e255bc321514222adf491b06d412ee6cd52c883 from offset 5304231 — its replicas can be continued
+2026-11-03T07:30:00.976983133Z 2026-11-03T07:30:00.976Z 1 [INFO] Replication: Partial resync for <ip>:57932: continuing from offset 5304231 (40 bytes of backlog)
+2026-11-03T07:30:01.065692546Z 2026-11-03T07:30:01.065Z 1 [INFO] Replication: Command stream from <ip>:6380 superseded (epoch 1) — dropping connection
+2026-11-03T07:30:01.065712858Z 2026-11-03T07:30:01.065Z 1 [INFO] Replication: Replication session for <ip>:6380 superseded — stopping replication client
+2026-11-03T07:31:40.975357252Z 2026-11-03T07:31:40.975Z 1 [INFO] Cluster: Voted for 0400792f2f4c129d42e926ec8e9dd114d031d450 to take over from 2e4fa5855bcbaa3f27f095f776b037e66709991e at epoch 15 (manual failover)
+2026-11-03T07:34:03.992286333Z 2026-11-03T07:34:03.992Z 1 [INFO] Cluster: Voted for 91c7de14cffd8b51a9959a87ccaf1432f2de05a7 to take over from 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 at epoch 16 (manual failover)
+2026-11-03T07:34:09.140958771Z 2026-11-03T07:34:09.140Z 1 [WARN] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 marked FAIL (reported by 0400792f2f4c129d42e926ec8e9dd114d031d450)
+2026-11-03T07:34:09.173110244Z 2026-11-03T07:34:09.172Z 1 [INFO] Cluster: Node 5fa5aeae1d47a536fc02cc0f8172fcbc3a485933 is reachable again — clearing FAIL
+2026-11-03T07:42:18.812760198Z 2026-11-03T07:42:18.812Z 1 [INFO] AOF: rebased onto dump.kdb (generation 4) — log is now the delta
+2026-11-03T07:43:04.195703175Z 2026-11-03T07:43:04.195Z 1 [INFO] KiviDB 1.2.0-rc9 starting: pid 1, default build, config file '/etc/kividb/kividb.conf'
+2026-11-03T07:43:04.195703845Z                                                                                      
+2026-11-03T07:43:04.195751102Z                                                                                                     
+2026-11-03T07:43:04.195754136Z                                                    :::.                                     
+2026-11-03T07:43:04.195755604Z                                 .:-==-:.       :#%@%%%@%%=                                  
+2026-11-03T07:43:04.195757165Z                           -*@@%%%######%%%%%=:%%+:::::::=%%:                                
+2026-11-03T07:43:04.195758702Z                       :*%%#+-::::::::::::::=*%#:::::::::::#%.                               
+2026-11-03T07:43:04.195760150Z                     +%%*::::::::::::::::::::::::::::%@%-::+%#.                              
+2026-11-03T07:43:04.195761494Z                   =%%=::::::::::::::::::::::::::::::=#+:::*%@@@#.                           
+2026-11-03T07:43:04.195763565Z                 .%%+:::::::::::::::::::::::::::::::::::::+%@@@@@@%+.                  ██╗  ██╗ ██╗           ██╗ ███████╗  ███████╗ 
+2026-11-03T07:43:04.195773086Z 2026-11-03T07:43:04.195Z 1 [WARN] The data directory /data is in use by another process (it holds kividb.lock): waiting for it to be free (0s so far)
+2026-11-03T07:43:04.195779855Z                -%%-::::::::::::::::::::::::::::::::::::*%%*+#%@@@@@%#:                ██║ ██╔╝ ╚═╝           ╚═╝ ╚██╔══██╗ ╚██╔══██╗
+2026-11-03T07:43:04.195781713Z               .%%:::::::::::::::::::::::::::::::::%@@%%*.        =#%@@%-              █████╔╝  ██╗ ██╗   ██╗ ██╗  ██║  ██║  ██████╔╝
+2026-11-03T07:43:04.195784703Z               +@=::::::::::::::::::::::::::::::::+@#.               .=%@%-            ██╔═██╗  ██║ ╚██╗ ██╔╝ ██║  ██║  ██║  ██╔══██╗
+2026-11-03T07:43:04.195785949Z               %#::::::::::::::::::::::::::::::::+%%:                    =%%:          ██║ ╚██╗ ██║  ╚████╔╝  ██║ ███████╔╝ ███████╔╝
+2026-11-03T07:43:04.195787014Z               @#:::::::::::::::::::::::::::::::*@%=                       .#+         ╚═╝  ╚═╝ ╚═╝   ╚═══╝   ╚═╝ ╚══════╝  ╚══════╝ 
+2026-11-03T07:43:04.195788500Z               %%:::::::::::::::::::::::::::::+%@%-                          .               
+2026-11-03T07:43:04.195789607Z               =@*::::::::::::::::::::::::::*%@@*                                            
+2026-11-03T07:43:04.195790669Z                *@*::::=+:::::::::::::::-*%@@%%:                                             
+2026-11-03T07:43:04.195792009Z                 *@#-:##::::::::::-=+*%@@@@%*.                                               
+2026-11-03T07:43:04.195793043Z                  :#@%@*::::::*%@@@%%@@@%*:                                                  
+2026-11-03T07:43:04.195794144Z                    .*%%=:::*%%%%%%%@@%+                                                     
+2026-11-03T07:43:04.195795114Z                      .#@@@%*-   .#%@*.                                                      
+2026-11-03T07:43:04.195796212Z                       .#@*        :%@%:                                                     
+2026-11-03T07:43:04.195797309Z                         %@*         =%@#                                                    
+2026-11-03T07:43:04.195798382Z                          #@#          +%%+                                                  
+2026-11-03T07:43:04.195807160Z                           *%%+:...     .*@%*:....                                           
+2026-11-03T07:43:04.195815251Z                        *%%%%%%%@%%%%+ %%%%%%%@@%%%%-                                        
+2026-11-03T07:43:04.195816964Z                                .+-            :+.                                           
+2026-11-03T07:43:04.195818839Z                                                                                                     
+2026-11-03T07:43:04.195820838Z     
+2026-11-03T07:43:04.195823525Z   KiviDB v1.2.0-rc9 - A fast Redis®-compatible store written in Rust
+2026-11-03T07:43:04.195826567Z   https://kividb.io
+2026-11-03T07:43:04.195827487Z 
+2026-11-03T07:43:04.195828600Z   Licensed under the GNU Affero General Public License, version 3 (AGPLv3)
+2026-11-03T07:43:04.195830223Z 
+2026-11-03T07:43:04.195832005Z   * Version        : 1.2.0-rc9
+2026-11-03T07:43:04.195833605Z   * Mode           : cluster
+2026-11-03T07:43:04.195835408Z   * OS             : linux x86_64
+2026-11-03T07:43:04.195836909Z   * Memory         : 15GiB available
+2026-11-03T07:43:04.195838548Z   * CPUs           : 4 cores detected
+2026-11-03T07:43:04.195840233Z   * Listening on   : <ip>:6380
+2026-11-03T07:43:04.195841946Z   * Cluster bus    : <ip>:16380
+2026-11-03T07:43:04.195854093Z   * Node timeout   : 5000ms
+2026-11-03T07:43:04.195857080Z   * Node ID        : (printed after cluster init)
+2026-11-03T07:43:04.195858104Z   * Worker threads : 2
+2026-11-03T07:43:04.195859129Z   * AOF            : enabled
+2026-11-03T07:43:04.195860345Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-03T07:43:04.195861324Z   * Databases      : 16
+2026-11-03T07:43:04.195862434Z   * ACL file       : /etc/kividb/acl/users.acl
+2026-11-03T07:43:04.195863365Z 
+2026-11-03T07:43:04.205815317Z 2026-11-03T07:43:04.205Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-03T07:43:04.215961190Z 2026-11-03T07:43:04.215Z 1 [INFO] Replication: Shutdown: replica <ip>:6380 has the whole stream, to offset 12918090 (10 ms); it can be continued after the restart
+2026-11-03T07:43:04.215982353Z 2026-11-03T07:43:04.215Z 1 [INFO] Writing final snapshot...
+2026-11-03T07:43:04.312852593Z 2026-11-03T07:43:04.312Z 1 [INFO] AOF: rebased onto dump.kdb (generation 5) — log is now the delta
+2026-11-03T07:43:04.312901715Z 2026-11-03T07:43:04.312Z 1 [INFO] Goodbye.
+2026-11-03T07:43:04.345985370Z 2026-11-03T07:43:04.345Z 1 [INFO] The data directory is free after 0.2s: starting
+2026-11-03T07:43:04.346004149Z 2026-11-03T07:43:04.345Z 1 [INFO] I/O model      : io_uring
+2026-11-03T07:43:04.353641921Z 2026-11-03T07:43:04.353Z 1 [INFO] ACL file loaded: /etc/kividb/acl/users.acl
+2026-11-03T07:43:04.353829042Z 2026-11-03T07:43:04.353Z 1 [INFO] Cluster: Node ID        : cc71136b847ed9ab626bc92af2add3fd463b6b30
+2026-11-03T07:43:04.353839855Z 2026-11-03T07:43:04.353Z 1 [INFO] Cluster: Bus port       : 16380
+2026-11-03T07:43:04.353846172Z 2026-11-03T07:43:04.353Z 1 [INFO] Shards per DB  : 32
+2026-11-03T07:43:04.353848983Z 2026-11-03T07:43:04.353Z 1 [INFO] I/O model      : io_uring
+2026-11-03T07:43:04.353851228Z 2026-11-03T07:43:04.353Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-03T07:43:04.647885072Z 2026-11-03T07:43:04.647Z 1 [INFO] Loaded 324753 keys from snapshot (0 with a TTL)
+2026-11-03T07:43:04.647919534Z 2026-11-03T07:43:04.647Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-03T07:43:04.654483417Z 2026-11-03T07:43:04.654Z 1 [INFO] Replication: Loaded dataset is offset 12918090 of this node's stream 4e255bc321514222adf491b06d412ee6cd52c883 — replicas stopped cleanly with it can be continued
+2026-11-03T07:43:04.654913113Z 2026-11-03T07:43:04.654Z 1 [INFO] Cluster: Bus listener bound on <ip>:16380
+2026-11-03T07:43:04.654924645Z 2026-11-03T07:43:04.654Z 1 [INFO] Cluster: Heartbeat loop started (interval 1s)
+2026-11-03T07:43:04.654928188Z 2026-11-03T07:43:04.654Z 1 [INFO] Cluster: Failure detection started (interval 100ms, node_timeout 5000ms)
+2026-11-03T07:43:04.655121074Z 2026-11-03T07:43:04.655Z 1 [INFO] Ready to accept connections on <ip>:6380
+2026-11-03T07:43:05.729122632Z 2026-11-03T07:43:05.728Z 1 [INFO] Replication: Partial resync for <ip>:56712: continuing from offset 12918090 (0 bytes of backlog)
+2026-11-03T07:43:14.547681060Z 2026-11-03T07:43:14.547Z 1 [INFO] CONFIG SET cluster-announce-hostname shd-2-1.shd-2-headless.e2e.svc
+2026-11-03T07:47:03.872178564Z 2026-11-03T07:47:03.872Z 1 [INFO] Cluster: handover of slots 15019-16383: writes paused 2 ms (in-flight writes 0,          last of the stream 0, the destination's takeover 2)
+2026-11-03T07:47:03.946793895Z 2026-11-03T07:47:03.946Z 1 [INFO] Cluster: Slots 15019-16383 migrated to 311191234860e3bdfa49172c77607c0d67138f42 (writes paused 36 ms)
+2026-11-03T07:48:23.327541782Z 2026-11-03T07:48:23.327Z 1 [INFO] Cluster: Slots 15019-16383 imported from 311191234860e3bdfa49172c77607c0d67138f42 (taken over in 2 ms)
+2026-11-03T07:48:23.627351817Z 2026-11-03T07:48:23.627Z 1 [INFO] Replication: Channel replica registered: <ip>:33546
+2026-11-03T07:48:23.651550566Z 2026-11-03T07:48:23.651Z 1 [INFO] Replication: uring: sent full RDB; streaming queued writes from hub
+2026-11-03T07:48:24.307644758Z 2026-11-03T07:48:24.307Z 1 [INFO] Replication: uring: replica disconnected
+2026-11-03T07:48:24.307680185Z 2026-11-03T07:48:24.307Z 1 [INFO] Replication: Replica <ip>:33546 left during its full sync; its queue peaked at 410 bytes

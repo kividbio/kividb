@@ -1,0 +1,13 @@
+lines with two engines for fx-0-1: 0
+2026-11-02T21:04:49.994589402Z 2026-11-02T21:04:49.994Z 1 [INFO] Cluster: Manual failover requested by e61f64e7a646285a37e4429e04ce040289179c94 — writes paused, replica must reach offset 5377901
+2026-11-02T21:04:50.057598414Z 2026-11-02T21:04:50.057Z 1 [INFO] Replication: Full resync from 26cd650448894c530561e4db0ddeed566288cd23 offset=5378061
+2026-11-02T21:04:50.250901478Z 2026-11-02T21:04:50.249Z 1 [INFO] SIGTERM received — shutting down gracefully
+2026-11-02T21:04:50.250918659Z 2026-11-02T21:04:50.249Z 1 [INFO] Writing final snapshot...
+2026-11-02T21:04:50.260082453Z 2026-11-02T21:04:50.259Z 1 [INFO] AOF: rebased onto dump.kdb (generation 8) — log is now the delta
+2026-11-02T21:04:50.344095996Z 2026-11-02T21:04:50.344Z 1 [INFO] AOF: rebased onto dump.kdb (generation 9) — log is now the delta
+2026-11-02T21:05:02.990259397Z   * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-02T21:05:03.003353692Z 2026-11-02T21:05:03.003Z 1 [INFO] Found dump.kdb — loading native snapshot
+2026-11-02T21:05:03.166191196Z 2026-11-02T21:05:03.166Z 1 [INFO] Loaded 169916 keys from snapshot (0 with a TTL)
+2026-11-02T21:05:03.171111966Z 2026-11-02T21:05:03.170Z 1 [INFO] Replaying appendonly.aof on top of the snapshot (writes since the dump)
+2026-11-02T21:05:03.179691485Z 2026-11-02T21:05:03.179Z 1 [INFO] Replication: Loaded dataset is offset 5378061 of 26cd650448894c530561e4db0ddeed566288cd23 — a partial resync will be asked for
+2026-11-02T21:05:03.186382713Z 2026-11-02T21:05:03.185Z 1 [INFO] Replication: Partial resync: continuing from offset 5378061 — no dataset transfer

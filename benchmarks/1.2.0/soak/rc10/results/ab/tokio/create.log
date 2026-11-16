@@ -1,0 +1,47 @@
+>>> Performing hash slots allocation on 6 nodes...
+Master[0] -> Slots 0 - 5460
+Master[1] -> Slots 5461 - 10922
+Master[2] -> Slots 10923 - 16383
+Adding replica 10.81.1.12:7002 to 10.81.1.11:7001
+Adding replica 10.81.1.13:7002 to 10.81.1.12:7001
+Adding replica 10.81.1.11:7002 to 10.81.1.13:7001
+M: 1fe09c8c865a986332d985d6dbf5e06db20a724d 10.81.1.11:7001
+   slots:[0-5460] (5461 slots) master
+M: 2d0b7fb07425018d89a7827976f07d2bac46f68b 10.81.1.12:7001
+   slots:[5461-10922] (5462 slots) master
+M: 9df774ac4230b63e31aa9ce60e35d4a618308a7d 10.81.1.13:7001
+   slots:[10923-16383] (5461 slots) master
+S: 9cac41ce38a8d8d6f601372b251b2f72899a3da5 10.81.1.11:7002
+   replicates 9df774ac4230b63e31aa9ce60e35d4a618308a7d
+S: b00360d45929ab26b6d26d9d94940296c1d3523a 10.81.1.12:7002
+   replicates 1fe09c8c865a986332d985d6dbf5e06db20a724d
+S: 76e34b2c2ae0a225d375e4c99ae6cf9946da649f 10.81.1.13:7002
+   replicates 2d0b7fb07425018d89a7827976f07d2bac46f68b
+>>> Nodes configuration updated
+>>> Assign a different config epoch to each node
+>>> Sending CLUSTER MEET messages to join the cluster
+Waiting for the cluster to join
+
+>>> Performing Cluster Check (using node 10.81.1.11:7001)
+M: 1fe09c8c865a986332d985d6dbf5e06db20a724d 10.81.1.11:7001
+   slots:[0-5460] (5461 slots) master
+   1 additional replica(s)
+M: 2d0b7fb07425018d89a7827976f07d2bac46f68b 10.81.1.12:7001
+   slots:[5461-10922] (5462 slots) master
+   1 additional replica(s)
+S: 76e34b2c2ae0a225d375e4c99ae6cf9946da649f 10.81.1.13:7002
+   slots: (0 slots) slave
+   replicates 2d0b7fb07425018d89a7827976f07d2bac46f68b
+S: 9cac41ce38a8d8d6f601372b251b2f72899a3da5 10.81.1.11:7002
+   slots: (0 slots) slave
+   replicates 9df774ac4230b63e31aa9ce60e35d4a618308a7d
+M: 9df774ac4230b63e31aa9ce60e35d4a618308a7d 10.81.1.13:7001
+   slots:[10923-16383] (5461 slots) master
+   1 additional replica(s)
+S: b00360d45929ab26b6d26d9d94940296c1d3523a 10.81.1.12:7002
+   slots: (0 slots) slave
+   replicates 1fe09c8c865a986332d985d6dbf5e06db20a724d
+[OK] All nodes agree about slots configuration.
+>>> Check for open slots...
+>>> Check slots coverage...
+[OK] All 16384 slots covered.

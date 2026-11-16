@@ -1,0 +1,6 @@
+total 67220
+-rw-rw-r-- 1 azureuser azureuser 33229412 05:16:59 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser 35588971 05:16:21 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser       24 05:16:21 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser      105 05:16:21 dump.kdb.repl
+-rw-rw-r-- 1 azureuser azureuser        0 05:16:19 kividb.lock

@@ -1,0 +1,57 @@
+== load stopped 01:11:26
+0s master_repl_offset=6520455509 replica_offset=6520455509 lag=0
+== replica INFO persistence
+aof_enabled:1
+rdb_bgsave_in_progress:0
+aof_rewrite_in_progress:0
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:0
+aof_last_rewrite_time_ms:706
+aof_last_bgrewrite_status:ok
+aof_current_size:591506
+aof_base_size:559951
+aof_lost_records:0
+aof_last_write_status:ok
+aof_acks_before_write:0
+aof_last_cow_size:0
+== DBSIZE master 1279236 replica 1279236
+== DEBUG DIGEST master OK replica OK
+== AOF/data files master
+9698	/mnt/kv/appendonly.aof
+736447550	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+105	/mnt/kv/node.conf
+6	/mnt/kv/pid
+9886	/mnt/kv/server.log
+/mnt/kv:
+total 719236
+drwxrwxr-x 2 azureuser azureuser      4096 Nov  2 01:11 .
+drwxr-xr-x 7 azureuser root           4096 Nov  2 01:07 ..
+-rw-rw-r-- 1 azureuser azureuser      9698 Nov  2 01:11 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser 736447550 Nov  2 01:11 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser        24 Nov  2 01:11 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser       105 Nov  2 01:07 node.conf
+-rw-rw-r-- 1 azureuser azureuser         6 Nov  2 01:07 pid
+-rw-rw-r-- 1 azureuser azureuser      9886 Nov  2 01:11 server.log
+== AOF/data files replica
+604061	/mnt/kv/appendonly.aof
+736700083	/mnt/kv/dump.kdb
+24	/mnt/kv/dump.kdb.gen
+93	/mnt/kv/dump.kdb.repl
+130	/mnt/kv/node.conf
+5	/mnt/kv/pid
+10353	/mnt/kv/server.log
+/mnt/kv:
+total 720068
+drwxrwxr-x 2 azureuser azureuser      4096 Nov  2 01:11 .
+drwxr-xr-x 4 azureuser root           4096 Nov  2 01:07 ..
+-rw-rw-r-- 1 azureuser azureuser    604061 Nov  2 01:11 appendonly.aof
+-rw-rw-r-- 1 azureuser azureuser 736700083 Nov  2 01:11 dump.kdb
+-rw-rw-r-- 1 azureuser azureuser        24 Nov  2 01:11 dump.kdb.gen
+-rw-rw-r-- 1 azureuser azureuser        93 Nov  2 01:07 dump.kdb.repl
+-rw-rw-r-- 1 azureuser azureuser       130 Nov  2 01:07 node.conf
+-rw-rw-r-- 1 azureuser azureuser         5 Nov  2 01:07 pid
+-rw-rw-r-- 1 azureuser azureuser     10353 Nov  2 01:11 server.log
+== compare.py
+{"dbsize_a": 1164125, "dbsize_b": 1164125, "scanned_a": 1278278, "scanned_b": 1277544, "compared": 1278278, "differ_first_pass": 134, "differ_after_recheck": 0, "expiring_at_compare": 0, "real_differences": 0, "sample": [], "seconds": 130.5}
+== DBSIZE after compare master 1163682 replica 1163682

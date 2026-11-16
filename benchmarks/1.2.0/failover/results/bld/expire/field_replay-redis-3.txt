@@ -1,0 +1,4 @@
+redis before kill: hf f=v1 fttl=-1  | hg g=6 gttl=1978 
+/home/azureuser/h/field_replay.sh: line 15: 10529 Killed                  nohup $CMD >> $D/server.log 2>&1 < /dev/null
+redis after restart: hf f=v1 fttl=-1  | hg g= gttl=-2  hlen=1
+--- AOF:

@@ -1,0 +1,11 @@
+BEGIN fx-loss2 20:57:00
+fx-loss2 cordoned all nodes but vmss000002 20:57:14
+fx-loss2 force delete fx-0-0 20:57:14
+pod "fx-0-0" force deleted from e2e namespace
+fx-loss2 new fx-0-0 on vmss000002, nodes uncordoned 20:57:20
+fx-loss2 fx-0-0 Ready 20:57:27
+lines with two engines for fx-0-0: 0
+END fx-loss2 20:58:16
+acked 265413 errors 0 win [] slow 0 []
+errkinds Counter()
+checked 266645 missing 0 wrong 0 readErr 0 bySec {} dbsize 269681 ex {}

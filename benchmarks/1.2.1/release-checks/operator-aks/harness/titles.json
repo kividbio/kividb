@@ -1,0 +1,212 @@
+{
+ "upgrade-rep": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "engine upgrade 1.1.3 -> 1.2.0-rc7 (replicated)",
+  "title": "rc7: engine upgrade 1.1.3 -> 1.2.0-rc7 of the replicated cluster, one switchover, no failed write"
+ },
+ "upgrade-shd": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "engine upgrade 1.1.3 -> 1.2.0-rc7 (sharded)",
+  "title": "rc7: engine upgrade 1.1.3 -> 1.2.0-rc7 of the sharded cluster, one CLUSTER FAILOVER per shard, no failed write"
+ },
+ "restart-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "rolling restart (KividbDbOps), sharded",
+  "title": "rc7: rolling restart (KividbDbOps) of the sharded cluster, no failed write (rc4: 1,013)"
+ },
+ "failover-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "CLUSTER FAILOVER on every replica in turn",
+  "title": "rc7: CLUSTER FAILOVER on every replica in turn, no failed write"
+ },
+ "sigstop-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "SIGSTOP of a shard master (host PID)",
+  "title": "rc7: shard master hung (SIGSTOP): replica elected, 10 s of failed writes to one shard, nothing lost"
+ },
+ "sigkill-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "kill -9 of a shard master's engine, restarts in place",
+  "title": "rc7: shard master's engine killed (kill -9), back from its AOF in place, no failed write"
+ },
+ "forcedel-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "force delete of a shard master",
+  "title": "rc7: shard master force-deleted: replacement started on the same node beside the old engine, 121,939 acked writes LOST"
+ },
+ "delete-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard master",
+  "title": "rc7: graceful delete of a shard master, handover first, no failed write"
+ },
+ "drain-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "drain of a node with a shard master",
+  "title": "rc7: drain of a node with a shard master and a replica, no failed write"
+ },
+ "drain-rc7-rep": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "same drain, replicated cluster",
+  "title": "rc7: same drain seen by the replicated cluster (its master was on the node): 2 s of refused connections"
+ },
+ "repdel-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "graceful delete of a shard's replica",
+  "title": "rc7: graceful delete of a shard's replica, no failed write"
+ },
+ "reshard-up-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "spec.shards 3 -> 4 under load",
+  "title": "rc7: 3 -> 4 shards under load in 42 s, no failed write"
+ },
+ "reshard-down-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "spec.shards 4 -> 3 under load",
+  "title": "rc7: 4 -> 3 shards under load in 11 s, no failed write"
+ },
+ "rep-sigstop-rc7": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "SIGSTOP of the replicated master",
+  "title": "rc7: replicated master hung (SIGSTOP): operator failover after ~50 s, nothing lost"
+ },
+ "rep-sigkill-rc7": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "kill -9 of the replicated master, restarts in place",
+  "title": "rc7: replicated master's engine killed, restarts in place, 9 s of refused writes, nothing lost"
+ },
+ "rep-forcedel-rc7": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "force delete of the replicated master",
+  "title": "rc7: replicated master force-deleted, replacement re-attached the volume on another node (29 s), nothing lost"
+ },
+ "rep-restart-rc7": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "rolling restart (KividbDbOps), replicated",
+  "title": "rc7: rolling restart of the replicated cluster, no failed write"
+ },
+ "dbq-rc7": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "two KividbDbOps restarts at once (#40 queue)",
+  "title": "#40: two restarts of one cluster at once run one after the other, never two pods down"
+ },
+ "holdback-rc7": {
+  "engine": "rc7",
+  "loader": "loader-rep",
+  "what": "missing configRef, then SIGSTOP of the master (#36)",
+  "title": "#36: a missing configRef holds back the writes, not the failover: master replaced in 48 s"
+ },
+ "fblock-rc7": {
+  "engine": "rc7",
+  "loader": "loader-fb",
+  "what": "master frozen, only replica emptied (#35 FailoverBlocked)",
+  "title": "#35: FailoverBlocked held for 2 min 52 s while the only replica was empty; master back with its data"
+ },
+ "guard-yes": {
+  "engine": "rc7",
+  "loader": "loader-g-yes",
+  "what": "#42 guard: rc7, aof-ack-after-write yes; master killed in a new pod while the operator is down",
+  "title": "#42 guard, rc7 + aof-ack-after-write yes: the restarted master (new pod, new stream) is kept, nothing lost"
+ },
+ "guard-no": {
+  "engine": "rc7",
+  "loader": "loader-g-no",
+  "what": "#42 guard: rc7, aof-ack-after-write no",
+  "title": "#42 guard, rc7 + aof-ack-after-write no: MasterRestartedBehind, failover to the replica, nothing lost"
+ },
+ "guard-113": {
+  "engine": "1.1.3",
+  "loader": "loader-g-113",
+  "what": "#42 guard: engine 1.1.3",
+  "title": "#42 guard, engine 1.1.3 (equal key counts): MasterRestartedBehind, failover, nothing lost"
+ },
+ "guard-bad": {
+  "engine": "rc7*",
+  "loader": "loader-g-bad",
+  "what": "#42 guard: version 1.2.0_rc7 (unparsable), ack yes",
+  "title": "#42 guard, version 1.2.0_rc7 (unparsable): fails closed, failover, nothing lost"
+ },
+ "guard-yes-opup": {
+  "engine": "rc7",
+  "loader": "loader-g-yes",
+  "what": "#42 guard: rc7 yes, operator left running",
+  "title": "#42 guard, rc7 + yes, operator running: master back in 21 s and kept, nothing lost"
+ },
+ "shrink-a-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "4 -> 3 shards, finish write lost, operator restarted (#38)",
+  "title": "#38: shrink whose status went back to mid-move: operator finishes again in 28 s"
+ },
+ "shrink-b-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "4 -> 3 shards, finish lost, spec.shards raised back to 4 (#38)",
+  "title": "#38: lost shrink finish + spec.shards raised back to 4: re-created shard gets its master and slots in 59 s"
+ },
+ "reshard-down2-rc7": {
+  "engine": "rc7",
+  "loader": "loader-shd",
+  "what": "spec.shards 4 -> 3 under load",
+  "title": "rc7: 4 -> 3 shards under load after the shrink tests"
+ },
+ "fx-force1": {
+  "engine": "rc7",
+  "loader": "loader-fx",
+  "what": "fx: force delete of a master, replacement on another node",
+  "title": "force-delete repro, force delete of a master, replacement on another node"
+ },
+ "fx-force2": {
+  "engine": "rc7",
+  "loader": "loader-fx",
+  "what": "fx: force delete, replacement on the same node, 1 GB/shard",
+  "title": "force-delete repro, force delete, replacement on the same node, 1 GB/shard"
+ },
+ "fx-loss1": {
+  "engine": "rc7",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete, small dataset, try 1",
+  "title": "force-delete repro, same-node force delete, small dataset, try 1"
+ },
+ "fx-loss2": {
+  "engine": "rc7",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete, try 2 (target was a replica)",
+  "title": "force-delete repro, same-node force delete, try 2 (target was a replica)"
+ },
+ "fx-loss3": {
+  "engine": "rc7",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete, try 3",
+  "title": "force-delete repro, same-node force delete, try 3"
+ },
+ "fx-loss4": {
+  "engine": "rc7",
+  "loader": "loader-fx",
+  "what": "fx: same-node force delete, try 4",
+  "title": "force-delete repro, same-node force delete, try 4"
+ },
+ "fx-graceful": {
+  "engine": "rc7",
+  "loader": "loader-fx",
+  "what": "fx: graceful delete of a master, replacement on the same node",
+  "title": "force-delete repro, graceful delete of a master, replacement on the same node"
+ }
+}

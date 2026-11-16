@@ -1,0 +1,80 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 29K of event 'armv8_pmuv3_0/cycles/P'
+# Event count (approx.): 81023507194
+#
+# Children      Self  Command          Shared Object      Symbol                                                                                                                                                                                                                                                            
+# ........  ........  ...............  .................  ..................................................................................................................................................................................................................................................................
+#
+    99.98%     0.00%  server           libc.so.6          [.] 0x0000eaf2b626582c
+    99.98%     0.00%  server           libc.so.6          [.] 0x0000eaf2b62cbb4c
+    99.98%     0.00%  server           server             [.] <std::sys::thread::unix::Thread>::new::thread_start
+    99.93%     0.00%  server           server             [.] <std::thread::lifecycle::spawn_unchecked<kividb::run_uring::{closure#8}::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+    99.93%     0.12%  server           server             [.] std::sys::backtrace::__rust_begin_short_backtrace::<kividb::run_uring::{closure#8}::{closure#0}, ()>
+    54.79%     0.14%  server           server             [.] <tokio::runtime::scheduler::current_thread::Context>::park
+    52.85%     0.00%  server           [kernel.kallsyms]  [.] el0t_64_sync
+    52.85%     0.00%  server           [kernel.kallsyms]  [.] el0t_64_sync_handler
+    52.81%     0.40%  server           [kernel.kallsyms]  [.] el0_svc
+    51.34%     0.00%  server           libc.so.6          [.] 0x0000eaf2b62c9768
+    49.42%     0.29%  server           [kernel.kallsyms]  [.] io_issue_sqe
+    48.39%     0.12%  server           [kernel.kallsyms]  [.] __io_issue_sqe
+    47.82%     0.03%  server           [kernel.kallsyms]  [.] do_el0_svc
+    47.77%     0.01%  server           [kernel.kallsyms]  [.] el0_svc_common.constprop.0
+    47.70%     0.07%  server           [kernel.kallsyms]  [.] invoke_syscall
+    46.65%     0.03%  server           [kernel.kallsyms]  [.] __arm64_sys_io_uring_enter
+    46.55%     0.05%  server           [kernel.kallsyms]  [.] __do_sys_io_uring_enter
+    46.28%     0.46%  server           [kernel.kallsyms]  [.] io_submit_sqes
+    44.79%     0.43%  server           server             [.] <tokio::task::local::LocalSet>::run_until::<core::future::poll_fn::PollFn<<tokio_uring::runtime::Runtime>::block_on<kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}>::{closure#1}>>::{closure#0}
+    42.06%     0.25%  server           server             [.] tokio::runtime::task::raw::poll::<kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}::{closure#2}::{closure#0}, alloc::sync::Arc<tokio::task::local::Shared>>
+    41.34%     0.34%  server           server             [.] kividb::run_uring::{closure#8}::{closure#0}::{closure#0}::{closure#0}::{closure#2}::{closure#0}
+    40.46%     3.21%  server           server             [.] kividb::server_uring::handle_client::{closure#0}
+    35.60%     0.16%  server           [kernel.kallsyms]  [.] io_write
+    34.11%     0.18%  server           [kernel.kallsyms]  [.] sock_write_iter
+    33.89%     0.07%  server           [kernel.kallsyms]  [.] __sock_sendmsg
+    33.21%     0.07%  server           [kernel.kallsyms]  [.] inet_sendmsg
+    32.99%     0.05%  server           [kernel.kallsyms]  [.] tcp_sendmsg
+    32.05%     0.78%  server           [kernel.kallsyms]  [.] tcp_sendmsg_locked
+    29.77%     0.31%  server           server             [.] kividb::commands::handler::execute_command
+    27.73%     1.68%  server           server             [.] kividb::commands::handler::run_command
+    24.86%     0.15%  server           [kernel.kallsyms]  [.] tcp_push
+    24.68%     0.03%  server           [kernel.kallsyms]  [.] __tcp_push_pending_frames
+    24.56%     0.23%  server           [kernel.kallsyms]  [.] tcp_write_xmit
+    21.62%     1.01%  server           [kernel.kallsyms]  [.] __tcp_transmit_skb
+    19.48%     0.01%  server           [kernel.kallsyms]  [.] ip_queue_xmit
+    19.34%     0.48%  server           [kernel.kallsyms]  [.] __ip_queue_xmit
+    12.66%     0.00%  server           [kernel.kallsyms]  [.] __el0_irq_handler_common
+    12.66%     0.00%  server           [kernel.kallsyms]  [.] el0_interrupt
+    12.66%     0.00%  server           [kernel.kallsyms]  [.] el0t_64_irq
+    12.66%     0.00%  server           [kernel.kallsyms]  [.] el0t_64_irq_handler
+    12.52%     1.46%  server           [kernel.kallsyms]  [.] exit_to_user_mode_loop
+    12.50%     0.08%  server           [kernel.kallsyms]  [.] io_read
+    12.45%     6.13%  server           server             [.] kividb::eviction::make_room
+    12.09%     0.00%  server           [kernel.kallsyms]  [.] ____do_softirq
+    12.09%     0.00%  server           [kernel.kallsyms]  [.] __do_softirq
+    12.09%     0.00%  server           [kernel.kallsyms]  [.] call_on_irq_stack
+    12.09%     0.00%  server           [kernel.kallsyms]  [.] do_softirq_own_stack
+    12.08%     2.36%  server           [kernel.kallsyms]  [.] handle_softirqs
+    11.72%     0.23%  server           [kernel.kallsyms]  [.] __io_read
+    11.38%     0.13%  server           [kernel.kallsyms]  [.] ip_output
+    10.83%     0.17%  server           [kernel.kallsyms]  [.] ip_finish_output
+    10.78%     0.00%  server           [kernel.kallsyms]  [.] __irq_exit_rcu
+    10.78%     0.00%  server           [kernel.kallsyms]  [.] irq_exit_rcu
+    10.63%     0.09%  server           [kernel.kallsyms]  [.] __ip_finish_output
+    10.57%     0.10%  server           [kernel.kallsyms]  [.] arch_do_signal_or_restart
+    10.47%     0.11%  server           [kernel.kallsyms]  [.] get_signal
+    10.31%     0.27%  server           [kernel.kallsyms]  [.] task_work_run
+    10.28%     0.48%  server           [kernel.kallsyms]  [.] ip_finish_output2
+    10.10%     0.18%  server           [kernel.kallsyms]  [.] sock_read_iter
+    10.01%     0.03%  server           [kernel.kallsyms]  [.] tctx_task_work
+     9.81%     0.11%  server           [kernel.kallsyms]  [.] sock_recvmsg
+     9.73%     0.06%  server           [kernel.kallsyms]  [.] neigh_hh_output
+     9.72%     0.21%  server           [kernel.kallsyms]  [.] tctx_task_work_run
+     9.63%     0.07%  server           [kernel.kallsyms]  [.] net_rx_action
+     9.62%     0.28%  server           [kernel.kallsyms]  [.] __dev_queue_xmit
+     9.50%     0.03%  server           [kernel.kallsyms]  [.] __napi_poll
+     9.38%     0.64%  server           [mlx5_core]        [.] mlx5e_napi_poll
+     9.27%     0.10%  server           [kernel.kallsyms]  [.] io_handle_tw_list
+     8.85%     0.32%  server           server             [.] kividb::commands::handler::dispatch_command_handlers

@@ -1,0 +1,12 @@
+cargo fmt --all -- --check on the patched tree (a6b1bf38 + git am --keep-cr 0001-...patch): FAILED (fmt-check.log).
+Two hunks: the two long `process_message(&cs, ping(a, NodeFlags::MASTER, vec![gossip_of(...)]), peer());`
+lines in the new tests.
+
+`cargo fmt --all` fixed them, but also rewrote the whole of listener.rs from CRLF to LF (the repo
+blob is CRLF), which showed as a 2252-line diff. Converted the file back to CRLF:
+`cargo fmt --all -- --check` is clean after that, and the real change is cargo-fmt.patch
+(1 file, +18 -2, CRLF like the blob; `git apply --check` is clean on fix/cluster-moved-address).
+The formatted tree was used for every later check and binary.
+
+Note: the commit's patch file only applies with `git am --keep-cr` (or git apply): plain `git am`
+strips the CRs from the patch's context lines and fails on listener.rs:524.

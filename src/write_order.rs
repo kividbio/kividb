@@ -83,11 +83,22 @@ pub struct OrderGuard {
     /// Or held shared, by a write that only has to keep the others out
     /// ([`lock_key_shared`]).
     _shared: Option<RwLockReadGuard<'static, ()>>,
-    _stripes: Vec<RwLockWriteGuard<'static, ()>>,
+    /// The stripes of a write of several keys.
+    _stripes: Stripes,
     /// Whether this guard is the one that set [`HELD`].
     outermost: bool,
     /// Tied to the thread that took it.
     _not_send: PhantomData<*const ()>,
+}
+
+/// The stripes an [`OrderGuard`] holds for a write of several keys: whole
+/// ([`lock_keys`], [`lock_keys_in`]) or shared ([`lock_keys_shared`]). One
+/// field for both: a guard of one key, nearly every one, has nothing more to
+/// drop than it had.
+enum Stripes {
+    None,
+    Whole(#[allow(dead_code)] Vec<RwLockWriteGuard<'static, ()>>),
+    Shared(#[allow(dead_code)] Vec<RwLockReadGuard<'static, ()>>),
 }
 
 impl OrderGuard {
@@ -96,7 +107,7 @@ impl OrderGuard {
         OrderGuard {
             _one: None,
             _shared: None,
-            _stripes: Vec::new(),
+            _stripes: Stripes::None,
             outermost,
             _not_send: PhantomData,
         }
@@ -141,7 +152,8 @@ pub fn lock_keys<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> OrderGu
             stripes.extend(keys.map(|key| stripe_of(db, key)));
             stripes.sort_unstable();
             stripes.dedup();
-            guard._stripes = stripes.into_iter().map(|i| STRIPE[i].write()).collect();
+            guard._stripes =
+                Stripes::Whole(stripes.into_iter().map(|i| STRIPE[i].write()).collect());
         }
     }
     guard
@@ -162,6 +174,34 @@ pub fn lock_key_shared(db: usize, key: &[u8]) -> OrderGuard {
     HELD.with(|h| h.set(STRIPES_HELD));
     let mut guard = OrderGuard::holding_none(true);
     guard._shared = Some(STRIPE[stripe_of(db, key)].read());
+    guard
+}
+
+/// [`lock_key_shared`] for a write of several keys that reads and writes all
+/// of them under every one of their shards' locks at once (`MSET`,
+/// `MSETNX`): two such writes to a key are ordered by its shard, so they
+/// run beside each other, and neither runs beside a write that holds a
+/// stripe of theirs whole. Stripes are taken in index order, as
+/// [`lock_keys`] takes them, so the two cannot deadlock.
+///
+/// Taking them whole queued every `MSET` behind every other that shared one
+/// of its ten stripes, for the whole of the command: with 1,200 clients
+/// that wait was longer than the work.
+pub fn lock_keys_shared<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> OrderGuard {
+    if HELD.with(|h| h.get()) != FREE {
+        return nested();
+    }
+    let mut stripes: Vec<usize> = keys.map(|key| stripe_of(db, key)).collect();
+    stripes.sort_unstable();
+    stripes.dedup();
+    let held = if stripes.is_empty() {
+        NO_STRIPE
+    } else {
+        STRIPES_HELD
+    };
+    HELD.with(|h| h.set(held));
+    let mut guard = OrderGuard::holding_none(true);
+    guard._stripes = Stripes::Shared(stripes.into_iter().map(|i| STRIPE[i].read()).collect());
     guard
 }
 
@@ -186,7 +226,7 @@ pub fn lock_keys_in<'a>(keys: impl Iterator<Item = (usize, &'a [u8])>) -> OrderG
     };
     HELD.with(|h| h.set(held));
     let mut guard = OrderGuard::holding_none(true);
-    guard._stripes = stripes.into_iter().map(|i| STRIPE[i].write()).collect();
+    guard._stripes = Stripes::Whole(stripes.into_iter().map(|i| STRIPE[i].write()).collect());
     guard
 }
 
@@ -228,6 +268,35 @@ pub fn lock_key_for_walk(db: usize, key: &[u8]) -> OrderGuard {
     }
 }
 
+/// Wait for every write that holds the order of a key now, shared or
+/// whole, to let go of it: each stripe taken whole and let go of at once,
+/// one after another. For a change after which a write takes its key's
+/// order whole where it took it shared before: the first search index
+/// (`vector::Indexes::write_to_add`). A write that took a stripe before
+/// this got to it has finished when this returns; one that takes it after
+/// this let go of it sees what was done before this was called.
+///
+/// One stripe at a time, never two held: it cannot deadlock with a write
+/// of several keys. Not on a thread that holds stripes ([`holds_stripes`]),
+/// which would wait for itself, and which the caller asks first: there it
+/// takes nothing. Skipping only that thread's own stripes would not do
+/// either: a write holding another stripe may be waiting for one of them.
+pub fn barrier() {
+    if holds_stripes() {
+        return;
+    }
+    for stripe in &STRIPE {
+        drop(stripe.write());
+    }
+}
+
+/// Whether this thread holds stripes, so that [`barrier`] cannot run on
+/// it: a write of keys, or a script that runs beside others under its
+/// keys' order (`tag_locks`).
+pub fn holds_stripes() -> bool {
+    HELD.with(|h| h.get()) == STRIPES_HELD
+}
+
 /// The guard of a write made from inside another: it takes nothing.
 fn nested() -> OrderGuard {
     OrderGuard::holding_none(false)
@@ -258,13 +327,33 @@ mod tests {
 
     #[test]
     fn shared_holds_of_one_key_overlap() {
-        let guard = lock_key_shared(0, b"s");
-        std::thread::spawn(|| {
-            let _guard = lock_key_shared(0, b"s");
-        })
-        .join()
-        .unwrap();
-        drop(guard);
+        overlap(
+            || lock_key_shared(0, b"s"),
+            || drop(lock_key_shared(0, b"s")),
+        );
+    }
+
+    /// `beside`, on a thread of its own, gets what it takes while `hold`'s
+    /// guard is held. A `barrier` of another test queued on the stripe keeps
+    /// new shared holds out until the guard is let go of, and would wait for
+    /// it for ever if this joined the thread first: then the guard is let
+    /// go of, and it is tried again.
+    fn overlap(hold: impl Fn() -> OrderGuard, beside: fn()) {
+        for _ in 0..100 {
+            let held = hold();
+            let (got, get) = std::sync::mpsc::channel();
+            let other = std::thread::spawn(move || {
+                beside();
+                let _ = got.send(());
+            });
+            let overlapped = get.recv_timeout(Duration::from_millis(500)).is_ok();
+            drop(held);
+            other.join().unwrap();
+            if overlapped {
+                return;
+            }
+        }
+        panic!("the second shared hold never got in beside the first");
     }
 
     #[test]
@@ -295,6 +384,39 @@ mod tests {
         assert!(!entered.load(Ordering::SeqCst), "the shared hold got in");
         drop(whole);
         shared.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+    }
+
+    /// Two writes of several keys that hold their keys' order shared run
+    /// beside each other, and a write that holds one of those keys whole
+    /// waits for both; nested, they take nothing.
+    #[test]
+    fn shared_holds_of_several_keys_overlap_and_keep_a_whole_one_out() {
+        let keys = [b"ms:a".as_slice(), b"ms:b".as_slice(), b"ms:c".as_slice()];
+        overlap(
+            || lock_keys_shared(0, keys.into_iter()),
+            || {
+                drop(lock_keys_shared(
+                    0,
+                    [b"ms:c".as_slice(), b"ms:a".as_slice()].into_iter(),
+                ))
+            },
+        );
+        let first = lock_keys_shared(0, keys.into_iter());
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&entered);
+        let whole = std::thread::spawn(move || {
+            let _guard = lock_keys(0, [b"ms:b".as_slice()].into_iter());
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::SeqCst), "the whole hold got in");
+        let inner = lock_keys(0, [b"ms:a".as_slice()].into_iter());
+        drop(inner);
+        assert_eq!(HELD.with(|h| h.get()), STRIPES_HELD);
+        drop(first);
+        assert_eq!(HELD.with(|h| h.get()), FREE);
+        whole.join().unwrap();
         assert!(entered.load(Ordering::SeqCst));
     }
 

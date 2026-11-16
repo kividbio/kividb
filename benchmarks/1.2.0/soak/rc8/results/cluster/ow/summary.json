@@ -1,0 +1,14 @@
+{
+ "keys_acked": 17344,
+ "acked_writes": 11068419,
+ "failed_writes": 1266,
+ "error_kinds": {
+  "ConnectionError:Error": 1266
+ },
+ "ok": 17344,
+ "missing": 0,
+ "stale": 0,
+ "other": 0,
+ "ok_unknown_later": 0,
+ "bad_by_slot": {}
+}

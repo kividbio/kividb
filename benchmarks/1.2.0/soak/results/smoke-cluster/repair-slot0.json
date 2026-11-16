@@ -1,0 +1,1 @@
+{"slot": 0, "src_keys_before": 72, "dst_keys_before": 44, "importing": "OK", "migrating": "OK", "migrated": 72, "tryagain": 0, "setslot_node": {"10.70.1.7:7002": "OK", "10.70.1.10:7002": "OK", "10.70.1.9:7001": "OK", "10.70.1.10:7001": "OK", "10.70.1.7:7001": "OK", "10.70.1.9:7002": "OK"}, "src_keys_after": 0, "dst_keys_after": 106, "seconds": 0.42}

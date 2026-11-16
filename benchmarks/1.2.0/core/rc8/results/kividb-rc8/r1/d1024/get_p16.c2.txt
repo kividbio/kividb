@@ -1,0 +1,32 @@
+Json file /tmp/r/get_p16.c2.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 5%,   1 secs] 15 threads 10 conns:     1065626 ops, 1064972 (avg: 1064972) ops/sec, 1.06GB/sec (avg: 1.06GB/sec),  2.25 (avg:  2.25) msec latency[RUN #1 10%,   2 secs] 15 threads 10 conns:     1992908 ops,  927124 (avg:  996063) ops/sec, 944.20MB/sec (avg: 1014.41MB/sec),  2.58 (avg:  2.40) msec latency[RUN #1 15%,   3 secs] 15 threads 10 conns:     2912403 ops,  919314 (avg:  970483) ops/sec, 936.25MB/sec (avg: 988.36MB/sec),  2.61 (avg:  2.47) msec latency[RUN #1 20%,   4 secs] 15 threads 10 conns:     3835465 ops,  922858 (avg:  958578) ops/sec, 939.86MB/sec (avg: 976.23MB/sec),  2.60 (avg:  2.50) msec latency[RUN #1 25%,   5 secs] 15 threads 10 conns:     4775071 ops,  939441 (avg:  954751) ops/sec, 956.74MB/sec (avg: 972.34MB/sec),  2.55 (avg:  2.51) msec latency[RUN #1 30%,   6 secs] 15 threads 10 conns:     5704666 ops,  928573 (avg:  950385) ops/sec, 945.68MB/sec (avg: 967.89MB/sec),  2.58 (avg:  2.52) msec latency[RUN #1 35%,   7 secs] 15 threads 10 conns:     6633878 ops,  929077 (avg:  947342) ops/sec, 946.19MB/sec (avg: 964.79MB/sec),  2.58 (avg:  2.53) msec latency[RUN #1 40%,   8 secs] 15 threads 10 conns:     7555317 ops,  921181 (avg:  944072) ops/sec, 938.15MB/sec (avg: 961.46MB/sec),  2.60 (avg:  2.54) msec latency[RUN #1 45%,   9 secs] 15 threads 10 conns:     8486740 ops,  930893 (avg:  942607) ops/sec, 948.04MB/sec (avg: 959.97MB/sec),  2.57 (avg:  2.54) msec latency[RUN #1 50%,  10 secs] 15 threads 10 conns:     9415838 ops,  928934 (avg:  941240) ops/sec, 946.04MB/sec (avg: 958.58MB/sec),  2.58 (avg:  2.55) msec latency[RUN #1 55%,  11 secs] 15 threads 10 conns:    10346739 ops,  930746 (avg:  940286) ops/sec, 947.89MB/sec (avg: 957.61MB/sec),  2.57 (avg:  2.55) msec latency[RUN #1 60%,  12 secs] 15 threads 10 conns:    11270333 ops,  923414 (avg:  938881) ops/sec, 940.42MB/sec (avg: 956.17MB/sec),  2.59 (avg:  2.55) msec latency[RUN #1 65%,  13 secs] 15 threads 10 conns:    12200370 ops,  929835 (avg:  938185) ops/sec, 946.96MB/sec (avg: 955.46MB/sec),  2.58 (avg:  2.55) msec latency[RUN #1 70%,  14 secs] 15 threads 10 conns:    13133521 ops,  932931 (avg:  937810) ops/sec, 950.11MB/sec (avg: 955.08MB/sec),  2.57 (avg:  2.55) msec latency[RUN #1 75%,  15 secs] 15 threads 10 conns:    14062620 ops,  928860 (avg:  937213) ops/sec, 945.97MB/sec (avg: 954.48MB/sec),  2.58 (avg:  2.56) msec latency[RUN #1 80%,  16 secs] 15 threads 10 conns:    14991908 ops,  928824 (avg:  936689) ops/sec, 945.93MB/sec (avg: 953.94MB/sec),  2.58 (avg:  2.56) msec latency[RUN #1 85%,  17 secs] 15 threads 10 conns:    15913816 ops,  921750 (avg:  935810) ops/sec, 938.73MB/sec (avg: 953.05MB/sec),  2.60 (avg:  2.56) msec latency[RUN #1 90%,  18 secs] 15 threads 10 conns:    16848271 ops,  934260 (avg:  935724) ops/sec, 951.47MB/sec (avg: 952.96MB/sec),  2.56 (avg:  2.56) msec latency[RUN #1 95%,  19 secs] 15 threads 10 conns:    17781412 ops,  932905 (avg:  935576) ops/sec, 950.09MB/sec (avg: 952.81MB/sec),  2.57 (avg:  2.56) msec latency[RUN #1 100%,  20 secs]  0 threads 10 conns:    18942967 ops,  932905 (avg:  947101) ops/sec, 950.09MB/sec (avg: 964.55MB/sec),  2.57 (avg:  2.53) msec latency
+
+Writing Full Run command HDR latency histogram results to /tmp/r/get_p16.c2_FULL_RUN_1.txt...
+Writing Full Run command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/get_p16.c2_FULL_RUN_1.hgrm...
+Writing GET command HDR latency histogram results to /tmp/r/get_p16.c2_GET_command_run_1.txt...
+Writing GET command HDR latency histogram results in HistogramLogProcessor format to /tmp/r/get_p16.c2_GET_command_run_1.hgrm...
+
+CPU Utilization Summary
+  Total CPU time:   151.287s  (user 43.137s, sys 108.150s)
+  Wall time:        20.003s
+  Cores used:       7.563   (avg 50.4% across 15 worker threads)
+  Peak utilization: 846.6%
+Saving JSON output file: /tmp/r/get_p16.c2.json
+Json file closed.
+15        Threads
+10        Connections per thread
+20        Seconds
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec 
+----------------------------------------------------------------------------------------------------------------------------
+Sets            0.00          ---          ---             ---             ---             ---             ---         0.00 
+Gets       946979.58    946979.58         0.00         2.53001         1.27900         7.10300         7.77500    987567.33 
+Waits           0.00          ---          ---             ---             ---             ---             ---          --- 
+Totals     946979.58    946979.58         0.00         2.53001         1.27900         7.10300         7.77500    987567.33 
+rc=0

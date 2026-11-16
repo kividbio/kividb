@@ -1,0 +1,158 @@
+=== extra checks v1.2.0-rc10 on amd64 ===
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10 resolves to linux/amd64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-lua resolves to linux/amd64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-tls resolves to linux/amd64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-full resolves to linux/amd64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc10 resolves to linux/amd64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc10-lua resolves to linux/amd64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc10-tls resolves to linux/amd64 on this host
+PASS: docker.io/kividb/kividb:v1.2.0-rc10-full resolves to linux/amd64 on this host
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-lua-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-tls-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-full-amd64 is linux/amd64 (config; binary: ELF 64-bit LSB pie executable, x86-64; no arm64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-lua-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-tls-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)
+PASS: ghcr.io/kividbio/kividb:v1.2.0-rc10-full-arm64 is linux/arm64 (config; binary: ELF 64-bit LSB pie executable, ARM aarch64; no amd64 manifest)
+PASS: tarball-default: binary is x86-64 (ELF 64-bit LSB pie executable, x86-64)
+PASS: tarball-default: --version [kividb 1.2.0-rc10]
+PASS: tarball-default: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-default: PING/SET/GET
+PASS: tarball-default: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: tarball-default plain redis-benchmark: 6 tests (	94786	107411	90826	102249	108932	112739 )
+PASS: tarball-lua: binary is x86-64 (ELF 64-bit LSB pie executable, x86-64)
+PASS: tarball-lua: --version [kividb 1.2.0-rc10]
+PASS: tarball-lua: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-lua: PING/SET/GET
+PASS: tarball-lua: EVAL works
+PASS: tarball-lua plain redis-benchmark: 6 tests (	100704	95238	94696	98039	112359	116009 )
+PASS: tarball-tls: binary is x86-64 (ELF 64-bit LSB pie executable, x86-64)
+PASS: tarball-tls: --version [kividb 1.2.0-rc10]
+PASS: tarball-tls: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-tls: PING/SET/GET
+PASS: tarball-tls: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: tarball-tls plain redis-benchmark: 6 tests (	93808	110987	97370	98911	103305	109051 )
+PASS: tarball-tls: TLS PING with a self-signed cert, no client cert
+PASS: tarball-tls: TLS SET/GET
+PASS: tarball-tls: plaintext on the TLS port refused
+PASS: tarball-tls: TLS client that does not trust the cert fails verification
+PASS: tarball-tls tls redis-benchmark: 6 tests (	70671	82850	74019	78125	72568	71736 )
+PASS: tarball-full: binary is x86-64 (ELF 64-bit LSB pie executable, x86-64)
+PASS: tarball-full: --version [kividb 1.2.0-rc10]
+PASS: tarball-full: INFO server kividb_version 1.2.0-rc10
+PASS: tarball-full: PING/SET/GET
+PASS: tarball-full: EVAL works
+PASS: tarball-full plain redis-benchmark: 6 tests (	108577	106951	108225	108225	112485	91491 )
+PASS: tarball-full: TLS PING with a self-signed cert, no client cert
+PASS: tarball-full: TLS SET/GET
+PASS: tarball-full: plaintext on the TLS port refused
+PASS: tarball-full: TLS client that does not trust the cert fails verification
+PASS: tarball-full tls redis-benchmark: 6 tests (	64020	79302	77279	78492	67980	68027 )
+PASS: image-ghcr-default: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-ghcr-default: INFO server kividb_version 1.2.0-rc10
+PASS: image-ghcr-default: --version [kividb 1.2.0-rc10]
+PASS: image-ghcr-default: PING/SET/GET
+PASS: image-ghcr-default: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: image-ghcr-default plain redis-benchmark: 6 tests (	84459	84317	84104	84175	84530	84459 )
+PASS: image-ghcr-lua: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-ghcr-lua: INFO server kividb_version 1.2.0-rc10
+PASS: image-ghcr-lua: --version [kividb 1.2.0-rc10]
+PASS: image-ghcr-lua: PING/SET/GET
+PASS: image-ghcr-lua: EVAL works
+PASS: image-ghcr-lua plain redis-benchmark: 6 tests (	84317	85251	83542	84459	86132	85034 )
+PASS: image-ghcr-tls: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-ghcr-tls: INFO server kividb_version 1.2.0-rc10
+PASS: image-ghcr-tls: --version [kividb 1.2.0-rc10]
+PASS: image-ghcr-tls: PING/SET/GET
+PASS: image-ghcr-tls: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: image-ghcr-tls plain redis-benchmark: 6 tests (	83263	82508	82034	83402	85034	84175 )
+PASS: image-ghcr-tls: TLS PING with a self-signed cert, no client cert
+PASS: image-ghcr-tls: TLS SET/GET
+PASS: image-ghcr-tls: plaintext on the TLS port refused
+PASS: image-ghcr-tls: TLS client that does not trust the cert fails verification
+PASS: image-ghcr-tls tls redis-benchmark: 6 tests (	54975	54614	53705	54525	55218	54200 )
+PASS: image-ghcr-full: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-ghcr-full: INFO server kividb_version 1.2.0-rc10
+PASS: image-ghcr-full: --version [kividb 1.2.0-rc10]
+PASS: image-ghcr-full: PING/SET/GET
+PASS: image-ghcr-full: EVAL works
+PASS: image-ghcr-full plain redis-benchmark: 6 tests (	81300	81103	80192	81833	81766	81037 )
+PASS: image-ghcr-full: TLS PING with a self-signed cert, no client cert
+PASS: image-ghcr-full: TLS SET/GET
+PASS: image-ghcr-full: plaintext on the TLS port refused
+PASS: image-ghcr-full: TLS client that does not trust the cert fails verification
+PASS: image-ghcr-full tls redis-benchmark: 6 tests (	56338	54824	55126	55218	55617	54495 )
+PASS: image-hub-default: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-hub-default: INFO server kividb_version 1.2.0-rc10
+PASS: image-hub-default: --version [kividb 1.2.0-rc10]
+PASS: image-hub-default: PING/SET/GET
+PASS: image-hub-default: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: image-hub-default plain redis-benchmark: 6 tests (	78678	82236	81699	81499	80906	79617 )
+PASS: image-hub-lua: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-hub-lua: INFO server kividb_version 1.2.0-rc10
+PASS: image-hub-lua: --version [kividb 1.2.0-rc10]
+PASS: image-hub-lua: PING/SET/GET
+PASS: image-hub-lua: EVAL works
+PASS: image-hub-lua plain redis-benchmark: 6 tests (	81833	81833	81632	82918	81499	83125 )
+PASS: image-hub-tls: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-hub-tls: INFO server kividb_version 1.2.0-rc10
+PASS: image-hub-tls: --version [kividb 1.2.0-rc10]
+PASS: image-hub-tls: PING/SET/GET
+PASS: image-hub-tls: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: image-hub-tls plain redis-benchmark: 6 tests (	84033	81900	82304	82644	82304	80580 )
+PASS: image-hub-tls: TLS PING with a self-signed cert, no client cert
+PASS: image-hub-tls: TLS SET/GET
+PASS: image-hub-tls: plaintext on the TLS port refused
+PASS: image-hub-tls: TLS client that does not trust the cert fails verification
+PASS: image-hub-tls tls redis-benchmark: 6 tests (	55524	55710	54704	54318	55066	55035 )
+PASS: image-hub-full: runs (user OCI runtime exec failed: exec failed: unable to start container process: exec: "id": executable file not found in $PATH
+1000:1000)
+PASS: image-hub-full: INFO server kividb_version 1.2.0-rc10
+PASS: image-hub-full: --version [kividb 1.2.0-rc10]
+PASS: image-hub-full: PING/SET/GET
+PASS: image-hub-full: EVAL works
+PASS: image-hub-full plain redis-benchmark: 6 tests (	81300	78802	80906	82576	82576	82781 )
+PASS: image-hub-full: TLS PING with a self-signed cert, no client cert
+PASS: image-hub-full: TLS SET/GET
+PASS: image-hub-full: plaintext on the TLS port refused
+PASS: image-hub-full: TLS client that does not trust the cert fails verification
+PASS: image-hub-full tls redis-benchmark: 6 tests (	55617	54734	54734	54674	54141	54674 )
+PASS: deb: dpkg -i
+PASS: deb: server up on the packaged port 6380
+PASS: deb: unit enabled
+PASS: deb: MainPID 57144 runs as user kividb
+PASS: deb: kividb is a system user with nologin (kividb:x:997:988:KiviDB:/var/lib/kividb:/usr/sbin/nologin)
+PASS: deb: /var/lib/kividb owned by kividb
+PASS: deb: INFO server kividb_version 1.2.0-rc10
+PASS: deb: PING/SET/GET
+PASS: deb: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: deb-amd64 plain redis-benchmark: 6 tests (	100200	112612	109769	110741	112233	105932 )
+PASS: deb: SAVE writes into /var/lib/kividb (appendonly.aof dump.kdb kividb.lock )
+PASS: deb: purge stops the service
+PASS: rpm: installs on clean amazonlinux:2023 (/usr/bin/dnf; useradd present before: no)
+PASS: rpm: installs on clean rockylinux/rockylinux:9 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean almalinux:9 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean fedora:41 (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean registry.access.redhat.com/ubi9/ubi (/usr/bin/dnf; useradd present before: yes)
+PASS: rpm: installs on clean registry.access.redhat.com/ubi9/ubi-minimal (/usr/bin/microdnf; useradd present before: yes)
+INFO: rpm -qpR (declared requirements): shadow-utils 
+INFO: systemd in container: running
+PASS: rpm: dnf install under systemd (ubi9-init)
+PASS: rpm: postinstall enabled+started the unit, PING on 6380
+PASS: rpm: unit enabled
+PASS: rpm: MainPID runs as user kividb
+PASS: rpm: INFO server kividb_version 1.2.0-rc10
+PASS: rpm: PING/SET/GET
+PASS: rpm: EVAL refused cleanly [ERR this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-rc10-lua, or a kividb-lua release file)], connection still serves
+PASS: rpm-amd64 plain redis-benchmark: 6 tests (	104712	104821	115340	106157	96805	95328 )
+PASS: rpm: dnf remove stops the service
+RESULT extra-amd64 145 0
+EXTRA-DONE

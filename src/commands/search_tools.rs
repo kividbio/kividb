@@ -34,7 +34,16 @@ pub(crate) type ShownRow = Vec<(String, String)>;
 pub(crate) fn rows_reply(resp: u8, total: usize, rows: &[ShownRow], timed_out: bool) -> Vec<u8> {
     let fields = |row: &ShownRow| -> Vec<Vec<u8>> {
         row.iter()
-            .flat_map(|(name, value)| [resp_bulk_str(name), value_reply(value, resp)])
+            .flat_map(|(name, value)| {
+                // A document's key, loaded as `@__key`, is a name
+                // (`key_bytes::text_of`): its reply is the key's bytes.
+                let value = if name == "__key" {
+                    resp_bulk(&crate::key_bytes::bytes_of(value))
+                } else {
+                    value_reply(value, resp)
+                };
+                [resp_bulk_str(name), value]
+            })
             .collect()
     };
     let warning = if timed_out {
@@ -99,6 +108,9 @@ struct Cursor {
     /// Whether the aggregation ran out of time: every page of a partial
     /// result says so, not only the first.
     timed_out: bool,
+    /// Whether the rows are groups: Redis reports their number with the
+    /// first page and 0 with the pages after it.
+    grouped: bool,
 }
 
 static CURSORS: LazyLock<Mutex<AHashMap<u64, Cursor>>> =
@@ -110,9 +122,15 @@ const MAX_CURSORS: usize = 1024;
 const DEFAULT_COUNT: usize = 1000;
 
 /// `[rows, cursor]`.
-fn cursor_reply(resp: u8, rows: &[ShownRow], cursor: u64, timed_out: bool) -> Vec<u8> {
+fn cursor_reply(
+    resp: u8,
+    total: usize,
+    rows: &[ShownRow],
+    cursor: u64,
+    timed_out: bool,
+) -> Vec<u8> {
     resp_array(vec![
-        rows_reply(resp, rows.len(), rows, timed_out),
+        rows_reply(resp, total, rows, timed_out),
         resp_integer(cursor as i64),
     ])
 }
@@ -161,11 +179,13 @@ pub(crate) fn open_cursor(
     count: usize,
     max_idle: Duration,
     timed_out: bool,
+    groups: Option<usize>,
 ) -> Vec<u8> {
     let mut rows: VecDeque<ShownRow> = rows.into();
     let first: Vec<ShownRow> = rows.drain(..count.min(rows.len())).collect();
+    let total = groups.unwrap_or(first.len());
     if rows.is_empty() {
-        return cursor_reply(resp, &first, 0, timed_out);
+        return cursor_reply(resp, total, &first, 0, timed_out);
     }
     let mut cursors = CURSORS.lock();
     forget_idle(&mut cursors);
@@ -188,9 +208,10 @@ pub(crate) fn open_cursor(
             max_idle,
             used: Instant::now(),
             timed_out,
+            grouped: groups.is_some(),
         },
     );
-    cursor_reply(resp, &first, id, timed_out)
+    cursor_reply(resp, total, &first, id, timed_out)
 }
 
 /// `FT.CURSOR READ index cursor [COUNT n]` / `FT.CURSOR DEL index cursor`.
@@ -206,9 +227,13 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("Unknown subcommand"));
     }
     // The index first, as in Redis. The cursors of one that has gone went
-    // with it.
+    // with it. An alias is its index: a cursor keeps the index's own name
+    // (`FT.AGGREGATE` is run against it), and is found by either.
+    let real = cmd
+        .get(2)
+        .and_then(|a| crate::vector::resolve_index_name(&ctx.index_store.read(), text(a)));
     if let Some(index) = cmd.get(2).map(|a| text(a))
-        && !ctx.index_store.read().contains_key(index)
+        && real.is_none()
     {
         CURSORS.lock().retain(|_, cursor| cursor.index != index);
         return Some(resp_error(&crate::commands::search::no_such_index(index)));
@@ -221,7 +246,7 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_integer((before - cursors.len()) as i64));
     }
     let (Some(index), Some(id)) = (
-        cmd.get(2).map(|a| text(a)),
+        real.as_deref(),
         cmd.get(3).and_then(|a| text(a).parse::<u64>().ok()),
     ) else {
         return Some(resp_error(
@@ -267,11 +292,13 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
     cursor.used = Instant::now();
     let left = !cursor.rows.is_empty();
     let timed_out = cursor.timed_out;
+    let total = if cursor.grouped { 0 } else { rows.len() };
     if !left {
         cursors.remove(&id);
     }
     Some(cursor_reply(
-        ctx.resp,
+        crate::commands::handler::effective_resp_for_reply(ctx),
+        total,
         &rows,
         if left { id } else { 0 },
         timed_out,
@@ -339,19 +366,14 @@ pub(crate) fn config_number(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// `ON_TIMEOUT fail` and `return_strict` error when a query runs out of
-/// time, instead of returning what was found.
+/// `ON_TIMEOUT fail` errors when a query runs out of time; `return` and
+/// `return-strict` reply with what was found.
 pub(crate) fn on_timeout_fails() -> bool {
     CONFIG
         .lock()
         .iter()
         .find(|(n, _)| *n == "ON_TIMEOUT")
-        .is_some_and(|(_, value)| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "fail" | "return_strict"
-            )
-        })
+        .is_some_and(|(_, value)| matches!(value.to_ascii_lowercase().as_str(), "fail"))
 }
 
 /// What a setting holds now. The server settings `search-timeout` and
@@ -388,12 +410,76 @@ fn config_applied(name: &str, value: &str) {
     }
 }
 
+/// What `FT.CONFIG HELP` says of a setting: RediSearch's words for it.
+fn config_help(name: &str) -> &'static str {
+    match name {
+        "CURSOR_MAX_IDLE" => {
+            "max idle time allowed to be set for cursor, setting it height might cause high \
+             memory consumption."
+        }
+        "TIMEOUT" => "Query (search) timeout",
+        "ON_TIMEOUT" => "Action to perform when search timeout is exceeded (choose RETURN or FAIL)",
+        "MAXSEARCHRESULTS" => "Maximum number of results from ft.search command",
+        "MAXAGGREGATERESULTS" => "Maximum number of results from ft.aggregate command",
+        "DEFAULT_DIALECT" => {
+            "Set RediSearch default dialect version through the lifetime of the server."
+        }
+        "MINPREFIX" => "Set the minimum prefix for expansions (`*`)",
+        "MINSTEMLEN" => "Set the minimum word length to stem (default 4)",
+        "MAXPREFIXEXPANSIONS" | "MAXEXPANSIONS" => {
+            "Maximum prefix expansions to be used in a query"
+        }
+        "MAXDOCTABLESIZE" => "Maximum runtime document table size (for this process)",
+        "MIN_PHONETIC_TERM_LEN" => "Minimum length of term to be considered for phonetic matching",
+        "DEFAULT_SCORER" => "Default scorer to use when no scorer is specified in queries",
+        "WORKERS" => {
+            "Number of worker threads to use for query processing and background tasks. Default \
+             is 0. This configuration also affects the number of connections per shard. See \
+             CONN_PER_SHARD."
+        }
+        "NOGC" => "Disable garbage collection (for this process)",
+        "FORK_GC_RUN_INTERVAL" => {
+            "interval (in seconds) in which to run the fork gc (relevant only when fork gc is \
+             used)"
+        }
+        "FORK_GC_CLEAN_THRESHOLD" => {
+            "the fork gc will only start to clean when the number of not cleaned document will \
+             exceed this threshold"
+        }
+        "PARTIAL_INDEXED_DOCS" => {
+            "Enable commands filter which optimize indexing on partial hash updates"
+        }
+        "UNION_ITERATOR_HEAP" => {
+            // RediSearch's C source runs "will" and "switch" together, and so
+            // does its reply; as do the two below ("values.Can", "scorer.The").
+            "minimum number of iterators in a union from which the iterator willswitch to heap \
+             based implementation."
+        }
+        "VSS_MAX_RESIZE" => "Set RediSearch vector indexes max resize (in bytes).",
+        "INDEX_CURSOR_LIMIT" => {
+            "Max number of cursors for a given index that can be opened inside of a shard. \
+             Default is 128"
+        }
+        "MULTI_TEXT_SLOP" => {
+            "Set RediSearch delta used to increase positional offsets between array slots for \
+             multi text values.Can control the level of separation between phrases in \
+             different array slots (related to the SLOP parameter of ft.search command)"
+        }
+        "BM25STD_TANH_FACTOR" => {
+            "Set the BM25STD.TANH stretch factor. This is an integer value that divides the \
+             argument of the tanh function that is used to normalize the score computed by the \
+             BM25STD scorer.The default value is 4."
+        }
+        _ => "",
+    }
+}
+
 /// Settings that hold something other than a non-negative number.
 fn config_value_ok(name: &str, value: &str) -> bool {
     match name {
         "ON_TIMEOUT" => matches!(
             value.to_ascii_lowercase().as_str(),
-            "return" | "fail" | "return_strict"
+            "return" | "fail" | "return-strict" | "return_strict"
         ),
         "NOGC" | "PARTIAL_INDEXED_DOCS" => {
             matches!(value.to_ascii_lowercase().as_str(), "true" | "false")
@@ -430,7 +516,7 @@ pub(crate) fn ft_config(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .iter()
                 .filter(|(name, _)| crate::commands::helpers::glob_match(&pattern, name))
                 .collect();
-            if ctx.resp == 3 {
+            if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
                 return Some(resp_map_for(
                     3,
                     found
@@ -495,7 +581,7 @@ pub(crate) fn ft_config(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         resp_array(vec![
                             resp_bulk_str(name),
                             resp_bulk_str("Description"),
-                            resp_bulk_str(""),
+                            resp_bulk_str(config_help(name)),
                             resp_bulk_str("Value"),
                             resp_bulk_str(value),
                         ])
@@ -924,7 +1010,7 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
 
     let shard = resp_map_for(
-        ctx.resp,
+        crate::commands::handler::effective_resp_for_reply(ctx),
         vec![
             resp_bulk_str("Total profile time"),
             millis(total + parsing),
@@ -943,7 +1029,7 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ],
     );
     let profile = resp_map_for(
-        ctx.resp,
+        crate::commands::handler::effective_resp_for_reply(ctx),
         vec![
             resp_bulk_str("Shards"),
             resp_array(vec![shard]),
@@ -951,19 +1037,21 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
             resp_array(vec![]),
         ],
     );
-    Some(if ctx.resp == 3 {
-        resp_map_for(
-            3,
-            vec![
-                resp_bulk_str("Results"),
-                reply,
-                resp_bulk_str("Profile"),
-                profile,
-            ],
-        )
-    } else {
-        resp_array(vec![reply, profile])
-    })
+    Some(
+        if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
+            resp_map_for(
+                3,
+                vec![
+                    resp_bulk_str("Results"),
+                    reply,
+                    resp_bulk_str("Profile"),
+                    profile,
+                ],
+            )
+        } else {
+            resp_array(vec![reply, profile])
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1045,6 +1133,7 @@ mod tests {
             2,
             Duration::from_secs(60),
             false,
+            None,
         );
         // [[2, row, row], cursor]
         assert!(first.starts_with(b"*2\r\n*3\r\n:2\r\n"), "{first:?}");
@@ -1058,6 +1147,7 @@ mod tests {
             10,
             Duration::from_secs(60),
             false,
+            None,
         );
         assert!(all.starts_with(b"*2\r\n*6\r\n:5\r\n"), "{all:?}");
         assert!(all.ends_with(b":0\r\n"));

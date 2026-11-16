@@ -1,0 +1,10 @@
+rc8-DEL total 4465.4 memcmp 192.3 without_memcmp 4273.2
+rc8-GET-100 total 3327.1 memcmp 107.3 without_memcmp 3219.8
+rc8-INCR total 4066.3 memcmp 38.4 without_memcmp 4027.9
+rc8-MIX-100 total 7613.9 memcmp 268.3 without_memcmp 7345.6
+rc8-SET-100 total 4259.9 memcmp 161.3 without_memcmp 4098.7
+rc9-DEL total 4490.2 memcmp 216.3 without_memcmp 4273.9
+rc9-GET-100 total 3346.0 memcmp 125.3 without_memcmp 3220.8
+rc9-INCR total 4068.5 memcmp 40.4 without_memcmp 4028.1
+rc9-MIX-100 total 7683.8 memcmp 337.3 without_memcmp 7346.5
+rc9-SET-100 total 4311.2 memcmp 212.3 without_memcmp 4098.9

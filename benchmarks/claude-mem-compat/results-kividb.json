@@ -1,0 +1,162 @@
+{
+  "label": "kividb",
+  "redis_url": "redis://127.0.0.1:6399",
+  "redis_version": "8.10.0",
+  "kividb_version": "1.2.0",
+  "claude_mem": "v15.9.0",
+  "bullmq_prefix": "claude_mem",
+  "counts": {
+    "PASS": 18,
+    "FAIL": 0
+  },
+  "checks": [
+    {
+      "check": "connection: the server answers PING and claude-mem reports the BullMQ queue healthy",
+      "status": "PASS",
+      "detail": "prefix claude_mem",
+      "ms": 23
+    },
+    {
+      "check": "the worker consumes the prefix the server enqueues under",
+      "status": "PASS",
+      "detail": "both claude_mem",
+      "ms": 1
+    },
+    {
+      "check": "enqueue and process: an event's job completes and stores one observation",
+      "status": "PASS",
+      "detail": "",
+      "ms": 561
+    },
+    {
+      "check": "the job is in BullMQ under claude-mem's prefix, with its deterministic evt_ id, and completed there",
+      "status": "PASS",
+      "detail": "claude_mem:server_beta_generate_event:<id>",
+      "ms": 1
+    },
+    {
+      "check": "a burst of 20 events: every job completes, one observation and one provider call each",
+      "status": "PASS",
+      "detail": "",
+      "ms": 849
+    },
+    {
+      "check": "retry: a rate-limited job waits in BullMQ's delayed set for its backoff, then completes on attempt 2",
+      "status": "PASS",
+      "detail": "BullMQ attemptsMade 2",
+      "ms": 5460
+    },
+    {
+      "check": "failure: a job rate-limited every time fails after its 3 attempts, in Postgres and in BullMQ's failed set",
+      "status": "PASS",
+      "detail": "failedReason \"stub: rate limited on every attempt\"",
+      "ms": 15128
+    },
+    {
+      "check": "non-retryable error: the job fails on its first attempt and stores nothing",
+      "status": "PASS",
+      "detail": "",
+      "ms": 3725
+    },
+    {
+      "check": "operator retry: POST /v1/jobs/:id/retry re-enqueues the failed job in BullMQ and it completes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 730
+    },
+    {
+      "check": "cancel: a job cancelled while it waits is removed from BullMQ and never runs",
+      "status": "PASS",
+      "detail": "",
+      "ms": 9245
+    },
+    {
+      "check": "worker down: 10 events wait in BullMQ's wait list, none is lost",
+      "status": "PASS",
+      "detail": "waiting 10",
+      "ms": 467
+    },
+    {
+      "check": "server restart (append-only file on): the 10 waiting jobs are still there after it",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1219
+    },
+    {
+      "check": "worker back: the 10 jobs are processed, one observation each",
+      "status": "PASS",
+      "detail": "",
+      "ms": 6649
+    },
+    {
+      "check": "a retry's backoff survives a server restart: the delayed job stays delayed, then completes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 7972
+    },
+    {
+      "check": "claude-mem restart: server and worker come back, earlier jobs keep their state, new jobs run",
+      "status": "PASS",
+      "detail": "",
+      "ms": 2162
+    },
+    {
+      "check": "two workers: 12 slow jobs are shared between them, each processed exactly once",
+      "status": "PASS",
+      "detail": "worker 2: 6, worker 1: 6",
+      "ms": 26111
+    },
+    {
+      "check": "session end: the summary job (the second queue) completes",
+      "status": "PASS",
+      "detail": "",
+      "ms": 1059
+    },
+    {
+      "check": "at the end: nothing left active or waiting, and no job reported stalled",
+      "status": "PASS",
+      "detail": "event: 48 completed, 1 failed; summary: 1 completed, 0 failed",
+      "ms": 4
+    }
+  ],
+  "commandstats": {
+    "bzpopmin": 23,
+    "client|setinfo": 46,
+    "client|setname": 12,
+    "del": 41,
+    "eval": 20,
+    "evalsha": 44,
+    "exists": 37,
+    "get": 16,
+    "hget": 32,
+    "hgetall": 16,
+    "hincrby": 32,
+    "hmget": 72,
+    "hmset": 31,
+    "hset": 19,
+    "incr": 15,
+    "info": 43,
+    "lindex": 4,
+    "llen": 18,
+    "lpush": 16,
+    "lrem": 16,
+    "ping": 1,
+    "rpoplpush": 41,
+    "scard": 16,
+    "set": 16,
+    "srem": 16,
+    "xadd": 68,
+    "xread": 62,
+    "xtrim": 16,
+    "zadd": 48,
+    "zcard": 27,
+    "zpopmin": 25,
+    "zrange": 25,
+    "zrangebyscore": 41,
+    "zrem": 1,
+    "zremrangebyrank": 16,
+    "zrevrange": 16,
+    "zrevrangebyscore": 16,
+    "zscore": 2
+  }
+}

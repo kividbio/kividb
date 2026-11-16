@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 import socket
 import subprocess
+import tempfile
 import threading
 import os
 
@@ -58,7 +59,9 @@ def start_server(port: int, extra_args: list[str] | None = None) -> subprocess.P
     else:
         args = [KIVI_BINARY, "--port", str(port), "--loglevel", "error",
                 "--io-model", "tokio"] + extra
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # A directory of its own: one engine to a data directory.
+    proc = subprocess.Popen(args, cwd=tempfile.mkdtemp(prefix="kividb-e2e-"),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not _wait_ready(KIVI_HOST, port, timeout=30):
         proc.terminate()
         pytest.fail(f"Server failed to start on port {port}")
@@ -73,8 +76,8 @@ def make_client(port: int, **kwargs) -> redis.Redis:
 # ── WAIT tests ────────────────────────────────────────────────────────────────
 
 class TestWait:
-    def test_wait_no_replicas_returns_zero_immediately(self):
-        """WAIT on a standalone master returns 0 without blocking."""
+    def test_wait_no_replicas_returns_zero_after_the_timeout(self):
+        """WAIT on a standalone master waits out its timeout and returns 0, as Redis does."""
         port = free_port()
         proc = start_server(port)
         try:

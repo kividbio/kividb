@@ -1,0 +1,5 @@
+  * AOF            : enabled
+  * Persistence    : AOF (recovered on start) + KDB snapshot (SAVE / BGSAVE)
+2026-11-02T21:39:38.097Z 1 [INFO] AOF replay: 1794706 commands, 1794704 keys, 70.52 MB in 1.70s
+2026-11-02T21:39:38.188Z 1 [INFO] Replication: dataset fingerprinted in 88 ms — a replica that holds the same data will be continued rather than sent it
+2026-11-02T21:39:40.831Z 1 [INFO] Replication: Partial resync for 10.244.1.101:50264: continuing from offset 0 (0 bytes of backlog)

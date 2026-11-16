@@ -1,0 +1,11 @@
+# The versions the results in this folder were produced with (Python 3.12.3). Celery's own suite was run
+# from the v5.7.0 tag, installed with pip install -e ".[redis]" -r requirements/test.txt
+# -r requirements/test-integration.txt; kombu's from the v5.7.0 tag with its test requirements.
+celery[redis]==5.7.0
+kombu==5.7.0
+redis==8.1.0
+pytest==9.1.1
+pytest-celery==1.3.0
+pytest-timeout==2.4.0
+pytest-rerunfailures==16.7
+pytest-xdist==3.8.0

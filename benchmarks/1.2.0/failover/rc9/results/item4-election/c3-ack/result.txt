@@ -1,0 +1,18 @@
+transfer: condition seen=1 1.13 s after the resync started; replica master_sync_in_progress at the kill: 1
+transfer: replica role 25 s after kill -9 of its master: slave; its keys: 0
+transfer: cluster_state:fail cluster_slots_ok:10923 cluster_slots_fail:5461 
+transfer: replica log: 2026-11-03T08:02:10.840Z 91269 [WARN] Cluster: Not standing for election for failed master f60b2eceef70d1def328f3053222a3b955b53e03: it has not finished loading its last full sync from the master and streamed since: it may hold part of the master's data, or none of it
+transfer: ackcheck once the master was back: {"acked": 8904, "lost_acked": 0, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 747, "recovery": {"event_t": -0.134, "pre_event_ok_per_100ms_median": 0, "first_error_t": 3.8000000000000003, "last_error_t": 38.0, "writes_below_80pct_from_t": 0.0, "throughput_back_t": 0.0, "recovery_s": 0.13}}
+transfer: ackcheck again after the replica synced: {"acked": 8904, "lost_acked": 0, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 747, "recovery": {}}
+transfer: after: A master keys 3061627; B slave keys 3061627
+load: condition seen=1 1.02 s after the resync started; replica master_sync_in_progress at the kill: 1
+load: replica role 25 s after kill -9 of its master: slave; its keys: 3130126
+load: cluster_state:fail cluster_slots_ok:10923 cluster_slots_fail:5461 
+load: replica log: 2026-11-03T08:02:10.840Z 91269 [WARN] Cluster: Not standing for election for failed master f60b2eceef70d1def328f3053222a3b955b53e03: it has not finished loading its last full sync from the master and streamed since: it may hold part of the master's data, or none of it
+load: replica log: 2026-11-03T08:03:02.653Z 93526 [WARN] Cluster: Not standing for election for failed master f60b2eceef70d1def328f3053222a3b955b53e03: it has not finished loading its last full sync from the master and streamed since: it may hold part of the master's data, or none of it
+load: ackcheck once the master was back: {"acked": 9024, "lost_acked": 0, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 769, "recovery": {"event_t": -0.14, "pre_event_ok_per_100ms_median": 0, "first_error_t": 4.3, "last_error_t": 38.5, "writes_below_80pct_from_t": 0.0, "throughput_back_t": 0.0, "recovery_s": 0.14}}
+load: ackcheck again after the replica synced: {"acked": 9024, "lost_acked": 0, "wrong_value": 0, "wait_acked": 0, "wait_acked_lost": 0, "unacked_errors": 769, "recovery": {}}
+load: after: A master keys 3168959; B slave keys 3168959
+failover: caught-up replica promoted after 6.62 s; keys A-before ? B now 3282197
+failover: replica log: 2026-11-03T08:03:02.653Z 93526 [WARN] Cluster: Not standing for election for failed master f60b2eceef70d1def328f3053222a3b955b53e03: it has not finished loading its last full sync from the master and streamed since: it may hold part of the master's data, or none of it
+failover: replica log: 2026-11-03T08:03:58.453Z 93526 [INFO] Cluster: Won election at epoch 4 (2 votes, quorum 2)

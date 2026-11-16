@@ -1,0 +1,65 @@
+cmd: taskset -c 1,2,3 ./bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.16
+pair: c6 -> 10.30.1.16
+Mon Nov  2 13:51:02 UTC 2026
+goos: linux
+goarch: arm64
+pkg: github.com/imchuncai/umem-cache-benchmark
+BenchmarkRedis-3   	
+======================================================================
+server:  2097152    warmup:  8388608    get:  8388608    hit:  4797540
+VmHWM:       0 kB   hit_rate: 57.19%    per_memory_hit_rate: 57.19%
+P1: 168 us  P50: 3323 us  P90: 6160 us  P99: 8168 us  P99.9: 9850 us
+1261.771s	    output:   11 Mb/s   input:   16 Mb/s
+======================================================================
+--- FAIL: BenchmarkRedis-3
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+    bench_test.go:104: got error: i/o timeout
+FAIL
+Command exited with non-zero status 1
+	Command being timed: "timeout 4h taskset -c 1,2,3 /home/azureuser/bench.test -test.run=^$ -test.bench=^BenchmarkRedis$ -test.benchtime=8388608x -test.timeout=0 true 1073741824 1024 8 1 0 10.30.1.16"
+	User time (seconds): 318.94
+	System time (seconds): 364.51
+	Percent of CPU this job got: 46%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 24:39.68
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 624764
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 2
+	Minor (reclaiming a frame) page faults: 325590
+	Voluntary context switches: 7070574
+	Involuntary context switches: 772497
+	Swaps: 0
+	File system inputs: 272
+	File system outputs: 8
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1
+exit=1
+Mon Nov  2 14:15:42 UTC 2026

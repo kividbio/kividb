@@ -1,0 +1,94 @@
+{
+  "meta": {
+    "label": "kividb-lua-resp2-backend",
+    "date": "2026-11-05",
+    "celery": "5.7.0",
+    "kombu": "5.7.0",
+    "redis_py": "8.1.0",
+    "backend_url": "redis://127.0.0.1:7700/0?protocol=2",
+    "server": {
+      "redis_version": "8.10.0",
+      "kividb_version": "1.2.0"
+    }
+  },
+  "results": [
+    {
+      "check": "worker starts and answers inspect ping (pidbox fanout over pub/sub)",
+      "status": "PASS",
+      "detail": "pong",
+      "ms": 2441
+    },
+    {
+      "check": "task round trip: broker, worker, result backend",
+      "status": "PASS",
+      "detail": "add(2, 3) = 5",
+      "ms": 20
+    },
+    {
+      "check": "group of 10",
+      "status": "PASS",
+      "detail": "10 results in order",
+      "ms": 513
+    },
+    {
+      "check": "chain",
+      "status": "PASS",
+      "detail": "1+2+3+4 = 10",
+      "ms": 18
+    },
+    {
+      "check": "chord (Celery 5.7 saves header results with a Lua script)",
+      "status": "PASS",
+      "detail": "sum = 90",
+      "ms": 15
+    },
+    {
+      "check": "countdown (kombu's unacked sorted set)",
+      "status": "PASS",
+      "detail": "ran after 3.0s",
+      "ms": 3003
+    },
+    {
+      "check": "retry",
+      "status": "PASS",
+      "detail": "failed twice, succeeded on the third try",
+      "ms": 409
+    },
+    {
+      "check": "revoke (broadcast to workers)",
+      "status": "PASS",
+      "detail": "the revoked task did not run",
+      "ms": 6009
+    },
+    {
+      "check": "task routed to a second queue",
+      "status": "PASS",
+      "detail": "routed to compat-other",
+      "ms": 4
+    },
+    {
+      "check": "result expires (TTL on the result key)",
+      "status": "PASS",
+      "detail": "result key TTL 600s",
+      "ms": 2
+    },
+    {
+      "check": "acks_late task redelivered after the worker is killed (SIGKILL)",
+      "status": "PASS",
+      "detail": "redelivered after SIGKILL and finished",
+      "ms": 14664
+    },
+    {
+      "check": "tasks queued across a server restart are not lost",
+      "status": "PASS",
+      "detail": "20 of 20 ran after the restart",
+      "ms": 3968
+    },
+    {
+      "check": "running worker reconnects after a server restart",
+      "status": "PASS",
+      "detail": "the running worker reconnected and ran a new task",
+      "ms": 3138
+    }
+  ]
+}

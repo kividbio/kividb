@@ -70,6 +70,13 @@ def parse_aof_keys(path):
     others = 0
     pos = 0
     end = len(data)
+    # A delta log (any log a checkpoint has turned over, and every log a
+    # start makes since 1.2.1) opens with an 8-byte magic and its save
+    # number: the records come after it.
+    if data.startswith(b"KIVIDLT1"):
+        if end < 16:
+            raise ValueError("delta header is cut short (%d bytes)" % end)
+        pos = 16
     while pos < end:
         if data[pos : pos + 1] != b"*":
             raise ValueError("expected '*' at offset %d, found %r" % (pos, data[pos : pos + 1]))
