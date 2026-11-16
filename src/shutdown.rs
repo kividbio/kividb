@@ -67,6 +67,14 @@ static FAILED: AtomicU64 = AtomicU64::new(0);
 /// running.
 pub static SHUTDOWN_FORCE: AtomicBool = AtomicBool::new(false);
 
+/// Held by [`request`], [`abort`] and [`failed`]: a `SHUTDOWN` that reads
+/// the count of failures and finds no shutdown in progress does so either
+/// wholly before a failure, and joins the shutdown that fails, or wholly
+/// after it, and starts one of its own. Between the two, it started one and
+/// was then answered with the failure of the one before, or joined one that
+/// had already failed and waited for ever.
+static LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
 thread_local! {
     /// The `SHUTDOWN` this thread's handler has just accepted, for the
     /// connection loop that called it (one command at a time on a thread):
@@ -83,6 +91,7 @@ pub fn in_progress() -> bool {
 /// thread's command as the one that asked. One that asks while another is
 /// in progress waits with it, as in Redis.
 pub fn request(mode: u8, force: bool) {
+    let _lock = LOCK.lock();
     // Before the shutdown can fail: what the connection waits for is a
     // failure after this.
     REQUESTED.with(|r| r.set(Some(FAILED.load(Ordering::SeqCst))));
@@ -113,6 +122,7 @@ pub async fn failed_after(seen: u64) {
 /// `SHUTDOWN ABORT`: cancel the shutdown that is in progress, if there is
 /// one. Whoever asked for it is answered with [`FAILED_REPLY`].
 pub fn abort() -> bool {
+    let _lock = LOCK.lock();
     if !in_progress() {
         return false;
     }
@@ -127,10 +137,30 @@ pub fn abort_requested() -> bool {
 
 /// The shutdown has been given up, its effects undone: the next may begin.
 fn failed() {
+    let _lock = LOCK.lock();
+    // Back to what a signal asks for: a signal reads the mode, and one after
+    // an aborted `SHUTDOWN NOSAVE` wrote no final save.
+    SHUTDOWN_MODE.store(mode::SAVE, Ordering::SeqCst);
+    SHUTDOWN_FORCE.store(false, Ordering::SeqCst);
     SHUTDOWN_PENDING.store(false, Ordering::SeqCst);
     ABORT.store(false, Ordering::SeqCst);
     RUNNING.store(false, Ordering::SeqCst);
     FAILED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A script has run past its time limit (`lua-time-limit`): other clients
+/// are told `BUSY`, and it holds the write gate until it ends, if it ever
+/// does. `SHUTDOWN NOSAVE` is the way out Redis gives (`BUSY ... You can
+/// only call SCRIPT KILL or SHUTDOWN NOSAVE.`), so it must not wait for it.
+pub fn script_busy() -> bool {
+    #[cfg(feature = "lua")]
+    {
+        crate::commands::running_script_is_over_its_time_limit()
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        false
+    }
 }
 
 /// How the final sequence ended.
@@ -166,19 +196,27 @@ impl Final<'_> {
         use crate::replication as repl;
         let (nosave, now) = (m & mode::NOSAVE != 0, m & mode::NOW != 0);
         RUNNING.store(true, Ordering::SeqCst);
+        // `SHUTDOWN NOSAVE` while a script runs past its time limit: it is
+        // the way to stop that script, and the wait below for the writes in
+        // flight would be for the script to end, which it may never do.
+        let script_in_the_way = || nosave && script_busy();
         // Before the gate below: the clients are paused, the write stream
         // ends here, and the replicas are given the time to receive all of
         // it, so that the restart can continue them from the offset saved
         // below (#306). The worker threads go on serving the replicas
         // meanwhile. `SHUTDOWN NOW` does not wait.
         let started = std::time::Instant::now();
-        let deadline = if !now {
-            repl::drain_replicas_for_shutdown(self.repl_state, self.hub_tx)
+        let (paused, deadline) = if !now {
+            let (paused, deadline) =
+                repl::drain_replicas_for_shutdown(self.repl_state, self.hub_tx, &|| {
+                    abort_requested() || script_in_the_way()
+                });
+            (Some(paused), deadline)
         } else {
-            started
+            (None, started)
         };
         if abort_requested() {
-            return self.give_up(by_command, "SHUTDOWN ABORT");
+            return self.give_up(by_command, "SHUTDOWN ABORT", paused);
         }
         if nosave {
             // As in Redis, NOSAVE waits for the replicas too, but writes
@@ -198,7 +236,7 @@ impl Final<'_> {
             Ok(hold) => hold,
             Err(e) => {
                 log_error!("Final snapshot failed: {e}");
-                return self.give_up(by_command, "the final save could not begin");
+                return self.give_up(by_command, "the final save could not begin", paused);
             }
         };
         repl::end_stream_for_shutdown(self.repl_state);
@@ -207,7 +245,7 @@ impl Final<'_> {
         }
         if abort_requested() {
             drop(hold);
-            return self.give_up(by_command, "SHUTDOWN ABORT");
+            return self.give_up(by_command, "SHUTDOWN ABORT", paused);
         }
         // Not over the last good dump with a dataset a full sync is still
         // replacing.
@@ -246,7 +284,7 @@ impl Final<'_> {
                     // on, and the gate opens.
                     drop(settled);
                     drop(hold);
-                    self.undo();
+                    self.undo(paused);
                     Ended::KeepRunning
                 } else {
                     // Not a clean exit: whatever restarts this node should
@@ -260,10 +298,10 @@ impl Final<'_> {
 
     /// Before the save: the shutdown is given up (aborted, or its gate could
     /// not be taken).
-    fn give_up(&self, by_command: bool, why: &str) -> Ended {
+    fn give_up(&self, by_command: bool, why: &str, paused: Option<crate::pause::Undo>) -> Ended {
         if by_command || abort_requested() {
             log_warn!("Shutdown given up: {why}. The server keeps running");
-            self.undo();
+            self.undo(paused);
             Ended::KeepRunning
         } else {
             crate::aof::sync_for_shutdown();
@@ -271,15 +309,20 @@ impl Final<'_> {
         }
     }
 
-    /// Take back what the sequence did before the save: the pause of the
-    /// clients and the end of the stream, and let the next shutdown begin.
-    /// The gate and the save's locks are let go by the caller, by dropping
-    /// them.
-    fn undo(&self) {
+    /// Take back what the sequence did before the save: its own pause of
+    /// the clients (`paused`), and the end of the stream, and let the next
+    /// shutdown begin. A pause that was in force before it stays: a
+    /// `CLIENT PAUSE`, or the hold of writes of a failover or a slot
+    /// migration, whose writes would be acknowledged here and lost with the
+    /// slots. The gate and the save's locks are let go by the caller, by
+    /// dropping them.
+    fn undo(&self, paused: Option<crate::pause::Undo>) {
         self.repl_state
             .stream_closed
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        crate::pause::clear_pause();
+        if let Some(paused) = paused {
+            crate::pause::undo_pause(paused);
+        }
         failed();
     }
 }

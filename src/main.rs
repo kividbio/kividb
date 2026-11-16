@@ -1028,10 +1028,17 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 // Wait for OS signal OR SHUTDOWN command (polled every 100ms).
                 // The poll arm is the only addition — OS signal behaviour is
                 // identical to before.
+                // Streams, made once: a signal that arrives while a shutdown
+                // runs is kept, and starts one when that shutdown is aborted
+                // or fails. A `ctrl_c()` made afresh each time round missed
+                // a SIGINT that came in between.
                 #[cfg(unix)]
-                let mut sigterm = {
+                let (mut sigterm, mut sigint) = {
                     use tokio::signal::unix::{SignalKind, signal};
-                    signal(SignalKind::terminate()).unwrap()
+                    (
+                        signal(SignalKind::terminate()).unwrap(),
+                        signal(SignalKind::interrupt()).unwrap(),
+                    )
                 };
                 loop {
                     // Whether it was a signal, and not a client's SHUTDOWN.
@@ -1039,7 +1046,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     loop {
                         #[cfg(unix)]
                         tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {
+                            _ = sigint.recv() => {
                                 log_info!("SIGINT received — shutting down gracefully");
                                 from_signal = true;
                                 break;
@@ -2024,10 +2031,15 @@ async fn async_main_tokio(
 
     // Set up signal handlers before entering the accept loop.
     // Both SIGTERM (systemd/kill) and SIGINT (Ctrl+C) trigger shutdown.
+    // Streams, made once: a signal is kept until it is taken (see
+    // `signal_pending` below).
     #[cfg(unix)]
-    let mut sigterm = {
+    let (mut sigterm, mut sigint) = {
         use tokio::signal::unix::{SignalKind, signal};
-        signal(SignalKind::terminate())?
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
     };
 
     let snapshot_store = Arc::clone(&store);
@@ -2043,8 +2055,16 @@ async fn async_main_tokio(
     shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Consume the first tick which fires immediately.
     shutdown_check.tick().await;
+    // Not polled again once it has completed (that panics): made afresh
+    // instead.
+    #[cfg(not(unix))]
     let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(not(unix))]
     tokio::pin!(ctrl_c);
+    // A signal has asked for a shutdown that has not yet begun: one arrived
+    // while another shutdown was under way, which may still be aborted or
+    // fail. Taken when the next one begins.
+    let mut signal_pending = false;
     loop {
         #[cfg(unix)]
         let shutdown = tokio::select! {
@@ -2130,12 +2150,14 @@ async fn async_main_tokio(
                     }
                 }
             }
-            _ = &mut ctrl_c => {
+            _ = sigint.recv() => {
                 log_info!("SIGINT received — shutting down gracefully");
+                signal_pending = true;
                 true
             }
             _ = sigterm.recv() => {
                 log_info!("SIGTERM received — shutting down gracefully");
+                signal_pending = true;
                 true
             }
             // NEW: poll for command-issued SHUTDOWN every 50 ms.
@@ -2233,6 +2255,8 @@ async fn async_main_tokio(
             }
             _ = &mut ctrl_c => {
                 log_info!("Ctrl+C received — shutting down gracefully");
+                ctrl_c.set(tokio::signal::ctrl_c());
+                signal_pending = true;
                 true
             }
             _ = shutdown_check.tick() => {
@@ -2244,14 +2268,19 @@ async fn async_main_tokio(
         // until the shutdown ends or fails), and not waited for here: the
         // loop goes on accepting, so that a client can `SHUTDOWN ABORT` a
         // shutdown that waits for the replicas.
-        if shutdown && !attempting.swap(true, Relaxed) {
+        // A signal that came while one was under way is not dropped: it is
+        // taken here once that one has been aborted or has failed (the tick
+        // comes round every 50 ms).
+        if (shutdown || signal_pending) && !attempting.swap(true, Relaxed) {
             // The mode the SHUTDOWN command (or OS signal) requested. A
             // client's SHUTDOWN that fails is answered with an error and the
             // server runs on, as does an aborted one; from a signal, or with
             // FORCE, a failed save ends the process.
+            let from_signal = std::mem::take(&mut signal_pending);
             let m = SHUTDOWN_MODE.load(Relaxed);
-            let by_command =
-                SHUTDOWN_PENDING.load(Relaxed) && !crate::shutdown::SHUTDOWN_FORCE.load(Relaxed);
+            let by_command = !from_signal
+                && SHUTDOWN_PENDING.load(Relaxed)
+                && !crate::shutdown::SHUTDOWN_FORCE.load(Relaxed);
             let store_c = Arc::clone(&snapshot_store);
             let index_c = Arc::clone(&snapshot_index_store);
             let repl_c = Arc::clone(&snapshot_repl_state);

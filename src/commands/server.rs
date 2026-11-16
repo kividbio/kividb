@@ -6652,6 +6652,12 @@ fn shutdown_command(cmd: &[&[u8]]) -> Vec<u8> {
             resp_error(shutdown::NO_SHUTDOWN_IN_PROGRESS)
         };
     }
+    // As in Redis: while a script runs past its time limit, only a shutdown
+    // that saves nothing may stop it. A save would wait for the script.
+    #[cfg(feature = "lua")]
+    if !nosave && shutdown::script_busy() {
+        return crate::commands::script_busy_reply();
+    }
     let m = if nosave { mode::NOSAVE } else { mode::SAVE } | if now { mode::NOW } else { 0 };
     shutdown::request(m, force);
     // No reply: see above.

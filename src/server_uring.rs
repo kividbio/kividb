@@ -2992,7 +2992,8 @@ pub async fn handle_client(
         // save; if the shutdown fails or is aborted instead, that is the
         // reply, and what was pipelined after it is read next.
         if let Some((failed_before, silent)) = shutdown_wait {
-            crate::shutdown::failed_after(failed_before).await;
+            // Boxed: a cold wait, kept out of the connection future.
+            Box::pin(crate::shutdown::failed_after(failed_before)).await;
             if !silent {
                 out_buf.extend_from_slice(&crate::resp::write::resp_error(
                     crate::shutdown::FAILED_REPLY,

@@ -505,6 +505,28 @@ fn read_len(conn: &mut TcpStream, len: usize, within: Duration) -> Vec<u8> {
     got
 }
 
+/// `HELLO 3` on `conn`, its reply (a map) read to its end: up to the `PONG`
+/// of a `PING` sent after it.
+fn hello3(conn: &mut TcpStream) {
+    use std::io::Read;
+    let mut req = encode(&["HELLO", "3"]);
+    req.extend(encode(&["PING"]));
+    conn.write_all(&req).unwrap();
+    let start = Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.ends_with(b"+PONG\r\n") {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "HELLO 3: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        if let Ok(n) = conn.read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
+}
+
 /// Every form of a SHUTDOWN that goes ahead: no reply at all, then the
 /// connection closes, and the process exits with status 0.
 #[test]
@@ -554,10 +576,7 @@ fn replies_before_a_shutdown_are_sent_and_commands_after_it_are_not_run() {
             conn.set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
             if resp3 {
-                conn.write_all(&encode(&["HELLO", "3"])).unwrap();
-                // The reply is a map: the connection is read to its end.
-                thread::sleep(Duration::from_millis(300));
-                let _ = read_len(&mut conn, usize::MAX, Duration::from_millis(300));
+                hello3(&mut conn);
             }
             // One write: the three commands arrive together.
             let mut batch = encode(&["SET", "before", "1"]);
@@ -690,9 +709,7 @@ fn a_failed_final_save_is_an_error_and_the_server_runs_on() {
             b"$1\r\n1\r\n"
         );
         // Again: the same, with RESP3 and with replies off.
-        conn.write_all(&encode(&["HELLO", "3"])).unwrap();
-        thread::sleep(Duration::from_millis(300));
-        let _ = read_len(&mut conn, usize::MAX, Duration::from_millis(300));
+        hello3(&mut conn);
         conn.write_all(&encode(&["SHUTDOWN", "SAVE"])).unwrap();
         let got = read_len(&mut conn, FAILED.len(), Duration::from_secs(30));
         assert_eq!(
@@ -884,5 +901,318 @@ fn shutdown_nosave_leaves_every_queued_write_in_the_aof() {
         let _ = again.kill();
         let _ = again.wait();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ── A shutdown that does not go ahead leaves the server as it was ────────
+//
+// Each of these lost acknowledged writes: a signal after an aborted
+// `SHUTDOWN NOSAVE` wrote no final save, a pause of a failover or of a
+// `CLIENT PAUSE` was lifted by a failed `SHUTDOWN`, a signal that came during
+// a client's shutdown was dropped when that one was aborted, a SIGINT on the
+// tokio model panicked the process before its save, and `SHUTDOWN NOSAVE`
+// never ended a script that had run past its time limit.
+
+impl Srv {
+    /// [`Srv::start`], logging to a file in its directory ([`Srv::log`]).
+    fn start_logged(model: &str, extra: &[&str], env: &[(&str, &str)]) -> Srv {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let log = dir.join("kividb.log");
+        let mut args = vec!["--logfile", log.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let (child, port, _) = start_with(&dir, free_port(), &["--io-model", model], &args, env);
+        Srv { child, port, dir }
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("kividb.log")).unwrap_or_default()
+    }
+
+    /// Until the log has `text`, at most `within`.
+    fn wait_log(&self, text: &str, within: Duration) {
+        let start = Instant::now();
+        while !self.log().contains(text) {
+            assert!(
+                start.elapsed() < within,
+                "the log never said {text:?}:\n{}",
+                self.log()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn signal(&self, sig: libc::c_int) {
+        unsafe { libc::kill(self.child.id() as libc::pid_t, sig) };
+    }
+
+    /// Start a server again on this one's directory, and read `key` there.
+    fn restarted_get(&self, model: &str, key: &str) -> String {
+        let (mut again, _, mut c) =
+            start_with(&self.dir, free_port(), &["--io-model", model], &[], &[]);
+        let got = resp_cmd(&mut c, &["GET", key]).unwrap();
+        let _ = again.kill();
+        let _ = again.wait();
+        got
+    }
+}
+
+/// A master with one replica attached, which is then stopped (SIGSTOP): a
+/// shutdown of the master waits for it, up to `shutdown-timeout` (60 s).
+fn master_with_a_stopped_replica(model: &str) -> (Srv, Srv) {
+    let master = Srv::start_logged(model, &["--shutdown-timeout", "60"], &[]);
+    let replica = Srv::start(
+        model,
+        &["--replicaof", "127.0.0.1", &master.port.to_string()],
+        &[],
+    );
+    let mut conn = master.raw();
+    let start = Instant::now();
+    loop {
+        conn.write_all(&encode(&["INFO", "replication"])).unwrap();
+        let (info, _) = until_closed(&mut conn, Duration::from_millis(300));
+        // Online: a shutdown waits only for a replica that is streaming.
+        if String::from_utf8_lossy(&info).contains("state=online") {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the replica did not attach"
+        );
+    }
+    replica.signal(libc::SIGSTOP);
+    // Something it has not acknowledged.
+    assert_eq!(ask(&mut conn, &["SET", "lag", "1"], 5), b"+OK\r\n");
+    (master, replica)
+}
+
+/// One command on a raw connection, and its reply of `len` bytes.
+fn ask(conn: &mut TcpStream, args: &[&str], len: usize) -> Vec<u8> {
+    conn.write_all(&encode(args)).unwrap();
+    read_len(conn, len, Duration::from_secs(10))
+}
+
+/// SIGINT, as SIGTERM: the final save, then the exit with status 0. On the
+/// tokio model the loop went on after a SIGINT, and polled the signal's
+/// finished future again: the process panicked (status 101) before its save.
+#[test]
+fn sigint_ends_the_process_after_its_final_save() {
+    for model in MODELS {
+        let mut server = Srv::start(model, &[], &[]);
+        let mut conn = server.raw();
+        assert_eq!(ask(&mut conn, &["SET", "k", "1"], 5), b"+OK\r\n");
+        server.signal(libc::SIGINT);
+        let status = server
+            .exited(Duration::from_secs(30))
+            .unwrap_or_else(|| panic!("{model}: no exit after SIGINT"));
+        assert_eq!(status.code(), Some(0), "{model}: {status}");
+        assert_eq!(server.restarted_get(model, "k"), "1", "{model}");
+    }
+}
+
+/// A `SHUTDOWN NOSAVE` that is aborted leaves no mode behind it: a SIGTERM
+/// after it writes the final save. It used to read the mode of the aborted
+/// one, and write nothing: the writes since the last save were lost.
+#[test]
+fn a_signal_after_an_aborted_shutdown_nosave_saves() {
+    for model in MODELS {
+        let (mut master, replica) = master_with_a_stopped_replica(model);
+        let mut asker = master.raw();
+        asker.write_all(&encode(&["SHUTDOWN", "NOSAVE"])).unwrap();
+        master.wait_log(
+            "Waiting for replicas before shutting down",
+            Duration::from_secs(30),
+        );
+        let mut other = master.raw();
+        assert_eq!(ask(&mut other, &["SHUTDOWN", "ABORT"], 5), b"+OK\r\n");
+        assert_eq!(
+            read_len(&mut asker, FAILED.len(), Duration::from_secs(30)),
+            FAILED
+        );
+        // Written after the abort, and acknowledged.
+        assert_eq!(
+            ask(&mut other, &["SET", "k", "1"], 5),
+            b"+OK\r\n",
+            "{model}"
+        );
+        // Going again, it takes what it lagged on: the SIGTERM's shutdown
+        // waits only for that.
+        replica.signal(libc::SIGCONT);
+        master.signal(libc::SIGTERM);
+        let status = master
+            .exited(Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("{model}: no exit after SIGTERM"));
+        assert_eq!(status.code(), Some(0), "{model}: {status}");
+        assert_eq!(
+            master.restarted_get(model, "k"),
+            "1",
+            "{model}: the SIGTERM wrote no final save"
+        );
+    }
+}
+
+/// A signal that comes while a client's `SHUTDOWN` waits for a replica is
+/// not lost when that shutdown is aborted: the process shuts down for the
+/// signal afterwards, with its final save. On the tokio model a SIGTERM was
+/// dropped (and a SIGINT panicked the process), and on io_uring a SIGINT was
+/// missed: the server ran on, until something killed it without a save.
+#[test]
+fn a_signal_during_an_aborted_shutdown_still_ends_the_process() {
+    for (model, sig, name) in MODELS.iter().flat_map(|model| {
+        [
+            (*model, libc::SIGTERM, "SIGTERM"),
+            (*model, libc::SIGINT, "SIGINT"),
+        ]
+    }) {
+        let (mut master, replica) = master_with_a_stopped_replica(model);
+        let mut other = master.raw();
+        assert_eq!(ask(&mut other, &["SET", "k", "1"], 5), b"+OK\r\n");
+        let mut asker = master.raw();
+        asker.write_all(&encode(&["SHUTDOWN", "NOSAVE"])).unwrap();
+        master.wait_log(
+            "Waiting for replicas before shutting down",
+            Duration::from_secs(30),
+        );
+        master.signal(sig);
+        if model == "tokio" {
+            // Taken by the accept loop before the abort, not after it
+            // (io_uring's signal thread is the one running the shutdown: it
+            // takes the signal once that has ended, whenever it came).
+            master.wait_log(&format!("{name} received"), Duration::from_secs(30));
+        }
+        assert_eq!(
+            ask(&mut other, &["SHUTDOWN", "ABORT"], 5),
+            b"+OK\r\n",
+            "{model} {name}"
+        );
+        assert_eq!(
+            read_len(&mut asker, FAILED.len(), Duration::from_secs(30)),
+            FAILED,
+            "{model} {name}"
+        );
+        // The replica going again, the signal's shutdown waits only for it
+        // to take what it lagged on.
+        replica.signal(libc::SIGCONT);
+        let status = master
+            .exited(Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("{model}: {name} during the shutdown was lost"));
+        assert_eq!(status.code(), Some(0), "{model} {name}: {status}");
+        assert_eq!(
+            master.restarted_get(model, "k"),
+            "1",
+            "{model} {name}: no final save"
+        );
+    }
+}
+
+/// A `SHUTDOWN` that fails takes back its own pause of the clients, and no
+/// other: a `CLIENT PAUSE WRITE` in force before it still holds the writes
+/// (as would a failover's or a slot migration's hold). It used to end every
+/// pause, and the writes it let through were acknowledged on a master that
+/// was handing over to another.
+#[test]
+fn a_failed_shutdown_leaves_a_pause_in_force_before_it() {
+    for model in MODELS {
+        let server = Srv::start(model, &[], &[("KIVIDB_TEST_FAILPOINTS", "final-save")]);
+        let mut admin = server.raw();
+        assert_eq!(
+            ask(&mut admin, &["CLIENT", "PAUSE", "60000", "WRITE"], 5),
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            ask(&mut admin, &["SHUTDOWN"], FAILED.len()),
+            FAILED,
+            "{model}"
+        );
+        // A write is held: it is counted among the blocked clients, and has
+        // no reply.
+        let mut writer = server.raw();
+        writer.write_all(&encode(&["SET", "k", "1"])).unwrap();
+        let start = Instant::now();
+        loop {
+            admin.write_all(&encode(&["INFO", "clients"])).unwrap();
+            let (info, _) = until_closed(&mut admin, Duration::from_millis(200));
+            if String::from_utf8_lossy(&info).contains("blocked_clients:1\r\n") {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "{model}: the write was not held: the pause was lifted"
+            );
+        }
+        assert_eq!(read_len(&mut writer, 5, Duration::from_millis(100)), b"");
+        // Reads go on, and the pause ends as its client says.
+        assert_eq!(ask(&mut admin, &["GET", "k"], 5), b"$-1\r\n");
+        assert_eq!(ask(&mut admin, &["CLIENT", "UNPAUSE"], 5), b"+OK\r\n");
+        assert_eq!(
+            read_len(&mut writer, 5, Duration::from_secs(10)),
+            b"+OK\r\n"
+        );
+    }
+}
+
+/// `SHUTDOWN NOSAVE` ends a script that has run past its time limit, as
+/// `BUSY` says it does. It waited for the script, which holds the write
+/// gate, before it waited for the replicas: for ever, with every client
+/// paused. A `SHUTDOWN` that saves is refused with `BUSY`, as in Redis; it
+/// was taken, and waited for the script the same way.
+#[cfg(feature = "lua")]
+#[test]
+fn shutdown_nosave_ends_a_busy_script() {
+    for model in MODELS {
+        let mut server = Srv::start(model, &[], &[]);
+        let mut admin = server.raw();
+        assert_eq!(
+            ask(&mut admin, &["CONFIG", "SET", "lua-time-limit", "100"], 5),
+            b"+OK\r\n"
+        );
+        let mut script = server.raw();
+        script
+            .write_all(&encode(&[
+                "EVAL",
+                "redis.call('set', KEYS[1], 'v') while true do end",
+                "1",
+                "k",
+            ]))
+            .unwrap();
+        // Until the script is past its limit: BUSY.
+        let start = Instant::now();
+        loop {
+            let got = ask(&mut admin, &["PING"], 5);
+            if got.starts_with(b"-BUSY") {
+                let _ = until_closed(&mut admin, Duration::from_millis(100));
+                break;
+            }
+            assert_eq!(got, b"+PONG\r\n", "{model}");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "{model}: never BUSY"
+            );
+        }
+        // A shutdown that would save is refused, as in Redis 8.10.2: the save
+        // would wait for the script.
+        let busy: &[u8] =
+            b"-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n";
+        for form in [
+            &["SHUTDOWN"][..],
+            &["SHUTDOWN", "SAVE"],
+            &["SHUTDOWN", "NOW"],
+            &["SHUTDOWN", "FORCE"],
+        ] {
+            let got = ask(&mut admin, form, busy.len());
+            assert_eq!(
+                got,
+                busy,
+                "{model}: {form:?}: {:?}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+        admin.write_all(&encode(&["SHUTDOWN", "NOSAVE"])).unwrap();
+        let (reply, closed) = until_closed(&mut admin, Duration::from_secs(30));
+        assert_eq!(reply, b"", "{model}: {:?}", String::from_utf8_lossy(&reply));
+        assert!(closed, "{model}: not closed");
+        let status = server
+            .exited(Duration::from_secs(30))
+            .unwrap_or_else(|| panic!("{model}: SHUTDOWN NOSAVE did not end the busy script"));
+        assert!(status.success(), "{model}: {status}");
     }
 }
