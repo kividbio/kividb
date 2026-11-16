@@ -345,6 +345,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from, under the lock a promotion reads it in, and is dropped when the
   node had stopped being a replica before the reply arrived.
 
+- **A master and its replica hold the same dataset digest while entries
+  `XNACK` released are pending (#856).** Each node that applied the
+  `XNACK` (a replica, an AOF replay) gave a released entry its own internal
+  mark for the time it was delivered, and the digest held that mark, so
+  `DEBUG DIGEST-VALUE` of the stream differed between a master and its
+  replica, and a master killed and started from its AOF no longer matched
+  the replica it had: the replica could not be continued and took a full
+  sync it did not need. No reply differed (`XPENDING` and `XINFO` showed
+  the same) and nothing was lost. The digest now holds the time as it is
+  shown, 0 for a released entry. A 1.2.2 node and a new one compute a
+  different digest for a dataset with released entries, so a replica of
+  one kind of a master of the other that comes back after the master was
+  killed takes a full sync (two 1.2.2 nodes already did; it costs a sync,
+  not data); the stream, a clean restart and a full sync work as before.
+
 - **`ASKING` before `MULTI` covers the whole transaction on a node
   importing the slot (#698).** It was used up by the first queued command,
   so the next one, or the `EXEC`, was answered `MOVED`, and a transaction
@@ -353,6 +368,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `EXEC` runs. An `EXEC` that is refused (wrong arguments, or denied by
   ACL) ends the transaction too, so it clears it as well. `RESET` clears it,
   as in Redis.
+
+- **`CONFIG GET dbfilename` answers with the snapshot file's name (#846).**
+  It answered nothing, so a tool that takes a snapshot over the protocol
+  (`SAVE`, then `CONFIG GET dir` and `CONFIG GET dbfilename`) could not find
+  the file. It now answers `dump.kdb`, the file the server writes and loads
+  whatever `--dbfilename` or the configuration file said, and a pattern such
+  as `d*` lists it. The name still cannot be changed: `CONFIG SET
+  dbfilename` with another name is refused, as the same setting in the
+  configuration file is.
+
+- **Entries `XNACK` released are no longer the entries of a consumer named
+  `""` (#833).** A released entry belongs to no consumer, but KiviDB kept
+  it under the empty name, so a real consumer named `""` was reported
+  as holding them: `XPENDING` with that consumer, `XINFO CONSUMERS`, the
+  `XPENDING` summary and a history read of it counted them, and `XGROUP
+  DELCONSUMER` deleted them. Released entries are now kept apart, as in
+  Redis 8.10.2. A snapshot keeps the two apart (a snapshot from an
+  earlier release still reads as it did, and tells them apart by the
+  delivery time `XNACK` gives), and an earlier release reads a new
+  snapshot as it read the old one. For that, `XCLAIM` for a consumer named
+  `""` with a `TIME` before 2004 (or an `IDLE` reaching back that far)
+  records that point in time instead.
 
 - **Under an `allkeys-*` policy a write is no longer refused with OOM while
   eviction is working (#520).** Two things refused one. Eviction stopped
@@ -417,6 +454,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FT.HYBRID` is unchanged (#779): Redis already answers it under
   `return-strict` with what was found.
 
+- **A vararg function in a script has Lua 5.1's implicit `arg` (#820).**
+  Redis builds its Lua with `LUA_COMPAT_VARARG`, so `function f(...)
+  for _, v in ipairs(arg) do ... end end` runs there; here it failed with
+  "Script attempted to access nonexistent global variable 'arg'" (older
+  scripts and sidekiq-unique-jobs' test fixtures use it). A vararg function
+  whose text says `arg` now starts with the local Lua 5.1 makes: the table
+  of its extra arguments with their count in `n`, or `nil` when its body
+  uses `...` itself, as in Redis. It is added once, when the script or
+  library is compiled, on the line of the function's parameters; a script
+  that does not say `arg` in a vararg function is compiled unchanged, and
+  no call does any more than it did.
 - **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
   scan whatever follows the cursor, and read their options as Redis does
   (#820).** `ZSCAN key 0 MATCH * COUNT 0` on a missing key answered `ERR

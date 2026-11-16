@@ -514,11 +514,68 @@ fn kdb_stream_consumer_groups_and_meta() {
             assert_eq!(g.entries_read, 1);
             assert_eq!(g.pel.len(), 1);
             let pel = g.pel.get(&StreamId::new(1000, 1)).unwrap();
-            assert_eq!(*pel.consumer(), "c1");
+            assert_eq!(pel.shown_consumer(), &b"c1"[..]);
             assert_eq!(g.pel.consumer_len(b"c1"), 1);
             g.pel.check().unwrap();
             assert_eq!(pel.delivery_count, 2);
             assert_eq!(g.consumers.get(&b"c1"[..]), Some(&1_700_000_000_100));
+        }
+        _ => panic!("wrong type"),
+    }
+}
+
+/// A snapshot keeps the entries `XNACK` released apart from those of a
+/// consumer named "" (#833): the first have no name and a delivery time
+/// below the one `XNACK` gives, which a real delivery never has.
+#[test]
+fn kdb_stream_released_entries_are_not_the_empty_named_consumers() {
+    use kividb::types::{ConsumerGroup, Pel};
+
+    let mut stream = StreamInner::new();
+    stream.last_id = StreamId::new(10, 0);
+    for ms in 1..=5 {
+        stream.entries.push_tail(
+            StreamId::new(ms, 0),
+            &[(Arc::from(b"f".as_slice()), Arc::from(b"v".as_slice()))],
+        );
+    }
+    let mut pel = Pel::new();
+    pel.insert(StreamId::new(1, 0), b"", 1_700_000_000_000, 1);
+    // A delivery time set by hand (XCLAIM ... TIME 5) as low as the mark.
+    pel.insert(StreamId::new(2, 0), b"", 5, 1);
+    pel.insert(StreamId::new(3, 0), b"alice", 1_700_000_000_000, 1);
+    pel.release(&StreamId::new(3, 0)).unwrap().delivered_at = 7;
+    pel.insert_released(StreamId::new(4, 0), 8, 0);
+    pel.insert_released(StreamId::new(5, 0), 0, 3);
+    pel.check().unwrap();
+    let mut consumers = AHashMap::new();
+    consumers.insert("".into(), 1_700_000_000_100);
+    consumers.insert("alice".into(), 1_700_000_000_100);
+    stream.groups.insert(
+        "g".into(),
+        ConsumerGroup {
+            name: "g".into(),
+            last_id: StreamId::new(5, 0),
+            entries_read: 5,
+            pel,
+            consumers,
+            active: Default::default(),
+        },
+    );
+    match roundtrip_one("st", KiviDBValue::Stream(Arc::new(RwLock::new(stream)))) {
+        KiviDBValue::Stream(s) => {
+            let inner = s.read();
+            let g = inner.groups.get(&b"g"[..]).unwrap();
+            g.pel.check().unwrap();
+            assert_eq!(g.pel.len(), 5);
+            assert_eq!(g.pel.consumer_len(b""), 2, "the empty-named consumer's");
+            assert_eq!(g.pel.consumer_len(b"alice"), 0);
+            assert_eq!(g.pel.released_len(), 3);
+            for (ms, released) in [(1, false), (2, false), (3, true), (4, true), (5, true)] {
+                let entry = g.pel.get(&StreamId::new(ms, 0)).unwrap();
+                assert_eq!(entry.is_released(), released, "{ms}-0");
+            }
+            assert_eq!(g.pel.get(&StreamId::new(5, 0)).unwrap().delivery_count, 3);
         }
         _ => panic!("wrong type"),
     }
@@ -1979,7 +2036,10 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
     assert_eq!((first.ms, first.seq), (1, 1));
     let group = &st.groups[&b"g"[..]];
     assert_eq!(group.pel.len(), 1);
-    assert_eq!(*group.pel.values().next().unwrap().consumer(), "alice");
+    assert_eq!(
+        group.pel.values().next().unwrap().shown_consumer(),
+        &b"alice"[..]
+    );
     assert_eq!(group.pel.consumer_len(b"alice"), 1);
     group.pel.check().unwrap();
     assert!(group.consumers.contains_key(&b"alice"[..]));

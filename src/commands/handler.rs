@@ -1412,9 +1412,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // What asking again would answer, were none passed; the
         // `debug_assert` says the applier's decision and the one here have
         // not drifted apart since they stopped being the same question.
-        let alone = ctx
-            .applied_gate_alone
-            .unwrap_or_else(|| takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated));
+        let alone = ctx.applied_gate_alone.unwrap_or_else(|| {
+            takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated)
+        });
         debug_assert!(
             ctx.applied_gate_alone.is_none_or(|passed| passed
                 == takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated)),

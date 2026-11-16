@@ -3582,3 +3582,119 @@ fn migrate_keeps_the_order_of_a_series_labels() {
     }
     assert_labels(&mut t, &series, Some(&digests), "after MIGRATE");
 }
+
+// ── Entries `XNACK` released (#856) ──────────────────────────────────────────
+
+/// A stream `key` with three entries, all delivered to a consumer and two of
+/// them released by `XNACK`: pending entries that are no one's.
+fn stream_with_released_entries(c: &mut Conn, key: &str) {
+    assert!(c.cmd(&["XGROUP", "CREATE", key, "g", "$", "MKSTREAM"]).ok());
+    for id in ["1-1", "2-1", "3-1"] {
+        assert_eq!(c.cmd(&["XADD", key, id, "f", "v"]).s(), id);
+    }
+    assert_eq!(
+        c.cmd(&["XREADGROUP", "GROUP", "g", "c1", "STREAMS", key, ">"])
+            .arr()
+            .len(),
+        1
+    );
+    assert_eq!(
+        c.cmd(&["XNACK", key, "g", "FAIL", "IDS", "2", "1-1", "2-1"])
+            .i(),
+        2
+    );
+}
+
+/// What a client sees of the pending entries: the same everywhere, but for
+/// the idle time of a delivered one, which is each node's own clock.
+fn pending_of(c: &mut Conn, key: &str) -> Vec<(String, String, i64)> {
+    c.cmd(&["XPENDING", key, "g", "-", "+", "10"])
+        .arr()
+        .iter()
+        .map(|row| {
+            let row = row.arr();
+            (row[0].s().to_string(), row[1].s().to_string(), row[3].i())
+        })
+        .collect()
+}
+
+/// `XNACK` is propagated as the command, and each node that applies it gives
+/// a released entry a mark of its own for the time it was delivered, from a
+/// counter of its process. The dataset's digest held the mark, so a master and
+/// its replica had two digests for one dataset, and a master that was killed
+/// and started from its append-only file (which applies the `XNACK` again)
+/// differed from the replica it had: the replica could not be continued, and
+/// was sent everything (#856). Nothing was lost; the sync was not needed.
+#[test]
+fn entries_xnack_released_do_not_make_a_master_and_its_replica_differ() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let mut m = master.conn();
+    // An XNACK before the replica is there: this process's counter is ahead
+    // of the replica's when it applies the next one.
+    stream_with_released_entries(&mut m, "warm");
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    // Applied from the stream, as it is made.
+    stream_with_released_entries(&mut m, "s");
+    assert_same_dataset(&mut m, &mut r);
+    for key in ["warm", "s"] {
+        assert_eq!(digest_of(&mut m, key), digest_of(&mut r, key), "{key}");
+        assert_eq!(pending_of(&mut m, key), pending_of(&mut r, key), "{key}");
+    }
+    let digests = [digest_of(&mut m, "warm"), digest_of(&mut m, "s")];
+
+    // The master killed and started from its AOF: the XNACKs are applied
+    // again, by a new process. Same dataset, same digests, and the replica
+    // that holds it is continued, not sent it again.
+    drop((m, r));
+    std::thread::sleep(Duration::from_millis(1500));
+    master.kill();
+    master.restart_master(&mut [&mut replica]);
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    for (key, digest) in ["warm", "s"].into_iter().zip(&digests) {
+        assert_eq!(&digest_of(&mut m, key), digest, "{key} after replay");
+        assert_eq!(&digest_of(&mut r, key), digest, "{key} on the replica");
+    }
+    write_batch(&mut m, 0, 5);
+    assert_same_dataset(&mut m, &mut r);
+    assert_eq!(
+        m.stat("sync_full"),
+        0,
+        "{}
+{}",
+        master.log(),
+        replica.log()
+    );
+    assert_eq!(m.stat("sync_partial_ok"), 1);
+
+    // A replica that is sent the dataset holds the same: it loads the marks
+    // the snapshot has, which are not its own.
+    let late = Server::start(&["--replicaof", "127.0.0.1", &master.port.to_string()]);
+    let mut l = late.conn();
+    wait_link_up(&mut l);
+    assert_same_dataset(&mut m, &mut l);
+    for (key, digest) in ["warm", "s"].into_iter().zip(&digests) {
+        assert_eq!(&digest_of(&mut l, key), digest, "{key} after a full sync");
+    }
+}
+
+/// An entry that is released and one a consumer holds are two things,
+/// whatever the time: the digest still tells them apart (a replica that held
+/// the wrong one would be continued with the wrong data).
+#[test]
+fn a_released_entry_and_a_delivered_one_digest_apart() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    stream_with_released_entries(&mut c, "b");
+    // Claiming a released entry makes it a consumer's.
+    let before = digest_of(&mut c, "b");
+    assert_eq!(
+        c.cmd(&["XCLAIM", "b", "g", "c2", "0", "1-1"]).arr().len(),
+        1
+    );
+    assert_ne!(digest_of(&mut c, "b"), before);
+}
