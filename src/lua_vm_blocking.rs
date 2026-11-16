@@ -131,7 +131,6 @@ impl ClientExecEnv {
             cluster: &self.cluster_state,
             bypass_cluster_check: false,
             apply_replication: false,
-            applied_gate_alone: None,
             skip_write_side_effects: false,
             peer_addr: &self.peer_addr,
             monitor_registry: &self.monitor_registry,

@@ -3221,7 +3221,6 @@ pub fn replay_aof(
                 &mut selected_db,
                 &watch_registry,
                 "aof-replay",
-                None,
             )
             .is_err()
         {

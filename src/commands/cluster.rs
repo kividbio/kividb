@@ -3040,7 +3040,6 @@ mod tests {
             cluster: &cluster,
             bypass_cluster_check: false,
             apply_replication: false,
-            applied_gate_alone: None,
             skip_write_side_effects: false,
             peer_addr: "127.0.0.1:1",
             monitor_registry: &monitor_registry,

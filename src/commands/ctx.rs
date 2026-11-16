@@ -127,16 +127,6 @@ pub struct Ctx<'a> {
     /// True only when applying replicated commands from the master stream.
     /// Normal clients attached to a replica must not mutate data (read-only replica).
     pub apply_replication: bool,
-    /// Whether this command takes the command gate alone, as the replica's
-    /// applier already decided for it (`applied_takes_the_gate_alone`,
-    /// #373) when it took the gate for the turn the command is applied in.
-    /// `run_command` uses it as is instead of asking
-    /// `takes_the_gate_alone` a second time for the same command; a
-    /// `debug_assert` there says the two do not drift apart. `None` for a
-    /// client's command, and for one the AOF replay applies at startup,
-    /// which has no such decision made for it: `run_command` asks, as
-    /// before.
-    pub applied_gate_alone: Option<bool>,
     /// SETBIT / BITFIELD no-op: skip replication feed and `rdb_changes_since_last_save` bump.
     pub skip_write_side_effects: bool,
     /// Address of the connected client — used for MONITOR line formatting.
