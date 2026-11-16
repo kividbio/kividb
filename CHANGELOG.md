@@ -327,6 +327,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CONFIG GET appendfilename` answers `appendonly.aof`, and `CONFIG SET
+  appendfilename appendonly.aof` is accepted (#855).** It answered an empty
+  list, and the set was refused although the configuration file takes the
+  same value. Any other name is still refused: the log has one name.
+
 - **A master and its replica hold the same dataset digest while entries
   `XNACK` released are pending (#856).** Each node that applied the
   `XNACK` (a replica, an AOF replay) gave a released entry its own internal
