@@ -32,6 +32,7 @@ and why.
 | `13-cluster-reshard` | #294 / #724 | 3-master cluster on one VM, 3M keys: `redis-cli` 7.0.15 `--cluster reshard` of 1,000 slots |
 | `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one; `SDIFFSTORE big small` as a cost guard; worst `SADD` to the small set during `SUNION big small` (Tokio, 1M) |
 | `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
+| `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
 
 ## Running it
 
@@ -745,6 +746,87 @@ Redis 27-101, v1.2.2 0.4-9.3 s. Every engine delivered every job exactly
 once (`lost` 0) and left no client blocked once the workers had gone
 (`blocked_after` 0; the issue's 469 left on 1.2.2 were not reproduced here,
 with workers that close cleanly).
+
+## Recorded run, suite 16
+
+Recorded 2026-11-16 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 16 --record`; the candidate is commit `8160700c` (#839),
+`cargo build --release --features lua,tls`. Runs: `pr-839-d4s_v5` (recorded)
+and `pr-839-d4s_v5-rerun` (the noise check: every gate passed, host speed
+1.03x). A run takes 75 s.
+
+One connection, `redis-py`, one reply at a time: each figure is a mean over
+150 (1,000,000 members), 1,000 (10,000) or 3,000 (100) calls, the median of 3
+rounds, and includes the round trip, about 50 us here. `bad_replies` (a reply
+of the wrong length, or with a member twice for a positive count) is 0 on
+every engine. Recorded run (rerun in brackets):
+
+1,000,000 members / fields (microseconds a call, rerun in brackets):
+
+| command | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|
+| `ZRANDMEMBER z` | 5,608 (5,537) | 1,121 (1,065) | 46 (47) |
+| `ZRANDMEMBER z 1` | 6,560 (6,210) | 995 (1,056) | 49 (50) |
+| `ZRANDMEMBER z 10` | 6,443 (6,375) | 1,852 (1,871) | 84 (64) |
+| `ZRANDMEMBER z -10` | 5,470 (5,426) | 1,803 (1,877) | 79 (79) |
+| `ZRANDMEMBER z 10 WITHSCORES` | 6,544 (6,272) | 1,820 (1,860) | 90 (72) |
+| `HRANDFIELD h` | 66 (50) | 49 (67) | 50 (48) |
+| `HRANDFIELD h 1` | 1,096 (1,055) | 51 (71) | 66 (50) |
+| `HRANDFIELD h 10` | 1,049 (1,135) | 63 (60) | 80 (63) |
+| `HRANDFIELD h -10` | 700 (695) | 60 (59) | 79 (80) |
+| `HRANDFIELD h 10 WITHVALUES` | 1,111 (1,211) | 70 (69) | 88 (72) |
+
+10,000 members / fields (microseconds a call, rerun in brackets):
+
+| command | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|
+| `ZRANDMEMBER z` | 95 (84) | 60 (68) | 50 (47) |
+| `ZRANDMEMBER z 1` | 78 (98) | 75 (59) | 58 (66) |
+| `ZRANDMEMBER z 10` | 113 (107) | 72 (69) | 78 (79) |
+| `ZRANDMEMBER z -10` | 108 (99) | 74 (69) | 59 (59) |
+| `ZRANDMEMBER z 10 WITHSCORES` | 110 (98) | 79 (99) | 85 (69) |
+| `HRANDFIELD h` | 66 (48) | 48 (66) | 58 (47) |
+| `HRANDFIELD h 1` | 83 (57) | 70 (71) | 65 (50) |
+| `HRANDFIELD h 10` | 94 (90) | 63 (80) | 60 (77) |
+| `HRANDFIELD h -10` | 63 (87) | 79 (79) | 75 (75) |
+| `HRANDFIELD h 10 WITHVALUES` | 75 (75) | 76 (89) | 77 (84) |
+
+100 members / fields (microseconds a call, rerun in brackets):
+
+| command | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|
+| `ZRANDMEMBER z` | 50 (65) | 48 (50) | 47 (53) |
+| `ZRANDMEMBER z 1` | 51 (54) | 51 (52) | 51 (56) |
+| `ZRANDMEMBER z 10` | 59 (71) | 59 (59) | 59 (60) |
+| `ZRANDMEMBER z -10` | 65 (60) | 59 (60) | 59 (75) |
+| `ZRANDMEMBER z 10 WITHSCORES` | 87 (68) | 68 (68) | 68 (71) |
+| `HRANDFIELD h` | 48 (54) | 49 (48) | 47 (48) |
+| `HRANDFIELD h 1` | 61 (51) | 69 (51) | 50 (56) |
+| `HRANDFIELD h 10` | 60 (64) | 77 (59) | 59 (67) |
+| `HRANDFIELD h -10` | 65 (59) | 59 (80) | 59 (75) |
+| `HRANDFIELD h 10 WITHVALUES` | 78 (74) | 68 (67) | 71 (71) |
+
+What it shows:
+
+- **The hash is O(count)**, as in Redis: at 1,000,000 fields `HRANDFIELD h 10`
+  takes 63 us against 1,049 us in v1.2.2 (Redis 80), whatever the size. At 100 and
+  10,000 there was nothing to gain and nothing is lost (the figures are the
+  round trip).
+- **The sorted set is not.** It has no index by position (a hash map of
+  members beside an ordered tree), so a sample is found by walking the member
+  table up to the last position picked, without copying it: about half of it
+  for one member (about a millisecond at 1,000,000, v1.2.2: 5.6 ms), nearly
+  all of it for ten (1.8 ms, v1.2.2: 6.4 ms). Redis, which indexes by rank,
+  takes 50-90 us. At 10,000 members the walk is within the round trip. A
+  member table that can be asked for its Nth member, as the sets' is
+  (`member_set.rs`) or an order-statistic tree, would make it O(count), and is
+  the storage change this needs.
+
+Gates: `rel` 50 % or 20 us (whichever is larger) on every row; at 1,000,000
+also `ratio` (keep 60 % of the gain over v1.2.2, every row but `HRANDFIELD h`,
+which never copied) and, for the hash rows, at most 2x Redis. The sorted set's
+rows are not compared with Redis (see above). The figures are of the client's
+round trip as much as of the server: compare within a session, as the gates do.
 
 ## Not covered
 
