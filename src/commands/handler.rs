@@ -1396,22 +1396,33 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // stream, alone for a command that takes it alone
     // (`applied_takes_the_gate_alone`, #373), and EXEC and a script hold it
     // alone for theirs. For one applied, that decision is the one taken —
-    // `Ctx::applied_gate_alone`: asked again here it could answer the other
-    // way (`lua-parallel-scripts` switched between the two calls), and the
-    // command would run without the exclusivity the applier's shared hold
-    // never gave it, nested entries taking nothing and saying nothing.
+    // `Ctx::applied_gate_alone` — instead of working it out a second time
+    // here. What a `CONFIG SET lua-parallel-scripts` would change in the
+    // asking cannot move in between: the `CONFIG SET` takes the gate alone
+    // itself, and the applier holds it for the whole turn.
     #[cfg(debug_assertions)]
     if gated && !crate::write_gate::held_by_this_thread() {
         crate::pause::test_stall_before_the_gate(ctx.cmd.as_slice());
     }
     let gates = if crate::command_gate::skips(name, &ctx.cmd) {
         Some((None, None))
-    } else if ctx.applied_gate_alone.unwrap_or_else(|| {
-        takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated)
-    }) {
-        crate::command_gate::enter_alone_unless(SLICE, overrun).map(|alone| (None, Some(alone)))
     } else {
-        crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
+        // What asking again would answer, were none passed; the
+        // `debug_assert` says the applier's decision and the one here have
+        // not drifted apart since they stopped being the same question.
+        let alone = ctx
+            .applied_gate_alone
+            .unwrap_or_else(|| takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated));
+        debug_assert!(
+            ctx.applied_gate_alone.is_none_or(|passed| passed
+                == takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated)),
+            "the gate decision the applier passed no longer matches takes_the_gate_alone"
+        );
+        if alone {
+            crate::command_gate::enter_alone_unless(SLICE, overrun).map(|alone| (None, Some(alone)))
+        } else {
+            crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
+        }
     };
     let Some((_command_gate, _alone)) = gates else {
         return busy_reply();

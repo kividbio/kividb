@@ -203,6 +203,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     replica without `vset-quant`, which logs why, instead of sending
     snapshots 1.2 refuses. **Upgrade replicas before masters.**
 
+- **A replica's `INFO replication` reports `master_replid`, as Redis's
+  does (#402).** It is the id of the stream `slave_repl_offset` counts in:
+  all zeros until a master has answered a `PSYNC`, the followed stream's
+  id after — including the new id a restarted master announces when a
+  dataset digest lets the replica continue without a full sync.
+
 ### Changed
 
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
@@ -317,6 +323,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stop at the query's `TIMEOUT` (#670).
 
 ### Fixed
+
+- **A replica continued by a dataset digest keeps the new stream's id as
+  its resync point (#402).** A master killed and started again from its
+  AOF begins a new stream; a replica that proved its dataset was that
+  stream's start (`+DIGEST`, then `+CONTINUE`) was continued but kept the
+  dead stream's id — and one that had asked `PSYNC ? -1` kept no resync
+  point at all. Promoted, such a replica advertised a `repl_id2` that
+  never was, so its siblings could not continue under the id they knew;
+  restarted, it asked for a full resync it did not need. The point now
+  takes the id `+CONTINUE` announces and the place the stream is continued
+  from, under the lock a promotion reads it in, and is dropped when the
+  node had stopped being a replica before the reply arrived.
 
 - **`ON_TIMEOUT return-strict` is accepted and `FT.SEARCH` / `FT.AGGREGATE`
   reply with what was found, as Redis does (#781).** Redis spells the

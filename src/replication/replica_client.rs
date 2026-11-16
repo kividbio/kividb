@@ -920,28 +920,26 @@ async fn run_replication_session(
         // the id a replica that asked `PSYNC ? -1` had nothing kept of at
         // all. Either way, what is kept as where this dataset stands is
         // that stream's id, and the place it is continued from (#109).
+        //
+        // Under the lock `become_master` takes to read where the stream
+        // stood, the generation checked in it: the reply can have arrived
+        // after this node stopped being a replica (`REPLICAOF NO ONE`, a
+        // failover), `guarded` having last looked before the await. Then
+        // the point this would write is not this node's to keep.
         if let Some(id) = tok.get(1).filter(|id| id.len() == 40) {
-            let mut slot = repl_state.resync_point.lock();
-            match slot.as_mut() {
-                Some(current) => {
-                    if current.repl_id.as_str() != *id {
-                        log_info!(
-                            "Replication: The master continues {} as {id}",
-                            current.repl_id
-                        );
-                        current.repl_id = id.to_string();
-                    }
-                    current.offset = point.offset;
-                    current.db = point.db;
-                }
-                None => {
-                    *slot = Some(crate::replication::ResyncPoint {
-                        repl_id: id.to_string(),
-                        offset: point.offset,
-                        db: point.db,
-                    });
-                }
+            let _applying = repl_state.apply_lock.lock();
+            if repl_state.generation() != my_generation {
+                return Ok(SessionEnd::Superseded);
             }
+            let old = repl_state.resync_point.lock().clone();
+            if let Some(old) = old.as_ref().filter(|p| p.repl_id != *id) {
+                log_info!("Replication: The master continues {} as {id}", old.repl_id);
+            }
+            repl_state.set_resync_point(Some(crate::replication::ResyncPoint {
+                repl_id: id.to_string(),
+                offset: point.offset,
+                db: point.db,
+            }));
         }
         repl_state.set_stream_origin(repl_state.cluster_master_node());
         log_info!(
@@ -1468,9 +1466,10 @@ async fn run_replication_session(
             let keeps_vset_quant = repl_state.master_keeps_vset_quant.load(Ordering::Relaxed);
             let mut dropped_vset_quant = false;
             // One command, a write the master sent as it is. `$alone` is
-            // whether the turn the command is applied in holds the command
-            // gate alone: the decision `run_command` takes of
-            // `Ctx::applied_gate_alone` instead of working it out again.
+            // the applier's classification of it
+            // (`applied_takes_the_gate_alone`): the decision `run_command`
+            // takes of `Ctx::applied_gate_alone` instead of working it out
+            // a second time.
             macro_rules! apply {
                 ($cmd:expr, $alone:expr) => {
                     repl_apply
@@ -1576,7 +1575,10 @@ async fn run_replication_session(
                         let _propagation = repl_apply.propagation_group(repl_state);
                         heartbeats_seen |= whole.heartbeat;
                         for cmd in whole.commands {
-                            apply!(cmd, alone);
+                            let refs: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+                            let wants_alone =
+                                crate::commands::handler::applied_takes_the_gate_alone(&refs);
+                            apply!(cmd, wants_alone);
                         }
                         whole.len
                     }
@@ -1622,7 +1624,7 @@ async fn run_replication_session(
                             if alone && !wants_alone && parse_pos > 0 {
                                 break;
                             }
-                            apply!(cmd.iter().map(|v| v.to_vec()).collect(), alone);
+                            apply!(cmd.iter().map(|v| v.to_vec()).collect(), wants_alone);
                             parse_pos += consumed;
                             // Holding the gate shared, a turn ends when
                             // something waits to take it alone, as the gate
@@ -2256,10 +2258,11 @@ impl ReplicationApplyEnv {
         }
     }
 
-    /// `gate_alone`: whether the caller holds the command gate alone for
-    /// this command — the applier's decision, which `run_command` takes of
-    /// `Ctx::applied_gate_alone` instead of working it out again. `None`
-    /// where no decision was made (the AOF replay): `run_command` asks.
+    /// `gate_alone`: whether this command takes the command gate alone, as
+    /// the applier classified it (`applied_takes_the_gate_alone`) —
+    /// `run_command` takes it of `Ctx::applied_gate_alone` instead of
+    /// working it out a second time. `None` where no decision was made
+    /// (the AOF replay): `run_command` asks.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_command(
         &self,

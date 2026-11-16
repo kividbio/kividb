@@ -128,16 +128,14 @@ pub struct Ctx<'a> {
     /// Normal clients attached to a replica must not mutate data (read-only replica).
     pub apply_replication: bool,
     /// Whether this command takes the command gate alone, as the replica's
-    /// applier already decided when it took the gate for the turn the
-    /// command is applied in (`applied_takes_the_gate_alone`, #373).
-    /// `run_command` uses it as is rather than asking
-    /// `takes_the_gate_alone` again: asked twice, the two could answer
-    /// differently (`lua-parallel-scripts` switched between the calls is
-    /// the only window) and, nested gate entries being no-ops, nothing
-    /// would report the command running without the exclusivity the
-    /// applier's shared hold never gave it. `None` for a client's command,
-    /// and for one the AOF replay applies at startup, which has no such
-    /// decision made for it: `run_command` asks, as before.
+    /// applier already decided for it (`applied_takes_the_gate_alone`,
+    /// #373) when it took the gate for the turn the command is applied in.
+    /// `run_command` uses it as is instead of asking
+    /// `takes_the_gate_alone` a second time for the same command; a
+    /// `debug_assert` there says the two do not drift apart. `None` for a
+    /// client's command, and for one the AOF replay applies at startup,
+    /// which has no such decision made for it: `run_command` asks, as
+    /// before.
     pub applied_gate_alone: Option<bool>,
     /// SETBIT / BITFIELD no-op: skip replication feed and `rdb_changes_since_last_save` bump.
     pub skip_write_side_effects: bool,
