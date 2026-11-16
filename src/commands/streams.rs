@@ -2396,7 +2396,7 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
                         };
                         resp_array(vec![
                             resp_bulk_str(&id.to_string()),
-                            resp_bulk(p.consumer()),
+                            resp_bulk(p.shown_consumer()),
                             resp_integer(idle),
                             resp_integer(p.delivery_count as i64),
                         ])
@@ -2989,7 +2989,7 @@ fn xinfo_stream_full(
                 .map(|(id, p)| {
                     resp_array(vec![
                         resp_bulk_str(&id.to_string()),
-                        resp_bulk(p.consumer()),
+                        resp_bulk(p.shown_consumer()),
                         resp_integer(shown_delivery_time(p.delivered_at)),
                         resp_integer(p.delivery_count as i64),
                     ])
@@ -3042,7 +3042,7 @@ fn xinfo_stream_full(
                     resp_integer(g.pel.len() as i64),
                     // Entries `XNACK` released: pending, and no one's.
                     resp_bulk_str("nacked-count"),
-                    resp_integer(g.pel.consumer_len(b"") as i64),
+                    resp_integer(g.pel.released_len() as i64),
                     // Redis 8.10's name for the pending entries, here and
                     // for each consumer (it was `pel`).
                     resp_bulk_str("pending"),
@@ -3694,7 +3694,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
             for (pos, id) in ids.iter().enumerate() {
                 // Unowned, and immediately claimable, after what was
                 // released before it.
-                match g.pel.assign(id, b"") {
+                match g.pel.release(id) {
                     Some(entry) => {
                         entry.delivery_count = match retrycount {
                             // RETRYCOUNT overrides the mode-based adjustment.
@@ -3722,8 +3722,11 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
                             (None, Mode::Fatal) => i64::MAX as u64,
                             (None, _) => 0,
                         };
-                        g.pel
-                            .insert(id.clone(), b"", stream_extra::nack_time(), delivery_count);
+                        g.pel.insert_released(
+                            id.clone(),
+                            stream_extra::nack_time(),
+                            delivery_count,
+                        );
                         released += 1;
                     }
                     // Not pending and no FORCE — ignored, not counted.

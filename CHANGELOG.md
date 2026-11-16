@@ -327,6 +327,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ACL) ends the transaction too, so it clears it as well. `RESET` clears it,
   as in Redis.
 
+- **Entries `XNACK` released are no longer the entries of a consumer named
+  `""` (#833).** A released entry belongs to no consumer, but KiviDB kept
+  it under the empty name, so a real consumer named `""` was reported
+  as holding them: `XPENDING` with that consumer, `XINFO CONSUMERS`, the
+  `XPENDING` summary and a history read of it counted them, and `XGROUP
+  DELCONSUMER` deleted them. Released entries are now kept apart, as in
+  Redis 8.10.2. A snapshot keeps the two apart (a snapshot from an
+  earlier release still reads as it did, and tells them apart by the
+  delivery time `XNACK` gives), and an earlier release reads a new
+  snapshot as it read the old one.
 - **Under an `allkeys-*` policy a write is no longer refused with OOM while
   eviction is working (#520).** Two things refused one. Eviction stopped
   once it had evicted about 1 MB of keys with memory use no lower (the

@@ -445,8 +445,18 @@ fn write_stream_groups(w: &mut impl Write, inner: &StreamInner) -> io::Result<()
         w.write_all(&(g.pel.len() as u32).to_le_bytes())?;
         for (id, pel) in g.pel.iter() {
             write_stream_id(w, id)?;
-            write_bytes(w, pel.consumer().as_bytes())?;
-            w.write_all(&pel.delivered_at.to_le_bytes())?;
+            // An entry `XNACK` released is written with no name and a
+            // delivery time below `NACKED_BELOW`, which a real delivery
+            // never has; one that a consumer named "" owns is kept above
+            // it, so that the two read back apart (#833).
+            let delivered_at = match pel.consumer() {
+                Some(c) if c.as_bytes().is_empty() => pel
+                    .delivered_at
+                    .max(crate::commands::stream_extra::NACKED_BELOW),
+                _ => pel.delivered_at,
+            };
+            write_bytes(w, pel.shown_consumer())?;
+            w.write_all(&delivered_at.to_le_bytes())?;
             w.write_all(&pel.delivery_count.to_le_bytes())?;
         }
         w.write_all(&(g.consumers.len() as u32).to_le_bytes())?;
@@ -571,7 +581,13 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
             let consumer = read_bytes(r)?;
             let delivered_at = read_u64_le(r)?;
             let delivery_count = read_u64_le(r)?;
-            pel.insert(id, &consumer, delivered_at, delivery_count);
+            // No name and a delivery time `XNACK` gives: released, as it was
+            // saved (snapshots from before #833 wrote the same).
+            if consumer.is_empty() && delivered_at < crate::commands::stream_extra::NACKED_BELOW {
+                pel.insert_released(id, delivered_at, delivery_count);
+            } else {
+                pel.insert(id, &consumer, delivered_at, delivery_count);
+            }
         }
         let ccount = read_u32_le(r)? as usize;
         let mut consumers = AHashMap::with_capacity(hint(ccount));
@@ -4234,7 +4250,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
                 return Err(rdb_invalid("a pending entry is listed twice"));
             }
             // Owned by no one until a consumer below claims it.
-            group.pel.insert(id, b"", delivered_at, delivery_count);
+            group.pel.insert_released(id, delivered_at, delivery_count);
         }
         for _ in 0..rdb_read_plain_length(r)? {
             let consumer = crate::types::StreamName::from(rdb_read_string(r)?);
@@ -4252,7 +4268,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             for _ in 0..rdb_read_plain_length(r)? {
                 let id = rdb_read_raw_stream_id(r)?;
                 match group.pel.get(&id) {
-                    Some(entry) if entry.consumer().is_empty() => {
+                    Some(entry) if entry.is_released() => {
                         group.pel.assign(&id, &consumer);
                     }
                     _ => return Err(rdb_invalid("a consumer owns an entry the group does not")),
@@ -4263,7 +4279,7 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
             for _ in 0..rdb_read_plain_length(r)? {
                 let id = rdb_read_raw_stream_id(r)?;
                 match group.pel.get_mut(&id) {
-                    Some(entry) if entry.consumer().is_empty() => entry.delivered_at = 0,
+                    Some(entry) if entry.is_released() => entry.delivered_at = 0,
                     _ => return Err(rdb_invalid("a released entry is owned or not pending")),
                 }
             }
