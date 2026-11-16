@@ -1,0 +1,741 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="8" skipped="0" tests="43" time="152.108" timestamp="2026-11-04T20:02:30.681604+00:00" hostname="selfhost"><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_channel.TestRedisBroadcastChannelIntegration" name="test_close_an_active_subscription_should_stop_iteration" time="2.010" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_channel.TestRedisBroadcastChannelIntegration" name="test_end_to_end_messaging" time="0.205" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_channel.TestRedisBroadcastChannelIntegration" name="test_multiple_subscribers_same_topic" time="0.227" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_channel.TestRedisBroadcastChannelIntegration" name="test_topic_isolation" time="0.017" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_channel.TestRedisBroadcastChannelIntegration" name="test_concurrent_producers" time="0.216" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_channel.TestRedisBroadcastChannelIntegration" name="test_subscription_cleanup" time="1.280" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelIntegration" name="test_close_an_active_subscription_should_stop_iteration" time="1.245" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelIntegration" name="test_end_to_end_messaging" time="0.206" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelIntegration" name="test_multiple_subscribers_same_topic" time="0.226" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelIntegration" name="test_topic_isolation" time="0.106" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelIntegration" name="test_concurrent_producers" time="0.215" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelIntegration" name="test_subscription_cleanup" time="1.302" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelClusterIntegration" name="test_cluster_sharded_pubsub_delivers_message" time="120.347"><error message="failed on setup with &quot;redis.exceptions.ConnectionError: Could not connect to Redis&quot;">self = &lt;tests.e2e_tests.containers.libs.broadcast_channel.redis.test_sharded_channel.TestShardedRedisBroadcastChannelClusterIntegration object at 0x74a22e8d2510&gt;
+
+    @pytest.fixture(scope="class")
+    def redis_cluster_container(self) -&gt; Iterator[RedisContainer]:
+        """Create a Redis 7 container with cluster mode enabled."""
+        command = (
+            "redis-server --port 6379 "
+            "--cluster-enabled yes "
+            "--cluster-config-file nodes.conf "
+            "--cluster-node-timeout 5000 "
+            "--appendonly no "
+            "--protected-mode no"
+        )
+&gt;       with RedisContainer(image="redis:7-alpine").with_command(command) as container:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/e2e_tests/containers/libs/broadcast_channel/redis/test_sharded_channel.py:357: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.13/site-packages/testcontainers/core/container.py:299: in __enter__
+    return self.start()
+           ^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/testcontainers/core/container.py:282: in start
+    self._wait_strategy.wait_until_ready(self)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;testcontainers.community.redis.PingWaitStrategy object at 0x74a22e7f5950&gt;
+container = &lt;testcontainers.community.redis.RedisContainer object at 0x74a22e7f7610&gt;
+
+    def wait_until_ready(self, container: WaitStrategyTarget) -&gt; None:
+        if not self._poll(lambda: container.get_client().ping()):
+&gt;           raise redis.exceptions.ConnectionError("Could not connect to Redis")
+E           redis.exceptions.ConnectionError: Could not connect to Redis
+
+.venv/lib/python3.13/site-packages/testcontainers/community/redis/__init__.py:74: ConnectionError</error></testcase><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_close_an_active_subscription_should_stop_iteration" time="1.333" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_end_to_end_messaging" time="0.156" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_multiple_subscriptions_each_receive_each_new_message" time="0.459" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_each_subscription_only_receives_messages_published_after_it_starts" time="0.408" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_prepare_subscription_fixes_boundary_before_listener_starts" time="0.105" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_subscription_with_injected_start_id_reads_only_later_entries" time="0.104" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_topic_isolation" time="0.106" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_concurrent_producers_publish_all_messages" time="0.064" /><testcase classname="tests.e2e_tests.containers.libs.broadcast_channel.redis.test_streams_channel.TestRedisStreamsBroadcastChannelIntegration" name="test_receive_raises_subscription_closed_after_close" time="0.252" /><testcase classname="tests.e2e_tests.containers.libs.test_auto_renew_redis_lock_integration" name="test_db_migration_lock_renews_ttl_and_releases" time="15.578"><failure message="assert -2 &gt; 0">@pytest.mark.usefixtures("flask_app_with_containers")
+    def test_db_migration_lock_renews_ttl_and_releases() -&gt; None:
+        lock_name = f"test:db_migration_auto_renew_lock:{uuid.uuid4().hex}"
+    
+        # Keep base TTL very small, and renew frequently so the test is stable even on slower CI.
+        lock = DbMigrationAutoRenewLock(
+            redis_client=redis_client,
+            name=lock_name,
+            ttl_seconds=1.0,
+            renew_interval_seconds=0.2,
+            log_context="test_db_migration_lock",
+        )
+    
+        acquired = lock.acquire(blocking=True, blocking_timeout=5)
+        assert acquired is True
+    
+        # Wait beyond the base TTL; key should still exist due to renewal.
+        time.sleep(1.5)
+        ttl = redis_client.ttl(lock_name)
+&gt;       assert ttl &gt; 0
+E       assert -2 &gt; 0
+
+tests/e2e_tests/containers/libs/test_auto_renew_redis_lock_integration.py:33: AssertionError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_rate_limiter_integration" name="test_rate_limiter_counts_multiple_attempts_in_same_second" time="0.313" /><testcase classname="tests.e2e_tests.containers.libs.test_rate_limiter_integration" name="test_reservation_admits_only_one_parallel_send" time="0.354"><failure message="redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)">@pytest.mark.usefixtures("flask_app_with_containers")
+    def test_reservation_admits_only_one_parallel_send() -&gt; None:
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+    
+        limiter = helper_module.RateLimiter(prefix=f"test_rate_limit:{uuid.uuid4().hex}", max_attempts=1, time_window=60)
+        ready = Barrier(16)
+    
+        def reserve(_index: int) -&gt; bool:
+            ready.wait(timeout=10)
+            with limiter.reserve("user@example.com") as acquired:
+                return acquired
+    
+        with ThreadPoolExecutor(max_workers=16) as executor:
+&gt;           admitted = list(executor.map(reserve, range(16)))
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:625: in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:318: in _result_or_cancel
+    return fut.result(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:460: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:402: in __get_result
+    raise self._exception
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:39: in reserve
+    with limiter.reserve("user@example.com") as acquired:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/contextlib.py:141: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+libs/helper.py:653: in reserve
+    acquired = bool(script(keys=[key], args=[int(time.time()), self.time_window, self.max_attempts, member]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+extensions/ext_redis.py:268: in execute
+    return registered_script(
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6225: in __call__
+    return client.evalsha(self.sha, len(keys), *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6453: in evalsha
+    return self._evalsha("EVALSHA", sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6437: in _evalsha
+    return self.execute_command(command, sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:716: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:736: in _execute_command
+    result = conn.retry.call_with_retry(
+.venv/lib/python3.13/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:737: in &lt;lambda&gt;
+    lambda: self._send_command_parse_response(
+.venv/lib/python3.13/site-packages/redis/client.py:682: in _send_command_parse_response
+    return self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:780: in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;redis.connection.Connection(host=localhost,port=32801,db=0)&gt;
+disable_decoding = False, disconnect_on_error = True, push_request = False
+
+    def read_response(
+        self,
+        disable_decoding=False,
+        *,
+        disconnect_on_error=True,
+        push_request=False,
+    ):
+        """Read the response from a previously sent command"""
+    
+        host_error = self._host_error()
+    
+        try:
+            if self.protocol in ["3", 3]:
+                response = self._parser.read_response(
+                    disable_decoding=disable_decoding, push_request=push_request
+                )
+            else:
+                response = self._parser.read_response(disable_decoding=disable_decoding)
+        except socket.timeout:
+            if disconnect_on_error:
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except OSError as e:
+            if disconnect_on_error:
+                self.disconnect()
+            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except BaseException:
+            # Also by default close in case of BaseException.  A lot of code
+            # relies on this behaviour when doing Command/Response pairs.
+            # See #1128.
+            if disconnect_on_error:
+                self.disconnect()
+            raise
+    
+        if self.health_check_interval:
+            self.next_health_check = time.monotonic() + self.health_check_interval
+    
+        if isinstance(response, ResponseError):
+            try:
+&gt;               raise response
+E               redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+
+.venv/lib/python3.13/site-packages/redis/connection.py:1364: ResponseError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_rate_limiter_integration" name="test_reservation_preserves_window_expiry_and_failed_send_retry" time="0.309"><failure message="redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)">monkeypatch = &lt;_pytest.monkeypatch.MonkeyPatch object at 0x74a1e69f9150&gt;
+
+    @pytest.mark.usefixtures("flask_app_with_containers")
+    def test_reservation_preserves_window_expiry_and_failed_send_retry(monkeypatch: pytest.MonkeyPatch) -&gt; None:
+        limiter = helper_module.RateLimiter(prefix=f"test_rate_limit:{uuid.uuid4().hex}", max_attempts=1, time_window=60)
+        email = "user@example.com"
+        key = limiter._get_key(email)
+        monkeypatch.setattr(helper_module.time, "time", lambda: 1000)
+    
+        def failed_send() -&gt; None:
+            with limiter.reserve(email) as acquired:
+                assert acquired
+                raise RuntimeError("queue unavailable")
+    
+        with pytest.raises(RuntimeError, match="queue unavailable"):
+&gt;           failed_send()
+
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:62: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:57: in failed_send
+    with limiter.reserve(email) as acquired:
+         ^^^^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/contextlib.py:141: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+libs/helper.py:653: in reserve
+    acquired = bool(script(keys=[key], args=[int(time.time()), self.time_window, self.max_attempts, member]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+extensions/ext_redis.py:268: in execute
+    return registered_script(
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6225: in __call__
+    return client.evalsha(self.sha, len(keys), *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6453: in evalsha
+    return self._evalsha("EVALSHA", sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6437: in _evalsha
+    return self.execute_command(command, sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:716: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:736: in _execute_command
+    result = conn.retry.call_with_retry(
+.venv/lib/python3.13/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:737: in &lt;lambda&gt;
+    lambda: self._send_command_parse_response(
+.venv/lib/python3.13/site-packages/redis/client.py:682: in _send_command_parse_response
+    return self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:780: in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;redis.connection.Connection(host=localhost,port=32801,db=0)&gt;
+disable_decoding = False, disconnect_on_error = True, push_request = False
+
+    def read_response(
+        self,
+        disable_decoding=False,
+        *,
+        disconnect_on_error=True,
+        push_request=False,
+    ):
+        """Read the response from a previously sent command"""
+    
+        host_error = self._host_error()
+    
+        try:
+            if self.protocol in ["3", 3]:
+                response = self._parser.read_response(
+                    disable_decoding=disable_decoding, push_request=push_request
+                )
+            else:
+                response = self._parser.read_response(disable_decoding=disable_decoding)
+        except socket.timeout:
+            if disconnect_on_error:
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except OSError as e:
+            if disconnect_on_error:
+                self.disconnect()
+            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except BaseException:
+            # Also by default close in case of BaseException.  A lot of code
+            # relies on this behaviour when doing Command/Response pairs.
+            # See #1128.
+            if disconnect_on_error:
+                self.disconnect()
+            raise
+    
+        if self.health_check_interval:
+            self.next_health_check = time.monotonic() + self.health_check_interval
+    
+        if isinstance(response, ResponseError):
+            try:
+&gt;               raise response
+E               redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+
+.venv/lib/python3.13/site-packages/redis/connection.py:1364: ResponseError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_rate_limiter_integration" name="test_expired_reservation_failure_does_not_remove_later_send" time="0.315"><failure message="redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)">monkeypatch = &lt;_pytest.monkeypatch.MonkeyPatch object at 0x74a1cc721040&gt;
+
+    @pytest.mark.usefixtures("flask_app_with_containers")
+    def test_expired_reservation_failure_does_not_remove_later_send(monkeypatch: pytest.MonkeyPatch) -&gt; None:
+        limiter = helper_module.RateLimiter(prefix=f"test_rate_limit:{uuid.uuid4().hex}", max_attempts=1, time_window=60)
+        email = "user@example.com"
+        monkeypatch.setattr(helper_module.time, "time", lambda: 1000)
+    
+        def overlapping_sends() -&gt; None:
+            with limiter.reserve(email) as acquired:
+                assert acquired
+                monkeypatch.setattr(helper_module.time, "time", lambda: 1060)
+                with limiter.reserve(email) as new_acquired:
+                    assert new_acquired
+                raise RuntimeError("original send failed")
+    
+        with pytest.raises(RuntimeError, match="original send failed"):
+&gt;           overlapping_sends()
+
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:95: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:87: in overlapping_sends
+    with limiter.reserve(email) as acquired:
+         ^^^^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/contextlib.py:141: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+libs/helper.py:653: in reserve
+    acquired = bool(script(keys=[key], args=[int(time.time()), self.time_window, self.max_attempts, member]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+extensions/ext_redis.py:268: in execute
+    return registered_script(
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6225: in __call__
+    return client.evalsha(self.sha, len(keys), *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6453: in evalsha
+    return self._evalsha("EVALSHA", sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6437: in _evalsha
+    return self.execute_command(command, sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:716: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:736: in _execute_command
+    result = conn.retry.call_with_retry(
+.venv/lib/python3.13/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:737: in &lt;lambda&gt;
+    lambda: self._send_command_parse_response(
+.venv/lib/python3.13/site-packages/redis/client.py:682: in _send_command_parse_response
+    return self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:780: in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;redis.connection.Connection(host=localhost,port=32801,db=0)&gt;
+disable_decoding = False, disconnect_on_error = True, push_request = False
+
+    def read_response(
+        self,
+        disable_decoding=False,
+        *,
+        disconnect_on_error=True,
+        push_request=False,
+    ):
+        """Read the response from a previously sent command"""
+    
+        host_error = self._host_error()
+    
+        try:
+            if self.protocol in ["3", 3]:
+                response = self._parser.read_response(
+                    disable_decoding=disable_decoding, push_request=push_request
+                )
+            else:
+                response = self._parser.read_response(disable_decoding=disable_decoding)
+        except socket.timeout:
+            if disconnect_on_error:
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except OSError as e:
+            if disconnect_on_error:
+                self.disconnect()
+            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except BaseException:
+            # Also by default close in case of BaseException.  A lot of code
+            # relies on this behaviour when doing Command/Response pairs.
+            # See #1128.
+            if disconnect_on_error:
+                self.disconnect()
+            raise
+    
+        if self.health_check_interval:
+            self.next_health_check = time.monotonic() + self.health_check_interval
+    
+        if isinstance(response, ResponseError):
+            try:
+&gt;               raise response
+E               redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+
+.venv/lib/python3.13/site-packages/redis/connection.py:1364: ResponseError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_rate_limiter_integration" name="test_reservation_command_retry_is_idempotent" time="0.309"><failure message="redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)">monkeypatch = &lt;_pytest.monkeypatch.MonkeyPatch object at 0x74a1e7445b80&gt;
+
+    @pytest.mark.usefixtures("flask_app_with_containers")
+    def test_reservation_command_retry_is_idempotent(monkeypatch: pytest.MonkeyPatch) -&gt; None:
+        limiter = helper_module.RateLimiter(prefix=f"test_rate_limit:{uuid.uuid4().hex}", max_attempts=1, time_window=60)
+        register_script = redis_client.register_script
+    
+        def replay_registration(script: str) -&gt; Callable[..., object]:
+            execute = register_script(script)
+    
+            def execute_twice(*, keys: list[str], args: list[object]) -&gt; object:
+                execute(keys=keys, args=args)
+                return execute(keys=keys, args=args)
+    
+            return execute_twice
+    
+        monkeypatch.setattr(redis_client, "register_script", replay_registration)
+&gt;       with limiter.reserve("user@example.com") as acquired:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:117: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/contextlib.py:141: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+libs/helper.py:653: in reserve
+    acquired = bool(script(keys=[key], args=[int(time.time()), self.time_window, self.max_attempts, member]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/e2e_tests/containers/libs/test_rate_limiter_integration.py:111: in execute_twice
+    execute(keys=keys, args=args)
+extensions/ext_redis.py:268: in execute
+    return registered_script(
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6225: in __call__
+    return client.evalsha(self.sha, len(keys), *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6453: in evalsha
+    return self._evalsha("EVALSHA", sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/commands/core.py:6437: in _evalsha
+    return self.execute_command(command, sha, numkeys, *keys_and_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:716: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:736: in _execute_command
+    result = conn.retry.call_with_retry(
+.venv/lib/python3.13/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:737: in &lt;lambda&gt;
+    lambda: self._send_command_parse_response(
+.venv/lib/python3.13/site-packages/redis/client.py:682: in _send_command_parse_response
+    return self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:780: in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;redis.connection.Connection(host=localhost,port=32801,db=0)&gt;
+disable_decoding = False, disconnect_on_error = True, push_request = False
+
+    def read_response(
+        self,
+        disable_decoding=False,
+        *,
+        disconnect_on_error=True,
+        push_request=False,
+    ):
+        """Read the response from a previously sent command"""
+    
+        host_error = self._host_error()
+    
+        try:
+            if self.protocol in ["3", 3]:
+                response = self._parser.read_response(
+                    disable_decoding=disable_decoding, push_request=push_request
+                )
+            else:
+                response = self._parser.read_response(disable_decoding=disable_decoding)
+        except socket.timeout:
+            if disconnect_on_error:
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except OSError as e:
+            if disconnect_on_error:
+                self.disconnect()
+            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except BaseException:
+            # Also by default close in case of BaseException.  A lot of code
+            # relies on this behaviour when doing Command/Response pairs.
+            # See #1128.
+            if disconnect_on_error:
+                self.disconnect()
+            raise
+    
+        if self.health_check_interval:
+            self.next_health_check = time.monotonic() + self.health_check_interval
+    
+        if isinstance(response, ResponseError):
+            try:
+&gt;               raise response
+E               redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+
+.venv/lib/python3.13/site-packages/redis/connection.py:1364: ResponseError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_redis_counter" name="test_increment_preserves_counter_ttl_without_resetting_it" time="0.337"><failure message="redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)">def test_increment_preserves_counter_ttl_without_resetting_it() -&gt; None:
+        key = f"counter-test:{uuid4()}"
+        redis_client.set(key, 0, ex=60)
+        try:
+            for expected in range(1, 7):
+&gt;               assert redis_client.incr_if_exists(key) == expected
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/e2e_tests/containers/libs/test_redis_counter.py:19: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+extensions/ext_redis.py:192: in incr_if_exists
+    count = self.eval(_INCR_IF_EXISTS_LUA, 1, _serialize_redis_name(name, self._get_prefix()))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+extensions/ext_redis.py:249: in eval
+    return self._require_client().execute_command("EVAL", script, numkeys, *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:716: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:736: in _execute_command
+    result = conn.retry.call_with_retry(
+.venv/lib/python3.13/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:737: in &lt;lambda&gt;
+    lambda: self._send_command_parse_response(
+.venv/lib/python3.13/site-packages/redis/client.py:682: in _send_command_parse_response
+    return self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:780: in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;redis.connection.Connection(host=localhost,port=32801,db=0)&gt;
+disable_decoding = False, disconnect_on_error = True, push_request = False
+
+    def read_response(
+        self,
+        disable_decoding=False,
+        *,
+        disconnect_on_error=True,
+        push_request=False,
+    ):
+        """Read the response from a previously sent command"""
+    
+        host_error = self._host_error()
+    
+        try:
+            if self.protocol in ["3", 3]:
+                response = self._parser.read_response(
+                    disable_decoding=disable_decoding, push_request=push_request
+                )
+            else:
+                response = self._parser.read_response(disable_decoding=disable_decoding)
+        except socket.timeout:
+            if disconnect_on_error:
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except OSError as e:
+            if disconnect_on_error:
+                self.disconnect()
+            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except BaseException:
+            # Also by default close in case of BaseException.  A lot of code
+            # relies on this behaviour when doing Command/Response pairs.
+            # See #1128.
+            if disconnect_on_error:
+                self.disconnect()
+            raise
+    
+        if self.health_check_interval:
+            self.next_health_check = time.monotonic() + self.health_check_interval
+    
+        if isinstance(response, ResponseError):
+            try:
+&gt;               raise response
+E               redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+
+.venv/lib/python3.13/site-packages/redis/connection.py:1364: ResponseError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_redis_counter" name="test_expired_counter_is_not_recreated" time="0.338"><failure message="redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)">def test_expired_counter_is_not_recreated() -&gt; None:
+        key = f"counter-test:{uuid4()}"
+        redis_client.set(key, 0, ex=60)
+        redis_client.expire(key, 0)
+&gt;       assert redis_client.incr_if_exists(key) is None
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/e2e_tests/containers/libs/test_redis_counter.py:32: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+extensions/ext_redis.py:192: in incr_if_exists
+    count = self.eval(_INCR_IF_EXISTS_LUA, 1, _serialize_redis_name(name, self._get_prefix()))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+extensions/ext_redis.py:249: in eval
+    return self._require_client().execute_command("EVAL", script, numkeys, *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:716: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:736: in _execute_command
+    result = conn.retry.call_with_retry(
+.venv/lib/python3.13/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:737: in &lt;lambda&gt;
+    lambda: self._send_command_parse_response(
+.venv/lib/python3.13/site-packages/redis/client.py:682: in _send_command_parse_response
+    return self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:780: in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;redis.connection.Connection(host=localhost,port=32801,db=0)&gt;
+disable_decoding = False, disconnect_on_error = True, push_request = False
+
+    def read_response(
+        self,
+        disable_decoding=False,
+        *,
+        disconnect_on_error=True,
+        push_request=False,
+    ):
+        """Read the response from a previously sent command"""
+    
+        host_error = self._host_error()
+    
+        try:
+            if self.protocol in ["3", 3]:
+                response = self._parser.read_response(
+                    disable_decoding=disable_decoding, push_request=push_request
+                )
+            else:
+                response = self._parser.read_response(disable_decoding=disable_decoding)
+        except socket.timeout:
+            if disconnect_on_error:
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except OSError as e:
+            if disconnect_on_error:
+                self.disconnect()
+            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except BaseException:
+            # Also by default close in case of BaseException.  A lot of code
+            # relies on this behaviour when doing Command/Response pairs.
+            # See #1128.
+            if disconnect_on_error:
+                self.disconnect()
+            raise
+    
+        if self.health_check_interval:
+            self.next_health_check = time.monotonic() + self.health_check_interval
+    
+        if isinstance(response, ResponseError):
+            try:
+&gt;               raise response
+E               redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+
+.venv/lib/python3.13/site-packages/redis/connection.py:1364: ResponseError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_redis_counter" name="test_concurrent_increments_do_not_lose_updates" time="0.347"><failure message="redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)">def test_concurrent_increments_do_not_lose_updates() -&gt; None:
+        key = f"counter-test:{uuid4()}"
+        redis_client.set(key, 0, ex=60)
+        barrier = Barrier(12)
+    
+        def increment(_: int) -&gt; int | None:
+            barrier.wait()
+            return redis_client.incr_if_exists(key)
+    
+        try:
+            with ThreadPoolExecutor(max_workers=12) as executor:
+&gt;               counts = list(executor.map(increment, range(12)))
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/e2e_tests/containers/libs/test_redis_counter.py:47: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:625: in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:318: in _result_or_cancel
+    return fut.result(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:460: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/_base.py:402: in __get_result
+    raise self._exception
+../../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/concurrent/futures/thread.py:59: in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/e2e_tests/containers/libs/test_redis_counter.py:43: in increment
+    return redis_client.incr_if_exists(key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+extensions/ext_redis.py:192: in incr_if_exists
+    count = self.eval(_INCR_IF_EXISTS_LUA, 1, _serialize_redis_name(name, self._get_prefix()))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+extensions/ext_redis.py:249: in eval
+    return self._require_client().execute_command("EVAL", script, numkeys, *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:716: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:736: in _execute_command
+    result = conn.retry.call_with_retry(
+.venv/lib/python3.13/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:737: in &lt;lambda&gt;
+    lambda: self._send_command_parse_response(
+.venv/lib/python3.13/site-packages/redis/client.py:682: in _send_command_parse_response
+    return self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.13/site-packages/redis/client.py:780: in parse_response
+    response = connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;redis.connection.Connection(host=localhost,port=32801,db=0)&gt;
+disable_decoding = False, disconnect_on_error = True, push_request = False
+
+    def read_response(
+        self,
+        disable_decoding=False,
+        *,
+        disconnect_on_error=True,
+        push_request=False,
+    ):
+        """Read the response from a previously sent command"""
+    
+        host_error = self._host_error()
+    
+        try:
+            if self.protocol in ["3", 3]:
+                response = self._parser.read_response(
+                    disable_decoding=disable_decoding, push_request=push_request
+                )
+            else:
+                response = self._parser.read_response(disable_decoding=disable_decoding)
+        except socket.timeout:
+            if disconnect_on_error:
+                self.disconnect()
+            raise TimeoutError(f"Timeout reading from {host_error}")
+        except OSError as e:
+            if disconnect_on_error:
+                self.disconnect()
+            raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except BaseException:
+            # Also by default close in case of BaseException.  A lot of code
+            # relies on this behaviour when doing Command/Response pairs.
+            # See #1128.
+            if disconnect_on_error:
+                self.disconnect()
+            raise
+    
+        if self.health_check_interval:
+            self.next_health_check = time.monotonic() + self.health_check_interval
+    
+        if isinstance(response, ResponseError):
+            try:
+&gt;               raise response
+E               redis.exceptions.ResponseError: this build of KiviDB has no Lua: EVAL, SCRIPT, FUNCTION and FCALL need the lua or full variant (Docker image kividb/kividb:v1.2.0-lua, or a kividb-lua release file)
+
+.venv/lib/python3.13/site-packages/redis/connection.py:1364: ResponseError</failure></testcase><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestApiTokenCacheRedisIntegration" name="test_cache_set_and_get_with_real_redis" time="0.193" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestApiTokenCacheRedisIntegration" name="test_cache_ttl_with_real_redis" time="0.005" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestApiTokenCacheRedisIntegration" name="test_cache_null_value_for_invalid_token" time="0.005" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestApiTokenCacheRedisIntegration" name="test_cache_delete_with_real_redis" time="0.006" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestApiTokenCacheRedisIntegration" name="test_tenant_index_creation" time="0.005" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestApiTokenCacheRedisIntegration" name="test_invalidate_by_tenant_via_index" time="0.007" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestApiTokenCacheRedisIntegration" name="test_concurrent_cache_access" time="0.018" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestTokenUsageRecording" name="test_record_token_usage_sets_redis_key" time="0.003" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestTokenUsageRecording" name="test_record_token_usage_has_ttl" time="0.002" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestTokenUsageRecording" name="test_record_token_usage_overwrites" time="0.013" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestEndToEndCacheFlow" name="test_complete_flow_cache_miss_then_hit" time="0.004" /><testcase classname="tests.e2e_tests.containers.libs.test_api_token_cache_integration.TestEndToEndCacheFlow" name="test_high_concurrency_simulation" time="1.118" /></testsuite></testsuites>

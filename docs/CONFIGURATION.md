@@ -1,0 +1,261 @@
+# Running and configuring KiviDB
+
+- [Running KiviDB](#running-kividb)
+- [Protected mode](#protected-mode)
+- [Configuration](#configuration)
+- [TLS](#tls)
+- [Health checks](#health-checks)
+- [Logs and errors](#logs-and-errors)
+- [Startup update check](#startup-update-check)
+
+## Running KiviDB
+
+```bash
+./target/release/kividb                    # listens on 0.0.0.0:6380
+redis-cli -p 6380 PING
+```
+
+Any Redis client works; point it at port **6380**. KiviDB listens on **6380**, not Redis's
+6379, so the two can run side by side; point your client at that port, or pass
+`--port 6379`. The default listen address is `0.0.0.0:6380`, with
+[protected mode](#protected-mode) on.
+
+[INSTALL.md](INSTALL.md) covers the packages, images and binaries;
+[BUILDING.md](BUILDING.md) covers building from source.
+
+## Protected mode
+
+Protected mode is **on by default**, as in Redis. While it is on, **no bind address has been
+set** (`--bind` or `bind` in the config file) and the **`default` user has no password**, only
+clients on the same machine (loopback) may connect. Any other client
+receives a `-DENIED` error that explains the options, and is disconnected.
+
+To accept clients from other machines, do one of these:
+
+- set a password: `--requirepass <password>`, or `ACL SETUSER default ><password>`;
+- set a bind address: `--bind <address>`;
+- turn protected mode off: `--protected-mode no`, `protected-mode no` in the config file, or
+  `CONFIG SET protected-mode no` from a local client.
+
+If you turn it off or bind to a public address, make sure the server cannot be reached from
+the internet without a password.
+
+The Docker image runs with protected mode off by default; see
+[Docker](INSTALL.md#docker).
+
+## Configuration
+
+KiviDB is configured with command-line flags, or with a Redis-style configuration file
+(one directive per line, such as `port 6380` or `appendonly yes`). The file is read from
+`/etc/kividb/kividb.conf` if it exists; `--configfile <path>` names another one. A server that
+read the default file without `--configfile` naming it logs a warning and refuses
+`CONFIG REWRITE`, since other servers on the host may read the same file; a future release will
+read a config file only when one is named, as Redis does. The packaged systemd unit passes
+`--configfile /etc/kividb/kividb.conf`. A flag given
+on the command line wins over the same setting in the file. Run `kividb --help` for the full
+list.
+
+Any directive the config file or `CONFIG SET` takes is also taken on the command line in the
+form `redis-server` uses, `--<directive> <value>`, so a Compose file, Helm chart or platform
+template written for Redis starts KiviDB unchanged:
+
+```bash
+kividb --appendonly yes --requirepass s3cret --maxmemory 256mb --maxmemory-policy allkeys-lru
+kividb /etc/redis.conf --save "" --loglevel warning     # a config file first, then overrides
+```
+
+A directive is read as a config line is, with the same checks: a value that is not valid, or a
+name that is not known, stops the server at start-up with a message that names it (and the
+closest known name, for a typo). A directive may have several values (`--save 900 1 --save 300
+10`), an empty one (`--save ""`), or one that starts with a dash. The first argument, when it
+does not start with `-`, is a config file, and `-` as the first or the last argument reads config
+text from standard input (so `--dir -` as the last argument is an error, as in Redis). Names are
+not case-sensitive, and `--name=value` is taken too, with spaces in the value (`--dir=/my dir`);
+`redis-server` does not accept that form. `--bind a b` lists two addresses; KiviDB listens on
+one, and warns, as it does for the config file. A directive that KiviDB accepts but
+does not act on (`--save 900 1`, `--tcp-keepalive`, `--io-threads`, ...) logs one warning.
+
+The order of precedence, strongest first: a flag of the table below, a directive on the command
+line, the config file, the default. A flag wins over the directive for the same setting
+whatever their order (`--aof --appendonly no` turns the append-only file on), and no warning
+is logged for the directive it overrides. A flag given twice counts once, the last.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
+| `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
+| `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
+| `--threads` | `0` (auto) | Worker threads; auto is the number of cores minus 2 (all cores below 4) |
+| `--databases` | `16` | Number of databases |
+| `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
+| `--aof` | off | Append-only file persistence |
+| `--maxmemory <bytes>` | `0` (unlimited) | Memory limit |
+| `--maxmemory-policy` | `noeviction` | What happens at the limit: `noeviction`, or the `allkeys-*` / `volatile-*` eviction policies (`kividb --help` lists them) |
+| `--key-access-tracking <yes\|no>` | `no` | `yes` keeps when each key was last used, and how often, under every `maxmemory-policy`, so that `OBJECT IDLETIME`, `OBJECT FREQ` and `RESTORE ... IDLETIME` work under `noeviction` as in Redis. It costs about 1.0 to 1.5% more instructions on a pipelined `GET` or `SET`, 0.5 to 1.5% unpipelined, and no memory. `no` records only under an LRU, LFU or LRM policy. Changeable with `CONFIG SET` |
+| `--loglevel` | `info` | `debug`, `verbose`, `notice` (or `info`), `warning`, `nothing` |
+| `--logfile <path>` | standard error | Write the log to a file |
+| `--log-format <text\|json>` | `text` | Log line format |
+| `--io-model` | `auto` | `auto`, `uring` or `tokio` (io_uring is Linux only) |
+| `--requirepass <password>` | none | Password for the `default` user |
+| `--aclfile <path>` | none | ACL file to load users from |
+| `--replicaof <HOST> <PORT>` | none | Replicate from a primary |
+| `--replica-announced-port <port>` | server port (the TLS port with `--tls-replication yes` or `--port 0`) | Port announced to the primary via `REPLCONF listening-port` |
+| `--replica-priority <n>` | `100` | Sentinel promotes the replica of lowest priority first, and never one of `0`. New in 1.2.1: 1.2.0 has no such flag, and ignores the setting in the file |
+| `--replica-announced <yes\|no>` | `yes` | Whether Sentinel lists this replica. New in 1.2.1, as above |
+| `--slowlog-log-slower-than <us>` | off | Slowlog threshold in microseconds (`0` logs every command) |
+| `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
+| `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
+| `--cluster-node-timeout <ms>` | `15000` | Time without a reply before a peer is suspected to have failed |
+| `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only); with `--port 0`, the only one |
+| `--tls-cert-file`, `--tls-key-file` | none | Server certificate and key (PEM) |
+| `--tls-ca-cert-file` | none | CA that client certificates are checked against |
+| `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
+| `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
+| `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
+
+`maxclients` (default `10000`, in the file or with `CONFIG SET`) counts plaintext and TLS
+clients, TLS ones from the start of their handshake. At startup KiviDB raises the soft
+open-file limit to `maxclients` plus what it keeps for itself (32 files, or on io_uring 40 and
+8 a worker thread) if the hard limit allows; if not, it lowers `maxclients` to fit and logs a
+warning. Cluster bus links, a replica's link to its master and files written while saving
+are not counted in that; leave room for them in a large cluster.
+
+Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md).
+
+## TLS
+
+TLS is an optional Cargo feature (`--features tls`): it is in the `tls` and `full` builds
+(see [BUILDING.md](BUILDING.md#builds)).
+
+TLS clients connect on a separate port, `--tls-port`; plain traffic stays on `--port`. With
+`--port 0` there is no plaintext port, and the server is reached over TLS only (it needs a
+`--tls-port`; a cluster node needs `--tls-cluster yes` as well, and its bus is then
+`<tls-port> + 10000`). A replica of such a master connects with `--tls-replication yes`.
+
+```bash
+cargo build --release --features tls
+./target/release/kividb --port 6380 --tls-port 6381 --tls-cert-file cert.pem --tls-key-file key.pem
+redis-cli --tls -p 6381 --cacert ca.pem   # ca.pem: the CA that signed cert.pem
+```
+
+**Client certificates (mutual TLS).** With `--tls-ca-cert-file ca.pem`, clients must present a
+certificate signed by that CA; others are refused during the handshake.
+`--tls-auth-clients optional` accepts clients without a certificate but still refuses an
+invalid one, and `--tls-auth-clients no` does not ask for one. With `redis-cli`:
+`redis-cli --tls -p 6381 --cacert ca.pem --cert client.pem --key client.key`.
+
+**Pinning client certificates by name.** `--tls-auth-clients-allowed-names "*.db1.example
+admin.example"` (spaces or commas between names) accepts a client certificate only if its subject
+CN or one of its DNS names matches one of the names; others signed by the same CA fail the
+handshake, and the server logs the names they carried. `*` stands for exactly one label:
+`*.db1.example` takes `node-0.db1.example`, not `a.b.db1.example` or `db1.example`. Case does
+not matter. It applies to clients, replicas and, with `tls-cluster`, nodes on the cluster bus;
+empty (the default) is off. KiviDB's own setting: Redis has none.
+
+**Changed without a restart.** `CONFIG SET` of `tls-cert-file`, `tls-key-file`,
+`tls-ca-cert-file`, `tls-auth-clients`, `tls-client-cert-file` and `tls-client-key-file` loads the
+files again for every handshake from then on. `CONFIG SET tls-port <port>` opens the TLS port
+(also on a server that started without TLS: `CONFIG SET tls-cert-file cert.pem tls-key-file
+key.pem tls-port 6381`), moves it, or closes it with `0`; connections already open stay open.
+`CONFIG SET tls-replication yes` makes a replica's next connection to its master TLS. What cannot
+be loaded or listened on is refused, and nothing changes. `tls-cluster` needs a restart, and so
+does `tls-port` on a node with `tls-cluster yes`.
+
+**Clients must use TLS on the TLS port.** A plain connection to it (for example `redis-cli -p 6381`
+without `--tls`) fails the handshake; at `--loglevel verbose` the server logs
+`TLS: handshake failed from <address>`. For
+memtier_benchmark, add `--tls` (and `--tls-skip-verify` for a self-signed certificate).
+
+## Health checks
+
+`kividb --ping` checks that a server is up, with nothing but the binary: the Docker images
+have no shell and no `redis-cli`, so it is the health check to use there, in exec form.
+
+```yaml
+healthcheck:
+  test: ["CMD", "kividb", "--ping"]
+```
+
+It connects to `127.0.0.1` on the server's port, sends `PING`, prints `PONG` and exits **0**
+if the server answers `PONG`. Anything else (no connection, a refused password, an error
+reply, no reply within about a second, or an argument it cannot read) exits **1**, with the
+reason on standard error. It starts no server, writes no log and does not touch the data
+directory.
+
+**It is a separate process.** It does not see the arguments the server was started with (the
+container's `command:` or `args:`), only its own and the config file. A `--port`,
+`--requirepass`, `--dir` or `--tls-*` given to the server must be given to the check too, or
+moved into the config file, which both read:
+
+- **Port**: `--port`, or `port` in the config file. With `--port 0` it connects to
+  `--tls-port` over TLS. `--ping-port` picks another port.
+- **Address**: `127.0.0.1`. If `bind` does not cover loopback (for example `--bind
+  10.0.0.5`), give the check the address with `--ping-host`.
+- **Password**: `KIVIDB_PASSWORD` in the environment, else `requirepass` from the config file
+  or the command line, sent as `AUTH <password>` for the default user. Prefer the environment
+  variable or the config file: an argument shows in `ps` and `docker inspect`. A password the
+  server does not need is ignored. The password goes to whatever `--ping-host` and
+  `--ping-port` point at.
+- **ACL users**: with `KIVIDB_USER` set as well, it sends `AUTH <user> <password>` with
+  `KIVIDB_PASSWORD` (`requirepass` is the default user's, so it is not used). Where an
+  `aclfile` or `ACL SETUSER` turns the default user off, give the check a user of its own that
+  may run `PING` and nothing else, for example `user health on >long-password -@all +ping`,
+  and set `KIVIDB_USER=health` and `KIVIDB_PASSWORD` in its environment.
+- **TLS**: on the TLS port it uses TLS (the `tls` or `full` build). With
+  `--tls-ca-cert-file`, it checks the server's certificate chain against that CA (not the
+  name, as between nodes) and presents `tls-client-cert-file`, or `tls-cert-file`, which
+  `tls-auth-clients yes` asks for. Without a CA file it takes the server's certificate as it
+  is, but only from a server on this host (a loopback address): a server elsewhere needs the
+  CA file, since the password would go to whoever answers. Relative TLS file names are read
+  from `dir`, as the server reads them.
+
+**Kubernetes.** A server opens its ports only once it has loaded its snapshot and append-only
+file, so the check fails while a large dataset loads. Use it as a `readinessProbe`, or as a
+`livenessProbe` together with a `startupProbe` that allows for the load, so that a slow start
+is not taken for a dead server:
+
+```yaml
+startupProbe:
+  exec:
+    command: ["kividb", "--ping"]
+  periodSeconds: 5
+  failureThreshold: 120      # up to 10 minutes to load
+livenessProbe:
+  exec:
+    command: ["kividb", "--ping"]
+  periodSeconds: 10
+readinessProbe:
+  exec:
+    command: ["kividb", "--ping"]
+  periodSeconds: 5
+```
+
+## Logs and errors
+
+The log goes to standard error, or to `--logfile`. [LOGGING.md](LOGGING.md)
+describes the log; [ERRORS.md](ERRORS.md) explains the warnings, errors and error
+replies, and what to do about each.
+
+## Startup update check
+
+When it starts, a release build of KiviDB makes **one HTTPS request** to
+`https://github.com/kividbio/kividb/releases/latest`, the same page you would open to find
+the newest release. GitHub answers with a redirect to that release's tag; if it is newer
+than the running build, KiviDB prints a short notice with the link before the startup
+banner. Nothing is sent but the request itself, with a `User-Agent` of `kividb/<version>`:
+no host name, configuration, keys, data or identifier. GitHub sees the request's source IP
+address, as any web server would.
+
+Startup waits at most 1.5 seconds for the reply; a failure is logged at debug level only and
+never affects clients. Only a version-shaped tag is accepted from the reply, and nothing
+else from it is printed.
+
+Any one of these turns it off:
+
+- `--update-check no` on the command line;
+- `update-check no` in the configuration file;
+- `KIVIDB_NO_UPDATE_CHECK=1` in the environment.
+
+It is also never made by a debug build or when the `CI` environment variable is set.
+`--update-check-url` points it at another `https://` address, such as a mirror inside a
+closed network. [UPDATE_CHECK.md](UPDATE_CHECK.md) has the details.

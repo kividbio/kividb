@@ -1,4 +1,17 @@
 // src/lib.rs
+//! The internals of the KiviDB server, a Redis-compatible in-memory database.
+//!
+//! This crate is published so that `cargo install kividb` can build the
+//! `kividb` server. The server binary is not built from this library:
+//! `src/main.rs` declares its own modules and its own global allocator. The
+//! library is built from the same sources so the integration tests can use
+//! them; it is not a public API. It is not a client or an embeddable
+//! database, and any release may change or remove any of it. It sets a
+//! global allocator too, so a crate that depended on it would get that one.
+//! To talk to KiviDB from Rust, use a Redis client such as the `redis` crate.
+//!
+//! Documentation for running the server: <https://github.com/kividbio/kividb>.
+
 // First, so its logging macros are in scope in every module after it.
 #[macro_use]
 pub mod loglevel;
@@ -13,6 +26,8 @@ pub mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod give_back;
+pub mod key_bytes;
 pub mod key_moves;
 pub mod latency;
 pub mod lazyfree;
@@ -23,6 +38,7 @@ pub mod member_set;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
+pub mod output_limits;
 pub mod pause;
 pub mod protected_mode;
 pub mod pubsub;
@@ -33,6 +49,7 @@ pub mod script_clock;
 pub mod server;
 pub mod shared_bytes;
 pub mod shutdown;
+pub mod sketch;
 pub mod slowlog;
 pub mod snapshot;
 pub mod stats;
@@ -67,6 +84,7 @@ static ALLOCATOR: memory_use::Counting = memory_use::Counting;
 
 pub static RUNTIME_MAXMEMORY: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
 /// Entry point for integration tests — starts a tokio server on the given
 /// config and blocks the calling thread. Meant to run inside a thread::spawn.
 pub fn run_for_test(config: config::Config) {
@@ -78,6 +96,10 @@ pub fn run_for_test(config: config::Config) {
     }
     crate::eviction::configure(&cfg);
     crate::compaction::configure(&cfg);
+    crate::give_back::set_enabled(cfg.allocator_give_back);
+    // Only ever raised here, as the servers of one test process share it.
+    crate::snapshot::SNAPSHOT_DATABASES
+        .fetch_max(cfg.databases, std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = crate::node_tls::init(&cfg) {
         panic!("TLS between nodes: {e}");
     }
@@ -88,6 +110,7 @@ pub fn run_for_test(config: config::Config) {
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_keep_alive(crate::commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()
         .unwrap()
@@ -105,6 +128,11 @@ async fn server_tokio(
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
+    // Never `store::shard_by_slot()` here, even with `cluster_enabled`: the
+    // switch is the whole process's, and the in-process servers of one test
+    // binary would place keys differently from each other's, and change
+    // under servers already holding keys. Cluster tests spawn the binary,
+    // whose `main` sets it (#294).
     let store = store::new_store(config.databases);
     let index_store = vector::new_index_store();
     let lastsave = Arc::new(RwLock::new(0i64));
@@ -114,7 +142,7 @@ async fn server_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = pubsub::PubSubHub::new();
+    let pubsub = pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be
@@ -133,11 +161,13 @@ async fn server_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
     let acl_store = acl::new_acl_store(&config.requirepass);
     let acl_log = acl::new_acl_log();
+    acl_log.set_max_len(config.acllog_max_len);
     let slowlog = crate::slowlog::new_slowlog_from_config(&config);
     let cluster_state = std::sync::Arc::new(
         crate::cluster::ClusterState::from_config(&config).expect("cluster config file"),

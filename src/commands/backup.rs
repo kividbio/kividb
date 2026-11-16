@@ -266,6 +266,10 @@ fn run_backup(handles: Handles, seq: u64, dir: PathBuf, tap: u64) {
         // Ends when the tap is detached and the channel has been drained.
         for payload in rx.iter() {
             incr.write_all(&payload)?;
+            // As in the AOF; taps also feed slot migration, so added here.
+            if crate::aof::needs_vset_quant_marker(&payload) {
+                incr.write_all(crate::aof::VSET_QUANT_MARKER)?;
+            }
         }
         incr.flush()?;
         incr.get_ref().sync_all()
@@ -615,9 +619,18 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         return None;
     }
     if ctx.cmd.len() != 2 {
-        return Some(resp_error(
-            "ERR wrong number of arguments for 'backup' command",
-        ));
+        // `backup|list`, as Redis names a subcommand; `backup` when there
+        // is none.
+        let name = match ctx.cmd.get(1) {
+            Some(sub) => format!(
+                "backup|{}",
+                String::from_utf8_lossy(sub).to_ascii_lowercase()
+            ),
+            None => "backup".to_string(),
+        };
+        return Some(resp_error(&format!(
+            "ERR wrong number of arguments for '{name}' command"
+        )));
     }
     let sub = String::from_utf8_lossy(ctx.cmd[1]).to_ascii_uppercase();
     Some(match sub.as_str() {

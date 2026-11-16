@@ -394,6 +394,20 @@ fn close(
     }
 }
 
+/// The slots handed out so far, one to each thread that has run a command
+/// (at most `SLOTS`). For tests: threads that come and go use them up.
+#[doc(hidden)]
+pub fn slots_handed_out() -> usize {
+    IN_USE.load(Ordering::SeqCst).min(SLOTS)
+}
+
+/// Whether anything is taking the gate alone, or holds it alone: for a
+/// holder of the gate that can let go of it between steps of its work.
+#[inline]
+pub fn taker_waiting() -> bool {
+    TAKERS.load(Ordering::Relaxed) > 0
+}
+
 /// Whether the calling thread holds the gate alone — whether what it is
 /// running is part of a transaction or a script.
 #[inline]

@@ -504,19 +504,34 @@ RSS of the idle server) / vectors. RSS is what the operating system has to provi
 ### Reproduce
 
 ```
-# 1. VMs (Azure CLI signed in): server + client in one placement group, plus a builder
+# 1. VMs (Azure CLI signed in): server + client in one placement group, plus a builder.
+#    SSH_PUB is read by az itself: on Windows give a native path (C:/Users/me/.ssh/id_ed25519.pub).
 RG=my-rg LOCATION=swedencentral SSH_PUB=~/.ssh/id_ed25519.pub SSH_CIDR=<your ip>/32 harness/create_vms.sh
-# 2. builder: Rust + the two KiviDB builds; then copy ~/bins/ to the server
+# 2. builder: Rust 1.99.1 (build_kividb.sh pins it; TOOLCHAIN= overrides) + the two KiviDB builds.
+#    The second argument names the build: kividb-<name> is its label in run_all.sh (cand, rc4).
 scp harness/build_kividb.sh azureuser@BUILDER:
 ssh azureuser@BUILDER 'bash build_kividb.sh 75482abb cand && bash build_kividb.sh v1.2.0-rc4 rc4'
+#    copy ~/bins/ to the server, then delete the builder
+ssh azureuser@BUILDER 'tar cz bins' | ssh azureuser@SERVER 'tar xz'
+az vm delete -g my-rg -n vec-builder --yes
 # 3. server: Redis 8.10.2, Dragonfly 2.0.2, the engine control script
 scp harness/setup_server.sh harness/server_ctl.sh azureuser@SERVER:
 ssh azureuser@SERVER 'bash setup_server.sh'
-# 4. client: both tool pins + engines-files; the client must be able to ssh to the server's private IP
-scp harness/setup_client.sh harness/run_suite.sh harness/run_all.sh harness/purge_test.sh azureuser@CLIENT:
+# 4. client: both tool pins + engines-files (about 15 min: it compiles the tool twice)
+scp harness/setup_client.sh harness/run_suite.sh harness/run_all.sh harness/purge_test.sh harness/extra_glove.sh azureuser@CLIENT:
 ssh azureuser@CLIENT 'bash setup_client.sh'
-# 5. run (on the client): three full passes, then the MEMORY PURGE check on 1.2.0 and rc4
-SERVER_IP=<server private ip> bash run_all.sh
+#    the client starts and stops engines over ssh to the server's private IP: give it a key the server accepts
+ssh azureuser@CLIENT 'ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519 <<< y >/dev/null; cat ~/.ssh/id_ed25519.pub' \
+  | ssh azureuser@SERVER 'cat >> ~/.ssh/authorized_keys'
+ssh azureuser@CLIENT 'ssh -o StrictHostKeyChecking=no <server private ip> true'
+#    The tool downloads each dataset on its first use (from storage.googleapis.com/ann-filtered-benchmark,
+#    ann-benchmarks.com and benchmarks.redislabs.s3.amazonaws.com, as its datasets.json says) before its
+#    "Starting upload" line, so the download is not in the ingest time; it makes pass 1's first run of each
+#    dataset take longer. Keep 100 GB free on the client.
+# 5. run (on the client): three full passes, then the MEMORY PURGE check on 1.2.0 and rc4.
+#    About 5 hours; run it detached so an ssh drop does not kill it, and wait for ~/out/ALL-DONE.
+#    CAND=kividb-<name> BASE=kividb-<name> choose two other builds.
+SERVER_IP=<server private ip> nohup bash run_all.sh > run_all.log 2>&1 < /dev/null &
 #    optional: five more alternating glove-25 loads
 SERVER_IP=<server private ip> bash extra_glove.sh
 # 6. summarise (anywhere with Python 3 + matplotlib), from a copy of the client's ~/out
@@ -530,6 +545,11 @@ python harness/chart_purge.py charts/memory-purge-dbpedia-1M.svg \
 
 `CHART_TITLES` sets the one-line finding above four charts (ingest time, bytes per vector,
 memory after delete, against rc4); without it they carry only their descriptive titles.
+
+`charts.py` here knows only the labels `kividb-cand` and `kividb-rc4`. To compare two other builds, use the
+copy in [`../../1.2.1/vector/harness/`](../../1.2.1/vector/harness/charts.py), which takes the labels and
+names from `CAND`, `BASE`, `CAND_NAME` and `BASE_NAME`. That folder also has `fetch_release.sh`, which installs
+a published release binary (checked against the release's `SHA256SUMS.txt`) in place of a local build.
 
 ### Files
 

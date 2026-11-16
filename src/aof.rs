@@ -256,14 +256,31 @@ static TURN_OVER_WAITERS: parking_lot::Mutex<
 > = parking_lot::Mutex::new(Vec::new());
 
 /// The log a turn-over moved aside, as the writer leaves it to the
-/// checkpoint: `None` if it needs nothing more.
-type OldLog = Option<std::fs::File>;
+/// checkpoint, with the number of the turn-over (see [`OLD_LOG_UNSYNCED`]):
+/// `None` if it needs nothing more.
+type OldLog = Option<(std::fs::File, u64)>;
 
 /// Set from a turn-over until the old log it moved aside is synced: the
 /// writer does not sync the new log before then. Records in the new log
 /// come after those in the old one, and a power failure must not keep them
 /// and lose the old one's last records.
-static OLD_LOG_UNSYNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// The number of the turn-over (see [`TURN_OVERS`]), 0 for none, and cleared
+/// only by a sync made after that turn-over: one that found an earlier
+/// turn-over's number, and synced that one's old log, must not clear the
+/// mark of a turn-over made while it synced. The writer did, and reported
+/// the records after the second synced with its renames not on the disk
+/// (#529).
+static OLD_LOG_UNSYNCED: AtomicU64 = AtomicU64::new(0);
+
+/// Turn-overs made in this process, numbering them for [`OLD_LOG_UNSYNCED`].
+static TURN_OVERS: AtomicU64 = AtomicU64::new(0);
+
+/// Clear [`OLD_LOG_UNSYNCED`] after a sync of the old log begun when it read
+/// `seen`: only if no turn-over has been made since.
+fn old_log_synced(seen: u64) {
+    let _ = OLD_LOG_UNSYNCED.compare_exchange(seen, 0, Ordering::AcqRel, Ordering::Acquire);
+}
 
 /// The start of a turn-over mark. No record begins with a zero byte.
 const TURN_OVER_MARK: &[u8] = b"\0kividb-aof-turn-over\0";
@@ -278,6 +295,30 @@ fn turn_over_mark(generation: u64) -> Vec<u8> {
 fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
     let rest = item.strip_prefix(TURN_OVER_MARK)?;
     Some(u64::from_le_bytes(rest.try_into().ok()?))
+}
+
+// ── Vector set quantization in the log ───────────────────────────────────────
+
+/// Follows a `VADD` whose options were kept; 1.2 skips it as unknown.
+pub(crate) const VSET_QUANT_MARKER: &[u8] = b"*1\r\n$21\r\nKIVIDB.AOF-VSET-QUANT\r\n";
+
+/// The marker's one argument: clients cannot send it.
+const VSET_QUANT_MARKER_NAME: &[u8] = b"KIVIDB.AOF-VSET-QUANT";
+
+fn is_vset_quant_marker(cmd: &[Vec<u8>]) -> bool {
+    matches!(cmd, [name] if name.as_slice() == VSET_QUANT_MARKER_NAME)
+}
+
+/// Whether a stream payload ends with a `VADD` that needs the marker.
+pub(crate) fn needs_vset_quant_marker(payload: &[u8]) -> bool {
+    // Most payloads are no `VADD`: not parsed.
+    if !payload.windows(4).any(|w| w.eq_ignore_ascii_case(b"VADD")) {
+        return false;
+    }
+    parse_aof_commands(payload)
+        .0
+        .last()
+        .is_some_and(|cmd| crate::vector::quant::carries_quant_option(cmd))
 }
 
 // ── Written before it is acknowledged ────────────────────────────────────────
@@ -536,6 +577,20 @@ fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
     if len <= header {
         return Ok(None);
     }
+    // Kept already, by an attempt that did not get to remove it (its removal
+    // failed, or the process stopped): not kept again. Each start or
+    // checkpoint that could not remove it added another copy (#375). Only a
+    // copy of the same name with the very same bytes counts; the caller
+    // syncs the directory before anything is removed, as for a new one.
+    let suffix = format!(".{path}");
+    for (kept, kept_len) in kept_logs() {
+        if kept_len == len && kept.ends_with(&suffix) && same_bytes(path, &kept).unwrap_or(false) {
+            // Synced first: a copy stopped between its write and its sync
+            // reads whole from the page cache, but may not be on disk.
+            std::fs::File::open(&kept)?.sync_all()?;
+            return Ok(Some(kept));
+        }
+    }
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -548,6 +603,35 @@ fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
         copy_synced(path, &name, |from, to| std::fs::copy(from, to))?;
     }
     Ok(Some(name))
+}
+
+/// Whether the files `a` and `b` hold the same bytes, read in full.
+fn same_bytes(a: &str, b: &str) -> std::io::Result<bool> {
+    use std::io::Read;
+    fn fill(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        Ok(filled)
+    }
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let (n, m) = (fill(&mut fa, &mut ba)?, fill(&mut fb, &mut bb)?);
+        if ba[..n] != bb[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 /// Copy `from` to `to` with `copy` ([`std::fs::copy`], or a test's) and sync
@@ -774,22 +858,93 @@ pub fn set_ack_after_write(on: bool) {
     ACK_AFTER_WRITE.store(on, Ordering::Relaxed);
 }
 
+/// `appendfsync always`: whether a reply to a write waits for its record to
+/// be synced to disk, not only written to the file (#513). It was accepted,
+/// and the file synced once a second all the same: a power failure could
+/// lose a second of writes their clients had been told were made.
+static FSYNC_ALWAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fsync_always(on: bool) {
+    FSYNC_ALWAYS.store(on, Ordering::Relaxed);
+    // Replies already waiting for a sync get it, whatever the setting now;
+    // the writer is woken to look at the setting again (see
+    // [`run_aof_writer`]).
+    SYNC_WANTED.notify_one();
+    QUEUED.notify_one();
+}
+
+#[inline]
+fn fsync_always() -> bool {
+    FSYNC_ALWAYS.load(Ordering::Relaxed)
+}
+
+/// Under `appendfsync always`: the barriers whose records are in the file
+/// and wait for it to be synced. Added to with the log locked, and taken
+/// with it locked too, so that what the barriers taken stand for is in the
+/// file then. The writer thread syncs for them ([`sync_for_replies`]).
+static UNSYNCED_BARRIERS: parking_lot::Mutex<Vec<u64>> = parking_lot::const_mutex(Vec::new());
+
+/// Wakes the writer thread to sync for [`UNSYNCED_BARRIERS`].
+static SYNC_WANTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Whether the writer thread has to listen for [`SYNC_WANTED`]: under
+/// `appendfsync always`, or while barriers handed to it under `always` are
+/// still waiting. Not otherwise: `everysec` costs what it did.
+fn syncs_for_replies() -> bool {
+    fsync_always() || !UNSYNCED_BARRIERS.lock().is_empty()
+}
+
+/// A sync of the AOF failed under `appendfsync always`: the server stops
+/// rather than acknowledge writes that may not be on disk, as Redis does.
+/// Never carried on from. Linux reports a failed writeback once to each open
+/// file, and every handle of the log shares one: a failure logged and
+/// passed over would leave the next sync to return success and its replies
+/// to go out with their writes lost.
+fn sync_failed_under_always(what: &str, e: &std::io::Error) -> ! {
+    log_fatal!(
+        "AOF: {what} failed under appendfsync always: {e} — exiting rather than acknowledge writes that may not be on disk"
+    );
+    std::process::exit(1);
+}
+
 /// Whether a connection's replies may have to wait for the AOF: it is on,
-/// and acknowledges after writing.
+/// and acknowledges after writing — always under `appendfsync always`,
+/// whatever `aof-ack-after-write` says.
 #[inline]
 pub fn acks_wait() -> bool {
-    AOF_ENABLED.load(Ordering::Relaxed) && ACK_AFTER_WRITE.load(Ordering::Relaxed)
+    AOF_ENABLED.load(Ordering::Relaxed)
+        && (ACK_AFTER_WRITE.load(Ordering::Relaxed) || fsync_always())
 }
 
 /// Whether a command may write a record its reply should wait for: a write,
 /// or a script or a transaction that may make some.
 #[inline]
-pub fn may_log(name: &[u8]) -> bool {
-    crate::replication::is_write_command_bytes(name)
-        || name.eq_ignore_ascii_case(b"EVAL")
-        || name.eq_ignore_ascii_case(b"EVALSHA")
-        || name.eq_ignore_ascii_case(b"FCALL")
-        || name.eq_ignore_ascii_case(b"EXEC")
+pub fn may_log(cmd: &[&[u8]]) -> bool {
+    let Some(&cmd0) = cmd.first() else {
+        return false;
+    };
+    // A write by name, the most of them, is told by its name alone.
+    if crate::replication::is_write_command_bytes(cmd0) {
+        return true;
+    }
+    // The rest, told apart by length first: most commands are none of them.
+    let is = |name: &str| cmd0.eq_ignore_ascii_case(name.as_bytes());
+    // Writes only with some arguments (`GEORADIUS ... STORE`, `MIGRATE`,
+    // `FUNCTION LOAD`): judged by them, so the reply waits for the record
+    // like any other write's.
+    let by_arguments =
+        |name: &str| is(name) && crate::replication::command_mutates_for_replication(name, cmd);
+    // EVAL, EVALSHA, FCALL and EXEC may write from what they run.
+    match cmd0.len() {
+        4 => is("EVAL") || is("EXEC"),
+        5 => is("FCALL"),
+        6 => by_arguments("SCRIPT"),
+        7 => is("EVALSHA") || by_arguments("MIGRATE"),
+        8 => by_arguments("FUNCTION"),
+        9 => by_arguments("GEORADIUS"),
+        17 => by_arguments("GEORADIUSBYMEMBER"),
+        _ => false,
+    }
 }
 
 /// How long a reply to a write waits for its records to reach the file
@@ -821,7 +976,24 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     if write_what_is_queued(false).is_none() {
         QUEUED.notify_one();
     }
-    if tokio::time::timeout(ACK_WAIT_LIMIT, wait).await.is_err() {
+    let mut wait = wait;
+    loop {
+        if tokio::time::timeout(ACK_WAIT_LIMIT, &mut wait)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        // Under `appendfsync always` a reply is never sent ahead of its
+        // write: it waits for as long as the disk takes.
+        if fsync_always() {
+            log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "AOF: a reply has waited over 5 s for its write to be synced to {AOF_PATH} (appendfsync always): the disk is behind"
+            );
+            continue;
+        }
         BARRIERS.lock().remove(&id);
         AOF_ACKS_BEFORE_WRITE.fetch_add(1, Ordering::Relaxed);
         log_throttled!(
@@ -829,6 +1001,7 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
             crate::loglevel::WARN,
             "AOF: a reply waited 5 s for its write to reach {AOF_PATH} and was sent without it"
         );
+        return;
     }
 }
 
@@ -1031,6 +1204,9 @@ async fn run_aof_writer(mut flush_rx: tokio::sync::mpsc::Receiver<()>) {
             Some(()) = flush_rx.recv() => {
                 do_fsync();
             }
+            () = SYNC_WANTED.notified(), if syncs_for_replies() => {
+                sync_for_replies();
+            }
             () = QUEUED.notified() => {
                 let released = write_what_is_queued(true).unwrap_or(false);
                 // Not straight back to waiting. A sender wakes a writer
@@ -1095,8 +1271,10 @@ fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
     let old = std::mem::replace(file, open_aof()?);
     match moved? {
         MovedAside::ToSync => {
-            OLD_LOG_UNSYNCED.store(true, Ordering::Release);
-            Ok(Some(old))
+            // With the log locked: turn-overs are numbered in the order made.
+            let number = TURN_OVERS.fetch_add(1, Ordering::Relaxed) + 1;
+            OLD_LOG_UNSYNCED.store(number, Ordering::Release);
+            Ok(Some((old, number)))
         }
         MovedAside::Synced => Ok(None),
     }
@@ -1106,13 +1284,35 @@ fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
 /// directory that has both logs under their new names. The writer syncs the
 /// new log again once they are.
 fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
-    let Some(old) = old else {
+    let Some((old, number)) = old else {
         return Ok(());
     };
     failpoint("turn-over-syncing");
-    let synced = old.sync_data().and_then(|()| sync_dir());
-    OLD_LOG_UNSYNCED.store(false, Ordering::Release);
+    let synced = if injected_failure("turn-over-sync-fails") {
+        Err(std::io::Error::other("failure injected by a test"))
+    } else {
+        old.sync_data().and_then(|()| sync_dir())
+    };
+    match &synced {
+        Ok(()) => old_log_synced(number),
+        Err(e) if fsync_always() => {
+            sync_failed_under_always(&format!("the sync of {AOF_PREV_PATH}"), e)
+        }
+        // Left set: the new log is not synced ahead of the old one, and the
+        // second's sync tries the old one again (see [`do_fsync`]).
+        Err(_) => {}
+    }
     synced
+}
+
+/// Sync the old log a turn-over moved aside, and the directory.
+fn sync_old_log() -> std::io::Result<()> {
+    match std::fs::File::open(AOF_PREV_PATH) {
+        Ok(old) => old.sync_data()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    sync_dir()
 }
 
 /// Write `first` and whatever else is queued, turning the log over at each
@@ -1158,7 +1358,18 @@ fn write_queued(
         wrote |= !batch.is_empty();
         write_batch(file, &batch);
         released |= !barriers.is_empty();
-        release_barriers(&mut barriers);
+        // Under `appendfsync always`, the replies the barriers stand for go
+        // out once what is before them is on the disk. The writer thread
+        // syncs, not the connection's: a sync takes milliseconds, and a
+        // connection's thread serves others meanwhile. Every barrier that
+        // comes in while it syncs is answered by the next sync: a group
+        // commit.
+        if !barriers.is_empty() && fsync_always() {
+            UNSYNCED_BARRIERS.lock().append(&mut barriers);
+            SYNC_WANTED.notify_one();
+        } else {
+            release_barriers(&mut barriers);
+        }
         let Some(generation) = mark else {
             if more_queued {
                 if drained < MAX_AOF_PASS_BYTES {
@@ -1499,12 +1710,82 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) {
         return;
     }
     if let Err(e) = file.write_all(batch) {
+        // Replies wait for this write and its sync: none can be sent
+        // without it, nor with it lost. Redis exits too.
+        if fsync_always() {
+            log_fatal!(
+                "AOF: write to {AOF_PATH} failed under appendfsync always: {e} — exiting rather than acknowledge writes that are not on disk"
+            );
+            std::process::exit(1);
+        }
         log_throttled!(
             10,
             crate::loglevel::ERROR,
             "AOF: write to {AOF_PATH} failed: {e} — writes are not being made durable; check free disk space and permissions on the data directory"
         );
     }
+}
+
+/// `appendfsync always`: sync the file for the replies waiting for it, and
+/// then answer them (#513). On a handle of its own, outside the lock:
+/// connections go on writing meanwhile, and what they write is synced next.
+fn sync_for_replies() {
+    let (mut barriers, written, file) = {
+        let log = LOG.lock();
+        let barriers = std::mem::take(&mut *UNSYNCED_BARRIERS.lock());
+        // What the sync covers, as in [`do_fsync`]: `WAITAOF` and the
+        // second's sync see it synced.
+        let written = AOF_WRITTEN.load(Ordering::Relaxed);
+        match log.as_ref() {
+            Some(log) => (barriers, written, Some(log.file.try_clone())),
+            // The AOF turned off since: nothing to sync.
+            None => (barriers, written, None),
+        }
+    };
+    if barriers.is_empty() {
+        return;
+    }
+    match file {
+        Some(Ok(file)) => {
+            // A test holds the sync for these replies here: only here, not
+            // in the second's sync (`do_fsync`), which answers no reply. Held
+            // there too, a tick that came first took the hit the test
+            // waited for, and the replies' sync then waited at the next one,
+            // which the test never let go of (#515).
+            failpoint("aof-fsync-before-reply");
+            sync_before_reply(&file);
+            AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
+        }
+        Some(Err(e)) => sync_failed_under_always(&format!("opening {AOF_PATH} to sync"), &e),
+        None => {}
+    }
+    release_barriers(&mut barriers);
+}
+
+/// `appendfsync always`: sync what has been written, before the replies
+/// that wait for it are sent — and first the old log of a turn-over the
+/// checkpoint has yet to sync, with the directory: the records after a
+/// turn-over must not be on the disk without those before it, nor in a
+/// new log whose name may not be. A sync that fails ends the server, as in
+/// Redis: it can neither reply nor keep the promise.
+fn sync_before_reply(file: &std::fs::File) {
+    let synced = (|| {
+        if OLD_LOG_UNSYNCED.load(Ordering::Acquire) != 0 {
+            sync_old_log()?;
+        }
+        file.sync_data()
+    })();
+    if let Err(e) = synced {
+        sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
+    }
+}
+
+/// Shutdown, with no snapshot to carry the writes (`SHUTDOWN NOSAVE`, or a
+/// final save that failed): the AOF is all the process leaves of them, so
+/// what is queued is written and the file synced before the process exits,
+/// as Redis flushes and syncs its AOF. Nothing with the AOF off.
+pub fn sync_for_shutdown() {
+    do_fsync();
 }
 
 /// Write what is queued and sync the file — on a handle of its own, outside
@@ -1542,10 +1823,37 @@ fn do_fsync() {
     if !had_data && written == AOF_FSYNCED.load(Ordering::Relaxed) {
         return;
     }
-    // Not ahead of the old log a turn-over has just moved aside: the next
-    // second's sync covers this, once the checkpoint has synced that one.
-    if OLD_LOG_UNSYNCED.load(Ordering::Acquire) {
+    // A test holds the sync here, as a slow disk would: `WAITAOF` waits.
+    failpoint("fsync");
+    // Under `appendfsync always`, a sync that fails stops the server, here
+    // as for a reply: logged and passed over, its error would be gone for
+    // the next sync, which would answer replies with their writes lost.
+    if fsync_always() {
+        sync_before_reply(&file);
+        AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
         return;
+    }
+    // Not ahead of the old log a turn-over has moved aside. The checkpoint
+    // syncs that one; if its sync failed, or has yet to be made, it is made
+    // here. Marked synced only if no turn-over was made meanwhile: what this
+    // synced may not be the old log of that one, nor its renames.
+    let seen = OLD_LOG_UNSYNCED.load(Ordering::Acquire);
+    if seen != 0 {
+        match sync_old_log() {
+            Ok(()) => {
+                // A test holds the writer here, as a slow disk would.
+                failpoint("old-log-synced");
+                old_log_synced(seen);
+            }
+            Err(e) => {
+                log_throttled!(
+                    10,
+                    crate::loglevel::ERROR,
+                    "AOF: fsync of {AOF_PREV_PATH} failed: {e} — writes acknowledged since the last good fsync may be lost on power failure; check the disk"
+                );
+                return;
+            }
+        }
     }
 
     if let Err(e) = file.sync_data() {
@@ -1748,12 +2056,7 @@ fn checkpoint_inner(
         );
     }
 
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp_path = format!(
-        "dump.kdb.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let tmp_path = temp_dump_name();
     let written = frozen
         .write_file(&tmp_path)
         .and_then(|()| install_dump(&tmp_path, generation, !aof_on));
@@ -1868,10 +2171,73 @@ fn logs_as_saved() -> std::io::Result<LogsAtSave> {
     if let Some(log) = LOG.lock().as_mut() {
         write_queued(&mut log.file, &mut log.rx, None);
         // Not synced, it is shorter after a power cut than recorded: read
-        // as changed, it is replayed, as when nothing was recorded.
-        let _ = log.file.sync_data();
+        // as changed, it is replayed, as when nothing was recorded. Under
+        // `appendfsync always` a failure is not passed over (see
+        // [`sync_failed_under_always`]).
+        if let Err(e) = log.file.sync_data()
+            && fsync_always()
+        {
+            sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
+        }
     }
     logs_on_disk()
+}
+
+/// The name a dump is written under before [`install_dump`] puts it in
+/// place, `dump.kdb.<pid>.<n>.tmp`: one of its own for each writer, since a
+/// checkpoint and a save with the AOF off can overlap, and two writing one
+/// file would interleave.
+pub(crate) fn temp_dump_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "dump.kdb.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Whether `name` is one of [`temp_dump_name`]'s, of any process.
+fn is_temp_dump(name: &str) -> bool {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("dump.kdb.")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(pid, n)| number(pid) && number(n))
+}
+
+/// Remove the dumps that saves cut short (a kill -9, the OOM killer, a
+/// Kubernetes liveness probe) left in the data directory, naming each in
+/// the log. Each is as big as the dataset, and nothing reads it: recovery
+/// goes by `dump.kdb` and the save number beside it. Left there, each crash
+/// during a save added one, until the volume was full (#545).
+///
+/// Only at start, by the process holding the data directory's lock, and
+/// before it saves anything: every such file is then another process's, one
+/// with this pid included, as every start in a container has the same.
+pub fn remove_cut_short_dumps() {
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return;
+    };
+    let mut cut_short: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            is_temp_dump(&name).then(|| (name, entry.metadata().map_or(0, |meta| meta.len())))
+        })
+        .collect();
+    cut_short.sort();
+    for (name, len) in cut_short {
+        match std::fs::remove_file(&name) {
+            Ok(()) => log_warn!(
+                "Removed {name} ({len} bytes), the dump of a save that did not finish: nothing \
+                 reads it"
+            ),
+            Err(e) => log_warn!(
+                "Can't remove {name}, the dump of a save that did not finish ({e}): nothing \
+                 reads it, remove it by hand"
+            ),
+        }
+    }
 }
 
 /// Put the dump written to `tmp` in place as save number `generation`, with
@@ -2607,6 +2973,12 @@ fn classify_tail(rest: &[u8]) -> Tail {
 /// KiviDB.
 pub(crate) fn fatal_persistence(what: &str) -> ! {
     log_fatal!("{what}");
+    // Keys outside database 0 of a cluster node: the file is fine, the
+    // node cannot serve them (#484).
+    if what.contains(crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0) {
+        log_fatal!("{}.", crate::snapshot::CLUSTER_KEYS_OUTSIDE_DB0_AT_START);
+        std::process::exit(1);
+    }
     log_fatal!(
         "Refusing to start with an empty dataset in place of one that could not be \
          loaded. Fix the file (or its permissions), or move it out of the working directory \
@@ -2781,7 +3153,8 @@ pub fn replay_aof(
     };
 
     if let Some(image) = image {
-        let loaded = crate::snapshot::load_snapshot_from(image)?;
+        let loaded = crate::snapshot::load_snapshot_bytes(image)
+            .map_err(|e| crate::snapshot::refusal_of_file(e, "the AOF's preamble"))?;
         let crate::snapshot::LoadedSnapshot {
             dbs,
             index_schemas,
@@ -2805,7 +3178,12 @@ pub fn replay_aof(
 
     let _indexing = DeferIndexing::start();
 
-    for (cmd, live) in commands.into_iter().zip(live) {
+    let mut records = commands.into_iter().zip(live).peekable();
+    while let Some((cmd, live)) = records.next() {
+        // Read with the record before it, below.
+        if is_vset_quant_marker(&cmd) {
+            continue;
+        }
         // What is left of a transaction here is whole: its commands are
         // applied in order, and nothing runs beside a replay to see them
         // half done. Its `MULTI` and `EXEC` have nothing more to do.
@@ -2817,6 +3195,15 @@ pub fn replay_aof(
             continue;
         }
         stats.commands += 1;
+        // Without its marker, a `VADD` is 1.2's, which stored f32.
+        let marked = records
+            .peek()
+            .is_some_and(|(next, _)| is_vset_quant_marker(next));
+        let cmd = if marked {
+            cmd
+        } else {
+            crate::vector::quant::without_quant_options(cmd).0
+        };
         if env
             .apply_command(
                 cmd,
@@ -3047,14 +3434,12 @@ pub fn recover_local(
             // None: the checkpoint that left it behind finished.
             let prev_age = (!checkpoint_completed(&buf)).then(|| on_disk.age_of(AOF_PREV_PATH));
             if prev_age.is_none() {
-                // Not left in place if it cannot be kept aside: a checkpoint
-                // would remove it later, kept or not.
                 // With a dump saved with the AOF off, the old log may hold
                 // writes it does not: it is not removed without a copy, and
                 // the server does not start without one. Otherwise the dump
                 // holds them, and an old log that cannot be removed is left
-                // in place: the next start, or the next turn-over, removes
-                // it (#375).
+                // in place (#375). Until it is removed, each turn-over fails
+                // on it, and so does each checkpoint: the warning says so.
                 if let Err(e) = keep_finished_old_log() {
                     log_fatal!(
                         "{AOF_PREV_PATH}, left by a checkpoint that finished, cannot be kept \
@@ -3067,8 +3452,11 @@ pub fn recover_local(
                 if let Err(e) = remove_if_there(AOF_PREV_PATH) {
                     log_warn!(
                         "AOF: {AOF_PREV_PATH}, left by a checkpoint that finished, could not be \
-                         removed: {e} — it is left in place, and the next start or checkpoint \
-                         removes it"
+                         removed: {e} — it is left in place. dump.kdb holds its writes. Until it is \
+                         removed, every checkpoint fails (INFO persistence shows \
+                         aof_last_bgrewrite_status:err) and {AOF_PATH} keeps growing: fix the \
+                         permissions of the data directory, and the next checkpoint removes it, or \
+                         remove {AOF_PREV_PATH} by hand"
                     );
                 }
             } else if prev_age == Some(LogAge::Older) {
@@ -3218,9 +3606,10 @@ pub fn recover_local(
                     repl_state,
                     dump_loaded,
                 );
-                if recovery.index_names.is_empty() {
-                    recovery.index_names = names;
-                }
+                // Every index there is now, not the snapshot's alone: one
+                // created since the dump is in the log, and its documents
+                // are indexed by the walk after this as well.
+                recovery.index_names = names;
                 // Delta writes are not in the snapshot's HNSW graph: the
                 // backfill after this brings it up to date with the keys.
                 if dump_loaded {
@@ -3271,18 +3660,49 @@ fn preload(
         }
         other => return Err(invalid(format!("unknown preload type '{other}'"))),
     };
+    // A file of a Dragonfly snapshot in Dragonfly's own format, by its name:
+    // `dump-<time>-summary.dfs` and a `dump-<time>-NNNN.dfs` for each shard.
+    // Each is an RDB file, and before Dragonfly 1.32 nothing in them says
+    // what they are: the summary loaded as an empty dataset, a shard's file
+    // as that shard's keys (#444).
+    if base
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dfs"))
+    {
+        return Err(invalid(format!(
+            "{} is a file of a Dragonfly snapshot in Dragonfly's own format (.dfs), which \
+             keeps each shard's keys in a file of its own; save one in RDB format \
+             (Dragonfly's SAVE RDB) and load that",
+            base.display()
+        )));
+    }
 
     log_info!("preload-file: loading {}", base.display());
     let base_str = base.to_string_lossy();
+    // Redis's header or Valkey 9's (`VALKEY080`).
     let is_redis_rdb = std::fs::File::open(&base)
         .and_then(|mut f| {
-            let mut magic = [0u8; 5];
+            let mut magic = [0u8; 6];
             std::io::Read::read_exact(&mut f, &mut magic).map(|()| magic)
         })
-        .is_ok_and(|magic| &magic == b"REDIS");
+        .is_ok_and(|magic| crate::snapshot::is_rdb_header(&magic));
     let mut index_names = Vec::new();
     let keys = if is_redis_rdb {
         let (dbs, expiries, functions) = crate::snapshot::load_redis_rdb_with_expiry(&base_str)?;
+        // A Dragonfly file with no keys at all is what the summary file of a
+        // snapshot in Dragonfly's own format is, renamed; up to Dragonfly
+        // 1.31 nothing else tells them apart. Either way there is nothing to
+        // start from.
+        if dbs.iter().all(|db| db.is_empty())
+            && crate::snapshot::rdb_written_by_dragonfly(&base_str)?
+        {
+            return Err(invalid(format!(
+                "{} was written by Dragonfly and holds no keys: it is the summary file of \
+                 a snapshot in Dragonfly's own format (.dfs), or a snapshot of an empty \
+                 Dragonfly. Save the data in RDB format (Dragonfly's SAVE RDB) and load that",
+                base.display()
+            )));
+        }
         crate::snapshot::restore_functions(functions)?;
         let keys = crate::snapshot::restore_into_store(dbs, store);
         crate::snapshot::restore_expiries_into_store(expiries, store);
@@ -3333,7 +3753,7 @@ fn preload(
         }
         // An index created during the backup window is in the replayed
         // commands, not in the base snapshot.
-        index_names = index_store.read().keys().cloned().collect();
+        index_names = crate::vector::index_names(index_store);
     }
     Ok(index_names)
 }
@@ -3441,7 +3861,7 @@ pub fn recover_from_aof(
         Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be loaded: {e}")),
     }
 
-    index_store.read().keys().cloned().collect()
+    crate::vector::index_names(index_store)
 }
 
 // ── Test hooks ───────────────────────────────────────────────────────────────
@@ -3453,18 +3873,7 @@ pub fn recover_from_aof(
 /// (`n` counts from 1 for each name) and waits while the file is there. Read
 /// once; unset, a step costs a load and a branch.
 pub(crate) fn failpoint(name: &'static str) {
-    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let names = NAMES.get_or_init(|| {
-        std::env::var("KIVIDB_TEST_FAILPOINTS")
-            .map(|list| {
-                list.split(',')
-                    .map(|name| name.trim().to_string())
-                    .filter(|name| !name.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-    if !names.iter().any(|n| n == name) {
+    if !failpoint_named(name) {
         return;
     }
     static HITS: parking_lot::Mutex<Vec<(&'static str, u64)>> = parking_lot::Mutex::new(Vec::new());
@@ -3486,9 +3895,49 @@ pub(crate) fn failpoint(name: &'static str) {
         return;
     }
     log_warn!("Test failpoint {path} reached — waiting for it to be removed");
-    while std::path::Path::new(&path).exists() {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // Off the runtime: a tokio worker held here for as long as a test likes
+    // must not take the polling of every other client with it.
+    crate::cluster::migration::off_the_runtime(|| {
+        while std::path::Path::new(&path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+}
+
+/// Whether `KIVIDB_TEST_FAILPOINTS` names `name`. Read once.
+fn failpoint_named(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            std::env::var("KIVIDB_TEST_FAILPOINTS")
+                .map(|list| {
+                    list.split(',')
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|n| n == name)
+}
+
+/// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to fail.
+pub(crate) fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// A fault a test injects, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to be.
+pub(crate) fn injected(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// What a node did before, that a test has it do again, named in
+/// `KIVIDB_TEST_FAILPOINTS` as a [`failpoint`] is: whether it is to.
+pub(crate) fn test_behaves_as_before(name: &str) -> bool {
+    failpoint_named(name)
 }
 
 // ── Checkpoint in progress ───────────────────────────────────────────────────
@@ -3533,6 +3982,23 @@ mod kept_file_tests {
         // And one that works is kept, whole.
         copy_synced(&from, &to, |from, to| std::fs::copy(from, to)).unwrap();
         assert_eq!(std::fs::read(&to).unwrap(), std::fs::read(&from).unwrap());
+    }
+
+    /// Same bytes, read in full: not just the same length, or the same ends.
+    #[test]
+    fn same_bytes_reads_all_of_both_files() {
+        let (dir, a) = in_temp("a");
+        let b = dir.path().join("b").to_str().unwrap().to_string();
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+        assert!(same_bytes(&a, &b).unwrap());
+        let mut middle = bytes.clone();
+        middle[100_000] ^= 1;
+        std::fs::write(&b, &middle).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap());
+        std::fs::write(&b, &bytes[..199_999]).unwrap();
+        assert!(!same_bytes(&a, &b).unwrap());
     }
 
     /// The fingerprint of a log's first bytes is the one it had when it was
@@ -4154,6 +4620,244 @@ mod backlog_tests {
     }
 }
 
+/// Time series commands in an AOF: those written by 1.2.0, with what that
+/// version accepted and 1.2.1 refuses from a client (#565), a chunk size
+/// out of bounds, `IGNORE`, replayed rather than the series lost, and its
+/// `TS.INCRBY` records read as it read them; and 1.2.1's, replayed as they
+/// ran.
+#[cfg(test)]
+mod ts_option_replay_tests {
+    use super::past_deadline_replay_tests::{replayed, replayed_with_index};
+    use crate::store::ValueRef;
+
+    /// `TS.INCRBY` records as 1.2.0 wrote them, `TIMESTAMP <time>` at the
+    /// end, read as 1.2.0 read them: each sample at its time, the options
+    /// passed over, no trim to the retention, and the records after them
+    /// applied. A word before the time that takes it when read with the
+    /// rest changes nothing. A record of 1.2.1, behind its mark, is read
+    /// with its options and trims.
+    #[test]
+    fn incrby_records_of_1_2_0_are_read_as_1_2_0_read_them() {
+        let store = replayed(&[
+            vec!["TS.INCRBY", "a", "1", "LABELS", "x", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "a", "1", "TIMESTAMP", "50"],
+            vec!["TS.INCRBY", "b", "1", "RETENTION", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "c", "1", "ENCODING", "TIMESTAMP", "42"],
+            vec![
+                "TS.INCRBY",
+                "d",
+                "1",
+                "RETENTION",
+                "100",
+                "LABELS",
+                "x",
+                "y",
+                "z",
+                "TIMESTAMP",
+                "42",
+            ],
+            vec!["TS.INCRBY", "e", "1", "DUPLICATE_POLICY", "TIMESTAMP", "42"],
+            vec!["TS.INCRBY", "f", "1", "LABELS", "a", "b", "TIMESTAMP", "42"],
+            // Read cleanly too, these were trimmed and given options.
+            vec!["TS.CREATE", "r", "RETENTION", "10"],
+            vec!["TS.INCRBY", "r", "1", "TIMESTAMP", "1"],
+            vec!["TS.INCRBY", "r", "1", "RETENTION", "10", "TIMESTAMP", "100"],
+            // 1.2.1's.
+            vec![
+                "TS.INCRBY",
+                "m",
+                "1",
+                "timestamp",
+                "5",
+                "RETENTION",
+                "10",
+                "LABELS",
+                "a",
+                "b",
+            ],
+            vec!["TS.INCRBY", "m", "1", "timestamp", "100"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let samples = |key: &str| {
+            series(key)
+                .samples
+                .iter()
+                .map(|(t, v)| (*t, *v))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(samples("a"), [(42, 1.0), (50, 2.0)]);
+        for key in ["a", "b", "c", "d", "e", "f"] {
+            let s = series(key);
+            assert!(s.labels.is_empty(), "{key}");
+            assert_eq!(s.retention, 0, "{key}");
+            assert_eq!(s.samples.get(&42), Some(&1.0), "{key}");
+        }
+        assert_eq!(samples("r"), [(1, 1.0), (100, 2.0)]);
+        let m = series("m");
+        assert_eq!(m.retention, 10);
+        assert_eq!(m.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(samples("m"), [(100, 2.0)]);
+    }
+
+    /// `ON_DUPLICATE` for one sample, labels a `TS.ALTER` took away, and a
+    /// `TS.INCRBY` as the feed writes it, with a word left over from
+    /// `LABELS`: replayed as they ran.
+    /// A time above `i64::MAX`, which 1.2.0 took: in its log as given
+    /// (`TS.ADD`, `TS.MADD`), or, from `TS.INCRBY`, as the negative number
+    /// it replied. Replayed, each sample at the time 1.2.0 kept (#592).
+    #[test]
+    fn times_above_i64_max_of_1_2_0_replay() {
+        let max = u64::MAX.to_string();
+        let below = (u64::MAX - 1).to_string();
+        let store = replayed(&[
+            vec!["TS.ADD", "h", below.as_str(), "1"],
+            vec!["TS.MADD", "h", max.as_str(), "2"],
+            vec!["TS.INCRBY", "i", "1", "TIMESTAMP", "-1"],
+        ]);
+        let samples = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner
+                    .read()
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (*t, *v))
+                    .collect::<Vec<_>>(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert_eq!(samples("h"), [(u64::MAX - 1, 1.0), (u64::MAX, 2.0)]);
+        assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
+    }
+
+    /// A compaction's destination past its time (its `DEL` not yet in the
+    /// log), deleted, made again and given its source again; and a source
+    /// renamed. Replayed, the links are as the master had them (#593).
+    #[test]
+    fn compaction_links_replay_as_they_ran() {
+        let store = replayed(&[
+            vec!["TS.CREATE", "s"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "1", "1"],
+            vec!["PEXPIREAT", "d", "1"],
+            vec!["TS.ADD", "s", "15", "1"],
+            vec!["DEL", "d"],
+            vec!["TS.CREATE", "d"],
+            vec!["TS.CREATERULE", "s", "d", "AGGREGATION", "sum", "10"],
+            vec!["TS.ADD", "s", "25", "1"],
+            vec!["RENAME", "s", "s2"],
+            vec!["TS.ADD", "s2", "35", "1"],
+            // A destination renamed onto another of its source's.
+            vec!["TS.CREATE", "w"],
+            vec!["TS.CREATE", "a"],
+            vec!["TS.CREATE", "b"],
+            vec!["TS.CREATERULE", "w", "a", "AGGREGATION", "sum", "10"],
+            vec!["TS.CREATERULE", "w", "b", "AGGREGATION", "sum", "10"],
+            vec!["RENAME", "a", "b"],
+            vec!["TS.ADD", "w", "1", "1"],
+            vec!["TS.ADD", "w", "15", "1"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let s = series("s2");
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].dest_key, "d");
+        let d = series("d");
+        assert_eq!(d.source.as_deref(), Some("s2"));
+        assert_eq!(
+            d.samples.iter().map(|(t, v)| (*t, *v)).collect::<Vec<_>>(),
+            [(10, 1.0), (20, 1.0)]
+        );
+        let w = series("w");
+        assert_eq!(w.rules.len(), 1);
+        assert_eq!(w.rules[0].dest_key, "b");
+        assert_eq!(series("b").source.as_deref(), Some("w"));
+        assert_eq!(series("b").samples.get(&0), Some(&1.0));
+    }
+
+    #[test]
+    fn options_replay_as_they_ran() {
+        let (store, index) = replayed_with_index(&[
+            vec!["TS.CREATE", "k", "LABELS", "a", "b"],
+            vec!["TS.ALTER", "k", "LABELS"],
+            vec!["TS.CREATE", "d", "DUPLICATE_POLICY", "BLOCK"],
+            vec!["TS.ADD", "d", "1", "1"],
+            vec!["TS.ADD", "d", "1", "5", "ON_DUPLICATE", "SUM"],
+            vec!["TS.INCRBY", "c", "2", "timestamp", "9", "LABELS", "x"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert!(series("k").labels.is_empty());
+        let indexed = |entry: &str| {
+            crate::read_lock!(index)
+                .get(entry)
+                .is_some_and(|keys| !keys.is_empty())
+        };
+        assert!(!indexed("a=b"));
+        let d = series("d");
+        assert_eq!(d.samples.get(&1), Some(&6.0));
+        assert_eq!(d.duplicate_policy, crate::types::DuplicatePolicy::Block);
+        let c = series("c");
+        assert_eq!(c.samples.get(&9), Some(&2.0));
+        assert!(c.labels.is_empty());
+    }
+
+    #[test]
+    fn words_an_older_version_passed_over_are_passed_over_again() {
+        let store = replayed(&[
+            vec![
+                "TS.CREATE",
+                "k",
+                "RETENTION",
+                "5000",
+                "FOO",
+                "LABELS",
+                "a",
+                "b",
+            ],
+            vec!["TS.ALTER", "k", "CHUNK", "SIZE", "100"],
+            vec!["TS.INCRBY", "c", "1", "BOGUS", "TIMESTAMP", "7"],
+            vec!["TS.ADD", "k", "10", "1.5", "IGNORE", "5", "0.5"],
+        ]);
+        let series = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner.read().clone(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        let k = series("k");
+        assert_eq!(k.retention, 5000);
+        assert_eq!(k.chunk_size, 100);
+        assert_eq!(k.labels.get("a").map(String::as_str), Some("b"));
+        assert_eq!(k.samples.get(&10), Some(&1.5));
+        let c = series("c");
+        assert_eq!(c.samples.get(&7), Some(&1.0));
+    }
+}
+
 /// A deadline the log gave a key, or a hash field, and the writes made to
 /// it after that while it lived: replayed once the deadline has passed.
 #[cfg(test)]
@@ -4168,7 +4872,14 @@ mod past_deadline_replay_tests {
     }
 
     /// `records`, written to an AOF and replayed into a new store.
-    fn replayed(records: &[Vec<&str>]) -> Store {
+    pub(super) fn replayed(records: &[Vec<&str>]) -> Store {
+        replayed_with_index(records).0
+    }
+
+    /// [`replayed`], and the time series label index the replay built.
+    pub(super) fn replayed_with_index(
+        records: &[Vec<&str>],
+    ) -> (Store, crate::store::SharedTsIndex) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("appendonly.aof");
         let log: Vec<u8> = records.iter().flat_map(|r| record(r)).collect();
@@ -4195,7 +4906,7 @@ mod past_deadline_replay_tests {
         )
         .expect("replay");
         assert_eq!(stats.errors, 0, "every record applied");
-        store
+        (store, ts_index)
     }
 
     fn expires(store: &Store, key: &str) -> Option<u64> {
@@ -4325,6 +5036,10 @@ mod past_deadline_replay_tests {
     /// `HSETEX ... PXAT t` and `HGETEX ... PXAT t`. Now `g` keeps its deadline
     /// and the increment, and is past its time once the replay is over. An
     /// `HSET` after it takes the deadline away, as it did on the master.
+    ///
+    /// A field the master expired is in the log as its `HDEL`, before the
+    /// write that found it gone: `z`, incremented after its deadline, is `1`
+    /// with no deadline, as on the master.
     #[test]
     fn a_field_deadline_that_has_passed_is_set_and_the_writes_after_it_go_into_the_field() {
         let past = (now_ms() - 5_000).to_string();
@@ -4338,7 +5053,12 @@ mod past_deadline_replay_tests {
             vec!["HSET", "y", "keep", "1", "m", "7"],
             vec!["HGETEX", "y", "PXAT", &past, "FIELDS", "1", "m"],
             vec!["HINCRBY", "y", "m", "1"],
+            vec!["HSET", "h", "z", "5"],
+            vec!["HPEXPIREAT", "h", &past, "FIELDS", "1", "z"],
+            vec!["HDEL", "h", "z"],
+            vec!["HINCRBY", "h", "z", "1"],
         ]);
+        assert_eq!(field(&store, "h", "z"), (Some(b"1".to_vec()), None));
         assert_eq!(field(&store, "h", "g"), (Some(b"6".to_vec()), Some(true)));
         assert_eq!(field(&store, "h", "f").0, Some(b"v1".to_vec()));
         assert_eq!(
@@ -4374,7 +5094,7 @@ mod past_deadline_replay_tests {
             .insert("g".to_string(), std::sync::Arc::from(&b"5"[..]));
         inner
             .expiries
-            .insert("g".to_string(), std::time::Instant::now());
+            .insert("g".to_string(), crate::types::field_now() - 1);
         {
             let _replay = crate::expiry::replay();
             assert!(!inner.is_field_expired("g"));
@@ -4397,5 +5117,352 @@ mod past_deadline_replay_tests {
         ]);
         assert_eq!(expires(&store, "h"), None);
         assert_eq!(hash_fields(&store, "h"), ["f1"]);
+    }
+}
+
+#[cfg(test)]
+mod may_log_tests {
+    use super::may_log;
+
+    fn logs(cmd: &[&str]) -> bool {
+        let cmd: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+        may_log(&cmd)
+    }
+
+    /// A reply waits for the AOF for a write by name, a script or a
+    /// transaction, and a write by argument only with the arguments that
+    /// write; never for a read.
+    #[test]
+    fn writes_are_told_by_name_or_by_their_arguments() {
+        for write in [
+            &["SET", "k", "v"][..],
+            &["incr", "k"],
+            &["eval", "return 1", "0"],
+            &["EVALSHA", "x", "0"],
+            &["fcall", "f", "0"],
+            &["EXEC"],
+            &["GEORADIUS", "k", "15", "37", "200", "km", "STORE", "d"],
+            &["georadiusbymember", "k", "m", "200", "km", "storedist", "d"],
+            &["MIGRATE", "h", "1", "k", "0", "100"],
+            &["SCRIPT", "LOAD", "return 1"],
+            &["FUNCTION", "FLUSH"],
+        ] {
+            assert!(logs(write), "{write:?}");
+        }
+        for read in [
+            &["GET", "k"][..],
+            &["PING"],
+            &["GEORADIUS", "k", "15", "37", "200", "km"],
+            &["GEORADIUSBYMEMBER", "k", "store", "200", "km"],
+            &["FUNCTION", "LIST"],
+            &["SCRIPT", "EXISTS", "x"],
+            &["EVAL_RO", "return 1", "0"],
+        ] {
+            assert!(!logs(read), "{read:?}");
+        }
+    }
+}
+
+/// A marker keeps its own `VADD`'s options; unmarked ones replay as 1.2.
+#[cfg(test)]
+mod vset_quant_marker_tests {
+    use super::*;
+    use crate::store::{Store, ValueRef};
+    use crate::vector::quant::{Quant, StoredVector};
+
+    fn record(parts: &[&str]) -> Vec<u8> {
+        let parts: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        crate::resp::write::encode_resp_command(&parts)
+    }
+
+    fn vadd_e(key: &str, element: &str, option: &str) -> Vec<u8> {
+        let mut parts = vec!["VADD", key, "VALUES", "3", "3", "-4", "0.5", element];
+        if !option.is_empty() {
+            parts.push(option);
+        }
+        record(&parts)
+    }
+
+    fn vadd(key: &str, option: &str) -> Vec<u8> {
+        vadd_e(key, "e", option)
+    }
+
+    const M: &[u8] = VSET_QUANT_MARKER;
+
+    /// `log` replayed into a new store.
+    fn replay(log: &[u8]) -> (Store, ReplayStats) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("appendonly.aof");
+        std::fs::write(&path, log).expect("write");
+        let store = crate::store::new_store(1);
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let stats = replay_aof(
+            &path.to_string_lossy(),
+            &store,
+            &crate::vector::new_index_store(),
+            &crate::vector::new_dict_store(),
+            &std::sync::Arc::new(crate::wait_table::WaitTable::new()),
+            &crate::store::new_ts_index(),
+            &std::sync::Arc::new(crate::config::Config::default()),
+            &compaction_tx,
+            &std::sync::Arc::new(crate::replication::ReplState::new_master()),
+            false,
+        )
+        .expect("replay");
+        (store, stats)
+    }
+
+    /// The set's quantization, whether it was asked for, and `element`'s storage.
+    fn set(store: &Store, key: &str, element: &str) -> Option<(Quant, bool, &'static str)> {
+        let shard = crate::store::get_shard(&store[0], key);
+        let map = shard.read();
+        match map.get(key.as_bytes()) {
+            Some(ValueRef::VectorSet(vs)) => {
+                let vs = vs.read();
+                let name = crate::key_bytes::KeyBytes::from(element.as_bytes());
+                let stored = match vs.entries.get(&name).map(|e| &e.vector) {
+                    Some(StoredVector::F32(_)) => "f32",
+                    Some(StoredVector::Q8 { .. }) => "int8",
+                    Some(StoredVector::Bin { .. }) => "bin",
+                    None => "none",
+                };
+                Some((vs.quant, vs.quant_chosen, stored))
+            }
+            _ => None,
+        }
+    }
+
+    fn quant(store: &Store, key: &str) -> Option<(Quant, bool)> {
+        set(store, key, "e").map(|(q, chosen, _)| (q, chosen))
+    }
+
+    fn delta(records: &[u8]) -> Vec<u8> {
+        let mut log = delta_header(7).to_vec();
+        log.extend_from_slice(records);
+        log
+    }
+
+    #[test]
+    fn the_marker_is_one_record_no_client_can_send() {
+        assert_eq!(
+            M,
+            crate::resp::write::encode_resp_command(&[VSET_QUANT_MARKER_NAME.to_vec()])
+        );
+        let (cmds, used) = parse_aof_commands(M);
+        assert_eq!(used, M.len());
+        assert!(is_vset_quant_marker(&cmds[0]));
+        assert!(!crate::commands::arity::is_known("KIVIDB.AOF-VSET-QUANT"));
+    }
+
+    #[test]
+    fn a_log_of_1_2_replays_as_1_2_stored_it() {
+        let records = [vadd("a", "Q8"), vadd("b", "BIN"), vadd("c", "NOQUANT")].concat();
+        for log in [records.clone(), delta(&records)] {
+            let (store, stats) = replay(&log);
+            assert_eq!((stats.errors, stats.commands), (0, 3));
+            for key in ["a", "b", "c"] {
+                assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_marked_vadd_replays_as_asked() {
+        let records = [
+            vadd("a", "Q8"),
+            M.to_vec(),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(
+            (stats.errors, stats.commands),
+            (0, 3),
+            "a marker is no command"
+        );
+        assert_eq!(set(&store, "a", "e"), Some((Quant::Q8, true, "int8")));
+        assert_eq!(set(&store, "b", "e"), Some((Quant::Bin, true, "bin")));
+        assert_eq!(set(&store, "c", "e"), Some((Quant::F32, true, "f32")));
+    }
+
+    /// Only the record just before a marker is marked, and only a `VADD`.
+    #[test]
+    fn a_marker_never_reaches_past_its_own_record() {
+        let records = [
+            // At the start: nothing before it.
+            M.to_vec(),
+            vadd("first", "Q8"),
+            // 1.2's, then a 1.3 one after it.
+            vadd("old", "BIN"),
+            vadd("new", "BIN"),
+            M.to_vec(),
+            // After another command, or a `VADD` with no option.
+            record(&["SET", "s", "1"]),
+            M.to_vec(),
+            vadd("after_set", "Q8"),
+            vadd("plain", ""),
+            M.to_vec(),
+            vadd("after_plain", "Q8"),
+            // Two in a row mark one record.
+            vadd("twice", "Q8"),
+            M.to_vec(),
+            M.to_vec(),
+            vadd("after_twice", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for key in [
+            "first",
+            "old",
+            "after_set",
+            "plain",
+            "after_plain",
+            "after_twice",
+        ] {
+            assert_eq!(quant(&store, key), Some((Quant::F32, false)), "{key}");
+        }
+        assert_eq!(quant(&store, "new"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "twice"), Some((Quant::Q8, true)));
+    }
+
+    /// Cut while being written, the marker is dropped and its `VADD` replays as f32.
+    #[test]
+    fn a_torn_marker_leaves_its_vadd_f32() {
+        for option in ["Q8", "BIN", "NOQUANT"] {
+            for cut in [1, 10, M.len() - 1] {
+                let mut log = delta(&vadd("a", option));
+                let whole = log.len();
+                log.extend_from_slice(&M[..cut]);
+                let (store, stats) = replay(&log);
+                assert!(stats.truncated_tail, "{option} {cut}");
+                assert_eq!(stats.valid_len as usize, whole, "{option} {cut}");
+                assert_eq!(
+                    set(&store, "a", "e"),
+                    Some((Quant::F32, false, "f32")),
+                    "{option} {cut}"
+                );
+            }
+        }
+    }
+
+    /// A later `VADD` follows the set, marked or not: only creation reads the marker.
+    #[test]
+    fn a_later_vadd_follows_the_set() {
+        let records = [
+            vadd_e("q", "e", "Q8"),
+            M.to_vec(),
+            vadd_e("q", "unmarked", "Q8"),
+            vadd_e("q", "other", "BIN"),
+            vadd_e("q", "none", ""),
+            vadd_e("f", "e", "Q8"),
+            vadd_e("f", "marked", "Q8"),
+            M.to_vec(),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        for element in ["e", "unmarked", "other", "none"] {
+            assert_eq!(
+                set(&store, "q", element),
+                Some((Quant::Q8, true, "int8")),
+                "{element}"
+            );
+        }
+        for element in ["e", "marked"] {
+            assert_eq!(
+                set(&store, "f", element),
+                Some((Quant::F32, false, "f32")),
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_inside_a_transaction() {
+        let records = [
+            record(&["MULTI"]),
+            vadd("a", "Q8"),
+            M.to_vec(),
+            record(&["SET", "s", "1"]),
+            vadd("b", "BIN"),
+            M.to_vec(),
+            vadd("c", "NOQUANT"),
+            record(&["EXEC"]),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.errors, 0);
+        assert_eq!(quant(&store, "a"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "b"), Some((Quant::Bin, true)));
+        assert_eq!(quant(&store, "c"), Some((Quant::F32, false)));
+
+        // Its `EXEC` never written: dropped whole, markers too.
+        let whole = delta(&vadd("x", "Q8"));
+        let mut log = whole.clone();
+        log.extend([record(&["MULTI"]), vadd("y", "Q8"), M.to_vec()].concat());
+        let (store, stats) = replay(&log);
+        assert!(stats.truncated_tail);
+        assert_eq!(stats.valid_len as usize, whole.len());
+        assert_eq!(quant(&store, "x"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "y"), None);
+    }
+
+    /// A flush skips the `VADD` before it; its marker reaches nothing further.
+    #[test]
+    fn a_flush_after_a_marked_vadd() {
+        let records = [
+            vadd("gone", "Q8"),
+            M.to_vec(),
+            record(&["FLUSHALL"]),
+            vadd("kept", "Q8"),
+            M.to_vec(),
+            vadd("unmarked", "Q8"),
+        ]
+        .concat();
+        let (store, stats) = replay(&delta(&records));
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(quant(&store, "gone"), None);
+        assert_eq!(quant(&store, "kept"), Some((Quant::Q8, true)));
+        assert_eq!(quant(&store, "unmarked"), Some((Quant::F32, false)));
+    }
+
+    /// The draft form, with an argument, marks nothing.
+    #[test]
+    fn a_marker_with_arguments_is_no_marker() {
+        let records = [
+            vadd("a", "Q8"),
+            record(&["KIVIDB.AOF-VSET-QUANT", "1"]),
+            vadd("b", "Q8"),
+        ]
+        .concat();
+        let (store, _) = replay(&delta(&records));
+        assert_eq!(quant(&store, "a"), Some((Quant::F32, false)));
+        assert_eq!(quant(&store, "b"), Some((Quant::F32, false)));
+    }
+
+    /// What a backup increment adds after a stream payload.
+    #[test]
+    fn payloads_that_need_a_marker() {
+        let select = record(&["SELECT", "0"]);
+        for (payload, needs) in [
+            (vadd("a", "Q8"), true),
+            ([select.clone(), vadd("a", "bin")].concat(), true),
+            (vadd("a", "NOQUANT"), true),
+            (vadd("a", ""), false),
+            ([vadd("a", "Q8"), select.clone()].concat(), false),
+            (record(&["SET", "VADD", "Q8"]), false),
+            (record(&["VREM", "a", "Q8"]), false),
+        ] {
+            assert_eq!(
+                needs_vset_quant_marker(&payload),
+                needs,
+                "{}",
+                String::from_utf8_lossy(&payload)
+            );
+        }
     }
 }

@@ -23,12 +23,13 @@
 //!
 //! When a key was last used (or modified), or how often, is kept in the
 //! key's own entry, in one 32-bit word of its header, as Redis keeps it in
-//! the object's `lru` field: see [`Access`]. It is written only while a
-//! policy that asks for it is selected (or `key-access-tracking` is on):
-//! with `noeviction` a command pays one atomic load for all of this, and
-//! each of its lookups one thread-local load. The word is written only when
-//! it changes, so a key read again and again within the same second dirties
-//! its cache line once.
+//! the object's `lru` field: see [`Access`]. It is written while a policy
+//! that asks for it is selected, and whatever the policy while
+//! `key-access-tracking yes` is set (as in Redis, so that `OBJECT IDLETIME`
+//! answers under `noeviction`); by default, with a policy that does not ask
+//! for it, a command pays one atomic load for all of this, and each of its lookups one thread-local load. The word
+//! is written only when it changes, so a key read again and again within
+//! the same second dirties its cache line once.
 //!
 //! **Where a use is written.** By the lookups the command makes anyway: the
 //! dispatcher opens a `store::AccessScope` around the command with the
@@ -47,9 +48,10 @@
 use crate::commands::ctx::Ctx;
 use crate::store::Store;
 use rand::Rng;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ── The policy ────────────────────────────────────────────────────────────────
 
@@ -191,9 +193,11 @@ pub fn set_policy(policy: Policy) {
 /// `key-access-tracking`: whether a key's use is recorded under every
 /// policy, so that `OBJECT IDLETIME` and `FREQ` report it under
 /// `noeviction` too, as Redis does (#21). Off by default: recording costs
-/// every command a clock reading, and each lookup a store to the key's
-/// entry when its word changes (it costs a key nothing: the word is in every
-/// entry anyway). Under an LRU or LFU policy it is recorded either way.
+/// every command a clock reading (kept for the second it is read in) and a
+/// scope for its lookups, and each lookup a store to the key's entry when
+/// its word changes: about 50 instructions, 1 to 1.5% of a pipelined `GET`
+/// or `SET` (`benchmarks/1.3.0/key-access-tracking`). It costs a key nothing:
+/// the word is in every entry anyway. Under an LRU or LFU policy it is recorded either way.
 pub fn key_access_tracking() -> bool {
     TRACK_ALWAYS.load(Ordering::Relaxed)
 }
@@ -339,18 +343,50 @@ fn clock() -> u32 {
     clock_at(Instant::now())
 }
 
-/// [`clock`] at `now`.
+thread_local! {
+    /// The second [`clock_at`] last answered for on this thread: when it
+    /// ends, and what [`clock`] says in it.
+    static SECOND: Cell<Option<(Instant, u32)>> = const { Cell::new(None) };
+}
+
+/// [`clock`] at `now`. Answered from the second this thread last asked
+/// about, and worked out again only when that ends: subtracting two
+/// instants was a tenth of what recording a use cost a command.
 #[inline]
 fn clock_at(now: Instant) -> u32 {
-    CLOCK_BASE + now.saturating_duration_since(*START).as_secs() as u32
+    if let Some((until, seconds)) = SECOND.get()
+        && now < until
+    {
+        return seconds;
+    }
+    clock_in_a_new_second(now)
+}
+
+#[cold]
+#[inline(never)]
+fn clock_in_a_new_second(now: Instant) -> u32 {
+    let start = *START;
+    let elapsed = now.saturating_duration_since(start).as_secs();
+    let seconds = CLOCK_BASE + elapsed as u32;
+    SECOND.set(Some((start + Duration::from_secs(elapsed + 1), seconds)));
+    seconds
 }
 
 /// What a command that uses keys has its lookups write to them, starting
 /// at `now` (`store::AccessScope`): the clock (LRU), or the minute with the
 /// stamp's top bit set (LFU, see [`counted`]). 0, nothing, when nothing is
 /// recorded, or only modifications are (LRM: see the module).
-#[inline]
+#[inline(always)]
 pub fn stamp(now: Instant) -> u32 {
+    // The common case first: one comparison.
+    if TRACK.load(Ordering::Relaxed) == Track::Used as u8 {
+        return Access::clock_word(clock_at(now));
+    }
+    stamp_other(now)
+}
+
+#[inline(never)]
+fn stamp_other(now: Instant) -> u32 {
     match track() {
         Track::Used => Access::clock_word(clock_at(now)),
         Track::Frequency => Access::LFU | ((clock_at(now) / 60) & 0xffff) << 8,
@@ -433,6 +469,12 @@ pub fn idle_seconds(word: u32) -> u64 {
     }
 }
 
+/// The low 24 bits of the access word, what Redis shows as `lru` in `DEBUG
+/// OBJECT`: seconds under LRU, minutes and count under LFU.
+pub fn lru_bits(word: u32) -> u32 {
+    word & 0xff_ffff
+}
+
 /// The frequency count of a key with the access word `word` (`OBJECT FREQ`).
 pub fn frequency(word: u32) -> u8 {
     Access::frequency(word, clock() / 60, lfu_decay_time())
@@ -482,6 +524,8 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "RENAME"
             | "RENAMENX"
             | "MOVE"
+            // Takes keys away; Redis flags it a write, but not `denyoom`.
+            | "MIGRATE"
             | "SWAPDB"
             | "LPOP"
             | "RPOP"
@@ -528,6 +572,9 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "EXEC"
             | "DISCARD"
             | "RESTORE-ASKING"
+            // Propagated, so `replication::is_write_command` has it, but it
+            // writes nothing (#411).
+            | "SELECT"
     )
 }
 
@@ -641,21 +688,31 @@ fn sample_shard<'m>(
     count
 }
 
-/// Up to `count` keys of one database, from a random shard and as many after
-/// it as it takes, each handed to `found` with its shard and place: of all
-/// its keys, or (`volatile`) of those with a time to live. Shards with none,
-/// as far as is known without a lock, are passed over unlocked.
+/// Up to `count` keys of one database, from a shard picked at random in
+/// proportion to its keys (`weights`, the running totals of
+/// `store::shard_weights`; evenly when they are empty or weigh nothing) and
+/// as many after it as it takes, each handed to `found` with its shard and
+/// place: of all its keys, or (`volatile`) of those with a time to live.
+/// Shards with none, as far as is known without a lock, are passed over
+/// unlocked. Within a shard the keys are sampled evenly ([`sample_shard`]),
+/// so a key is as likely to be looked at as any other of the database
+/// however unevenly the shards are filled: in cluster mode a busy hash tag
+/// fills one shard, and picked evenly that shard came up as often as one of
+/// a few keys (#294).
 fn sample_db(
     shards: &[crate::store::Shard],
     volatile: bool,
     count: usize,
+    weights: &[usize],
     rng: &mut impl Rng,
     mut found: impl FnMut(usize, usize, crate::store::EntryView<'_>),
 ) {
     if shards.is_empty() {
         return;
     }
-    let first = rng.gen_range(0..shards.len());
+    let first = crate::store::pick_weighted(weights, rng.r#gen())
+        .filter(|&i| i < shards.len())
+        .unwrap_or_else(|| rng.gen_range(0..shards.len()));
     let mut got = 0;
     for step in 0..shards.len() {
         let index = (first + step) % shards.len();
@@ -735,7 +792,7 @@ impl Choice {
     /// `spot`, whose key is `key`. Among keys as unwanted, the one offered
     /// first stays first.
     #[inline]
-    fn offer(&mut self, spot: Spot, key: &str) {
+    fn offer(&mut self, spot: Spot, key: &[u8]) {
         let top = &self.top[..self.len];
         if top.iter().any(|s| s.id == spot.id) {
             // Sampled twice, or kept and sampled again.
@@ -778,6 +835,7 @@ fn choose(
     ctx: &Ctx,
     policy: Policy,
     dbs: &[usize],
+    weights: &[Vec<usize>],
     rng: &mut impl Rng,
 ) -> Option<(usize, crate::store::Key)> {
     let now = clock();
@@ -814,17 +872,25 @@ fn choose(
         }
     }
     for &db in dbs {
-        sample_db(&ctx.store[db], volatile, count, rng, |shard, place, e| {
-            let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
-            let spot = Spot {
-                db,
-                shard,
-                place,
-                id: e.id(),
-                unwanted,
-            };
-            choice.offer(spot, e.key());
-        });
+        let weights = weights.get(db).map_or(&[][..], Vec::as_slice);
+        sample_db(
+            &ctx.store[db],
+            volatile,
+            count,
+            weights,
+            rng,
+            |shard, place, e| {
+                let unwanted = unwanted(policy, e.access(), e.expires(), now, decay);
+                let spot = Spot {
+                    db,
+                    shard,
+                    place,
+                    id: e.id(),
+                    unwanted,
+                };
+                choice.offer(spot, e.key());
+            },
+        );
     }
     choice.decide()
 }
@@ -844,13 +910,17 @@ struct Dbs {
     volatile: bool,
     found: Option<Instant>,
     list: Vec<usize>,
+    /// For each database, the running totals of its shards' keys (or keys
+    /// with a time to live), as found with the list: what a shard weighs
+    /// when one is picked to sample (`store::pick_weighted`).
+    weights: Vec<Vec<usize>>,
 }
 
 impl Dbs {
     const TRUSTED: std::time::Duration = std::time::Duration::from_millis(10);
 
     /// The list, found again if it is not to be trusted (`fresh`: it is not).
-    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> &[usize] {
+    fn get(&mut self, ctx: &Ctx, volatile: bool, fresh: bool) -> (&[usize], &[Vec<usize>]) {
         let store = Arc::as_ptr(ctx.store) as *const () as usize;
         let now = Instant::now();
         if fresh
@@ -864,17 +934,15 @@ impl Dbs {
             self.volatile = volatile;
             self.found = Some(now);
             self.list.clear();
-            self.list.extend((0..ctx.store.len()).filter(|&db| {
-                ctx.store[db].iter().any(|shard| {
-                    if volatile {
-                        !shard.holds_no_ttl()
-                    } else {
-                        !shard.holds_no_keys()
-                    }
-                })
-            }));
+            self.weights.resize_with(ctx.store.len(), Vec::new);
+            for (db, weights) in self.weights.iter_mut().enumerate() {
+                crate::store::shard_weights(&ctx.store[db], volatile, weights);
+                if weights.last().is_some_and(|&total| total > 0) {
+                    self.list.push(db);
+                }
+            }
         }
-        &self.list
+        (&self.list, &self.weights)
     }
 }
 
@@ -882,17 +950,126 @@ thread_local! {
     static DBS: std::cell::RefCell<Dbs> = std::cell::RefCell::new(Dbs::default());
 }
 
+/// Bytes, at least, that evictions under way are freeing: collections
+/// gone from the keyspace and not yet freed (see [`evict`]). A list of
+/// millions of elements takes a while to free, element by element, on the
+/// thread that evicted it; meanwhile the keyspace may hold nothing more to
+/// evict, while memory use still counts all of it.
+static FREEING_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// A collection below this ([`freeing_at_least`]) is freed in no time, and
+/// not counted in [`FREEING_BYTES`]: nor is a string, whose bytes are one
+/// allocation.
+const FREEING_COUNTED: usize = 64 << 10;
+
+/// About how much freeing `value` gives back, at least: a floor of what
+/// each element of a collection takes (no element of any of them takes
+/// less), or what is known exactly (a stream's entries, a sketch's bytes).
+/// 0 for a string. Too low is safe: a write is let through only on what
+/// is known to be on its way back ([`room_on_its_way`]).
+fn freeing_at_least(value: crate::store::ValueRef<'_>) -> usize {
+    use crate::store::ValueRef as V;
+    // A block of its own, and a slot in its collection.
+    const ELEMENT: usize = 32;
+    match value {
+        V::String(_) => 0,
+        V::List(list) => list.read().len() * ELEMENT,
+        V::Hash(hash) => hash.read().len() * ELEMENT,
+        V::HashEx(hash) => hash.read().len() * ELEMENT,
+        V::Set(set) => set.read().len() * ELEMENT,
+        V::SortedSet(zset) => zset.read().len() * ELEMENT,
+        V::VectorSet(set) => set.read().entries.len() * ELEMENT,
+        V::Json(json) => match &*json.read() {
+            serde_json::Value::Array(items) => items.len() * ELEMENT,
+            serde_json::Value::Object(fields) => fields.len() * ELEMENT,
+            _ => 0,
+        },
+        V::Stream(stream) => stream.read().entries.heap_bytes(),
+        // A timestamp and a value apiece.
+        V::TimeSeries(series) => series.read().samples.len() * 16,
+        V::Array(array) => array.read().count() as usize * ELEMENT,
+        V::Sketch(sketch) => sketch.read().memory_bytes(),
+    }
+}
+
+/// A collection being freed, its bytes counted in [`FREEING_BYTES`] while
+/// this lives.
+struct Freeing(usize);
+
+impl Freeing {
+    fn start(bytes: usize) -> Option<Self> {
+        (bytes >= FREEING_COUNTED).then(|| {
+            FREEING_BYTES.fetch_add(bytes, Ordering::AcqRel);
+            Freeing(bytes)
+        })
+    }
+}
+
+impl Drop for Freeing {
+    fn drop(&mut self) {
+        FREEING_BYTES.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+/// Nothing is left to evict, memory use is `used`: whether the write is
+/// let through all the same, because what evictions under way are freeing
+/// brings memory use under `limit` by itself (#520). Only under an
+/// `allkeys-*` policy, where what the write adds can itself be evicted:
+/// under a `volatile-*` one, nothing left to evict means no key with a time
+/// to live, and a key written without one could never be.
+///
+/// How far over the limit that lets memory go is bounded, and does not add
+/// up: a write is let through only while memory use, with every write let
+/// through before it, is no more than the limit and the bytes on their way
+/// back. So at most the collections being freed at that moment, and what
+/// the writes checked at that same moment (one per thread) add; once they
+/// are freed, at most those writes and the reckoned bytes not yet freed
+/// when they were let in, until the next write evicts them. Nothing waits.
+///
+/// Redis has no such case: it frees an evicted key on the thread that
+/// evicts, before the next command. With `lazyfree-lazy-eviction`, when
+/// nothing is left to evict it waits a little for its background frees and
+/// then refuses the write; it lets a write through without making room
+/// (`EVICT_RUNNING`) only when keys are left to evict and it ran out of
+/// time evicting them.
+fn room_on_its_way(policy: Policy, used: usize, limit: usize) -> bool {
+    !policy.volatile() && used.saturating_sub(FREEING_BYTES.load(Ordering::Acquire)) <= limit
+}
+
 /// Delete `key` to make room, with everything a deletion entails. Returns
 /// about how much memory that gives back (see `store::Taken::footprint`),
 /// or None if the key was gone already.
-fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
+/// `freeing_slowly`: `KIVIDB_TEST_FAILPOINTS` names `eviction-frees-slowly`.
+fn evict(
+    ctx: &mut Ctx,
+    db: usize,
+    key: &[u8],
+    ordered: bool,
+    freeing_slowly: bool,
+) -> Option<usize> {
     // Ordered against other writes to the key, like any write (#271). See
     // `write_order`.
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())
-        .then(|| crate::write_order::lock_keys(db, std::iter::once(key.as_bytes())));
+        .then(|| crate::write_order::lock_keys(db, std::iter::once(key)));
 
-    let given = crate::commands::helpers::delete_key_sized(ctx.store, db, key)?;
-    crate::vector::maybe_unindex(ctx.index_store, db, key);
+    // A document left its indexes when the shard was let go of
+    // (`ShardMap::remove`).
+    let taken = crate::commands::helpers::take_entry(ctx.store, db, key)?;
+    let given = taken.footprint();
+    // Until it is freed (see `room_on_its_way`). A string kept in the entry
+    // goes with it.
+    let freeing = if taken.is_inline() {
+        None
+    } else {
+        Freeing::start(freeing_at_least(taken.value()))
+    };
+    if freeing_slowly {
+        // A large value, slow to free: a test's other clients write
+        // meanwhile.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    drop(taken);
+    drop(freeing);
     crate::vector::maybe_request_compaction(ctx.index_store, ctx.compaction_tx, key);
     crate::stats::record_evicted();
     crate::stats::record_rdb_change();
@@ -911,14 +1088,16 @@ fn evict(ctx: &mut Ctx, db: usize, key: &str, ordered: bool) -> Option<usize> {
         // In the key's database, whichever the client has selected.
         let selected = *ctx.selected_db;
         *ctx.selected_db = db;
-        crate::replication::replicate_one_write(ctx, &[b"DEL".to_vec(), key.as_bytes().to_vec()]);
+        crate::replication::replicate_one_write(ctx, &[b"DEL".to_vec(), key.to_vec()]);
         *ctx.selected_db = selected;
     }
     Some(given)
 }
 
 /// Delete keys until memory use is at most `limit`. False if the policy has
-/// nothing more to delete and it is still over: the write is refused.
+/// nothing more to delete and it is still over, unless what evictions under
+/// way are freeing brings it under ([`room_on_its_way`]): the write is
+/// refused.
 ///
 /// Memory use is what `maxmemory` is measured against: what is allocated,
 /// less what deleting keys would not give back (`memory_use::counted`), such
@@ -973,10 +1152,77 @@ pub fn limit_changed() {
 
 /// Whether keys that took `given` bytes have been evicted to no effect:
 /// twice what memory use was over the limit by (`over`), and a megabyte
-/// more for what other threads allocate meanwhile, and memory use (`used`)
-/// is no lower than when it began (`began`).
-fn fruitless(given: usize, over: usize, used: usize, began: usize) -> bool {
-    given > over.saturating_mul(2).saturating_add(1 << 20) && used >= began
+/// more, memory use (`used`) no lower than when it began (`began`), and
+/// less than a quarter of it given back by the evicting itself (`freed`:
+/// what this thread's own share of memory use came down by meanwhile, what
+/// it freed and what it counted as held by a snapshot, `None` if it has no
+/// count of its own).
+///
+/// Memory use alone does not say: other threads' writes add to it while
+/// this one evicts (each makes room before it writes, and many write at
+/// once), and so does what stops being left out of it, such as a queue
+/// for a replica let go of. It can stay as high while every key evicted
+/// here is freed, and a write was refused with keys to spare (#520). What
+/// does say is a key deleted and its memory still allocated and counted:
+/// held by something eviction does not know of. Deleting more of those
+/// would empty the keyspace for nothing (#284).
+/// `freed` is asked last, and only if the rest says so: it reads this
+/// thread's counters, on every pass of an eviction at the limit.
+fn fruitless(
+    given: usize,
+    over: usize,
+    used: usize,
+    began: usize,
+    freed: impl FnOnce() -> Option<isize>,
+) -> bool {
+    given > over.saturating_mul(2).saturating_add(1 << 20)
+        && used >= began
+        && freed().is_none_or(|freed| freed < (given / 4) as isize)
+}
+
+/// What this thread has added to memory use, if it has a count of its
+/// own: see [`fruitless`].
+fn mine() -> Option<isize> {
+    crate::memory_use::counted_by_this_thread()
+}
+
+/// `KIVIDB_TEST_FAILPOINTS` names `eviction-others-allocate`: as each key is
+/// evicted, other threads are taken to allocate twice what it took, 8 MB
+/// at most in all. Writers that outpace one thread's evicting for a while,
+/// for a test to see that eviction goes on (#520).
+fn others_allocate(given: usize) {
+    static SO_FAR: AtomicUsize = AtomicUsize::new(0);
+    const AT_MOST: usize = 8 << 20;
+    let more = given.saturating_mul(2);
+    if SO_FAR.fetch_add(more, Ordering::Relaxed) < AT_MOST {
+        crate::memory_use::note_by_another_thread(more as isize);
+    }
+}
+
+/// [`test_hooks`]: `eviction-others-allocate` ([`others_allocate`]).
+const OTHERS_ALLOCATE: u8 = 1;
+/// [`test_hooks`]: `eviction-frees-slowly` (see [`evict`]).
+const FREES_SLOWLY: u8 = 2;
+
+/// The test hooks `KIVIDB_TEST_FAILPOINTS` names, looked up once: a load on
+/// every eviction after that.
+fn test_hooks() -> u8 {
+    static HOOKS: AtomicU8 = AtomicU8::new(u8::MAX);
+    let hooks = HOOKS.load(Ordering::Relaxed);
+    if hooks != u8::MAX {
+        return hooks;
+    }
+    let hooks = if crate::aof::injected("eviction-others-allocate") {
+        OTHERS_ALLOCATE
+    } else {
+        0
+    } | if crate::aof::injected("eviction-frees-slowly") {
+        FREES_SLOWLY
+    } else {
+        0
+    };
+    HOOKS.store(hooks, Ordering::Relaxed);
+    hooks
 }
 
 fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs: &mut Dbs) -> bool {
@@ -986,20 +1232,33 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
     // A key that could not be deleted — it went between being chosen and
     // being deleted — is no reason to stop, but nothing but those is.
     let mut misses = 0;
+    let mut looked_again = false;
     // Nor is an eviction that gives nothing back, now and then; but keys
     // that took far more than memory use was over by, evicted with memory
-    // use no lower, are memory that evicting keys does not give back: the
-    // keyspace was emptied that way (#284). Rather than lose every key,
-    // stop, and refuse writes while memory use stays that high.
+    // use no lower and their memory still allocated, are memory that
+    // evicting keys does not give back: the keyspace was emptied that way
+    // (#284). Rather than lose every key, stop, and refuse writes while
+    // memory use stays that high. Whether it was given back is told by
+    // this thread's own count, which other threads' writes do not move (see
+    // `fruitless`).
     let began = crate::memory_use::counted();
+    let began_here = mine();
     let over = began.saturating_sub(limit);
     let mut given = 0usize;
+    let hooks = test_hooks();
+    let others_allocating = hooks & OTHERS_ALLOCATE != 0;
+    let freeing_slowly = hooks & FREES_SLOWLY != 0;
     loop {
         let used = crate::memory_use::counted();
         if used <= limit {
             return true;
         }
-        if fruitless(given, over, used, began) {
+        let freed = || {
+            began_here
+                .zip(mine())
+                .map(|(then, now)| then.wrapping_sub(now))
+        };
+        if fruitless(given, over, used, began, freed) {
             STALLED_AT.store(used, Ordering::Relaxed);
             log_throttled!(
                 60,
@@ -1011,24 +1270,38 @@ fn make_room_in(ctx: &mut Ctx, policy: Policy, limit: usize, ordered: bool, dbs:
             );
             return false;
         }
-        let Some((db, key)) = choose(ctx, policy, dbs.get(ctx, volatile, fresh), &mut rng) else {
+        let (list, weights) = dbs.get(ctx, volatile, fresh);
+        let Some((db, key)) = choose(ctx, policy, list, weights, &mut rng) else {
             if fresh {
-                return false;
+                // Nothing left to evict: refused, unless what is being
+                // freed makes the room (#520).
+                return room_on_its_way(policy, used, limit);
             }
             // Nothing where there were keys: ask again where they are.
             fresh = true;
             continue;
         };
         fresh = false;
-        match evict(ctx, db, &key, ordered) {
+        match evict(ctx, db, &key, ordered, freeing_slowly) {
             Some(size) => {
                 misses = 0;
                 given = given.saturating_add(size);
+                if others_allocating {
+                    others_allocate(size);
+                }
             }
             None => {
                 misses += 1;
                 if misses > 64 {
-                    return false;
+                    // Gone before this thread could evict them: evicted or
+                    // deleted by others. Once more, from where the keys
+                    // are now; then as when nothing is left.
+                    if looked_again {
+                        return room_on_its_way(policy, used, limit);
+                    }
+                    looked_again = true;
+                    misses = 0;
+                    fresh = true;
                 }
             }
         }
@@ -1041,19 +1314,43 @@ mod tests {
     use std::sync::Arc;
 
     /// Eviction stops only once keys well past what memory use was over by
-    /// have gone with memory use no lower: not for a deletion or two that
-    /// give nothing back, nor while memory use comes down.
+    /// have gone with memory use no lower and their memory not given back:
+    /// not for a deletion or two that give nothing back, nor while memory
+    /// use comes down, nor while what is evicted is freed (#520).
     #[test]
     fn eviction_stops_when_it_gives_nothing_back() {
         const MB: usize = 1 << 20;
+        const KB: usize = 1 << 10;
+        // Nothing freed here.
+        let stops = |given, over, used, began| fruitless(given, over, used, began, || Some(0));
         // 8 KB over; 1.1 MB of keys evicted, memory use as it was.
-        assert!(fruitless(MB + 17 * 1024, 8 * 1024, 100 * MB, 100 * MB));
-        assert!(!fruitless(MB, 8 * 1024, 100 * MB, 100 * MB));
+        assert!(stops(MB + 17 * KB, 8 * KB, 100 * MB, 100 * MB));
+        assert!(!stops(MB, 8 * KB, 100 * MB, 100 * MB));
         // Lower than when it began: the evictions are working.
-        assert!(!fruitless(50 * MB, 8 * 1024, 100 * MB - 1, 100 * MB));
+        assert!(!stops(50 * MB, 8 * KB, 100 * MB - 1, 100 * MB));
         // Far over: twice that is evicted first.
-        assert!(!fruitless(40 * MB, 20 * MB, 120 * MB, 120 * MB));
-        assert!(fruitless(42 * MB, 20 * MB, 121 * MB, 120 * MB));
+        assert!(!stops(40 * MB, 20 * MB, 120 * MB, 120 * MB));
+        assert!(stops(42 * MB, 20 * MB, 121 * MB, 120 * MB));
+        // No count of its own: memory use alone says.
+        assert!(fruitless(MB + 17 * KB, 8 * KB, 100 * MB, 100 * MB, || None));
+    }
+
+    /// What was evicted was freed, here: other threads' writes kept memory
+    /// use as high (#520), and eviction goes on. Freed in part (a value
+    /// something else still has a handle on), it goes on while a quarter of
+    /// it is; and stops once less is.
+    #[test]
+    fn eviction_goes_on_while_what_it_evicts_is_freed() {
+        const MB: usize = 1 << 20;
+        const GIVEN: usize = 2 * MB;
+        // 2 MB evicted, 8 KB over, memory use 1 MB higher than it began,
+        // and `freed` of it freed here.
+        let stops = |freed: isize| fruitless(GIVEN, 8 << 10, 101 * MB, 100 * MB, || Some(freed));
+        assert!(!stops(GIVEN as isize));
+        assert!(!stops(GIVEN as isize / 4));
+        assert!(stops(GIVEN as isize / 4 - 1));
+        // This thread allocated meanwhile more than it freed.
+        assert!(stops(-(MB as isize)));
     }
 
     #[test]
@@ -1148,11 +1445,46 @@ mod tests {
         rng: &mut impl Rng,
     ) -> Vec<Sampled> {
         let mut found = Vec::new();
-        sample_db(shards, volatile, count, rng, |_, _, e| {
+        sample_db(shards, volatile, count, &[], rng, |_, _, e| {
             let expires = if volatile { e.expires() } else { None };
-            found.push((e.key().to_string(), expires, e.access()))
+            found.push((
+                crate::key_bytes::text_of(e.key()).into_owned(),
+                expires,
+                e.access(),
+            ))
         });
         found
+    }
+
+    /// Shards filled unevenly, as one busy hash tag fills one in cluster
+    /// mode: picked in proportion to their keys, a key of the full shard is
+    /// as likely to be looked at as a key of the others (#294). (Picked
+    /// evenly, the full shard's 7,000 keys came up an eighth of the time.)
+    #[test]
+    fn a_full_shard_is_sampled_as_often_as_its_keys_say() {
+        let shards: Vec<crate::store::Shard> = (0..8)
+            .map(|_| Arc::new(crate::store::ShardLock::default()))
+            .collect();
+        for i in 0..7_000 {
+            shards[0].write().insert_str(format!("big{i}"), b"v");
+        }
+        for i in 0..1_000 {
+            shards[1 + i % 7].write().insert_str(format!("k{i}"), b"v");
+        }
+        let mut weights = Vec::new();
+        crate::store::shard_weights(&shards, false, &mut weights);
+        assert_eq!(weights.last(), Some(&8_000));
+        let mut rng = rand::thread_rng();
+        let (mut big, mut all) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            sample_db(&shards, false, 5, &weights, &mut rng, |shard, _, _| {
+                all += 1;
+                big += u32::from(shard == 0);
+            });
+        }
+        // 7/8 of the keys; about 0.002 either way.
+        let share = f64::from(big) / f64::from(all);
+        assert!((0.85..0.90).contains(&share), "{share}");
     }
 
     /// Every key is as likely to be sampled as any other, wherever it is in
@@ -1180,7 +1512,9 @@ mod tests {
         // 200 times each, on average.
         for _ in 0..40_000 {
             let n = sample_shard(&map, false, 5, &mut rng, |_, e| {
-                *times.entry(e.key().to_string()).or_default() += 1;
+                *times
+                    .entry(crate::key_bytes::text_of(e.key()).into_owned())
+                    .or_default() += 1;
             });
             assert_eq!(n, 5);
         }
@@ -1218,13 +1552,14 @@ mod tests {
             (7, 40),
             (8, 20),
         ] {
-            c.offer(spot(id, unwanted), &format!("k{id}"));
+            c.offer(spot(id, unwanted), format!("k{id}").as_bytes());
         }
         let ids = |s: &[Spot]| s.iter().map(|s| s.id).collect::<Vec<_>>();
         // 2 is there once; 8 is as unwanted as 3, and came after it.
         assert_eq!(ids(&c.top[..c.len]), [7, 2, 5, 3, 8]);
         assert_eq!(
-            c.decide().map(|(db, key)| (db, key.to_string())),
+            c.decide()
+                .map(|(db, key)| (db, crate::key_bytes::text_of(&key).into_owned())),
             Some((3, "k7".to_string()))
         );
         let kept = KEPT_SPOTS.with(|k| k.get());

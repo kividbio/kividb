@@ -279,6 +279,16 @@ impl MemberSet {
         }
     }
 
+    /// The bytes of the table's one allocation (buckets and control bytes),
+    /// from its bucket count: no walk. The members' own blocks are not in
+    /// it. For the array, what it has allocated.
+    pub fn allocation_size(&self) -> usize {
+        match &self.repr {
+            Repr::Ints(ints) => each_width!(ints, v => allocated(v)),
+            Repr::Table(t) => t.table.allocation_size(),
+        }
+    }
+
     #[inline]
     pub fn contains(&self, member: &[u8]) -> bool {
         match &self.repr {

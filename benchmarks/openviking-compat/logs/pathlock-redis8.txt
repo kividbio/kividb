@@ -1,0 +1,26 @@
+benchmarks/openviking-compat/.work/venv-openviking/lib/python3.12/site-packages/pytest_asyncio/plugin.py:300: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+.........                                                                [100%]
+=============================== warnings summary ===============================
+../venv-openviking/lib/python3.12/site-packages/lark_oapi/ws/pb/google/protobuf/internal/well_known_types.py:91
+  benchmarks/openviking-compat/.work/venv-openviking/lib/python3.12/site-packages/lark_oapi/ws/pb/google/protobuf/internal/well_known_types.py:91: DeprecationWarning: datetime.datetime.utcfromtimestamp() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.fromtimestamp(timestamp, datetime.UTC).
+    _EPOCH_DATETIME_NAIVE = datetime.datetime.utcfromtimestamp(0)
+
+../venv-openviking/lib/python3.12/site-packages/lark_oapi/ws/client.py:35
+  benchmarks/openviking-compat/.work/venv-openviking/lib/python3.12/site-packages/lark_oapi/ws/client.py:35: DeprecationWarning: There is no current event loop
+    loop = asyncio.get_event_loop()
+
+../venv-openviking/lib/python3.12/site-packages/openviking/resource/watch_manager.py:56
+  benchmarks/openviking-compat/.work/venv-openviking/lib/python3.12/site-packages/openviking/resource/watch_manager.py:56: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class WatchTask(BaseModel):
+
+../venv-openviking/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:300
+../venv-openviking/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:300
+../venv-openviking/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:300
+  benchmarks/openviking-compat/.work/venv-openviking/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:300: PydanticDeprecatedSince20: `json_encoders` is deprecated. See https://pydantic.dev/docs/validation/2.14/concepts/serialization/#custom-serializers for alternatives. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+9 passed, 6 warnings in 28.17s

@@ -42,15 +42,22 @@ static PAUSE_MODE_WRITE_ONLY: std::sync::atomic::AtomicBool =
 /// (`handoff`), steps out again and waits for the handoff to end
 /// (`wait_out_handoff`) — and is then answered by whoever owns the key.
 ///
-/// Not set for `CLIENT PAUSE`: nothing is handed over, so a write that slips
-/// past it is merely a moment late in being paused, and waiting for it in
-/// the gate would hold a worker thread for as long as the client asked.
+/// Not set for `CLIENT PAUSE`, which lasts as long as its client asks: a
+/// write waiting it out there would hold its worker thread for all that
+/// time. A `CLIENT PAUSE` has a bit of its own instead ([`CLIENT_PAUSE`]),
+/// for the same reason: a switchover pauses writes, reads
+/// `master_repl_offset`, waits for the replica to reach it and promotes the
+/// replica, and a write that got past the pause check before the pause was
+/// set, and was applied after that reading, was acknowledged and lost with
+/// the promotion (#629). Such a write steps out of the gate and goes back to
+/// its connection, which holds it as it holds any write while writes are
+/// paused ([`held_in_gate`]).
 ///
 /// The same flag, a second bit of it, is up while a `MIGRATE` holds keys
 /// here ([`KEYS_MOVING`], see `key_moves`): one load still tells a write
 /// whether it has anything to look at ([`writes_must_check`]).
 ///
-/// Above those two bits, in a cluster, it counts the times keys have left
+/// Above those bits, in a cluster, it counts the times keys have left
 /// this node or a slot here has changed state ([`routes_moved`]): a
 /// `MIGRATE` deleted what it moved, or `CLUSTER SETSLOT` ran. A command is
 /// routed ("is its key here?") before it enters the write gate, and a whole
@@ -66,8 +73,10 @@ static HANDOFF: AtomicU64 = AtomicU64::new(0);
 const HANDOFF_PAUSE: u64 = 1;
 /// [`HANDOFF`]: a `MIGRATE` is moving keys (`key_moves`).
 const KEYS_MOVING: u64 = 2;
+/// [`HANDOFF`]: a `CLIENT PAUSE` may be in force ([`pause_clients`]).
+const CLIENT_PAUSE: u64 = 4;
 /// [`HANDOFF`]: one more time keys left here or a slot changed state.
-const ROUTES_MOVED: u64 = 4;
+const ROUTES_MOVED: u64 = 8;
 /// [`HANDOFF`]: the bits below the count.
 const BITS: u64 = ROUTES_MOVED - 1;
 
@@ -112,10 +121,29 @@ pub fn active() -> Option<bool> {
 /// paused.
 #[inline]
 pub fn expiry_deferred() -> bool {
+    #[cfg(test)]
+    if crate::expiry::undisturbed() {
+        return false;
+    }
     PAUSE_UNTIL_MS.load(Ordering::Relaxed) != 0 && active().is_some()
 }
 
+/// Moved on by every [`set_pause`] and [`clear_pause`], under
+/// [`FLAG_LOCK`]: a `CLIENT PAUSE` that failed undoes its pause only if no
+/// other has been set or ended since. Comparing `PAUSE_UNTIL_MS` alone took
+/// a pause set meanwhile that ended no later than its own for its own, and
+/// undid it: that pause's caller had been answered OK for a pause that was
+/// gone (#634).
+static PAUSE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 pub fn set_pause(duration_ms: i64, write_only: bool) {
+    let _flag = FLAG_LOCK.lock();
+    set_pause_held(duration_ms, write_only);
+}
+
+/// [`set_pause`], with [`FLAG_LOCK`] held.
+fn set_pause_held(duration_ms: i64, write_only: bool) {
+    PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
     let end = now_ms().saturating_add(duration_ms);
     let (end, write_only) = match active() {
         Some(was_write_only) => (
@@ -128,7 +156,286 @@ pub fn set_pause(duration_ms: i64, write_only: bool) {
     PAUSE_UNTIL_MS.store(end, Ordering::Relaxed); // gate last
 }
 
+/// What [`set_pause_undoable`] found, and set: what [`undo_pause`] needs to
+/// take back that pause and that pause only.
+#[derive(Debug)]
+pub struct Undo {
+    /// The pause in force before: its end and whether it held only writers.
+    before: Option<(i64, bool)>,
+    /// [`PAUSE_GENERATION`] once this pause was set.
+    generation: u64,
+}
+
+/// [`set_pause`], for a pause that may have to be taken back (a shutdown
+/// that fails or is aborted): [`undo_pause`] then leaves what was in force
+/// before it, a `CLIENT PAUSE`, a failover's or a slot migration's hold of
+/// writes, as it was.
+pub fn set_pause_undoable(duration_ms: i64, write_only: bool) -> Undo {
+    let _flag = FLAG_LOCK.lock();
+    let before =
+        active().map(|was_write_only| (PAUSE_UNTIL_MS.load(Ordering::SeqCst), was_write_only));
+    set_pause_held(duration_ms, write_only);
+    Undo {
+        before,
+        generation: PAUSE_GENERATION.load(Ordering::SeqCst),
+    }
+}
+
+/// Take back the pause of [`set_pause_undoable`]: back to the pause that was
+/// in force before it, or to none. Only that pause: one ended since (by
+/// `CLIENT UNPAUSE`) stays ended, and the hold of a handoff or a
+/// `CLIENT PAUSE` set since stays until `clear_pause` lifts it, a hold of
+/// writers alone, as `hold_writes` holds them.
+pub fn undo_pause(undo: Undo) {
+    let _flag = FLAG_LOCK.lock();
+    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) <= 0 {
+        // Ended meanwhile (`CLIENT UNPAUSE`), and stays so.
+        return;
+    }
+    let set_since = PAUSE_GENERATION.load(Ordering::SeqCst) != undo.generation;
+    if set_since {
+        // A handoff or a `CLIENT PAUSE` paused writes meanwhile, merged into
+        // ours. Whoever set it was told the writes are held, so they stay
+        // held: until the handoff's `clear_pause`, or `CLIENT UNPAUSE` (a
+        // `CLIENT PAUSE` set meanwhile no longer ends at its own time). Only
+        // the readers ours held go on.
+        PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let write_only = undo.before.is_none_or(|(_, was_write_only)| was_write_only);
+        PAUSE_MODE_WRITE_ONLY.store(write_only, Ordering::Relaxed);
+    } else if let Some((until, was_write_only)) = undo.before {
+        PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
+        PAUSE_MODE_WRITE_ONLY.store(was_write_only, Ordering::Relaxed);
+        PAUSE_UNTIL_MS.store(until, Ordering::SeqCst);
+    } else {
+        clear_pause_held();
+        return;
+    }
+    // The clients held may now go on (the readers, under a pause of writers).
+    CHANGED.notify_waiters();
+}
+
+/// How long `CLIENT PAUSE` waits at most for the writes that are in the
+/// write gate when it pauses clients: the default `busy-reply-threshold`,
+/// past which a command still running is taken to be stuck. They are
+/// normally gone in microseconds. In debug builds a test may set it
+/// (`KIVIDB_TEST_IN_FLIGHT_WAIT_MS`).
+fn in_flight_wait_max() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    {
+        static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        if let Some(ms) = *SET.get_or_init(|| {
+            std::env::var("KIVIDB_TEST_IN_FLIGHT_WAIT_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+        }) {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    std::time::Duration::from_secs(5)
+}
+
+/// Held while `CLIENT PAUSE` raises [`CLIENT_PAUSE`] with its pause, and
+/// while the flag is taken down: a pause ending must not take down the flag
+/// of one being set (see [`end_client_pause_flag`]).
+static FLAG_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+/// What `CLIENT PAUSE` answers when the writes in progress did not finish in
+/// time ([`pause_clients`]).
+pub const PAUSE_DID_NOT_TAKE_HOLD: &str =
+    "ERR writes in progress did not finish before the pause could take hold";
+
+/// `CLIENT PAUSE timeout [WRITE | ALL]`: pause clients ([`set_pause`]), and
+/// return once every write that got past the pause before it was set has
+/// either been applied (counted in `master_repl_offset` and queued for the
+/// replicas) or is going to be held.
+///
+/// A write checks the pause in its connection loop, before it enters the
+/// write gate. One that passed that check an instant before the pause was
+/// set is either in the gate now, and waited out here, or not there yet: it
+/// then finds [`CLIENT_PAUSE`] up once it is in the gate
+/// ([`held_in_gate`]), steps out again and is held with the others. So when
+/// this returns nothing more is written until the pause ends, and the
+/// master's offset covers every write a client has been told is done: a
+/// switchover may promote a replica that has reached it (#629). Redis has
+/// nothing to wait for: it runs one command at a time.
+///
+/// The wait is for the writes in the gate, which take microseconds, and not
+/// for one held up before it, however long: behind a script or a
+/// transaction, on a stalled thread, parked in a blocking command. It does
+/// not wait for itself: inside a transaction or a script, which hold the
+/// gate, the slot of this thread is passed over (their writes are done
+/// before they reply, and nothing runs beside them).
+///
+/// A write still in the gate after [`in_flight_wait_max`] (a `FLUSHALL`, a
+/// `DEL` of a huge key, a long script), or a pause (not of no time) that
+/// ended before the writes did, fails it with [`PAUSE_DID_NOT_TAKE_HOLD`]: the write would
+/// be acknowledged after the offset a switchover reads. What this call
+/// paused is then undone, if nothing has changed the pause since, so a
+/// `CLIENT PAUSE` that failed has paused nothing.
+pub fn pause_clients(duration_ms: i64, write_only: bool) -> Result<(), &'static str> {
+    pause_clients_within(duration_ms, write_only, in_flight_wait_max())
+}
+
+fn pause_clients_within(
+    duration_ms: i64,
+    write_only: bool,
+    limit: std::time::Duration,
+) -> Result<(), &'static str> {
+    let (before, ours, generation) = {
+        let _flag = FLAG_LOCK.lock();
+        let before =
+            active().map(|was_write_only| (PAUSE_UNTIL_MS.load(Ordering::SeqCst), was_write_only));
+        set_pause_held(duration_ms, write_only);
+        // After the pause, before the wait: a write that enters the gate once
+        // the wait has passed its slot sees both.
+        HANDOFF.fetch_or(CLIENT_PAUSE, Ordering::SeqCst);
+        (
+            before,
+            PAUSE_UNTIL_MS.load(Ordering::SeqCst),
+            PAUSE_GENERATION.load(Ordering::SeqCst),
+        )
+    };
+    let deadline = std::time::Instant::now() + limit;
+    // A pause of no time is over at once: its writes are waited out all the
+    // same, and it answers OK, as in Redis. Nothing to wait for in a
+    // transaction or a script that runs alone: no other command is running,
+    // and the ones waiting for the command gate find the flag in the write
+    // gate. (A wait from there could also wait for a cut, of a full sync
+    // say, that is itself waiting for this thread's slot.)
+    let waited_out = crate::command_gate::alone_on_this_thread()
+        || crate::cluster::migration::off_the_runtime(|| {
+            crate::write_gate::wait_out_writes(deadline, || duration_ms == 0 || active().is_some())
+        });
+    if waited_out {
+        return Ok(());
+    }
+    log_warn!(
+        "CLIENT PAUSE refused: a write in progress when clients were paused had not finished \
+         after {} ms, or the pause ended first; nothing is paused by it",
+        limit.as_millis()
+    );
+    let _flag = FLAG_LOCK.lock();
+    if PAUSE_GENERATION.load(Ordering::SeqCst) == generation
+        && PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ours
+    {
+        match before {
+            Some((until, was_write_only)) => {
+                PAUSE_MODE_WRITE_ONLY.store(was_write_only, Ordering::Relaxed);
+                PAUSE_UNTIL_MS.store(until, Ordering::SeqCst);
+            }
+            None => clear_pause_held(),
+        }
+    }
+    Err(PAUSE_DID_NOT_TAKE_HOLD)
+}
+
+/// What a write that got past a `CLIENT PAUSE` before it was set returns
+/// from inside the write gate in place of a reply, when its connection
+/// cannot be asked to hold it as a parked command is
+/// (`blocking::hold_for_pause`): a script, which runs on the runner thread
+/// or off the runtime, or a command on the connection's slow path. The
+/// connection sends no reply for it: it reads the command again, and its
+/// pause check holds it (an `EXEC`, which the connection runs itself, goes
+/// back the same way: `exec_held_in_gate`). No reply begins with a 0 byte.
+pub const HELD_IN_GATE: &[u8] = b"\0held by CLIENT PAUSE\0";
+
+/// Whether `reply` is [`HELD_IN_GATE`].
+#[inline]
+pub fn is_held(reply: &[u8]) -> bool {
+    reply.first() == Some(&0) && reply == HELD_IN_GATE
+}
+
+/// Whether a write that has just entered the write gate, `cmd` (an `EXEC`
+/// of `queued`), got past a `CLIENT PAUSE` before it was set, and is to step
+/// out of the gate again and be held (see [`pause_clients`]). Asked when
+/// [`writes_must_check`] has said there is something to look at, and not
+/// during a handoff, which has its own way ([`handoff`]). A flag left up
+/// after its pause has ended is taken down here.
+#[cold]
+#[inline(never)]
+pub fn held_in_gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>]) -> bool {
+    if HANDOFF.load(Ordering::Acquire) & CLIENT_PAUSE == 0 {
+        return false;
+    }
+    if holds(cmd, queued) {
+        return true;
+    }
+    if active().is_none() {
+        end_client_pause_flag();
+    }
+    false
+}
+
+/// [`held_in_gate`], for a command outside a transaction.
+#[inline]
+pub fn write_held_in_gate(cmd: &[&[u8]]) -> bool {
+    held_in_gate::<Vec<u8>>(cmd, &[])
+}
+
+/// [`held_in_gate`], for an `EXEC` of `queued` that has taken its gates,
+/// where a handoff refuses it instead (`routing::exec_refusal_in_gate`).
+pub fn exec_held_in_gate(queued: &[Vec<Vec<u8>>]) -> bool {
+    !handoff() && held_in_gate(&[b"EXEC"], queued)
+}
+
+/// Take [`CLIENT_PAUSE`] down: the pause has ended. Under [`FLAG_LOCK`],
+/// and only if no pause runs on: a `CLIENT PAUSE` being set holds the lock
+/// from its pause to its flag, so the flag is never down, even for an
+/// instant, while a pause that raised it is in force. (A write that entered
+/// a slot its sweep had passed would otherwise find nothing, run, and be
+/// acknowledged after the reply.) Not waited for: a `CLIENT PAUSE` holding
+/// the lock raises the flag itself, and so does one that is being undone
+/// take it down. A flag left up while nothing is paused costs every write a
+/// look at it in the gate, until a write takes it down ([`held_in_gate`]).
+fn end_client_pause_flag() {
+    if HANDOFF.load(Ordering::Relaxed) & CLIENT_PAUSE == 0 {
+        return;
+    }
+    let Some(_flag) = FLAG_LOCK.try_lock() else {
+        return;
+    };
+    lower_client_pause_flag();
+}
+
+/// [`end_client_pause_flag`], with [`FLAG_LOCK`] held.
+fn lower_client_pause_flag() {
+    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) <= now_ms() {
+        HANDOFF.fetch_and(!CLIENT_PAUSE, Ordering::SeqCst);
+    }
+}
+
+/// `KIVIDB_TEST_PRE_GATE_DELAY_MS`, never set otherwise, and read in debug
+/// builds only: the first write with an argument that begins with
+/// `stalled:` (a key, or a key of a script or of a transaction's command)
+/// waits this long once it is past the pause check, before it enters the
+/// write gate, as a write can be held up there on a busy machine. A test's
+/// window to pause clients meanwhile (#629).
+#[cfg(debug_assertions)]
+pub fn test_stall_before_the_gate(cmd: &[&[u8]]) {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let delay = DELAY.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_PRE_GATE_DELAY_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(std::time::Duration::from_millis)
+    });
+    if let Some(delay) = *delay
+        && cmd.iter().skip(1).any(|arg| arg.starts_with(b"stalled:"))
+        && !TAKEN.swap(true, Ordering::Relaxed)
+    {
+        crate::cluster::migration::off_the_runtime(|| std::thread::sleep(delay));
+    }
+}
+
 pub fn clear_pause() {
+    let _flag = FLAG_LOCK.lock();
+    clear_pause_held();
+}
+
+/// [`clear_pause`], with [`FLAG_LOCK`] held.
+fn clear_pause_held() {
+    PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
     PAUSE_MODE_WRITE_ONLY.store(false, Ordering::Relaxed);
     let held = HELD.load(Ordering::SeqCst) > 0;
     PAUSE_UNTIL_MS.store(if held { ENDING } else { 0 }, Ordering::SeqCst);
@@ -137,6 +444,9 @@ pub fn clear_pause() {
         let _ = PAUSE_UNTIL_MS.compare_exchange(ENDING, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
     end_handoff_flag();
+    // `end_handoff_flag` cannot take the `CLIENT PAUSE` flag down itself
+    // here: the lock it would try is ours.
+    lower_client_pause_flag();
     CHANGED.notify_waiters();
 }
 
@@ -154,10 +464,11 @@ fn end_handoff_flag() {
     while now & HANDOFF_PAUSE != 0 {
         let ended = (now & !HANDOFF_PAUSE).wrapping_add(ROUTES_MOVED);
         match HANDOFF.compare_exchange_weak(now, ended, Ordering::SeqCst, Ordering::Relaxed) {
-            Ok(_) => return,
+            Ok(_) => break,
             Err(seen) => now = seen,
         }
     }
+    end_client_pause_flag();
 }
 
 /// Woken when a pause is ended, and when the last client it held goes on.
@@ -167,7 +478,18 @@ static CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// it runs: wait for the clients an ended pause held to go on (at most
 /// 100 ms: they are a step from it), then wait while `cmd` is held (see
 /// [`holds`]). What it returns is to be kept until the command has run.
-pub async fn gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>], id: u64) -> Option<Ran> {
+///
+/// `None`: the client went while its command was held — `gone`, made only
+/// then, resolved — and the command is not to run, as in Redis, which goes on
+/// reading a client a pause holds and frees it (#384). Only while it is held:
+/// a command the pause does not hold runs, though its client has gone, as a
+/// fire-and-forget `LPUSH` sent just as a pause ends runs in Redis.
+pub async fn gate<Q: AsRef<[u8]>, G: std::future::Future<Output = ()>>(
+    cmd: &[&[u8]],
+    queued: &[Vec<Q>],
+    id: u64,
+    gone: impl FnOnce() -> G,
+) -> Option<Option<Ran>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
     while PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING {
         if std::time::Instant::now() >= deadline {
@@ -179,14 +501,21 @@ pub async fn gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>], id: u64) -> 
         wait_for_change(|| PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING).await;
     }
     if !holds(cmd, queued) {
-        return None;
+        return Some(None);
     }
     let held = Held::new();
     HELD.fetch_add(1, Ordering::SeqCst);
     // Counted off however the wait ends, the connection going with it.
     let counted = Counted;
+    let gone = gone();
+    let mut gone = std::pin::pin!(gone);
     while holds(cmd, queued) {
-        wait_for_change(|| holds(cmd, queued)).await;
+        tokio::select! {
+            biased;
+            () = wait_for_change(|| holds(cmd, queued)) => {}
+            // Let go with its client; `held` and `counted` go with it.
+            () = &mut gone => return None,
+        }
     }
     drop(held);
     if PAUSE_UNTIL_MS.load(Ordering::SeqCst) == ENDING {
@@ -194,9 +523,9 @@ pub async fn gate<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>], id: u64) -> 
         std::mem::forget(counted);
         LETTING_GO.lock().push(id);
         LETTING_GO_LEN.fetch_add(1, Ordering::SeqCst);
-        return Some(Ran(id));
+        return Some(Some(Ran(id)));
     }
-    None
+    Some(None)
 }
 
 struct Counted;
@@ -393,9 +722,13 @@ pub fn wait_out_handoff() {
 /// With all clients paused, every command waits — but for `CLIENT UNPAUSE`,
 /// which Redis holds too: there, a pause of everything can only run out.
 /// With only writers paused, the commands that wait are the ones that may
-/// change the dataset or the replication stream: writes, `PFCOUNT` (which
+/// change the dataset or the replication stream: writes (not `SELECT`,
+/// which writes nothing and is sent to nobody: #411), `PFCOUNT` (which
 /// may rewrite its key), `PUBLISH`, a script that has not declared itself
-/// free of writes, and an `EXEC` of a transaction holding any of those.
+/// free of writes, and an `EXEC` of a transaction holding any of those. A
+/// command that writes only with some of its arguments (`GEORADIUS …
+/// STORE`, `FUNCTION LOAD`) waits when it has them: see [`may_replicate`].
+/// `SCRIPT LOAD` and `SCRIPT FLUSH` do not wait, as in Redis (#518).
 ///
 /// A command with the wrong number of arguments is not held: it is going to
 /// be refused whenever it runs, and is refused now.
@@ -408,26 +741,63 @@ pub fn holds<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>]) -> bool {
         return false;
     }
     if !write_only {
+        // `SHUTDOWN ABORT` too: a shutdown pauses every client while it
+        // waits for the replicas, and this is what ends that wait. And any
+        // `SHUTDOWN` while one is in progress: it waits with that one. Held
+        // until an abort, it would start a shutdown of its own after it.
         return !(name == "CLIENT"
             && cmd
                 .get(1)
-                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")));
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")))
+            && !(name == "SHUTDOWN"
+                && (crate::shutdown::in_progress()
+                    || cmd
+                        .get(1)
+                        .is_some_and(|sub| sub.eq_ignore_ascii_case(b"ABORT"))));
     }
     if name == "EXEC" {
-        return queued.iter().any(|command| {
-            command.first().is_some_and(|cmd0| {
-                may_replicate(
-                    &String::from_utf8_lossy(cmd0.as_ref()).to_ascii_uppercase(),
-                    command.get(1).map(|arg| arg.as_ref()),
-                )
-            })
-        });
+        return queued.iter().any(|command| queued_may_replicate(command));
     }
-    may_replicate(&name, cmd.get(1).copied())
+    may_replicate(&name, cmd)
 }
 
-/// Whether running `name` — with `first`, its first argument — may write.
-fn may_replicate(name: &str, first: Option<&[u8]>) -> bool {
+/// Whether the queued command `command` may write: what [`holds`] holds of
+/// an `EXEC`, and what a transaction that reaches its gates during a
+/// handoff is refused for (`routing::exec_refusal_in_gate`).
+///
+/// Called only while writes are paused, or when `EXEC` reaches its gates
+/// during a handoff: never on a command's way through when nothing is.
+pub fn queued_may_replicate<Q: AsRef<[u8]>>(command: &[Q]) -> bool {
+    let Some(cmd0) = command.first() else {
+        return false;
+    };
+    let cmd: Vec<&[u8]> = command.iter().map(|arg| arg.as_ref()).collect();
+    may_replicate(
+        &String::from_utf8_lossy(cmd0.as_ref()).to_ascii_uppercase(),
+        &cmd,
+    )
+}
+
+/// Whether running `cmd`, named `name`, may write: change the dataset or
+/// the replication stream.
+///
+/// A command that writes only with some of its arguments is judged by them,
+/// as replication judges it (`command_mutates_for_replication`):
+/// `GEORADIUS` and `GEORADIUSBYMEMBER` with `STORE` or `STOREDIST`, the
+/// `FUNCTION` subcommands that change what is loaded, `PFDEBUG TODENSE`,
+/// `HIMPORT`, and `MIGRATE`, which deletes what it moves. They used to be
+/// judged by their name alone, and so were taken for reads: a `GEORADIUS …
+/// STORE` in a transaction was neither held by the pause nor refused during
+/// a handoff, ran behind the handoff's back, and its write was lost with
+/// the slot (#407).
+///
+/// `SCRIPT` is not one of them: `SCRIPT LOAD` and `SCRIPT FLUSH` change
+/// the script cache, not the dataset, and Redis holds neither (`NOSCRIPT`,
+/// `STALE`; neither `WRITE` nor `MAY_REPLICATE`). Holding them stalled
+/// every client that loads its scripts on connect or on `NOSCRIPT` for the
+/// whole pause, the ones that only read too (#518). They are sent to nobody
+/// now (#705), so a pause has nothing of theirs to keep out of the stream.
+fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     #[cfg(feature = "lua")]
     let declared_read_only = |name: &str, first: &[u8]| match name {
         "EVAL" => crate::commands::script_declares_no_writes(first),
@@ -438,9 +808,14 @@ fn may_replicate(name: &str, first: Option<&[u8]>) -> bool {
     let declared_read_only = |_: &str, _: &[u8]| false;
     match name {
         "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
-        "EVAL" | "EVALSHA" | "FCALL" => !first.is_some_and(|first| declared_read_only(name, first)),
+        // Writes nothing (#411), nor anything in the dataset (#518).
+        "SELECT" | "SCRIPT" => false,
+        "EVAL" | "EVALSHA" | "FCALL" => !cmd
+            .get(1)
+            .copied()
+            .is_some_and(|first| declared_read_only(name, first)),
         "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => false,
-        _ => crate::replication::is_write_command(name),
+        _ => crate::replication::command_mutates_for_replication(name, cmd),
     }
 }
 
@@ -508,6 +883,77 @@ mod tests {
         let writes = vec![vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]];
         assert!(!holds(&[b"EXEC"], &reads));
         assert!(holds(&[b"EXEC"], &writes));
+        // A command that writes only with some of its arguments waits when
+        // it has them, alone or in a transaction (#407).
+        let georadius: &[&[u8]] = &[b"GEORADIUS", b"src", b"15", b"37", b"200", b"km"];
+        let store: &[&[u8]] = &[
+            b"GEORADIUS",
+            b"src",
+            b"15",
+            b"37",
+            b"200",
+            b"km",
+            b"STORE",
+            b"dst",
+        ];
+        let storedist: &[&[u8]] = &[
+            b"GEORADIUSBYMEMBER",
+            b"src",
+            b"m",
+            b"10",
+            b"km",
+            b"STOREDIST",
+            b"dst",
+        ];
+        assert!(!holds(georadius, none));
+        assert!(holds(store, none));
+        assert!(holds(storedist, none));
+        let queue = |cmd: &[&[u8]]| vec![cmd.iter().map(|arg| arg.to_vec()).collect::<Vec<_>>()];
+        assert!(!holds(&[b"EXEC"], &queue(georadius)));
+        assert!(holds(&[b"EXEC"], &queue(store)));
+        assert!(holds(&[b"EXEC"], &queue(storedist)));
+        assert!(holds(&[b"FUNCTION", b"LOAD", b"code"], none));
+        assert!(holds(&[b"FUNCTION", b"DELETE", b"lib"], none));
+        assert!(holds(&[b"FUNCTION", b"FLUSH"], none));
+        assert!(!holds(&[b"FUNCTION", b"LIST"], none));
+        // The script cache is not the dataset: Redis holds no `SCRIPT`
+        // subcommand, alone or in a transaction, and nor is a transaction
+        // refused for one during a handoff (#518).
+        assert!(!holds(&[b"SCRIPT", b"LOAD", b"return 1"], none));
+        assert!(!holds(&[b"SCRIPT", b"FLUSH"], none));
+        assert!(!holds(&[b"SCRIPT", b"FLUSH", b"ASYNC"], none));
+        assert!(!holds(&[b"SCRIPT", b"EXISTS", b"0123"], none));
+        let script_load = vec![vec![
+            b"SCRIPT".to_vec(),
+            b"LOAD".to_vec(),
+            b"return 1".to_vec(),
+        ]];
+        assert!(!holds(&[b"EXEC"], &script_load));
+        assert!(!script_load.iter().any(|c| queued_may_replicate(c)));
+        let script_load_and_write = vec![
+            script_load[0].clone(),
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()],
+        ];
+        assert!(holds(&[b"EXEC"], &script_load_and_write));
+        assert!(holds(
+            &[b"MIGRATE", b"127.0.0.1", b"6379", b"k", b"0", b"1000"],
+            none
+        ));
+        // `SELECT` is propagated, but writes nothing: it is not held, alone
+        // or in a transaction, nor is a transaction refused for it during a
+        // handoff (`queued_may_replicate`, #411).
+        assert!(!holds(&[b"SELECT", b"1"], none));
+        let select_and_read = vec![
+            vec![b"SELECT".to_vec(), b"1".to_vec()],
+            vec![b"GET".to_vec(), b"k".to_vec()],
+        ];
+        assert!(!holds(&[b"EXEC"], &select_and_read));
+        assert!(!select_and_read.iter().any(|c| queued_may_replicate(c)));
+        let select_and_write = vec![
+            vec![b"SELECT".to_vec(), b"1".to_vec()],
+            vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()],
+        ];
+        assert!(holds(&[b"EXEC"], &select_and_write));
         clear_pause();
         assert!(!holds(&[b"SET", b"k", b"v"], none));
 
@@ -534,6 +980,114 @@ mod tests {
         assert!(!holds(&[b"GET", b"k"], none));
         clear_pause();
         assert!(!handoff());
+
+        // CLIENT PAUSE raises a flag of its own, which a write in the gate
+        // looks at (#629): it is no handoff, and it comes down with its
+        // pause, however that ends.
+        let client_flag = || HANDOFF.load(Ordering::SeqCst) & CLIENT_PAUSE != 0;
+        assert!(!client_flag());
+        pause_clients(60_000, true).unwrap();
+        assert!(client_flag() && !handoff());
+        assert!(write_held_in_gate(&[b"SET", b"k", b"v"]));
+        assert!(!write_held_in_gate(&[b"GET", b"k"]));
+        assert!(exec_held_in_gate(&writes) && !exec_held_in_gate(&reads));
+        assert!(client_flag());
+        clear_pause();
+        assert!(!client_flag() && !write_held_in_gate(&[b"SET", b"k", b"v"]));
+        // Ended by its time: taken down by the first write that looks.
+        let _ = pause_clients(1, false);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!write_held_in_gate(&[b"SET", b"k", b"v"]));
+        assert!(!client_flag());
+        // A handoff during a CLIENT PAUSE is a handoff, and a write in the
+        // gate waits it out rather than going back to be held.
+        pause_clients(60_000, true).unwrap();
+        set_handoff_pause(60_000);
+        assert!(handoff() && !exec_held_in_gate(&writes));
+        clear_pause();
+        assert!(!handoff() && !client_flag());
+        // Neither moves the routes the count of which is above the flags.
+        let routed = routes_now();
+        pause_clients(60_000, true).unwrap();
+        assert!(!routes_moved_since(routed));
+        clear_pause();
+
+        // The flag is not taken down while a pause runs on, nor while a
+        // CLIENT PAUSE is raising it with its pause (it holds FLAG_LOCK): a
+        // pause that had ended could otherwise take down the flag of the
+        // one being set, after its sweep had passed a write's slot.
+        pause_clients(60_000, true).unwrap();
+        end_client_pause_flag();
+        assert!(client_flag(), "the flag of a pause in force came down");
+        clear_pause();
+        HANDOFF.fetch_or(CLIENT_PAUSE, Ordering::SeqCst);
+        PAUSE_UNTIL_MS.store(now_ms() - 10, Ordering::SeqCst);
+        {
+            let _setting = FLAG_LOCK.lock();
+            end_client_pause_flag();
+            assert!(
+                client_flag(),
+                "taken down while a CLIENT PAUSE held the lock"
+            );
+        }
+        end_client_pause_flag();
+        assert!(!client_flag());
+        PAUSE_UNTIL_MS.store(0, Ordering::SeqCst);
+
+        // A write still in the gate when the time runs out: the pause fails,
+        // and is undone, back to the pause there was before it.
+        let (in_gate, out) = (
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+            std::sync::Arc::new(std::sync::Barrier::new(2)),
+        );
+        let writer = {
+            let (in_gate, out) = (std::sync::Arc::clone(&in_gate), std::sync::Arc::clone(&out));
+            std::thread::spawn(move || {
+                let _gate = crate::write_gate::enter();
+                in_gate.wait();
+                out.wait();
+            })
+        };
+        in_gate.wait();
+        let limit = std::time::Duration::from_millis(30);
+        assert_eq!(
+            pause_clients_within(60_000, true, limit),
+            Err(PAUSE_DID_NOT_TAKE_HOLD)
+        );
+        assert_eq!(active(), None, "a failed CLIENT PAUSE left clients paused");
+        assert!(!client_flag());
+        set_pause(60_000, false);
+        let before = PAUSE_UNTIL_MS.load(Ordering::SeqCst);
+        assert_eq!(
+            pause_clients_within(120_000, true, limit),
+            Err(PAUSE_DID_NOT_TAKE_HOLD)
+        );
+        assert_eq!(active(), Some(false));
+        assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), before);
+        // A pause set while a failing one waits, and ending no later than
+        // it, leaves `PAUSE_UNTIL_MS` as the failing one set it. It is not
+        // undone with it (#634).
+        clear_pause();
+        let failing = std::thread::spawn(move || pause_clients_within(60_000, true, limit * 10));
+        while active().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let failing_until = PAUSE_UNTIL_MS.load(Ordering::SeqCst);
+        set_pause(30_000, true);
+        assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), failing_until);
+        assert_eq!(failing.join().unwrap(), Err(PAUSE_DID_NOT_TAKE_HOLD));
+        assert_eq!(
+            active(),
+            Some(true),
+            "the pause set meanwhile was undone with the one that failed"
+        );
+        clear_pause();
+        out.wait();
+        writer.join().unwrap();
+        let enough = std::time::Duration::from_secs(5);
+        assert_eq!(pause_clients_within(60_000, true, enough), Ok(()));
+        clear_pause();
+        assert!(!client_flag());
 
         // A write that waits out a handoff on a worker of the multi-threaded
         // runtime leaves that worker's other tasks to run. Here the one that
@@ -562,5 +1116,67 @@ mod tests {
             started.elapsed()
         );
         assert!(!handoff());
+    }
+
+    /// A pause that is taken back (a shutdown that failed) leaves the pause
+    /// in force before it as it was: a `CLIENT PAUSE`, a handoff's hold. One
+    /// ended meanwhile stays ended, and a handoff's hold set meanwhile stays.
+    #[test]
+    fn an_undone_pause_leaves_the_one_before_it() {
+        let _pause = TEST_LOCK.lock();
+        const LONG: i64 = 100 * 365 * 24 * 3600 * 1000;
+        let none: &[Vec<Vec<u8>>] = &[];
+        let set: &[&[u8]] = &[b"SET", b"k", b"v"];
+        let get: &[&[u8]] = &[b"GET", b"k"];
+        clear_pause();
+
+        // Nothing before: nothing after.
+        let undo = set_pause_undoable(LONG, false);
+        assert_eq!(active(), Some(false));
+        undo_pause(undo);
+        assert_eq!(active(), None);
+
+        // A CLIENT PAUSE WRITE before: it holds the writes still, until its
+        // own end, and the reads go on.
+        pause_clients(60_000, true).unwrap();
+        let end = PAUSE_UNTIL_MS.load(Ordering::SeqCst);
+        let undo = set_pause_undoable(LONG, false);
+        assert!(holds(get, none));
+        undo_pause(undo);
+        assert_eq!(active(), Some(true));
+        assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), end);
+        assert!(holds(set, none) && !holds(get, none));
+        assert!(HANDOFF.load(Ordering::SeqCst) & CLIENT_PAUSE != 0);
+        clear_pause();
+
+        // A handoff's hold before: it is still a handoff.
+        hold_writes();
+        let undo = set_pause_undoable(LONG, false);
+        undo_pause(undo);
+        assert!(handoff() && holds(set, none) && !holds(get, none));
+        clear_pause();
+        assert!(!handoff());
+
+        // A handoff's hold set meanwhile: it stays, of writers alone.
+        let undo = set_pause_undoable(LONG, false);
+        hold_writes();
+        undo_pause(undo);
+        assert!(handoff() && holds(set, none) && !holds(get, none));
+        clear_pause();
+
+        // A CLIENT PAUSE set meanwhile: its client was told the writes are
+        // held, and they are, until CLIENT UNPAUSE.
+        let undo = set_pause_undoable(LONG, false);
+        pause_clients(60_000, true).unwrap();
+        undo_pause(undo);
+        assert!(holds(set, none) && !holds(get, none));
+        clear_pause();
+        assert_eq!(active(), None);
+
+        // Ended meanwhile (CLIENT UNPAUSE): it stays ended.
+        let undo = set_pause_undoable(LONG, false);
+        clear_pause();
+        undo_pause(undo);
+        assert_eq!(active(), None);
     }
 }

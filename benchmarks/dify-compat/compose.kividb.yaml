@@ -1,0 +1,26 @@
+# Replaces Dify's `redis` service with KiviDB. Use it on top of Dify's own compose file:
+#
+#   cd dify/docker
+#   cp .env.example .env
+#   mkdir -p volumes/kividb/data && sudo chown 1000:1000 volumes/kividb/data
+#   docker compose -f docker-compose.yaml -f /path/to/compose.kividb.yaml up -d
+#
+# The service keeps the name `redis` and the port 6379, so nothing else in Dify's
+# configuration changes: REDIS_HOST=redis, REDIS_PORT=6379, CELERY_BROKER_URL and the
+# password all stay as Dify sets them.
+#
+# Dify needs the `-lua` variant (see REPORT.md): Dify and redis-py's Lock run Lua scripts.
+services:
+  redis:
+    image: ${KIVIDB_IMAGE:-kividb/kividb:v1.2.0-lua}
+    # Dify's command runs redis-server through a shell; KiviDB's image has neither, so
+    # pass KiviDB's own flags. --requirepass keeps Dify's password, and also turns off
+    # protected mode, which the image's default command would otherwise do.
+    command: ["--port", "6379", "--requirepass", "${REDIS_PASSWORD:-difyai123456}", "--dir", "/data"]
+    volumes:
+      - ./volumes/kividb/data:/data
+    # Dify's health check calls redis-cli inside the container, and KiviDB's image has no
+    # redis-cli. Every Dify service waits only for `service_started` on redis, so the
+    # check can go.
+    healthcheck:
+      disable: true

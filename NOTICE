@@ -23,7 +23,8 @@ Redis Ltd.
 --------------------------------------------------------------------------------
 Third-party material
 
-src/commands/key_spec_table.rs is derived from the command files
+src/commands/arity_table.rs, src/commands/command_docs_table.rs and
+src/commands/key_spec_table.rs are derived from the command files
 (src/commands/*.json) of Valkey 9.1.3, https://github.com/valkey-io/valkey,
 which carry the two notices and licence below.
 

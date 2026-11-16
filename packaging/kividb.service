@@ -8,8 +8,9 @@ Type=simple
 User=kividb
 Group=kividb
 
-# With no flags the server reads /etc/kividb/kividb.conf when it exists.
-ExecStart=/usr/bin/kividb
+# The config file is named, not found by default: only a server given
+# --configfile may CONFIG REWRITE it (#475).
+ExecStart=/usr/bin/kividb --configfile /etc/kividb/kividb.conf
 
 # dump.kdb, appendonly.aof, backups and nodes.conf land here, so the process
 # never writes into whatever directory systemd started it in.

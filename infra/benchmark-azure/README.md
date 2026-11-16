@@ -43,7 +43,9 @@ the client builds memtier_benchmark and installs Rust. With
 self-hosted runner (one job, then it deregisters) labelled `run-<run id>`, so
 a run's benchmark job can only land on the machine made for that run.
 `vector-benchmark.yml` uses `BOOTSTRAP=false`: it ships its own binaries over
-SSH from GitHub-hosted runners.
+SSH from GitHub-hosted runners. `regression-suite.yml` does the same with
+`CREATE_CLIENT=false` (one x86_64 `Standard_D4s_v5`, Ubuntu 24.04, no client
+machine) and `IMAGE` set to the Ubuntu 24.04 image.
 
 `destroy.sh` deletes every resource whose name contains `kvb-<run id>-`, so
 it works whether create finished, failed half way or was cancelled, and it

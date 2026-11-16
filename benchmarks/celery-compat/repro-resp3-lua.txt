@@ -1,0 +1,42 @@
+== port 7802 HELLO 3 -> version [b'8.10.2']
+  EVAL "return {1, false, '3', 0}" 1 missing
+    -> b'*4\r\n:1\r\n_\r\n$1\r\n3\r\n:0\r\n'
+  EVAL "return {1, redis.call('GET', KEYS[1]), '3', 0}" 1 missing
+    -> b'*4\r\n:1\r\n_\r\n$1\r\n3\r\n:0\r\n'
+  EVAL "return redis.call('GET', KEYS[1])" 1 missing
+    -> b'_\r\n'
+  EVAL 'return false' 1 missing
+    -> b'_\r\n'
+  EVAL 'return {false}' 1 missing
+    -> b'*1\r\n_\r\n'
+  EVAL 'return {1, 2, 3}' 1 missing
+    -> b'*3\r\n:1\r\n:2\r\n:3\r\n'
+  EVAL "return {'a', false, 'b'}" 1 missing
+    -> b'*3\r\n$1\r\na\r\n_\r\n$1\r\nb\r\n'
+  EVAL "return redis.call('ZCOUNT', KEYS[1], '-inf', '+inf')" 1 missing
+    -> b':0\r\n'
+  EVAL "return {redis.call('ZCOUNT', KEYS[1], '-inf', '+inf'), redis.call('GET', KEYS[1]), redis.call('GET', KEYS[1]), 0}" 1 missing
+    -> b'*4\r\n:0\r\n_\r\n_\r\n:0\r\n'
+  EVAL "return redis.call('SET', KEYS[1], 'x', 'NX', 'EX', 10)" 1 setkey
+    -> b'+OK\r\n'
+== port 7801 HELLO 3 -> version []
+  EVAL "return {1, false, '3', 0}" 1 missing
+    -> b'*4\r\n:1\r\n$-1\r\n$1\r\n3\r\n:0\r\n'
+  EVAL "return {1, redis.call('GET', KEYS[1]), '3', 0}" 1 missing
+    -> b'*4\r\n:1\r\n$-1\r\n$1\r\n3\r\n:0\r\n'
+  EVAL "return redis.call('GET', KEYS[1])" 1 missing
+    -> b'$-1\r\n'
+  EVAL 'return false' 1 missing
+    -> b'$-1\r\n'
+  EVAL 'return {false}' 1 missing
+    -> b'*1\r\n$-1\r\n'
+  EVAL 'return {1, 2, 3}' 1 missing
+    -> b'*3\r\n:1\r\n:2\r\n:3\r\n'
+  EVAL "return {'a', false, 'b'}" 1 missing
+    -> b'*3\r\n$1\r\na\r\n$-1\r\n$1\r\nb\r\n'
+  EVAL "return redis.call('ZCOUNT', KEYS[1], '-inf', '+inf')" 1 missing
+    -> b':0\r\n'
+  EVAL "return {redis.call('ZCOUNT', KEYS[1], '-inf', '+inf'), redis.call('GET', KEYS[1]), redis.call('GET', KEYS[1]), 0}" 1 missing
+    -> b'*4\r\n:0\r\n$-1\r\n$-1\r\n:0\r\n'
+  EVAL "return redis.call('SET', KEYS[1], 'x', 'NX', 'EX', 10)" 1 setkey
+    -> b'+OK\r\n'

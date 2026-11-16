@@ -219,6 +219,19 @@ fn info(c: &mut Conn, section: &str, field: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
+/// `INFO commandstats` counts for the whole process, and every server these
+/// tests start runs in it. A test that reads the counts, and one that sends a
+/// command they count (`HELLO`, `RESET`, `AUTH` ...), take this lock, so that
+/// neither adds to the other's counts while it runs. So does a test that
+/// reads a counter of `INFO stats`: `CONFIG RESETSTAT`, which a test holding
+/// this lock sends, sets those back to zero too.
+fn stats_lock() -> std::sync::MutexGuard<'static, ()> {
+    static STATS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    STATS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The `name=value` fields of one `cmdstat_…` line.
 fn cmdstat(c: &mut Conn, command: &str) -> Option<std::collections::HashMap<String, f64>> {
     let line = info(c, "commandstats", &format!("cmdstat_{command}"))?;
@@ -234,6 +247,7 @@ fn cmdstat(c: &mut Conn, command: &str) -> Option<std::collections::HashMap<Stri
 
 #[test]
 fn reset_puts_a_connection_back_as_it_was_opened() {
+    let _stats = stats_lock();
     let mut c = conn();
     let mut other = conn();
     assert!(c.cmd(&["SELECT", "3"]).ok());
@@ -264,6 +278,7 @@ fn reset_puts_a_connection_back_as_it_was_opened() {
 /// connection unauthenticated.
 #[test]
 fn reset_forgets_who_the_connection_was() {
+    let _stats = stats_lock();
     let port = start("secret");
     let mut c = Conn::connect(port);
     assert!(c.cmd(&["GET", "k"]).err().starts_with("NOAUTH"));
@@ -286,12 +301,71 @@ fn info_reports_the_release_it_follows() {
         info(&mut c, "server", "redis_version").as_deref(),
         Some("8.10.0")
     );
+    assert_eq!(
+        info(&mut c, "server", "kividb_version").as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    // Which build: the `kividb` and `kividb-full` packages install the same
+    // binary path (#732).
+    let variant = match (cfg!(feature = "lua"), cfg!(feature = "tls")) {
+        (true, true) => "full",
+        (true, false) => "lua",
+        (false, true) => "tls",
+        (false, false) => "default",
+    };
+    assert_eq!(
+        info(&mut c, "server", "kividb_variant").as_deref(),
+        Some(variant)
+    );
+}
+
+/// `HELLO` reports the Redis release this server follows, as `INFO`'s
+/// `redis_version` does: redis-py and Jedis turn on their client-side
+/// caches only for a `server` of `redis` at 7.4 or later, and refused to
+/// with `server: kividb, version: 1.2.0` (#451). KiviDB's own release
+/// follows, as Dragonfly's does. Under RESP2 and RESP3.
+#[test]
+fn hello_reports_the_release_it_follows() {
+    let _stats = stats_lock();
+    let mut c = conn();
+    let fields = |reply: V| -> Vec<(String, V)> {
+        match reply {
+            V::Map(pairs) => pairs
+                .into_iter()
+                .map(|(k, v)| (k.s().to_string(), v))
+                .collect(),
+            V::Arr(items) => items
+                .chunks(2)
+                .map(|pair| (pair[0].s().to_string(), pair[1].clone()))
+                .collect(),
+            other => panic!("HELLO replied {other:?}"),
+        }
+    };
+    for proto in ["2", "3"] {
+        let hello = fields(c.cmd(&["HELLO", proto]));
+        let get = |name: &str| {
+            hello
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {name} in HELLO {proto}: {hello:?}"))
+        };
+        assert_eq!(get("server").s(), "redis", "HELLO {proto}");
+        assert_eq!(get("version").s(), "8.10.0", "HELLO {proto}");
+        assert_eq!(
+            get("kividb_version").s(),
+            env!("CARGO_PKG_VERSION"),
+            "HELLO {proto}"
+        );
+        assert_eq!(get("proto").i(), proto.parse::<i64>().unwrap());
+    }
 }
 
 /// `INFO commandstats`: calls, time, and the calls that failed — for every
 /// command, and per subcommand.
 #[test]
 fn commandstats_count_every_call() {
+    let _stats = stats_lock();
     let mut c = conn();
     let before = cmdstat(&mut c, "lolwut").map_or(0.0, |s| s["calls"]);
     for _ in 0..25 {
@@ -311,7 +385,7 @@ fn commandstats_count_every_call() {
     assert!(matches!(c.cmd(&["LLEN"]), V::Err(_)));
     let after = cmdstat(&mut c, "llen").unwrap();
     let grew = |field: &str| after[field] - before.get(field).copied().unwrap_or(0.0);
-    assert_eq!(grew("calls"), 2.0);
+    assert_eq!(grew("calls"), 1.0);
     assert_eq!(grew("failed_calls"), 1.0);
     assert_eq!(grew("rejected_calls"), 1.0);
 
@@ -321,6 +395,86 @@ fn commandstats_count_every_call() {
     // Not a command: no line.
     c.cmd(&["NOSUCHCOMMAND"]);
     assert!(cmdstat(&mut c, "nosuchcommand").is_none());
+}
+
+/// The commands a connection answers itself, without `execute_command`, are
+/// counted too: `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`, `RESET`, `AUTH`, `WAIT`
+/// and `WAITAOF`.
+/// A server of its own, and [`stats_lock`], so that no other test adds to
+/// the counts.
+#[test]
+fn commandstats_count_the_connection_commands() {
+    let _stats = stats_lock();
+    let mut c = Conn::connect(start("secret"));
+    assert!(c.cmd(&["AUTH", "wrong"]).err().starts_with("WRONGPASS"));
+    assert!(c.cmd(&["AUTH", "secret"]).ok());
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+
+    assert!(c.cmd(&["WATCH", "cc:k"]).ok());
+    assert!(c.cmd(&["UNWATCH"]).ok());
+    assert!(matches!(c.cmd(&["HELLO", "2"]), V::Arr(_)));
+    assert!(matches!(c.cmd(&["HELLO", "9"]), V::Err(_)));
+    assert!(c.cmd(&["MULTI"]).ok());
+    assert!(c.cmd(&["DISCARD"]).ok());
+    assert!(matches!(c.cmd(&["DISCARD"]), V::Err(_)));
+    assert!(matches!(c.cmd(&["AUTH", "wrong"]), V::Err(_)));
+    assert_eq!(c.cmd(&["RESET"]).s(), "RESET");
+
+    // RESET drops the authentication: the connection has to log in again to
+    // read the statistics, and that is a second call of AUTH.
+    assert!(c.cmd(&["AUTH", "secret"]).ok());
+    assert_eq!(c.cmd(&["WAIT", "0", "0"]).i(), 0);
+    assert!(matches!(c.cmd(&["WAITAOF", "0", "0", "0"]), V::Arr(_)));
+    let mut calls = |name: &str| {
+        let stats = cmdstat(&mut c, name).unwrap_or_else(|| panic!("no cmdstat_{name} line"));
+        (stats["calls"], stats["failed_calls"])
+    };
+    assert_eq!(calls("watch"), (1.0, 0.0));
+    assert_eq!(calls("unwatch"), (1.0, 0.0));
+    assert_eq!(calls("hello"), (2.0, 1.0));
+    assert_eq!(calls("multi"), (1.0, 0.0));
+    assert_eq!(calls("discard"), (2.0, 1.0));
+    assert_eq!(calls("auth"), (2.0, 1.0));
+    assert_eq!(calls("reset"), (1.0, 0.0));
+    assert_eq!(calls("wait"), (1.0, 0.0));
+    assert_eq!(calls("waitaof"), (1.0, 0.0));
+}
+
+/// `WAIT` inside `MULTI` is queued and counted once, when `EXEC` runs it (not
+/// as the `+QUEUED` reply too); and a `WAIT` that blocks is counted for the
+/// work of the call, not for the time the client waited, as in Redis (where
+/// a `WAIT 1 300` with no replica adds nothing to `usec`). A server of its
+/// own, and [`stats_lock`], so that no other test adds to the counts.
+#[test]
+fn commandstats_wait_counts_calls_not_blocked_time() {
+    let _stats = stats_lock();
+    let mut c = Conn::connect(start("secret"));
+    assert!(c.cmd(&["AUTH", "secret"]).ok());
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+
+    assert!(c.cmd(&["MULTI"]).ok());
+    assert_eq!(c.cmd(&["WAIT", "0", "0"]).s(), "QUEUED");
+    assert_eq!(c.cmd(&["WAITAOF", "0", "0", "0"]).s(), "QUEUED");
+    let exec = c.cmd(&["EXEC"]);
+    assert_eq!(exec.arr().len(), 2, "{exec:?}");
+    let counts = |c: &mut Conn, name: &str| {
+        let stats = cmdstat(c, name).unwrap_or_else(|| panic!("no cmdstat_{name} line"));
+        (stats["calls"], stats["failed_calls"])
+    };
+    assert_eq!(counts(&mut c, "multi"), (1.0, 0.0));
+    assert_eq!(counts(&mut c, "exec"), (1.0, 0.0));
+    assert_eq!(counts(&mut c, "wait"), (1.0, 0.0));
+    assert_eq!(counts(&mut c, "waitaof"), (1.0, 0.0));
+
+    // No replica: WAIT 1 200 blocks for 200 ms and answers 0. Those 200 ms
+    // are not the time of the command.
+    let began = std::time::Instant::now();
+    assert_eq!(c.cmd(&["WAIT", "1", "200"]).i(), 0);
+    assert!(began.elapsed() >= std::time::Duration::from_millis(150));
+    let stats = cmdstat(&mut c, "wait").unwrap();
+    assert_eq!(stats["calls"], 2.0, "{stats:?}");
+    assert!(stats["usec"] < 100_000.0, "{stats:?}");
+    assert!(stats["usec_per_call"] < 100_000.0, "{stats:?}");
 }
 
 // ── Expiry: notifications, and hash fields ────────────────────────────────────
@@ -376,6 +530,9 @@ fn a_key_that_expires_is_announced() {
 /// hash with none left goes with them.
 #[test]
 fn hash_fields_expire_on_their_own() {
+    // `expired_subkeys` is counted for the process: no `CONFIG RESETSTAT`
+    // between the two readings.
+    let _stats = stats_lock();
     let mut sub = events();
     let mut c = conn();
     let before: u64 = info(&mut c, "stats", "expired_subkeys")

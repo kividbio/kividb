@@ -9,6 +9,7 @@ real API keys or spend are involved.
   pip install "litellm[proxy]" redis redisvl numpy
   python litellm_kividb_compat.py --url redis://HOST:6379 --label kividb
   python litellm_kividb_compat.py --url redis://HOST:6379 --label kividb --bench
+  python litellm_kividb_compat.py --url redis://HOST:6379 --model openai/gpt-6-luna
 
 Writes results-<label>.json next to the script. Run the same command against stock
 Redis (and Redis Stack) with a different --label to get a comparison.
@@ -182,7 +183,7 @@ def raw_vector(r, p):
     check("FT.DROPINDEX", drop, level="WARN")
 
 
-def litellm_checks(url, p, stub_port):
+def litellm_checks(url, p, stub_port, model):
     import litellm
     from litellm import Router
     from litellm.caching.caching import Cache
@@ -197,21 +198,21 @@ def litellm_checks(url, p, stub_port):
         litellm.cache = Cache(type="redis", host=host, port=str(port), password=pw, namespace=p + "exact", ttl=60)
         msgs = [{"role": "user", "content": "exact " + uuid.uuid4().hex}]
         c0 = Stub.counts["chat"]
-        a = litellm.completion(model="gpt-4o-mini", messages=msgs, caching=True)
-        b = litellm.completion(model="gpt-4o-mini", messages=msgs, caching=True)
+        a = litellm.completion(model=model, messages=msgs, caching=True)
+        b = litellm.completion(model=model, messages=msgs, caching=True)
         assert Stub.counts["chat"] - c0 == 1, f"provider hit {Stub.counts['chat'] - c0}x, expected 1"
         assert a.choices[0].message.content == b.choices[0].message.content
 
     def router_counters():
-        # Counter keys look like <deployment-hash>:openai/gpt-4o-mini:rpm:HH-MM and live ~60s.
+        # Counter keys look like <deployment-hash>:<model>:rpm:HH-MM and live ~60s.
         # The hash is stable across runs, so a dbsize delta reads 0 when a previous run wrote
         # the same minute's keys. Compare counter values instead.
         def counters():
-            ks = [k for k in r.scan_iter(match="*gpt-4o-mini:[rt]pm:*", count=1000)]
+            ks = [k for k in r.scan_iter(match=f"*{model}:[rt]pm:*", count=1000)]
             return dict(zip(ks, r.mget(ks))) if ks else {}
         litellm.cache = None
         before = counters()
-        rt = Router(model_list=[{"model_name": "m", "litellm_params": {"model": "openai/gpt-4o-mini"}}],
+        rt = Router(model_list=[{"model_name": "m", "litellm_params": {"model": model}}],
                     redis_host=host, redis_port=port, redis_password=pw,
                     routing_strategy="usage-based-routing-v2")
         for i in range(3):
@@ -234,7 +235,7 @@ def litellm_checks(url, p, stub_port):
                               redis_semantic_cache_index_name=p + "semcache",
                               redis_semantic_cache_embedding_model="text-embedding-ada-002")
         tag = uuid.uuid4().hex[:6]
-        ask = lambda s: litellm.completion(model="gpt-4o-mini", messages=[{"role": "user", "content": s}],
+        ask = lambda s: litellm.completion(model=model, messages=[{"role": "user", "content": s}],
                                            caching=True)
         try:
             c0 = Stub.counts["chat"]
@@ -259,9 +260,47 @@ def litellm_checks(url, p, stub_port):
             except redis.ResponseError:
                 pass
 
+    def proxy_rate_limiter():
+        # The proxy's per-key limiter (parallel_request_limiter_v3), run in-process the way the proxy
+        # builds it: an InternalUsageCache over a DualCache with this Redis behind it. It counts with
+        # Lua scripts (EVALSHA), so it needs the lua or full KiviDB build.
+        import asyncio
+        from fastapi import HTTPException
+        from litellm.caching.caching import DualCache
+        from litellm.caching.redis_cache import RedisCache
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.hooks.parallel_request_limiter_v3 import _PROXY_MaxParallelRequestsHandler_v3
+        from litellm.proxy.utils import InternalUsageCache, hash_token
+
+        hashed = hash_token("sk-" + p + uuid.uuid4().hex)
+
+        async def run():
+            cache = DualCache(redis_cache=RedisCache(host=host, port=port, password=pw))
+            handler = _PROXY_MaxParallelRequestsHandler_v3(internal_usage_cache=InternalUsageCache(cache))
+            key = UserAPIKeyAuth(api_key=hashed, rpm_limit=2)
+            outcomes = []
+            for _ in range(3):
+                try:
+                    await handler.async_pre_call_hook(user_api_key_dict=key, cache=cache, data={}, call_type="")
+                    outcomes.append("ok")
+                except HTTPException as e:
+                    outcomes.append(e.status_code)
+            return outcomes
+
+        outcomes = asyncio.run(run())
+        assert outcomes == ["ok", "ok", 429], f"expected ok, ok, 429 with rpm_limit=2; got {outcomes}"
+        # The limiter falls back to counting in process memory when its scripts fail, so the outcome
+        # alone doesn't show that Redis did the counting: its counter keys must be in Redis.
+        counters = [k.decode() for k in r.scan_iter(match=f"*{hashed}*", count=1000)]
+        assert counters, "no counter keys in Redis: the limiter counted in process memory (its scripts failed?)"
+        for k in counters:
+            r.delete(k)
+        return f"rpm_limit=2: ok, ok, 429; {len(counters)} counter keys in Redis"
+
     check("LiteLLM exact cache (type=redis)", exact)
     check("LiteLLM router TPM/RPM counters in Redis", router_counters, level="WARN")
     check("LiteLLM semantic cache (type=redis-semantic)", semantic)
+    check("LiteLLM proxy per-key rate limiter (v3, Lua scripts) on Redis", proxy_rate_limiter)
 
 
 def bench(url, p, threads=32, seconds=5):
@@ -292,6 +331,8 @@ def main():
     ap.add_argument("--label", default="target")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--skip-litellm", action="store_true")
+    ap.add_argument("--model", default="openai/gpt-6-luna",
+                    help="OpenAI chat model for the local stub (default: openai/gpt-6-luna)")
     a = ap.parse_args()
     p = f"lkc:{uuid.uuid4().hex[:8]}:"
     r = redis.Redis.from_url(a.url)
@@ -306,7 +347,7 @@ def main():
         from importlib.metadata import version
         meta["litellm"], meta["redis_py"] = version("litellm"), redis.__version__
         print(f"-- LiteLLM {meta['litellm']} end to end (stub provider)")
-        litellm_checks(a.url, p, start_stub())
+        litellm_checks(a.url, p, start_stub(), a.model)
     if a.bench:
         print("-- Micro-benchmark")
         meta["bench"] = bench(a.url, p)

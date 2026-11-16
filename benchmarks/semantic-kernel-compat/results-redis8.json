@@ -1,0 +1,110 @@
+{
+  "meta": {
+    "label": "redis8",
+    "date": "2026-11-05",
+    "semantic_kernel": "1.47.0",
+    "redis_py": "8.1.0",
+    "redisvl": "0.30.0",
+    "server": {
+      "redis_version": "8.10.2"
+    }
+  },
+  "results": [
+    {
+      "check": "json: ensure_collection_exists / collection_exists",
+      "status": "PASS",
+      "detail": "skc_json_a1f5e2",
+      "ms": 2
+    },
+    {
+      "check": "json: upsert",
+      "status": "PASS",
+      "detail": "4 records",
+      "ms": 18
+    },
+    {
+      "check": "json: get by key and by keys",
+      "status": "PASS",
+      "detail": "n3, then n1 and n4",
+      "ms": 0
+    },
+    {
+      "check": "json: vector search, top 2",
+      "status": "PASS",
+      "detail": "n1=0.0012 n2=0.0018",
+      "ms": 2
+    },
+    {
+      "check": "json: vector search with a tag filter",
+      "status": "PASS",
+      "detail": "tag == a: n1 n3",
+      "ms": 2
+    },
+    {
+      "check": "json: delete",
+      "status": "WARN",
+      "detail": "AssertionError: SK left skc_json_a1f5e2:n1 in place: JSON.DEL went to the unprefixed key n1",
+      "ms": 2
+    },
+    {
+      "check": "json: search after a server restart",
+      "status": "PASS",
+      "detail": "index and records back; nearest n1 n2",
+      "ms": 362
+    },
+    {
+      "check": "json: ensure_collection_deleted",
+      "status": "PASS",
+      "detail": "dropped",
+      "ms": 3
+    },
+    {
+      "check": "hashset: ensure_collection_exists / collection_exists",
+      "status": "PASS",
+      "detail": "skc_hashset_290585",
+      "ms": 2
+    },
+    {
+      "check": "hashset: upsert",
+      "status": "PASS",
+      "detail": "4 records",
+      "ms": 3
+    },
+    {
+      "check": "hashset: get by key and by keys",
+      "status": "PASS",
+      "detail": "n3, then n1 and n4",
+      "ms": 0
+    },
+    {
+      "check": "hashset: vector search, top 2",
+      "status": "PASS",
+      "detail": "n1=0.0012 n2=0.0018",
+      "ms": 1
+    },
+    {
+      "check": "hashset: vector search with a tag filter",
+      "status": "PASS",
+      "detail": "tag == a: n1 n3",
+      "ms": 2
+    },
+    {
+      "check": "hashset: delete",
+      "status": "PASS",
+      "detail": "n1 gone from get and search",
+      "ms": 1
+    },
+    {
+      "check": "hashset: search after a server restart",
+      "status": "PASS",
+      "detail": "index and records back; nearest n2 n3",
+      "ms": 379
+    },
+    {
+      "check": "hashset: ensure_collection_deleted",
+      "status": "PASS",
+      "detail": "dropped",
+      "ms": 3
+    }
+  ]
+}

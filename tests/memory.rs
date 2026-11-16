@@ -117,10 +117,21 @@ impl RespValue {
 
 use std::sync::atomic::{AtomicU16, Ordering};
 
-static NEXT_PORT: AtomicU16 = AtomicU16::new(16400);
-
+/// A port nothing is listening on, in 10000-29999 (below the ports the system
+/// hands out to outgoing connections). Each process starts from a place of its
+/// own (its pid), because under `cargo nextest` every test is a process: a
+/// counter that starts at the same number in each would give them all the
+/// same port.
 fn free_port() -> u16 {
-    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let from = (std::process::id() as u16).wrapping_mul(31);
+        let port = 10_000 + from.wrapping_add(step) % 20_000;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn start_server(port: u16) {

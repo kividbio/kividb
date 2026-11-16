@@ -60,7 +60,8 @@ pub type SharedLatencyTracker = Arc<LatencyTracker>;
 pub fn new_latency_tracker() -> SharedLatencyTracker {
     Arc::new(LatencyTracker {
         events: RwLock::new(AHashMap::new()),
-        max_samples: 180,
+        // Redis's LATENCY_TS_LEN.
+        max_samples: 160,
     })
 }
 
@@ -75,14 +76,23 @@ impl LatencyTracker {
     pub fn record(&self, event: &str, latency_ms: u32) {
         let mut map = self.events.write();
         let event = map.entry(event.to_string()).or_default();
+        event.max_ms = event.max_ms.max(latency_ms);
+        // One sample a second, as in Redis: a second spike in the same
+        // second raises that second's sample, if it is the higher (#566).
+        let now = unix_secs();
+        if let Some(last) = event.samples.back_mut()
+            && last.timestamp == now
+        {
+            last.latency_ms = last.latency_ms.max(latency_ms);
+            return;
+        }
         if event.samples.len() >= self.max_samples {
             event.samples.pop_front();
         }
         event.samples.push_back(LatencySample {
-            timestamp: unix_secs(),
+            timestamp: now,
             latency_ms,
         });
-        event.max_ms = event.max_ms.max(latency_ms);
     }
 
     /// `(event, latest time, latest ms, most ms)` of each event, as
@@ -131,5 +141,29 @@ impl LatencyTracker {
                 .filter(|event| map.remove(**event).is_some())
                 .count()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spikes of one event in the same second are one sample, the highest
+    /// of them, as in Redis (#566).
+    #[test]
+    fn one_sample_a_second() {
+        let tracker = new_latency_tracker();
+        // Not across the turn of a second: wait for a fresh one.
+        let start = unix_secs();
+        while unix_secs() == start {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        tracker.record("command", 5);
+        tracker.record("command", 9);
+        tracker.record("command", 3);
+        let history = tracker.history("command");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].latency_ms, 9);
+        assert_eq!(tracker.latest()[0].3, 9);
     }
 }

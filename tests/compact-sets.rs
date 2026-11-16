@@ -121,7 +121,11 @@ impl Server {
 
     /// `SHUTDOWN` with or without a save, and wait for the process to go.
     fn stop(mut self, how: &str) {
-        let _ = self.conn().cmd(&["SHUTDOWN", how]);
+        // A SHUTDOWN that goes ahead closes the connection without a reply.
+        let mut conn = self.conn();
+        let _ = conn
+            .stream
+            .write_all(format!("*2\r\n$8\r\nSHUTDOWN\r\n${}\r\n{how}\r\n", how.len()).as_bytes());
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.child.try_wait().unwrap().is_none() {
             assert!(Instant::now() < deadline, "server did not stop");

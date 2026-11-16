@@ -110,7 +110,7 @@ fn count_at(cmd: &[&[u8]], i: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Where the clause at `cmd[i]` ends: what [`run`] steps over for it,
+/// Where the clause at `cmd[i]` ends: what [`run_within`] steps over for it,
 /// without running it.
 fn clause_end(cmd: &[&[u8]], i: usize) -> usize {
     let is = |at: usize, word: &str| {
@@ -150,7 +150,7 @@ fn clause_end(cmd: &[&[u8]], i: usize) -> usize {
 }
 
 /// Where the option `name` (`TIMEOUT`, ...) is in the clauses from
-/// `cmd[start]` on, walked clause by clause as [`run`] walks them: a word
+/// `cmd[start]` on, walked clause by clause as [`run_within`] walks them: a word
 /// inside a clause (an `APPLY`'s `AS timeout`, a parameter's name or value,
 /// a `FILTER`'s expression) is not the option.
 pub fn option_at(cmd: &[&[u8]], start: usize, name: &str) -> Option<usize> {
@@ -168,11 +168,8 @@ pub fn option_at(cmd: &[&[u8]], start: usize, name: &str) -> Option<usize> {
 /// transformed rows. On an unrecognised clause we advance past it (lenient
 /// behaviour matching the existing ft_aggregate implementation), which
 /// handles tokens like SCORER/DIALECT that ft_search consumes earlier.
-pub fn run(rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
-    run_within(rows, cmd, start_idx, None).0
-}
-
-/// [`run`], stopping when `deadline` has passed; then the second value is
+///
+/// It stops when `deadline` has passed; then the second value is
 /// true. A step cut short keeps only what it finished (an `APPLY` the rows
 /// it computed, a `FILTER` the rows it found good, a `GROUPBY` the groups
 /// of the rows it read, or the groups it reduced), a sort with no time left
@@ -182,14 +179,31 @@ pub fn run(rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
 ///
 /// [`DEADLINE_EVERY`]: crate::commands::search::DEADLINE_EVERY
 pub fn run_within(
-    mut rows: Vec<Row>,
+    rows: Vec<Row>,
     cmd: &[&[u8]],
     start_idx: usize,
     deadline: Option<std::time::Instant>,
 ) -> (Vec<Row>, bool) {
+    let (rows, cut, _) = run_counted(rows, cmd, start_idx, deadline);
+    (rows, cut)
+}
+
+/// [`run_within`], and the number of groups the last `GROUPBY` made, before
+/// any `LIMIT` or `SORTBY ... MAX` cut them down: it is what Redis reports
+/// as the total of a grouped aggregation, so that a client can page through
+/// the groups. `None` when there is no `GROUPBY`, or a `FILTER` follows it
+/// (Redis's total then depends on how many rows it read before the page was
+/// full, and is not the same under RESP2 and RESP3).
+pub fn run_counted(
+    mut rows: Vec<Row>,
+    cmd: &[&[u8]],
+    start_idx: usize,
+    deadline: Option<std::time::Instant>,
+) -> (Vec<Row>, bool, Option<usize>) {
     use crate::commands::search::{deadline_due, no_time_for};
     let mut i = start_idx;
     let mut cut = false;
+    let mut groups: Option<usize> = None;
 
     while i < cmd.len() {
         let clause = match std::str::from_utf8(cmd[i]) {
@@ -225,6 +239,7 @@ pub fn run_within(
             "GROUPBY" => {
                 let (consumed, new_rows) = run_groupby(rows, cmd, i, deadline, &mut cut);
                 rows = new_rows;
+                groups = Some(rows.len());
                 i = consumed;
             }
 
@@ -274,6 +289,7 @@ pub fn run_within(
             }
 
             "FILTER" => {
+                groups = None;
                 i += 1;
                 if let Some(expr_bytes) = cmd.get(i) {
                     if let Ok(expr_str) = std::str::from_utf8(expr_bytes)
@@ -399,7 +415,7 @@ pub fn run_within(
         }
     }
 
-    (rows, cut)
+    (rows, cut, groups)
 }
 
 // ── GROUPBY + REDUCE ────────────────────────────────────────────────────────

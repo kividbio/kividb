@@ -278,6 +278,8 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     let mut prefixes: Vec<String> = Vec::new();
     let mut stopwords: Option<Vec<String>> = None;
     let mut language = crate::vector::stem::LanguageOptions::default();
+    let mut default_score = 1.0;
+    let mut score_field = None;
     let mut skip_initial_scan = false;
     let mut schema_found = false;
     let mut i = 2usize;
@@ -351,9 +353,35 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                 language.field = Some(field.to_string());
                 i += 2;
             }
-            // Ranking and storage hints with no counterpart here. They
-            // change no result a query can see.
-            "SCORE" | "SCORE_FIELD" | "PAYLOAD_FIELD" | "TEMPORARY" => {
+            "SCORE" => {
+                let raw = cmd
+                    .get(i + 1)
+                    .map(|a| text(a))
+                    .ok_or_else(|| "Bad arguments for SCORE: expected a value".to_string())?;
+                let score = raw
+                    .trim_matches(|c: char| c.is_ascii_whitespace())
+                    .parse::<f64>()
+                    .map_err(|_| "Invalid score".to_string())?;
+                if score > 1.0 || score < 0.0 {
+                    return Err("Invalid score".into());
+                }
+                default_score = score;
+                i += 2;
+            }
+            "SCORE_FIELD" => {
+                score_field = Some(
+                    cmd.get(i + 1)
+                        .map(|a| text(a))
+                        .ok_or_else(|| {
+                            "Bad arguments for SCORE_FIELD: expected a value".to_string()
+                        })?
+                        .to_string(),
+                );
+                i += 2;
+            }
+            // Storage hints with no counterpart here. They change no result
+            // a query can see.
+            "PAYLOAD_FIELD" | "TEMPORARY" => {
                 if cmd.get(i + 1).is_none() {
                     return Err(format!("Bad arguments for {word}: expected a value"));
                 }
@@ -390,6 +418,8 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
         stopwords,
         synonyms: Default::default(),
         language,
+        default_score,
+        score_field,
     }
     .into_def();
 
@@ -400,10 +430,11 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     // write. The walk takes each key's write order and reads it as it is
     // then (`vector::walk_documents`), so it cannot put back what a write
     // to the key has replaced. A clone of the definition shares its live
-    // indexes.
+    // indexes. Added once the writes that found no index are done, if it is
+    // the first (`vector::Indexes::write_to_add`, #570).
     def.name = name.clone();
     {
-        let mut store = ctx.index_store.write();
+        let mut store = ctx.index_store.write_to_add()?;
         if store.contains_key(&name) {
             return Err("Index already exists".into());
         }
@@ -433,30 +464,24 @@ fn language_definition(language: &crate::vector::stem::LanguageOptions) -> Vec<V
     out
 }
 
-/// Documents the index covers: hashes, or JSON documents, under its prefixes.
-fn count_docs(db: &Db, def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
-    // Read before any shard is locked: not the slot table with one held
-    // (see `ClusterState`).
+/// Documents the index holds, as it counts them itself
+/// ([`IndexDef::count_docs`]), not by a walk of its database, which read
+/// every key of it under each shard's lock in turn (#590). In a cluster,
+/// those in the slots this node serves.
+///
+/// A document is counted from when it is indexed until it is unindexed: one
+/// past its time is, until an expiry deletes it, as the walk counted it.
+pub(crate) fn count_docs(def: &IndexDef, cluster: Option<&crate::cluster::ClusterState>) -> usize {
+    // Read before the index's own locks are taken: nothing reads the slot
+    // table with one held (see `ClusterState`, #353).
     let served = cluster.map(crate::cluster::search::served_slots);
-    db.iter()
-        .map(|shard| {
-            shard
-                .read()
-                .iter()
-                .filter(|(key, value)| {
-                    crate::vector::is_document(&def.on, *value)
-                        && covers(def, key)
-                        && served
-                            .as_deref()
-                            .is_none_or(|served| crate::cluster::search::in_served(served, key))
-                })
-                .count()
-        })
-        .sum()
+    def.count_docs(served.as_deref())
 }
 
+/// Whether the index covers the document named `key` (a name: see
+/// `key_bytes::text_of`).
 fn covers(def: &IndexDef, key: &str) -> bool {
-    def.prefixes.is_empty() || def.prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    def.covers(&crate::key_bytes::bytes_of(key))
 }
 
 pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
@@ -471,9 +496,10 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error(&no_such_index(name)));
     };
     let def = &def;
-    let resp = ctx.resp;
+    let resp = search_resp(ctx);
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
-    let mut num_docs = count_docs(&ctx.store[*ctx.selected_db], def, cluster);
+    // The index's own database, whichever the client has selected.
+    let mut num_docs = count_docs(def, cluster);
     // In a cluster, the documents of every master.
     if crate::cluster::search::coordinates(ctx) {
         let owned: Vec<Vec<u8>> = ctx.cmd.iter().map(|a| a.to_vec()).collect();
@@ -503,25 +529,25 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     put("index_name", resp_bulk_str(&def.name));
     put("index_options", resp_array(vec![]));
-    put(
-        "index_definition",
-        resp_map_for(
-            resp,
-            vec![
-                resp_bulk_str("key_type"),
-                resp_bulk_str(match def.on {
-                    IndexOn::Hash => "HASH",
-                    IndexOn::Json => "JSON",
-                }),
-                resp_bulk_str("prefixes"),
-                resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
-            ]
-            .into_iter()
-            .chain(language_definition(&def.language))
-            .chain([resp_bulk_str("default_score"), resp_bulk_str("1")])
-            .collect(),
-        ),
-    );
+    let mut definition = vec![
+        resp_bulk_str("key_type"),
+        resp_bulk_str(match def.on {
+            IndexOn::Hash => "HASH",
+            IndexOn::Json => "JSON",
+        }),
+        resp_bulk_str("prefixes"),
+        resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
+    ];
+    definition.extend(language_definition(&def.language));
+    if def.default_score != 0.0 {
+        definition.push(resp_bulk_str("default_score"));
+        definition.push(resp_bulk_str(&score_text(def.default_score)));
+    }
+    if let Some(field) = &def.score_field {
+        definition.push(resp_bulk_str("score_field"));
+        definition.push(resp_bulk_str(field));
+    }
+    put("index_definition", resp_map_for(resp, definition));
     put(
         "attributes",
         resp_array(
@@ -780,10 +806,12 @@ pub(crate) fn scan_docs(
             let this_run = left.min(run);
             if expired.is_empty() {
                 for (key, value) in docs.by_ref().take(this_run) {
-                    each(key, value);
+                    each(&crate::key_bytes::text_of(key), value);
                 }
             } else {
                 for (key, value) in docs.by_ref().take(this_run) {
+                    let key = crate::key_bytes::text_of(key);
+                    let key: &str = &key;
                     if !expired.contains(key) {
                         each(key, value);
                     }
@@ -804,7 +832,9 @@ fn expired_in(map: &crate::store::ShardMap) -> AHashSet<String> {
     }
     let now = crate::commands::helpers::now_ms();
     let (due, _) = map.due(now, usize::MAX);
-    due.into_iter().map(|key| key.to_string()).collect()
+    due.into_iter()
+        .map(|key| crate::key_bytes::text_of(&key).into_owned())
+        .collect()
 }
 
 /// Whether a step over `n` items that cannot stop part-way (a sort) is to
@@ -815,8 +845,7 @@ pub(crate) fn no_time_for(deadline: Option<Instant>, n: usize) -> bool {
     n >= DEADLINE_EVERY as usize && past_deadline(deadline)
 }
 
-/// `ON_TIMEOUT fail` and `return_strict` error instead of returning what
-/// was found.
+/// `ON_TIMEOUT fail` errors instead of returning what was found.
 pub(crate) fn on_timeout_fails() -> bool {
     crate::commands::search_tools::on_timeout_fails()
 }
@@ -1034,8 +1063,9 @@ pub(crate) fn plan(
     def: &IndexDef,
     filter: &Filter,
     only: Option<&AHashSet<String>>,
+    now: &crate::types::QueryClock,
 ) -> Option<Plan> {
-    plan_in(ctx.store, *ctx.selected_db, def, filter, only)
+    plan_in(ctx.store, *ctx.selected_db, def, filter, only, now)
 }
 
 /// [`plan`], for database `db` of `store`.
@@ -1045,6 +1075,7 @@ fn plan_in(
     def: &IndexDef,
     filter: &Filter,
     only: Option<&AHashSet<String>>,
+    now: &crate::types::QueryClock,
 ) -> Option<Plan> {
     // The postings are of the index's own database's documents.
     if !def.keeps_postings() || def.db_index != db {
@@ -1059,7 +1090,10 @@ fn plan_in(
     // a hash whose sweep ran in between, its write queued behind this read:
     // the postings had it as it was, and it was not tried. FT.AGGREGATE then
     // counted a document the filter no longer matched (#347).
-    let watched = crate::field_expiry::watched_keys(store, db);
+    let watched: Vec<String> = crate::field_expiry::watched_keys(store, db)
+        .iter()
+        .map(|key| crate::key_bytes::text_of(key).into_owned())
+        .collect();
     let (mut ids, exact, volatile) = {
         let p = def.postings.read();
         if !p.enabled() || p.unused {
@@ -1097,7 +1131,9 @@ fn plan_in(
     let any_volatile = !volatile.is_empty();
     for (key, id) in volatile {
         if exact {
-            let matches = with_doc(store, def, &key, |fields, _| filter::eval(filter, fields));
+            let matches = with_doc(store, def, &key, now, |fields, _| {
+                filter::eval(filter, fields)
+            });
             if matches == Some(true) {
                 ids.set(id);
             } else {
@@ -1127,42 +1163,41 @@ pub(crate) fn relevance(
     key: &str,
     fields: &Fields,
     scoring: &crate::vector::score::Scoring,
+    json: Option<&serde_json::Value>,
 ) -> f64 {
-    scoring.score(def, key, fields)
+    scoring.score(def, key, fields, json)
 }
 
-/// Every document of the index that the filter accepts. In no particular
-/// order. Stops when `deadline` has passed, and then `timed_out` is true.
-pub(crate) fn filter_search(
-    ctx: &Ctx,
-    def: &IndexDef,
-    filter: &Filter,
-    only: Option<&AHashSet<String>>,
-    deadline: Option<Instant>,
-) -> FilterHits {
-    let scorer = crate::vector::score::Scorer::default_scorer();
-    filter_search_scored(ctx, def, filter, only, deadline, scorer)
-}
-
-/// [`filter_search`], scored by `scorer` (`SCORER`).
+/// Every document of the index that the filter accepts, scored by `scorer`
+/// (`SCORER`). In no particular order. Stops when `deadline` has passed, and
+/// then `timed_out` is true.
 pub(crate) fn filter_search_scored(
     ctx: &Ctx,
     def: &IndexDef,
     filter: &Filter,
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
+    now: &crate::types::QueryClock,
     scorer: crate::vector::score::Scorer,
 ) -> FilterHits {
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let range = filter.vector_range();
     let mut out: Vec<Match> = Vec::new();
-    let timed_out = filter_each(ctx, def, filter, only, deadline, |key, fields| {
-        out.push(Match {
-            key: key.to_string(),
-            score: relevance(def, key, fields, &scoring),
-            distance: range.and_then(|clause| filter::range_distance(clause, fields)),
-        });
-    });
+    let timed_out = filter_each(
+        ctx,
+        def,
+        filter,
+        only,
+        deadline,
+        now,
+        |key, fields, json| {
+            out.push(Match {
+                key: key.to_string(),
+                score: relevance(def, key, fields, &scoring, json),
+                distance: range.and_then(|clause| filter::range_distance(clause, fields)),
+            });
+        },
+    );
     FilterHits {
         matches: out,
         timed_out,
@@ -1170,7 +1205,7 @@ pub(crate) fn filter_search_scored(
 }
 
 /// Every document of the index that the filter accepts, into `accept`, with
-/// its key and fields: [`filter_search`] without the copies, for a caller
+/// its key and fields: [`filter_search_scored`] without the copies, for a caller
 /// that keeps only some of them. True if it stopped because `deadline` had
 /// passed. `accept` may run under a shard's read lock.
 pub(crate) fn filter_each(
@@ -1179,31 +1214,32 @@ pub(crate) fn filter_each(
     filter: &Filter,
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
-    mut accept: impl FnMut(&str, &Fields),
+    now: &crate::types::QueryClock,
+    mut accept: impl FnMut(&str, &Fields, Option<&serde_json::Value>),
 ) -> bool {
     let db = &ctx.store[*ctx.selected_db];
     let mut timed_out = false;
 
     // From postings, if they narrow the filter: the documents they name, each
     // read only to hand it over, or to try it where they are not exact.
-    if let Some(plan) = plan(ctx, def, filter, only) {
+    if let Some(plan) = plan(ctx, def, filter, only, now) {
         let mut seen = 0u32;
         for key in keys_of(def, &plan.ids) {
             if deadline_due(deadline, &mut seen) {
                 return true;
             }
-            with_doc(db, def, &key, |fields, _| {
+            with_doc(db, def, &key, now, |fields, json| {
                 if plan.exact || filter::eval(filter, fields) {
-                    accept(&key, fields);
+                    accept(&key, fields, json);
                 }
             });
         }
         return false;
     }
 
-    let mut consider = |key: &str, fields: &Fields| {
+    let mut consider = |key: &str, fields: &Fields, json: Option<&serde_json::Value>| {
         if filter::eval(filter, fields) {
-            accept(key, fields);
+            accept(key, fields, json);
         }
     };
 
@@ -1221,6 +1257,9 @@ pub(crate) fn filter_each(
     // up in it by key (#371).
     let watched = if has_words(filter) {
         crate::field_expiry::watched_keys(ctx.store, *ctx.selected_db)
+            .iter()
+            .map(|key| crate::key_bytes::text_of(key).into_owned())
+            .collect()
     } else {
         Vec::new()
     };
@@ -1271,9 +1310,9 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     continue;
                 }
-                with_doc(db, def, key, |fields, _| {
+                with_doc(db, def, key, now, |fields, json| {
                     if *matches || filter::eval(filter, fields) {
-                        accept(key, fields);
+                        accept(key, fields, json);
                     }
                 });
             }
@@ -1283,8 +1322,11 @@ pub(crate) fn filter_each(
                 if !covers(def, key) {
                     return;
                 }
-                if let Some(fields) = crate::vector::doc_fields(&def.on, &def.fields, value) {
-                    consider(key, &fields);
+                if let Some(fields) =
+                    crate::vector::query_doc_fields(&def.on, &def.fields, value, now)
+                {
+                    let json = fields.json();
+                    consider(key, &fields, json);
                 }
             });
         }
@@ -1294,20 +1336,59 @@ pub(crate) fn filter_each(
     timed_out
 }
 
+/// Whether `key` holds a document of the kind the index covers now.
+fn holds_document(db: &Db, def: &IndexDef, key: &str) -> bool {
+    let key = crate::key_bytes::bytes_of(key);
+    crate::store::get_shard(db, &*key)
+        .read()
+        .get(&*key)
+        .is_some_and(|value| crate::vector::is_document(&def.on, value))
+}
+
+/// Whether a query is not to see `field` of the document at `key`: a hash
+/// field past its deadline and not removed yet, as [`with_doc`] leaves it
+/// out. A vector index holds such a field's vector until the removal
+/// reindexes the hash, so a nearest-neighbour search asks this of its hits.
+/// The shard is let go before the hash is read, as in `with_doc`.
+pub(crate) fn field_hidden(
+    db: &Db,
+    key: &str,
+    field: &str,
+    now: &crate::types::QueryClock,
+) -> bool {
+    if !crate::field_expiry::any_watched() {
+        return false;
+    }
+    let key = crate::key_bytes::bytes_of(key);
+    let value = crate::store::get_shard(db, &*key)
+        .read()
+        .get(&*key)
+        .map(ValueRef::to_value);
+    let Some(KiviDBValue::HashEx(hash)) = value else {
+        return false;
+    };
+    hash.read().hides(field, now.get())
+}
+
 /// Run `f` on the document at `key`, if there is one of the kind the index
-/// covers: on its fields, and for a JSON document on the document too.
+/// covers: on its fields, and for a JSON document on the document too. `now`
+/// is the moment the query judges field deadlines by, read once per query
+/// (`types::field_now`), so that it sees every document at the same moment.
 pub(crate) fn with_doc<R>(
     db: &Db,
     def: &IndexDef,
     key: &str,
+    now: &crate::types::QueryClock,
     f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
 ) -> Option<R> {
     // Out of the shard, so that its lock is not held while `f` runs. A key
     // whose time to live has ended is no document, though nothing has
     // deleted it yet.
+    // A document is named by `key_bytes::text_of` of its key.
+    let key = crate::key_bytes::bytes_of(key);
     let value = {
-        let map = crate::store::get_shard(db, key).read();
-        let (value, expires) = map.get_expiring(key)?;
+        let map = crate::store::get_shard(db, &*key).read();
+        let (value, expires) = map.get_expiring(&*key)?;
         if expires.is_some_and(crate::commands::helpers::is_past) {
             return None;
         }
@@ -1315,7 +1396,15 @@ pub(crate) fn with_doc<R>(
     };
     match (&def.on, &value) {
         (IndexOn::Hash, KiviDBValue::Hash(hash)) => Some(f(&hash.read(), None)),
-        (IndexOn::Hash, KiviDBValue::HashEx(hash)) => Some(f(&hash.read().fields, None)),
+        (IndexOn::Hash, KiviDBValue::HashEx(hash)) => {
+            let hash = hash.read();
+            let shown = hash.shown(now.get());
+            // Every field due: no document, as HGETALL shows it empty.
+            if shown.is_empty() {
+                return None;
+            }
+            Some(f(&shown, None))
+        }
         (IndexOn::Json, KiviDBValue::Json(doc)) => {
             let doc = doc.read();
             Some(f(
@@ -1424,6 +1513,9 @@ fn every_match_scores_the_same(
             _ => false,
         }
     }
+    if def.score_field.is_some() && scorer != Scorer::Hamming {
+        return false;
+    }
     let lengths = def.text_fields().next().is_some();
     match scorer {
         Scorer::DocScore | Scorer::Hamming => true,
@@ -1440,6 +1532,7 @@ fn page_from_postings(
     filter: &Filter,
     args: &SearchArgs,
     deadline: Option<Instant>,
+    now: &crate::types::QueryClock,
 ) -> Option<Posted> {
     // A distance is no part of the postings.
     if filter.vector_range().is_some() {
@@ -1448,6 +1541,12 @@ fn page_from_postings(
     let scorer = args
         .scorer
         .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
+    if args.withscores
+        && def.score_field.is_some()
+        && scorer != crate::vector::score::Scorer::Hamming
+    {
+        return None;
+    }
     let (order, numeric) = match &args.sortby {
         // Only the count (LIMIT 0 0): no order to keep.
         None if args.count == 0 || every_match_scores_the_same(def, filter, scorer) => {
@@ -1468,7 +1567,7 @@ fn page_from_postings(
     if def.postings.peek().read_all {
         return None;
     }
-    let plan = plan(ctx, def, filter, args.inkeys.as_ref())?;
+    let plan = plan(ctx, def, filter, args.inkeys.as_ref(), now)?;
     // Exactly the matches. Ordered by a number, with the numbers the
     // documents hold, which a field's time to live may have taken away.
     if !plan.exact || (plan.volatile && numeric.is_some()) {
@@ -1520,7 +1619,7 @@ fn page_from_postings(
         // Documents that left the index since the plan was made.
         ids.and_with(p.live());
         for key in &expired {
-            if let Some(id) = p.id(key) {
+            if let Some(id) = p.id(&crate::key_bytes::text_of(key)) {
                 ids.unset(id);
             }
         }
@@ -1567,7 +1666,7 @@ fn page_from_postings(
     let scoring = crate::vector::score::Scoring::new(def, filter, scorer);
     let mut page = Vec::with_capacity(picked.len());
     for (key, number) in picked {
-        let hit = with_doc(db, def, &key, |fields, _| {
+        let hit = with_doc(db, def, &key, now, |fields, json| {
             if !filter::eval(filter, fields) {
                 return None;
             }
@@ -1588,7 +1687,7 @@ fn page_from_postings(
             };
             Some(Hit {
                 key: key.to_string(),
-                score: relevance(def, &key, fields, &scoring),
+                score: relevance(def, &key, fields, &scoring, json),
                 extras: Vec::new(),
                 sort_key,
             })
@@ -1887,10 +1986,12 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 if n > cmd.len().saturating_sub(i + 2) {
                     return Err("Bad arguments for INKEYS: not enough keys".into());
                 }
+                // Named as documents are (`key_bytes::text_of`), so a key
+                // that is not plain UTF-8 still finds its document.
                 args.inkeys = Some(
                     cmd[i + 2..i + 2 + n]
                         .iter()
-                        .map(|a| text(a).to_string())
+                        .map(|a| crate::key_bytes::text_of(a).into_owned())
                         .collect(),
                 );
                 i += 2 + n;
@@ -1994,6 +2095,40 @@ pub(crate) fn number_text(value: f64) -> String {
     }
 }
 
+pub(crate) fn score_text(value: f64) -> String {
+    const INTEGER_BOUND: f64 = (i64::MAX / 2) as f64;
+    if value.is_nan() {
+        "nan".to_string()
+    } else if value == 0.0 && value.is_sign_negative() {
+        "-0".to_string()
+    } else if !value.is_finite() {
+        value.to_string()
+    } else if value == value.trunc() && value.abs() <= INTEGER_BOUND {
+        format!("{}", value as i64)
+    } else {
+        let scientific = format!("{value:e}");
+        let Some((coefficient, exponent)) = scientific.split_once('e') else {
+            return number_text(value);
+        };
+        let Ok(exponent) = exponent.parse::<i32>() else {
+            return number_text(value);
+        };
+        let digits = coefficient.bytes().filter(u8::is_ascii_digit).count() as i32;
+        let k = exponent - (digits - 1);
+        let scientific = if k >= 0 {
+            exponent >= digits + 7
+        } else {
+            k <= -7 && exponent.abs() >= 4
+        };
+        if scientific && exponent != 0 {
+            let sign = if exponent >= 0 { "+" } else { "" };
+            format!("{coefficient}e{sign}{exponent}")
+        } else {
+            number_text(value)
+        }
+    }
+}
+
 pub(crate) fn distance_text(distance: f32) -> String {
     if distance == 0.0 {
         "0".to_string()
@@ -2074,6 +2209,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         std::str::from_utf8(cmd[2]).map_err(|_| "The query must be valid UTF-8".to_string())?;
     let args = parse_search_args(cmd, 3)?;
     let deadline = search_deadline(args.timeout_ms);
+    // One moment for the whole query to judge field deadlines by.
+    let clock = crate::types::QueryClock::new();
+    let now = &clock;
 
     let def = ctx
         .index_store
@@ -2134,7 +2272,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     // ── The page, from postings, where they know it ─────────────────────────
     let posted = match &query.knn {
         Some(_) => None,
-        None => page_from_postings(ctx, &def, &filter, &args, deadline),
+        None => page_from_postings(ctx, &def, &filter, &args, deadline, now),
     };
 
     // ── Otherwise every match, in the query's own order ─────────────────────
@@ -2155,21 +2293,45 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .get(&knn.field)
                 .ok_or_else(|| "The vector field has no index".to_string())?;
             let nearest = if matches!(filter, Filter::MatchAll) && args.inkeys.is_none() {
-                match live {
-                    LiveIndex::Flat(index) => {
-                        crate::vector::knn_flat(index, &knn.vector, knn.k, metric)
+                // The nearest `k` whose vector field the query sees: one
+                // past its deadline is left out, and more are asked for.
+                let nearest_of = |k: usize| {
+                    crate::commands::vector::nearest_shown(db, &knn.field, k, now, |k| match live {
+                        LiveIndex::Flat(index) => {
+                            crate::vector::knn_flat(index, &knn.vector, k, metric)
+                        }
+                        LiveIndex::Hnsw(graph) => {
+                            let ef = knn.ef_runtime.unwrap_or(match &field.field_type {
+                                FieldType::Vector {
+                                    algo: VectorAlgo::Hnsw { ef_runtime, .. },
+                                    ..
+                                } => *ef_runtime,
+                                _ => k * 2,
+                            });
+                            crate::vector::knn_hnsw(graph, &knn.vector, k, ef, metric)
+                        }
+                    })
+                };
+                // A document leaves its indexes once its shard is let go
+                // of, so one just deleted or written over can still be
+                // among the nearest. It is left out, and as many more are
+                // asked for as were left out.
+                let mut live_ones = Vec::new();
+                let mut more = 0;
+                for _ in 0..4 {
+                    let found = nearest_of(knn.k + more);
+                    let asked = knn.k + more;
+                    let had = found.len();
+                    live_ones = found;
+                    live_ones.retain(|hit| holds_document(db, &def, &hit.key));
+                    let gone = had - live_ones.len();
+                    if gone == 0 || live_ones.len() >= knn.k || had < asked {
+                        break;
                     }
-                    LiveIndex::Hnsw(graph) => {
-                        let ef = knn.ef_runtime.unwrap_or(match &field.field_type {
-                            FieldType::Vector {
-                                algo: VectorAlgo::Hnsw { ef_runtime, .. },
-                                ..
-                            } => *ef_runtime,
-                            _ => knn.k * 2,
-                        });
-                        crate::vector::knn_hnsw(graph, &knn.vector, knn.k, ef, metric)
-                    }
+                    more = gone;
                 }
+                live_ones.truncate(knn.k);
+                live_ones
             } else if let Some((nearest, cut)) = crate::commands::vector::knn_planned(
                 ctx,
                 &def,
@@ -2178,6 +2340,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 knn,
                 field,
                 deadline,
+                now,
             ) {
                 // The documents the filter matches, from postings: see
                 // `knn_planned`.
@@ -2195,7 +2358,14 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                     &filter,
                     args.inkeys.as_ref(),
                     deadline,
-                    |key, _| scorer.offer(key),
+                    now,
+                    // Measured only if the query sees the vector field: a
+                    // hash's past its deadline is left out of `fields`.
+                    |key, fields, json| {
+                        if json.is_some() || fields.get(knn.field.as_str()).is_some() {
+                            scorer.offer(key);
+                        }
+                    },
                 );
                 scorer.nearest()
             };
@@ -2218,8 +2388,15 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             let scorer = args
                 .scorer
                 .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
-            let found =
-                filter_search_scored(ctx, &def, &filter, args.inkeys.as_ref(), deadline, scorer);
+            let found = filter_search_scored(
+                ctx,
+                &def,
+                &filter,
+                args.inkeys.as_ref(),
+                deadline,
+                now,
+                scorer,
+            );
             timed_out = found.timed_out;
             let mut matches = found.matches;
             // A sort cannot stop part-way. Past the deadline it is left
@@ -2261,7 +2438,16 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     // In a cluster, only the keys of the slots this node serves: a key part
     // of the way through a migration is not counted twice.
     if ctx.cluster.enabled {
-        hits.retain(|hit| crate::cluster::search::serves(ctx.cluster, &hit.key));
+        hits.retain(|hit| {
+            crate::cluster::search::serves(ctx.cluster, &*crate::key_bytes::bytes_of(&hit.key))
+        });
+    }
+    let scores_matter = shard
+        .then(|| crate::cluster::search::scores_matter(&ctx.cmd))
+        .flatten()
+        .unwrap_or_else(|| args.withscores || (args.sortby.is_none() && args.count > 0));
+    if scores_matter {
+        hits.retain(|hit| hit.score != f64::NEG_INFINITY);
     }
 
     // ── SORTBY ───────────────────────────────────────────────────────────────
@@ -2284,7 +2470,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             // holds.
             hit.sort_key = match hit.extras.iter().find(|(alias, _)| alias == name) {
                 Some((_, value)) => value.parse::<f64>().ok().map(SortKey::Number),
-                None => with_doc(db, &def, &hit.key, |fields, _| {
+                None => with_doc(db, &def, &hit.key, now, |fields, _| {
                     sort_key_of(fields, source, numeric, unf)
                 })
                 .flatten(),
@@ -2360,7 +2546,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .map(|(alias, value)| (alias.clone(), value.clone().into_bytes()))
                 .collect()
         };
-        with_doc(db, &def, &hit.key, |fields, json| {
+        with_doc(db, &def, &hit.key, now, |fields, json| {
             match (&args.returns, json) {
                 (Some(returns), _) => returns
                     .iter()
@@ -2389,7 +2575,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 // A JSON document is returned whole, under `$`.
                 (None, Some(doc)) => {
                     let mut out = extras();
-                    out.push(("$".to_string(), serde_json::to_vec(doc).unwrap_or_default()));
+                    out.push(("$".to_string(), crate::commands::json::json_bytes(doc)));
                     out
                 }
                 (None, None) => {
@@ -2420,7 +2606,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             },
         })
         .collect();
-    let page = encode_page(ctx.resp, &page, total, &args, nocontent, timed_out);
+    let page = encode_page(search_resp(ctx), &page, total, &args, nocontent, timed_out);
     // A coordinator that asks for it is told whether this part timed out;
     // one from before there was a timeout gets the page as it expects it.
     if shard && crate::cluster::search::wants_timeout_flag(&ctx.cmd) {
@@ -2436,6 +2622,15 @@ struct PageHit {
     score: f64,
     sort_key: Option<SortKey>,
     fields: Vec<(String, Vec<u8>)>,
+}
+
+fn resp3_score(value: f64) -> Vec<u8> {
+    let text = score_text(value);
+    let mut out = Vec::with_capacity(text.len() + 3);
+    out.push(b',');
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// The reply to FT.SEARCH for `page`, of `total` matches.
@@ -2459,10 +2654,13 @@ fn encode_page(
         let results: Vec<Vec<u8>> = page
             .iter()
             .map(|hit| {
-                let mut entry = vec![resp_bulk_str("id"), resp_bulk_str(&hit.key)];
+                let mut entry = vec![
+                    resp_bulk_str("id"),
+                    resp_bulk(&crate::key_bytes::bytes_of(&hit.key)),
+                ];
                 if args.withscores {
                     entry.push(resp_bulk_str("score"));
-                    entry.push(resp_double_for(3, hit.score));
+                    entry.push(resp3_score(hit.score));
                 }
                 if args.withsortkeys {
                     entry.push(resp_bulk_str("sortkey"));
@@ -2507,9 +2705,9 @@ fn encode_page(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(1 + page.len() * 2);
     out.push(resp_integer(total as i64));
     for hit in page {
-        out.push(resp_bulk_str(&hit.key));
+        out.push(resp_bulk(&crate::key_bytes::bytes_of(&hit.key)));
         if args.withscores {
-            out.push(resp_bulk_str(&number_text(hit.score)));
+            out.push(resp_bulk_str(&score_text(hit.score)));
         }
         if args.withpayloads {
             out.push(resp_null_bulk());
@@ -2532,6 +2730,18 @@ fn encode_page(
 thread_local! {
     /// Set while a coordinator runs its own part of a search.
     static SHARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The protocol a reply is written in: a script's own (`redis.setresp`)
+/// inside one, the client's otherwise. A shard's part is always RESP2,
+/// whatever the script says: the coordinator parses it as such.
+#[inline]
+fn search_resp(ctx: &Ctx) -> u8 {
+    if SHARD.with(|s| s.get()) {
+        2
+    } else {
+        crate::commands::handler::effective_resp_for_reply(ctx)
+    }
 }
 
 /// FT.SEARCH across the cluster: see `cluster::search`.
@@ -2564,6 +2774,10 @@ fn coordinate(
     shard_cmd.push(b"LIMIT".to_vec());
     shard_cmd.push(b"0".to_vec());
     shard_cmd.push((args.offset + args.count).to_string().into_bytes());
+    crate::cluster::search::ask_for_scores_matter(
+        &mut shard_cmd,
+        args.withscores || (args.sortby.is_none() && args.count > 0),
+    );
     crate::cluster::search::ask_for_timeout_flag(&mut shard_cmd);
 
     // This node's part, then the others'.
@@ -2609,7 +2823,15 @@ fn coordinate(
             total += n.max(0) as usize;
         }
         while let Some(key) = items.next() {
-            let key = key.text().unwrap_or_default();
+            // A master sends the key's bytes (`bytes_of` of its name): it is
+            // a name again by `text_of`, as `encode_page` expects. It was
+            // decoded lossily, so a key that is not text came back as
+            // U+FFFD, and one with a character of the escape's block in it
+            // as other bytes.
+            let key = match key {
+                Reply::Bulk(Some(raw)) => crate::key_bytes::text_of(&raw).into_owned(),
+                other => other.text().unwrap_or_default(),
+            };
             let score = items
                 .next()
                 .and_then(|s| s.text())
@@ -2691,7 +2913,12 @@ fn coordinate(
         return Err("Timeout limit was reached".into());
     }
     Ok(encode_page(
-        ctx.resp, &page, total, args, nocontent, timed_out,
+        search_resp(ctx),
+        &page,
+        total,
+        args,
+        nocontent,
+        timed_out,
     ))
 }
 
@@ -2724,6 +2951,8 @@ mod tests {
             stopwords: None,
             synonyms: Default::default(),
             language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
         }
         .into_def();
         index_store.write().insert("i347".into(), def.clone());
@@ -2740,7 +2969,7 @@ mod tests {
             if key == "d347:b" {
                 inner
                     .expiries
-                    .insert("n".into(), Instant::now() + Duration::from_millis(1));
+                    .insert("n".into(), crate::types::field_now() + 1);
             }
             crate::store::get_shard(&store[0], key).write().insert(
                 key,
@@ -2772,7 +3001,15 @@ mod tests {
                 .map(|key| key.to_string())
                 .collect()
         };
-        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        let plan = plan_in(
+            &store,
+            0,
+            &def,
+            &filter,
+            None,
+            &crate::types::QueryClock::new(),
+        )
+        .unwrap();
         assert!(plan.exact);
         assert_eq!(matches(&plan), ["d347:a"], "a watched hash is tried");
 
@@ -2781,7 +3018,15 @@ mod tests {
         crate::test_hooks::set("plan: postings read", move || {
             crate::field_expiry::sweep(&s, &i)
         });
-        let plan = plan_in(&store, 0, &def, &filter, None).unwrap();
+        let plan = plan_in(
+            &store,
+            0,
+            &def,
+            &filter,
+            None,
+            &crate::types::QueryClock::new(),
+        )
+        .unwrap();
         assert!(
             crate::field_expiry::watched_keys(&store, 0).is_empty(),
             "the sweep ran, and the hash is no longer watched"
@@ -2793,6 +3038,47 @@ mod tests {
         let cmd: Vec<&[u8]> = cmd.iter().map(|w| w.as_bytes()).collect();
         let mut i = 0;
         parse_schema_fields(&cmd, &mut i)
+    }
+
+    #[test]
+    fn score_text_matches_redis_number_formatting() {
+        assert_eq!(score_text(f64::from(0.1f32)), "0.10000000149011612");
+        assert_eq!(score_text(0.1), "0.1");
+        assert_eq!(score_text(0.0001), "0.0001");
+        assert_eq!(score_text(f64::from(0.0001f32)), "9.999999747378752e-5");
+        assert_eq!(score_text(0.0009999), "9.999e-4");
+        assert_eq!(score_text(0.00001), "0.00001");
+        assert_eq!(score_text(0.000001), "0.000001");
+        assert_eq!(score_text(1e-7), "1e-7");
+        assert_eq!(score_text(123456.789), "123456.789");
+        assert_eq!(score_text(f64::from(123_456.79_f32)), "1.234567890625e+5");
+        assert_eq!(score_text(f64::from(1e-45f32)), "1.401298464324817e-45");
+        assert_eq!(score_text(f64::from(3.4e38f32)), "3.3999999521443642e+38");
+        assert_eq!(score_text(f64::from(9e18f32)), "9000000202358129000");
+        assert_eq!(score_text(f64::from(1e19f32)), "9999999980506448000");
+        assert_eq!(score_text(f64::from(1e23f32)), "99999997781963080000000");
+        assert_eq!(score_text(f64::from(1e24f32)), "1.0000000138484279e+24");
+        assert_eq!(
+            score_text(f64::from(1.0000001e23f32)),
+            "100000006789162340000000"
+        );
+        assert_eq!(
+            score_text(f64::from(9.999999e23f32)),
+            "9.999998697332398e+23"
+        );
+        assert_eq!(
+            score_text(f64::from(1.2345678e23f32)),
+            "1.234567802683402e+23"
+        );
+        assert_eq!(
+            score_text(f64::from(1.234_567_9e23_f32)),
+            "123456789275539450000000"
+        );
+        assert_eq!(score_text(0.0), "0");
+        assert_eq!(score_text(-0.0), "-0");
+        assert_eq!(score_text(f64::INFINITY), "inf");
+        assert_eq!(score_text(f64::NEG_INFINITY), "-inf");
+        assert_eq!(score_text(f64::NAN), "nan");
     }
 
     /// The five schemas of the LiteLLM report: each was refused.

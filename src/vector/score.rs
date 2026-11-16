@@ -334,6 +334,15 @@ impl<'q> Scoring<'q> {
         let mut tags = Vec::new();
         let patterns = named_terms(filter, &mut words, &mut tags);
         let mut wanted = Bits::new();
+        // What is queued for the postings applied first (`PostingsLock::
+        // read`): a document's removal queued there, while a query held
+        // them, takes its words out of the TEXT index when it is applied.
+        // Read before it, the statistics below still counted a document
+        // that the postings read after them, and the query's count, left
+        // out: the full path scored with it, the page from postings (which
+        // reads the postings first) without, and the next query without
+        // (#421).
+        drop(def.postings.read());
         let (term_ids, doc_count, total_len) = {
             let text = def.text.read();
             let ids: AHashMap<String, (u32, usize)> = words
@@ -406,22 +415,65 @@ impl<'q> Scoring<'q> {
 
     /// The score of the document at `key`, whose fields are `doc`. The
     /// document matches the query.
-    pub fn score(&self, def: &IndexDef, key: &str, doc: &dyn Doc) -> f64 {
-        match self.scorer {
-            Scorer::DocScore => 1.0,
-            Scorer::Hamming => 0.0,
-            _ => {
-                let id = def.postings.read().id(key);
-                self.score_id(def, id, doc)
-            }
+    pub fn score(
+        &self,
+        def: &IndexDef,
+        key: &str,
+        doc: &dyn Doc,
+        json: Option<&serde_json::Value>,
+    ) -> f64 {
+        if matches!(self.scorer, Scorer::DocScore | Scorer::Hamming) {
+            return self.score_id(def, None, doc, json);
         }
+        let id = def.postings.read().id(key);
+        self.score_id(def, id, doc, json)
+    }
+
+    /// The document score `SCORE_FIELD` gives a document, or `SCORE` when it
+    /// holds no number there. A JSON document's number is read from the
+    /// document itself, not from what the schema projects of it.
+    fn document_score(def: &IndexDef, doc: &dyn Doc, json: Option<&serde_json::Value>) -> f64 {
+        let default_score = f64::from(def.default_score as f32);
+        let Some(field) = &def.score_field else {
+            return default_score;
+        };
+        let score = match def.on {
+            super::IndexOn::Hash => doc.field_bytes(field).and_then(Self::score_from_bytes),
+            super::IndexOn::Json => json
+                .and_then(|doc| super::json_score_field_number(field, doc))
+                .map(Self::score_from_number),
+        };
+        score
+            .filter(|score| !score.is_nan())
+            .unwrap_or(default_score)
+    }
+
+    /// Redis parses `SCORE_FIELD` as an `f64` and then narrows it to the
+    /// `f32` the document score is kept in.
+    fn score_from_number(number: f64) -> f64 {
+        f64::from(number as f32)
+    }
+
+    fn score_from_bytes(bytes: &[u8]) -> Option<f64> {
+        std::str::from_utf8(bytes)
+            .ok()?
+            .parse::<f64>()
+            .ok()
+            .map(Self::score_from_number)
     }
 
     /// [`Scoring::score`] of the document whose id in the index is `id`
     /// (`None`: it has none, and no words).
-    pub fn score_id(&self, def: &IndexDef, id: Option<u32>, doc: &dyn Doc) -> f64 {
+    pub fn score_id(
+        &self,
+        def: &IndexDef,
+        id: Option<u32>,
+        doc: &dyn Doc,
+        json: Option<&serde_json::Value>,
+    ) -> f64 {
+        let document_score = Self::document_score(def, doc, json);
         match self.scorer {
-            Scorer::DocScore => return 1.0,
+            Scorer::DocScore => return document_score,
             Scorer::Hamming => return 0.0,
             _ => {}
         }
@@ -442,11 +494,14 @@ impl<'q> Scoring<'q> {
         };
         drop(text);
         drop(postings);
-        let raw = res.value;
+        let raw = res.value * document_score;
         match self.scorer {
             Scorer::Bm25Std => raw,
             Scorer::Bm25StdTanh => (raw / self.tanh_factor).tanh(),
-            Scorer::Bm25 => raw / f64::from(slop(&res)),
+            Scorer::Bm25 => {
+                let score = raw / f64::from(slop(&res));
+                if score > 0.0 { score } else { 0.0 }
+            }
             Scorer::Tfidf | Scorer::TfidfDocNorm => {
                 let norm = if self.scorer == Scorer::Tfidf {
                     terms.max_freq
@@ -456,9 +511,10 @@ impl<'q> Scoring<'q> {
                 if norm == 0 {
                     return 0.0;
                 }
-                raw / f64::from(norm) / f64::from(slop(&res))
+                let score = raw / f64::from(norm) / f64::from(slop(&res));
+                if score > 0.0 { score } else { 0.0 }
             }
-            Scorer::DisMax => raw,
+            Scorer::DisMax => res.value,
             Scorer::DocScore | Scorer::Hamming => unreachable!(),
         }
     }
@@ -799,5 +855,65 @@ mod tests {
         assert_eq!(Scorer::parse("bm25std"), Some(Scorer::Bm25Std));
         assert_eq!(Scorer::parse("TFIDF.DOCNORM"), Some(Scorer::TfidfDocNorm));
         assert_eq!(Scorer::parse("nope"), None);
+    }
+
+    /// A document whose removal was queued, while a query held the
+    /// postings, is out of the next query's statistics as it is out of its
+    /// count (#421). The statistics were read before the queue was applied:
+    /// that query scored with the document still counted, and the one after
+    /// it without.
+    #[test]
+    fn statistics_are_read_after_a_queued_removal_is_applied() {
+        use super::super::{
+            FieldOptions, FieldType, IndexOn, IndexSchema, SchemaField, Write, index_fields,
+        };
+        let def = IndexSchema {
+            name: "idx".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["doc:".into()],
+            fields: vec![SchemaField {
+                name: "t".into(),
+                field_type: FieldType::Text,
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        }
+        .into_def();
+        for (i, words) in [
+            "apple pear",
+            "apple",
+            "apple plum fig",
+            "kiwi lime lemon date",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let fields = [("t".to_string(), std::sync::Arc::from(words.as_bytes()))];
+            index_fields(&def, &format!("doc:{i}"), &fields, Write::Whole);
+        }
+        let filter = super::super::filter::parse_query("apple", &Default::default(), &def)
+            .unwrap()
+            .filter;
+        let before = Scoring::new(&def, &filter, Scorer::Bm25Std);
+        assert_eq!(before.n, 4);
+        {
+            // A query holds the postings: the removal is queued.
+            let _query = def.postings.peek();
+            def.postings.remove("doc:3", def.text_removal());
+        }
+        let first = Scoring::new(&def, &filter, Scorer::Bm25Std);
+        let next = Scoring::new(&def, &filter, Scorer::Bm25Std);
+        assert_eq!(next.n, 3);
+        assert_eq!(
+            (first.n, first.avgdl),
+            (next.n, next.avgdl),
+            "the first query after the removal scored with the document"
+        );
     }
 }

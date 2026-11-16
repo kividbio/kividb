@@ -1,5 +1,108 @@
 # LiteLLM on KiviDB: compatibility results
 
+## KiviDB 1.2.0 with LiteLLM 1.108.0 (2026-11-06)
+
+**Verdict:** KiviDB 1.2.0 works as LiteLLM's Redis: the exact cache, the semantic cache
+(`redis-semantic`, through RedisVL), the router's usage counters, and the proxy's per-key rate limiter.
+The rate limiter and LiteLLM's other proxy-side limiters and locks run Lua scripts, so use the
+**`-lua` image** (`kividb/kividb:v1.2.0-lua`) for the proxy. The SDK's caches and the router work on
+the default image.
+
+LiteLLM's own Redis tests behave the same on KiviDB as on Redis 8, except for four tests that fail on
+KiviDB because of two gaps in how a test harness starts and stops its own server, filed as
+[#429](https://github.com/kividbio/kividb/issues/429) (`SHUTDOWN` replies `+OK`) and
+[#430](https://github.com/kividbio/kividb/issues/430) (no `cluster-port` directive). Neither touches what
+LiteLLM does with Redis while it runs.
+
+| | |
+|---|---|
+| KiviDB | `kividb/kividb:v1.2.0` and `kividb/kividb:v1.2.0-lua` (Docker Hub), started with `--port … --protected-mode no` (and `--aof` for the harness) |
+| Reference | `redis:8.10.2` (Redis Open Source, with the Query Engine and JSON) |
+| LiteLLM | `1.108.0`, from the `v1.108.0` tag (`b48077ff`), installed with its own `uv.lock` (`uv sync --frozen --group ci --group proxy-dev --extra proxy --extra caching --extra semantic-router --extra extra_proxy --extra proxy-runtime --extra utils`) |
+| Resolved pins | `redis` 5.3.1, `redisvl` 0.4.1, `numpy` 2.4.4, `pytest` 9.0.3, Python 3.12.3: [`requirements-1.2.0.txt`](requirements-1.2.0.txt) |
+| Host | one Azure `Standard_D16s_v5` (16 vCPU, x86_64), Ubuntu 24.04, Docker 29.1; client and servers on the same VM |
+
+### Our harness (`litellm_kividb_compat.py`)
+
+The harness gained one check since 1.0.5: the proxy's per-key rate limiter
+(`litellm/proxy/hooks/parallel_request_limiter_v3.py`), run in-process over a `DualCache` with the server
+behind it, with `rpm_limit=2`: two calls go through and the third gets HTTP 429.
+
+| Check | Redis 8.10.2 | KiviDB 1.2.0-lua | KiviDB 1.2.0 (default) |
+|---|---|---|---|
+| PING, SET EX/GET/TTL, INCR/EXPIRE/MGET, MULTI/EXEC, SCAN MATCH, SET NX EX, HSET/HGETALL, RPUSH/LRANGE/LPOP | PASS | PASS | PASS |
+| EVAL + EVALSHA (Lua) | PASS | PASS | FAIL: no Lua in this build, as intended |
+| INFO | PASS | PASS (`redis_version=8.10.0 kividb_version=1.2.0`) | PASS |
+| FT.CREATE / FT.SEARCH KNN + TAG / FT.INFO / FT.DROPINDEX | PASS | PASS | PASS |
+| LiteLLM exact cache (`type=redis`) | PASS | PASS | PASS |
+| LiteLLM router TPM/RPM counters | PASS | PASS | PASS |
+| LiteLLM semantic cache (`type=redis-semantic`) | PASS | PASS | PASS |
+| LiteLLM proxy per-key rate limiter (v3, Lua) | PASS (2 counter keys in Redis) | PASS (2 counter keys in Redis) | FAIL: its scripts fail without Lua, and it counts in process memory instead |
+| **Totals** | **18 PASS / 0 FAIL** | **18 PASS / 0 FAIL** | **16 PASS / 2 FAIL**, both for want of Lua |
+
+Results: `results-redis8.json`, `results-kividb-1.2.0-lua.json`, `results-kividb-1.2.0.json`. On the default
+image the limiter still answers `ok, ok, 429`, because it falls back to counting in each proxy process's
+memory when its scripts fail, which is no limit across workers. That is why the check also looks for its
+counter keys in Redis.
+
+### LiteLLM's own Redis tests
+
+LiteLLM's integration suite has an `sdk` group for "SDK-side caching cases that need a real Redis server"
+(`tests/integration/README.md`). We ran every file in it that uses Redis, 14 files and 57 tests, with
+LiteLLM's own runner, one worker, against each server:
+
+```bash
+REDIS_HOST=127.0.0.1 REDIS_PORT=7379 LITELLM_LOCAL_MODEL_COST_MAP=True \
+  uv run --no-sync python tests/integration/run.py sdk $(grep -liE redis tests/integration/sdk/test_*.py)
+```
+
+Some of these tests start a server of their own with `redis-server` from `PATH`. For the KiviDB runs that
+was [`redis-server-shim.sh`](redis-server-shim.sh), which starts KiviDB with the same flags, minus those
+KiviDB 1.2.0 refuses on its command line (`--save` and `--appendonly`, filed as #390, and
+`--set-proc-title`), and with a positional config file passed as `--configfile`. The full
+command is [`run_upstream.sh`](run_upstream.sh).
+
+| | Redis 8.10.2 | KiviDB 1.2.0 | KiviDB 1.2.0-lua |
+|---|---|---|---|
+| passed | 49 | 45 | 45 |
+| failed or error | 8 | 12 | 12 |
+
+The eight that fail on Redis 8 fail the same way on KiviDB: seven `test_response_cache_sync_sdk.py` tests
+reach for a scripted upstream that `run_integration.sh` starts in LiteLLM's CI and we did not
+(`httpx.ConnectError`), and one tag-budget test needs an Enterprise licence. The four that pass on Redis 8
+and not on KiviDB:
+
+| Test | KiviDB | Cause |
+|---|---|---|
+| `test_owned_redis_ports.py::test_owned_redis_restart_refuses_a_port_another_redis_took_while_it_was_down` | `RedisError('SHUTDOWN seems to have failed.')` | #429: KiviDB answers `SHUTDOWN NOSAVE` with `+OK`; redis-py takes any reply as a failed shutdown |
+| `test_usage_based_routing_sdk_redis_reads.py::test_sdk_usage_routing_reads_tpm_then_rpm_from_redis` | the same, in the teardown of the server the test started; the routing assertions before it passed | #429 |
+| `test_redis_cluster_iam_auth.py::test_sync_cluster_authenticates_with_azure_credentials` | the server does not start: `unknown directive 'cluster-port'` | #430. With that line removed, the test then waits for the log line `Cluster state changed: ok`, which KiviDB does not write (also in #430) |
+| `test_redis_cluster_iam_auth.py::test_sync_cluster_authenticates_with_gcp_credentials` | the same | #430 |
+
+Per-test results: `upstream-tests-redis8.xml`, `upstream-tests-kividb.xml`, `upstream-tests-kividb-lua.xml`,
+and the comparison in `upstream-tests-compare.json`. The `SHUTDOWN` reproduction is
+[`repro_shutdown.py`](repro_shutdown.py) with its output in `repro-shutdown.txt`.
+
+### Which LiteLLM features run Lua
+
+`register_script` / `eval` in LiteLLM 1.108.0, all on the proxy side: the v3 per-key rate limiter
+(`proxy/hooks/parallel_request_limiter_v3.py`), the session budget and iteration limiters, the batch token
+limiter, the login throttle, the pod lock manager for the DB transaction queue, the MCP credential lock, and
+in `caching/`, `redis_batch.py`, `affinity_cache.py` and `redis_cache.py`. A proxy with Redis configured
+should run on `kividb/kividb:v1.2.0-lua` (or `-full`).
+
+LiteLLM's lock resolves redis-py 5.3.1, which speaks RESP2. With redis-py 8 (RESP3 by default), KiviDB
+1.2.0 sends a script's `false` in a form redis-py 8 rejects ([#431](https://github.com/kividbio/kividb/issues/431));
+none of the checks here hit it, at LiteLLM's own pins.
+
+### Not covered on 1.2.0
+
+The proxy server process itself (`litellm --config`), its Postgres-backed key and team limits end to end,
+Redis Cluster, and LiteLLM's e2e chaos tests. The stub embedding is a hashed bag of words: it proves the
+wiring, not retrieval quality.
+
+---
+
 ## KiviDB 1.0.5 (2026-10-03): all checks pass, all eight 1.0.4 gaps fixed
 
 **Verdict:** KiviDB 1.0.5 works as LiteLLM's Redis backend for everything the harness covers: the

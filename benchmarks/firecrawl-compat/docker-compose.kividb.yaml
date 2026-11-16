@@ -1,0 +1,15 @@
+# KiviDB in place of the redis service of Firecrawl's docker-compose.yaml (v2.11.0).
+# Put this next to it, set REDIS_URL=redis://kividb:6380 in .env, and run
+#   docker compose -f docker-compose.yaml -f docker-compose.kividb.yaml up -d
+# The -lua image is needed: BullMQ, Firecrawl's semaphore and Redlock run Lua scripts.
+services:
+  kividb:
+    image: kividb/kividb:v1.2.0-lua
+    command: ["--protected-mode", "no", "--aof"]
+    volumes:
+      - kividb-data:/home/kividb
+    networks:
+      - backend
+
+volumes:
+  kividb-data:

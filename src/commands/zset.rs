@@ -2,16 +2,16 @@
 
 use crate::commands::blocking;
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{format_score, parse_utf8};
+use crate::commands::helpers::format_score;
 use crate::keyspace_events::{KS_SORTED_SET, notify};
 use crate::resp::write::*;
 use crate::store;
-use crate::store::Key;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, SortedSetInner, ZMember};
 use crate::{read_lock, write_lock};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
+use std::ops::Bound;
 use std::sync::Arc;
 
 // ── RESP3 shaping ─────────────────────────────────────────────────────────
@@ -154,7 +154,7 @@ fn pairs_reply<'a>(
 /// of a key that is not there makes nothing.
 fn write_zset<R>(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
     mut write: impl FnMut(&mut SortedSetInner) -> R,
 ) -> Result<R, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
@@ -178,10 +178,7 @@ fn write_zset<R>(
             let mut zs = SortedSetInner::new();
             let out = write(&mut zs);
             if !zs.is_empty() {
-                map.insert(
-                    Key::from(key),
-                    KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))),
-                );
+                map.insert(key, KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))));
             }
             Ok(out)
         }
@@ -190,11 +187,15 @@ fn write_zset<R>(
 
 /// The first bulk string of an array reply: the key, in the reply of a
 /// command that takes several and answers with the one it used.
-fn first_bulk(reply: &[u8]) -> Option<&str> {
-    let mut lines = reply.split(|b| *b == b'\n');
-    lines.next().filter(|line| line.first() == Some(&b'*'))?;
-    lines.next().filter(|line| line.first() == Some(&b'$'))?;
-    std::str::from_utf8(lines.next()?.strip_suffix(b"\r")?).ok()
+fn first_bulk(reply: &[u8]) -> Option<&[u8]> {
+    // `*n\r\n$len\r\n` and then `len` bytes, which may hold anything,
+    // line breaks too: the key is read by its length, not by lines.
+    let rest = reply.strip_prefix(b"*")?;
+    let rest = &rest[memchr::memmem::find(rest, b"\r\n")? + 2..];
+    let rest = rest.strip_prefix(b"$")?;
+    let end = memchr::memmem::find(rest, b"\r\n")?;
+    let len: usize = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+    rest.get(end + 2..end + 2 + len)
 }
 
 /// The keyspace event of a sorted-set command that has just answered
@@ -208,9 +209,9 @@ fn announce(ctx: &Ctx, name: &str, reply: &[u8]) {
     let popped_some = || {
         reply.first() == Some(&b'*') && !reply.starts_with(b"*0\r\n") && !reply.starts_with(b"*-1")
     };
-    let key_argument = || ctx.cmd.get(1).and_then(|raw| std::str::from_utf8(raw).ok());
+    let key_argument = || ctx.cmd.get(1).copied();
     let lower;
-    let (event, key): (&str, Option<&str>) = match name {
+    let (event, key): (&str, Option<&[u8]>) = match name {
         "ZINCRBY" if reply.first() != Some(&b'-') => ("zincr", key_argument()),
         "ZREM" if removed_some() => ("zrem", key_argument()),
         "ZREMRANGEBYSCORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYLEX" | "ZUNIONSTORE"
@@ -392,74 +393,29 @@ struct RangeParams<'a> {
 ///   - Legacy wrappers (ZRANGEBYSCORE etc.) just build RangeParams and call this
 fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> {
     if p.by_score {
-        let min_str = std::str::from_utf8(p.start).unwrap_or("-inf");
-        let max_str = std::str::from_utf8(p.stop).unwrap_or("+inf");
-
         // REV swaps the bounds — caller passes (max, min) in REV mode
-        let (min_str, max_str) = if p.rev {
-            (max_str, min_str)
+        let (min_raw, max_raw) = if p.rev {
+            (p.stop, p.start)
         } else {
-            (min_str, max_str)
+            (p.start, p.stop)
         };
 
-        let (min_val, min_excl) = match parse_score_bound(min_str) {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
-        let (max_val, max_excl) = match parse_score_bound(max_str) {
-            Ok(v) => v,
-            Err(_) => return vec![],
-        };
-
-        let in_range = |score: f64| -> bool {
-            let above = if min_excl {
-                score > min_val
-            } else {
-                score >= min_val
-            };
-            let below = if max_excl {
-                score < max_val
-            } else {
-                score <= max_val
-            };
-            above && below
-        };
-
-        // The tree is in score order: begin at the first score that can be
-        // in the range and stop at the first that cannot, where this used
-        // to look at every member of the set, in the range or not.
-        use std::ops::Bound;
-        // The least member there can be: with a score, the least key of
-        // that score.
-        let least: ZMember = Arc::from(&[][..]);
-        let lower = if min_val == f64::NEG_INFINITY || min_val.is_nan() {
-            Bound::Unbounded
-        } else {
-            Bound::Included((OrderedFloat(min_val), Arc::clone(&least)))
-        };
-        // Everything up to the next score above the largest wanted. There
-        // is none above infinity, and nothing to leave out there.
-        let upper = if max_val == f64::INFINITY || max_val.is_nan() {
-            Bound::Unbounded
-        } else {
-            Bound::Excluded((OrderedFloat(max_val.next_up()), least))
-        };
-        if min_val > max_val {
+        let (Ok(min), Ok(max)) = (parse_score_bound(min_raw), parse_score_bound(max_raw)) else {
             return vec![];
-        }
-        let within = inner.by_score.range((lower, upper));
-        // The ends themselves may be left out (`(1.5`): `in_range` knows.
+        };
+        let Some(range) = score_range(min, max) else {
+            return vec![];
+        };
+        let within = inner.by_score.range(range);
         if p.rev {
             within
                 .rev()
-                .filter(|((score, _), _)| in_range(score.0))
                 .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
                 .collect()
         } else {
             within
-                .filter(|((score, _), _)| in_range(score.0))
                 .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
@@ -592,10 +548,7 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'zadd' command");
     }
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
 
     // ── Parse optional flags before the score/member pairs ──────────────────
     // We scan from index 2 until we find something that parses as f64,
@@ -689,8 +642,9 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
             let existing = inner.members.get(member.as_ref()).copied();
 
             let final_score = if flag_incr {
-                // INCR: add to existing score (or treat as 0 if not present)
-                existing.unwrap_or(0.0) + score
+                // INCR: add to the existing score; a new member's is the
+                // increment itself, `-0` too, as Redis replies (#422).
+                existing.map_or(score, |old| old + score)
             } else {
                 score
             };
@@ -764,10 +718,7 @@ fn zcard(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 2 {
         return resp_error("ERR wrong number of arguments for 'zcard' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
         return resp_integer(0);
@@ -790,10 +741,7 @@ fn zscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 3 {
         return resp_error("ERR wrong number of arguments for 'zscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let resp = reply_resp(ctx);
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -827,10 +775,7 @@ fn zmscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'zmscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     // Nils here sit *inside* the array, so `resp3_normalize_null` (which only
     // rewrites a reply that is nothing but a null) never sees them — they have
@@ -881,10 +826,7 @@ fn zrank(ctx: &mut Ctx) -> Vec<u8> {
         }
     };
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -945,10 +887,7 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
         true
     };
 
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -991,31 +930,101 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
     }
 }
 
-/// A score as Redis reads one (`strtod`, then a check that all of the
-/// argument was used and the result is a number): decimal, `inf` /
+/// A score as Redis 8.10 reads one (`string2d`): decimal, `inf` /
 /// `infinity` with a sign or without, or a C hexadecimal float such as
-/// `0x1p+4`. Not `nan`, not an empty string, nothing with space around it.
+/// `0x1p+4`, all of the argument. Not `nan`, not an empty string, nothing
+/// with space around it.
+///
+/// A number past the range of a double is where Redis is particular (#422).
+/// Its decimal reader (`fast_float`) takes a number of at most 19
+/// significant digits, `digits × 10^q`, as infinite or as zero, if that is
+/// what it rounds to, as long as `q` is from -342 to 308, and refuses it
+/// past them: `2e308` is infinite, `1e309` refused, `1e-342` zero, `1e-343`
+/// refused. A number of more digits, and a hexadecimal one (`strtod`), is
+/// refused if it rounds to infinity or to zero.
 pub(crate) fn parse_score(raw: &[u8]) -> Option<f64> {
     let text = std::str::from_utf8(raw).ok()?;
     if text.is_empty() || text.starts_with(char::is_whitespace) {
         return None;
     }
-    let value = match parse_hex_float(text) {
-        Some(value) => value,
-        None => text.parse::<f64>().ok()?,
-    };
-    if value.is_nan() {
+    let unsigned = text.trim_start_matches(['+', '-']);
+    if unsigned.len() + 1 < text.len() {
         return None;
     }
-    // Infinity only when infinity was written: a number too large for a
-    // double is out of range (`strtod` sets ERANGE), not infinite.
-    if value.is_infinite() {
-        let unsigned = text.trim_start_matches(['+', '-']);
-        if !unsigned.eq_ignore_ascii_case("inf") && !unsigned.eq_ignore_ascii_case("infinity") {
+    if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
+        return Some(if text.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    let (value, decimal) = match parse_hex_float(text) {
+        Some(value) => (value, false),
+        None => {
+            // Rust reads `inf` and `nan` too, but those were dealt with or
+            // are refused: only digits, a point, an exponent.
+            if !unsigned
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+            {
+                return None;
+            }
+            (text.parse::<f64>().ok()?, true)
+        }
+    };
+    let rounded_away = value.is_infinite() || (value == 0.0 && !is_zero_written(unsigned));
+    if !rounded_away {
+        return Some(value);
+    }
+    match decimal.then(|| decimal_shape(unsigned)).flatten() {
+        Some((digits, q)) if digits <= 19 && (-342..=308).contains(&q) => Some(value),
+        _ => None,
+    }
+}
+
+/// Whether `text`, a number without its sign, is zero as written: no digit
+/// of its mantissa is other than 0.
+fn is_zero_written(text: &str) -> bool {
+    let mantissa = match text.find(['e', 'E', 'p', 'P']) {
+        Some(at) => &text[..at],
+        None => text,
+    };
+    let mantissa = mantissa
+        .strip_prefix("0x")
+        .or_else(|| mantissa.strip_prefix("0X"))
+        .unwrap_or(mantissa);
+    mantissa.bytes().all(|b| matches!(b, b'0' | b'.'))
+}
+
+/// A decimal number without its sign as `fast_float` sees it: how many
+/// significant digits it has (leading zeros are not, trailing ones are),
+/// and `q`, the power of ten that its digits are multiplied by. `None` if
+/// it is no number.
+fn decimal_shape(text: &str) -> Option<(usize, i64)> {
+    let (mantissa, exponent) = match text.find(['e', 'E']) {
+        Some(at) => (&text[..at], &text.as_bytes()[at + 1..]),
+        None => (text, &b""[..]),
+    };
+    let exponent = if exponent.is_empty() {
+        0
+    } else {
+        let (negative, digits) = match exponent[0] {
+            b'-' => (true, &exponent[1..]),
+            b'+' => (false, &exponent[1..]),
+            _ => (false, exponent),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
             return None;
         }
-    }
-    Some(value)
+        let value = digits.iter().fold(0i64, |acc, &d| {
+            (acc * 10 + i64::from(d - b'0')).min(1 << 40)
+        });
+        if negative { -value } else { value }
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all = whole.bytes().chain(fraction.bytes());
+    let significant = all.skip_while(|&b| b == b'0').count();
+    Some((significant, exponent - fraction.len() as i64))
 }
 
 /// One end of a lexicographic range: `-`, `+`, `[member` or `(member`.
@@ -1063,7 +1072,7 @@ fn lex_in_range(member: &[u8], min: &LexBound, max: &LexBound) -> bool {
 fn range_error(p: &RangeParams) -> Option<Vec<u8>> {
     if p.by_score {
         for end in [p.start, p.stop] {
-            if let Err(e) = parse_score_bound(std::str::from_utf8(end).unwrap_or("")) {
+            if let Err(e) = parse_score_bound(end) {
                 return Some(e);
             }
         }
@@ -1098,43 +1107,185 @@ fn parse_hex_float(text: &str) -> Option<f64> {
         .strip_prefix("0x")
         .or_else(|| rest.strip_prefix("0X"))?;
     let (mantissa, exponent) = match rest.find(['p', 'P']) {
-        Some(at) => (&rest[..at], rest[at + 1..].parse::<i32>().ok()?),
+        Some(at) => (&rest[..at], parse_binary_exponent(&rest[at + 1..])?),
         None => (rest, 0),
     };
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     if whole.is_empty() && fraction.is_empty() {
         return None;
     }
-    let mut value = 0f64;
-    for digit in whole.chars() {
-        value = value * 16.0 + digit.to_digit(16)? as f64;
+    // The value is `bits × 2^exp`, and a little more if `sticky`: the
+    // first 60 bits or so of the digits, exactly, and whether any digit
+    // after them is not 0. Rounded once, at the end, as `strtod` rounds.
+    let mut bits = 0u64;
+    let mut exp = exponent;
+    let mut sticky = false;
+    for (digit, in_fraction) in whole
+        .chars()
+        .map(|c| (c, false))
+        .chain(fraction.chars().map(|c| (c, true)))
+    {
+        let digit = u64::from(digit.to_digit(16)?);
+        if bits >> 56 == 0 {
+            bits = bits << 4 | digit;
+            if in_fraction {
+                exp -= 4;
+            }
+        } else {
+            sticky |= digit != 0;
+            if !in_fraction {
+                exp += 4;
+            }
+        }
     }
-    let mut scale = 1.0 / 16.0;
-    for digit in fraction.chars() {
-        value += digit.to_digit(16)? as f64 * scale;
-        scale /= 16.0;
-    }
-    let value = value * 2f64.powi(exponent);
+    let value = round_to_double(bits, exp, sticky);
     Some(if negative { -value } else { value })
+}
+
+/// The decimal exponent after `p`: a sign and at least one digit. Past a
+/// million it is a million, which is past the range either way.
+fn parse_binary_exponent(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value = digits.bytes().fold(0i64, |acc, d| {
+        (acc * 10 + i64::from(d - b'0')).min(1_000_000)
+    });
+    Some(if negative { -value } else { value })
+}
+
+/// `bits × 2^exp`, and a little more if `sticky`, as the nearest double,
+/// ties to even: infinite past the largest, zero under half the smallest
+/// subnormal. `bits` has at least two bits more than a double keeps, if
+/// `sticky`.
+fn round_to_double(bits: u64, exp: i64, sticky: bool) -> f64 {
+    if bits == 0 {
+        return 0.0;
+    }
+    let width = 64 - i64::from(bits.leading_zeros());
+    // bits × 2^exp < 2^top.
+    let top = exp + width;
+    if top > 1024 {
+        return f64::INFINITY;
+    }
+    if top < -1074 {
+        return 0.0;
+    }
+    // The exponent of the lowest bit kept: 53 bits, or fewer below the
+    // normal range.
+    let lowest = (top - 53).max(-1074);
+    let mut kept = if lowest <= exp {
+        bits << (exp - lowest)
+    } else {
+        let shift = (lowest - exp) as u32;
+        let kept = if shift >= 64 { 0 } else { bits >> shift };
+        let half = bits >> (shift - 1) & 1 == 1;
+        let below = sticky || bits & ((1u64 << (shift - 1)) - 1) != 0;
+        if half && (below || kept & 1 == 1) {
+            kept + 1
+        } else {
+            kept
+        }
+    };
+    let mut lowest = lowest;
+    if kept == 1 << 53 {
+        kept >>= 1;
+        lowest += 1;
+    }
+    if kept >= 1 << 52 {
+        // Normal: the leading bit is implied.
+        let biased = lowest + 52 + 1023;
+        if biased >= 2047 {
+            return f64::INFINITY;
+        }
+        f64::from_bits((biased as u64) << 52 | (kept & ((1 << 52) - 1)))
+    } else {
+        // Subnormal (or zero): `lowest` is -1074.
+        f64::from_bits(kept)
+    }
 }
 
 /// Parse a Redis score bound like "5.0", "(5.0", "-inf", "+inf"
 /// Returns (value, exclusive) — the bool is true if the paren form was used.
-fn parse_score_bound(s: &str) -> Result<(f64, bool), Vec<u8>> {
-    if s.eq_ignore_ascii_case("-inf") {
-        return Ok((f64::NEG_INFINITY, false));
-    }
-    if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
-        return Ok((f64::INFINITY, false));
-    }
-    let (exclusive, num_str) = if let Some(rest) = s.strip_prefix('(') {
-        (true, rest)
-    } else {
-        (false, s)
+///
+/// Read as Redis's `zslParseRange` reads it, which is not how a score is
+/// read (`parse_score`, Redis's `string2d`): with `fast_float_strtod`, which
+/// is `strtod` wherever its fast path does not read the whole bound. Only
+/// what is left after the number, or NaN, is refused. So an empty bound is
+/// 0, as `(` alone is an open 0: nothing is read, and nothing is left. A
+/// number too large for a double is infinite, where a score is refused for
+/// it. Space before the number is skipped, as `strtod` skips it, and
+/// hexadecimal is read; space after it is left over (#413).
+fn parse_score_bound(raw: &[u8]) -> Result<(f64, bool), Vec<u8>> {
+    let (exclusive, number) = match raw.split_first() {
+        Some((b'(', rest)) => (true, rest),
+        _ => (false, raw),
     };
-    parse_score(num_str.as_bytes())
-        .map(|v| (v, exclusive))
+    // `strtod` reads a C string, which ends at a NUL.
+    let number = number.split(|&b| b == 0).next().unwrap_or_default();
+    let value = if number.is_empty() {
+        Some(0.0)
+    } else {
+        std::str::from_utf8(number)
+            .ok()
+            .and_then(|text| {
+                let text = text.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+                parse_hex_float(text).or_else(|| text.parse::<f64>().ok())
+            })
+            .filter(|value| !value.is_nan())
+    };
+    value
+        .map(|value| (value, exclusive))
         .ok_or_else(|| resp_error("ERR min or max is not a float"))
+}
+
+type ScoreKey = (OrderedFloat<f64>, ZMember);
+
+/// The part of `by_score` with scores from `min` to `max`, each a bound
+/// from [`parse_score_bound`]; `None` when no score can be in it.
+///
+/// No member sorts before the empty one, so `(score, "")` is the first key
+/// of a score. An open end moves to the next float, which keeps both ends
+/// on such a key and leaves nothing for the caller to filter out.
+fn score_range(
+    (min, min_excl): (f64, bool),
+    (max, max_excl): (f64, bool),
+) -> Option<(Bound<ScoreKey>, Bound<ScoreKey>)> {
+    let first = if min_excl {
+        if min == f64::INFINITY {
+            return None;
+        }
+        min.next_up()
+    } else {
+        min
+    };
+    // The least score past the range, if there is one.
+    let past = if max_excl {
+        Some(max)
+    } else if max == f64::INFINITY {
+        None
+    } else {
+        Some(max.next_up())
+    };
+    if past.is_some_and(|past| first > past) {
+        return None;
+    }
+    let least: ZMember = Arc::from(&[][..]);
+    let lower = if first == f64::NEG_INFINITY {
+        Bound::Unbounded
+    } else {
+        Bound::Included((OrderedFloat(first), Arc::clone(&least)))
+    };
+    let upper = match past {
+        Some(past) => Bound::Excluded((OrderedFloat(past), least)),
+        None => Bound::Unbounded,
+    };
+    Some((lower, upper))
 }
 
 fn zcount(ctx: &mut Ctx) -> Vec<u8> {
@@ -1142,24 +1293,12 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zcount' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let min_str = match std::str::from_utf8(cmd[2]) {
-        Ok(s) => s,
-        Err(_) => return resp_error("ERR min must be UTF-8"),
-    };
-    let max_str = match std::str::from_utf8(cmd[3]) {
-        Ok(s) => s,
-        Err(_) => return resp_error("ERR max must be UTF-8"),
-    };
-
-    let (min_val, min_excl) = match parse_score_bound(min_str) {
+    let key: &[u8] = cmd[1];
+    let min = match parse_score_bound(cmd[2]) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (max_val, max_excl) = match parse_score_bound(max_str) {
+    let max = match parse_score_bound(cmd[3]) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1172,24 +1311,12 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
-            // score_in_range is a closure — captures min/max by value.
-            // Rust lesson: closures that only read captured vars implement Fn,
-            // which means we can call them multiple times freely.
-            let in_range = |score: f64| -> bool {
-                let above_min = if min_excl {
-                    score > min_val
-                } else {
-                    score >= min_val
-                };
-                let below_max = if max_excl {
-                    score < max_val
-                } else {
-                    score <= max_val
-                };
-                above_min && below_max
+            let count = match score_range(min, max) {
+                None => 0,
+                Some((Bound::Unbounded, Bound::Unbounded)) => inner.len(),
+                Some(range) => inner.by_score.range(range).count(),
             };
-            let count = inner.members.values().filter(|&&s| in_range(s)).count() as i64;
-            resp_integer(count)
+            resp_integer(count as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
@@ -1201,10 +1328,7 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zincrby' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k.to_string(),
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: Vec<u8> = cmd[1].to_vec();
     let Some(incr) = parse_score(cmd[2]) else {
         return resp_error("ERR value is not a valid float");
     };
@@ -1212,8 +1336,12 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
 
     let resp = reply_resp(ctx);
     let written = write_zset(ctx, &key, |inner| {
-        let old = inner.members.get(member.as_ref()).copied().unwrap_or(0.0);
-        let new_score = old + incr;
+        // A new member's score is the increment itself: `-0` too, as Redis
+        // replies (#422). It is stored as 0 (`SortedSetInner::insert`).
+        let new_score = match inner.members.get(member.as_ref()) {
+            Some(&old) => old + incr,
+            None => incr,
+        };
         if new_score.is_nan() {
             return Err(resp_error("ERR resulting score is not a number (NaN)"));
         }
@@ -1231,10 +1359,7 @@ fn zrem(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'zrem' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1261,10 +1386,7 @@ fn zrange(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrange' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let RangeOptions {
         by_score,
@@ -1322,10 +1444,7 @@ fn zset_pop(ctx: &mut Ctx, max: bool) -> Vec<u8> {
     if cmd.len() < 2 || cmd.len() > 3 {
         return resp_error("ERR wrong number of arguments");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let count = match cmd.get(2) {
         None => 1,
         Some(raw) => match std::str::from_utf8(raw)
@@ -1397,12 +1516,9 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 3 {
         return resp_error("ERR wrong number of arguments for 'zscan' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let (cursor, options) = match crate::commands::helpers::scan_arguments(cmd, 2, &["NOSCORES"]) {
-        Ok(parsed) => parsed,
+    let key: &[u8] = cmd[1];
+    let cursor = match crate::commands::helpers::scan_cursor(cmd, 2) {
+        Ok(cursor) => cursor,
         Err(e) => return e,
     };
 
@@ -1413,6 +1529,12 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
     match map.get(key) {
         None => resp_array(vec![resp_bulk_str("0"), resp_array(vec![])]),
         Some(value @ ValueRef::SortedSet(zs)) => {
+            // The options are read once the key is known to be a sorted set,
+            // as Redis does: a missing key is an empty scan whatever they say.
+            let options = match crate::commands::helpers::scan_options(cmd, 3, &["NOSCORES"]) {
+                Ok(options) => options,
+                Err(e) => return e,
+            };
             // A sorted set Redis would encode compactly comes back whole.
             let (cursor, count) = if crate::commands::generics::scans_whole(value) {
                 (0, usize::MAX)
@@ -1435,10 +1557,12 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
                 1024,
             );
             let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
+            let pattern = options
+                .pattern
+                .as_deref()
+                .map(crate::commands::glob_redis::Glob::new);
             for (member, score) in page {
-                if options.pattern.as_deref().is_some_and(|pat| {
-                    !crate::commands::helpers::glob_match(pat, &String::from_utf8_lossy(member))
-                }) {
+                if pattern.as_ref().is_some_and(|glob| !glob.matches(member)) {
                     continue;
                 }
                 // ZSCAN keeps the flat, all-bulk-string shape under RESP3
@@ -1489,10 +1613,7 @@ fn zunion(ctx: &mut Ctx) -> Vec<u8> {
     let mut result: ahash::AHashMap<Vec<u8>, f64> = ahash::AHashMap::new();
 
     for (idx, key_bytes) in cmd[2..2 + num_keys].iter().enumerate() {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         let snapshot = match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => s,
             Ok(None) => continue, // missing key contributes nothing to union
@@ -1528,10 +1649,7 @@ fn zunionstore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zunionstore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR destination must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
     let num_keys = match numkeys(cmd, 2, "zunionstore") {
         Ok(n) => n,
         Err(e) => return e,
@@ -1547,10 +1665,7 @@ fn zunionstore(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut result: ahash::AHashMap<Vec<u8>, f64> = ahash::AHashMap::new();
     for (idx, key_bytes) in cmd[3..3 + num_keys].iter().enumerate() {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         let snapshot = match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => s,
             Ok(None) => continue,
@@ -1594,10 +1709,7 @@ fn zinter(ctx: &mut Ctx) -> Vec<u8> {
     // Load all snapshots first
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
             Ok(None) => return resp_array(vec![]), // any missing key → empty intersection
@@ -1628,10 +1740,7 @@ fn zinterstore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zinterstore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR destination must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
     let num_keys = match numkeys(cmd, 2, "zinterstore") {
         Ok(n) => n,
         Err(e) => return e,
@@ -1646,10 +1755,7 @@ fn zinterstore(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[3..3 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
             Ok(None) => {
@@ -1703,10 +1809,7 @@ fn zintercard(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
             Ok(None) => return resp_integer(0), // any missing = empty intersection
@@ -1753,10 +1856,7 @@ fn zdiff(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut snapshots: Vec<Option<std::collections::BTreeMap<Vec<u8>, f64>>> = Vec::new();
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(s) => snapshots.push(s),
             Err(e) => return e,
@@ -1772,10 +1872,7 @@ fn zdiff(ctx: &mut Ctx) -> Vec<u8> {
     // Load the rest as membership sets (we only need to check presence)
     let mut others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[3..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         if let Ok(Some(s)) = read_zset_snapshot(ctx, key) {
             others.push(s);
         }
@@ -1803,10 +1900,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zdiffstore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR destination must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
     let num_keys = match numkeys(cmd, 2, "zdiffstore") {
         Ok(n) => n,
         Err(e) => return e,
@@ -1815,13 +1909,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR syntax error");
     }
 
-    let base = match read_zset_snapshot(
-        ctx,
-        match std::str::from_utf8(cmd[3]) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        },
-    ) {
+    let base = match read_zset_snapshot(ctx, cmd[3]) {
         Ok(Some(s)) => s,
         Ok(None) => {
             store_zset(ctx, &dst, ahash::AHashMap::new());
@@ -1832,10 +1920,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
 
     let mut others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
     for key_bytes in &cmd[4..3 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
         if let Ok(Some(s)) = read_zset_snapshot(ctx, key) {
             others.push(s);
         }
@@ -1857,33 +1942,14 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zremrangebyscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
-    let min_str = std::str::from_utf8(cmd[2]).unwrap_or("");
-    let max_str = std::str::from_utf8(cmd[3]).unwrap_or("");
-    let (min_val, min_excl) = match parse_score_bound(min_str) {
+    let key: &[u8] = cmd[1];
+    let min = match parse_score_bound(cmd[2]) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let (max_val, max_excl) = match parse_score_bound(max_str) {
+    let max = match parse_score_bound(cmd[3]) {
         Ok(v) => v,
         Err(e) => return e,
-    };
-
-    let in_range = move |score: f64| -> bool {
-        let above = if min_excl {
-            score > min_val
-        } else {
-            score >= min_val
-        };
-        let below = if max_excl {
-            score < max_val
-        } else {
-            score <= max_val
-        };
-        above && below
     };
 
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -1893,22 +1959,21 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     match map.get(key) {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
+            let Some(range) = score_range(min, max) else {
+                return resp_integer(0);
+            };
             let mut inner = zs.write();
-            // Collect members to remove first (can't mutate while iterating)
-            let to_remove: Vec<(f64, ZMember)> = inner
+            // Collect the keys before modifying the index.
+            let to_remove: Vec<ScoreKey> = inner
                 .by_score
-                .iter()
-                .filter(|((score, _), _)| in_range(score.0))
-                .map(|((score, member), _)| (score.0, member.clone()))
+                .range(range)
+                .map(|(key, _)| key.clone())
                 .collect();
-            let count = to_remove.len() as i64;
-            for (score, member) in to_remove {
-                inner
-                    .by_score
-                    .remove(&(OrderedFloat(score), member.clone()));
-                inner.members.remove(member.as_ref());
+            for key in &to_remove {
+                inner.by_score.remove(key);
+                inner.members.remove(key.1.as_ref());
             }
-            resp_integer(count)
+            resp_integer(to_remove.len() as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
@@ -1920,10 +1985,7 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zremrangebyrank' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1985,10 +2047,7 @@ fn zremrangebylex(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zremrangebylex' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let (min, max) = match (parse_lex_bound(cmd[2]), parse_lex_bound(cmd[3])) {
         (Ok(min), Ok(max)) => (min, max),
         (Err(e), _) | (_, Err(e)) => return e,
@@ -2029,10 +2088,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'zrandmember' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     // `[count [WITHSCORES]]`
     let count_arg: Option<i64> = match cmd.get(2) {
@@ -2145,10 +2201,7 @@ fn zlexcount(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() != 4 {
         return resp_error("ERR wrong number of arguments for 'zlexcount' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let (min, max) = match (parse_lex_bound(cmd[2]), parse_lex_bound(cmd[3])) {
         (Ok(min), Ok(max)) => (min, max),
         (Err(e), _) | (_, Err(e)) => return e,
@@ -2179,14 +2232,8 @@ fn zrangestore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 5 {
         return resp_error("ERR wrong number of arguments for 'zrangestore' command");
     }
-    let dst = match std::str::from_utf8(cmd[1]) {
-        Ok(k) => k.to_string(),
-        Err(_) => return resp_error("ERR dst must be valid UTF-8"),
-    };
-    let src = match parse_utf8(cmd[2]) {
-        Some(k) => k,
-        None => return resp_error("ERR src must be valid UTF-8"),
-    };
+    let dst: Vec<u8> = cmd[1].to_vec();
+    let src: &[u8] = cmd[2];
 
     let RangeOptions {
         by_score,
@@ -2242,7 +2289,7 @@ fn zrangestore(ctx: &mut Ctx) -> Vec<u8> {
 /// Returns None if key doesn't exist, Err if wrong type.
 fn read_zset_snapshot(
     ctx: &Ctx,
-    key: &str,
+    key: &[u8],
 ) -> Result<Option<std::collections::BTreeMap<Vec<u8>, f64>>, Vec<u8>> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -2424,7 +2471,7 @@ fn parse_weights_aggregate(cmd: &[&[u8]], start: usize, num_keys: usize) -> Weig
 /// Overwrites whatever was at dst_key — matches Redis STORE semantics: the
 /// destination's previous value and TTL go, and an empty result leaves no key
 /// behind rather than an empty sorted set.
-fn store_zset(ctx: &mut Ctx, dst_key: &str, members: ahash::AHashMap<Vec<u8>, f64>) {
+fn store_zset(ctx: &mut Ctx, dst_key: &[u8], members: ahash::AHashMap<Vec<u8>, f64>) {
     if members.is_empty() {
         crate::commands::helpers::delete_key(ctx.store, *ctx.selected_db, dst_key);
         return;
@@ -2437,8 +2484,7 @@ fn store_zset(ctx: &mut Ctx, dst_key: &str, members: ahash::AHashMap<Vec<u8>, f6
     let zs = Arc::new(RwLock::new(inner));
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, dst_key);
-    let replaced =
-        write_lock!(shard).insert_expiring(Key::from(dst_key), KiviDBValue::SortedSet(zs), None);
+    let replaced = write_lock!(shard).insert_expiring(dst_key, KiviDBValue::SortedSet(zs), None);
     drop(replaced);
 }
 
@@ -2448,10 +2494,7 @@ fn zrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrangebyscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut with_scores = false;
     let mut limit_offset = 0usize;
@@ -2498,10 +2541,7 @@ fn zrevrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrevrangebyscore' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut with_scores = false;
     let mut limit_offset = 0usize;
@@ -2547,10 +2587,7 @@ fn zrevrange(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrevrange' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
     let with_scores = match &cmd[4..] {
         [] => false,
         [word] if word.eq_ignore_ascii_case(b"WITHSCORES") => true,
@@ -2576,10 +2613,7 @@ fn zrangebylex(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrangebylex' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut limit_offset = 0usize;
     let mut limit_count = usize::MAX;
@@ -2622,10 +2656,7 @@ fn zrevrangebylex(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() < 4 {
         return resp_error("ERR wrong number of arguments for 'zrevrangebylex' command");
     }
-    let key = match parse_utf8(cmd[1]) {
-        Some(k) => k,
-        None => return resp_error("ERR key must be valid UTF-8"),
-    };
+    let key: &[u8] = cmd[1];
 
     let mut limit_offset = 0usize;
     let mut limit_count = usize::MAX;
@@ -2662,7 +2693,7 @@ fn zrevrangebylex(ctx: &mut Ctx) -> Vec<u8> {
 
 /// Look up key, call zrange_pairs, format as RESP array.
 /// All public range commands funnel through here after building RangeParams.
-fn execute_range(ctx: &Ctx, key: &str, params: &RangeParams, with_scores: bool) -> Vec<u8> {
+fn execute_range(ctx: &Ctx, key: &[u8], params: &RangeParams, with_scores: bool) -> Vec<u8> {
     if let Some(error) = range_error(params) {
         return error;
     }
@@ -2698,7 +2729,7 @@ type PoppedMember = (Vec<u8>, Vec<u8>);
 fn pop_members(
     ctx: &Ctx,
     resp: u8,
-    key: &str,
+    key: &[u8],
     want_max: bool,
     count: usize,
 ) -> Result<Vec<PoppedMember>, Vec<u8>> {
@@ -2744,10 +2775,7 @@ fn zset_blocking_pop(ctx: &mut Ctx, want_max: bool) -> Vec<u8> {
         Err(e) => return e,
     };
 
-    let keys: Vec<String> = cmd[1..cmd.len() - 1]
-        .iter()
-        .filter_map(|b| parse_utf8(b).map(|s| s.to_string()))
-        .collect();
+    let keys: Vec<Vec<u8>> = cmd[1..cmd.len() - 1].iter().map(|b| b.to_vec()).collect();
 
     // `[key, member, score]` from the first key, in the order given, that
     // has a member.
@@ -2760,7 +2788,7 @@ fn zset_blocking_pop(ctx: &mut Ctx, want_max: bool) -> Vec<u8> {
                 match pop_members(ctx, resp, key, want_max, 1) {
                     Ok(mut popped) => {
                         if let Some((member, score)) = popped.pop() {
-                            return Some(resp_array(vec![resp_bulk_str(key), member, score]));
+                            return Some(resp_array(vec![resp_bulk(key), member, score]));
                         }
                     }
                     Err(e) => return Some(e),
@@ -2787,10 +2815,7 @@ fn zmpop(ctx: &mut Ctx) -> Vec<u8> {
 
     // Try each key in order, pop from the first non-empty one
     for key_bytes in &cmd[2..2 + num_keys] {
-        let key = match std::str::from_utf8(key_bytes) {
-            Ok(k) => k,
-            Err(_) => return resp_error("ERR key must be valid UTF-8"),
-        };
+        let key: &[u8] = key_bytes;
 
         let db_ref = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db_ref, key);
@@ -2828,7 +2853,7 @@ fn zmpop(ctx: &mut Ctx) -> Vec<u8> {
                     continue;
                 }
 
-                return resp_array(vec![resp_bulk_str(key), resp_array(popped_pairs)]);
+                return resp_array(vec![resp_bulk(key), resp_array(popped_pairs)]);
             }
             Some(_) => {
                 return resp_error(
@@ -2859,10 +2884,7 @@ fn bzmpop(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return e,
     };
 
-    let keys: Vec<String> = cmd[3..3 + num_keys]
-        .iter()
-        .filter_map(|b| std::str::from_utf8(b).ok().map(|s| s.to_string()))
-        .collect();
+    let keys: Vec<Vec<u8>> = cmd[3..3 + num_keys].iter().map(|b| b.to_vec()).collect();
 
     // `[key, [[member, score], ...]]`: up to `count` members from the first
     // key that has any.
@@ -2879,7 +2901,7 @@ fn bzmpop(ctx: &mut Ctx) -> Vec<u8> {
                             .into_iter()
                             .map(|(member, score)| resp_array(vec![member, score]))
                             .collect();
-                        return Some(resp_array(vec![resp_bulk_str(key), resp_array(pairs)]));
+                        return Some(resp_array(vec![resp_bulk(key), resp_array(pairs)]));
                     }
                     Err(e) => return Some(e),
                 }
@@ -2941,5 +2963,152 @@ mod aggregate_tests {
         assert_eq!(agg(1.0, 1.0), 2.0);
         let cmd: Vec<&[u8]> = vec![b"ZUNION", b"1", b"k", b"AGGREGATE", b"MEDIAN"];
         assert!(parse_weights_aggregate(&cmd, 3, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod score_range_tests {
+    use super::*;
+
+    fn in_bounds(score: f64, (min, min_excl): (f64, bool), (max, max_excl): (f64, bool)) -> bool {
+        let above = if min_excl { score > min } else { score >= min };
+        let below = if max_excl { score < max } else { score <= max };
+        above && below
+    }
+
+    fn by_scan(zs: &SortedSetInner, min: (f64, bool), max: (f64, bool)) -> Vec<ScoreKey> {
+        zs.by_score
+            .keys()
+            .filter(|(score, _)| in_bounds(score.0, min, max))
+            .cloned()
+            .collect()
+    }
+
+    fn by_range(zs: &SortedSetInner, min: (f64, bool), max: (f64, bool)) -> Vec<ScoreKey> {
+        score_range(min, max).map_or_else(Vec::new, |range| {
+            zs.by_score
+                .range(range)
+                .map(|(key, _)| key.clone())
+                .collect()
+        })
+    }
+
+    fn member(name: &str) -> ZMember {
+        Arc::from(name.as_bytes())
+    }
+
+    const EDGES: [f64; 17] = [
+        f64::NEG_INFINITY,
+        f64::MIN,
+        -1.5,
+        -1.0,
+        -f64::MIN_POSITIVE,
+        -5e-324,
+        -0.0,
+        0.0,
+        5e-324,
+        f64::MIN_POSITIVE,
+        1.0f64.next_down(),
+        1.0,
+        1.000_000_000_000_000_2,
+        1.5,
+        f64::MAX,
+        f64::INFINITY,
+        2.0,
+    ];
+
+    /// Several members to each score, the empty member among them, at
+    /// every score next to a bound that is easy to get wrong.
+    fn edge_set() -> SortedSetInner {
+        let mut zs = SortedSetInner::new();
+        for (i, &score) in EDGES.iter().enumerate() {
+            for name in ["", "a", "b"] {
+                zs.insert(member(&format!("{name}{i}")), score);
+            }
+        }
+        zs.insert(member(""), 1.0);
+        zs
+    }
+
+    #[test]
+    fn every_pair_of_edge_bounds_matches_a_full_scan() {
+        let zs = edge_set();
+        for &min in &EDGES {
+            for &max in &EDGES {
+                for min_excl in [false, true] {
+                    for max_excl in [false, true] {
+                        let (lo, hi) = ((min, min_excl), (max, max_excl));
+                        assert_eq!(by_range(&zs, lo, hi), by_scan(&zs, lo, hi), "{lo:?} {hi:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signed_zeros_are_the_same_score() {
+        let mut zs = SortedSetInner::new();
+        zs.insert(member("neg"), -0.0);
+        zs.insert(member("pos"), 0.0);
+        for (min, max) in [(-0.0, 0.0), (0.0, -0.0), (0.0, 0.0), (-0.0, -0.0)] {
+            assert_eq!(by_range(&zs, (min, false), (max, false)).len(), 2);
+            assert!(by_range(&zs, (min, true), (max, false)).is_empty());
+            assert!(by_range(&zs, (min, false), (max, true)).is_empty());
+        }
+        assert_eq!(by_range(&zs, (-5e-324, true), (5e-324, true)).len(), 2);
+    }
+
+    #[test]
+    fn empty_and_inverted_ranges_have_no_bounds() {
+        assert!(score_range((2.0, false), (1.0, false)).is_none());
+        assert!(score_range((1.0, true), (1.0, true)).is_none());
+        assert!(score_range((f64::INFINITY, true), (f64::INFINITY, false)).is_none());
+        assert!(score_range((f64::INFINITY, false), (f64::NEG_INFINITY, false)).is_none());
+        let zs = edge_set();
+        // One-sided empties still give bounds a BTreeMap accepts.
+        assert!(by_range(&zs, (1.0, true), (1.0, false)).is_empty());
+        assert!(by_range(&zs, (1.0, false), (1.0, true)).is_empty());
+        assert!(by_range(&zs, (f64::NEG_INFINITY, false), (f64::NEG_INFINITY, true)).is_empty());
+        assert!(by_range(&zs, (f64::INFINITY, false), (f64::INFINITY, true)).is_empty());
+    }
+
+    /// Fixed-seed xorshift, so a failure can be run again.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn score(&mut self) -> f64 {
+            match self.below(10) {
+                0 => EDGES[self.below(EDGES.len() as u64) as usize],
+                1 => (self.below(2001) as f64 - 1000.0) / 7.0,
+                // Mostly a few whole scores, so that most of them repeat.
+                _ => self.below(21) as f64 - 10.0,
+            }
+        }
+    }
+
+    #[test]
+    fn random_ranges_match_a_full_scan() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..200 {
+            let mut zs = SortedSetInner::new();
+            for i in 0..rng.below(300) {
+                let score = rng.score();
+                zs.insert(member(&format!("m{i:04}")), score);
+            }
+            for _ in 0..50 {
+                let lo = (rng.score(), rng.below(2) == 0);
+                let hi = (rng.score(), rng.below(2) == 0);
+                assert_eq!(by_range(&zs, lo, hi), by_scan(&zs, lo, hi), "{lo:?} {hi:?}");
+            }
+        }
     }
 }

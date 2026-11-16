@@ -1,0 +1,59 @@
+{
+  "id": "KiviCompatFlow01",
+  "name": "kividb-compat queue test",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "nodes": [
+    {
+      "id": "7b0c3f2e-0001-4c1a-9a51-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "5f7d1c9e-2b44-4f0e-8d6a-6b1c0c0f0001",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "kividb-compat",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "7b0c3f2e-0002-4c1a-9a51-000000000002",
+      "name": "Work",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8nc-sidecar:8099/work",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ batch: $json.body.batch, id: $json.body.id, exec: $execution.id }) }}",
+        "options": { "timeout": 30000 }
+      }
+    },
+    {
+      "id": "7b0c3f2e-0003-4c1a-9a51-000000000003",
+      "name": "Done",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0],
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8nc-sidecar:8099/done",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ batch: $('Webhook').item.json.body.batch, id: $('Webhook').item.json.body.id, exec: $execution.id }) }}",
+        "options": { "timeout": 30000 }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "Work", "type": "main", "index": 0 }]] },
+    "Work": { "main": [[{ "node": "Done", "type": "main", "index": 0 }]] }
+  }
+}

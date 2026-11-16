@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod common;
+use common::{port_is_free, restart_verified, start_verified};
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,34 +127,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`, asked with a socket that is bound and never
-/// listens (see tests/backup.rs).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on, outside the range the system hands out
-/// to outgoing connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(37);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 /// The I/O models to run each test on: both, where io_uring exists.
 fn io_models() -> &'static [&'static str] {
     if cfg!(target_os = "linux") {
@@ -208,8 +183,8 @@ struct Server {
 impl Server {
     fn start(io: &'static str, failpoints: &str) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
-        let child = launch(&dir, port, io, failpoints, true);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| launch(&dir, port, io, failpoints, true));
         let server = Server {
             port,
             dir,
@@ -243,7 +218,15 @@ impl Server {
     }
 
     fn restart(&mut self) -> Conn {
-        self.child = launch(&self.dir, self.port, self.io, &self.failpoints, self.aof);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters; nothing in this file keeps the port).
+        let (child, port, _) = restart_verified(
+            |port| launch(&self.dir, port, self.io, &self.failpoints, self.aof),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         self.conn()
     }
 
@@ -816,6 +799,77 @@ fn writes_go_on_while_a_turn_over_syncs_the_old_log() {
     }
 }
 
+/// The writer syncs the old log of a turn-over itself when the checkpoint
+/// has not, and then marks it synced. It marked it so even when a second
+/// turn-over had moved another log aside meanwhile: the directory, with the
+/// second's renames, unsynced, and the records after it reported synced
+/// once the new log alone was (#529). The writer is held here between its
+/// sync of the first old log and its mark, as a slow disk would hold it, and
+/// the second turn-over made then.
+#[test]
+fn a_second_turn_over_during_the_writers_sync_of_the_first_is_synced_too() {
+    for &io in io_models() {
+        let server = Server::start(io, "turn-over-syncing,old-log-synced");
+        let mut c = server.conn();
+        fill(&mut c, "before", 10);
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("turn-over-syncing.1", LONG), "{io}");
+        assert!(c.cmd(&["SET", "first", "1"]).ok());
+        // The second's sync, or a WAITAOF's: the writer syncs the old log
+        // the checkpoint is held from syncing.
+        let mut w = server.conn();
+        send(&mut w, &["WAITAOF", "1", "0", "0"]);
+        assert!(server.reached("old-log-synced.1", LONG), "{io}");
+
+        // The first checkpoint ends, and a second turns the log over while
+        // the writer is still held. Its mark is taken by the connection that
+        // writes next, the writer being held.
+        server.release("turn-over-syncing.1");
+        wait_idle(&mut c);
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        let deadline = Instant::now() + LONG;
+        let mut i = 0;
+        while !server.dir.join("failpoint.turn-over-syncing.2").exists() {
+            assert!(Instant::now() < deadline, "{io}: no second turn-over");
+            assert!(c.cmd(&["SET", &format!("second:{i}"), "1"]).ok());
+            i += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The writer goes on. What is written now is in the second's new
+        // log: it is not synced before the second's old log, and the
+        // directory, are — by the writer, again.
+        server.release("old-log-synced.1");
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        send(&mut c, &["WAITAOF", "1", "0", "0"]);
+        let deadline = Instant::now() + LONG;
+        loop {
+            if server.dir.join("failpoint.old-log-synced.2").exists() {
+                break;
+            }
+            let socket = c.reader.get_ref();
+            socket.set_nonblocking(true).unwrap();
+            let reply = socket.peek(&mut [0]);
+            socket.set_nonblocking(false).unwrap();
+            assert!(
+                matches!(reply, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "{io}: a write after the second turn-over was reported synced, the second's old \
+                 log and the directory not synced: {reply:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{io}: WAITAOF neither answered nor synced"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.release("old-log-synced.2");
+        assert_eq!(c.read().arr()[0].i(), 1, "{io}");
+        assert_eq!(w.read().arr()[0].i(), 1, "{io}");
+        server.release("turn-over-syncing.2");
+        wait_idle(&mut c);
+    }
+}
+
 // ── The AOF turned on at runtime ─────────────────────────────────────────────
 
 /// Send a command and do not wait for its reply: for one the server is held
@@ -1146,9 +1200,12 @@ fn an_enable_overtaken_by_a_disable_does_not_answer_ok() {
         let mut c = server.conn();
         assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok());
         assert!(c.cmd(&["SET", "k", "1"]).ok());
-        // Connections are spread over the server's threads, and the enable
-        // holds its own while it waits at the step: the disable is sent on
-        // several, and one on another thread is answered.
+        // The enable holds its thread while it waits at the step. An io_uring
+        // server spreads connections over its threads, and the disable is
+        // sent on several: one on another thread is answered. A tokio server
+        // runs the enable off the runtime, and answers any of them; it used
+        // to keep the enable on a worker, and about one run in a hundred
+        // nothing else polled the sockets until the enable was done.
         let others: Vec<Conn> = (0..8).map(|_| server.conn()).collect();
         send(&mut c, &["CONFIG", "SET", "appendonly", "yes"]);
         assert!(server.reached("aof-enabling.1", LONG), "{io}");
@@ -1752,6 +1809,89 @@ fn a_checkpoint_stopped_between_its_number_and_its_dump_loses_nothing() {
     }
 }
 
+/// The names in `dir` of the files a dump is written to before it is put in
+/// place, `dump.kdb.<pid>.<n>.tmp`.
+fn temp_dumps(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.strip_prefix("dump.kdb.")
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(pid, n)| {
+                    [pid, n]
+                        .iter()
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                })
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// A checkpoint cut short (a kill -9, the OOM killer, a liveness probe)
+/// leaves the file its dump was being written to, as big as the dump, which
+/// nothing ever reads. The next start, once it holds the data directory,
+/// removes those, whichever process wrote them -- in a container every start
+/// has the same pid -- and says so. Each crash used to leave one more, until
+/// the volume was full (#545). Files named otherwise are left alone.
+#[test]
+fn a_start_removes_the_dumps_of_checkpoints_cut_short() {
+    for &io in io_models() {
+        for (save, started) in [
+            ("BGSAVE", "Background saving started"),
+            ("BGREWRITEAOF", STARTED),
+        ] {
+            let mut server = Server::start(io, "dump-installing");
+            let mut c = server.conn();
+            assert!(c.cmd(&["SET", "k", "1"]).ok());
+            durable(&mut c);
+            assert_eq!(c.cmd(&[save]).s(), started, "{io}, {save}");
+            assert!(server.reached("dump-installing.1", LONG), "{io}, {save}");
+            let cut_short = temp_dumps(&server.dir);
+            assert_eq!(cut_short.len(), 1, "{io}, {save}: {cut_short:?}");
+            // As a start with the same pid would have left it.
+            std::fs::write(server.dir.join("dump.kdb.1.0.tmp"), b"cut short").unwrap();
+            let others = [
+                "dump.kdb.1.tmp",
+                "dump.kdb.x.0.tmp",
+                "dump.kdb.1.0.tmp.bak",
+                "old.dump.kdb.1.0.tmp",
+            ];
+            for name in others {
+                std::fs::write(server.dir.join(name), b"not a dump of ours").unwrap();
+            }
+            drop(c);
+            server.kill();
+
+            server.failpoints.clear();
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{io}, {save}");
+            assert_eq!(
+                temp_dumps(&server.dir),
+                Vec::<String>::new(),
+                "{io}, {save}"
+            );
+            for name in others {
+                assert!(
+                    server.dir.join(name).exists(),
+                    "{io}, {save}: {name} removed"
+                );
+            }
+            let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+            for name in [cut_short[0].as_str(), "dump.kdb.1.0.tmp"] {
+                assert!(
+                    log.lines()
+                        .any(|line| line.contains("Removed") && line.contains(name)),
+                    "{io}, {save}: no line says {name} was removed"
+                );
+            }
+        }
+    }
+}
+
 /// A save with the AOF off beside an old log and a log, both holding
 /// records the dataset has: a checkpoint was stopped part-way, the next start
 /// replayed both, and the AOF was then turned off and the dataset saved.
@@ -2202,7 +2342,10 @@ fn an_old_log_that_cannot_be_removed_is_left_in_place() {
             "{io}: no warning"
         );
         assert!(
-            said.contains("it is left in place, and the next start or checkpoint removes it"),
+            said.contains(
+                "Until it is removed, every checkpoint fails (INFO persistence shows \
+                 aof_last_bgrewrite_status:err)"
+            ),
             "{io}"
         );
         assert!(server.dir.join("appendonly.aof.prev").exists(), "{io}");
@@ -2313,5 +2456,98 @@ fn a_turn_over_keeps_a_finished_checkpoints_old_log_aside_after_a_save_with_the_
             "{io}: the old log was removed without a copy"
         );
         assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{io}");
+    }
+}
+
+/// What the warning says of an old log that cannot be removed: each
+/// checkpoint fails on it, `INFO persistence` says so, and nothing is lost.
+#[test]
+fn a_checkpoint_fails_while_an_old_log_cannot_be_removed() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "");
+        let mut c = server.conn();
+        assert!(c.cmd(&["SET", "k", "1"]).ok());
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert!(c.cmd(&["SET", "k2", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        an_old_log_that_cannot_be_removed(&server.dir);
+
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        wait_idle(&mut c);
+        assert_eq!(
+            info_field(&mut c, "aof_last_bgrewrite_status"),
+            "err",
+            "{io}"
+        );
+        assert!(c.cmd(&["SET", "k3", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        for key in ["k", "k2", "k3"] {
+            assert_eq!(c.cmd(&["GET", key]).s(), "1", "{io}: {key}");
+        }
+    }
+}
+
+/// The old log of a checkpoint that finished, beside a dump saved with the
+/// AOF off, is kept aside before it is removed. If an attempt kept it and
+/// did not get to remove it, it is not kept a second time: each start or
+/// checkpoint that could not remove it added another copy. A kept file with
+/// the same length but other bytes is not taken for it.
+#[test]
+fn a_log_kept_aside_already_is_not_kept_again() {
+    for &io in io_models() {
+        for other_copy in [false, true] {
+            let mut server = Server::start(io, "");
+            server.kill();
+            std::fs::remove_file(server.dir.join("appendonly.aof")).unwrap();
+            server.aof = false;
+            let mut c = server.restart();
+            assert!(c.cmd(&["SET", "k", "1"]).ok());
+            assert!(c.cmd(&["SAVE"]).ok());
+            drop(c);
+            server.kill();
+            // A log on that dump's number, as a start with the AOF on makes.
+            server.aof = true;
+            let mut c = server.restart();
+            assert!(c.cmd(&["SET", "k2", "1"]).ok());
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let dir = server.dir.clone();
+            let (number, marked) = saved_number(&dir);
+            assert!(marked, "{io}");
+
+            let mut old = delta_header(number - 1);
+            old.extend_from_slice(&set_record("only-in-the-old-log", "1"));
+            std::fs::write(dir.join("appendonly.aof.prev"), &old).unwrap();
+            // What an earlier attempt kept.
+            std::fs::write(dir.join("superseded.1.0.appendonly.aof.prev"), &old).unwrap();
+            let mut different = old.clone();
+            *different.last_mut().unwrap() ^= 1;
+            if other_copy {
+                std::fs::write(dir.join("superseded.1.1.appendonly.aof.prev"), &different).unwrap();
+            }
+
+            let mut c = server.restart();
+            assert_eq!(c.cmd(&["GET", "k2"]).s(), "1", "{io}");
+            assert!(!dir.join("appendonly.aof.prev").exists(), "{io}");
+            let kept = kept_aside(&dir);
+            let copies = kept.iter().filter(|(_, bytes)| *bytes == old).count();
+            assert_eq!(copies, 1, "{io}, {other_copy}: {kept:?}");
+            assert_eq!(
+                kept.len(),
+                1 + usize::from(other_copy),
+                "{io}, {other_copy}"
+            );
+            if other_copy {
+                assert!(kept.iter().any(|(_, bytes)| *bytes == different), "{io}");
+            }
+            drop(c);
+        }
     }
 }

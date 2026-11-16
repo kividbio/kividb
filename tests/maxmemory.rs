@@ -285,6 +285,38 @@ fn test_maxmemory_always_allowed_commands() {
     c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
 }
 
+/// `SELECT` writes nothing: past `maxmemory` under `noeviction` it runs,
+/// as in Redis, where it has no `denyoom` flag (#411). So does a
+/// transaction that only selects and reads.
+#[test]
+fn test_maxmemory_select_is_not_refused() {
+    let _lock = lock();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "maxmemory-policy", "noeviction"])
+            .is_ok()
+    );
+    assert!(c.cmds(&["CONFIG", "SET", "maxmemory", "1"]).is_ok());
+    thread::sleep(Duration::from_millis(1100));
+
+    let r = c.cmds(&["SET", "k", "v"]);
+    assert!(
+        r.is_error() && r.error_str().contains("OOM"),
+        "past the limit: {r:?}"
+    );
+    let r = c.cmds(&["SELECT", "1"]);
+    assert!(r.is_ok(), "SELECT: {r:?}");
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert_eq!(c.cmds(&["SELECT", "2"]).as_str(), "QUEUED");
+    assert_eq!(c.cmds(&["GET", "k"]).as_str(), "QUEUED");
+    let exec = c.cmds(&["EXEC"]);
+    assert_eq!(exec.as_array().len(), 2, "{exec:?}");
+    assert!(exec.as_array()[0].is_ok(), "{exec:?}");
+    c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
+}
+
 /// Past `maxmemory` under `noeviction`, a new subscription is refused as a
 /// write is, as in Redis 8.10; taking one away is not.
 #[test]
@@ -310,4 +342,58 @@ fn test_maxmemory_refuses_new_subscriptions() {
     let r = c.cmds(&["UNSUBSCRIBE", "news"]);
     assert!(!r.is_error(), "UNSUBSCRIBE: {r:?}");
     c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
+}
+
+/// Past `maxmemory` under `noeviction`, what is refused is judged by the
+/// arguments, as Redis judges it by the `denyoom` flag. `GEORADIUS ... STORE`
+/// writes, and is refused; `GEORADIUS` without it reads, and runs. `MIGRATE`
+/// only takes keys away (Redis flags it a write, not `denyoom`): it is not
+/// refused, alone or queued in a transaction, so a full node can still be
+/// drained.
+#[test]
+fn test_maxmemory_judges_writes_by_their_arguments() {
+    let _lock = lock();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["GEOADD", "src", "13.361389", "38.115556", "palermo"]);
+    assert!(c.cmds(&["SET", "moving", "v"]).is_ok());
+    // Nothing listens there: MIGRATE gets as far as connecting.
+    let nobody = free_port().to_string();
+    assert!(
+        c.cmds(&["CONFIG", "SET", "maxmemory-policy", "noeviction"])
+            .is_ok()
+    );
+    assert!(c.cmds(&["CONFIG", "SET", "maxmemory", "1"]).is_ok());
+    thread::sleep(Duration::from_millis(1100));
+
+    let stored = c.cmds(&["GEORADIUS", "src", "15", "37", "200", "km", "STORE", "dst"]);
+    let refused = stored.is_error() && stored.error_str().contains("OOM");
+    let read = c.cmds(&["GEORADIUS", "src", "15", "37", "200", "km"]);
+    let migrate = [
+        "MIGRATE",
+        "127.0.0.1",
+        nobody.as_str(),
+        "moving",
+        "0",
+        "200",
+    ];
+    let moved = c.cmds(&migrate);
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    let queued = c.cmds(&migrate);
+    c.cmds(&["DISCARD"]);
+    c.cmds(&["CONFIG", "SET", "maxmemory", "0"]);
+
+    assert!(refused, "GEORADIUS ... STORE: {stored:?}");
+    assert!(!read.is_error(), "GEORADIUS: {read:?}");
+    assert!(
+        !(moved.is_error() && moved.error_str().contains("OOM")),
+        "MIGRATE: {moved:?}"
+    );
+    assert!(
+        matches!(&queued, RespValue::SimpleStr(s) if s == "QUEUED"),
+        "MIGRATE in MULTI: {queued:?}"
+    );
+    let exists = c.cmds(&["EXISTS", "dst"]);
+    assert!(matches!(exists, RespValue::Int(0)), "{exists:?}");
 }
