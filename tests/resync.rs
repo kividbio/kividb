@@ -2797,6 +2797,10 @@ fn writes_after_promotion_and_a_select_only_script_reach_a_second_replica() {
     assert_eq!(promoted.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
     drop((m, promoted));
     r1.kill();
+    // It was promoted: it starts again as a master, not as a replica of the
+    // old one, whose full sync would replace what the AOF restored.
+    let at = r1.args.iter().position(|a| a == "--replicaof").unwrap();
+    r1.args.drain(at..at + 3);
     r1.restart_master(&mut [&mut r2]);
     assert_eq!(dataset_of_dbs(&r1), expected, "{}", r1.log());
 }
