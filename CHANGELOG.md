@@ -331,14 +331,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pick a few members (#839).** `HRANDFIELD key count` built a vector of
   every field and one of every index, and `ZRANDMEMBER` collected every
   member, before choosing; one `ZRANDMEMBER` over a million members took
-  5.5 ms where Redis 8.10.2 takes 0.05 ms. A hash is now read by position,
+  5.6 ms where Redis 8.10.2 takes 0.05 ms. A hash is now read by position,
   so `HRANDFIELD` costs the count, not the size: with a million fields a
-  count of 10 takes 71 us instead of 1,053 us (Redis: 65 us; each figure
+  count of 10 takes 63 us instead of 1,049 us (Redis: 80 us; each figure
   includes about 50 us of client round trip). A sorted set has no index by
   position, so `ZRANDMEMBER` still walks its member table up to the last
   member it picks, without copying anything: over a million members one
-  member takes 1.1 ms instead of 5.5 ms and ten take 1.8 ms instead of
-  6.5 ms, and the cost still grows with the set until its storage can be
+  member takes 1.1 ms instead of 5.6 ms and ten take 1.9 ms instead of
+  6.4 ms, and the cost still grows with the set until its storage can be
   indexed by position. A count of the collection's size or more now returns
   the whole collection in its order (a hash as `HGETALL` has it, a sorted
   set from the highest score down), as Redis does, instead of in a random
