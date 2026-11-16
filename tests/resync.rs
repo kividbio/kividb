@@ -2684,7 +2684,7 @@ fn watch_multi_after_a_select_only_script_replicates_and_replays_in_db2() {
     let select_only = "redis.call('SELECT', 4) redis.call('GET', KEYS[1]) return 1";
     let mut c = master.conn();
     assert!(c.cmd(&["SELECT", "2"]).ok());
-    assert_eq!(c.cmd(&["EVAL_RO", select_only, "1", "x"]), V::Nil);
+    assert_eq!(c.cmd(&["EVAL_RO", select_only, "1", "x"]), V::Int(1));
     // A transaction of plain writes, in the connection's own database 2.
     assert!(c.cmd(&["WATCH", "watchme"]).ok());
     assert!(c.cmd(&["MULTI"]).ok());
@@ -2762,7 +2762,7 @@ fn brpop_in_db2_woken_by_a_db0_conns_push_replicates_and_replays() {
 #[cfg(feature = "lua")]
 #[test]
 fn writes_after_promotion_and_a_select_only_script_reach_a_second_replica() {
-    let mut master = Server::start(&["--aof"]);
+    let master = Server::start(&["--aof"]);
     let port = master.port.to_string();
     let mut r1 = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let mut r2 = Server::start(&["--replicaof", "127.0.0.1", &port]);
@@ -2783,7 +2783,7 @@ fn writes_after_promotion_and_a_select_only_script_reach_a_second_replica() {
     let select_only = "redis.call('SELECT', 4) redis.call('GET', KEYS[1]) return 1";
     let mut promoted = r1.conn();
     assert!(promoted.cmd(&["SELECT", "2"]).ok());
-    assert_eq!(promoted.cmd(&["EVAL_RO", select_only, "1", "x"]), V::Nil);
+    assert_eq!(promoted.cmd(&["EVAL_RO", select_only, "1", "x"]), V::Int(1));
     assert!(promoted.cmd(&["SET", "p1", "1"]).ok());
     assert!(promoted.cmd(&["SET", "p2", "2"]).ok());
 

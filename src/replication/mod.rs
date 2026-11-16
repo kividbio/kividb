@@ -3838,7 +3838,7 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
             note_group_write(true);
             append_to_own_aof(ctx, parts, payloads);
         } else if tapped {
-            advance_stream_db(ctx, parts);
+            advance_stream_db(ctx);
         }
         return;
     }
@@ -3898,7 +3898,7 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
     }
     // Only advance after bytes are emitted: writes that ran with no replicas must not
     // consume the implicit `SELECT`, or the first observer would miss `{select *}` on stream.
-    advance_stream_db(ctx, parts);
+    advance_stream_db(ctx);
 }
 
 /// Hand something other than a write — a `PUBLISH` — to replicas: now, or,
@@ -4224,12 +4224,12 @@ fn append_to_own_aof(
     }
     crate::aof::AOF_WRITTEN.fetch_add(combined.len() as u64, Ordering::Relaxed);
     crate::aof::queue_record(ctx.aof_tx, combined);
-    advance_stream_db(ctx, parts);
+    advance_stream_db(ctx);
 }
 
 /// Record which db the emitted stream is now positioned on, so the next write
 /// only pays for a `SELECT` when it actually changes.
-fn advance_stream_db(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) {
+fn advance_stream_db(ctx: &crate::commands::ctx::Ctx<'_>) {
     // Before any client has left database 0, a write of another went in
     // one piece that goes back to 0 (`in_db_for_stream`).
     let db = if *ctx.selected_db != 0 && !ctx.repl_state.several_databases.load(Ordering::Relaxed) {
