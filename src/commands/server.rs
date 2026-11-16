@@ -1449,14 +1449,16 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
-                if matches!(policy.as_str(), "return" | "fail" | "return_strict")
-                    && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
+                if matches!(
+                    policy.as_str(),
+                    "return" | "fail" | "return-strict" | "return_strict"
+                ) && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
                 {
                     Some(resp_simple("OK"))
                 } else {
                     Some(resp_error(
                         "ERR CONFIG SET failed (possibly related to argument 'search-on-timeout') \
-                         - argument(s) must be one of the following: return, fail, return_strict",
+                         - argument(s) must be one of the following: return, fail, return-strict, return_strict",
                     ))
                 }
             }

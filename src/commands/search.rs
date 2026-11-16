@@ -845,8 +845,7 @@ pub(crate) fn no_time_for(deadline: Option<Instant>, n: usize) -> bool {
     n >= DEADLINE_EVERY as usize && past_deadline(deadline)
 }
 
-/// `ON_TIMEOUT fail` and `return_strict` error instead of returning what
-/// was found.
+/// `ON_TIMEOUT fail` errors instead of returning what was found.
 pub(crate) fn on_timeout_fails() -> bool {
     crate::commands::search_tools::on_timeout_fails()
 }

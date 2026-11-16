@@ -318,6 +318,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`ON_TIMEOUT return-strict` is accepted and `FT.SEARCH` / `FT.AGGREGATE`
+  reply with what was found, as Redis does (#781).** Redis spells the
+  policy `return-strict` (hyphen). This build only took `return_strict`
+  (underscore) and treated it as `fail`: a query cut short was an error
+  instead of a partial reply and a RESP3 warning. Both spellings are
+  taken (`FT.CONFIG SET ON_TIMEOUT`, `CONFIG SET search-on-timeout`, the
+  config file). `return-strict` and `return_strict` now match `return`
+  for `FT.SEARCH` and `FT.AGGREGATE`; only `fail` is an error.
+  `FT.HYBRID` is unchanged (#779): Redis already answers it under
+  `return-strict` with what was found.
+
 - **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
   scan whatever follows the cursor, and read their options as Redis does
   (#820).** `ZSCAN key 0 MATCH * COUNT 0` on a missing key answered `ERR
