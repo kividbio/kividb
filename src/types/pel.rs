@@ -22,18 +22,34 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct PelEntry {
     /// Shared with the consumer's index, so the name is stored once per
-    /// consumer rather than once per entry. Empty for an entry `XNACK`
-    /// released, which no one owns.
-    consumer: Arc<StreamName>,
+    /// consumer rather than once per entry. `None` for an entry `XNACK`
+    /// released, which no one owns: not a consumer named "", which can
+    /// own entries too (#833).
+    consumer: Option<Arc<StreamName>>,
     /// Unix ms.
     pub delivered_at: u64,
     pub delivery_count: u64,
 }
 
 impl PelEntry {
-    /// The consumer that owns the entry; empty if no one does.
-    pub fn consumer(&self) -> &StreamName {
-        &self.consumer
+    /// The consumer that owns the entry; `None` if no one does.
+    pub fn consumer(&self) -> Option<&StreamName> {
+        self.consumer.as_deref()
+    }
+
+    /// The owner's name as a reply shows it: empty for an entry no one
+    /// owns, as in Redis.
+    pub fn shown_consumer(&self) -> &[u8] {
+        self.consumer.as_deref().map_or(&[], StreamName::as_bytes)
+    }
+
+    /// Whether `XNACK` released the entry and no consumer has it since.
+    pub fn is_released(&self) -> bool {
+        self.consumer.is_none()
+    }
+
+    fn owner_bytes(&self) -> Option<&[u8]> {
+        self.consumer.as_deref().map(StreamName::as_bytes)
     }
 }
 
@@ -109,9 +125,10 @@ fn owner_mut<'a>(owners: &'a mut Owners, consumer: &[u8]) -> &'a mut Owned {
     owners.slot(consumer)
 }
 
-/// Takes `id` out of `consumer`'s index. The slot stays, even empty.
-fn unlink(owners: &mut Owners, consumer: &[u8], id: &StreamId) {
-    if let Some(owned) = owners.get_mut(consumer) {
+/// Takes `id` out of `consumer`'s index (`None`: it was released, and is in
+/// no one's). The slot stays, even empty.
+fn unlink(owners: &mut Owners, consumer: Option<&[u8]>, id: &StreamId) {
+    if let Some(owned) = consumer.and_then(|consumer| owners.get_mut(consumer)) {
         owned.ids.remove(id);
     }
 }
@@ -188,7 +205,7 @@ impl Pel {
                 let owned = owner_mut(&mut self.owners, consumer);
                 owned.ids.insert(slot.key().clone());
                 slot.insert(PelEntry {
-                    consumer: Arc::clone(&owned.name),
+                    consumer: Some(Arc::clone(&owned.name)),
                     delivered_at,
                     delivery_count,
                 })
@@ -196,11 +213,11 @@ impl Pel {
             btree_map::Entry::Occupied(slot) => {
                 let id = slot.key().clone();
                 let entry = slot.into_mut();
-                if entry.consumer.as_bytes() != consumer {
-                    unlink(&mut self.owners, entry.consumer.as_bytes(), &id);
+                if entry.owner_bytes() != Some(consumer) {
+                    unlink(&mut self.owners, entry.owner_bytes(), &id);
                     let owned = owner_mut(&mut self.owners, consumer);
                     owned.ids.insert(id);
-                    entry.consumer = Arc::clone(&owned.name);
+                    entry.consumer = Some(Arc::clone(&owned.name));
                 }
                 entry.delivered_at = delivered_at;
                 entry.delivery_count = delivery_count;
@@ -209,15 +226,50 @@ impl Pel {
         }
     }
 
+    /// Makes `id` pending and owned by no one, as `XNACK` leaves an entry.
+    /// An entry already pending is replaced.
+    pub fn insert_released(
+        &mut self,
+        id: StreamId,
+        delivered_at: u64,
+        delivery_count: u64,
+    ) -> &mut PelEntry {
+        match self.entries.entry(id) {
+            btree_map::Entry::Vacant(slot) => slot.insert(PelEntry {
+                consumer: None,
+                delivered_at,
+                delivery_count,
+            }),
+            btree_map::Entry::Occupied(slot) => {
+                let id = slot.key().clone();
+                let entry = slot.into_mut();
+                unlink(&mut self.owners, entry.owner_bytes(), &id);
+                entry.consumer = None;
+                entry.delivered_at = delivered_at;
+                entry.delivery_count = delivery_count;
+                entry
+            }
+        }
+    }
+
+    /// Takes the pending entry `id` from its consumer, if it has one: it is
+    /// then owned by no one. None if it is not pending.
+    pub fn release(&mut self, id: &StreamId) -> Option<&mut PelEntry> {
+        let entry = self.entries.get_mut(id)?;
+        unlink(&mut self.owners, entry.owner_bytes(), id);
+        entry.consumer = None;
+        Some(entry)
+    }
+
     /// Hands the pending entry `id` to `consumer`. None if it is not
     /// pending.
     pub fn assign(&mut self, id: &StreamId, consumer: &[u8]) -> Option<&mut PelEntry> {
         let entry = self.entries.get_mut(id)?;
-        if entry.consumer.as_bytes() != consumer {
-            unlink(&mut self.owners, entry.consumer.as_bytes(), id);
+        if entry.owner_bytes() != Some(consumer) {
+            unlink(&mut self.owners, entry.owner_bytes(), id);
             let owned = owner_mut(&mut self.owners, consumer);
             owned.ids.insert(id.clone());
-            entry.consumer = Arc::clone(&owned.name);
+            entry.consumer = Some(Arc::clone(&owned.name));
         }
         Some(entry)
     }
@@ -225,7 +277,7 @@ impl Pel {
     /// Acknowledges `id`: it is no longer pending.
     pub fn remove(&mut self, id: &StreamId) -> Option<PelEntry> {
         let entry = self.entries.remove(id)?;
-        unlink(&mut self.owners, entry.consumer.as_bytes(), id);
+        unlink(&mut self.owners, entry.owner_bytes(), id);
         Some(entry)
     }
 
@@ -262,8 +314,14 @@ impl Pel {
         })
     }
 
+    /// How many entries `XNACK` released and no consumer has since.
+    pub fn released_len(&self) -> usize {
+        let owned: usize = self.owners.table.iter().map(|owned| owned.ids.len()).sum();
+        self.entries.len() - owned
+    }
+
     /// Every consumer that owns entries, with how many, in no order. The
-    /// unnamed one, if listed, holds the entries `XNACK` released.
+    /// entries `XNACK` released are no one's, and not counted.
     pub fn owners(&self) -> impl Iterator<Item = (&StreamName, usize)> {
         self.owners
             .table
@@ -278,11 +336,18 @@ impl Pel {
     pub fn check(&self) -> Result<(), String> {
         let mut counts: AHashMap<&[u8], usize> = AHashMap::new();
         for (id, entry) in &self.entries {
-            let owner = entry.consumer.as_bytes();
+            let Some(shared) = &entry.consumer else {
+                // Released: in no consumer's index.
+                if self.owners.table.iter().any(|owned| owned.ids.contains(id)) {
+                    return Err(format!("{id}: released, yet in a consumer's index"));
+                }
+                continue;
+            };
+            let owner = shared.as_bytes();
             *counts.entry(owner).or_insert(0) += 1;
             match self.owners.get(owner) {
                 Some(owned) if owned.ids.contains(id) => {
-                    if !Arc::ptr_eq(&owned.name, &entry.consumer) {
+                    if !Arc::ptr_eq(&owned.name, shared) {
                         return Err(format!("{id}: owner name not shared with the index"));
                     }
                 }
@@ -338,7 +403,7 @@ mod tests {
         // Re-inserted for someone else: moves, with the new details.
         let e = pel.insert(id(2), b"b", 20, 5);
         assert_eq!(
-            (e.consumer().as_bytes(), e.delivered_at, e.delivery_count),
+            (e.shown_consumer(), e.delivered_at, e.delivery_count),
             (&b"b"[..], 20, 5)
         );
         assert_eq!(pel.consumer_len(b"a"), 1);
@@ -349,7 +414,7 @@ mod tests {
         assert_eq!(pel.owners().count(), 2, "a owns nothing, so is not listed");
         pel.check().unwrap();
         assert!(pel.assign(&id(9), b"c").is_none());
-        assert_eq!(pel.remove(&id(3)).unwrap().consumer(), "b");
+        assert_eq!(pel.remove(&id(3)).unwrap().consumer().unwrap(), "b");
         assert!(pel.remove(&id(3)).is_none());
         let b: Vec<_> = pel
             .consumer_range(b"b", ..)
@@ -359,6 +424,36 @@ mod tests {
         assert_eq!(pel.remove_consumer(b"c"), 1);
         assert_eq!(pel.remove_consumer(b"c"), 0);
         assert_eq!(pel.len(), 1);
+        pel.check().unwrap();
+    }
+
+    /// An entry `XNACK` released is no one's, not a consumer named "" (#833).
+    #[test]
+    fn a_released_entry_is_not_the_empty_named_consumers() {
+        let mut pel = Pel::new();
+        pel.insert(id(1), b"", 10, 1);
+        pel.insert(id(2), b"", 10, 1);
+        pel.insert(id(3), b"alice", 10, 1);
+        pel.insert(id(4), b"alice", 10, 1);
+        pel.release(&id(3)).unwrap().delivered_at = 1;
+        pel.insert_released(id(4), 2, 0);
+        pel.insert_released(id(5), 3, 0);
+        pel.check().unwrap();
+        assert_eq!(pel.released_len(), 3);
+        assert_eq!(pel.consumer_len(b""), 2);
+        assert_eq!(pel.consumer_len(b"alice"), 0);
+        assert!(pel.get(&id(3)).unwrap().is_released());
+        assert_eq!(pel.get(&id(3)).unwrap().shown_consumer(), b"");
+        assert!(!pel.get(&id(1)).unwrap().is_released());
+        // Deleting the consumer takes its entries and leaves the released.
+        assert_eq!(pel.remove_consumer(b""), 2);
+        assert_eq!(pel.len(), 3);
+        assert_eq!(pel.released_len(), 3);
+        // Handed to a consumer, a released entry is its.
+        pel.assign(&id(5), b"").unwrap();
+        assert_eq!((pel.consumer_len(b""), pel.released_len()), (1, 2));
+        pel.check().unwrap();
+        assert!(pel.remove(&id(3)).unwrap().is_released());
         pel.check().unwrap();
     }
 
@@ -408,7 +503,7 @@ mod tests {
                     let got: Vec<_> = pel
                         .consumer_range(c.as_bytes(), lo.clone()..)
                         .map(|(id, e)| {
-                            assert_eq!(e.consumer(), c);
+                            assert_eq!(e.shown_consumer(), c.as_bytes());
                             id.clone()
                         })
                         .collect();
