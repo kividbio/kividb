@@ -399,6 +399,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FT.HYBRID` is unchanged (#779): Redis already answers it under
   `return-strict` with what was found.
 
+- **A vararg function in a script has Lua 5.1's implicit `arg` (#820).**
+  Redis builds its Lua with `LUA_COMPAT_VARARG`, so `function f(...)
+  for _, v in ipairs(arg) do ... end end` runs there; here it failed with
+  "Script attempted to access nonexistent global variable 'arg'" (older
+  scripts and sidekiq-unique-jobs' test fixtures use it). A vararg function
+  whose text says `arg` now starts with the local Lua 5.1 makes: the table
+  of its extra arguments with their count in `n`, or `nil` when its body
+  uses `...` itself, as in Redis. It is added once, when the script or
+  library is compiled, on the line of the function's parameters; a script
+  that does not say `arg` in a vararg function is compiled unchanged, and
+  no call does any more than it did.
 - **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
   scan whatever follows the cursor, and read their options as Redis does
   (#820).** `ZSCAN key 0 MATCH * COUNT 0` on a missing key answered `ERR
