@@ -1866,9 +1866,10 @@ impl Config {
             }
             "dbfilename" => {
                 if !matches!(one()?, "dump.kdb" | "dump.rdb") {
-                    return Err(
-                        "'dbfilename' cannot be changed: the snapshot is always 'dump.kdb'".into(),
-                    );
+                    return Err(format!(
+                        "'dbfilename' cannot be changed: the snapshot is always '{}'",
+                        crate::aof::SNAPSHOT_PATH
+                    ));
                 }
             }
             "daemonize" => {

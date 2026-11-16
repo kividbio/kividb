@@ -2547,3 +2547,114 @@ fn string_format_frees_what_it_built_when_it_fails() {
     // some 5 MB a call, 300 MB over the 60 here.
     assert!(grown < 96 << 20, "resident memory grew {grown} bytes");
 }
+
+/// A function declared with `...` has the implicit local `arg` of Lua 5.1
+/// (Redis is built with `LUA_COMPAT_VARARG`): a table of the extra arguments,
+/// with their count in `n`, when the body never says `...`; `nil` when it
+/// does; and in a function that is not vararg, or in the script's own body,
+/// there is none and the global is refused (#820). Each reply below is what
+/// Redis 8.10.2 answered.
+#[test]
+fn the_implicit_arg_of_a_vararg_function_is_the_one_lua_5_1_makes() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let int = |n: i64| RespValue::Int(n);
+    let text = |s: &str| RespValue::Bulk(s.as_bytes().to_vec());
+    let cases: Vec<(&str, RespValue)> = vec![
+        (
+            "local function f(...) return #arg end return f(1,2,3)",
+            int(3),
+        ),
+        (
+            "local function f(...) return arg.n end return f(1,nil,3)",
+            int(3),
+        ),
+        (
+            concat!(
+                "local function log_debug(...) local result = \"\" ",
+                "for _, v in ipairs(arg) do result = result .. \" \" .. tostring(v) end ",
+                "return result end return log_debug(\"a\", \"b\")"
+            ),
+            text(" a b"),
+        ),
+        // The body says `...`: `arg` is a local, and nil.
+        (
+            "local function f(...) local t = {...} return type(arg) end return f(1)",
+            text("nil"),
+        ),
+        (
+            "local function f(...) local t = {...} return arg end return f(1)",
+            RespValue::Nil,
+        ),
+        // After a named parameter.
+        (
+            "local function f(a, ...) return arg.n end return f(1, 2, 3)",
+            int(2),
+        ),
+        // It is the local the parameter list makes last, so it hides a
+        // parameter of the same name.
+        (
+            "local function f(arg, ...) return type(arg) end return f(7, 8)",
+            text("table"),
+        ),
+        // A function inside one reads the outer `arg`.
+        (
+            "local function f(...) local g = function() return arg.n end return g() end return f(1,2)",
+            int(2),
+        ),
+        (
+            "local function f(...) return function() return type(arg) end end return f(1)()",
+            text("table"),
+        ),
+        (
+            "local f = function(...) return arg[1] .. arg[2] end return f('x','y')",
+            text("xy"),
+        ),
+        // Not the name: a string, a field, a longer name.
+        (
+            "local function f(...) local s = 'arg' return s end return f()",
+            text("arg"),
+        ),
+        (
+            "local function f(...) local t = {arg = 5} return t.arg end return f()",
+            int(5),
+        ),
+        (
+            "local function f(...) local args = {...} return #args end return f(1,2)",
+            int(2),
+        ),
+    ];
+    for (script, want) in cases {
+        let got = c.cmds(&["EVAL", script, "0"]);
+        assert_eq!(got, want, "{script}");
+    }
+
+    // No vararg function around it: the global does not exist.
+    for script in [
+        "local function f(a) return arg end return f(1)",
+        "return arg",
+    ] {
+        let got = c.cmds(&["EVAL", script, "0"]);
+        assert!(
+            got.as_error()
+                .contains("Script attempted to access nonexistent global variable 'arg'"),
+            "{script}: {got:?}"
+        );
+    }
+
+    // In a library: a function it registers can use one.
+    let library = concat!(
+        "#!lua name=argtest\n",
+        "local function count(...) return arg.n end\n",
+        "redis.register_function('argcount', function(keys, args) return count(unpack(args)) end)"
+    );
+    assert_eq!(c.cmds(&["FUNCTION", "LOAD", library]), text("argtest"));
+    assert_eq!(c.cmds(&["FCALL", "argcount", "0", "a", "b", "c"]), int(3));
+    // And SCRIPT LOAD takes the script as EVAL does.
+    let script = "local function f(...) return #arg end return f(1,2)";
+    let sha = c.cmds(&["SCRIPT", "LOAD", script]);
+    assert_eq!(c.cmds(&["EVALSHA", sha.as_str(), "0"]), int(2));
+}

@@ -1499,6 +1499,92 @@ fn replica_priority_and_announced_reach_info_replication() {
     assert_eq!(replica_info(&mut c, "replica_announced"), "1");
 }
 
+/// `CONFIG GET dbfilename` names the snapshot file the server writes and
+/// loads, and `CONFIG GET dir` the directory it is in, so that a tool that
+/// takes a snapshot over the protocol finds it (#846). It answered nothing.
+/// The name is what the server uses whatever `--dbfilename` said, and a
+/// pattern that matches it lists it.
+#[test]
+fn config_get_dbfilename_and_dir_find_the_snapshot_file() {
+    /// The server, ended with the test, whether it passes or not.
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let _server = Killed(
+        std::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
+        )
+        .current_dir(dir.path())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--dir",
+            dir.path().to_str().unwrap(),
+            "--dbfilename",
+            "dump.rdb",
+            "--loglevel",
+            "error",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start kividb"),
+    );
+    let mut c = Conn::connect(port);
+    let pair = |c: &mut Conn, args: &[&str]| -> Vec<String> {
+        c.cmds(args)
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect()
+    };
+
+    let name = pair(&mut c, &["CONFIG", "GET", "dbfilename"]);
+    assert_eq!(name, ["dbfilename", "dump.kdb"]);
+    let folder = pair(&mut c, &["CONFIG", "GET", "dir"]);
+    assert_eq!(folder[0], "dir");
+    assert_eq!(
+        std::fs::canonicalize(&folder[1]).unwrap(),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
+    // A pattern lists both.
+    let listed = pair(&mut c, &["CONFIG", "GET", "d*"]);
+    for want in ["dbfilename", "dump.kdb", "dir"] {
+        assert!(listed.iter().any(|v| v == want), "{want} in {listed:?}");
+    }
+    // The file a save writes is the one named, where `dir` says.
+    assert!(c.cmds(&["SET", "k", "v"]).is_ok());
+    assert!(c.cmds(&["SAVE"]).is_ok());
+    assert!(
+        std::path::Path::new(&folder[1]).join(&name[1]).is_file(),
+        "no {} in {}",
+        name[1],
+        folder[1]
+    );
+    // It cannot be renamed: another name is refused, and it stays what it is.
+    let reply = c.cmds(&["CONFIG", "SET", "dbfilename", "other.rdb"]);
+    assert!(
+        matches!(&reply, RespValue::Error(e) if e == &format!(
+            "ERR CONFIG SET failed (possibly related to argument '{}') - can't set immutable config",
+            "dbfilename"
+        )),
+        "{reply:?}"
+    );
+    assert!(c.cmds(&["CONFIG", "SET", "dbfilename", "dump.kdb"]).is_ok());
+    assert_eq!(
+        pair(&mut c, &["CONFIG", "GET", "dbfilename"]),
+        ["dbfilename", "dump.kdb"]
+    );
+}
+
 /// `CONFIG GET appendfilename` names the append-only file the server writes,
 /// as Redis does (#855). It answered an empty list, and `CONFIG SET` of the
 /// same name was refused for want of a row to compare with.
