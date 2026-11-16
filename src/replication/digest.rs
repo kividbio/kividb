@@ -87,7 +87,13 @@ fn stream_digest(h: &mut Xxh3, stream: &crate::types::StreamInner) {
         g.update(&(group.pel.len() as u64).to_le_bytes());
         for (id, pending) in group.pel.iter() {
             id_digest(&mut g, id);
-            bytes_digest(&mut g, pending.consumer().as_bytes());
+            bytes_digest(&mut g, pending.shown_consumer());
+            // An entry `XNACK` released is no one's; one a consumer named
+            // "" holds is that consumer's (#833). The mark is added for the
+            // second only, so every other digest is what it was.
+            if pending.consumer().is_some_and(|c| c.as_bytes().is_empty()) {
+                g.update(&[1]);
+            }
             g.update(&pending.delivered_at.to_le_bytes());
             g.update(&pending.delivery_count.to_le_bytes());
         }
