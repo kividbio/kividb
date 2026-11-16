@@ -2764,7 +2764,7 @@ fn brpop_in_db2_woken_by_a_db0_conns_push_replicates_and_replays() {
 fn writes_after_promotion_and_a_select_only_script_reach_a_second_replica() {
     let master = Server::start(&["--aof"]);
     let port = master.port.to_string();
-    let mut r1 = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r1 = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
     let mut r2 = Server::start(&["--replicaof", "127.0.0.1", &port]);
     wait_link_up(&mut r1.conn());
     wait_link_up(&mut r2.conn());
