@@ -5125,19 +5125,19 @@
       "unit": "ms",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 972.9177,
-        "candidate": 32.192,
-        "redis": 37.698,
+        "v1_2_2": 1287.0488,
+        "candidate": 37.7179,
+        "redis": 42.0445,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "date": "2026-11-15",
-        "commit": "f767a149",
-        "label": "pr822-d4s_v5"
+        "date": "2026-11-16",
+        "commit": "9c466db3",
+        "label": "flaky15-median-of-5-d4s_v5"
       },
       "gate": [
         {
           "kind": "rel",
-          "pct": 50,
+          "pct": 100,
           "redis_plus": 10,
           "speed": false
         }

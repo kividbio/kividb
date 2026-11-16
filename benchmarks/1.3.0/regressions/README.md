@@ -247,6 +247,14 @@ changing this logic.
 
 Why a few rows differ from the plan's defaults:
 
+- `15-brpop-many-keys` c1000 `ping_max_ms`: the worst PING of 1,000 blocked
+  workers beside a producer and a probe on 4 vCPUs is scheduling jitter. Five
+  runs of the master build on a `Standard_D4s_v5` gave 31.9-43.6 ms
+  (median 37.7) for the candidate, 39.6-48.8 ms (median 42.0) for Redis and
+  1,125-1,486 ms for v1.2.2 (`results/flaky15-r1` to `r5`). The first
+  recording, 32.2 ms with the usual 1.5x, failed healthy runs; the row now
+  records the median of the five and is judged at 2x it or Redis + 10 ms
+  (75 ms), still 15x under v1.2.2's. The other two configurations keep 1.5x.
 - `04-long-commands` on Tokio: the worst PING is 0.4-8 ms against 130-260 ms
   on v1.2.2. A ratio of those two is mostly noise in the denominator, and
   "Redis + 10 ms" would allow the full stall back (Redis stalls everyone). The
