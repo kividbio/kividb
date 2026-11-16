@@ -318,6 +318,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Under an `allkeys-*` policy a write is no longer refused with OOM while
+  eviction is working (#520).** Two things refused one. Eviction stopped
+  once it had evicted about 1 MB of keys with memory use no lower (the
+  guard against evicting keys a snapshot still holds, #284), and with many
+  clients writing at once the other threads' writes kept memory use as high
+  while every key evicted was freed: the guard now asks what the evicting
+  thread itself gave back (what it freed, and what it counted as held by a
+  snapshot), and stops only when that is under a quarter of what it
+  evicted. And a write that found nothing left to evict while another
+  thread was still freeing a large collection it had evicted was refused.
+  Under an `allkeys-*` policy only, such a write is now let through when
+  the collections being freed at that moment (reckoned low: 32 bytes an
+  element) bring memory use under `maxmemory` by themselves; otherwise, and
+  under every `volatile-*` policy, it is refused as before. That lets
+  memory go over the limit by at most the bytes reckoned as being freed
+  and one command per thread, until the next write evicts the keys let in;
+  nothing waits. On a 4-vCPU VM (master and replica with
+  AOF, memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists,
+  sets and sorted sets, `maxmemory 512mb`, ~53M writes in ten minutes),
+  master refused 2 writes under `allkeys-lfu` and 3 under `allkeys-lru`,
+  the fix none; memory use was never over the limit by more than 0.23 MB
+  for 100 ms or longer (master: 0.18 MB). Keys that only a snapshot holds are
+  still not evicted for nothing. The soak is
+  `benchmarks/1.3.0/eviction-soak/soak.sh`.
+
 - **`SHUTDOWN` that goes ahead answers nothing, as Redis does, and one that
   fails answers an error and keeps the server running (#429).** It
   answered `+OK` and then closed the connection, so redis-py's
