@@ -430,7 +430,13 @@ impl Srv {
 
     /// A raw connection: replies are read as bytes.
     fn raw(&self) -> TcpStream {
-        let conn = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        let conn = TcpStream::connect(("127.0.0.1", self.port)).unwrap_or_else(|e| {
+            panic!(
+                "no connection to port {}: {e}; its log: {}",
+                self.port,
+                self.log()
+            )
+        });
         conn.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         conn
@@ -945,6 +951,40 @@ impl Srv {
         unsafe { libc::kill(self.child.id() as libc::pid_t, sig) };
     }
 
+    /// SIGSTOP, and then until every thread of the process has stopped. The
+    /// signal is only queued when `kill` returns: each thread stops when it
+    /// next runs, and on a loaded machine that can be after a thread has
+    /// read a write that comes next and acknowledged it. A replica stopped
+    /// "for" a write was then up to date when the shutdown looked, and the
+    /// shutdown did not wait for it.
+    fn stop(&self) {
+        self.signal(libc::SIGSTOP);
+        let tasks = format!("/proc/{}/task", self.child.id());
+        let start = Instant::now();
+        loop {
+            let running: Vec<String> = std::fs::read_dir(&tasks)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|task| std::fs::read_to_string(task.path().join("stat")).ok())
+                // `pid (comm) S ...`: the state follows the last `)`.
+                .filter(|stat| {
+                    stat.rsplit(')')
+                        .next()
+                        .and_then(|rest| rest.split_whitespace().next())
+                        != Some("T")
+                })
+                .collect();
+            if running.is_empty() {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "still running after SIGSTOP: {running:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Start a server again on this one's directory, and read `key` there.
     fn restarted_get(&self, model: &str, key: &str) -> String {
         let (mut again, _, mut c) =
@@ -979,7 +1019,7 @@ fn master_with_a_stopped_replica(model: &str) -> (Srv, Srv) {
             "the replica did not attach"
         );
     }
-    replica.signal(libc::SIGSTOP);
+    replica.stop();
     // Something it has not acknowledged.
     assert_eq!(ask(&mut conn, &["SET", "lag", "1"], 5), b"+OK\r\n");
     (master, replica)
