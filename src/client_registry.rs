@@ -203,6 +203,12 @@ impl ReplyGate {
         }
     }
 
+    /// The command that has just begun is one whose reply is not wanted
+    /// (`CLIENT REPLY OFF`, or `SKIP`).
+    pub fn drops_reply(&self) -> bool {
+        self.open && !self.keep
+    }
+
     /// Drop the reply of the command that has just run, if it is not wanted.
     #[inline(always)]
     pub fn settle(&mut self, out: &mut Vec<u8>) {

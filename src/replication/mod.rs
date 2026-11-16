@@ -3613,6 +3613,11 @@ pub struct FinalSaveHold<'a> {
 pub fn hold_for_final_save(state: &ReplState) -> std::io::Result<FinalSaveHold<'_>> {
     use std::time::{Duration, Instant};
     loop {
+        // `SHUTDOWN ABORT` ends the wait for a command that keeps the gate
+        // (a script that does not end): the caller then undoes the shutdown.
+        if crate::shutdown::abort_requested() {
+            return Err(std::io::Error::other("SHUTDOWN ABORT"));
+        }
         let turn = crate::aof::checkpoint_turn()?;
         let deadline = Instant::now() + Duration::from_millis(50);
         if let Some(alone) =
@@ -3663,14 +3668,35 @@ const SHUTDOWN_PAUSE_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
 /// its clients while a shutdown waits for the replicas. No command starts
 /// again before the exit: the pause has no end, and the caller then holds the
 /// command gate alone. Blocking: called from the thread that then saves.
-pub fn drain_replicas_for_shutdown(state: &ReplState, hub_tx: &HubTx) -> std::time::Instant {
-    crate::pause::set_pause(SHUTDOWN_PAUSE_MS, false);
-    end_stream_for_shutdown(state);
+///
+/// Returns the pause, for a shutdown that does not go ahead to take back
+/// (`pause::undo_pause`), and when the wait ends. The wait for the writes in
+/// flight ends early once `give_up` says so: the shutdown was aborted (the
+/// caller sees it), or a script has run past its time limit, which holds the
+/// write gate for as long as it runs, and `SHUTDOWN NOSAVE` is the way to
+/// stop it. The replicas are then waited for all the same, as in Redis.
+pub fn drain_replicas_for_shutdown(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    give_up: &dyn Fn() -> bool,
+) -> (crate::pause::Undo, std::time::Instant) {
+    let paused = crate::pause::set_pause_undoable(SHUTDOWN_PAUSE_MS, false);
+    // `end_stream_for_shutdown`, with a wait that can be given up.
+    state.stream_closed.store(true, Ordering::SeqCst);
+    let never = std::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600);
+    crate::write_gate::wait_out_writes(never, || !give_up());
     let timeout =
         std::time::Duration::from_secs(state.shutdown_timeout_secs.load(Ordering::Relaxed));
+    if !timeout.is_zero() && !state.is_slave() && !state.replica_progress.lock().is_empty() {
+        // As Redis says it.
+        log_info!(
+            "Waiting for replicas before shutting down (shutdown-timeout {} s)",
+            timeout.as_secs()
+        );
+    }
     let deadline = std::time::Instant::now() + timeout;
     wait_for_replicas_until(state, hub_tx, deadline);
-    deadline
+    (paused, deadline)
 }
 
 /// Shutdown, with the command gate held alone, just before the save: wait
@@ -3740,11 +3766,13 @@ fn wait_for_replicas_until(state: &ReplState, hub_tx: &HubTx, deadline: std::tim
             done_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ) && std::time::Instant::now() < deadline
+            && !crate::shutdown::abort_requested()
         {
             std::thread::sleep(pause);
         }
     }
     while std::time::Instant::now() < deadline
+        && !crate::shutdown::abort_requested()
         && replicas_at_shutdown(state).iter().any(|(_, p)| {
             p.state() == ReplicaState::Online && p.delivered() < p.sent.load(Ordering::Relaxed)
         })

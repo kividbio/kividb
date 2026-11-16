@@ -343,6 +343,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still not evicted for nothing. The soak is
   `benchmarks/1.3.0/eviction-soak/soak.sh`.
 
+- **`SHUTDOWN` that goes ahead answers nothing, as Redis does, and one that
+  fails answers an error and keeps the server running (#429).** It
+  answered `+OK` and then closed the connection, so redis-py's
+  `shutdown()`, which takes any reply for a failure, raised "SHUTDOWN seems
+  to have failed" on every successful shutdown. The connection now stays
+  silent until the process exits, after the final save, and replies that
+  were owed before the `SHUTDOWN` (a pipelined `SET`) are sent first.
+  If the final save cannot be written, `SHUTDOWN` answers `-ERR Errors
+  trying to SHUTDOWN. Check logs.` and the server runs on: the shutdown's
+  own pause is lifted, and a pause in force before it (`CLIENT PAUSE`, a
+  failover's or a slot migration's hold of writes) stays. `SHUTDOWN FORCE`,
+  and a signal, still end the process with status 1. `SHUTDOWN ABORT`
+  cancels a shutdown that is waiting for lagging replicas, and answers
+  `-ERR No shutdown in progress.` when there is none, where it answered
+  `+OK`; a signal that came meanwhile still shuts the server down
+  afterwards, with its final save. `SHUTDOWN NOSAVE` now waits for lagging
+  replicas too, as in Redis, for at most `shutdown-timeout` (`NOW` skips
+  the wait), and writes and syncs the AOF before the process exits. While a
+  script has run past `lua-time-limit`, `SHUTDOWN NOSAVE` still ends the
+  process without waiting for the script, and a `SHUTDOWN` that would save
+  is answered `BUSY`, as in Redis, where it waited for the script for ever.
+  An unknown or conflicting modifier is `-ERR syntax error`, as in Redis.
+  Two differences from Redis remain: every client,
+  readers included, is paused while the shutdown waits for the replicas,
+  where Redis pauses writes only, and a SIGTERM whose final save fails
+  ends the process with status 1, where Redis keeps running.
+
 - **`ON_TIMEOUT return-strict` is accepted and `FT.SEARCH` / `FT.AGGREGATE`
   reply with what was found, as Redis does (#781).** Redis spells the
   policy `return-strict` (hyphen). This build only took `return_strict`
