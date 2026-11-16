@@ -1624,12 +1624,18 @@ fn ready_conns(server: &Server, n: usize) -> Vec<Conn> {
 }
 
 /// Lower the limit to `limit` from another client: `CONFIG SET` evicts at
-/// once, here the one big list, which it frees a second on.
-fn lower_limit(server: &Server, limit: i64) -> std::thread::JoinHandle<V> {
+/// once, here the one big list `big`, which it frees a second on. Returns
+/// once `c`, a client served before, sees the list gone: it is being
+/// freed.
+fn lower_limit(server: &Server, c: &mut Conn, limit: i64) -> std::thread::JoinHandle<V> {
     let mut setter = server.conn();
     let limit = limit.to_string();
     let lowered = std::thread::spawn(move || setter.cmd(&["CONFIG", "SET", "maxmemory", &limit]));
-    std::thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.cmd(&["EXISTS", "big"]).i() != 0 {
+        assert!(Instant::now() < deadline, "the list was not evicted");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     lowered
 }
 
@@ -1647,7 +1653,7 @@ fn a_write_while_the_last_key_evicted_is_being_freed_is_let_through() {
     let conns = ready_conns(&server, 6);
     // 2 MB under what is used: the list's 3.2 MB at least make the room.
     let limit = c.used_memory() - 2 * MB;
-    let lowered = lower_limit(&server, limit);
+    let lowered = lower_limit(&server, &mut c, limit);
     // From several clients, so that some are served by another thread than
     // the one freeing.
     let value = big_value('v');
@@ -1684,7 +1690,8 @@ fn a_write_while_too_little_is_being_freed_is_refused() {
     c.big_list("big");
     let mut conn = ready_conns(&server, 1).pop().unwrap();
     // 8 MB under what is used: more than the 3.2 MB reckoned to be freed.
-    let lowered = lower_limit(&server, c.used_memory() - 8 * MB);
+    let limit = c.used_memory() - 8 * MB;
+    let lowered = lower_limit(&server, &mut c, limit);
     let reply = conn.cmd(&["SET", "w", &big_value('v')]);
     assert!(
         reply.is_err() && reply.s().starts_with("OOM"),
@@ -1712,7 +1719,7 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
     let conns = ready_conns(&server, 10);
     let before = c.counted();
     let limit = c.used_memory() - 2 * MB;
-    let lowered = lower_limit(&server, limit);
+    let lowered = lower_limit(&server, &mut c, limit);
     let writes: Vec<_> = conns
         .into_iter()
         .enumerate()
