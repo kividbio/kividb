@@ -366,19 +366,14 @@ pub(crate) fn config_number(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// `ON_TIMEOUT fail` and `return_strict` error when a query runs out of
-/// time, instead of returning what was found.
+/// `ON_TIMEOUT fail` errors when a query runs out of time; `return` and
+/// `return-strict` reply with what was found.
 pub(crate) fn on_timeout_fails() -> bool {
     CONFIG
         .lock()
         .iter()
         .find(|(n, _)| *n == "ON_TIMEOUT")
-        .is_some_and(|(_, value)| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "fail" | "return_strict"
-            )
-        })
+        .is_some_and(|(_, value)| matches!(value.to_ascii_lowercase().as_str(), "fail"))
 }
 
 /// What a setting holds now. The server settings `search-timeout` and
@@ -484,7 +479,7 @@ fn config_value_ok(name: &str, value: &str) -> bool {
     match name {
         "ON_TIMEOUT" => matches!(
             value.to_ascii_lowercase().as_str(),
-            "return" | "fail" | "return_strict"
+            "return" | "fail" | "return-strict" | "return_strict"
         ),
         "NOGC" | "PARTIAL_INDEXED_DOCS" => {
             matches!(value.to_ascii_lowercase().as_str(), "true" | "false")

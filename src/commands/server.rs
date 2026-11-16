@@ -1449,14 +1449,16 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
-                if matches!(policy.as_str(), "return" | "fail" | "return_strict")
-                    && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
+                if matches!(
+                    policy.as_str(),
+                    "return" | "fail" | "return-strict" | "return_strict"
+                ) && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
                 {
                     Some(resp_simple("OK"))
                 } else {
                     Some(resp_error(
                         "ERR CONFIG SET failed (possibly related to argument 'search-on-timeout') \
-                         - argument(s) must be one of the following: return, fail, return_strict",
+                         - argument(s) must be one of the following: return, fail, return-strict, return_strict",
                     ))
                 }
             }
@@ -3083,10 +3085,8 @@ const FAST_COMMANDS: &[&str] = &[
 ];
 
 /// Whether `name` (upper case) is in `@write`, and flagged `write` by
-/// `COMMAND`. That is what is sent to replicas
-/// ([`crate::replication::is_write_command`]) but `SELECT`: replicas are
-/// sent it to follow the database, and Redis has it in `@fast @connection`
-/// only (#392).
+/// `COMMAND`. That is [`crate::replication::is_write_command`] but
+/// `SELECT`, which Redis has in `@fast @connection` only (#392).
 fn is_acl_write(name: &str) -> bool {
     (crate::replication::is_write_command(name) && name != "SELECT")
         || WRITES_BY_ARGUMENT.contains(&name)

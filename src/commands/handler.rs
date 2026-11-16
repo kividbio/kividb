@@ -784,8 +784,8 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // client tracking that key is not told. Judged by the arguments, as the
     // propagation below judges it (`command_mutates_for_replication`).
     let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
-    // A `SELECT` is propagated, but writes nothing: a script that has only
-    // selected a database can still be killed (#424).
+    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`):
+    // a script that has only selected a database can still be killed (#424).
     #[cfg(feature = "lua")]
     if !result.starts_with(b"-")
         && inner_write
@@ -1440,9 +1440,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
     {
         // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
-        // cache, not the dataset, and while writes are paused they are kept
-        // out of the replication stream and the AOF
-        // (`replication::held_back`), so a handoff misses nothing of them.
+        // cache, not the dataset, and are sent to nobody (#705), so a
+        // handoff misses nothing of them.
         // The pause does not hold them (#518), and they used to wait the
         // handoff out here instead, asleep on their worker thread, with
         // every other connection of that thread (#528).
@@ -2595,15 +2594,38 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
         return;
     }
     let db = *ctx.selected_db;
+    // A blocking pop's own keys gained nothing from it: what it wakes there
+    // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
+    // destination) its handler wakes, and that is waited for.
+    let quiet = waiters && pops_blocking(name);
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {
             continue;
         }
-        if waiters {
+        if quiet {
+            crate::wait_table::without_collecting(|| ctx.wait_table.notify_signal(key));
+        } else if waiters {
             ctx.wait_table.notify_signal(key);
         }
     }
+}
+
+/// The commands that wait for elements and take them.
+#[cold]
+fn pops_blocking(name: &str) -> bool {
+    matches!(
+        name,
+        "BLPOP"
+            | "BRPOP"
+            | "BRPOPLPUSH"
+            | "BLMOVE"
+            | "BLMPOP"
+            | "BZPOPMIN"
+            | "BZPOPMAX"
+            | "BZMPOP"
+            | "XREADGROUP"
+    )
 }
 
 /// [`apply_write_side_effects`] for a caller that has already classified the

@@ -665,8 +665,7 @@ pub fn wait_out_handoff() {
 /// which Redis holds too: there, a pause of everything can only run out.
 /// With only writers paused, the commands that wait are the ones that may
 /// change the dataset or the replication stream: writes (not `SELECT`,
-/// which writes nothing and is held back from the stream meanwhile,
-/// `replication::replicate_one_write`: #411), `PFCOUNT` (which
+/// which writes nothing and is sent to nobody: #411), `PFCOUNT` (which
 /// may rewrite its key), `PUBLISH`, a script that has not declared itself
 /// free of writes, and an `EXEC` of a transaction holding any of those. A
 /// command that writes only with some of its arguments (`GEORADIUS …
@@ -725,13 +724,12 @@ pub fn queued_may_replicate<Q: AsRef<[u8]>>(command: &[Q]) -> bool {
 /// a handoff, ran behind the handoff's back, and its write was lost with
 /// the slot (#407).
 ///
-/// `SCRIPT` is not one of them, though `SCRIPT LOAD` and `SCRIPT FLUSH` are
-/// propagated: they change the script cache, not the dataset, and Redis
-/// holds neither (`NOSCRIPT`, `STALE`; neither `WRITE` nor
-/// `MAY_REPLICATE`). Holding them stalled every client that loads its
-/// scripts on connect or on `NOSCRIPT` for the whole pause, the ones that
-/// only read too (#518). While writes are paused they are kept out of the
-/// replication stream and the AOF instead (`replication::held_back`).
+/// `SCRIPT` is not one of them: `SCRIPT LOAD` and `SCRIPT FLUSH` change
+/// the script cache, not the dataset, and Redis holds neither (`NOSCRIPT`,
+/// `STALE`; neither `WRITE` nor `MAY_REPLICATE`). Holding them stalled
+/// every client that loads its scripts on connect or on `NOSCRIPT` for the
+/// whole pause, the ones that only read too (#518). They are sent to nobody
+/// now (#705), so a pause has nothing of theirs to keep out of the stream.
 fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     #[cfg(feature = "lua")]
     let declared_read_only = |name: &str, first: &[u8]| match name {
@@ -743,8 +741,7 @@ fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     let declared_read_only = |_: &str, _: &[u8]| false;
     match name {
         "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
-        // Propagated, but writes nothing (#411), nor does anything in the
-        // dataset (#518).
+        // Writes nothing (#411), nor anything in the dataset (#518).
         "SELECT" | "SCRIPT" => false,
         "EVAL" | "EVALSHA" | "FCALL" => !cmd
             .get(1)
