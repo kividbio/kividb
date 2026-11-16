@@ -44,6 +44,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Redis-style command-line directives: `kividb --appendonly yes --save 900 1
+  --maxmemory 256mb ...` (#390).** Every directive a config file or `CONFIG
+  SET` takes is now taken on the command line, in the form `redis-server`
+  takes it, with the same checks, so Compose files, Helm charts and platform
+  templates written for Redis start KiviDB unchanged. Values may be several
+  (`--save 900 1 --save 300 10`), empty (`--save ""`) or start with a dash;
+  a config file may be named first, and `-` reads config text from standard
+  input (so a `-` as the last argument is never a value). A flag KiviDB has wins over a directive, a directive wins over the
+  config file, and one KiviDB accepts but ignores logs one warning. A name
+  that is not known stops the server and names the closest one (a mistyped
+  flag such as `--prot` too), where it used to print clap's usage and exit 2;
+  it now exits 1. `--name=value` is taken too, with spaces in the value
+  (`--dir=/my dir`), which Redis does not accept. `--bind a b` lists two
+  addresses and warns that KiviDB listens on one, as the config file does.
+  No message prints the value of a password. `kividb --ping` reads them too.
+  Thanks to @mikak94 for the first implementation.
 - **`kividb --ping`, a health check that needs no shell (#433).** The images
   are distroless, so Compose files and platform templates could not run
   `redis-cli ping` and had no health check. `["CMD", "kividb", "--ping"]`
@@ -283,6 +299,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key is the table `{ok='results'}`. It was an error ("map key must be
   string or integer").
 
+- **A search query reads the clock once, and `FT.AGGREGATE` with a KNN
+  clause reads each hash once (part of #670).** A query over hashes with
+  field TTLs read the clock for every document it looked at, so one query
+  could judge two documents at different moments: a field ending while the
+  query ran was shown by half of it. It reads the clock once, when the first
+  document needs it, and none at all over hashes with no field TTL. The KNN
+  of an `FT.AGGREGATE` looked each row's hash up a second time to see
+  whether its vector was past its deadline; it uses the first read. Results
+  are the same. Instructions per query (callgrind, Azure D4s_v5, 2,000
+  hashes with a TTL on a field of each, `benchmarks/1.3.0/search-clock`):
+  `FT.AGGREGATE` with `*=>[KNN 10 @vec $q]` -3.5%, with a tag filter
+  -2.8%; `FT.SEARCH` over a tag filter -1.2%, `KNN` with a filter -1.1%, an
+  unfiltered `KNN` -0.5%; hashes with no field TTL within 0.2% either way.
+  The search of `FT.SEARCH` and hybrid `KNN` still asks the index for more
+  neighbours, up to the whole index, while hits are left out, and does not
+  stop at the query's `TIMEOUT` (#670).
+
 ### Fixed
 
 - **`SHUTDOWN` that goes ahead answers nothing, as Redis does, and one that
@@ -299,6 +332,69 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shutdown that is waiting for lagging replicas, and answers `-ERR No
   shutdown in progress.` when there is none, where it answered `+OK`. An
   unknown or conflicting modifier is `-ERR syntax error`, as in Redis.
+
+- **`ON_TIMEOUT return-strict` is accepted and `FT.SEARCH` / `FT.AGGREGATE`
+  reply with what was found, as Redis does (#781).** Redis spells the
+  policy `return-strict` (hyphen). This build only took `return_strict`
+  (underscore) and treated it as `fail`: a query cut short was an error
+  instead of a partial reply and a RESP3 warning. Both spellings are
+  taken (`FT.CONFIG SET ON_TIMEOUT`, `CONFIG SET search-on-timeout`, the
+  config file). `return-strict` and `return_strict` now match `return`
+  for `FT.SEARCH` and `FT.AGGREGATE`; only `fail` is an error.
+  `FT.HYBRID` is unchanged (#779): Redis already answers it under
+  `return-strict` with what was found.
+
+- **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
+  scan whatever follows the cursor, and read their options as Redis does
+  (#820).** `ZSCAN key 0 MATCH * COUNT 0` on a missing key answered `ERR
+  syntax error`, so sidekiq-unique-jobs, which sizes its `ZSCAN` by `ZCARD`,
+  failed on an empty digest set. The commands now read the cursor, look the
+  key up (missing: `0` and an empty list; another type: `WRONGTYPE`) and only
+  then read the options, one after another, the first fault being the one
+  reported. `COUNT` is read as Redis reads an integer, so `+3`, `03` and
+  `-0` are "not an integer" now, not taken. `NOVALUES` in `SCAN`, `SSCAN`
+  and `ZSCAN` answers `NOVALUES option can only be used in HSCAN`. On a key
+  that is there, `COUNT 0` is still a syntax error in all four commands, as
+  in Redis 8.10.2 and 8.10.3. Lua's implicit `arg` table in vararg functions
+  is not part of this fix; it comes with the move to Lua 5.1 (#756) and is
+  listed in docs/SCRIPTS.md.
+
+- **A consumer's history read of a pending entry that is gone from the
+  stream no longer makes its replicas and the AOF drop the entry (#737).**
+  `XREADGROUP ... STREAMS key 0` reports an entry removed by `XDEL`, `XTRIM`
+  or `MAXLEN` as `[id, nil]` and keeps it pending, but counted it as a
+  delivery and sent that as an `XCLAIM`, which removes an entry that is gone.
+  The primary kept it while its replicas and an AOF replay dropped it, so
+  `XPENDING` changed after a failover or a restart. Such an entry is now
+  left as it was: still pending, its delivery count and time unchanged, and
+  nothing sent, as in Redis 8.10.2. `XCLAIM` and `XAUTOCLAIM` drop it, on
+  every copy.
+
+- **A script that writes nothing, a `SELECT` and `SCRIPT LOAD` no longer
+  move the master's replication offset (#705).** A read-only script that
+  ran `SELECT`, and every `SELECT` a client sent, added a `SELECT n` to the
+  replication stream and the AOF (23 bytes each), and `SCRIPT LOAD` and
+  `SCRIPT FLUSH` added the command itself; in Redis 8.10 `master_repl_offset`
+  stays where it is for all of them. A write already carries the `SELECT`
+  it needs, so nothing is lost: scripts that write in several databases,
+  also in a transaction, reach the replica and the AOF in the same databases
+  as before. One difference you can see: a script loaded on the master is
+  no longer loaded on its replicas, as in Redis since 7.0, so a client that
+  runs `EVALSHA` there gets `NOSCRIPT` and loads the script, which is what
+  clients do for Redis. A script's writes always reached a replica as the
+  commands it made, never as `EVALSHA`, so a replica did not need it.
+
+- **A time series keeps its labels in the order they were given
+  (#612).** They were held in a hash map, whose order differs from one
+  process to the next, so `TS.INFO` and `WITHLABELS` showed the pairs in an
+  order of the server's own choosing, and a replica after a full sync, a
+  restart, a `DUMP` and `RESTORE`, or a slot migration showed them in
+  another: `DEBUG DIGEST-VALUE` of the same series then differed between
+  nodes. As in RedisTimeSeries, `TS.INFO`, `TS.MGET`, `TS.MRANGE` and
+  `TS.MREVRANGE` give them as given (the last two sorted them by name).
+  Nothing in a snapshot, a `DUMP` payload or the append-only file changes:
+  they were written as a list of pairs, and are read in the order written,
+  so files move between this release and 1.2.x either way.
 
 - **A replica promoted after its master died part way through a slot
   import deletes what the import brought, and an import sent again no
@@ -322,6 +418,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `CLUSTER RESET` forgets the imports. A replica or master of an
   earlier release behaves as before: `CLUSTER ORPHANSLOTS` lists the keys.
 
+- **`BRPOP` across many keys keeps up with many blocked clients (#758).**
+  A client blocked on 270 queues raced 270 receivers, each with a task and
+  a timer of its own, and every wait, wake-up and timeout walked a sorted
+  line of every client on each of those keys; a client that timed out also
+  woke the next client in every one of its lines, for nothing. Each client
+  now waits on one receiver with one timer, a key's line is an ordered map,
+  and a client that leaves passes its turn on only where it had one. On a
+  D4s_v5 with 200 jobs pushed every 0.1 s, 1,000 workers x 270 queues get
+  1,934 jobs/s (1.2.2: 380, Redis 8.10.2: 1,567) and 4,000 workers 1,924
+  (1.2.2: 8, Redis: 950), with the same FIFO order per key; the suite is
+  `benchmarks/1.3.0/regressions/suites/15-brpop-many-keys.py`.
+  Also, a client unblocked with `CLIENT UNBLOCK … ERROR` just as an element
+  arrived on its key no longer pops it and then answers `-UNBLOCKED` in its
+  place, losing it: it takes nothing, as in Redis.
+  And a blocking command inside `MULTI` or a script no longer stands in
+  line while it looks: a push landing then could wake it instead of the
+  client blocked behind it, which then stayed blocked with the element
+  there.
+
 - **`INFO commandstats` counts `WAIT` and `WAITAOF`, and times the commands
   the connection answers itself (#388).** `WATCH`, `UNWATCH`, `HELLO`,
   `DISCARD`, `RESET` and `AUTH` were counted with 0 microseconds; they, and
@@ -337,6 +452,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `replica`, as in Redis (`ROLE` and `INFO` still say `slave`), and the
   fallback `HELLO` in the command table has the `id` field and the
   connection's protocol too. Thanks to @matheussilvano.
+
+- **What a client reads after a push that woke a blocked client includes
+  that client's pop (#42).** The woken client was answered on its own
+  task, so its `BLPOP` could land after the `LPUSH` that woke it had
+  replied: `INFO` or `LLEN` sent right behind the push could see one change
+  fewer and the element still there, which made Redis's `BLPOP/BLMOVE
+  should increase dirty` and `Circular BRPOPLPUSH` fail now and then. Now
+  a command that reads runs only once the clients woken by the commands
+  before it on the same connection have looked at their keys, for a chain
+  of them too (waiting at most 100 ms for a client that cannot look at
+  once: paused, killed), so what a client reads after its own push is what
+  Redis shows. Writes and replies are not held: a producer pipelining
+  pushes to queues with blocked workers keeps its rate (holding replies
+  until the workers had popped cost 30-40 % of the jobs per second in
+  suite 15). What still differs from Redis, as it did before: a write
+  pipelined right behind the push that woke a client acts on the list
+  before that client's pop. A second push's reply may count the element
+  the woken client has yet to take; `LPUSHX` or `LSET` find the list
+  there; `LPOP`, `LMOVE`, `LTRIM`, `DEL` or `RENAME` may take the element
+  first, and the client then waits on. Nothing is lost or delivered
+  twice, and a replica applies the same order. In builds with Lua, a
+  push made by a script is not waited for by the reads that follow it.
+  Thanks to @willgitdata for the fix.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,

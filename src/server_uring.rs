@@ -485,7 +485,9 @@ async fn park_blocking_uring(
     // leaves the line it was standing in — or, its client gone or the role
     // changed, only to leave that line, taking nothing (see
     // `server::park_blocking`).
-    if interrupted.gone || interrupted.role_changed {
+    // Unblocked with an error, it takes nothing either: its reply is
+    // `-UNBLOCKED`, and an element popped for it would be lost (#758).
+    if interrupted.gone || interrupted.role_changed || interrupted.unblocked_with_error {
         slot.set_gone(block_state);
     } else {
         slot.set_pending(delivery, block_state);
@@ -1135,6 +1137,14 @@ pub async fn handle_client(
             // Tokio's loop already loads AOF_ENABLED per command; this parameter
             // was the boot-time snapshot and left post-toggle writes unlogged.
             let aof_enabled = crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+            // The clients the commands before this one woke have looked, if
+            // this one reads: it sees what they took (#42). A write does not
+            // wait for them, and nor do the replies.
+            if blocking_slot.settles_before(cmd[0])
+                && let Some(settling) = blocking_slot.settle()
+            {
+                settling.await;
+            }
             // ── QUIT ─────────────────────────────────────────────────────────
             // Reply +OK and close the connection. Handled in the connection
             // loop rather than the dispatch table because closing the socket
@@ -1372,7 +1382,9 @@ pub async fn handle_client(
                         if std::mem::take(&mut aof_wait) {
                             crate::aof::written(&aof_tx).await;
                         }
-                        match park_blocking_uring(
+                        // Boxed, and so polled out of line: the wait is cold, and the
+                        // connection's own future stays the size it is without it.
+                        match Box::pin(park_blocking_uring(
                             wait,
                             &mut blocking_slot,
                             &stream,
@@ -1383,7 +1395,7 @@ pub async fn handle_client(
                             &mut interrupted,
                             &peer_watch,
                             &repl_state,
-                        )
+                        ))
                         .await
                         {
                             // `parse_offset` deliberately not advanced: the same
@@ -1456,7 +1468,9 @@ pub async fn handle_client(
                     if std::mem::take(&mut aof_wait) {
                         crate::aof::written(&aof_tx).await;
                     }
-                    match park_blocking_uring(
+                    // Boxed, and so polled out of line: the wait is cold, and the
+                    // connection's own future stays the size it is without it.
+                    match Box::pin(park_blocking_uring(
                         wait,
                         &mut blocking_slot,
                         &stream,
@@ -1467,7 +1481,7 @@ pub async fn handle_client(
                         &mut interrupted,
                         &peer_watch,
                         &repl_state,
-                    )
+                    ))
                     .await
                     {
                         // See the note at the non-slowlog site above.
@@ -2900,6 +2914,9 @@ pub async fn handle_client(
         if std::mem::take(&mut aof_wait) {
             crate::aof::written(&aof_tx).await;
         }
+        // What its commands woke and nothing has waited for yet stays for
+        // the next command that reads; looks done by now are forgotten.
+        blocking_slot.forget_looked();
         // `client-output-buffer-limit` (#774): replies over the hard limit,
         // or over the soft limit for longer than its seconds, end the
         // connection unwritten, as Redis drops such a client and its output.

@@ -734,8 +734,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let (cursor, options) = match crate::commands::helpers::scan_arguments(cmd, 2, &[]) {
-                Ok(parsed) => parsed,
+            let cursor = match crate::commands::helpers::scan_cursor(cmd, 2) {
+                Ok(cursor) => cursor,
                 Err(e) => return Some(e),
             };
 
@@ -749,6 +749,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_array(vec![resp_bulk_str("0"), resp_array(vec![])]))
                 }
                 Some(value @ ValueRef::Set(s)) => {
+                    // The options are read once the key is known to be a set,
+                    // as Redis does: a missing key is an empty scan whatever
+                    // they say.
+                    let options = match crate::commands::helpers::scan_options(cmd, 3, &[]) {
+                        Ok(options) => options,
+                        Err(e) => return Some(e),
+                    };
                     // A set Redis would encode compactly comes back whole.
                     let (cursor, count) = if crate::commands::generics::scans_whole(value) {
                         (0, usize::MAX)

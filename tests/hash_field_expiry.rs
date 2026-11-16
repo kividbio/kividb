@@ -1284,6 +1284,69 @@ fn ft_knn_leaves_out_a_due_vector_as_its_removal_would() {
     }
 }
 
+/// The `n` of each row of an FT.AGGREGATE with a KNN `query` on `index` around
+/// the origin, nearest first.
+fn aggregate_knn(c: &mut Conn, index: &str, query: &str) -> Vec<String> {
+    let origin = vec2(0.0, 0.0);
+    let args: [&[u8]; 12] = [
+        b"FT.AGGREGATE",
+        index.as_bytes(),
+        query.as_bytes(),
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"LOAD",
+        b"1",
+        b"@n",
+        b"DIALECT",
+        b"2",
+    ];
+    let reply = cmd_bytes(c, &args);
+    reply.arr()[1..]
+        .iter()
+        .map(|row| {
+            let row = row.arr();
+            let at = row
+                .iter()
+                .position(|v| v.s() == "n")
+                .unwrap_or_else(|| panic!("a row with n: {reply:?}"));
+            row[at + 1].s().to_string()
+        })
+        .collect()
+}
+
+/// FT.AGGREGATE reads each hash once, and the KNN leaves out a due vector as
+/// its removal would: with the vector due and stored, as after the sweep.
+#[test]
+fn ft_aggregate_knn_leaves_out_a_due_vector_as_its_removal_would() {
+    let queries = [
+        "*=>[KNN 2 @vec $q AS d]",
+        "(@t:{red})=>[KNN 2 @vec $q AS d]",
+        "(@n:[0 10])=>[KNN 2 @vec $q AS d]",
+    ];
+    let removed = Server::start(&[]);
+    let mut r = removed.conn();
+    vectors(&mut r, "v", "FLAT", 4, 1, false, true);
+    wait_until("the sweep to remove the fields", 10, || {
+        r.cmd(&["HLEN", "v:0"]).i() == 3 && r.cmd(&["HLEN", "v:1"]).i() == 4
+    });
+    let want: Vec<_> = queries
+        .iter()
+        .map(|q| aggregate_knn(&mut r, "v", q))
+        .collect();
+    assert_eq!(want[0], ["1", "2"], "after removal");
+
+    let paused = Server::start(&[]);
+    let mut p = paused.conn();
+    vectors(&mut p, "v", "FLAT", 4, 1, false, false);
+    let got: Vec<_> = queries
+        .iter()
+        .map(|q| aggregate_knn(&mut p, "v", q))
+        .collect();
+    assert_eq!(got, want, "due and still stored");
+}
+
 #[test]
 fn ft_knn_on_a_replica_leaves_out_a_due_vector() {
     let master = Server::start(&[]);

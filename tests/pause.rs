@@ -383,15 +383,14 @@ fn client_pause_write_does_not_hold_script_load_or_flush() {
     c.ok(&["CLIENT", "UNPAUSE"]);
     assert_eq!(function_loader.read(), V::Bulk(b"lib518".to_vec()));
 
-    // With the pause over, `SCRIPT LOAD` is propagated again. (The script
-    // cache is the process's, which the replica here shares: the offset
-    // is what tells.)
+    // With the pause over, `SCRIPT LOAD` is still not propagated, as in Redis
+    // (#705): the offset does not move.
     let before = repl_field(&mut c, "master_repl_offset");
     assert!(matches!(
         rr.cmd(&["SCRIPT", "LOAD", "return 5"]),
         V::Bulk(_)
     ));
-    assert_ne!(repl_field(&mut c, "master_repl_offset"), before);
+    assert_eq!(repl_field(&mut c, "master_repl_offset"), before);
 }
 
 /// A pause of writers holds `GEORADIUS … STORE` and `GEORADIUSBYMEMBER …
