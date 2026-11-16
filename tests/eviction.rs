@@ -1783,7 +1783,7 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
 
 /// `UNLINK` hands a big collection to the background to free. A client
 /// that builds one big list after another and unlinks each, while the
-/// background frees fall behind (`lazyfree-slowly`), does not let writes
+/// background frees fall behind (`lazyfree-held`: none is freed), does not let writes
 /// past the limit: once nothing is left to evict, they are refused with
 /// OOM, the list being built too, and memory use stays within a few
 /// megabytes of the limit however many lists wait to be freed.
@@ -1793,7 +1793,7 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     let server = Server::start_in_env(
         dir,
         &["--maxmemory-policy", "allkeys-lru"],
-        &[("KIVIDB_TEST_FAILPOINTS", "lazyfree-slowly")],
+        &[("KIVIDB_TEST_FAILPOINTS", "lazyfree-held")],
     );
     let mut c = server.conn();
     let value = big_value('k');
@@ -1802,16 +1802,27 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     }
     let limit = c.limit_to(4 * MB);
     let mut builder = server.conn();
+    // Lists are built until something has been refused: the background
+    // frees take 200 ms each, and what must pile up is a few lists waiting
+    // for them. On a loaded machine the builder is slower than that, and 30
+    // lists were over before the queue had grown (nothing refused, and
+    // nothing the server did wrong).
+    let refusal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&refusal_seen);
     let built = std::thread::spawn(move || {
         let element = "e".repeat(100);
         let mut refused = 0;
-        for i in 0..30 {
+        for i in 0..300 {
+            if seen.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             let key = format!("tmp{i}");
             let mut push = vec!["RPUSH", key.as_str()];
             push.extend(std::iter::repeat_n(element.as_str(), 2000));
             for _ in 0..15 {
                 if builder.cmd(&push).is_err() {
                     refused += 1;
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             builder.cmd(&["UNLINK", &key]);
@@ -1825,6 +1836,7 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     while !built.is_finished() {
         if writer.cmd(&["SET", &format!("w{n}"), &value]).is_err() {
             refused += 1;
+            refusal_seen.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         n += 1;
         peak = peak.max(c.counted());
@@ -1834,7 +1846,7 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
         refused + refused_builds > 0,
         "nothing was refused: {n} writes"
     );
-    // 30 lists of 3 MB were built and unlinked: over the limit by no more
+    // Lists of 3 MB were built and unlinked: over the limit by no more
     // than a list being built and what was queued to be freed before the
     // limit was reached.
     assert!(
