@@ -859,6 +859,7 @@ mod tests {
             &mut db,
             &crate::watch::NoopWatchRegistry,
             "replica:test",
+            None,
         )
         .expect("applied");
         deferred || crate::vector::DEFER_INDEXING.load(SeqCst)
@@ -1800,6 +1801,7 @@ mod propagation_tests {
                     &mut db,
                     &crate::watch::NoopWatchRegistry,
                     "replica:test",
+                    None,
                 )
                 .unwrap();
         }

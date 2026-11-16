@@ -914,18 +914,34 @@ async fn run_replication_session(
             len
         };
         offset = point.offset + prelude_len as u64;
-        // A master that was this one's sibling, promoted since, continues the
-        // old stream under its own id: follow that id from here on (#109).
-        if let Some(id) = tok
-            .get(1)
-            .filter(|id| id.len() == 40 && **id != point.repl_id)
-            && let Some(current) = repl_state.resync_point.lock().as_mut()
-        {
-            log_info!(
-                "Replication: The master continues {} as {id}",
-                current.repl_id
-            );
-            current.repl_id = id.to_string();
+        // A master that was this one's sibling, promoted since, continues
+        // the old stream under its own id; so does one a dataset digest
+        // says this node is at the start of, under the id it announces —
+        // the id a replica that asked `PSYNC ? -1` had nothing kept of at
+        // all. Either way, what is kept as where this dataset stands is
+        // that stream's id, and the place it is continued from (#109).
+        if let Some(id) = tok.get(1).filter(|id| id.len() == 40) {
+            let mut slot = repl_state.resync_point.lock();
+            match slot.as_mut() {
+                Some(current) => {
+                    if current.repl_id.as_str() != *id {
+                        log_info!(
+                            "Replication: The master continues {} as {id}",
+                            current.repl_id
+                        );
+                        current.repl_id = id.to_string();
+                    }
+                    current.offset = point.offset;
+                    current.db = point.db;
+                }
+                None => {
+                    *slot = Some(crate::replication::ResyncPoint {
+                        repl_id: id.to_string(),
+                        offset: point.offset,
+                        db: point.db,
+                    });
+                }
+            }
         }
         repl_state.set_stream_origin(repl_state.cluster_master_node());
         log_info!(
@@ -1451,9 +1467,12 @@ async fn run_replication_session(
             // Stored as the older master did; the backlog keeps raw bytes for offsets.
             let keeps_vset_quant = repl_state.master_keeps_vset_quant.load(Ordering::Relaxed);
             let mut dropped_vset_quant = false;
-            // One command, a write the master sent as it is.
+            // One command, a write the master sent as it is. `$alone` is
+            // whether the turn the command is applied in holds the command
+            // gate alone: the decision `run_command` takes of
+            // `Ctx::applied_gate_alone` instead of working it out again.
             macro_rules! apply {
-                ($cmd:expr) => {
+                ($cmd:expr, $alone:expr) => {
                     repl_apply
                         .apply_command(
                             if keeps_vset_quant {
@@ -1475,6 +1494,7 @@ async fn run_replication_session(
                             &mut selected_db,
                             &crate::watch::ForStore(store),
                             addr.as_str(),
+                            Some($alone),
                         )
                         .map_err(|e| {
                             // Where the dataset stands is no longer known to
@@ -1556,7 +1576,7 @@ async fn run_replication_session(
                         let _propagation = repl_apply.propagation_group(repl_state);
                         heartbeats_seen |= whole.heartbeat;
                         for cmd in whole.commands {
-                            apply!(cmd);
+                            apply!(cmd, alone);
                         }
                         whole.len
                     }
@@ -1602,7 +1622,7 @@ async fn run_replication_session(
                             if alone && !wants_alone && parse_pos > 0 {
                                 break;
                             }
-                            apply!(cmd.iter().map(|v| v.to_vec()).collect());
+                            apply!(cmd.iter().map(|v| v.to_vec()).collect(), alone);
                             parse_pos += consumed;
                             // Holding the gate shared, a turn ends when
                             // something waits to take it alone, as the gate
@@ -2236,6 +2256,10 @@ impl ReplicationApplyEnv {
         }
     }
 
+    /// `gate_alone`: whether the caller holds the command gate alone for
+    /// this command — the applier's decision, which `run_command` takes of
+    /// `Ctx::applied_gate_alone` instead of working it out again. `None`
+    /// where no decision was made (the AOF replay): `run_command` asks.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_command(
         &self,
@@ -2251,6 +2275,7 @@ impl ReplicationApplyEnv {
         selected_db: &mut usize,
         watch_registry: &dyn crate::watch::WatchNotifier,
         peer_addr: &str,
+        gate_alone: Option<bool>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::replication::keydb::{self, Translated};
         // What KeyDB sends that Redis does not: member TTLs (`EXPIREMEMBER`),
@@ -2277,6 +2302,7 @@ impl ReplicationApplyEnv {
             selected_db,
             watch_registry,
             peer_addr,
+            gate_alone,
         );
         if let Some(what) = member_ttl
             && out.starts_with(b"-WRONGTYPE")
@@ -2309,6 +2335,7 @@ impl ReplicationApplyEnv {
         selected_db: &mut usize,
         watch_registry: &dyn crate::watch::WatchNotifier,
         peer_addr: &str,
+        gate_alone: Option<bool>,
     ) -> Vec<u8> {
         use crate::commands::ctx::Ctx;
         use crate::commands::execute_command;
@@ -2360,6 +2387,7 @@ impl ReplicationApplyEnv {
             cluster: &self.cluster,
             bypass_cluster_check: true,
             apply_replication: true,
+            applied_gate_alone: gate_alone,
             skip_write_side_effects: false,
             peer_addr,
             monitor_registry: &self.monitor_registry,
@@ -2419,6 +2447,7 @@ pub(crate) fn run_as_client(
         cluster: &env.cluster,
         bypass_cluster_check: true,
         apply_replication: false,
+        applied_gate_alone: None,
         skip_write_side_effects: false,
         peer_addr: "client:test",
         monitor_registry: &env.monitor_registry,
@@ -2854,6 +2883,7 @@ mod repl_apply_env_tests {
                 &mut db,
                 &crate::watch::NoopWatchRegistry,
                 peer.as_str(),
+                None,
             )
             .expect("apply SET");
         }
@@ -2871,6 +2901,7 @@ mod repl_apply_env_tests {
             &mut db,
             &crate::watch::NoopWatchRegistry,
             peer.as_str(),
+            None,
         )
         .unwrap();
 

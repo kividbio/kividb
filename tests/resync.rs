@@ -557,6 +557,13 @@ fn write_batch(master: &mut Conn, round: usize, count: usize) {
 /// The same data on both sides — compared through commands whose answers
 /// depend on every write having been applied exactly once.
 fn assert_same_dataset(master: &mut Conn, replica: &mut Conn) {
+    // Of the same stream first: an offset counts in the stream a replica
+    // follows, and one still on an old stream could be far enough along it
+    // to satisfy the check below while holding another stream's data.
+    assert_eq!(
+        master.info("replication", "master_replid"),
+        replica.info("replication", "master_replid"),
+    );
     // At least as far as the master was: its heartbeats go on adding to its
     // offset, and the replica can step past this one between two looks.
     let offset: u64 = master

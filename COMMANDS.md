@@ -1456,7 +1456,9 @@ cluster master that came back without its dataset waits for its replica
 (see below). On a replica it reports
 `master_link_status` — `up` only when the replica is synced and receiving —
 `master_last_io_seconds_ago`, `master_link_down_since_seconds` while the link
-is down, `master_sync_in_progress`, `slave_repl_offset`, and the guard's state
+is down, `master_sync_in_progress`, `slave_repl_offset`, `master_replid` (the
+id of the stream the offset counts in; all zeros before a master has answered
+a PSYNC), and the guard's state
 (`replica_full_sync_guard`, `replica_full_syncs_refused`,
 `replica_last_sync_refusal`).
 
