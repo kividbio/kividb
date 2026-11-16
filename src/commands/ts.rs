@@ -128,6 +128,8 @@ struct TsOptions {
     timestamp: Option<u64>,
     /// Where each `TIMESTAMP` option is among the options.
     timestamp_at: Vec<usize>,
+    /// `IGNORE max-time-diff max-val-diff`: suppresses duplicate or near-duplicate samples.
+    ignore: Option<(u64, f64)>,
 }
 
 /// RedisTimeSeries's error for a `CHUNK_SIZE` out of its bounds.
@@ -315,8 +317,28 @@ fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsO
                 }
                 options.labels = Some(labels);
             }
-            b"IGNORE" if strict => {
-                return Err(resp_error("TSDB: IGNORE is not supported"));
+            b"IGNORE" => {
+                let parse_ignore = || -> Option<(u64, f64)> {
+                    let time_diff = std::str::from_utf8(tokens.get(i + 1)?).ok()?.parse().ok()?;
+                    let val_diff: f64 =
+                        std::str::from_utf8(tokens.get(i + 2)?).ok()?.parse().ok()?;
+                    if val_diff.is_nan() || val_diff < 0.0 {
+                        return None;
+                    }
+                    Some((time_diff, val_diff))
+                };
+                match parse_ignore() {
+                    Some(pair) => {
+                        options.ignore = Some(pair);
+                        i += 3;
+                    }
+                    None if strict => {
+                        return Err(resp_error("TSDB: Couldn't parse IGNORE"));
+                    }
+                    None => {
+                        i += 1;
+                    }
+                }
             }
             // Passed over, as RedisTimeSeries does.
             _ => i += 1,
@@ -335,6 +357,10 @@ fn configure_new(ts: &mut TsInner, options: &TsOptions) {
     }
     if let Some(policy) = &options.duplicate_policy {
         ts.duplicate_policy = policy.clone();
+    }
+    if let Some((time_diff, val_diff)) = options.ignore {
+        ts.ignore_max_time_diff = time_diff;
+        ts.ignore_max_val_diff = val_diff;
     }
     for (lk, lv) in options.labels.iter().flatten() {
         ts.labels.insert(lk.clone(), lv.clone());
@@ -806,6 +832,10 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if let Some(dp) = options.duplicate_policy {
                 ts.duplicate_policy = dp;
             }
+            if let Some((time_diff, val_diff)) = options.ignore {
+                ts.ignore_max_time_diff = time_diff;
+                ts.ignore_max_val_diff = val_diff;
+            }
 
             if let Some(new_labels) = options.labels {
                 let old_labels = std::mem::take(&mut ts.labels);
@@ -898,6 +928,9 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if let Some(dp) = &options.duplicate_policy {
                 ts.duplicate_policy = dp.clone();
             }
+        }
+        if let Some(existing_ts) = ts.should_ignore(timestamp, value, &policy, options.ignore) {
+            return Some(resp_integer(existing_ts as i64));
         }
         ts.add_sample_as(timestamp, value, &policy)
     };
@@ -1370,6 +1403,9 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 })
                 .collect();
             out.push(resp_array(rules_resp));
+
+            kv!("ignoreMaxTimeDiff", ts.ignore_max_time_diff);
+            kv!("ignoreMaxValDiff", ts.ignore_max_val_diff);
 
             Some(resp_array(out))
         }

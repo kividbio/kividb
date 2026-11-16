@@ -584,6 +584,12 @@ pub struct TsInner {
     /// in `TS.INFO`, and where `LATEST` finds the bucket still open (#128).
     /// By name: `key_bytes::text_of` of its key.
     pub source: Option<String>,
+
+    /// Maximum time difference in milliseconds for the IGNORE filter.
+    pub ignore_max_time_diff: u64,
+
+    /// Maximum absolute value difference for the IGNORE filter.
+    pub ignore_max_val_diff: f64,
 }
 
 impl TsInner {
@@ -597,6 +603,38 @@ impl TsInner {
             rules: Vec::new(),
             last_ts: None,
             source: None,
+            ignore_max_time_diff: 0,
+            ignore_max_val_diff: 0.0,
+        }
+    }
+
+    /// Checks whether an incoming sample should be ignored (suppressed) by the IGNORE filter.
+    /// Returns `Some(max_timestamp)` if ignored, or `None` if it should be added.
+    pub fn should_ignore(
+        &self,
+        ts: u64,
+        value: f64,
+        policy: &DuplicatePolicy,
+        override_ignore: Option<(u64, f64)>,
+    ) -> Option<u64> {
+        if self.source.is_some() || *policy != DuplicatePolicy::Last {
+            return None;
+        }
+        let (max_time_diff, max_val_diff) = match override_ignore {
+            Some(pair) => pair,
+            None => {
+                if self.ignore_max_time_diff == 0 && self.ignore_max_val_diff == 0.0 {
+                    return None;
+                }
+                (self.ignore_max_time_diff, self.ignore_max_val_diff)
+            }
+        };
+        let (&max_ts, &max_val) = self.samples.iter().next_back()?;
+        if ts >= max_ts && (ts - max_ts) <= max_time_diff && (value - max_val).abs() <= max_val_diff
+        {
+            Some(max_ts)
+        } else {
+            None
         }
     }
 
@@ -608,6 +646,9 @@ impl TsInner {
             return Err(BLOCKED_DUPLICATE);
         }
         let policy = self.duplicate_policy.clone();
+        if let Some(existing_ts) = self.should_ignore(ts, value, &policy, None) {
+            return Ok(existing_ts);
+        }
         self.add_sample_as(ts, value, &policy)
     }
 

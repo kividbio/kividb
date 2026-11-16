@@ -1777,7 +1777,7 @@ fn test_ts_unknown_option_is_passed_over() {
     let refused: &[&[&str]] = &[
         &["TS.ALTER", "opt:u", "RETENTION"],
         &["TS.ALTER", "opt:u", "RETENTION", "0", "ENCODING", "FOO"],
-        &["TS.CREATE", "opt:new", "IGNORE", "5", "0.5"],
+        &["TS.CREATE", "opt:new", "IGNORE", "5"],
         &["TS.DECRBY", "opt:new", "1", "TIMESTAMP"],
     ];
     for cmd in refused {
@@ -2428,4 +2428,158 @@ fn test_ts_labels_keep_the_order_given() {
     // The label index finds them: the series with alpha=v1 (the second name).
     let r = c.cmds(&["TS.QUERYINDEX", "alpha=v1"]);
     assert!(!r.as_array().is_empty());
+}
+
+// ── IGNORE option tests ──────────────────────────────────────────────────────
+
+#[test]
+fn test_ts_create_and_alter_ignore() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // TS.CREATE with IGNORE
+    assert!(
+        c.cmds(&["TS.CREATE", "ts:ign:create", "IGNORE", "5000", "0.5",])
+            .is_ok()
+    );
+
+    let info = c.cmds(&["TS.INFO", "ts:ign:create"]);
+    let arr = info.as_array();
+    let find_field = |name: &str| -> Option<usize> {
+        arr.iter().position(|v| match v {
+            RespValue::Bulk(b) => std::str::from_utf8(b).unwrap_or("") == name,
+            RespValue::SimpleStr(s) => s.as_str() == name,
+            _ => false,
+        })
+    };
+    let time_pos = find_field("ignoreMaxTimeDiff").unwrap();
+    assert_eq!(arr[time_pos + 1].as_str(), "5000");
+    let val_pos = find_field("ignoreMaxValDiff").unwrap();
+    assert_eq!(arr[val_pos + 1].as_str(), "0.5");
+
+    // TS.ALTER with IGNORE
+    assert!(
+        c.cmds(&["TS.ALTER", "ts:ign:create", "IGNORE", "10000", "1.25",])
+            .is_ok()
+    );
+    let info = c.cmds(&["TS.INFO", "ts:ign:create"]);
+    let arr = info.as_array();
+    let time_pos = find_field("ignoreMaxTimeDiff").unwrap();
+    assert_eq!(arr[time_pos + 1].as_str(), "10000");
+    let val_pos = find_field("ignoreMaxValDiff").unwrap();
+    assert_eq!(arr[val_pos + 1].as_str(), "1.25");
+}
+
+#[test]
+fn test_ts_add_ignore_suppression() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // Create series with IGNORE 5000 (ms) and 0.5 (val delta)
+    assert!(
+        c.cmds(&[
+            "TS.CREATE",
+            "ts:filter",
+            "DUPLICATE_POLICY",
+            "LAST",
+            "IGNORE",
+            "5000",
+            "0.5",
+        ])
+        .is_ok()
+    );
+
+    // First sample is always stored
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:filter", "1000", "10.0"]).as_int(),
+        1000
+    );
+
+    // Delta t = 1000 (<= 5000), Delta v = 0.2 (<= 0.5) -> IGNORED, returns last stored ts (1000)
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:filter", "2000", "10.2"]).as_int(),
+        1000
+    );
+
+    // Verify it was NOT stored in the series
+    let range = c.cmds(&["TS.RANGE", "ts:filter", "-", "+"]);
+    let samples = range.as_array();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].as_array()[0].as_int(), 1000);
+    assert_eq!(samples[0].as_array()[1].as_f64(), 10.0);
+
+    // Delta t = 1000 (<= 5000), Delta v = 0.6 (> 0.5) -> NOT ignored, stored
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:filter", "2000", "10.6"]).as_int(),
+        2000
+    );
+    let range = c.cmds(&["TS.RANGE", "ts:filter", "-", "+"]);
+    assert_eq!(range.as_array().len(), 2);
+
+    // Delta t = 6000 (> 5000), Delta v = 0.1 (<= 0.5) -> NOT ignored, stored
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:filter", "8000", "10.7"]).as_int(),
+        8000
+    );
+    let range = c.cmds(&["TS.RANGE", "ts:filter", "-", "+"]);
+    assert_eq!(range.as_array().len(), 3);
+}
+
+#[test]
+fn test_ts_add_auto_create_with_ignore_and_override() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // Auto-create with IGNORE
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:auto", "1000", "20.0", "IGNORE", "3000", "1.0"])
+            .as_int(),
+        1000
+    );
+
+    // Within threshold -> ignored, returns 1000
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:auto", "2500", "20.8"]).as_int(),
+        1000
+    );
+
+    // Per-command override threshold allows wider delta
+    // Normal threshold would ignore delta_v = 0.5, but with IGNORE 500 0.1, delta_t 2000 > 500 -> stored!
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:auto", "3000", "20.5", "IGNORE", "500", "0.1"])
+            .as_int(),
+        3000
+    );
+}
+
+#[test]
+fn test_ts_ignore_malformed_syntax() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let err_msg = "TSDB: Couldn't parse IGNORE";
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:bad", "IGNORE"]),
+        RespValue::Error(err_msg.to_string())
+    );
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:bad", "IGNORE", "5000"]),
+        RespValue::Error(err_msg.to_string())
+    );
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:bad", "IGNORE", "abc", "0.5"]),
+        RespValue::Error(err_msg.to_string())
+    );
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:bad", "IGNORE", "5000", "xyz"]),
+        RespValue::Error(err_msg.to_string())
+    );
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:bad", "IGNORE", "5000", "-0.5"]),
+        RespValue::Error(err_msg.to_string())
+    );
 }
