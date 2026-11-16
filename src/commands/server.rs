@@ -3083,10 +3083,8 @@ const FAST_COMMANDS: &[&str] = &[
 ];
 
 /// Whether `name` (upper case) is in `@write`, and flagged `write` by
-/// `COMMAND`. That is what is sent to replicas
-/// ([`crate::replication::is_write_command`]) but `SELECT`: replicas are
-/// sent it to follow the database, and Redis has it in `@fast @connection`
-/// only (#392).
+/// `COMMAND`. That is [`crate::replication::is_write_command`] but
+/// `SELECT`, which Redis has in `@fast @connection` only (#392).
 fn is_acl_write(name: &str) -> bool {
     (crate::replication::is_write_command(name) && name != "SELECT")
         || WRITES_BY_ARGUMENT.contains(&name)
