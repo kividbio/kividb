@@ -205,6 +205,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Active defrag's pass ends about twice as fast, at the same CPU cap
+  (#240, #291).** It slept after every batch of 128 buckets, and each sleep
+  overshot; it now sleeps once a millisecond of work is owed its rest, at
+  the same `active-defrag-cycle-max`, and between its holds hands a busy
+  shard to a waiting client. On Azure (5M keys, half deleted) a pass took
+  6 s instead of 13 s and gave memory back in 6 s instead of 12 s, with no
+  measurable change in `GET`/`SET` p99.9 during the pass.
+  Thanks @Parikalp-Bhardwaj.
+
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
   FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
