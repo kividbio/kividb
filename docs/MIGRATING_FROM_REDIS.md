@@ -24,6 +24,14 @@ If you aren't sure whether your application runs scripts, run
 `INFO commandstats` on your Redis and look for `cmdstat_eval`,
 `cmdstat_evalsha` and `cmdstat_fcall`.
 
+Scripts and function libraries run on Lua 5.4, where Redis runs Lua 5.1.
+Most move over unchanged, and `string.format('%d', x)` takes an `x` with a
+fraction as on Redis. One thing to look for: a number divided with `/` is a
+float, written `5.0` and not `5`, so a key or a value built with `..` or
+`tostring` from a division differs. Wrap the division in `math.floor(...)`
+or format it with `string.format('%d', ...)`. The other differences, with
+workarounds, are in [SCRIPTS.md](SCRIPTS.md#lua-54-and-how-it-differs-from-rediss-lua-51).
+
 ## 2. Port and network
 
 - **KiviDB listens on 6380, not 6379**, so the two can run side by side
@@ -45,8 +53,10 @@ you already use carry over, under the same names.
 directive KiviDB doesn't know stops the server, with an error naming it.
 Start from KiviDB's own file and carry over the settings you changed.
 Directives for machinery KiviDB doesn't have (`io-threads`, `hz`,
-`tcp-keepalive`, `lazyfree-*`, `rdbcompression` and similar) are accepted
-with a warning and do nothing.
+`tcp-keepalive`, `lazyfree-lazy-eviction`, `rdbcompression` and similar)
+are accepted with a warning and do nothing. `lazyfree-lazy-expire` and
+`lazyfree-lazy-user-del` are in effect: `lazyfree-lazy-user-del yes` makes
+`DEL` free a large value in the background, as `UNLINK` does.
 
 The ones that behave differently:
 
@@ -56,7 +66,7 @@ The ones that behave differently:
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
 | `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. |
-| `client-output-buffer-limit` | Not supported: remove it. Pub/Sub subscribers get Redis's default limits. |
+| `client-output-buffer-limit` | As in Redis, but a replica has no soft limit by default. A replica's hard limit is the same setting as `repl-replica-max-backlog-bytes`, and the last line that sets it wins; during a full sync a replica is held to `repl-replica-sync-max-backlog-bytes` instead. A carried-over `client-output-buffer-limit replica 256mb 64mb 60` takes effect: it turns the 64 MB soft limit on and puts the hard limit at 256 MB. Leave it out to keep KiviDB's defaults. |
 | `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets and Bloom filters (`BF.*`) are built in. |
 | Sentinel | No Sentinel. Use replication with your own failover, or cluster mode (`--cluster-enabled yes`), which fails over by itself. |
 

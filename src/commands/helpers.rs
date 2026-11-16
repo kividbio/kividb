@@ -434,7 +434,7 @@ pub fn active_expire_cycle(
             // looks only at those (#618): before, every cycle went over every
             // key with a time to live, due or not.
             if read_lock!(db_values[shard]).ttl_sweep_due(now) {
-                while !write_lock!(db_values[shard]).sweep_ttl(now, TTL_SWEEP_STEPS) {}
+                db_values[shard].sweep_ttl(now, TTL_SWEEP_STEPS);
             }
             // A batch at a time: a pass stops at the batch's last key, so it
             // copies no more keys than it deletes. Collecting every due key
@@ -638,11 +638,13 @@ const SHRINK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Shrink the tables, and lists of keys with a time to live, of `cursor`'s
 /// shards that keys have mostly left ([`store::ShardLock::shrink_if_sparse`],
-/// #113).
+/// #113), and finish the growth of those growing
+/// ([`store::ShardLock::step_growth`], #752).
 fn shrink_sparse_tables(store: &Store, cursor: &ExpireCursor) {
     for db in store.iter() {
         for (s, shard) in db.iter().enumerate() {
             if cursor.owns(s) {
+                shard.step_growth();
                 shard.shrink_if_sparse();
             }
         }
@@ -783,6 +785,50 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// [`glob_match`] of bytes: a channel's name need not be UTF-8.
 pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
     super::glob_redis::matches(pattern, text)
+}
+
+/// How many keys, or elements, a command goes through before it is long
+/// enough for [`long_work`] to move it off the runtime: a few milliseconds of
+/// work. Below it, what moving costs (a thread handed the runtime's work, tens
+/// of microseconds) is more than what it saves.
+pub const LONG_WORK: usize = 65_536;
+
+/// Run `f`, a command's work over `units` keys or elements, so that other
+/// clients are served meanwhile.
+///
+/// On the Tokio runtime a command runs on a worker thread, inline. The
+/// worker that got the command is, often, the one that was waiting on the
+/// sockets for the others: while it runs a long command nothing waits on
+/// them, and every connection's next command waits for this one to end,
+/// whatever thread would have served it (#754). So past [`LONG_WORK`] the
+/// work runs with the worker's other tasks handed to another thread, as
+/// `tokio::task::block_in_place` does. On the io_uring runtime, each thread
+/// serves its own connections, and only those wait.
+#[inline]
+pub fn long_work<R>(units: usize, f: impl FnOnce() -> R) -> R {
+    if units >= LONG_WORK {
+        crate::cluster::migration::off_the_runtime(f)
+    } else {
+        f()
+    }
+}
+
+/// How long the Tokio runtime keeps an idle thread of its blocking pool.
+///
+/// [`long_work`] hands its worker's tasks to a thread of that pool, and the
+/// thread the command ran on joins the pool when it ends. With Tokio's
+/// default of 10 s, long commands further apart than that made a new thread
+/// each time, and every new thread that runs a command takes, for good, a
+/// slot of the command gate and of the write gate and a stripe of
+/// `memory_use`: past 128 slots every `EXEC` and script takes all 128.
+/// Kept for hours, the threads that served long commands serve the next.
+pub const RUNTIME_THREAD_KEEP_ALIVE: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
+/// How many keys database `db` holds, expired ones not yet removed included:
+/// `DBSIZE`. A shard's lock at a time.
+pub fn db_len(db: &crate::store::Db) -> usize {
+    db.iter().map(|shard| read_lock!(shard).len()).sum()
 }
 
 /// The latest deadline a command may give a hash field, in Unix
@@ -977,18 +1023,16 @@ pub fn delete_key(store: &Store, db: usize, key: &(impl AsRef<[u8]> + ?Sized)) -
     take_key(store, db, key).is_some()
 }
 
-/// [`delete_key`], saying about how much memory the key took: what
-/// deleting it gives back, or leaves to a snapshot that still holds it
-/// (`store::Taken::footprint`). For eviction to see that it gets anywhere.
-pub fn delete_key_sized(
+/// [`delete_key`], handing back the key's entry, for eviction to say about
+/// how much memory it took (`store::Taken::footprint`) and then free it, or
+/// leave it to a snapshot that still holds it, with the shard unlocked.
+pub fn take_entry(
     store: &Store,
     db: usize,
     key: &(impl AsRef<[u8]> + ?Sized),
-) -> Option<usize> {
+) -> Option<store::Taken> {
     let value_shard = store::get_shard(&store[db], key);
-    let removed = write_lock!(value_shard).remove(key)?;
-    // Freed (or left to what holds it) with the shard unlocked.
-    Some(removed.footprint())
+    write_lock!(value_shard).remove(key)
 }
 
 /// [`delete_key`], handing back the value, for `UNLINK` to free: after the
@@ -1322,25 +1366,44 @@ pub struct ScanOptions {
     pub no_scores: bool,
 }
 
-/// The cursor and the options of a scan command, from `cmd[at..]`.
-/// `extra` names the options this command takes besides `MATCH` and `COUNT`.
-pub fn scan_arguments(
-    cmd: &[&[u8]],
-    at: usize,
-    extra: &[&str],
-) -> Result<(u64, ScanOptions), Vec<u8>> {
-    use crate::resp::write::resp_error;
-    let syntax = || resp_error("ERR syntax error");
-    let cursor = cmd
-        .get(at)
+/// The cursor of a scan command, at `cmd[at]`.
+///
+/// Redis reads the cursor first, then looks the key up (a missing key is an
+/// empty scan, a key of another type is `WRONGTYPE`), and only then reads the
+/// options: so the `*SCAN` commands that take a key call this, look the key
+/// up, and call `scan_options` once the key is a collection of theirs.
+pub fn scan_cursor(cmd: &[&[u8]], at: usize) -> Result<u64, Vec<u8>> {
+    cmd.get(at)
         .and_then(|raw| parse_utf8(raw))
         .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| resp_error("ERR invalid cursor"))?;
+        .ok_or_else(|| crate::resp::write::resp_error("ERR invalid cursor"))
+}
+
+/// A `COUNT` as Redis reads a 64-bit integer: no sign but `-`, no spaces, no
+/// leading zeros, no `-0`.
+fn count_integer(raw: &[u8]) -> Option<i64> {
+    let digits = raw.strip_prefix(b"-").unwrap_or(raw);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if digits[0] == b'0' && (digits.len() > 1 || raw.len() > 1) {
+        return None;
+    }
+    std::str::from_utf8(raw).ok()?.parse().ok()
+}
+
+/// `[MATCH pattern] [COUNT count]` and whatever else a scan command takes,
+/// from `cmd[from..]`, read in order as Redis does: the first fault is the
+/// one reported. `extra` names the options this command takes besides
+/// `MATCH` and `COUNT`.
+pub fn scan_options(cmd: &[&[u8]], from: usize, extra: &[&str]) -> Result<ScanOptions, Vec<u8>> {
+    use crate::resp::write::resp_error;
+    let syntax = || resp_error("ERR syntax error");
     let mut options = ScanOptions {
         count: 10,
         ..Default::default()
     };
-    let mut i = at + 1;
+    let mut i = from;
     while i < cmd.len() {
         let word = String::from_utf8_lossy(cmd[i]).to_ascii_uppercase();
         let value = cmd.get(i + 1);
@@ -1350,7 +1413,7 @@ pub fn scan_arguments(
                 i += 2;
             }
             ("COUNT", Some(count)) => {
-                options.count = match parse_utf8(count).and_then(|s| s.parse::<i64>().ok()) {
+                options.count = match count_integer(count) {
                     Some(n) if n >= 1 => n as usize,
                     Some(_) => return Err(syntax()),
                     None => return Err(resp_error("ERR value is not an integer or out of range")),
@@ -1365,6 +1428,9 @@ pub fn scan_arguments(
                 options.no_values = true;
                 i += 1;
             }
+            ("NOVALUES", _) => {
+                return Err(resp_error("ERR NOVALUES option can only be used in HSCAN"));
+            }
             ("NOSCORES", _) if extra.contains(&"NOSCORES") => {
                 options.no_scores = true;
                 i += 1;
@@ -1372,7 +1438,17 @@ pub fn scan_arguments(
             _ => return Err(syntax()),
         }
     }
-    Ok((cursor, options))
+    Ok(options)
+}
+
+/// The cursor and the options of a scan command, from `cmd[at..]`.
+pub fn scan_arguments(
+    cmd: &[&[u8]],
+    at: usize,
+    extra: &[&str],
+) -> Result<(u64, ScanOptions), Vec<u8>> {
+    let cursor = scan_cursor(cmd, at)?;
+    Ok((cursor, scan_options(cmd, at + 1, extra)?))
 }
 
 #[cfg(test)]

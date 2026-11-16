@@ -669,6 +669,12 @@ async fn run_replication_session(
             .find_map(|line| line.strip_prefix("kividb_version:"))
             .map(|version| version.trim().to_string())
     });
+    // Asked only of a master whose `PSYNC` reply does not say.
+    let info_keeps_vset_quant = crate::replication::vset_quant_kept_by(master_info.as_deref());
+    // Unknown again until this master's `PSYNC` reply.
+    repl_state
+        .master_keeps_vset_quant
+        .store(false, Ordering::Relaxed);
     repl_state.master_dd_deletes.store(
         master_version
             .as_deref()
@@ -733,11 +739,22 @@ async fn run_replication_session(
     // And a master that came back without its dataset says so
     // (`+LOSTDATA <its node id>`) to a replica that takes that word, instead
     // of offering a sync: see `ClusterState::check_dataset_at_start`.
-    send_command(
-        &mut writer,
-        &["REPLCONF", "capa", "dataset-digest", "capa", "lost-data"],
-    )
-    .await?;
+    //
+    // And the imports a cluster master has under way (`slot-imports`,
+    // #741), unless a test has this node act as an earlier release.
+    let mut capas = vec![
+        "REPLCONF",
+        "capa",
+        "dataset-digest",
+        "capa",
+        "lost-data",
+        "capa",
+        "vset-quant",
+    ];
+    if !crate::replication::hides_slot_imports_capability() {
+        capas.extend(["capa", crate::replication::SLOT_IMPORTS_CAPA]);
+    }
+    send_command(&mut writer, &capas).await?;
     let _ = guarded(
         read_line(&mut reader),
         timeout,
@@ -844,6 +861,35 @@ async fn run_replication_session(
         .first()
         .map(|s| s.trim_start_matches('+').to_ascii_uppercase())
         .unwrap_or_default();
+    // Before any of the stream is applied, logged or recorded.
+    let keeps_vset_quant = if crate::replication::psync_reply_keeps_vset_quant(&fullresync) {
+        true
+    } else {
+        let syncs = cmd0 == "FULLRESYNC" || cmd0 == "CONTINUE";
+        if syncs && !info_keeps_vset_quant {
+            log_info!(
+                "Replication: The master (KiviDB {}) did not offer vset-quant: this replica \
+                 stores its vector sets as f32, as an older master did",
+                master_version
+                    .as_deref()
+                    .unwrap_or("?, no INFO server answer")
+            );
+        }
+        info_keeps_vset_quant
+    };
+    repl_state
+        .master_keeps_vset_quant
+        .store(keeps_vset_quant, Ordering::Relaxed);
+    // What this node knew of its master's slot imports holds for this
+    // session only if the master tells of them, and the dataset is not
+    // replaced (#741).
+    if cmd0 == "FULLRESYNC" || cmd0 == "CONTINUE" {
+        repl_state.slot_imports_event(crate::replication::SlotImportsEvent::Session {
+            marked: !crate::replication::hides_slot_imports_capability()
+                && crate::replication::psync_reply_has_slot_imports(&fullresync),
+            full: cmd0 == "FULLRESYNC",
+        });
+    }
 
     // The stream as it will be read below: what has arrived and is not yet
     // applied, how many bytes have arrived in all, and which database the
@@ -1176,6 +1222,10 @@ async fn run_replication_session(
             offset: master_offset,
             db: 0,
         }));
+        // Nothing before this offset is continuable; an older watermark is another numbering.
+        repl_state
+            .vset_quant_dropped_until
+            .store(master_offset, Ordering::Relaxed);
         repl_state.set_stream_origin(repl_state.cluster_master_node());
         // Every key in it that this master expires is sent as a `DEL`, if
         // it sends them at all: nothing is left for a sweep.
@@ -1398,12 +1448,22 @@ async fn run_replication_session(
         let mut applied_commands = false;
         if pending_input {
             pending_input = false;
+            // Stored as the older master did; the backlog keeps raw bytes for offsets.
+            let keeps_vset_quant = repl_state.master_keeps_vset_quant.load(Ordering::Relaxed);
+            let mut dropped_vset_quant = false;
             // One command, a write the master sent as it is.
             macro_rules! apply {
                 ($cmd:expr) => {
                     repl_apply
                         .apply_command(
-                            $cmd,
+                            if keeps_vset_quant {
+                                $cmd
+                            } else {
+                                let (cmd, dropped) =
+                                    crate::vector::quant::without_quant_options($cmd);
+                                dropped_vset_quant |= dropped;
+                                cmd
+                            },
                             store,
                             repl_state,
                             index_store,
@@ -1483,6 +1543,8 @@ async fn run_replication_session(
                     );
                     return Ok(SessionEnd::Superseded);
                 }
+                // A slot-imports marker at the front of what is left (#741).
+                let mut marker: Option<usize> = None;
                 let parse_pos = match transaction {
                     Some(whole) => {
                         // As `EXEC` runs on the master: alone, so that no
@@ -1512,6 +1574,16 @@ async fn run_replication_session(
                                 heartbeats_seen = true;
                                 parse_pos += consumed;
                                 continue;
+                            }
+                            if cmd.first().is_some_and(|name| {
+                                name.eq_ignore_ascii_case(crate::replication::SLOT_IMPORTS_MARKER)
+                            }) {
+                                // Not part of the stream: on a turn of its
+                                // own, below, at the front.
+                                if parse_pos == 0 {
+                                    marker = Some(consumed);
+                                }
+                                break;
                             }
                             if heartbeats {
                                 // The rest, on a turn with the gate.
@@ -1544,6 +1616,20 @@ async fn run_replication_session(
                         parse_pos
                     }
                 };
+                if let Some(consumed) = marker {
+                    // Told the cluster layer here, every command before it
+                    // applied and none after, under the lock a promotion
+                    // takes; then taken out of the stream: no offset counts
+                    // it, no backlog keeps it, nothing applies it.
+                    if let Some((_, cmd)) = parse_resp_command(&repl_buf[head..head + consumed]) {
+                        repl_state
+                            .slot_imports_event(crate::replication::SlotImportsEvent::Marker(&cmd));
+                    }
+                    repl_buf.drain(head..head + consumed);
+                    offset -= consumed as u64;
+                    transaction_scanned = 0;
+                    continue;
+                }
                 if parse_pos == 0 {
                     if next_alone {
                         continue;
@@ -1555,6 +1641,11 @@ async fn run_replication_session(
                 head += parse_pos;
                 transaction_scanned = 0;
                 applied = offset - (repl_buf.len() - head) as u64;
+                if std::mem::take(&mut dropped_vset_quant) {
+                    repl_state
+                        .vset_quant_dropped_until
+                        .fetch_max(applied, Ordering::Relaxed);
+                }
                 repl_state.repl_offset.store(applied, Ordering::Relaxed);
                 if let Some(point) = repl_state.resync_point.lock().as_mut() {
                     point.offset = applied;
@@ -2398,6 +2489,10 @@ pub async fn handle_replica_connection<R, W>(
     listening_port: Option<u16>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
+    // It sent `REPLCONF capa vset-quant`.
+    vset_quant_announced: bool,
+    // It sent `REPLCONF capa slot-imports`.
+    slot_imports_announced: bool,
     // The connection's `CLIENT KILL` signal: it ends the link (#595).
     mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -2504,6 +2599,7 @@ where
         peer_port,
         tx: replica_tx,
         pending_bytes,
+        slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
@@ -2551,11 +2647,13 @@ where
     // The payload is not counted against `maxmemory` until it is written
     // (#284).
     let mut payload_not_counted = None;
+    // Outside the stream: offsets do not count it.
+    let word = repl_state.psync_words(vset_quant_announced, slot_imports_announced);
     match full_sync {
-        None => frames.push(format!("+CONTINUE {}\r\n", repl_state.repl_id()).into_bytes()),
+        None => frames.push(format!("+CONTINUE {}{word}\r\n", repl_state.repl_id()).into_bytes()),
         Some(sync) => {
             if !legacy_sync {
-                frames.push(sync.announcement(&repl_state.repl_id()).into_bytes());
+                frames.push(sync.announcement(&repl_state.repl_id(), &word).into_bytes());
             }
             frames.push(format!("${}\r\n", sync.payload.len()).into_bytes());
             frames.push(sync.payload);

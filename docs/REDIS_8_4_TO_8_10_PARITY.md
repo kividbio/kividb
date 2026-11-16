@@ -123,7 +123,8 @@ does.
   `JSON.OBJLEN key`, `JSON.TYPE key` return a plain value.
 * Objects keep their members in insertion order (they used to be sorted by
   name). This shows in `JSON.GET`, `JSON.OBJKEYS` and `$~`.
-* `JSON.SET` on a key holding another type is a `WRONGTYPE` error; it used to
+* `JSON.SET` on a key holding another type is an error (`Existing key has wrong
+  Redis type`, as RedisJSON answers); it used to
   replace the key.
 * `JSON.GET` understands `INDENT`, `NEWLINE` and `SPACE`; they used to be
   taken for paths.
@@ -338,7 +339,7 @@ Beyond the report:
 | Per-iterator timings in `FT.PROFILE` | — | The times reported are the query's as a whole. |
 | Parse-batch metrics in `INFO` and `CLIENT LIST` | 8.8 | Not reported. |
 | `XIDMPRECORD` | 8.6 | Internal to Redis's AOF rewrite; KiviDB saves idempotency state in its snapshot instead. |
-| `client-output-buffer-limit` | — | Not configurable: Pub/Sub uses Redis's default limits, replicas `repl-replica-max-backlog-bytes`. |
+| `client-output-buffer-limit` | — | Configurable since 1.3.0 (#774). A replica's hard limit is `repl-replica-max-backlog-bytes`; during a full sync it is held to `repl-replica-sync-max-backlog-bytes` instead. |
 | A master's replication ID across a restart, without the AOF | — | A master restarted without the AOF has a new ID, and its replicas resync in full. Since 1.1.0, with the AOF on, a master stopped cleanly keeps its ID and offset. A restarted replica continues by partial resync. |
 
 ## Known gaps in what is implemented
@@ -348,8 +349,10 @@ Beyond the report:
   later element than Redis would give it. Order of service is unaffected, and
   nothing is lost or delivered twice.
 * `OBJECT IDLETIME` is `0` under `noeviction` and the policies that do not go
-  by use: keys are watched only when a policy needs it, so that the default
-  costs a command nothing. Redis always tracks one of idle time or frequency.
+  by use unless `key-access-tracking yes` is set: keys are watched only when
+  a policy needs it, so that the default costs a command nothing. Redis always
+  tracks one of idle time or frequency; `key-access-tracking yes` does too, for
+  about 1 to 1.5% of a pipelined `GET` or `SET`.
 * A replica waits for its master's `DEL` of a key that expires, as in Redis,
   except under a KiviDB master older than 1.1.3, which sends none: there it
   expires keys by its own clock, as every replica did before 1.1.3. Both hold

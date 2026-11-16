@@ -865,6 +865,91 @@ fn test_scan_match_filters_without_dropping_unmatched_from_cursor_progress() {
     c.cmds(&["SELECT", "0"]);
 }
 
+fn mset(conn: &mut Conn, keys: impl Iterator<Item = String>) {
+    let mut args = vec!["MSET".to_string()];
+    for k in keys {
+        args.push(k);
+        args.push("v".to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    assert!(conn.cmds(&refs).is_ok());
+}
+
+/// A key there from a scan's first call to its last is returned, whatever
+/// is written and deleted in between: here, after every call, another
+/// client adds keys enough to make every shard's table grow several times
+/// over and deletes others, and some keys are past their time (#751).
+#[test]
+fn test_scan_returns_every_lasting_key_while_the_keyspace_grows_and_shrinks() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+
+    c.cmds(&["SELECT", "9"]);
+    other.cmds(&["SELECT", "9"]);
+    c.cmds(&["FLUSHDB"]);
+
+    const LASTING: usize = 3000;
+    const DOOMED: usize = 3000;
+    mset(&mut c, (0..LASTING).map(|i| format!("lasting:{i}")));
+    mset(&mut c, (0..DOOMED).map(|i| format!("doomed:{i}")));
+    for i in 0..50 {
+        assert!(
+            c.cmds(&["SET", &format!("lasting:past:{i}"), "v", "PX", "1"])
+                .is_ok()
+        );
+    }
+    thread::sleep(Duration::from_millis(20));
+
+    let mut found = std::collections::HashSet::new();
+    let mut cursor = "0".to_string();
+    let mut calls = 0;
+    let mut added = 0;
+    let mut deleted = 0;
+    loop {
+        calls += 1;
+        assert!(calls <= 100_000, "SCAN never came back to cursor 0");
+        let r = c.cmds(&["SCAN", &cursor, "MATCH", "lasting:*", "COUNT", "20"]);
+        let parts = r.as_array();
+        cursor = parts[0].as_str().to_string();
+        for item in parts[1].as_array() {
+            let key = item.as_str().to_string();
+            assert!(key.starts_with("lasting:"), "MATCH let {key} through");
+            assert!(!key.starts_with("lasting:past:"), "{key} is past its time");
+            found.insert(key);
+        }
+        if cursor == "0" {
+            break;
+        }
+        // Keys that come and go, and others that stay.
+        mset(&mut other, (added..added + 400).map(|i| format!("new:{i}")));
+        added += 400;
+        if deleted < DOOMED {
+            let mut args = vec!["DEL".to_string()];
+            args.extend((deleted..(deleted + 100).min(DOOMED)).map(|i| format!("doomed:{i}")));
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            other.cmds(&refs);
+            deleted += 100;
+        }
+    }
+    // The tables grew to several times what they held when the scan began.
+    assert!(added >= 4 * (LASTING + DOOMED), "only {added} keys added");
+    let missing: Vec<String> = (0..LASTING)
+        .map(|i| format!("lasting:{i}"))
+        .filter(|k| !found.contains(k))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "SCAN missed {} keys: {:?}",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+
+    c.cmds(&["FLUSHDB"]);
+    c.cmds(&["SELECT", "0"]);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // SERVER COMMANDS
 // ═════════════════════════════════════════════════════════════════════════════

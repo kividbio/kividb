@@ -542,6 +542,16 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR CONFIG SET failed (possibly related to argument 'activedefrag') - argument must be 'yes' or 'no'",
                 )),
             },
+            // Giving free memory back once idle (#753): see src/give_back.rs.
+            "allocator-give-back" => match value.to_ascii_lowercase().as_str() {
+                "yes" | "no" => {
+                    crate::give_back::set_enabled(value.eq_ignore_ascii_case("yes"));
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'allocator-give-back') - argument must be 'yes' or 'no'",
+                )),
+            },
             "active-defrag-ignore-bytes" => match memory_size(value) {
                 Some(bytes) => {
                     crate::compaction::set_ignore_bytes(bytes as u64);
@@ -810,10 +820,14 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 )),
             },
             // Read for each write the hub queues: a change applies to the
-            // replicas already attached (#305).
+            // replicas already attached (#305). 0 is no limit, as
+            // `client-output-buffer-limit replica 0 0 0` sets it; and any
+            // value that sets, this takes back, so that `CONFIG GET` reads
+            // back through `CONFIG SET` (and a failed `CONFIG SET` of several
+            // settings puts it back) (#774).
             "repl-replica-max-backlog-bytes" | "repl-replica-sync-max-backlog-bytes" => {
                 match memory_size(value) {
-                    Some(bytes) if bytes > 0 && bytes <= i64::MAX as usize => {
+                    Some(bytes) => {
                         let limit = if param == "repl-replica-max-backlog-bytes" {
                             &ctx.repl_state.replica_max_backlog_bytes
                         } else {
@@ -822,12 +836,39 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         limit.store(bytes as u64, Ordering::Relaxed);
                         Some(resp_simple("OK"))
                     }
-                    _ => Some(resp_error(&format!(
+                    None => Some(resp_error(&format!(
                         "ERR CONFIG SET failed (possibly related to argument '{param}') - \
-                         argument must be a memory value of at least 1 byte"
+                         argument must be a memory value"
                     ))),
                 }
             }
+            // `<class> <hard> <soft> <seconds>`, for one class or more (#774).
+            // Normal and subscribed clients' limits are the hub's, read as
+            // each reply or message is queued; a replica's are the
+            // replication's, read for each write the hub queues, its hard
+            // limit being `repl-replica-max-backlog-bytes`.
+            "client-output-buffer-limit" => match crate::output_limits::parse(value) {
+                Ok(classes) => {
+                    for (class, limit) in classes {
+                        if class == crate::output_limits::Class::Replica {
+                            let rs = &ctx.repl_state;
+                            rs.replica_max_backlog_bytes
+                                .store(limit.hard, Ordering::Relaxed);
+                            rs.replica_soft_limit_bytes
+                                .store(limit.soft, Ordering::Relaxed);
+                            rs.replica_soft_limit_secs
+                                .store(limit.soft_seconds, Ordering::Relaxed);
+                        } else {
+                            ctx.pubsub.limits().set(class, limit);
+                        }
+                    }
+                    Some(resp_simple("OK"))
+                }
+                Err(why) => Some(resp_error(&format!(
+                    "ERR CONFIG SET failed (possibly related to argument \
+                     'client-output-buffer-limit') - {why}"
+                ))),
+            },
             // Read when a shutdown begins to wait for the replicas.
             "shutdown-timeout" => match value.parse::<u64>() {
                 Ok(v) if v <= i32::MAX as u64 => {
@@ -1333,7 +1374,9 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             // Settings of Redis's that take yes or no: remembered, and in
             // effect where KiviDB has what they set (`lazyfree-lazy-expire`
             // decides whether a key that expires is propagated as `UNLINK`
-            // or `DEL`; `latency-tracking`, whether `INFO latencystats`
+            // or `DEL`; `lazyfree-lazy-user-del`, whether `DEL` frees a large
+            // value in the background, as `UNLINK` does (#754);
+            // `latency-tracking`, whether `INFO latencystats`
             // reports; `rdbchecksum no`, that an RDB file's checksum is not
             // checked as it is loaded). Anything else is refused, as Redis
             // refuses it.
@@ -1406,14 +1449,16 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
-                if matches!(policy.as_str(), "return" | "fail" | "return_strict")
-                    && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
+                if matches!(
+                    policy.as_str(),
+                    "return" | "fail" | "return-strict" | "return_strict"
+                ) && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
                 {
                     Some(resp_simple("OK"))
                 } else {
                     Some(resp_error(
                         "ERR CONFIG SET failed (possibly related to argument 'search-on-timeout') \
-                         - argument(s) must be one of the following: return, fail, return_strict",
+                         - argument(s) must be one of the following: return, fail, return-strict, return_strict",
                     ))
                 }
             }
@@ -1982,6 +2027,26 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
     )
 });
 
+/// `client-output-buffer-limit` in effect now, as `CONFIG GET` gives it.
+fn output_buffer_limits(ctx: &Ctx) -> String {
+    use crate::output_limits::{Class, Limit, Limits};
+    use std::sync::atomic::Ordering::Relaxed;
+    let rs = &ctx.repl_state;
+    let mut limits = Limits::default();
+    for class in [Class::Normal, Class::PubSub] {
+        limits.set(class, ctx.pubsub.limits().get(class));
+    }
+    limits.set(
+        Class::Replica,
+        Limit {
+            hard: rs.replica_max_backlog_bytes.load(Relaxed),
+            soft: rs.replica_soft_limit_bytes.load(Relaxed),
+            soft_seconds: rs.replica_soft_limit_secs.load(Relaxed),
+        },
+    );
+    limits.to_config_string()
+}
+
 /// Every setting `CONFIG GET` knows, with its value now: the ones that are
 /// in effect, then the ones that are only remembered.
 fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
@@ -2023,6 +2088,8 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("logfile", ctx.config.logfile.clone()),
         ("log-format", ctx.config.log_format.clone()),
         ("databases", ctx.config.databases.to_string()),
+        // All three classes, always, as Redis gives them (#774).
+        ("client-output-buffer-limit", output_buffer_limits(ctx)),
         // As given with `--threads` (0: one per core), the value `CONFIG
         // REWRITE` keeps, not the count it resolved to on this machine.
         ("threads", ctx.config.threads.to_string()),
@@ -2047,6 +2114,15 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "activedefrag",
             if crate::compaction::enabled() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
+        (
+            "allocator-give-back",
+            if crate::give_back::enabled() {
                 "yes"
             } else {
                 "no"
@@ -2874,12 +2950,14 @@ const ADMIN_COMMANDS: &[&str] = &[
     "CLUSTER|COUNT-FAILURE-REPORTS",
     "CLUSTER|DELSLOTS",
     "CLUSTER|DELSLOTSRANGE",
+    "CLUSTER|DROPORPHANS",
     "CLUSTER|FAILOVER",
     "CLUSTER|FLUSHSLOTS",
     "CLUSTER|FORGET",
     "CLUSTER|LINKS",
     "CLUSTER|MEET",
     "CLUSTER|MIGRATION",
+    "CLUSTER|ORPHANSLOTS",
     "CLUSTER|REPLICAS",
     "CLUSTER|REPLICATE",
     "CLUSTER|RESET",
@@ -3007,10 +3085,8 @@ const FAST_COMMANDS: &[&str] = &[
 ];
 
 /// Whether `name` (upper case) is in `@write`, and flagged `write` by
-/// `COMMAND`. That is what is sent to replicas
-/// ([`crate::replication::is_write_command`]) but `SELECT`: replicas are
-/// sent it to follow the database, and Redis has it in `@fast @connection`
-/// only (#392).
+/// `COMMAND`. That is [`crate::replication::is_write_command`] but
+/// `SELECT`, which Redis has in `@fast @connection` only (#392).
 fn is_acl_write(name: &str) -> bool {
     (crate::replication::is_write_command(name) && name != "SELECT")
         || WRITES_BY_ARGUMENT.contains(&name)
@@ -3735,19 +3811,14 @@ fn keysize_count(bins: &mut KeysizeBins, value: crate::store::ValueRef<'_>) {
 ///
 /// A shard nobody writes to meanwhile is counted exactly. Under writes the
 /// count is approximate, as a `SCAN` is: a key written or deleted
-/// meanwhile is counted or not, and keys move between buckets when the
-/// table is rehashed. A resize changes how many buckets there are, and the
-/// shard is then counted again (in one hold after a few tries); a rehash
-/// in place, at the same size, which the table does when deleted keys
-/// have used up its room to grow, cannot be seen from here, and in the
-/// part not yet counted a key may then be counted twice or not at all.
+/// meanwhile is counted or not. Keys move between buckets when the table
+/// grows, rehashes in place, shrinks or takes a step of a growth, and each
+/// of those changes `ShardMap::layout`: the shard is then counted again
+/// (in one hold after a few tries).
 ///
 /// One hold for the whole shard would be exact: about 20 ms for a shard
 /// of a million keys (21 ns a key measured, 5 million keys on 8 vCPUs), a
-/// wait for every write to it, every 10 s while `INFO all` is asked. A
-/// count of rehashes kept by the table would let the walk start again on
-/// one too, but needs a check on every insert, the `SET` path. For a
-/// distribution refreshed every 10 seconds neither is worth it.
+/// wait for every write to it, every 10 s while `INFO all` is asked.
 ///
 /// `between` is called with no lock held after each part (for tests).
 fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> KeysizeBins {
@@ -3759,7 +3830,9 @@ fn keysizes_of_shard(shard: &crate::store::Shard, between: &mut dyn FnMut()) -> 
         loop {
             let map = read_lock!(shard);
             let buckets = map.buckets();
-            if *size.get_or_insert(buckets) != buckets {
+            // A growth's steps move keys without a change of size.
+            let layout = (buckets, map.layout());
+            if *size.get_or_insert(layout) != layout {
                 tries += 1;
                 if tries < 3 {
                     continue 'shard;
@@ -4314,6 +4387,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // (`replication::expiry_propagated_by`).
                 out.push_str(crate::replication::EXPIRY_PROPAGATED_INFO);
                 out.push_str("\r\n");
+                // Not on a replica of a master that ignores the options.
+                if ctx.repl_state.keeps_vset_quant() {
+                    out.push_str(crate::replication::VSET_QUANT_INFO);
+                    out.push_str("\r\n");
+                }
                 // And each hash field expired here, as an `HDEL`
                 // (`replication::field_expiry_propagated_by`). Not said under
                 // `KIVIDB_TEST_NO_FIELD_EXPIRY_CAPABILITY`, for the tests of a
@@ -4404,9 +4482,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // standalone server.
                 out.push_str("# Cluster\r\n");
                 out.push_str(&format!(
-                    "cluster_enabled:{}\r\n\r\n",
+                    "cluster_enabled:{}\r\n",
                     u8::from(ctx.config.cluster_enabled)
                 ));
+                // KiviDB's own: the slots this master holds keys of but
+                // does not serve, and those keys, as last counted (#517).
+                if ctx.config.cluster_enabled {
+                    let (slots, keys) = ctx.cluster.orphans.last_count();
+                    out.push_str(&format!(
+                        "cluster_orphan_slots:{slots}\r\ncluster_orphan_keys:{keys}\r\n"
+                    ));
+                    // And of those, the slots of which an unfinished import
+                    // into its old master brought keys, still to be
+                    // deleted (#741).
+                    out.push_str(&format!(
+                        "cluster_import_cleanup_slots:{}\r\n",
+                        crate::cluster::followed_imports::slots_to_clean(ctx.cluster)
+                    ));
+                }
+                out.push_str("\r\n");
             }
 
             if want("keyspace") {
@@ -4524,6 +4618,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!(
                     "slowlog_commands_time_ms_max:{:.2}\r\n",
                     slow_us_max as f64 / 1000.0
+                ));
+                out.push_str(&format!(
+                    "client_output_buffer_limit_disconnections:{}\r\n",
+                    crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.load(Ordering::Relaxed)
                 ));
                 out.push_str(&format!(
                     "total_error_replies:{}\r\n",
@@ -4799,6 +4897,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let fill = crate::value_slab::fill();
                 out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
                 out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
+                // Times freed memory was given back to the system after a
+                // large fall in what is allocated (#753).
+                out.push_str(&format!(
+                    "allocator_trims:{}\r\n",
+                    crate::give_back::trims()
+                ));
+                // ... and times one was put off while the server was busy.
+                out.push_str(&format!(
+                    "allocator_trims_skipped_busy:{}\r\n",
+                    crate::give_back::skipped_busy()
+                ));
                 out.push_str(&format!(
                     "used_memory_rss_human:{}\r\n",
                     crate::commands::memory::human_bytes_pub(rss)
@@ -5246,6 +5355,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // resets its `stat_active_defrag_*` (#370).
                     crate::compaction::reset_stats();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
+                    crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.store(0, Ordering::Relaxed);
                     // Not `rdb_changes_since_last_save`: that is not a
                     // statistic, and Redis keeps it (#566).
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
@@ -5619,6 +5729,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_takes_digest = true;
+                        info.replica_vset_quant.get_or_insert(false);
                     });
                 }
                 if cmd[i].eq_ignore_ascii_case(b"capa")
@@ -5626,6 +5737,23 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_lost_data = 1;
+                        info.replica_vset_quant.get_or_insert(false);
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1]
+                        .eq_ignore_ascii_case(crate::replication::SLOT_IMPORTS_CAPA.as_bytes())
+                    && !crate::replication::hides_slot_imports_capability()
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_slot_imports = true;
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1].eq_ignore_ascii_case(b"vset-quant")
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_vset_quant = Some(true);
                     });
                 }
                 i += 2;
@@ -6255,7 +6383,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // HELLO is intercepted in the server loops before reaching here.
             // If it arrives here something went wrong — return a minimal response
             // rather than an error, so clients don't break.
-            Some(resp_array(vec![
+            let proto = ctx.resp as i64;
+            let fields = vec![
                 resp_bulk_str("server"),
                 resp_bulk_str("redis"),
                 resp_bulk_str("version"),
@@ -6263,14 +6392,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 resp_bulk_str("kividb_version"),
                 resp_bulk_str(env!("CARGO_PKG_VERSION")),
                 resp_bulk_str("proto"),
-                resp_integer(2),
+                resp_integer(proto),
+                resp_bulk_str("id"),
+                resp_integer(ctx.client_id as i64),
                 resp_bulk_str("mode"),
-                resp_bulk_str("standalone"),
+                resp_bulk_str(if ctx.cluster.enabled {
+                    "cluster"
+                } else {
+                    "standalone"
+                }),
                 resp_bulk_str("role"),
-                resp_bulk_str("master"),
+                resp_bulk_str(&ctx.repl_state.hello_role()),
                 resp_bulk_str("modules"),
-                module_list_reply(2),
-            ]))
+                module_list_reply(proto as u8),
+            ];
+            Some(if proto == 3 {
+                resp_map(fields)
+            } else {
+                resp_array(fields)
+            })
         }
 
         "TIME" => {
@@ -6344,70 +6484,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             Some(resp_simple("Background append only file rewriting started"))
         }
 
-        "SHUTDOWN" => {
-            // SHUTDOWN [NOSAVE | SAVE | NOW | FORCE | ABORT]
-            //
-            // We cannot write the snapshot here — execute_command is a plain fn
-            // with no async executor.  Instead we set two global atomics and
-            // return +OK.  The signal-watching thread in main.rs reads the flag
-            // and drives the real shutdown sequence (snapshot + process::exit).
-            //
-            // ABORT clears the pending flag and returns OK immediately so the
-            // caller knows the in-progress shutdown was cancelled.
-
-            use crate::shutdown::{SHUTDOWN_MODE, SHUTDOWN_PENDING, mode};
-            use std::sync::atomic::Ordering::Relaxed;
-
-            let modifier = ctx
-                .cmd
-                .get(1)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .map(|s| s.to_ascii_uppercase());
-
-            match modifier.as_deref() {
-                // SHUTDOWN ABORT — cancel a pending shutdown.
-                Some("ABORT") => {
-                    SHUTDOWN_PENDING.store(false, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN NOSAVE — exit without writing snapshot.
-                Some("NOSAVE") => {
-                    SHUTDOWN_MODE.store(mode::NOSAVE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    // Return OK before the process exits; the signal thread will
-                    // call process::exit shortly after, so the client may or may
-                    // not receive this response — that is Redis-compatible behaviour.
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN NOW — skip AOF flush wait, write snapshot immediately.
-                Some("NOW") => {
-                    SHUTDOWN_MODE.store(mode::NOW, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN FORCE — ignore replica/AOF checks.
-                Some("FORCE") => {
-                    SHUTDOWN_MODE.store(mode::FORCE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN / SHUTDOWN SAVE — default: write snapshot then exit.
-                None | Some("SAVE") => {
-                    SHUTDOWN_MODE.store(mode::SAVE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // Unknown modifier — match Redis's exact error.
-                Some(other) => Some(resp_error(&format!(
-                    "ERR SHUTDOWN requires NOSAVE, SAVE, NOW, FORCE, or ABORT, not '{other}'"
-                ))),
-            }
-        }
+        "SHUTDOWN" => Some(shutdown_command(&ctx.cmd)),
 
         // ── Tier 3 rejections — Lua / Functions / Modules ───────────────────
         //
@@ -6529,6 +6606,62 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 pub(crate) fn all_commands_for_test() -> &'static [&'static str] {
     ALL_COMMANDS
+}
+
+/// `SHUTDOWN [NOSAVE | SAVE] [NOW] [FORCE] | SHUTDOWN ABORT`
+///
+/// As in Redis, a shutdown that goes ahead is answered with nothing: the
+/// connection closes when the process exits, after the final save. We cannot
+/// write the snapshot here, and the connection must not be answered before it
+/// is known to have succeeded, so the handler only validates and asks for the
+/// shutdown (`shutdown::request`), and returns no reply. The connection loop
+/// flushes the replies that came before and waits for the signal-watching
+/// thread in main.rs, which drives the real sequence (`shutdown::Final`) and
+/// ends the process. A shutdown that fails or is aborted is answered with an
+/// error (`shutdown::FAILED_REPLY`) and the server runs on.
+///
+/// Out of line, so that the command dispatch is the same size as it was.
+#[cold]
+#[inline(never)]
+fn shutdown_command(cmd: &[&[u8]]) -> Vec<u8> {
+    use crate::shutdown::{self, mode};
+
+    let (mut nosave, mut save, mut now, mut force, mut abort) = (false, false, false, false, false);
+    for arg in cmd.iter().skip(1) {
+        if arg.eq_ignore_ascii_case(b"NOSAVE") {
+            nosave = true;
+        } else if arg.eq_ignore_ascii_case(b"SAVE") {
+            save = true;
+        } else if arg.eq_ignore_ascii_case(b"NOW") {
+            now = true;
+        } else if arg.eq_ignore_ascii_case(b"FORCE") {
+            force = true;
+        } else if arg.eq_ignore_ascii_case(b"ABORT") {
+            abort = true;
+        } else {
+            return resp_error("ERR syntax error");
+        }
+    }
+    if (nosave && save) || (abort && (nosave || save || now || force)) {
+        return resp_error("ERR syntax error");
+    }
+    if abort {
+        return if shutdown::abort() {
+            resp_simple("OK")
+        } else {
+            resp_error(shutdown::NO_SHUTDOWN_IN_PROGRESS)
+        };
+    }
+    // As in Redis: while a script runs past its time limit, only a shutdown
+    // that saves nothing may stop it. A save would wait for the script.
+    #[cfg(feature = "lua")]
+    if !nosave && shutdown::script_busy() {
+        return crate::commands::script_busy_reply();
+    }
+    let m = if nosave { mode::NOSAVE } else { mode::SAVE } | if now { mode::NOW } else { 0 };
+    shutdown::request(m, force);
+    // No reply: see above.
+    Vec::new()
 }
 
 pub fn acl_cat_commands_pub(category: &str) -> Vec<&'static str> {

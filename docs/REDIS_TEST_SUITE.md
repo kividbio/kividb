@@ -27,8 +27,15 @@ it fail for that reason and not their own.
 a server started empty**, with a no-progress limit of five minutes and a
 limit of fifteen on a unit as a whole. A unit that hangs or dies costs
 itself. The script prints a line per unit, writes the table to the job's
-summary page, and keeps every unit's log as an artifact. It exits 0 whatever
-the tests did: it is a measurement, not a gate.
+summary page, and keeps every unit's log as an artifact.
+
+It is a gate on what fails. `scripts/redis_compat_known_failures.txt` lists
+the tests KiviDB is known to fail, by unit and name. A unit with any other
+failure, or that ends early (an exception, a test that never finishes, the
+unit's time running out, the server gone), is run once more, and fails the job if it fails again: a
+regression fails twice, a flake once. A listed test that passes is printed
+as a notice, to be taken off the list. `scripts/redis_compat_check.sh`
+decides; `scripts/redis_compat_check_test.sh` tests it.
 
 ```
 scripts/redis_compat.sh <kividb-binary> <redis-checkout> [<output-dir>]
@@ -44,7 +51,8 @@ tests of that kind and contribute nothing either way.
 
 CI runs Redis 8.10.2's suite since 1.1.1, the release KiviDB reports itself
 as. The figures below are from Redis 8.0.0's suite, which it ran before; the
-CI job's summary has the current ones.
+CI job's summary has the current ones, and
+`scripts/redis_compat_known_failures.txt` what fails today.
 
 Redis 8.0.0's suite, on Linux, io_uring loop:
 
@@ -164,7 +172,7 @@ need action or attention:
 
 ## What still fails
 
-Thirty-one tests, in three groups.
+Twenty-nine tests, in three groups.
 
 **Things KiviDB does not have (17).**
 
@@ -175,8 +183,7 @@ Thirty-one tests, in three groups.
 | `latency-monitor` | 2 | the `expire-cycle` latency event |
 | `querybuf` | 2 | these are on **io_uring only**: the server reports `idle=` correctly now, but io_uring has no idle timer to shrink a private query buffer while the client waits, so the unit's idle-wait on a smaller `qbuf` never satisfies. The second failure is a knock-on of the first, not a separate gap. On **Tokio** the whole unit passes (see below) |
 
-**Redis's internal encodings (5).** `dump` (2): `RESTORE … IDLETIME` and
-`FREQ` are accepted and not applied. `type/hash` (2) and the one unit that
+**Redis's internal encodings (3).** `type/hash` (2) and the one unit that
 still ends early, `type/stream-cgroups`: the tests `RESTORE` a payload
 produced by Redis itself; KiviDB's `DUMP` format is its own and it does not
 read Redis's. `hyperloglog` (1): the test reads the cache-valid bit of
@@ -189,7 +196,10 @@ Redis's HyperLogLog header with `GETRANGE`.
 - `introspection` (2): `CONFIG SET maxmemory-clients` and `CONFIG SET port`
   are accepted and remembered without being applied, so the tests'
   out-of-range value and unusable port are not refused.
-- `introspection-2` (1): `TTL`, `TYPE` and `EXISTS` reset a key's idle time.
+- `introspection-2` (1): `OBJECT IDLETIME` is 0 under `noeviction` unless
+  `key-access-tracking yes` is set (off by default), so the test of `TTL`,
+  `TYPE` and `EXISTS` leaving a key's idle time alone fails; it passes with it
+  on.
 - `pubsub` (2): a RESP3 client that publishes to a channel it is subscribed
   to, from inside a script or a transaction, gets the message before the
   reply to the script; Redis sends the reply first.

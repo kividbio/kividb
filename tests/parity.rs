@@ -398,7 +398,8 @@ fn commandstats_count_every_call() {
 }
 
 /// The commands a connection answers itself, without `execute_command`, are
-/// counted too: `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`, `RESET` and `AUTH`.
+/// counted too: `WATCH`, `UNWATCH`, `HELLO`, `DISCARD`, `RESET`, `AUTH`, `WAIT`
+/// and `WAITAOF`.
 /// A server of its own, and [`stats_lock`], so that no other test adds to
 /// the counts.
 #[test]
@@ -422,6 +423,8 @@ fn commandstats_count_the_connection_commands() {
     // RESET drops the authentication: the connection has to log in again to
     // read the statistics, and that is a second call of AUTH.
     assert!(c.cmd(&["AUTH", "secret"]).ok());
+    assert_eq!(c.cmd(&["WAIT", "0", "0"]).i(), 0);
+    assert!(matches!(c.cmd(&["WAITAOF", "0", "0", "0"]), V::Arr(_)));
     let mut calls = |name: &str| {
         let stats = cmdstat(&mut c, name).unwrap_or_else(|| panic!("no cmdstat_{name} line"));
         (stats["calls"], stats["failed_calls"])
@@ -433,6 +436,45 @@ fn commandstats_count_the_connection_commands() {
     assert_eq!(calls("discard"), (2.0, 1.0));
     assert_eq!(calls("auth"), (2.0, 1.0));
     assert_eq!(calls("reset"), (1.0, 0.0));
+    assert_eq!(calls("wait"), (1.0, 0.0));
+    assert_eq!(calls("waitaof"), (1.0, 0.0));
+}
+
+/// `WAIT` inside `MULTI` is queued and counted once, when `EXEC` runs it (not
+/// as the `+QUEUED` reply too); and a `WAIT` that blocks is counted for the
+/// work of the call, not for the time the client waited, as in Redis (where
+/// a `WAIT 1 300` with no replica adds nothing to `usec`). A server of its
+/// own, and [`stats_lock`], so that no other test adds to the counts.
+#[test]
+fn commandstats_wait_counts_calls_not_blocked_time() {
+    let _stats = stats_lock();
+    let mut c = Conn::connect(start("secret"));
+    assert!(c.cmd(&["AUTH", "secret"]).ok());
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+
+    assert!(c.cmd(&["MULTI"]).ok());
+    assert_eq!(c.cmd(&["WAIT", "0", "0"]).s(), "QUEUED");
+    assert_eq!(c.cmd(&["WAITAOF", "0", "0", "0"]).s(), "QUEUED");
+    let exec = c.cmd(&["EXEC"]);
+    assert_eq!(exec.arr().len(), 2, "{exec:?}");
+    let counts = |c: &mut Conn, name: &str| {
+        let stats = cmdstat(c, name).unwrap_or_else(|| panic!("no cmdstat_{name} line"));
+        (stats["calls"], stats["failed_calls"])
+    };
+    assert_eq!(counts(&mut c, "multi"), (1.0, 0.0));
+    assert_eq!(counts(&mut c, "exec"), (1.0, 0.0));
+    assert_eq!(counts(&mut c, "wait"), (1.0, 0.0));
+    assert_eq!(counts(&mut c, "waitaof"), (1.0, 0.0));
+
+    // No replica: WAIT 1 200 blocks for 200 ms and answers 0. Those 200 ms
+    // are not the time of the command.
+    let began = std::time::Instant::now();
+    assert_eq!(c.cmd(&["WAIT", "1", "200"]).i(), 0);
+    assert!(began.elapsed() >= std::time::Duration::from_millis(150));
+    let stats = cmdstat(&mut c, "wait").unwrap();
+    assert_eq!(stats["calls"], 2.0, "{stats:?}");
+    assert!(stats["usec"] < 100_000.0, "{stats:?}");
+    assert!(stats["usec_per_call"] < 100_000.0, "{stats:?}");
 }
 
 // ── Expiry: notifications, and hash fields ────────────────────────────────────

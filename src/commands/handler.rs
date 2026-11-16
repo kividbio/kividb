@@ -784,8 +784,8 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // client tracking that key is not told. Judged by the arguments, as the
     // propagation below judges it (`command_mutates_for_replication`).
     let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
-    // A `SELECT` is propagated, but writes nothing: a script that has only
-    // selected a database can still be killed (#424).
+    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`):
+    // a script that has only selected a database can still be killed (#424).
     #[cfg(feature = "lua")]
     if !result.starts_with(b"-")
         && inner_write
@@ -820,7 +820,10 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         && !repl_is_slave
         && !ctx.apply_replication
         && !propagates_nothing(name2, ctx.cmd.as_slice(), &result)
-        && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
+        // Not a `SELECT`: a write carries the one it needs, from the database
+        // it ran in, and a script that only selected one sent nothing in
+        // Redis, whose offset it must not move (#705).
+        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
     {
         let feeds = replication::script_feed::commands_for_propagation(
             ctx,
@@ -1002,15 +1005,40 @@ fn is_script(name: &str) -> bool {
 }
 
 /// What the lookups of the command `name`, started at `now`, write to the
-/// keys they find: see `store::AccessScope`.
-#[cold]
-#[inline(never)]
-fn access_scope(name: &str, now: std::time::Instant, cmd: &[&[u8]]) -> crate::store::AccessScope {
+/// keys they find: see `store::AccessScope`. And whether the keys have their
+/// use written after the command, by `eviction::used`: a script's declared
+/// keys, and a modification under the LRM policies.
+#[inline(always)]
+fn access_scope(
+    name: &str,
+    now: std::time::Instant,
+    cmd: &[&[u8]],
+) -> (crate::store::AccessScope, bool) {
     use crate::store::AccessScope;
-    if asks_only(name) || is_script(name) {
-        return AccessScope::none();
+    // Names that start with another letter than these are neither, and are
+    // not compared to them (GET, SET, ...).
+    if matches!(
+        name.as_bytes().first(),
+        Some(b'O' | b'T' | b'P' | b'E' | b'D' | b'R' | b'F')
+    ) {
+        if asks_only(name) {
+            return (AccessScope::none(), false);
+        }
+        if is_script(name) {
+            return (AccessScope::none(), true);
+        }
     }
     let stamp = crate::eviction::stamp(now);
+    // A stamp of 0 under a policy that records: the LRM policies, where only
+    // a modification is a use, and the command's outcome tells.
+    let after = stamp == 0;
+    (access_scope_counting(name, cmd, stamp), after)
+}
+
+/// [`access_scope`] once the stamp is known.
+#[inline(always)]
+fn access_scope_counting(name: &str, cmd: &[&[u8]], stamp: u32) -> crate::store::AccessScope {
+    use crate::store::AccessScope;
     // Under LFU, a key the command names twice (`MGET a a`) is counted
     // twice, as Redis counts each lookup. Only a command of more than one
     // argument can, and the hot ones find their keys without the long
@@ -1414,9 +1442,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
     {
         // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
-        // cache, not the dataset, and while writes are paused they are kept
-        // out of the replication stream and the AOF
-        // (`replication::held_back`), so a handoff misses nothing of them.
+        // cache, not the dataset, and are sent to nobody (#705), so a
+        // handoff misses nothing of them.
         // The pause does not hold them (#518), and they used to wait the
         // handoff out here instead, asleep on their worker thread, with
         // every other connection of that thread (#528).
@@ -1657,7 +1684,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     // Under an eviction policy that goes by use, the command's own lookups
     // write it (see `eviction`): one atomic load when there is none.
-    let access = crate::eviction::recording().then(|| access_scope(name, started, &ctx.cmd));
+    let (access, used_after) = if crate::eviction::recording() {
+        let (scope, after) = access_scope(name, started, &ctx.cmd);
+        (Some(scope), after)
+    } else {
+        (None, false)
+    };
     let result = dispatch_command_handlers(ctx, name)
         .or_else(|| lua::handle(ctx, name))
         .unwrap_or_else(|| unknown_command(&ctx.cmd));
@@ -1665,14 +1697,14 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // refused before it looks its keys up; those keys are used all the
     // same, as they were when the use was written after every command. Only
     // on an error: a key it did look up is not counted again.
-    if access.is_some() && result.starts_with(b"-") {
+    if access.is_some() && result.first() == Some(&b'-') {
         used_on_error(ctx, name);
     }
     // Under LFU, a key the command names more than once is counted as many
     // times as it is named, as when its use was written after the command,
     // a lookup for each place it is named. Its own lookups count up to that
     // many; these make up the rest.
-    if access.is_some()
+    if access.as_ref().is_some_and(|scope| scope.is_counting())
         && let Some(named) = crate::store::AccessScope::named_more_than_once()
     {
         let db = *ctx.selected_db;
@@ -1732,7 +1764,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // A parked command has not done its work yet — there is nothing to
     // propagate, invalidate or feed to MONITOR until it is resumed, and the
     // reply above is a discarded placeholder. The resume dispatch runs this.
+    // All but what it did before it parked: the consumer an `XREADGROUP`
+    // created (#654).
     if crate::commands::blocking::parked(ctx) {
+        if name == "XREADGROUP" {
+            propagate_before_park(ctx, name);
+        }
         return result;
     }
 
@@ -1744,10 +1781,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // policies, and the keys a script declares (see `eviction`). Not by the
     // commands that only ask about a key: Redis does not count those as a
     // use of it either.
-    if crate::eviction::recording()
-        && crate::eviction::used_after(is_script(name))
-        && !asks_only(name)
-    {
+    if used_after {
         let wrote = writes_operation && !result.starts_with(b"-");
         for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
             crate::eviction::used(ctx.store, *ctx.selected_db, ctx.cmd[pos], wrote);
@@ -1765,6 +1799,36 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         result
     };
     crate::tracking::with_what_came_before(result)
+}
+
+/// What an `XREADGROUP` that is about to wait has already changed: the
+/// consumer it created, which stays whether anything is delivered or not.
+/// Redis propagates it as `XGROUP CREATECONSUMER` when the command blocks;
+/// waiting for the resume left it out of the AOF and the replicas
+/// whenever the wait timed out, since by then the consumer was there to
+/// be found (#654). Deliveries are not made before a park, so this is the
+/// whole of it; a resumed command propagates what it delivers itself.
+#[cold]
+#[inline(never)]
+fn propagate_before_park(ctx: &Ctx, name: &str) {
+    let effects = replication::script_feed::effects_take();
+    if effects.is_empty() {
+        return;
+    }
+    if !ctx.apply_replication {
+        ctx.repl_state.note_local_write_of(name);
+    }
+    if ctx.skip_write_side_effects {
+        return;
+    }
+    if replication::write_is_observed(ctx) {
+        for parts in &effects {
+            replication::replicate_one_write(ctx, parts);
+        }
+    }
+    if replication::script_feed::effects_changed_data() {
+        crate::stats::record_rdb_change();
+    }
 }
 
 /// Replication/AOF propagation, WATCH notification, RDB-change tracking, MONITOR broadcast,
@@ -2532,15 +2596,38 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
         return;
     }
     let db = *ctx.selected_db;
+    // A blocking pop's own keys gained nothing from it: what it wakes there
+    // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
+    // destination) its handler wakes, and that is waited for.
+    let quiet = waiters && pops_blocking(name);
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {
             continue;
         }
-        if waiters {
+        if quiet {
+            crate::wait_table::without_collecting(|| ctx.wait_table.notify_signal(key));
+        } else if waiters {
             ctx.wait_table.notify_signal(key);
         }
     }
+}
+
+/// The commands that wait for elements and take them.
+#[cold]
+fn pops_blocking(name: &str) -> bool {
+    matches!(
+        name,
+        "BLPOP"
+            | "BRPOP"
+            | "BRPOPLPUSH"
+            | "BLMOVE"
+            | "BLMPOP"
+            | "BZPOPMIN"
+            | "BZPOPMAX"
+            | "BZMPOP"
+            | "XREADGROUP"
+    )
 }
 
 /// [`apply_write_side_effects`] for a caller that has already classified the
@@ -2573,7 +2660,14 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
         // `write_is_observed`), but reaching that no-op used to cost a
         // `Vec<Vec<u8>>` clone of every argument here *plus* a full RESP encode
         // inside — allocations on every single write, discarded immediately.
-        if replication::write_is_observed(ctx) && !propagates_nothing(name, &ctx.cmd, result) {
+        //
+        // Not a `SELECT` or a `SCRIPT LOAD` / `FLUSH`, which Redis sends to
+        // nobody (#705): a write carries the `SELECT` it needs, and a
+        // script's writes reach a replica as the commands it made.
+        if replication::write_is_observed(ctx)
+            && !propagates_nothing(name, &ctx.cmd, result)
+            && !matches!(name, "SELECT" | "SCRIPT")
+        {
             // Propagate the command's *effect*, not the bytes the client sent.
             // `SPOP` and `XADD … *` produce a different result each time they
             // run, so a replica re-executing them diverges (measured: a replica

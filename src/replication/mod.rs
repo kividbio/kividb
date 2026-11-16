@@ -61,8 +61,11 @@ pub struct ReplState {
     /// Replica-only: KV / aux structures are swapped in from staging during bulk full-sync (RDB).
     /// Mirrors Redis-style `LOADING`; INFO sets `master_sync_in_progress`.
     pub slave_sync_in_progress: AtomicBool,
-    /// Last logical DB index written to the replication backlog (`usize::MAX` = never emitted).
-    /// Drives implicit `SELECT` lines so replicas stay aligned with per-client `selected_db`.
+    /// The database the emitted write stream is in (`u64::MAX` before the
+    /// first). Whether the next write needs a `SELECT` in front of it is
+    /// read from here (`encode_for_stream`), and it moves only with a write
+    /// (`advance_stream_db`): a client's own `SELECT` no longer enters the
+    /// stream.
     pub repl_stream_last_db: AtomicU64,
     /// Set, and never cleared, once a client has selected a database other
     /// than 0. From then on every write travels with its own `SELECT`; see
@@ -72,6 +75,16 @@ pub struct ReplState {
     /// documents on the master. Set at each connection to a master, from the
     /// release it says it is (`INFO server`); see [`dd_deleted_by`].
     pub master_dd_deletes: AtomicBool,
+    /// Whether the current master stores `VADD` quantization; false until its `PSYNC` reply.
+    pub master_keeps_vset_quant: AtomicBool,
+    /// Whether this node, as a master, tells the replicas that ask for it
+    /// (`REPLCONF capa slot-imports`) which atomic slot imports it has
+    /// under way (#741). Set by the cluster layer at startup, in cluster
+    /// mode only. See [`SLOT_IMPORTS_MARKER`].
+    pub sends_slot_imports: AtomicBool,
+    /// Master offset after the last stripped `VADD`; earlier continuations
+    /// would re-apply its options.
+    pub vset_quant_dropped_until: AtomicU64,
     /// Whether this replica's master sends a `DEL` (or `UNLINK`) for every
     /// key it expires, as KiviDB does since 1.1.3 and Redis always has. Then
     /// the replica deletes no expired key itself and waits for that `DEL`
@@ -220,6 +233,13 @@ pub struct ReplState {
     /// during its full sync (#305). See [`start_hub`].
     pub replica_max_backlog_bytes: AtomicU64,
     pub replica_sync_max_backlog_bytes: AtomicU64,
+    /// `client-output-buffer-limit replica`'s soft limit and its seconds: a
+    /// streaming replica with this much queued for longer than that is
+    /// dropped, as in Redis (#774), once its queue has been under it since
+    /// its full sync or partial resync. 0, the default, for none. Its hard
+    /// limit is `replica_max_backlog_bytes`, 0 for none.
+    pub replica_soft_limit_bytes: AtomicU64,
+    pub replica_soft_limit_secs: AtomicU64,
     /// Master side: what `INFO` reports about the backlog. Written by the hub.
     pub backlog_first_offset: AtomicU64,
     pub backlog_histlen: AtomicU64,
@@ -270,12 +290,33 @@ pub struct ClusterLink {
     /// `why`: an election that does not wait for the master to be failed.
     /// False when it cannot (it is not that master's replica).
     pub take_over: TakeOverFn,
+    /// What the replication client learns of its master's atomic slot
+    /// imports, and a promotion: see [`SlotImportsEvent`] (#741).
+    pub slot_imports: SlotImportsFn,
 }
 
 /// See [`ClusterLink::master_node`].
 pub type MasterNodeFn = Box<dyn Fn() -> Option<String> + Send + Sync>;
 /// See [`ClusterLink::take_over`].
 pub type TakeOverFn = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+/// See [`ClusterLink::slot_imports`].
+pub type SlotImportsFn = Box<dyn Fn(SlotImportsEvent<'_>) + Send + Sync>;
+
+/// What the cluster layer is told of the imports of the master this node
+/// follows (#741).
+pub enum SlotImportsEvent<'a> {
+    /// A session with a master has begun: whether the master said it sends
+    /// [`SLOT_IMPORTS_MARKER`]s (the `slot-imports` word of its `PSYNC`
+    /// reply), and whether it sends the dataset in full (what this node
+    /// knew of the imports was of the dataset it replaces).
+    Session { marked: bool, full: bool },
+    /// A marker, as read from the stream, in its place there: every command
+    /// before it has been applied, none after it.
+    Marker(&'a [&'a [u8]]),
+    /// This node has become a master, and applies nothing more of the old
+    /// master's stream.
+    Promoted,
+}
 
 impl std::fmt::Debug for ClusterLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -504,6 +545,9 @@ impl ReplState {
             repl_stream_last_db: AtomicU64::new(u64::MAX),
             several_databases: AtomicBool::new(false),
             master_dd_deletes: AtomicBool::new(false),
+            master_keeps_vset_quant: AtomicBool::new(false),
+            sends_slot_imports: AtomicBool::new(false),
+            vset_quant_dropped_until: AtomicU64::new(0),
             master_propagates_expiry: AtomicBool::new(true),
             expiry_sweep_owed: AtomicBool::new(true),
             master_propagates_field_expiry: AtomicBool::new(true),
@@ -539,6 +583,9 @@ impl ReplState {
             backlog_ttl_secs: AtomicU64::new(3600),
             replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
             replica_sync_max_backlog_bytes: AtomicU64::new(1024 * 1024 * 1024),
+            // Off by default, unlike Redis: see `output_limits`.
+            replica_soft_limit_bytes: AtomicU64::new(0),
+            replica_soft_limit_secs: AtomicU64::new(0),
             backlog_first_offset: AtomicU64::new(0),
             backlog_histlen: AtomicU64::new(0),
             sync_full: AtomicU64::new(0),
@@ -571,6 +618,29 @@ impl ReplState {
         self.cluster_link
             .get()
             .is_some_and(|l| (l.take_over)(node, why))
+    }
+
+    /// Tell the cluster layer `event` (#741); nothing outside cluster mode.
+    pub fn slot_imports_event(&self, event: SlotImportsEvent<'_>) {
+        if let Some(link) = self.cluster_link.get() {
+            (link.slot_imports)(event);
+        }
+    }
+
+    /// Master side: the imports this node has under way, as a
+    /// [`SLOT_IMPORTS_MARKER`] in its two forms, for the replicas that take
+    /// them (#741): `live` at once, to those attached, in its place among
+    /// the writes; `sync` to each that attaches from now on.
+    pub fn send_slot_imports(&self, live: Vec<u8>, sync: Vec<u8>) {
+        if !self.sends_slot_imports.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::SlotImports {
+                live: Arc::from(live),
+                sync: Arc::from(sync),
+            });
+        }
     }
 
     /// The node whose stream this replica's dataset is from, if known.
@@ -620,9 +690,8 @@ impl ReplState {
     }
 
     /// [`note_local_write`](Self::note_local_write) for the command `name`
-    /// a client sent, which is propagated: not for a `SELECT` or a `SCRIPT`,
-    /// which change no data (`writes_the_dataset`). Looked at only when
-    /// there is a point to lose.
+    /// a client sent: not for a `SELECT` or a `SCRIPT`, which change no data
+    /// (`writes_the_dataset`). Looked at only when there is a point to lose.
     #[inline]
     pub fn note_local_write_of(&self, name: &str) {
         if self.has_resync_point.load(Ordering::Relaxed) && !matches!(name, "SELECT" | "SCRIPT") {
@@ -785,6 +854,15 @@ impl ReplState {
             config.repl_replica_sync_max_backlog_bytes,
             Ordering::Relaxed,
         );
+        let replica = config
+            .client_output_buffer_limit
+            .get(crate::output_limits::Class::Replica);
+        state
+            .replica_soft_limit_bytes
+            .store(replica.soft, Ordering::Relaxed);
+        state
+            .replica_soft_limit_secs
+            .store(replica.soft_seconds, Ordering::Relaxed);
         state.hll_write_redis.store(
             config.hll_write_format.eq_ignore_ascii_case("redis"),
             Ordering::Relaxed,
@@ -1101,6 +1179,15 @@ impl ReplState {
         self.role.read().clone()
     }
 
+    /// The role as `HELLO` names it: Redis says `replica` there, where `ROLE`
+    /// and `INFO` still say `slave`.
+    pub fn hello_role(&self) -> String {
+        match self.role().as_str() {
+            "slave" => "replica".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     /// The current replication epoch. A `start_replica` task whose claimed epoch
     /// no longer equals this has been superseded and must stop.
     #[inline]
@@ -1133,6 +1220,11 @@ impl ReplState {
             let _applying = self.apply_lock.lock();
             self.resync_point.lock().clone()
         });
+        // The old master's imports this node knew of are this one's to
+        // settle now (#741); and its replicas, the moment one can attach,
+        // are to be told of them. At every promotion, with a resync point
+        // or not: the markers its hub has kept must be this node's own.
+        self.slot_imports_event(SlotImportsEvent::Promoted);
         self.slave_mode.store(false, Ordering::Release);
         *self.master_addr.write() = None;
         *self.role.write() = "master".into();
@@ -1239,6 +1331,8 @@ impl ReplState {
             }
         }
         self.slave_mode.store(true, Ordering::Release);
+        // Unknown until this replica's handshake reads its master's INFO.
+        self.master_keeps_vset_quant.store(false, Ordering::Relaxed);
         *self.role.write() = "slave".into();
         // A `WAIT` waiting on this master's replicas ends now (see
         // `wait_for_replicas`).
@@ -1294,7 +1388,11 @@ impl ReplState {
         registry: &crate::client_registry::ClientRegistry,
         client_id: u64,
         cmd: &[&[u8]],
+        store: &crate::store::Store,
     ) -> Option<Vec<u8>> {
+        if let Some(refusal) = self.vset_quant_refusal(registry, client_id, cmd, store) {
+            return Some(refusal);
+        }
         if cluster.lost_dataset() && !self.is_slave() {
             let (mut stage, mut addr, mut port) = (0u8, String::new(), 0u16);
             registry.update(client_id, |info| {
@@ -1332,6 +1430,39 @@ impl ReplState {
             }
         }
         self.digest_offer(registry, client_id, cmd)
+    }
+
+    /// 1.2 replicas refuse Q8/BIN snapshots and retry forever; tell them why instead.
+    fn vset_quant_refusal(
+        &self,
+        registry: &crate::client_registry::ClientRegistry,
+        client_id: u64,
+        cmd: &[&[u8]],
+        store: &crate::store::Store,
+    ) -> Option<Vec<u8>> {
+        if self.is_slave() {
+            return None;
+        }
+        let mut reads = None;
+        registry.update(client_id, |info| reads = info.replica_vset_quant);
+        if reads != Some(false) {
+            return None;
+        }
+        let dropped = self.vset_quant_dropped_until.load(Ordering::Relaxed);
+        let continued = PsyncRequest::parse(cmd)
+            .is_some_and(|p| self.continues_stream(&p.repl_id, p.offset) && p.offset > dropped);
+        if continued || !crate::vector::quant::store_holds_quantized_set(store) {
+            return None;
+        }
+        let mut addr = String::new();
+        registry.update(client_id, |info| addr.clone_from(&info.addr));
+        log_throttled!(
+            60,
+            crate::loglevel::WARN,
+            "Replication: Not syncing replica {addr}: it is an older KiviDB, which cannot read \
+             the Q8 or BIN vector sets this master holds. Upgrade replicas before masters"
+        );
+        Some(VSET_QUANT_REFUSAL.as_bytes().to_vec())
     }
 
     /// The answer to a `PSYNC` that cannot be continued, from a replica that
@@ -1378,6 +1509,38 @@ impl ReplState {
     #[inline]
     pub fn is_slave(&self) -> bool {
         self.slave_mode.load(Ordering::Relaxed)
+    }
+
+    /// A master's stream keeps `VADD` quantization; a replica's only if its master's does.
+    pub fn keeps_vset_quant(&self) -> bool {
+        !hides_vset_quant_capability()
+            && (!self.is_slave() || self.master_keeps_vset_quant.load(Ordering::Relaxed))
+    }
+
+    /// What ends `+FULLRESYNC` or `+CONTINUE` for a replica that announced `vset-quant`.
+    pub fn vset_quant_word(&self, announced: bool) -> &'static str {
+        if announced && self.keeps_vset_quant() {
+            VSET_QUANT_WORD
+        } else {
+            ""
+        }
+    }
+
+    /// Whether a replica that did (`announced`) or did not ask for them is
+    /// sent [`SLOT_IMPORTS_MARKER`]s.
+    pub fn sends_slot_imports_to(&self, announced: bool) -> bool {
+        announced && self.sends_slot_imports.load(Ordering::Relaxed)
+    }
+
+    /// What ends `+FULLRESYNC` or `+CONTINUE` for a replica: the
+    /// `vset-quant` word ([`Self::vset_quant_word`]), and the
+    /// `slot-imports` one for a replica sent the markers.
+    pub fn psync_words(&self, vset_quant: bool, slot_imports: bool) -> String {
+        let mut words = self.vset_quant_word(vset_quant).to_string();
+        if self.sends_slot_imports_to(slot_imports) {
+            words.push_str(SLOT_IMPORTS_WORD);
+        }
+        words
     }
 }
 
@@ -2063,6 +2226,8 @@ pub enum HubMsg {
         /// The offset this replica's `+FULLRESYNC` announced. Its ACKs count
         /// from here; see [`ReplicaProgress`].
         base: u64,
+        /// It is sent [`SLOT_IMPORTS_MARKER`]s.
+        slot_imports: bool,
     },
     Propagate(ReplPayload),
     /// Replica side: bytes of the master's stream this node has read and
@@ -2100,6 +2265,14 @@ pub enum HubMsg {
     /// does not pass its master's stream on (#144). Their connections close,
     /// and when they connect again they are told why.
     DropReplicas,
+    /// The atomic slot imports this master has under way changed: `live`
+    /// goes to each replica that takes [`SLOT_IMPORTS_MARKER`]s, here among
+    /// the writes; `sync` is kept, for each that attaches from now on. Not
+    /// in the backlog, nor counted in any offset (#741).
+    SlotImports {
+        live: ReplPayload,
+        sync: ReplPayload,
+    },
 }
 
 /// What a replica answers a node that asks to replicate from it: KiviDB does
@@ -2273,6 +2446,91 @@ pub fn expiry_propagated_by(info: Option<&str>) -> bool {
     }
 }
 
+/// What a replica that cannot read quantized sets is told (see
+/// [`ReplState::vset_quant_refusal`]).
+pub const VSET_QUANT_REFUSAL: &str = "-ERR this master holds Q8 or BIN vector sets, which this \
+     replica's KiviDB release cannot read: upgrade the replica to KiviDB 1.3 or later\r\n";
+
+/// Says this node's stream keeps the quantization `VADD` asks for.
+pub const VSET_QUANT_INFO: &str = "kividb_vset_quantization:1";
+
+/// The capability a replica announces, and its master's `PSYNC` reply repeats.
+pub const VSET_QUANT_CAPA: &str = "vset-quant";
+
+/// Added to a `PSYNC` reply only for replicas announcing [`VSET_QUANT_CAPA`].
+const VSET_QUANT_WORD: &str = " vset-quant";
+
+/// Whether a `+FULLRESYNC` or `+CONTINUE` line says the stream keeps the options.
+pub fn psync_reply_keeps_vset_quant(reply: &str) -> bool {
+    // After the id and offset: neither can be this word.
+    reply
+        .split_whitespace()
+        .skip(1)
+        .any(|word| word == VSET_QUANT_CAPA)
+}
+
+/// The capability by which a replica asks to be told of its master's atomic
+/// slot imports, and a master's `PSYNC` reply says it tells (#741).
+pub const SLOT_IMPORTS_CAPA: &str = "slot-imports";
+
+/// Added to a `PSYNC` reply only for replicas announcing [`SLOT_IMPORTS_CAPA`].
+const SLOT_IMPORTS_WORD: &str = " slot-imports";
+
+/// The command by which a master tells a replica that took
+/// [`SLOT_IMPORTS_CAPA`] which atomic slot imports it has under way (#741):
+///
+/// `KIVIDB.IMPORTS LIVE|SYNC [<task-id> <slots> <kept>] ...`
+///
+/// `<slots>` is the import's slot ranges, `a-b,c-d`; `<kept>` the ranges
+/// of those of its slots of which the master held keys before it began, or
+/// `-` for none, or `*` while it has not looked yet (the source has been
+/// asked for nothing). `LIVE` is sent in its place among the writes, when
+/// the list changes; `SYNC` once to each such replica as it attaches, ahead
+/// of everything else it is sent.
+///
+/// It is not part of the stream: never in the backlog, the AOF or a
+/// snapshot, never counted in an offset, and never sent to a replica that
+/// did not ask for it, such as one of an earlier release.
+pub const SLOT_IMPORTS_MARKER: &[u8] = b"KIVIDB.IMPORTS";
+
+/// Whether a `+FULLRESYNC` or `+CONTINUE` line says markers follow.
+pub fn psync_reply_has_slot_imports(reply: &str) -> bool {
+    reply
+        .split_whitespace()
+        .skip(1)
+        .any(|word| word == SLOT_IMPORTS_CAPA)
+}
+
+/// Test only: `KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY` makes this node act
+/// as one of an earlier release: as a replica it does not ask for the
+/// markers, as a master it does not send them.
+pub fn hides_slot_imports_capability() -> bool {
+    static HIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIDES.get_or_init(|| std::env::var_os("KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY").is_some())
+}
+
+/// Test only: `KIVIDB_TEST_NO_VSET_QUANT_CAPABILITY` acts as an older master.
+pub fn hides_vset_quant_capability() -> bool {
+    static HIDES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HIDES.get_or_init(|| std::env::var_os("KIVIDB_TEST_NO_VSET_QUANT_CAPABILITY").is_some())
+}
+
+/// Without the `PSYNC` word: Redis keeps options; KiviDB 1.2, or no answer, drops them.
+pub fn vset_quant_kept_by(info: Option<&str>) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    let mut kividb = false;
+    for line in info.lines() {
+        let line = line.trim();
+        if line == VSET_QUANT_INFO {
+            return true;
+        }
+        kividb |= line.starts_with("kividb_version:");
+    }
+    !kividb
+}
+
 /// The line of `INFO server` by which a KiviDB master says it sends an
 /// `HDEL` (or a `DEL`) for every hash field it expires.
 pub const FIELD_EXPIRY_PROPAGATED_INFO: &str = "kividb_expired_fields_propagated:1";
@@ -2366,6 +2624,41 @@ mod expiry_version_tests {
         assert!(expiry_propagated_by(Some(&kividb("garbage"))));
         assert_eq!(uptime_in(redis), Some(5));
         assert_eq!(uptime_in(&kividb("1.1.2")), None);
+    }
+}
+
+#[cfg(test)]
+mod vset_quant_version_tests {
+    use super::{VSET_QUANT_INFO, psync_reply_keeps_vset_quant, vset_quant_kept_by};
+
+    #[test]
+    fn only_older_kividb_masters_drop_quantization() {
+        let old = "# Server\r\nredis_version:8.10.0\r\nkividb_version:1.2.1\r\n";
+        assert!(!vset_quant_kept_by(Some(old)));
+        assert!(vset_quant_kept_by(Some(&format!(
+            "{old}{VSET_QUANT_INFO}\r\n"
+        ))));
+        // Redis keeps what it is asked for.
+        assert!(vset_quant_kept_by(Some(
+            "# Server\r\nredis_version:8.10.3\r\n"
+        )));
+        // No answer: taken as an older master, which loses nothing.
+        assert!(!vset_quant_kept_by(None));
+    }
+
+    #[test]
+    fn the_psync_word_is_read_after_the_id() {
+        let id = "a".repeat(40);
+        for (reply, keeps) in [
+            (format!("+FULLRESYNC {id} 1234 vset-quant"), true),
+            (format!("+FULLRESYNC {id} 1234"), false),
+            (format!("+CONTINUE {id} vset-quant"), true),
+            (format!("+CONTINUE {id}"), false),
+            ("+CONTINUE".to_string(), false),
+            ("+vset-quant".to_string(), false),
+        ] {
+            assert_eq!(psync_reply_keeps_vset_quant(&reply), keeps, "{reply}");
+        }
     }
 }
 
@@ -2470,6 +2763,9 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_ping = tokio::time::Instant::now();
         let mut backlog = Backlog::new();
+        // What a replica that takes them is told of this master's slot
+        // imports as it attaches (#741): the last `SYNC` form.
+        let mut slot_imports_sync: Option<ReplPayload> = None;
         // Queues of replicas let go of for falling too far behind, until
         // their forwarders have let go of what is in them (see
         // `ReplicaQueue::abandon`): memory still held for a replica.
@@ -2506,6 +2802,20 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                 },
                 _ = tick.tick() => {
                     backlog.report(&state);
+                    // A queue under the soft limit now is no longer over it,
+                    // though nothing was written to find that out: its clock
+                    // starts again. Without this, a replica that went over,
+                    // drained, and stayed idle was dropped by the first
+                    // large write after, as over it ever since (#774).
+                    let soft = state.replica_soft_limit_bytes.load(Ordering::Relaxed);
+                    if soft != 0 {
+                        for replica in channel_replicas.iter_mut().filter(|r| !r.syncing) {
+                            if replica.pending_bytes.bytes() < soft {
+                                replica.soft_armed = true;
+                                replica.over_soft_since = 0;
+                            }
+                        }
+                    }
                     // Give the backlog up once no replica has been attached
                     // for `repl-backlog-ttl`: keeping it means encoding every
                     // write for a replica that is not coming back.
@@ -2634,10 +2944,21 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             ReplicaState::Online,
                         );
                         let _ = progress.queue.set(Arc::clone(&registration.pending_bytes));
-                        let delivered = missed.is_empty() || {
-                            registration.pending_bytes.add(missed.len());
-                            registration.tx.send(Arc::from(missed)).is_ok()
-                        };
+                        // The imports under way first, as they stand at the
+                        // end of what it missed (#741): what it knew of
+                        // those that ended meanwhile goes, and those begun
+                        // meanwhile it did not see begin.
+                        let told = !registration.slot_imports
+                            || queue_marker(
+                                &registration.tx,
+                                &registration.pending_bytes,
+                                slot_imports_sync.get_or_insert_with(no_slot_imports),
+                            );
+                        let delivered = told
+                            && (missed.is_empty() || {
+                                registration.pending_bytes.add(missed.len());
+                                registration.tx.send(Arc::from(missed)).is_ok()
+                            });
                         if !delivered {
                             forget_replica(&state, registration.replica_id);
                             continue;
@@ -2656,6 +2977,11 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             progress,
                             syncing: false,
                             peak: missed_len,
+                            over_soft_since: 0,
+                            // What it missed is queued: not held to the soft
+                            // limit until it has drained it.
+                            soft_armed: false,
+                            slot_imports: registration.slot_imports,
                         });
                         if reply.send(Ok(())).is_err() {
                             // The connection went away while it was asking.
@@ -2749,6 +3075,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     replica_id,
                     pending_bytes,
                     base,
+                    slot_imports,
                 } => {
                     // Everything queued before this message is in the
                     // dataset the replica was sent; the backlog records what
@@ -2783,6 +3110,18 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // through it.
                     let progress = state.register_replica(replica_id, peer_ip, peer_port, base);
                     let _ = progress.queue.set(Arc::clone(&pending_bytes));
+                    // The imports under way as the dataset it is sent has
+                    // them, ahead of the writes that follow it (#741).
+                    if slot_imports
+                        && !queue_marker(
+                            &tx,
+                            &pending_bytes,
+                            slot_imports_sync.get_or_insert_with(no_slot_imports),
+                        )
+                    {
+                        forget_replica(&state, replica_id);
+                        continue;
+                    }
                     channel_replicas.push(ChannelReplica {
                         id: replica_id,
                         addr: addr.clone(),
@@ -2793,8 +3132,24 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // and drained what was queued meanwhile.
                         syncing: true,
                         peak: 0,
+                        over_soft_since: 0,
+                        soft_armed: false,
+                        slot_imports,
                     });
                     log_info!("Replication: Channel replica registered: {addr}");
+                }
+
+                HubMsg::SlotImports { live, sync } => {
+                    slot_imports_sync = Some(sync);
+                    channel_replicas.retain(|replica| {
+                        if !replica.slot_imports
+                            || queue_marker(&replica.tx, &replica.pending_bytes, &live)
+                        {
+                            return true;
+                        }
+                        forget_replica(&state, replica.id);
+                        false
+                    });
                 }
 
                 HubMsg::Propagate(payload) => {
@@ -2828,11 +3183,21 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // an unbounded amount of undelivered data in master memory).
                     let mut alive_channels = Vec::with_capacity(channel_replicas.len());
                     // Read for each write, so that `CONFIG SET` applies at once.
-                    let streaming_limit = state.replica_max_backlog_bytes.load(Ordering::Relaxed);
-                    let sync_limit = state
-                        .replica_sync_max_backlog_bytes
-                        .load(Ordering::Relaxed)
-                        .max(streaming_limit);
+                    // 0: no limit, as `client-output-buffer-limit replica 0 0 0`
+                    // means in Redis (#774). The sync's limit is never under the
+                    // streaming one, so no streaming limit lifts it too.
+                    let unlimited_if_0 = |limit: u64| if limit == 0 { u64::MAX } else { limit };
+                    let streaming_limit =
+                        unlimited_if_0(state.replica_max_backlog_bytes.load(Ordering::Relaxed));
+                    let soft = crate::output_limits::Limit {
+                        hard: 0,
+                        soft: state.replica_soft_limit_bytes.load(Ordering::Relaxed),
+                        soft_seconds: state.replica_soft_limit_secs.load(Ordering::Relaxed),
+                    };
+                    let sync_limit = unlimited_if_0(
+                        state.replica_sync_max_backlog_bytes.load(Ordering::Relaxed),
+                    )
+                    .max(streaming_limit);
                     for mut replica in channel_replicas.drain(..) {
                         // Account for the payload *before* handing it over. The
                         // forwarder subtracts as soon as it has the payload, and
@@ -2860,7 +3225,33 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         } else {
                             streaming_limit
                         };
-                        if now_pending > limit {
+                        // Streaming, it is held to the soft limit too: more
+                        // than its seconds over it, without a break, and it
+                        // is dropped. Not in its full sync, whose queue
+                        // grows by design (#305), nor until its queue has
+                        // been under the soft limit once since then: what
+                        // queued up during a full sync, or before a partial
+                        // resync, is still being drained (with a raised hard
+                        // limit, a replica streams again with up to a
+                        // quarter of it queued). The clock is read only over
+                        // the limit.
+                        let over_soft_too_long = if replica.syncing || soft.soft == 0 {
+                            false
+                        } else if now_pending < soft.soft {
+                            replica.soft_armed = true;
+                            replica.over_soft_since = 0;
+                            false
+                        } else {
+                            replica.soft_armed
+                                && soft.exceeded(
+                                    now_pending,
+                                    &mut replica.over_soft_since,
+                                    crate::output_limits::now_secs(),
+                                )
+                        };
+                        if now_pending > limit || over_soft_too_long {
+                            crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS
+                                .fetch_add(1, Ordering::Relaxed);
                             // Replica isn't draining its queue fast enough — evict rather than
                             // let the backlog grow without bound. Dropping `tx` here (by not
                             // pushing it back into `channel_replicas`) closes its forwarder's
@@ -2872,6 +3263,17 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             replica.pending_bytes.abandon();
                             leaving.push(Arc::clone(&replica.pending_bytes));
                             forget_replica(&state, replica.id);
+                            if over_soft_too_long && now_pending <= limit {
+                                log_warn!(
+                                    "Replication: Channel replica {} has had {now_pending} bytes \
+                                     queued, over the soft limit of {} bytes, for more than {} \
+                                     seconds (client-output-buffer-limit replica) — evicting",
+                                    replica.addr,
+                                    soft.soft,
+                                    soft.soft_seconds
+                                );
+                                continue;
+                            }
                             log_warn!(
                                 "Replication: Channel replica {} exceeded backlog limit \
                                  ({now_pending} > {limit} bytes{}) — evicting",
@@ -2926,6 +3328,9 @@ pub struct ReplicaRegistration {
     pub peer_port: u16,
     pub tx: mpsc::UnboundedSender<ReplPayload>,
     pub pending_bytes: Arc<ReplicaQueue>,
+    /// It asked for [`SLOT_IMPORTS_MARKER`]s, and this node sends them
+    /// ([`ReplState::sends_slot_imports_to`]).
+    pub slot_imports: bool,
 }
 
 /// Take the cut for a full resync: register the replica with the hub and
@@ -2982,6 +3387,7 @@ pub fn begin_full_sync(
             replica_id: registration.replica_id,
             pending_bytes: registration.pending_bytes,
             base,
+            slot_imports: registration.slot_imports,
         })
         .is_err()
     {
@@ -3030,9 +3436,9 @@ pub struct FullSync {
 }
 
 impl FullSync {
-    /// The line that announces it.
-    pub fn announcement(&self, repl_id: &str) -> String {
-        format!("+FULLRESYNC {repl_id} {}\r\n", self.base)
+    /// The line that announces it; `word` from [`ReplState::vset_quant_word`].
+    pub fn announcement(&self, repl_id: &str, word: &str) -> String {
+        format!("+FULLRESYNC {repl_id} {}{word}\r\n", self.base)
     }
 }
 
@@ -3052,6 +3458,17 @@ pub async fn request_continuation(
     };
     if !repl_state.continues_stream(&psync.repl_id, psync.offset) {
         // It followed some other master.
+        repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
+        return Err(registration);
+    }
+    let dropped = repl_state.vset_quant_dropped_until.load(Ordering::Relaxed);
+    if psync.offset <= dropped {
+        // The backlog holds a `VADD` whose quantization was not applied here.
+        log_info!(
+            "Replication: Not continuing a replica from offset {}: the stream up to {dropped} \
+             holds a VADD whose quantization an older master ignored — syncing it in full",
+            psync.offset
+        );
         repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
         return Err(registration);
     }
@@ -3086,6 +3503,34 @@ struct ChannelReplica {
     syncing: bool,
     /// The most that has been queued for it at once.
     peak: u64,
+    /// When it went over the soft limit, on `output_limits::now_secs`'s
+    /// clock; 0 while it is under it.
+    over_soft_since: u64,
+    /// Its queue has been under the soft limit since its full sync or
+    /// partial resync: from then on it is held to it. See [`start_hub`].
+    soft_armed: bool,
+    /// It is sent [`SLOT_IMPORTS_MARKER`]s.
+    slot_imports: bool,
+}
+
+/// `KIVIDB.IMPORTS SYNC` with no import: what a replica that takes the
+/// markers is sent on attaching to a master that has never had any.
+fn no_slot_imports() -> ReplPayload {
+    Arc::from(crate::resp::write::encode_resp_command(&[
+        SLOT_IMPORTS_MARKER.to_vec(),
+        b"SYNC".to_vec(),
+    ]))
+}
+
+/// Queue a [`SLOT_IMPORTS_MARKER`] for a replica: memory it takes while
+/// queued, as a write's, but not in what it has been sent of the stream.
+fn queue_marker(
+    tx: &mpsc::UnboundedSender<ReplPayload>,
+    pending: &ReplicaQueue,
+    marker: &ReplPayload,
+) -> bool {
+    pending.add(marker.len());
+    tx.send(Arc::clone(marker)).is_ok()
 }
 
 /// Drop every trace of a replica from the shared state. Idempotent: the
@@ -3168,6 +3613,11 @@ pub struct FinalSaveHold<'a> {
 pub fn hold_for_final_save(state: &ReplState) -> std::io::Result<FinalSaveHold<'_>> {
     use std::time::{Duration, Instant};
     loop {
+        // `SHUTDOWN ABORT` ends the wait for a command that keeps the gate
+        // (a script that does not end): the caller then undoes the shutdown.
+        if crate::shutdown::abort_requested() {
+            return Err(std::io::Error::other("SHUTDOWN ABORT"));
+        }
         let turn = crate::aof::checkpoint_turn()?;
         let deadline = Instant::now() + Duration::from_millis(50);
         if let Some(alone) =
@@ -3218,14 +3668,35 @@ const SHUTDOWN_PAUSE_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
 /// its clients while a shutdown waits for the replicas. No command starts
 /// again before the exit: the pause has no end, and the caller then holds the
 /// command gate alone. Blocking: called from the thread that then saves.
-pub fn drain_replicas_for_shutdown(state: &ReplState, hub_tx: &HubTx) -> std::time::Instant {
-    crate::pause::set_pause(SHUTDOWN_PAUSE_MS, false);
-    end_stream_for_shutdown(state);
+///
+/// Returns the pause, for a shutdown that does not go ahead to take back
+/// (`pause::undo_pause`), and when the wait ends. The wait for the writes in
+/// flight ends early once `give_up` says so: the shutdown was aborted (the
+/// caller sees it), or a script has run past its time limit, which holds the
+/// write gate for as long as it runs, and `SHUTDOWN NOSAVE` is the way to
+/// stop it. The replicas are then waited for all the same, as in Redis.
+pub fn drain_replicas_for_shutdown(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    give_up: &dyn Fn() -> bool,
+) -> (crate::pause::Undo, std::time::Instant) {
+    let paused = crate::pause::set_pause_undoable(SHUTDOWN_PAUSE_MS, false);
+    // `end_stream_for_shutdown`, with a wait that can be given up.
+    state.stream_closed.store(true, Ordering::SeqCst);
+    let never = std::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600);
+    crate::write_gate::wait_out_writes(never, || !give_up());
     let timeout =
         std::time::Duration::from_secs(state.shutdown_timeout_secs.load(Ordering::Relaxed));
+    if !timeout.is_zero() && !state.is_slave() && !state.replica_progress.lock().is_empty() {
+        // As Redis says it.
+        log_info!(
+            "Waiting for replicas before shutting down (shutdown-timeout {} s)",
+            timeout.as_secs()
+        );
+    }
     let deadline = std::time::Instant::now() + timeout;
     wait_for_replicas_until(state, hub_tx, deadline);
-    deadline
+    (paused, deadline)
 }
 
 /// Shutdown, with the command gate held alone, just before the save: wait
@@ -3295,11 +3766,13 @@ fn wait_for_replicas_until(state: &ReplState, hub_tx: &HubTx, deadline: std::tim
             done_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ) && std::time::Instant::now() < deadline
+            && !crate::shutdown::abort_requested()
         {
             std::thread::sleep(pause);
         }
     }
     while std::time::Instant::now() < deadline
+        && !crate::shutdown::abort_requested()
         && replicas_at_shutdown(state).iter().any(|(_, p)| {
             p.state() == ReplicaState::Online && p.delivered() < p.sent.load(Ordering::Relaxed)
         })
@@ -3363,34 +3836,8 @@ pub fn write_is_observed(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
         || ctx.repl_state.stream_taps.load(Ordering::Relaxed) > 0
 }
 
-/// Whether a command that `CLIENT PAUSE WRITE` lets run although it is
-/// propagated (`SELECT`, `SCRIPT LOAD`, `SCRIPT FLUSH`: see
-/// `pause::may_replicate`) is to be kept out of the replication stream and
-/// the AOF: while writes are paused on a master. Nothing may be added to
-/// the stream then: a failover waits for its replica to reach the master's
-/// offset, and takes that offset to stay put (#411, #518). Not on a
-/// replica, whose offset is its master's, nor for what its master sent.
-pub(crate) fn held_back(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
-    !ctx.apply_replication && !ctx.repl_state.is_slave() && crate::pause::active().is_some()
-}
-
 pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) {
-    let cmd0 = parts.first().map(|v| v.as_slice()).unwrap_or_default();
-    let payloads: Vec<Vec<u8>> = if cmd0.eq_ignore_ascii_case(b"SELECT") && parts.len() >= 2 {
-        // `CLIENT PAUSE WRITE` lets a `SELECT` run (it writes nothing), but
-        // nothing may be added to the stream while writes are paused: a
-        // failover waits for its replica to reach the master's offset, and
-        // takes that offset to stay put. A `SELECT` sent now is not needed
-        // there either: the next write in another database carries its own
-        // (`encode_for_stream`), since the stream's database is not moved.
-        // Not on a replica, whose offset is its master's.
-        if held_back(ctx) {
-            return;
-        }
-        vec![crate::resp::write::encode_resp_command(parts)]
-    } else {
-        in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0
-    };
+    let payloads: Vec<Vec<u8>> = in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0;
 
     // Two cases end at this node's own AOF and go no further:
     //
@@ -3415,9 +3862,9 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
             // Part of a transaction its master sent, applied as one: see
             // `PropagationGroup`.
             note_group_write(true);
-            append_to_own_aof(ctx, cmd0, parts, payloads);
+            append_to_own_aof(ctx, parts, payloads);
         } else if tapped {
-            advance_stream_db(ctx, cmd0, parts);
+            advance_stream_db(ctx);
         }
         return;
     }
@@ -3435,7 +3882,10 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
         note_group_write(ctx.aof_enabled);
     }
 
-    for payload_bytes in payloads {
+    // The command is the last payload; a `SELECT` may come first.
+    let marked = ctx.aof_enabled && crate::vector::quant::carries_quant_option(parts);
+    let count = payloads.len();
+    for (n, payload_bytes) in payloads.into_iter().enumerate() {
         if tapped {
             ctx.repl_state.feed_taps(&payload_bytes);
         }
@@ -3462,13 +3912,19 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
             }
         }
         if ctx.aof_enabled {
-            crate::aof::AOF_WRITTEN.fetch_add(enc_len, std::sync::atomic::Ordering::Relaxed);
-            crate::aof::queue_record(ctx.aof_tx, raw_opt.take().expect("encoded for AOF path"));
+            let mut record = raw_opt.take().expect("encoded for AOF path");
+            // In the same record, so no crash separates them. AOF only.
+            if marked && n + 1 == count {
+                record.extend_from_slice(crate::aof::VSET_QUANT_MARKER);
+            }
+            crate::aof::AOF_WRITTEN
+                .fetch_add(record.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::aof::queue_record(ctx.aof_tx, record);
         }
     }
     // Only advance after bytes are emitted: writes that ran with no replicas must not
     // consume the implicit `SELECT`, or the first observer would miss `{select *}` on stream.
-    advance_stream_db(ctx, cmd0, parts);
+    advance_stream_db(ctx);
 }
 
 /// Hand something other than a write — a `PUBLISH` — to replicas: now, or,
@@ -3778,7 +4234,6 @@ fn in_db_for_stream(repl_state: &ReplState, db: usize, parts: &[Vec<u8>]) -> (Ve
 /// to *the AOF*, since that is the only stream this node emits.
 fn append_to_own_aof(
     ctx: &crate::commands::ctx::Ctx<'_>,
-    cmd0: &[u8],
     parts: &[Vec<u8>],
     payloads: Vec<Vec<u8>>,
 ) {
@@ -3789,35 +4244,28 @@ fn append_to_own_aof(
     for p in payloads {
         combined.extend_from_slice(&p);
     }
+    // `parts` as applied: options a non-keeping master sent are gone already.
+    if crate::vector::quant::carries_quant_option(parts) {
+        combined.extend_from_slice(crate::aof::VSET_QUANT_MARKER);
+    }
     crate::aof::AOF_WRITTEN.fetch_add(combined.len() as u64, Ordering::Relaxed);
     crate::aof::queue_record(ctx.aof_tx, combined);
-    advance_stream_db(ctx, cmd0, parts);
+    advance_stream_db(ctx);
 }
 
 /// Record which db the emitted stream is now positioned on, so the next write
 /// only pays for a `SELECT` when it actually changes.
-fn advance_stream_db(ctx: &crate::commands::ctx::Ctx<'_>, cmd0: &[u8], parts: &[Vec<u8>]) {
-    if cmd0.eq_ignore_ascii_case(b"SELECT") && parts.len() >= 2 {
-        if let Ok(db_s) = std::str::from_utf8(&parts[1])
-            && let Ok(db) = db_s.parse::<u64>()
-        {
-            ctx.repl_state
-                .repl_stream_last_db
-                .store(db, Ordering::Relaxed);
-        }
+fn advance_stream_db(ctx: &crate::commands::ctx::Ctx<'_>) {
+    // Before any client has left database 0, a write of another went in
+    // one piece that goes back to 0 (`in_db_for_stream`).
+    let db = if *ctx.selected_db != 0 && !ctx.repl_state.several_databases.load(Ordering::Relaxed) {
+        0
     } else {
-        // Before any client has left database 0, a write of another went in
-        // one piece that goes back to 0 (`in_db_for_stream`).
-        let db =
-            if *ctx.selected_db != 0 && !ctx.repl_state.several_databases.load(Ordering::Relaxed) {
-                0
-            } else {
-                *ctx.selected_db
-            };
-        ctx.repl_state
-            .repl_stream_last_db
-            .store(db as u64, Ordering::Relaxed);
-    }
+        *ctx.selected_db
+    };
+    ctx.repl_state
+        .repl_stream_last_db
+        .store(db as u64, Ordering::Relaxed);
 }
 
 /// Returns true if this command name mutates state and must be
@@ -4423,9 +4871,11 @@ pub async fn wait_for_replicas(
 #[inline]
 pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
     match name {
-        // `SELECT` is in `is_write_command` because the replication stream and
-        // the AOF both need it propagated, not because it writes anything — it
-        // changes per-connection state only. Conflating "must be propagated"
+        // `SELECT` is in `is_write_command` so that it takes the write gate
+        // like a write — the switch to writes that carry their own `SELECT`
+        // is only race-free inside it (`note_database_selected`) — not
+        // because it writes anything: it changes per-connection state only,
+        // and is propagated to nobody (#705). Conflating "flagged a write"
         // with "a read-only replica must reject it" made every database except
         // 0 unreachable on a replica: any client configured with `db=N` sends
         // SELECT on connect and got
@@ -4645,6 +5095,7 @@ mod replication_invariants_tests {
             replica_id: 9001,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
 
@@ -4668,6 +5119,7 @@ mod replication_invariants_tests {
             replica_id: 9002,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
 
@@ -4697,6 +5149,7 @@ mod replication_invariants_tests {
             replica_id: 9003,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
 
@@ -4737,6 +5190,7 @@ mod replication_invariants_tests {
             replica_id: 9004,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         await_connected(&state, 1).await;
@@ -4782,6 +5236,7 @@ mod replication_invariants_tests {
             replica_id: id,
             pending_bytes: Arc::clone(pending),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         rx
@@ -4838,6 +5293,141 @@ mod replication_invariants_tests {
             propagate(&hub, vec![0u8; 50]);
         }
         await_connected(&state, 0).await;
+    }
+
+    /// Take everything queued for a replica, as its connection would.
+    fn drain(rx: &mut ReplRx, pending: &ReplicaQueue) {
+        let (mut bytes, mut held) = (0, 0);
+        while let Ok(payload) = rx.try_recv() {
+            bytes += payload.len();
+            held += ReplicaQueue::held_for(payload.len());
+        }
+        pending.taken(bytes, held);
+    }
+
+    /// A replica streaming again after its full sync still has what queued
+    /// up meanwhile to drain: up to a quarter of the hard limit, far over a
+    /// soft limit when the hard one is raised. It is not dropped for that,
+    /// which would start the sync again and again (#305); it is held to the
+    /// soft limit once its queue has been under it (#774).
+    #[tokio::test]
+    async fn a_replica_draining_after_its_sync_is_held_to_the_soft_limit_only_after() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(10_000, Ordering::Relaxed);
+        state.replica_soft_limit_bytes.store(100, Ordering::Relaxed);
+        state.replica_soft_limit_secs.store(0, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9010, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..20 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        // Loaded; 200 of the 1000 bytes left to drain.
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9010,
+            offset: 0,
+        })
+        .unwrap();
+        for _ in 0..16 {
+            rx.try_recv().unwrap();
+        }
+        pending.taken(800, 16 * ReplicaQueue::held_for(50));
+        // Streaming again from this write (220 bytes, under a quarter of
+        // 1000), over the soft limit from the next, and for longer than its
+        // seconds: still there.
+        propagate(&hub, vec![0u8; 20]);
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        propagate(&hub, vec![0u8; 20]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+
+        // Drained once: from now on, over the soft limit for longer than its
+        // seconds and it is dropped.
+        drain(&mut rx, &pending);
+        propagate(&hub, vec![0u8; 20]);
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        propagate(&hub, vec![0u8; 50]);
+        await_connected(&state, 0).await;
+        assert!(pending.abandoned());
+    }
+
+    /// A replica that went over the soft limit and then drained, with nothing
+    /// written meanwhile, is not over it any more: a large write after a
+    /// quiet spell starts its clock again, and does not drop it at once.
+    #[tokio::test]
+    async fn the_soft_limit_clock_starts_again_after_a_drain() {
+        let state = Arc::new(ReplState::new_master());
+        state
+            .replica_max_backlog_bytes
+            .store(1000, Ordering::Relaxed);
+        state.replica_soft_limit_bytes.store(100, Ordering::Relaxed);
+        state.replica_soft_limit_secs.store(0, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9011, &pending);
+        await_connected(&state, 1).await;
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9011,
+            offset: 0,
+        })
+        .unwrap();
+        // Streaming, under the soft limit, then over it.
+        propagate(&hub, vec![0u8; 20]);
+        for _ in 0..3 {
+            propagate(&hub, vec![0u8; 50]);
+        }
+        barrier(&hub).await;
+        // Drained, and quiet for longer than the soft limit's seconds.
+        drain(&mut rx, &pending);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        propagate(&hub, vec![0u8; 150]);
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+    }
+
+    /// 0 for the hard limit is no limit, as `client-output-buffer-limit
+    /// replica 0 0 0` is in Redis; and no streaming limit lifts the sync's.
+    #[tokio::test]
+    async fn no_hard_limit_keeps_a_replica_however_far_behind() {
+        let state = Arc::new(ReplState::new_master());
+        state.replica_max_backlog_bytes.store(0, Ordering::Relaxed);
+        state
+            .replica_sync_max_backlog_bytes
+            .store(100, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        let pending = Arc::new(ReplicaQueue::default());
+        let mut rx = register_syncing(&hub, 9012, &pending);
+        await_connected(&state, 1).await;
+        for _ in 0..100 {
+            propagate(&hub, vec![0u8; 1000]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
+        hub.send(HubMsg::AckOffset {
+            replica_id: 9012,
+            offset: 0,
+        })
+        .unwrap();
+        drain(&mut rx, &pending);
+        for _ in 0..100 {
+            propagate(&hub, vec![0u8; 1000]);
+        }
+        barrier(&hub).await;
+        assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
     }
 
     /// The sync's allowance is a bound too: the master's memory stays bounded
@@ -5055,18 +5645,21 @@ mod replication_invariants_tests {
     /// The length-bucketed `is_write_command` must be *exactly* equivalent to the
     /// flat list it was generated from.
     ///
-    /// `SELECT` must stay propagated *and* stay allowed on a read-only replica.
+    /// `SELECT` must stay flagged a write *and* stay allowed on a read-only
+    /// replica.
     ///
-    /// It is in `is_write_command` so the replication stream and the AOF carry
-    /// the db switch, but it mutates nothing. Denying it made every database
-    /// except 0 unreachable on a replica — a client configured with `db=N`
-    /// sends SELECT on connect and could not even read. The two predicates have
+    /// It is in `is_write_command` so it takes the write gate like a write:
+    /// the switch to writes that carry their own `SELECT` is only race-free
+    /// inside it (`note_database_selected`). But it mutates nothing and is
+    /// propagated to nobody. Denying it made every database except 0
+    /// unreachable on a replica — a client configured with `db=N` sends
+    /// SELECT on connect and could not even read. The two predicates have
     /// to disagree about this one command, so pin both sides.
     #[test]
-    fn select_is_propagated_but_allowed_on_a_replica() {
+    fn select_is_a_write_but_allowed_on_a_replica() {
         assert!(
             super::is_write_command("SELECT"),
-            "SELECT must still be propagated, or a replica applies writes to the wrong db"
+            "SELECT must stay flagged a write, or it stops taking the write gate"
         );
         assert!(
             !super::is_denied_on_readonly_replica("SELECT", &[b"SELECT", b"3"]),
@@ -5305,6 +5898,7 @@ mod replication_invariants_tests {
             replica_id: 9005,
             pending_bytes: Arc::default(),
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         await_connected(&state, 1).await;
@@ -5362,6 +5956,7 @@ mod replication_invariants_tests {
                 peer_port: port,
                 tx,
                 pending_bytes: Arc::clone(&queue),
+                slot_imports: false,
             },
             QueueRx::new(rx, queue),
         )
@@ -5437,6 +6032,7 @@ mod replication_invariants_tests {
             replica_id: 7002,
             pending_bytes: r.pending_bytes,
             base: 0,
+            slot_imports: false,
         })
         .unwrap();
         await_connected(&state, 1).await;
@@ -5658,5 +6254,127 @@ mod backlog_tests {
         assert_eq!(flush_before_load("on-empty-db"), Some(true));
         assert_eq!(flush_before_load("swapdb"), Some(false));
         assert_eq!(flush_before_load("sometimes"), None);
+    }
+}
+
+#[cfg(test)]
+mod slot_imports_tests {
+    use super::*;
+
+    fn link(promotions: Arc<AtomicU64>) -> ClusterLink {
+        ClusterLink {
+            master_node: Box::new(|| None),
+            take_over: Box::new(|_, _| false),
+            slot_imports: Box::new(move |event| {
+                if matches!(event, SlotImportsEvent::Promoted) {
+                    promotions.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        }
+    }
+
+    /// The cluster layer is told of every promotion, with a resync point or
+    /// not: it re-sends its markers then (#741 review).
+    #[test]
+    fn every_promotion_tells_the_cluster_layer() {
+        let promotions = Arc::new(AtomicU64::new(0));
+        let state = ReplState::new_master();
+        state.install_cluster_link(link(Arc::clone(&promotions)));
+        state.become_master();
+        assert_eq!(promotions.load(Ordering::SeqCst), 1);
+        state.become_master();
+        assert_eq!(promotions.load(Ordering::SeqCst), 2);
+    }
+
+    async fn barrier(hub: &HubTx) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done)).unwrap();
+        wait.await.unwrap();
+    }
+
+    fn drained(rx: &mut mpsc::UnboundedReceiver<ReplPayload>) -> Vec<Vec<u8>> {
+        let mut got = Vec::new();
+        while let Ok(payload) = rx.try_recv() {
+            got.push(payload.to_vec());
+        }
+        got
+    }
+
+    /// Markers go to the replicas that asked for them only, the `SYNC` form
+    /// first, and are not part of the stream: no backlog keeps them, and
+    /// what a replica has been sent of the stream does not count them. A
+    /// replica that did not ask (one of an earlier release) is sent the
+    /// stream alone, byte for byte.
+    #[tokio::test]
+    async fn markers_go_only_to_replicas_that_asked_and_outside_the_stream() {
+        let state = Arc::new(ReplState::new_master());
+        state.sends_slot_imports.store(true, Ordering::Relaxed);
+        let hub = start_hub(Arc::clone(&state));
+        state.send_slot_imports(b"LIVE-1".to_vec(), b"SYNC-1".to_vec());
+        let mut rxs = Vec::new();
+        for (id, takes) in [(31_u64, true), (32, false)] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            hub.send(HubMsg::RegisterChannel {
+                addr: format!("replica-{id}"),
+                peer_ip: "127.0.0.1".into(),
+                peer_port: id as u16,
+                tx,
+                replica_id: id,
+                pending_bytes: Arc::default(),
+                base: 0,
+                slot_imports: takes,
+            })
+            .unwrap();
+            rxs.push(rx);
+        }
+        let write = b"*1\r\n$4\r\nPING\r\n".to_vec();
+        propagate(&hub, write.clone());
+        state.send_slot_imports(b"LIVE-2".to_vec(), b"SYNC-2".to_vec());
+        propagate(&hub, write.clone());
+        barrier(&hub).await;
+        assert_eq!(
+            drained(&mut rxs[0]),
+            vec![
+                b"SYNC-1".to_vec(),
+                write.clone(),
+                b"LIVE-2".to_vec(),
+                write.clone()
+            ]
+        );
+        assert_eq!(drained(&mut rxs[1]), vec![write.clone(), write.clone()]);
+        for id in [31, 32] {
+            let sent = state.replica(id).unwrap().sent.load(Ordering::Relaxed);
+            assert_eq!(sent, 2 * write.len() as u64, "replica {id}");
+        }
+        // A replica attached later is sent the last `SYNC` form first.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.send(HubMsg::RegisterChannel {
+            addr: "replica-33".into(),
+            peer_ip: "127.0.0.1".into(),
+            peer_port: 33,
+            tx,
+            replica_id: 33,
+            pending_bytes: Arc::default(),
+            base: 0,
+            slot_imports: true,
+        })
+        .unwrap();
+        barrier(&hub).await;
+        assert_eq!(drained(&mut rx), vec![b"SYNC-2".to_vec()]);
+    }
+
+    /// A master that does not send markers (outside cluster mode, or acting
+    /// as an earlier release) sends none, whatever a replica asked.
+    #[test]
+    fn a_master_that_does_not_send_markers_adds_no_word() {
+        let state = ReplState::new_master();
+        assert!(!state.sends_slot_imports_to(true));
+        assert_eq!(state.psync_words(false, true), "");
+        state.sends_slot_imports.store(true, Ordering::Relaxed);
+        assert!(!state.sends_slot_imports_to(false));
+        assert!(state.psync_words(false, true).ends_with(" slot-imports"));
+        assert!(psync_reply_has_slot_imports(
+            "+CONTINUE 0123456789012345678901234567890123456789 slot-imports"
+        ));
     }
 }

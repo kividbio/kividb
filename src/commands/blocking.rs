@@ -49,6 +49,7 @@
 //! what Redis does: a blocking command inside `MULTI` never blocks, it returns
 //! its empty-handed reply.
 
+use crate::resp::write::resp_error;
 use crate::wait_table::Value;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -223,10 +224,19 @@ pub struct Interrupted {
 /// The timeout of a blocking command, in seconds, as Redis reads one: any
 /// float (hexadecimal included), not negative, and not so large that the
 /// deadline in milliseconds would overflow.
+///
+/// Redis reads the number as a `long double` and rounds it up to whole
+/// milliseconds, so a timeout too small for an `f64` (`1e-343`) is still a
+/// real one and waits 1 ms; only a text that no `long double` can hold
+/// (`1e-5000`, `1e5000`) is "not a float". `parse_score` refuses such texts
+/// and [`parse_rounded_away_timeout`] sorts them out.
 pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
-    use crate::resp::write::resp_error;
-    let Some(secs) = crate::commands::zset::parse_score(raw).filter(|t| t.is_finite()) else {
-        return Err(resp_error("ERR timeout is not a float or out of range"));
+    let parsed = crate::commands::zset::parse_score(raw);
+    // `parse_score` reads `1e-330` as 0.0 (as `fast_float` does), which is
+    // no zero as written: such a text goes the same way as one it refuses.
+    let secs = match parsed {
+        Some(secs) if secs != 0.0 => secs,
+        _ => return parse_rounded_away_timeout(raw, parsed),
     };
     if secs < 0.0 {
         return Err(resp_error("ERR timeout is negative"));
@@ -240,6 +250,107 @@ pub fn parse_timeout(raw: &[u8]) -> Result<f64, Vec<u8>> {
     Ok(secs)
 }
 
+/// The cut-offs of a `long double`, as a power of ten and the first 22
+/// digits: half the smallest subnormal (2^-16446, below which a text rounds
+/// to 0 and is no number) and the value where `strtold` overflows (2^16384 -
+/// 2^16319). Texts are compared with these to 22 significant digits, not
+/// exactly: a text that differs only past the 22nd digit may land on the
+/// wrong side.
+const LONG_DOUBLE_TINY: (i64, &[u8; DIGITS]) = (-4951, b"1822599765941237301264");
+const LONG_DOUBLE_HUGE: (i64, &[u8; DIGITS]) = (4932, b"1189731495357231765053");
+const DIGITS: usize = 22;
+
+/// The power of ten of a number's first non-zero digit, and its digits.
+type Magnitude = (i64, [u8; DIGITS]);
+
+/// A timeout that `parse_score` did not take or read as 0.0: one that an
+/// `f64` rounds to 0 or to infinity, or that is no number at all. `parsed` is
+/// what `parse_score` made of it.
+fn parse_rounded_away_timeout(raw: &[u8], parsed: Option<f64>) -> Result<f64, Vec<u8>> {
+    let not_a_float = || resp_error("ERR timeout is not a float or out of range");
+    let Some((negative, magnitude)) = std::str::from_utf8(raw).ok().and_then(split_timeout_parts)
+    else {
+        // A hexadecimal zero (`0x0`) is a zero all the same.
+        return if parsed.is_some() {
+            Ok(0.0)
+        } else {
+            Err(not_a_float())
+        };
+    };
+    // A zero as written is a timeout that never ends, and `parse_score`
+    // has read it already.
+    let Some(magnitude) = magnitude else {
+        return Ok(0.0);
+    };
+    // Redis tells these apart from a number of any size before it looks at
+    // the sign: `-1e-5000` is not a float, but `-1e-343` is negative.
+    if magnitude <= (LONG_DOUBLE_TINY.0, *LONG_DOUBLE_TINY.1)
+        || magnitude >= (LONG_DOUBLE_HUGE.0, *LONG_DOUBLE_HUGE.1)
+    {
+        return Err(not_a_float());
+    }
+    if negative {
+        return Err(resp_error("ERR timeout is negative"));
+    }
+    if magnitude.0 > 0 {
+        return Err(resp_error("ERR timeout is out of range"));
+    }
+    // A tiny timeout, but not zero: the shortest wait there is.
+    Ok(0.001)
+}
+
+/// Split a decimal number, `[+-]digits[.digits][e[+-]digits]` with at least
+/// one digit before the `e`, into its sign and its magnitude: the power of
+/// ten of its first non-zero digit and its first [`DIGITS`] digits from
+/// there (the rest zeros), or `None` for the magnitude of a zero. `None` if
+/// the text is no number. The power saturates, so `1e-99999999999999999999`
+/// is read at once.
+fn split_timeout_parts(text: &str) -> Option<(bool, Option<Magnitude>)> {
+    let (negative, unsigned) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut all = whole.bytes().chain(fraction.bytes()).peekable();
+    if all.peek().is_none() || !all.clone().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let exponent = match exponent {
+        None => 0,
+        Some(exponent) => {
+            let (negative, digits) = match exponent.as_bytes().first() {
+                Some(b'-') => (true, &exponent[1..]),
+                Some(b'+') => (false, &exponent[1..]),
+                _ => (false, exponent),
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let value = digits.bytes().fold(0i64, |acc, b| {
+                acc.saturating_mul(10)
+                    .saturating_add(i64::from(b - b'0'))
+                    .min(1 << 40)
+            });
+            if negative { -value } else { value }
+        }
+    };
+    let zeros = all.clone().take_while(|&b| b == b'0').count();
+    if zeros == whole.len() + fraction.len() {
+        return Some((negative, None));
+    }
+    let power = whole.len() as i64 - 1 - zeros as i64 + exponent;
+    let mut digits = [b'0'; DIGITS];
+    for (slot, b) in digits.iter_mut().zip(all.skip(zeros)) {
+        *slot = b;
+    }
+    Some((negative, Some((power, digits))))
+}
+
 /// Mark an error reply as one a woken client is told even though it says
 /// WRONGTYPE: see [`wait_for_keys`].
 pub fn definite(mut reply: Vec<u8>) -> Vec<u8> {
@@ -248,6 +359,13 @@ pub fn definite(mut reply: Vec<u8>) -> Vec<u8> {
 }
 
 const DEFINITE: u8 = 0x01;
+
+/// How long a reply waits on the clients its command woke. See
+/// [`BlockingSlot::settle`].
+const WOKEN_BOUND: Duration = Duration::from_millis(100);
+
+/// The wait [`BlockingSlot::settle`] gives a reply.
+pub type Settling = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// What a resumed blocking command was handed: the key that fired and the value
 /// delivered through the handoff, or `None` if the wait timed out.
@@ -288,12 +406,41 @@ pub struct BlockingSlot {
     /// True while the current dispatch *is* a resume. Guards against a handler
     /// that parks again after being resumed, which would spin the loop forever.
     in_resume: bool,
+    /// The looks this client owes whoever woke it, from the end of its wait
+    /// until it has looked at its keys and either replied or waited again:
+    /// they hold their replies until then. Done at the end of the dispatch
+    /// that looks. See [`crate::wait_table::Look`].
+    looked: Vec<std::sync::Arc<crate::wait_table::Look>>,
+    /// The looks of the clients the last dispatch woke. See
+    /// [`settle`](Self::settle).
+    woken: Vec<std::sync::Arc<crate::wait_table::Look>>,
+    /// This connection, to the looks it waits for: one per woken client.
+    owner: u64,
+    /// Whether the dispatch under way collects the clients it wakes.
+    collecting: bool,
+}
+
+impl Drop for BlockingSlot {
+    /// A connection that ends before its resume dispatch has run still owes
+    /// its looks: they are marked done here, so that whoever woke it does
+    /// not wait out the bound for a client that has gone.
+    fn drop(&mut self) {
+        if !self.looked.is_empty() {
+            crate::wait_table::all_done(std::mem::take(&mut self.looked), &[]);
+        }
+    }
 }
 
 impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
+        // Nobody stands in any line (nearly always): nothing this command
+        // does can wake anyone, and there is nothing to collect.
+        self.collecting = crate::wait_table::anyone_in_line();
+        if self.collecting {
+            self.collect();
+        }
         self.ctl.awaitable = true;
         self.ctl.parked = None;
         match self.pending.take() {
@@ -312,13 +459,140 @@ impl BlockingSlot {
         &mut self.ctl
     }
 
+    /// Collect what the dispatch about to run wakes, for this connection.
+    #[inline(never)]
+    fn collect(&mut self) {
+        if self.owner == 0 {
+            self.owner = new_owner();
+        }
+        crate::wait_table::collect_woken_for(self.owner);
+    }
+
     /// Take the wait a handler parked during the dispatch just completed.
+    ///
+    /// Called straight after every dispatch and before anything is awaited:
+    /// what it woke is in a thread-local, which another connection on this
+    /// thread would overwrite.
+    #[inline]
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
+        // Looked at in place: moving the wait out of the slot to look at it
+        // copied it on every command.
+        if self.ctl.parked.is_none() {
+            if self.in_resume {
+                self.resume_over();
+            }
+            // Nearly every command: ran while nobody stood in any line,
+            // owes nobody a look, and did not wait.
+            if !self.collecting && self.looked.is_empty() {
+                return None;
+            }
+            return self.looked_or_waits(None);
+        }
         let parked = self.ctl.parked.take();
-        if parked.is_none() && self.in_resume {
-            self.resume_over();
+        self.looked_or_waits(parked)
+    }
+
+    /// [`take_parked`](Self::take_parked) for a command that may have woken
+    /// someone, owes a look, or waits.
+    #[cold]
+    fn looked_or_waits(&mut self, parked: Option<BlockingWait>) -> Option<BlockingWait> {
+        // After `resume_over`: a refused resume's ticket, dropped there,
+        // passes its turn on, and the client that wakes is this dispatch's to
+        // wait for, as the client a handler passes the turn to is.
+        let collected = if self.collecting {
+            crate::wait_table::take_woken()
+        } else {
+            None
+        };
+        let mut woken = Vec::new();
+        if let Some(collected) = collected {
+            woken = collected.woken;
+            self.looked.extend(collected.owed);
+        }
+        if let Some(wait) = &parked {
+            // It looked, found nothing and waits again: whoever woke it has
+            // its look, unless a write woke it again once it stood back in
+            // line (that one it has not seen yet). A command that waits has
+            // no reply to hold for those it woke.
+            let owed = std::mem::take(&mut self.looked);
+            match &wait.state {
+                Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) => {
+                    ticket.looked_and_waits(owed, &woken)
+                }
+                _ => crate::wait_table::all_done(owed, &woken),
+            }
+        } else {
+            if !self.looked.is_empty() {
+                // It looked: done, with the looks of those it woke, which
+                // whoever woke it waits for too. Now, not after its own wait
+                // for them, so that two clients that woke each other never
+                // wait for each other.
+                crate::wait_table::all_done(std::mem::take(&mut self.looked), &woken);
+            }
+            // Waited for before the next command of this client that reads
+            // (`settles_before`), with those of the commands before it.
+            self.woken.append(&mut woken);
         }
         parked
+    }
+
+    /// Whether the clients the commands before `cmd0` woke must have looked
+    /// before it runs: it reads (or is not known to write), and so would see
+    /// what they are yet to take. Writes do not wait, and replies are not
+    /// held: a producer pipelining `LPUSH`es to queues with blocked workers
+    /// would otherwise wait for every worker it woke, push by push or batch
+    /// by batch, and push at the rate the workers pop (#823: 1,960 jobs/s
+    /// down to 1,240 at 1,000 workers x 270 queues waiting per command, and
+    /// 1,400 waiting once per batch). What a client observes after its own
+    /// push, with `LLEN`, `INFO` or anything else that reads, comes after
+    /// the pops that push caused, as in Redis.
+    #[inline]
+    pub fn settles_before(&self, cmd0: &[u8]) -> bool {
+        !self.woken.is_empty() && !crate::replication::is_write_command_bytes(cmd0)
+    }
+
+    /// Forget the looks of the clients woken before that are done: kept
+    /// only for the next command that reads, they must not pile up on a
+    /// connection that only writes.
+    #[inline]
+    pub fn forget_looked(&mut self) {
+        if !self.woken.is_empty() {
+            self.woken.retain(|look| !look.is_done());
+        }
+    }
+
+    /// Wait for the clients the commands before this one woke to have
+    /// looked at their keys, so that what it reads comes after their pops,
+    /// as in Redis (#42); a chain (`BRPOPLPUSH a b` woken by a push to `a`,
+    /// whose push to `b` wakes `BRPOPLPUSH b c`) is waited for whole.
+    ///
+    /// Bounded: a woken client cannot always look at once — a paused server
+    /// holds its resume dispatch, and `CLIENT KILL` or a timeout can take it
+    /// away mid-flight. At the bound the command runs without waiting any
+    /// longer, and may not see that client's pop. A hundred milliseconds is
+    /// far longer than a dispatch, which only has to finish what it was
+    /// already running, and far shorter than any `CLIENT PAUSE` someone
+    /// would set. The bound is for all of them together, not for each.
+    ///
+    /// A client that has gone does not hold it: the looks it owes are done
+    /// when its ticket goes, or with the dispatch that leaves its lines.
+    ///
+    /// `None`, nothing to wait for, is what nearly every command gets. The
+    /// wait is boxed, so that it is polled out of line, as `until_gone` is:
+    /// the connection's own future is compiled as it was without it.
+    #[inline]
+    pub fn settle(&mut self) -> Option<Settling> {
+        if self.woken.is_empty() {
+            return None;
+        }
+        self.settle_woken()
+    }
+
+    #[cold]
+    fn settle_woken(&mut self) -> Option<Settling> {
+        let woken = std::mem::take(&mut self.woken);
+        let deadline = tokio::time::Instant::now() + WOKEN_BOUND;
+        Some(Box::pin(crate::wait_table::all_looked(woken, deadline)))
     }
 
     /// A dispatch that resumed a command is over and did not park again:
@@ -364,13 +638,25 @@ impl BlockingSlot {
 
     /// Store what the wait produced, for the resume dispatch to pick up.
     pub fn set_pending(&mut self, delivery: Delivery, state: Option<BlockState>) {
+        if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+            &state
+        {
+            self.looked.extend(ticket.take_looked());
+        }
         self.pending = Some((delivery, state, false));
     }
 
     /// The client went while its command waited. The command is dispatched
     /// once more, but only to leave the line it stood in: see
-    /// [`client_gone`].
+    /// [`client_gone`]. Whoever woke it, if anyone did, waits for that
+    /// dispatch as for any other: it passes the turn on, and the client it
+    /// passes it to is the one that takes the element.
     pub fn set_gone(&mut self, state: Option<BlockState>) {
+        if let Some(BlockState::Queued { ticket, .. } | BlockState::GroupRead { ticket, .. }) =
+            &state
+        {
+            self.looked.extend(ticket.take_looked());
+        }
         self.pending = Some((None, state, true));
     }
 
@@ -383,6 +669,14 @@ impl BlockingSlot {
             *gone = true;
         }
     }
+}
+
+/// A number for a connection, to the looks it waits for
+/// (`wait_table::collect_woken_for`).
+#[cold]
+fn new_owner() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Outcome of asking to park.
@@ -523,27 +817,30 @@ pub fn wait_for_keys(
         // Nobody is there to be given anything: out of the line, taking
         // nothing, and the turn to the client behind, which may have been
         // this one's.
-        for key in keys {
-            ctx.wait_table.dequeue(key, &ticket);
-            ctx.wait_table.pass_on(key, &ticket);
-        }
+        leave_lines(ctx, keys, &ticket);
         return empty();
     }
     let timed_out = matches!(resumed, Some(None));
-    // The key this client was woken for, if it was.
+    // The key this client was woken for, if it was: what the line's
+    // receiver is sent (`WaitTable::enqueue_all`).
     let woken_for: Option<Vec<u8>> = match &resumed {
-        Some(Some((key, _))) => Some(key.clone()),
+        Some(Some((_, key))) => Some(key.to_vec()),
         _ => None,
     };
 
     // Stand in line before looking, so a write that lands between the look
-    // and the park still wakes us.
-    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out {
+    // and the park still wakes us. One receiver for all the keys, which the
+    // first of them to be written wakes (#758).
+    //
+    // Not a caller that cannot wait (`MULTI`, a script, the replica
+    // applier): it only looks. Standing in line, it could be the head a
+    // push wakes, and then leave without passing the turn on, leaving the
+    // client behind it blocked with the element there.
+    let may_park = ctx.blocking.as_ref().is_some_and(|slot| slot.awaitable);
+    let rxs: Vec<(Vec<u8>, oneshot::Receiver<Value>)> = if timed_out || !may_park {
         Vec::new()
     } else {
-        keys.iter()
-            .map(|key| (key.clone(), ctx.wait_table.enqueue(key, &ticket)))
-            .collect()
+        vec![(Vec::new(), ctx.wait_table.enqueue_all(keys, &ticket))]
     };
     // On the first look a key of the wrong type is an error. Found on
     // being woken — the key it was waiting on has been replaced by
@@ -572,24 +869,36 @@ pub fn wait_for_keys(
     // On the others it waits its turn, which comes when those ahead have
     // looked — and they are made to look.
     let can_wait = ctx.blocking.is_some() && !timed_out && remaining_time(deadline).is_some();
-    let open: Vec<Vec<u8>> = keys
-        .iter()
-        .filter(|key| {
-            let theirs = can_wait
-                && woken_for.as_deref() != Some(key.as_slice())
-                && ctx.wait_table.someone_ahead(key, &ticket)
-                && has_elements(ctx, key);
-            if theirs {
-                ctx.wait_table.wake_head(key);
+    //
+    // Whether a key has elements is asked first: it is the cheap question,
+    // and of a client blocked on many keys nearly all are empty.
+    let theirs = |ctx: &crate::commands::ctx::Ctx, key: &Vec<u8>| {
+        let theirs = can_wait
+            && woken_for.as_deref() != Some(key.as_slice())
+            && has_elements(ctx, key)
+            && ctx.wait_table.someone_ahead(key, &ticket);
+        if theirs {
+            ctx.wait_table.wake_head(key);
+        }
+        theirs
+    };
+    let attempted = match keys.iter().position(|key| theirs(&*ctx, key)) {
+        // All of them are open to it: no copy of the keys.
+        None => attempt(ctx, keys),
+        Some(first) => {
+            let mut open: Vec<Vec<u8>> = keys[..first].to_vec();
+            open.extend(
+                keys[first + 1..]
+                    .iter()
+                    .filter(|key| !theirs(&*ctx, key))
+                    .cloned(),
+            );
+            if open.is_empty() {
+                None
+            } else {
+                attempt(ctx, &open)
             }
-            !theirs
-        })
-        .cloned()
-        .collect();
-    let attempted = if open.is_empty() {
-        None
-    } else {
-        attempt(ctx, &open)
+        }
     };
     let reply = match attempted {
         Some(mut reply) if reply.first() == Some(&DEFINITE) => {
@@ -626,26 +935,19 @@ pub fn wait_for_keys(
     // there). Not when it stays and there is nothing: waking the next client
     // to look at nothing would put two of them in a race for whatever
     // arrives next, and the order they blocked in would be lost.
-    let leaving = outcome.is_ok();
-    let pass_on = |ctx: &crate::commands::ctx::Ctx, leaving: bool| {
-        for key in keys {
-            if leaving {
-                ctx.wait_table.dequeue(key, &ticket);
-                ctx.wait_table.pass_on(key, &ticket);
-            } else if has_elements(ctx, key) {
-                ctx.wait_table.pass_on(key, &ticket);
-            }
-        }
-    };
     let remaining = match outcome {
         Ok(reply) => {
             drop(rxs);
-            pass_on(ctx, leaving);
+            leave_lines(ctx, keys, &ticket);
             return reply;
         }
         Err(remaining) => remaining,
     };
-    pass_on(ctx, leaving);
+    for key in keys {
+        if has_elements(ctx, key) {
+            ctx.wait_table.pass_on(key, &ticket);
+        }
+    }
     let state = BlockState::Queued {
         deadline,
         ticket: std::sync::Arc::clone(&ticket),
@@ -656,12 +958,34 @@ pub fn wait_for_keys(
             ticket.parks_in(keys, false);
             Vec::new()
         }
+        // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
-            for key in keys {
-                ctx.wait_table.dequeue(key, &ticket);
-            }
             crate::stats::record_miss();
             empty()
+        }
+    }
+}
+
+/// A command that waited in the lines for `keys` is over: out of all of
+/// them, under one lock, and the turn to the client behind it where the
+/// turn may have been this one's — it had been woken there and had not
+/// looked, or the key has elements it has left behind.
+///
+/// Not where the key is empty and the turn was not with it: the client
+/// behind would only look, find nothing and wait again. Every client that
+/// timed out used to wake the next in each of its lines that way, and with
+/// a thousand clients blocked on the same 270 keys each timeout set off a
+/// round of a few hundred pointless wake-ups (#758).
+fn leave_lines(
+    ctx: &crate::commands::ctx::Ctx,
+    keys: &[Vec<u8>],
+    ticket: &crate::wait_table::Ticket,
+) {
+    let woken = ctx.wait_table.dequeue_all(keys, ticket);
+    ctx.wait_table.left_all(ticket);
+    for (key, woken) in keys.iter().zip(woken) {
+        if woken || has_elements(ctx, key) {
+            ctx.wait_table.pass_on(key, ticket);
         }
     }
 }
@@ -807,41 +1131,43 @@ impl BlockingWait {
         self.race().await
     }
 
+    /// The receivers are raced in this future, under one timer: the first
+    /// to be sent something wins, and a receiver whose sender has gone drops
+    /// out. With none left, or the time up, there is no delivery. Each
+    /// receiver used to be raced by a task of its own, with a timer of its
+    /// own, which for `XREAD BLOCK` over many streams (and, before #758 gave
+    /// a client in the lines for many keys a single receiver, `BRPOP` over
+    /// many keys) was a task and a timer per key per wait.
     async fn race(self) -> Delivery {
-        let timeout = self.timeout;
-        let (winner_tx, mut winner_rx) = tokio::sync::mpsc::channel(1);
-        let mut handles = Vec::with_capacity(self.rxs.len());
-
-        for (key, rx) in self.rxs {
-            let tx = winner_tx.clone();
-            handles.push(tokio::spawn(async move {
-                let got = match timeout {
-                    None => rx.await.ok(),
-                    Some(d) => tokio::time::timeout(d, rx).await.ok().and_then(|r| r.ok()),
+        let mut rxs: Vec<(Vec<u8>, Option<oneshot::Receiver<Value>>)> = self
+            .rxs
+            .into_iter()
+            .map(|(key, rx)| (key, Some(rx)))
+            .collect();
+        let first = std::future::poll_fn(move |cx| {
+            let mut waiting = false;
+            for (key, slot) in rxs.iter_mut() {
+                let Some(rx) = slot.as_mut() else {
+                    continue;
                 };
-                if let Some(val) = got {
-                    let _ = tx.send((key, val)).await;
-                }
-            }));
-        }
-        // Dropping our own sender is what lets `recv()` return `None` once every
-        // racing task has finished — which, when they all timed out, is the
-        // timeout signal itself.
-        drop(winner_tx);
-
-        // Stopped when this future ends, however it ends: a task left
-        // running would go on holding its place among a key's waiters for a
-        // client that is no longer waiting.
-        struct Racers(Vec<tokio::task::JoinHandle<()>>);
-        impl Drop for Racers {
-            fn drop(&mut self) {
-                for handle in &self.0 {
-                    handle.abort();
+                match std::future::Future::poll(std::pin::Pin::new(rx), cx) {
+                    std::task::Poll::Ready(Ok(value)) => {
+                        return std::task::Poll::Ready(Some((std::mem::take(key), value)));
+                    }
+                    std::task::Poll::Ready(Err(_)) => *slot = None,
+                    std::task::Poll::Pending => waiting = true,
                 }
             }
+            if waiting {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        });
+        match self.timeout {
+            None => first.await,
+            Some(timeout) => tokio::time::timeout(timeout, first).await.ok().flatten(),
         }
-        let _racers = Racers(handles);
-        winner_rx.recv().await
     }
 }
 
@@ -915,6 +1241,45 @@ mod tests {
             None,
         );
         assert_eq!(got.expect("k2 fired").0, b"k2");
+    }
+
+    /// A woken client that never looks at its keys — paused, killed, or gone —
+    /// must not hold the reply past the bound: for all of them together.
+    /// Looks that name each other end.
+    #[test]
+    fn a_woken_client_that_never_looks_holds_the_reply_only_to_the_bound() {
+        use crate::wait_table::Look;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let woken = Look::new_for_tests(5);
+        // The slot has a `Drop`, so it cannot be built with `..Default::default()`.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut slot = BlockingSlot::default();
+        slot.woken = woken.clone();
+        let started = Instant::now();
+        rt.block_on(slot.settle().expect("something to wait for"));
+        let waited = started.elapsed();
+        assert!(waited >= WOKEN_BOUND, "gave up early: {waited:?}");
+        assert!(
+            waited < WOKEN_BOUND * 3,
+            "waited past the bound: {waited:?}"
+        );
+        // Done, and done with each other: no wait.
+        woken[0].done(&woken[1..]);
+        for (n, look) in woken.iter().enumerate().skip(1) {
+            look.done(&woken[..n]);
+        }
+        // The slot has a `Drop`, so it cannot be built with `..Default::default()`.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut slot = BlockingSlot::default();
+        slot.woken = woken;
+        let started = Instant::now();
+        rt.block_on(slot.settle().expect("something to wait for"));
+        assert!(started.elapsed() < WOKEN_BOUND / 2);
+        // Nothing woken, nothing to wait for.
+        assert!(BlockingSlot::default().settle().is_none());
     }
 
     /// Every registration being cancelled must not hang a `timeout 0` wait
@@ -1009,6 +1374,111 @@ mod gone_resume_tests {
         test(&run, &wait_table);
     }
 
+    fn with_ctx(test: impl FnOnce(&mut Ctx<'_>)) {
+        // `with_server`, handing the test a `Ctx` with no blocking slot, as
+        // `MULTI`, a script and the replica applier have.
+        // The pause is the process's: a unit test pausing writes would hold
+        // these commands back (`pause::held_in_gate`).
+        let _pause = crate::pause::TEST_LOCK.lock();
+        let store = crate::store::new_store(1);
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(crate::cluster::ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        {
+            let mut ctx = Ctx {
+                cmd: Vec::new(),
+                store: &store,
+                lastsave: &lastsave,
+                selected_db: &mut selected_db,
+                aof_tx: &NoopAofSender,
+                aof_enabled: false,
+                config: &config,
+                started_at: &started_at,
+                index_store: &index_store,
+                dict_store: &dict_store,
+                wait_table: &wait_table,
+                ts_index: &ts_index,
+                pubsub: &pubsub,
+                hub_tx: &hub_tx,
+                repl_state: &repl_state,
+                watch_registry: &crate::watch::NoopWatchRegistry,
+                client_id: 0,
+                client_registry: &client_registry,
+                resp: 2,
+                acl_store: &acl_store,
+                acl_log: &acl_log,
+                slowlog: &slowlog,
+                latency: &latency,
+                compaction_tx: &compaction_tx,
+                cluster: &cluster,
+                bypass_cluster_check: false,
+                apply_replication: false,
+                skip_write_side_effects: false,
+                peer_addr: "127.0.0.1:1",
+                monitor_registry: &monitor_registry,
+                authenticated_user: "default",
+                tracking_table: &tracking_table,
+                blocking: None,
+            };
+            test(&mut ctx);
+        }
+    }
+
+    /// A blocking command that cannot wait (`MULTI`, a script, the replica
+    /// applier) only looks: it does not stand in line, so a push that lands
+    /// while it looks wakes the client blocked behind it, not it. It used to
+    /// stand in line, be the head the push woke, and leave without passing
+    /// the turn on: the client behind stayed blocked with the element there.
+    #[test]
+    fn a_command_that_cannot_wait_does_not_take_a_turn() {
+        with_ctx(|ctx| {
+            let keys = vec![b"k".to_vec()];
+            let table = Arc::clone(ctx.wait_table);
+            let mut behind = None;
+            let reply = wait_for_keys(
+                ctx,
+                &keys,
+                None,
+                |ctx, _| {
+                    // A client blocks on the key, and a push to it lands,
+                    // while this command looks.
+                    let ticket = table.new_ticket();
+                    let rx = table.enqueue_all(&keys, &ticket);
+                    ticket.parks_in(&keys, false);
+                    ctx.wait_table.notify_signal("k");
+                    behind = Some((ticket, rx));
+                    None
+                },
+                crate::resp::write::resp_null_array,
+            );
+            assert_eq!(reply, crate::resp::write::resp_null_array());
+            let (_ticket, mut rx) = behind.expect("looked");
+            assert_eq!(
+                rx.try_recv()
+                    .expect("the client behind was not woken")
+                    .as_ref(),
+                b"k"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn a_list_or_zset_command_whose_client_went_takes_nothing_and_passes_the_turn() {
         with_server(|run, wait_table| {
@@ -1071,6 +1541,49 @@ mod gone_resume_tests {
         });
     }
 
+    /// The client woken for an element has gone: whoever woke it has its
+    /// look once its gone dispatch has left the line and passed the turn
+    /// on, and that look carries the look of the client it passed the turn
+    /// to, which takes the element.
+    #[tokio::test]
+    async fn a_gone_resume_hands_its_waker_the_client_it_passes_to() {
+        with_server(|run, wait_table| {
+            run(&["RPUSH", "g", "e"], None);
+            let gone = wait_table.new_ticket();
+            let behind = wait_table.new_ticket();
+            let _gone_rx = wait_table.enqueue("g", &gone);
+            let mut behind_rx = wait_table.enqueue("g", &behind);
+            gone.parks_in(&["g".to_string()], false);
+            behind.parks_in(&["g".to_string()], false);
+            // The push's dispatch, which wakes the client at the head.
+            crate::wait_table::collect_woken();
+            wait_table.notify_signal("g");
+            let waker = crate::wait_table::take_woken().expect("woke one").woken;
+            assert_eq!(waker.len(), 1);
+            assert!(!waker[0].is_done());
+
+            let mut slot = BlockingSlot::default();
+            slot.set_gone(Some(BlockState::Queued {
+                deadline: None,
+                ticket: gone,
+            }));
+            run(&["BLPOP", "g", "0"], Some(slot.prime()));
+            assert!(slot.take_parked().is_none());
+            assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
+            assert!(waker[0].is_done(), "the gone client's look is not done");
+            // The one behind is waited for (twice, perhaps: the dispatch's
+            // write to `g` wakes the head of its line again, and that is the
+            // same client, yet to look).
+            assert!(!slot.woken.is_empty(), "the one behind is not waited for");
+            assert!(slot.woken.iter().all(|look| !look.is_done()));
+            drop(behind);
+            assert!(
+                slot.woken.iter().all(|look| look.is_done()),
+                "a client that went owes nothing"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn an_xreadgroup_whose_client_went_delivers_nothing_and_passes_the_turn() {
         with_server(|run, wait_table| {
@@ -1112,5 +1625,80 @@ mod gone_resume_tests {
             );
             assert!(behind_rx.try_recv().is_ok(), "the turn was not passed on");
         });
+    }
+
+    #[test]
+    fn parse_timeout_reads_a_long_double() {
+        let err = |raw: &[u8]| String::from_utf8(parse_timeout(raw).unwrap_err()).unwrap();
+        // Too small for an f64 but not for a long double: the shortest wait.
+        for raw in [
+            "1e-343",
+            "1e-400",
+            "+1e-343",
+            ".5e-343",
+            "5.e-343",
+            "1e-4950",
+            "1000e-4953",
+            "1.83e-4951",
+            "3e-4951",
+            "1e-330",
+            "1e-325",
+            "2e-324",
+            "0.000001e-320",
+        ] {
+            assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.001, "{raw}");
+        }
+        // Zero in any spelling never ends.
+        for raw in ["0", "0.0", "0e10", "-0", "-0.0", "-0e10", "0x0"] {
+            assert_eq!(parse_timeout(raw.as_bytes()).unwrap(), 0.0, "{raw}");
+        }
+        for raw in [
+            "1e-4951",
+            "1.8e-4951",
+            "0.001e-4948",
+            "1e-5000",
+            "-1e-5000",
+            "1e-99999999999999999999",
+            "1e99999999999999999999",
+            "1.2e4932",
+            "1e4933",
+            "xe-5",
+            "1.2.3e-400",
+            "1e2e3",
+            "e999",
+            "1e",
+            "1e-",
+            ".",
+            "",
+            " 1",
+            "1 ",
+            "1abc",
+            "--1",
+            "nan",
+        ] {
+            assert_eq!(
+                err(raw.as_bytes()),
+                "-ERR timeout is not a float or out of range\r\n",
+                "{raw}"
+            );
+        }
+        for raw in [
+            "inf",
+            "+inf",
+            "2e308",
+            "1e309",
+            "1e4000",
+            "1.1e4932",
+            "1.18973149535723176503e4932",
+        ] {
+            assert_eq!(
+                err(raw.as_bytes()),
+                "-ERR timeout is out of range\r\n",
+                "{raw}"
+            );
+        }
+        for raw in ["-1", "-inf", "-2e308", "-1e-343", "-1e-4950", "-1e-330"] {
+            assert_eq!(err(raw.as_bytes()), "-ERR timeout is negative\r\n", "{raw}");
+        }
     }
 }

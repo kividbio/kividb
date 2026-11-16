@@ -89,6 +89,8 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         "RESET" => cmd_reset(ctx),
         "MYSHARDID" => cmd_myshardid(ctx),
         "SLOT-STATS" => cmd_slot_stats(ctx),
+        "ORPHANSLOTS" => cmd_orphanslots(ctx),
+        "DROPORPHANS" => cmd_droporphans(ctx),
 
         "MIGRATION" => cmd_migration(ctx),
         // Node-to-node half of CLUSTER MIGRATION; not for clients.
@@ -167,6 +169,14 @@ fn cluster_help() -> Vec<u8> {
         "LINKS",
         "    Return information about all network links between this node and its peers.",
         "    Output format is an array where each array element is a map containing attributes of a link",
+        "ORPHANSLOTS",
+        "    Return the slots this node holds keys of but does not serve, with their key",
+        "    counts and owners: [start, end, keys, owner-id] (KiviDB).",
+        "DROPORPHANS [SLOT <slot> [<slot> ...] | SLOTSRANGE <start slot> <end slot> [...]]",
+        "    Delete, in the background, the keys this master holds of slots another master",
+        "    owns and has the keys of: those ORPHANSLOTS lists, or the slots given (KiviDB).",
+        "DROPORPHANS STATUS",
+        "    How the last DROPORPHANS went: [state, slots, deleted, kept, reason] (KiviDB).",
         "MIGRATION IMPORT <start-slot end-slot [start-slot end-slot ...]> |",
         "          STATUS [ID <task-id> | ALL] | CANCEL [ID <task-id> | ALL]",
         "    Start, monitor and cancel slot migration.",
@@ -279,6 +289,129 @@ fn cmd_countkeysinslot(ctx: &Ctx) -> Vec<u8> {
         }
     }
     resp_integer(count)
+}
+
+// ── CLUSTER ORPHANSLOTS / DROPORPHANS (KiviDB) ───────────────────────────────
+//
+// Keys a master holds of slots it does not serve, which nothing deletes on
+// its own (#517; see `cluster::orphans`).
+//
+//   CLUSTER ORPHANSLOTS
+//     [[start-slot, end-slot, key-count, owner-id | nil], ...]: runs of
+//     consecutive slots with keys here and the same owner, counted afresh.
+//   CLUSTER DROPORPHANS [SLOT slot [slot ...] | SLOTSRANGE start end [...]]
+//     Begin deleting this master's keys of the slots given, or of every
+//     slot ORPHANSLOTS lists: all of them, or none if one may not be. The
+//     number of keys found to delete; they are deleted in the background.
+
+fn cmd_orphanslots(ctx: &Ctx) -> Vec<u8> {
+    if ctx.cmd.len() != 2 {
+        return resp_error("ERR wrong number of arguments for 'cluster|orphanslots' command");
+    }
+    let found = crate::cluster::migration::off_the_runtime(|| {
+        crate::cluster::orphans::orphan_counts(ctx.cluster, ctx.store, ctx.repl_state)
+    });
+    ctx.cluster.orphans.record(&found, None);
+    let owners: Vec<Option<NodeId>> = {
+        let table = ctx.cluster.slots.read();
+        found
+            .iter()
+            .map(|&(slot, _)| table[slot as usize])
+            .collect()
+    };
+    // Runs of consecutive slots of one owner.
+    let mut runs: Vec<(u16, u16, u64, Option<NodeId>)> = Vec::new();
+    for (&(slot, keys), owner) in found.iter().zip(owners) {
+        match runs.last_mut() {
+            Some((_, end, n, o)) if *end + 1 == slot && *o == owner => {
+                *end = slot;
+                *n += keys;
+            }
+            _ => runs.push((slot, slot, keys, owner)),
+        }
+    }
+    resp_array(
+        runs.into_iter()
+            .map(|(start, end, keys, owner)| {
+                resp_array(vec![
+                    resp_integer(i64::from(start)),
+                    resp_integer(i64::from(end)),
+                    resp_integer(keys as i64),
+                    owner.map_or_else(resp_null_bulk, |id| resp_bulk_str(node_id_str(&id))),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn cmd_droporphans(ctx: &Ctx) -> Vec<u8> {
+    let args = &ctx.cmd[2..];
+    let wanted = match args.first().map(|a| a.to_ascii_uppercase()) {
+        None => None,
+        Some(form) if form == b"STATUS" && args.len() == 1 => {
+            return droporphans_status(ctx);
+        }
+        Some(form) if form == b"SLOT" && args.len() > 1 => {
+            let mut slots = Vec::with_capacity(args.len() - 1);
+            for arg in &args[1..] {
+                match parse_slot_arg(arg) {
+                    Ok(slot) => slots.push(slot),
+                    Err(e) => return e,
+                }
+            }
+            Some(slots)
+        }
+        Some(form) if form == b"SLOTSRANGE" && args.len() > 1 && args.len() % 2 == 1 => {
+            let mut slots = Vec::new();
+            for pair in args[1..].chunks(2) {
+                let (start, end) = match (parse_slot_arg(pair[0]), parse_slot_arg(pair[1])) {
+                    (Ok(start), Ok(end)) => (start, end),
+                    (Err(e), _) | (_, Err(e)) => return e,
+                };
+                if start > end {
+                    return resp_error(&format!(
+                        "ERR start slot number {start} is greater than end slot number {end}"
+                    ));
+                }
+                slots.extend(start..=end);
+            }
+            Some(slots)
+        }
+        Some(_) => {
+            return resp_error(
+                "ERR syntax error: CLUSTER DROPORPHANS [SLOT slot [slot ...] | SLOTSRANGE \
+                 start-slot end-slot [start-slot end-slot ...] | STATUS]",
+            );
+        }
+    };
+    // Nothing here waits on another node: the owners are asked on the
+    // deletion's own thread.
+    let env = crate::cluster::migration::Env::from_ctx(ctx);
+    match crate::cluster::orphans::drop_orphans(&env, wanted) {
+        Ok(keys) => resp_integer(keys as i64),
+        Err(e) => resp_error(&format!("ERR {e}")),
+    }
+}
+
+/// `CLUSTER DROPORPHANS STATUS`: `[state, slots, deleted, kept, reason]` of
+/// the last run, as name-value pairs; an empty array if none has run.
+fn droporphans_status(ctx: &Ctx) -> Vec<u8> {
+    let status = ctx.cluster.orphans.drop_status.lock().clone();
+    let Some(status) = status else {
+        return resp_array(Vec::new());
+    };
+    resp_array(vec![
+        resp_bulk_str("state"),
+        resp_bulk_str(status.state),
+        resp_bulk_str("slots"),
+        resp_integer(status.slots as i64),
+        resp_bulk_str("deleted"),
+        resp_integer(status.deleted as i64),
+        resp_bulk_str("kept"),
+        resp_integer(status.kept as i64),
+        resp_bulk_str("reason"),
+        resp_bulk_str(&status.reason),
+    ])
 }
 
 // ── CLUSTER GETKEYSINSLOT ────────────────────────────────────────────────────
@@ -1374,6 +1507,16 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
         Ok(s) => s.to_ascii_uppercase(),
         Err(_) => return resp_error("ERR invalid action"),
     };
+    // Not on a slot an atomic slot migration to or from this node is moving
+    // (#755), whatever the form, as Redis: first, before anything is looked
+    // at or deleted; and again, with the tasks locked, as the change is made.
+    let known = matches!(
+        action.as_str(),
+        "IMPORTING" | "MIGRATING" | "STABLE" | "NODE"
+    );
+    if known && let Err(e) = ctx.cluster.setslot_unless_migrating(slot, || Ok(())) {
+        return resp_error(&format!("ERR {e}"));
+    }
 
     match action.as_str() {
         "MIGRATING" => {
@@ -1386,7 +1529,10 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 Some(id) => id,
                 None => return resp_error("ERR Invalid node id"),
             };
-            if let Err(e) = ctx.cluster.set_migrating(slot, dest) {
+            if let Err(e) = ctx
+                .cluster
+                .setslot_unless_migrating(slot, || ctx.cluster.set_migrating(slot, dest))
+            {
                 return resp_error(&format!("ERR {e}"));
             }
             slot_changed_state();
@@ -1412,7 +1558,10 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             if let Some(refused) = before_slots_come(ctx, &[slot], "SETSLOT IMPORTING") {
                 return refused;
             }
-            if let Err(e) = ctx.cluster.set_importing(slot, src) {
+            if let Err(e) = ctx
+                .cluster
+                .setslot_unless_migrating(slot, || ctx.cluster.set_importing(slot, src))
+            {
                 return resp_error(&format!("ERR {e}"));
             }
             slot_changed_state();
@@ -1425,7 +1574,13 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                     "ERR wrong number of arguments for 'cluster|setslot|stable' command",
                 );
             }
-            ctx.cluster.clear_migration(slot);
+            let cleared = ctx.cluster.setslot_unless_migrating(slot, || {
+                ctx.cluster.clear_migration(slot);
+                Ok(())
+            });
+            if let Err(e) = cleared {
+                return resp_error(&format!("ERR {e}"));
+            }
             slot_changed_state();
             let _ = ctx.cluster.save_to_disk();
             resp_simple("OK")
@@ -1483,7 +1638,10 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             {
                 return refused;
             }
-            if let Err(e) = ctx.cluster.finalize_slot(slot, new_owner) {
+            if let Err(e) = ctx
+                .cluster
+                .setslot_unless_migrating(slot, || ctx.cluster.finalize_slot(slot, new_owner))
+            {
                 return resp_error(&format!("ERR {e}"));
             }
             slot_changed_state();
@@ -1684,6 +1842,60 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             ))
         }
         "APPLY" => syncslots_apply(ctx, &task_id),
+        // `CLUSTER SYNCSLOTS ORPHANCHECK <asker-id> <slot> ...`: what this
+        // node, the owner another one's slot table names, says of those
+        // slots before that one deletes its keys of them (#517).
+        "ORPHANCHECK" => {
+            let Some(asker) = crate::cluster::node::parse_node_id(ctx.cmd[3]) else {
+                return resp_error("ERR Invalid node id");
+            };
+            let mut slots = Vec::with_capacity(ctx.cmd.len().saturating_sub(4));
+            for arg in &ctx.cmd[4..] {
+                match parse_slot_arg(arg) {
+                    Ok(slot) => slots.push(slot),
+                    Err(e) => return e,
+                }
+            }
+            crate::log_info!(
+                "Cluster: {} asks, before it deletes its keys of {} slot(s) it says are this \
+                 node's, whether they are (CLUSTER DROPORPHANS)",
+                crate::cluster::node_id_str(&asker),
+                slots.len()
+            );
+            // Counts the slots' keys: O(N) in them, off the runtime.
+            let answer = migration::off_the_runtime(|| {
+                crate::cluster::orphans::orphan_check_answer(
+                    ctx.cluster,
+                    ctx.store,
+                    ctx.repl_state,
+                    &slots,
+                )
+            });
+            resp_simple(&answer)
+        }
+        // `CLUSTER SYNCSLOTS ORPHANKEYS <asker-id> <key> ...`: which of
+        // those keys this node has, looked at without using them, before
+        // the asker deletes its copies (#517).
+        "ORPHANKEYS" => {
+            let Some(asker) = crate::cluster::node::parse_node_id(ctx.cmd[3]) else {
+                return resp_error("ERR Invalid node id");
+            };
+            if ctx.cmd.len() < 5 {
+                return resp_error("ERR syntax error");
+            }
+            crate::log_verbose!(
+                "Cluster: {} asks which of {} key(s) this node has (CLUSTER DROPORPHANS)",
+                crate::cluster::node_id_str(&asker),
+                ctx.cmd.len() - 4
+            );
+            let answer = crate::cluster::orphans::orphan_keys_answer(
+                ctx.cluster,
+                ctx.store,
+                ctx.repl_state,
+                &ctx.cmd[4..],
+            );
+            resp_simple(&answer)
+        }
         other => resp_error(&format!(
             "ERR unknown CLUSTER SYNCSLOTS subcommand '{other}'"
         )),
@@ -2504,6 +2716,13 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
         log_info!("Cluster: Soft reset performed");
     }
     drop(cut);
+
+    // The imports of the master this node followed are no longer its to
+    // settle: it is no one's replica, nor in that cluster (#741). Before it
+    // becomes a master, which would begin their cleanup.
+    ctx.cluster
+        .followed_imports
+        .forget_all(ctx.cluster, "CLUSTER RESET");
 
     // Drop our replica relationship if any.
     ctx.repl_state.become_master();

@@ -20,8 +20,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+mod common;
+use common::{restart_verified, start_verified};
 
 // ── RESP client ───────────────────────────────────────────────────────────────
 
@@ -88,6 +90,21 @@ impl Conn {
         self.read()
     }
 
+    /// Several commands in one write, and their replies in order.
+    fn pipeline(&mut self, commands: &[Vec<String>]) -> Vec<V> {
+        let mut buf = Vec::new();
+        for args in commands {
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        self.writer.write_all(&buf).unwrap();
+        commands.iter().map(|_| self.read()).collect()
+    }
+
     fn read(&mut self) -> V {
         let mut line = String::new();
         self.reader.read_line(&mut line).expect("reply");
@@ -133,34 +150,6 @@ impl Conn {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`: asked with a socket that is bound and never
-/// listens (see `tests/resync.rs`).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing listens on, outside the range handed to outgoing
-/// connections.
-fn free_port() -> u16 {
-    use std::sync::atomic::AtomicU16;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(41);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
-        }
-    }
-}
-
 fn kividb(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -203,9 +192,9 @@ struct Server {
 impl Server {
     fn start(extra: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
-        let port = free_port();
         let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let child = kividb(&dir, port, &args, &[]);
+        // Verified to be the process started: see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| kividb(&dir, port, &args, &[]));
         let server = Server {
             port,
             dir,
@@ -250,7 +239,16 @@ impl Server {
     /// connection made the moment it comes up can be reset (master does the
     /// same): it is tried again.
     fn restart(&mut self) {
-        self.child = kividb(&self.dir, self.port, &self.args, &self.env);
+        // On the same port if it is still free, and on another if a test of
+        // another process has taken it in the gap (the data directory is what
+        // matters): `self.port` is the one it is on. Whoever was pointed at
+        // the old port has to be pointed at `self.port` again.
+        let (child, port, _) = restart_verified(
+            |port| kividb(&self.dir, port, &self.args, &self.env),
+            self.port,
+        );
+        self.child = child;
+        self.port = port;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).and_then(|mut s| {
@@ -340,9 +338,8 @@ fn unix_ms_now() -> u64 {
 fn start_with_conf(extra: &[&str], conf: &str) -> Server {
     let dir = tempfile::tempdir().unwrap().keep();
     std::fs::write(dir.join("kividb.conf"), conf).unwrap();
-    let port = free_port();
     let args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-    let child = kividb(&dir, port, &args, &[]);
+    let (child, port) = start_verified(|port| kividb(&dir, port, &args, &[]));
     let server = Server {
         port,
         dir,
@@ -402,17 +399,43 @@ fn assert_same_keys(master: &mut Conn, replica: &mut Conn, kinds: &[&str], n: us
 
 /// `HSET {kind}:{i} f 5 keep 1` and `HPEXPIREAT … at FIELDS 1 f`, of each
 /// kind, `i` below `n`.
+///
+/// In one pipeline: every `HPEXPIREAT` has to reach its hash before `at`,
+/// and on a busy machine 2 * kinds * n round trips can outlast a short
+/// margin.
 fn hashes_with_f_due_at(c: &mut Conn, kinds: &[&str], n: usize, at: u64) {
+    let at = at.to_string();
+    let mut commands = Vec::new();
     for kind in kinds {
         for i in 0..n {
             let key = format!("{kind}:{i}");
-            assert_eq!(c.cmd(&["HSET", &key, "f", "5", "keep", "1"]).i(), 2);
-            assert_eq!(
-                c.cmd(&["HPEXPIREAT", &key, &at.to_string(), "FIELDS", "1", "f"]),
-                V::Arr(vec![V::Int(1)])
+            commands.push(
+                ["HSET", &key, "f", "5", "keep", "1"]
+                    .map(String::from)
+                    .to_vec(),
+            );
+            commands.push(
+                ["HPEXPIREAT", &key, &at, "FIELDS", "1", "f"]
+                    .map(String::from)
+                    .to_vec(),
             );
         }
     }
+    for (i, pair) in c.pipeline(&commands).chunks(2).enumerate() {
+        assert_eq!(pair[0], V::Int(2), "write {i}");
+        assert_eq!(
+            pair[1],
+            V::Arr(vec![V::Int(1)]),
+            "write {i}: the field was past its time already"
+        );
+    }
+}
+
+/// Sleep until `extra` ms past `at` (unix ms), not at all if that has gone
+/// by: a plain `at - now` underflows when the setup took longer than planned.
+fn sleep_past(at: u64, extra: u64) {
+    let wait = (at + extra).saturating_sub(unix_ms_now());
+    std::thread::sleep(Duration::from_millis(wait));
 }
 
 /// Until no field of `{kind}:{i}` is past its time on the master: each gone,
@@ -453,7 +476,7 @@ fn writes_made_just_before_a_field_deadline_reach_a_lagging_replica_as_made() {
     let (mut m, mut r) = (master.conn(), replica.conn());
     wait_link_up(&mut r);
     let (kinds, n) = (["incr", "float", "nx", "persist"], 30);
-    let at = unix_ms_now() + 1_500;
+    let at = unix_ms_now() + 3_000;
     hashes_with_f_due_at(&mut m, &kinds, n, at);
     wait_caught_up(&mut m, &mut r);
     replica.signal(libc::SIGSTOP);
@@ -471,7 +494,7 @@ fn writes_made_just_before_a_field_deadline_reach_a_lagging_replica_as_made() {
         );
     }
     assert!(unix_ms_now() < at, "the writes came after the deadline");
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 500));
+    sleep_past(at, 500);
     replica.signal(libc::SIGCONT);
     wait_fields_expired(&mut m, &kinds, n);
     assert_same_keys(&mut m, &mut r, &kinds, n);
@@ -510,9 +533,9 @@ fn a_write_that_finds_a_field_past_its_time_takes_it_as_gone_on_both() {
     let (kinds, n) = (["incr", "float", "nx", "xx", "gt"], 30);
     // The master's sweep held off: each write finds its field itself.
     assert_eq!(m.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
-    let at = unix_ms_now() + 300;
+    let at = unix_ms_now() + 2_000;
     hashes_with_f_due_at(&mut m, &kinds, n, at);
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
+    sleep_past(at, 300);
     for i in 0..n {
         assert_eq!(m.cmd(&["HINCRBY", &format!("incr:{i}"), "f", "1"]).i(), 1);
         assert_eq!(
@@ -578,7 +601,7 @@ fn a_hash_emptied_by_its_last_field_expiring_reaches_a_lagging_replica_before_a_
     }
     wait_caught_up(&mut m, &mut r);
     replica.signal(libc::SIGSTOP);
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 200));
+    sleep_past(at, 200);
     wait_until("the master's sweep to take the hashes", 30, || {
         m.cmd(&["DBSIZE"]).i() == 0
     });
@@ -619,9 +642,9 @@ fn writes_after_field_deadlines_replay_as_made_after_a_kill() {
     // The others, each write finding its field itself.
     assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
     let kinds = ["incr", "float", "nx", "persist", "xx"];
-    let at = unix_ms_now() + 300;
+    let at = unix_ms_now() + 2_000;
     hashes_with_f_due_at(&mut c, &kinds, 1, at);
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
+    sleep_past(at, 300);
     // What each answers is the business of the test above; here, only
     // that the replay leaves what they left.
     c.cmd(&["HINCRBY", "incr:0", "f", "1"]);
@@ -769,7 +792,7 @@ fn a_sort_store_by_a_hash_field_reaches_a_lagging_replica_as_sorted() {
             )
         )
     );
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 300));
+    sleep_past(at, 300);
     replica.signal(libc::SIGCONT);
     wait_caught_up(&mut m, &mut r);
     assert_eq!(r.cmd(&["LRANGE", "before", "0", "-1"]), sorted);
@@ -809,7 +832,7 @@ fn a_sort_store_by_a_hash_field_replays_as_sorted_after_a_kill() {
     assert_eq!(sort_store(&mut c, "before"), 6);
     assert!(unix_ms_now() < at, "the sort came after the deadline");
 
-    std::thread::sleep(Duration::from_millis(at - unix_ms_now() + 100));
+    sleep_past(at, 100);
     assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
     assert_eq!(c.cmd(&["HSET", "obj:1", "w", "35"]).i(), 0);
     assert_eq!(

@@ -1,6 +1,7 @@
 pub mod doc_keys;
 pub mod filter;
 pub mod postings;
+pub mod quant;
 pub mod score;
 pub mod simd;
 pub mod slots;
@@ -2134,10 +2135,11 @@ pub fn query_doc_fields<'a>(
     on: &IndexOn,
     schema: &[SchemaField],
     value: crate::store::ValueRef<'a>,
+    now: &crate::types::QueryClock,
 ) -> Option<DocFields<'a>> {
     match doc_fields(on, schema, value)? {
         DocFields::HashEx(hash) => {
-            let shown = match hash.shown(crate::types::field_now()) {
+            let shown = match hash.shown(now.get()) {
                 // Every field due: no document, as HGETALL shows it empty.
                 // A hash emptied by removal is no key at all.
                 std::borrow::Cow::Owned(fields) if fields.is_empty() => return None,

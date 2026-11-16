@@ -66,7 +66,7 @@ checks respect lazy expiry — an expired key is treated as absent.
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `DUMP` | `DUMP key` | Serialize the value at key to a binary string in KiviDB's snapshot format with a 10-byte CRC64 envelope; returns nil if key missing or expired; TimeSeries and VectorSet keys are not portable |
+| `DUMP` | `DUMP key` | Serialize the value at key to a binary string in KiviDB's snapshot format with a 10-byte CRC64 envelope; returns nil if key missing or expired; TimeSeries and VectorSet payloads are KiviDB's own: they restore on KiviDB nodes, not on Redis |
 | `RESTORE` | `RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]` | Deserialize a value from a `DUMP` payload and store it at key; ttl is in milliseconds (0 = no expiry); `REPLACE` overwrites an existing key; `ABSTTL` treats ttl as a Unix timestamp in milliseconds; returns `BUSYKEY` error if key exists without `REPLACE` |
 
 ### Sorting
@@ -378,9 +378,9 @@ KiviDB implements the RediSearch RESP command surface for vector similarity sear
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `FT.SEARCH` | `FT.SEARCH index query [VERBATIM] [LANGUAGE lang] [SCORER name] [PARAMS n k v ...] [RETURN n field ...] [LIMIT offset count] [TIMEOUT ms] [DIALECT 2]` | Search an index; supports pure KNN (`*=>[KNN k @field $param AS alias]`), pure text/filter queries (`@field:token`, `@field:{tag}`, `@field:[lo hi]`, `*`), and hybrid pre-filter KNN. A word also finds its stem (`VERBATIM`: not; `LANGUAGE`: stemmed in that language). Scores are Redis 8.10's: `SCORER` `BM25STD` (default), `BM25STD.TANH`, `BM25`, `TFIDF`, `TFIDF.DOCNORM`, `DISMAX`, `DOCSCORE`, `HAMMING` (no payloads: 0). `TIMEOUT` is milliseconds, `0` no limit; omitted, `search-timeout` (`FT.CONFIG TIMEOUT`) is used, which is `0` unless set. The scan, the order of the matches (and `SORTBY`), and a filtered KNN's nearest-neighbour step are held to it. A query cut short: `search-on-timeout` (`FT.CONFIG ON_TIMEOUT`) `return` replies with what was found, `total_results` being that partial count (RESP3 puts `Timeout limit was reached` in `warning`; over RESP2 the client gets no signal); `fail` and `return_strict` reply with that as an error. A query that finishes, however late, is not reported as timed out. In a cluster, each master reports whether its part timed out and the coordinator applies `ON_TIMEOUT` |
+| `FT.SEARCH` | `FT.SEARCH index query [VERBATIM] [LANGUAGE lang] [SCORER name] [PARAMS n k v ...] [RETURN n field ...] [LIMIT offset count] [TIMEOUT ms] [DIALECT 2]` | Search an index; supports pure KNN (`*=>[KNN k @field $param AS alias]`), pure text/filter queries (`@field:token`, `@field:{tag}`, `@field:[lo hi]`, `*`), and hybrid pre-filter KNN. A word also finds its stem (`VERBATIM`: not; `LANGUAGE`: stemmed in that language). Scores are Redis 8.10's: `SCORER` `BM25STD` (default), `BM25STD.TANH`, `BM25`, `TFIDF`, `TFIDF.DOCNORM`, `DISMAX`, `DOCSCORE`, `HAMMING` (no payloads: 0). `TIMEOUT` is milliseconds, `0` no limit; omitted, `search-timeout` (`FT.CONFIG TIMEOUT`) is used, which is `0` unless set. The scan, the order of the matches (and `SORTBY`), and a filtered KNN's nearest-neighbour step are held to it. A query cut short: `search-on-timeout` (`FT.CONFIG ON_TIMEOUT`) `return` and `return-strict` (`return_strict` is the same) reply with what was found, `total_results` being that partial count (RESP3 puts `Timeout limit was reached` in `warning`; over RESP2 the client gets no signal); `fail` replies with that as an error. A query that finishes, however late, is not reported as timed out. In a cluster, each master reports whether its part timed out and the coordinator applies `ON_TIMEOUT` |
 | `FT.AGGREGATE` | `FT.AGGREGATE index query [LOAD n @field … \| LOAD *] [ADDSCORES] [GROUPBY n @prop ... REDUCE fn n arg ... [AS name] …] [APPLY expr AS name] [FILTER expr] [SORTBY n @prop [ASC\|DESC] … [MAX n]] [LIMIT offset count] [TIMEOUT ms] [WITHCURSOR [COUNT n] [MAXIDLE ms]] [PARAMS …]` | Aggregate the documents a query matches. Reducers: `COUNT`, `COUNT_DISTINCT`, `COUNT_DISTINCTISH`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `QUANTILE`, `TOLIST` (a list of the distinct values), `FIRST_VALUE [BY @prop [ASC\|DESC]]`, `RANDOM_SAMPLE`, and `COLLECT` (Redis 8.8: the group's documents — `FIELDS * \| n @field …`, with `SORTBY`, `LIMIT` and `DISTINCT` inside the group). Groups come out in the order they first appear. `ADDSCORES` gives each row `@__score`. `WITHCURSOR` returns the first `COUNT` rows and a cursor for `FT.CURSOR READ`. On an `ON JSON` index, fields go by the names the schema gives their paths. `TIMEOUT` is the same as on `FT.SEARCH`, and holds the scan, a `KNN` step, and `GROUPBY`, `APPLY`, `FILTER` and `SORTBY` to it; a step cut short keeps what it finished, and `LIMIT` still applies. Each `FT.CURSOR READ` page of a timed-out aggregation carries the warning |
-| `FT.HYBRID` | `FT.HYBRID index SEARCH query [YIELD_SCORE_AS name] VSIM @field $param [KNN count K k [EF_RUNTIME n]] [YIELD_SCORE_AS name] [COMBINE RRF\|LINEAR count [WINDOW w] [CONSTANT c] [ALPHA a] [BETA b] [YIELD_SCORE_AS name]] [LIMIT off cnt] [SORTBY count field [ASC\|DESC]] [NOSORT] [LOAD count @field ...] [LOAD *] PARAMS n k v ... [GROUPBY ...] [REDUCE ...] [APPLY expr AS name] [FILTER expr]` | Combined text + vector search with score fusion. Default fusion is RRF (rank-based). LINEAR uses min-max-normalized scores with ALPHA (text) and BETA (vector) weights. Returns ranked merged result list with hybrid_score, text_score, vsim_score per row (renameable via YIELD_SCORE_AS). Supports the full FT.AGGREGATE pipeline tail (GROUPBY/REDUCE/APPLY/FILTER) for further transformation. Does not take `TIMEOUT` (an error before the pipeline clauses, ignored among them), and `search-timeout` does not apply: it runs to the end |
+| `FT.HYBRID` | `FT.HYBRID index SEARCH query [SCORER name] [YIELD_SCORE_AS name] VSIM @field $param [KNN count K k [EF_RUNTIME n] [SHARD_K_RATIO r] \| RANGE count RADIUS r [EPSILON e]] [FILTER filter] [YIELD_SCORE_AS name] [COMBINE RRF count [CONSTANT c] [WINDOW w] [YIELD_SCORE_AS name] \| COMBINE LINEAR count [ALPHA a BETA b] [WINDOW w] [YIELD_SCORE_AS name]] [LIMIT offset num] [SORTBY nargs @field [ASC\|DESC] ... \| NOSORT] [PARAMS n k v ...] [TIMEOUT ms] [FORMAT fmt] [LOAD count @field [AS name] ... \| LOAD *] [GROUPBY ... [REDUCE ...]] [APPLY expr AS name] [FILTER expr]` | Combined text + vector search with score fusion, as Redis 8.10 runs it. The text query is scored by `SCORER` as `FT.SEARCH` scores it (default `BM25STD`; the name in capitals, else `No such scorer`); the vector query takes the nearest `K` (default 10), or those within `RADIUS`, of the documents its own `FILTER` accepts. Each list is cut to `WINDOW` (default 20), then fused: `RRF` (default, `CONSTANT` 60) sums 1 / (constant + rank); `LINEAR` sums `ALPHA` x the text score and `BETA` x the vector similarity (defaults 0.3 and 0.7), the similarity being 1 / (1 + d) for L2, 1 - d/2 for COSINE and (1 + d)/2 for IP, as Redis yields it. Results are by fused score, best first. The reply is `total_results`, `results`, `warnings`, `execution_time` (a map under RESP3), a row being `__key` and `__score`, or the fields `LOAD`ed; `YIELD_SCORE_AS` adds the text, vector or fused score under that name (the fused one in place of `__score`). The steps after the clauses (`LOAD`, `APPLY`, a `FILTER` after the `VSIM` clause, `GROUPBY`, `SORTBY`) run on the fused rows, and `total_results` counts what they leave, before `LIMIT`. `TIMEOUT` (or `search-timeout`) bounds both queries and the steps. A query cut short: `ON_TIMEOUT` `return` and `return_strict` reply with what was found and a warning for each part cut short (`Timeout limit was reached (SEARCH)`, `(VSIM)`), as Redis does; `fail` replies with `SEARCH_TIMEOUT Timeout limit was reached`. `CONSTANT`, `ALPHA` and `BETA` must be finite. Not taken: `EXPLAINSCORE`, `WITHCURSOR`, and JSON paths (`$.x`) in `LOAD`; `DIALECT` and the vector side's `POLICY` are refused, as in Redis. In a cluster of more than one master it is refused (`FT.HYBRID is not supported across a cluster's masters yet`): it is not yet answered from every master |
 
 ### Hybrid search filter syntax
 
@@ -454,7 +454,7 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VADD` | `VADD key [REDUCE dim] [DISTANCE L2\|COSINE\|INNERPRODUCT] (FP32 \| VALUES num) vector element [SETATTR json] [NOQUANT\|Q8\|BIN] [EF n] [M n]` | Add or update an element with its vector; `FP32` accepts raw little-endian bytes, `VALUES n` accepts space-separated floats; returns 1 if new, 0 if updated; AOF-logged |
+| `VADD` | `VADD key [REDUCE dim] [DISTANCE L2\|COSINE\|INNERPRODUCT] (FP32 \| VALUES num) vector element [SETATTR json] [NOQUANT\|Q8\|BIN] [EF n] [M n]` | Add or update an element with its vector; `FP32` accepts raw little-endian bytes, `VALUES n` accepts space-separated floats; returns 1 if new, 0 if updated; AOF-logged. `NOQUANT`, `Q8` (int8 with a norm and range, as Redis) or `BIN` (one bit per component) is chosen when the set is made; a set made without one keeps f32 (Redis's default is `Q8`) and accepts any of them later, as 1.2 did; a set made with one refuses another with Redis's `asked quantization mismatch` error; a `VADD` without one is accepted into any set, in its quantization (Redis accepts it only into a `Q8` set) |
 | `VREM` | `VREM key element [element ...]` | Remove one or more elements; returns count removed; AOF-logged |
 | `VCARD` | `VCARD key` | Return the number of elements in the set; 0 if key does not exist |
 | `VDIM` | `VDIM key` | Return the vector dimension; nil if key does not exist |
@@ -464,7 +464,7 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VEMB` | `VEMB key element [RAW]` | Return the vector as an array of float strings; with `RAW`, return raw little-endian FP32 bytes |
+| `VEMB` | `VEMB key element [RAW]` | Return the vector as doubles (dequantized for `Q8`; +1/-1 for `BIN`, as Redis); with `RAW`, Redis's array: the quantization (`f32`, `int8`, `bin`), the stored bytes (unit length; `BIN` in 64-bit words), the L2 norm, and for `int8` the range |
 | `VGETATTR` | `VGETATTR key element` | Return the JSON attributes string attached to an element; nil if none |
 | `VSETATTR` | `VSETATTR key element json` | Attach a JSON attributes string to an element; pass empty string `""` to remove; AOF-logged |
 
@@ -472,13 +472,13 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [FILTER expr] [FILTER-EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `FILTER` keeps the elements whose JSON attributes pass Redis's expression (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024, 2025]`, arithmetic, `not`, `**`); an element without a field it asks for does not pass. The search is exact, so `EF` and `FILTER-EF` change nothing; `ELE` queries by an existing element's vector; `WITHSCORES` gives each a similarity from the set's metric: for cosine, the default and Redis's only one, `(1 + cosine) / 2` as in Redis (1 the same direction, 0.5 at right angles, 0 opposite); for `IP` the dot product; for `L2` `1 / (1 + distance)` |
+| `VSIM` | `VSIM key (ELE \| FP32 \| VALUES num) vector [WITHSCORES] [WITHATTRIBS] [COUNT num] [EF n] [FILTER expr] [FILTER-EF n] [NOTHREAD] [TRUTH]` | Return elements ordered by cosine similarity to the query vector; `FILTER` keeps the elements whose JSON attributes pass Redis's expression (`.color == "red" and .size > 3`, `"a" in .tags`, `.year in [2024, 2025]`, arithmetic, `not`, `**`); an element without a field it asks for does not pass. The search is exact, so `EF` and `FILTER-EF` change nothing; `ELE` queries by an existing element's vector; `WITHSCORES` gives each a similarity from the set's metric: for cosine, the default and Redis's only one, `(1 + cosine) / 2` as in Redis (1 the same direction, 0.5 at right angles, 0 opposite); for `IP` the dot product; for `L2` `1 / (1 + distance)`. A `Q8` or `BIN` set quantizes the query as Redis does, so scores are Redis's to within 1e-6 (KiviDB computes the norm in f64, Redis in f32). Equal scores are ordered by element name. A query of another dimension than the set's is an error, as in Redis |
 
 ### Inspection and traversal
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VINFO` | `VINFO key` | Return metadata: `vector-dim`, `vector-count`, `quant-type` (always `f32`: vectors are kept at full precision, whatever `VADD` asked for), `index-type`, `max-level` |
+| `VINFO` | `VINFO key` | Return metadata: `vector-dim`, `vector-count`, `quant-type` (`f32`, `int8` or `bin`, as the set stores its vectors), `index-type`, `max-level` |
 | `VLINKS` | `VLINKS key element [WITHSCORES]` | Return nearest neighbours of an element (up to 16) as a single-layer array; approximated via brute-force cosine similarity |
 | `VRANDMEMBER` | `VRANDMEMBER key [count]` | Return random elements; positive count returns distinct elements up to set size; negative count returns `\|count\|` elements with repetition allowed |
 | `VRANGE` | `VRANGE key start end [count]` | Return elements in lexicographical range of element names; bounds follow ZRANGEBYLEX syntax: `[inclusive`, `(exclusive`, `-` for start, `+` for end |
@@ -858,7 +858,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 
 - A subscribed connection stays in its ordinary command loop. Under RESP3 it keeps every command; under RESP2 it is limited to the commands above until it has no subscriptions left.
 - Every subscribed connection has one queue. A publish appends to the queue of each subscriber, and the connection's forwarder task writes from it to the socket, so a subscriber sees messages in the order they were published, whichever channel or pattern they came through.
-- No message is skipped. A subscriber that cannot keep up is disconnected once its queue passes Redis's default `client-output-buffer-limit pubsub` (32 MB, or 8 MB for 60 seconds).
+- No message is skipped. A subscriber that cannot keep up is disconnected once its queue passes `client-output-buffer-limit pubsub` (Redis's default: 32 MB, or 8 MB for more than 60 seconds). `CONFIG SET client-output-buffer-limit "pubsub 0 0 0"` removes the limit. `PUBLISH` counts a subscriber that its message takes over the limit, as Redis does, and then disconnects it.
 
 ---
 
@@ -879,9 +879,9 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `TIME` | `TIME` | Return `[unix_seconds, microseconds_within_second]` as two bulk strings; uses real wall clock |
 | `HELLO` | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch the connection to RESP2 or RESP3 and return the server's details (`server`, `version`, `proto`, `id`, `mode`, `role`, `modules`) — a map under RESP3. `server` and `version` are the Redis release KiviDB follows (`redis`, `8.10.0`), as `INFO`'s `redis_version`; KiviDB's own release follows them as `kividb_version`, as in `INFO`. `AUTH` and `SETNAME` apply before the reply. Unauthenticated, when a password is required, it is `NOAUTH` |
 | `LOLWUT` | `LOLWUT [VERSION version]` | Return ASCII art and the server version |
-| `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss`, `maxmemory_policy`, the slabs of string values (`value_slab_bytes`, and `value_slab_live_bytes` in them) and active defrag's `active_defrag_running`, `active_defrag_hits` (values moved), `active_defrag_misses` (left, being held), `active_defrag_panics` (passes that panicked: each panic is caught and logged at `ERROR` with its file and line, the slabs the pass was emptying are put back in use, and the next pass comes 1, 2, 4, then 8 seconds later) and `active_defrag_disabled_by_panics` (1 once 5 passes in a row have panicked with none ending between them: active defrag has then turned itself off, `CONFIG GET activedefrag` says `no`, and `CONFIG SET activedefrag yes` sent while it is off turns it back on and sets this to 0; sent while it is on, it changes nothing. It is not kept across a restart: after a `CONFIG REWRITE`, which writes `activedefrag no` then, the server starts with active defrag off and this at 0, and the `ERROR` line "active defrag turned itself off" in the log says why); `INFO stats` reports `evicted_keys` |
+| `INFO` | `INFO [section [section ...]]` | Return server info; sections include `server`, `keyspace`, `replication`, `errorstats` (per-error reply counters), `all`, etc. `INFO commandstats` has, for each command that has been called, `calls`, `usec`, `usec_per_call`, `rejected_calls` and `failed_calls`, and the Redis 8.8 slowlog fields `slowlog_count`, `slowlog_time_ms_sum` and `slowlog_time_ms_max`. `INFO memory` reports `used_memory` (allocated bytes — what `maxmemory` is compared with), `used_memory_rss`, `maxmemory_policy`, the slabs of string values (`value_slab_bytes`, and `value_slab_live_bytes` in them), `allocator_trims` (times free memory was given back to the system after a large delete, once the server was idle; `allocator-give-back no` turns that off) and `allocator_trims_skipped_busy` (times it was put off because the server was busy), and active defrag's `active_defrag_running`, `active_defrag_hits` (values moved), `active_defrag_misses` (left, being held), `active_defrag_panics` (passes that panicked: each panic is caught and logged at `ERROR` with its file and line, the slabs the pass was emptying are put back in use, and the next pass comes 1, 2, 4, then 8 seconds later) and `active_defrag_disabled_by_panics` (1 once 5 passes in a row have panicked with none ending between them: active defrag has then turned itself off, `CONFIG GET activedefrag` says `no`, and `CONFIG SET activedefrag yes` sent while it is off turns it back on and sets this to 0; sent while it is on, it changes nothing. It is not kept across a restart: after a `CONFIG REWRITE`, which writes `activedefrag no` then, the server starts with active defrag off and this at 0, and the `ERROR` line "active defrag turned itself off" in the log says why); `INFO stats` reports `evicted_keys` |
 | `CONFIG GET` | `CONFIG GET parameter [parameter ...]` | Get a configuration parameter; supports `*` for all |
-| `CONFIG SET` | `CONFIG SET param value [param value ...]` | All or nothing: an unknown parameter, a value out of range, a parameter that cannot change at run time or one named twice is an error naming it, and none of the pairs is applied. `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time`, `activedefrag`, `active-defrag-ignore-bytes`, `active-defrag-threshold-lower`, `active-defrag-cycle-max`, `appendonly`, `loglevel`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-load`, `repl-replica-max-backlog-bytes`, `repl-replica-sync-max-backlog-bytes`, `shutdown-timeout` all apply immediately at runtime without restart |
+| `CONFIG SET` | `CONFIG SET param value [param value ...]` | All or nothing: an unknown parameter, a value out of range, a parameter that cannot change at run time or one named twice is an error naming it, and none of the pairs is applied. `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `maxmemory`, `maxmemory-policy`, `maxmemory-samples`, `lfu-log-factor`, `lfu-decay-time`, `activedefrag`, `allocator-give-back`, `active-defrag-ignore-bytes`, `active-defrag-threshold-lower`, `active-defrag-cycle-max`, `appendonly`, `loglevel`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-load`, `repl-replica-max-backlog-bytes`, `repl-replica-sync-max-backlog-bytes`, `shutdown-timeout` all apply immediately at runtime without restart |
 | `CONFIG REWRITE` | `CONFIG REWRITE` | Persist the current runtime config to the file the server was started with (default `/etc/kividb/kividb.conf`). A server started without one (the file was not there at startup) replies `ERR The server is running without a config file` and writes nothing, as Redis does. A server that read `/etc/kividb/kividb.conf` only because it is the default path, without `--configfile` naming it, refuses too, and says to start it with `--configfile`. Atomic write via tmpfile-rename. Keeps the file's mode, and its owner when run as root; a new file is `0600`. Redis resets the mode to `0644` less the umask instead |
 | `CONFIG RESETSTAT` | `CONFIG RESETSTAT` | Reset the statistics INFO reports, among them `active_defrag_hits`, `active_defrag_misses` and `active_defrag_panics` (not `active_defrag_disabled_by_panics`, which is a state). Returns OK |
 | `OBJECT ENCODING` | `OBJECT ENCODING key` | The encoding Redis would use for the value, from its size and the `*-max-listpack-*` / `set-max-intset-entries` settings: `int`, `embstr` or `raw` for strings; `listpack` or `quicklist` for lists; `listpack`, `intset` or `hashtable` for sets; `listpack` or `hashtable` for hashes; `listpack` or `skiplist` for sorted sets; `stream`. KiviDB stores each type one way internally; the name is for clients and tests that look at it |
@@ -894,7 +894,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `MEMORY MALLOC-STATS` | `MEMORY MALLOC-STATS` | Allocator statistics (minimal) |
 | `MEMORY PURGE` | `MEMORY PURGE` | Ask the allocator to return free memory; replies `OK` |
 | `MEMORY HELP` | `MEMORY HELP` | List the `MEMORY` subcommands |
-| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 unless an LRU or LFU policy (or `key-access-tracking`) is on. `ERR no such key` for a missing key |
+| `DEBUG OBJECT` | `DEBUG OBJECT key` | The key's encoding, serialized length and last use, in Redis's order of fields. A key past its time is shown while it is still there, and looking is not a use. `Value at` is `0x0` and `refcount` `1`; `serializedlength` is the length in a `DUMP`, not Redis's RDB; `lru` and `lru_seconds_idle` are 0 unless an LRU or LFU policy (or `key-access-tracking yes`) is on. `ERR no such key` for a missing key |
 | `DEBUG SET-ACTIVE-EXPIRE` | `DEBUG SET-ACTIVE-EXPIRE 0\|1` | Stop or restart the background expiry of keys and hash fields. Keys past their time still go when read. Process-wide, and on again after a restart |
 | `DEBUG PAUSE-CRON` | `DEBUG PAUSE-CRON 0\|1` | Pause or resume the background expiry, as in Redis, where it runs inside the cron |
 | `DEBUG SLEEP` | `DEBUG SLEEP seconds` | Block this connection's worker thread for `seconds` |
@@ -1259,6 +1259,100 @@ deletes the keys it holds for that slot, as Redis does.
 |---|---|---|
 | `CLUSTER SLOT-STATS` | `CLUSTER SLOT-STATS SLOTSRANGE start end` or `CLUSTER SLOT-STATS ORDERBY metric [LIMIT n] [ASC \| DESC]` | Per-slot stats. Only `key-count` carries real data; `cpu-usec` / `network-bytes-in` / `network-bytes-out` are reported as 0 (no per-slot instrumentation yet). `ORDERBY` only accepts `key-count`, and sorts descending (the busiest slots first) unless `ASC` is given, as in Redis. |
 
+### Keys of slots a master does not serve
+
+A master can be left holding keys of slots it does not serve: slots another
+master owns, that are not being imported into it or migrating away from it.
+The case that leaves them: a master crashes right after it hands slots over
+in an atomic slot migration (`CLUSTER MIGRATION IMPORT`), before its
+deletion of their keys has reached its replica; the replica, promoted, has
+every key of the slots that moved away (#517). No client is served them
+(every command for them gets `-MOVED`), but they take memory, count in
+`DBSIZE`, `SCAN`, `KEYS`, `RANDOMKEY` and `INFO keyspace`, and are saved and
+replicated to the node's replicas.
+
+KiviDB never deletes them on its own. Deciding automatically that the keys
+are stale, from what the cluster bus says, could not be made safe: there
+are ways (`SETSLOT`/`MIGRATE` resharding, late heartbeats, restarts part way
+through a handover) in which they are the only copy of the slot's data. So
+the node reports them, and an operator deletes them:
+
+- A master logs a warning when it finds any. It counts them in full at
+  startup and after it is promoted, and after the slots it serves change it
+  counts only the slots that became orphans (once the change has settled,
+  and not more often than every few seconds). The line names the slots and
+  the count of keys, and is repeated only when they change, or after ten
+  minutes.
+- `INFO cluster` reports `cluster_orphan_slots` and `cluster_orphan_keys`,
+  as last counted. A replica reports 0: its keys are its master's.
+- `CLUSTER ORPHANSLOTS` lists them, counted afresh, with their owners as
+  this node's slot table names them.
+- `CLUSTER DROPORPHANS` deletes those of them the owner has, and only
+  those. This node's slot table can be out of date (a destination that
+  crashed before its claim reached this node, a resharding left half done,
+  a restart before the table was saved), and a key here can be the only
+  copy of its data (written after the owner took the slot, or one a
+  resharding never moved). So it asks each owner its table names, over a
+  node-to-node connection: first whether it owns the slot in its own table
+  and is not importing or migrating it, then, batch by batch, which of
+  these keys it has. Keys it does not have are kept, counted, and still
+  listed by `CLUSTER ORPHANSLOTS`; they are not this command's to delete.
+
+One case is cleaned up on its own, because the node knows exactly which
+keys are stale: a replica promoted after its master died part way through
+a `CLUSTER MIGRATION IMPORT` (#741). A master tells the replicas that ask
+for it (`REPLCONF capa slot-imports`) which imports it has under way, and
+of which of their slots it held keys before each began. That message
+(`KIVIDB.IMPORTS LIVE|SYNC [<task-id> <slots> <kept>] ...`) is not part of
+the replication stream: no offset counts it, and no backlog, AOF or
+snapshot holds it, and a replica of an earlier release never asks for it
+and is never sent it. The replica notes its own keys of the slots at the
+moment its master looked at its own, and writes the slots down beside the
+cluster config (`<cluster-config-file>.followed-imports`; slots only, no
+key names). Promoted with an import still listed:
+
+- It deletes what the import brought: every key of a slot of which nothing
+  was held before, and in the others the keys not held before. Never a
+  key that was there before the import, and never one of a slot it owns.
+- Only once nothing on this node is importing, migrating or deleting the
+  slot, the slot's owner is a master it sees as up, and that owner, asked
+  directly (`CLUSTER SYNCSLOTS ORPHANCHECK`), owns the slot and is not
+  moving it. The owner is asked again before each batch of keys is
+  deleted (`ORPHANKEYS`). The deletes go through the write path, so they
+  reach its replicas and AOF; a replica never deletes on its own.
+- It stops if the node becomes a replica, and tries again every second
+  otherwise. A replica of it promoted next carries it on. The log says
+  why it waits, and `INFO cluster` reports how many slots are left
+  (`cluster_import_cleanup_slots`). Meanwhile a `CLUSTER MIGRATION IMPORT`
+  of those slots is refused: kept beside what it brings, keys the source
+  deleted since would be served again.
+- A replica that did not see the import begin (attached part way, sent the
+  dataset in full, or restarted) knows only which slots had keys before,
+  and keeps every key of those.
+- An import its master completed is not cleaned up once the replica has
+  heard it end (the master's next marker no longer lists it), whatever the
+  promoted node's slot table says: its keys may be the slots' only copy. If
+  the master died after taking the slots but before that marker reached the
+  replica, the owner check protects them: the source, told the slots were
+  taken, no longer owns them and says so, and nothing is deleted; if it was
+  never told, it still has them all.
+- A slot that comes to the promoted node (`CLUSTER ADDSLOTS`, `SETSLOT
+  IMPORTING` or `NODE`, an import, a failover) is left out of the cleanup
+  for good, even once it leaves again: keys written to it meanwhile are
+  acknowledged writes. After a restart, whether a slot was the node's
+  before it is not known, so of an import read back from disk only the
+  keys the owner has are deleted.
+- `CLUSTER RESET` forgets the imports: the node is no longer that master's
+  replica, nor in that cluster, and their keys are left as they are.
+- If the owner runs an earlier release, which cannot be asked, or the
+  replica or its master does, the keys are left as an earlier release
+  left them, for `CLUSTER DROPORPHANS`.
+
+| Command | Syntax | Notes |
+|---|---|---|
+| `CLUSTER ORPHANSLOTS` | `CLUSTER ORPHANSLOTS` | KiviDB's own. An array with one entry per run of consecutive slots this master holds keys of, does not serve, and that have the same owner: `[start-slot, end-slot, key-count, owner-id]`, the owner `nil` for an unassigned slot (the owner as this node's slot table names it: `CLUSTER DROPORPHANS` asks the owner itself). Slots whose keys are already being deleted (a slot that left this node, an atomic migration's handover) are not listed. Empty on a replica. O(N) in the node's keys: the slots a master does not serve have keys in every shard; it walks them a few thousand buckets per hold of a shard's lock. In `@admin`, `@dangerous` and `@slow`; refused in scripts. |
+| `CLUSTER DROPORPHANS` | `CLUSTER DROPORPHANS [SLOT slot [slot ...] \| SLOTSRANGE start end [start end ...]]` or `CLUSTER DROPORPHANS STATUS` | KiviDB's own. Deletes this master's keys of the slots given, or, without arguments, of every slot `CLUSTER ORPHANSLOTS` lists, that their owner says it has. Replies with the number of keys it is to look at, and does the rest on a thread of its own (no network wait on the command's thread, an I/O thread under io_uring): it asks each owner, then deletes in batches of up to 128 keys (and 1 MiB of key names), each batch's keys first put to their owner (`CLUSTER SYNCSLOTS ORPHANKEYS`, which looks at the keys without using them: no expiry, LRU or keyspace event), and only those it has deleted, through the write path, so the `DEL`s reach its replicas and its AOF. It stops, keeping the keys not reached, if an owner can no longer be asked, answers as another node, stops owning a slot or starts moving it, or is no longer the slot's owner in this node's table. `CLUSTER DROPORPHANS STATUS` gives `state` (`running`, `done`, `stopped`), `slots`, `deleted`, `kept` (keys their owner does not have) and `reason`; the log says the same. One run at a time. Before it starts, all the slots or none: it refuses, naming the slot and why, on a replica; for a slot this node owns, imports or migrates (`CLUSTER SETSLOT`); for a slot in an atomic slot migration here, running or ended in the last few seconds, or whose keys are already being deleted; while an atomic migration away from this node is handing slots over, or ended in the last few seconds; while this node does not know yet whether a replica of it took its slots over; unless the slot's owner is another master that this node sees as up (not `fail` or `fail?`, not in a handshake, and heard from since this node started); and the run stops before it deletes anything unless that owner, asked directly (`CLUSTER SYNCSLOTS ORPHANCHECK`, over the connection and with the credentials an atomic slot migration uses), answers as itself and says it owns the slot in its own table and is not importing or migrating it (`SETSLOT`, or an atomic slot migration running or ended in the last few seconds). An owner that cannot be asked, or runs a version without these subcommands, stops it too. There is no option to skip any of this. A slot that comes to this node while it runs (`CLUSTER ADDSLOTS`, `CLUSTER SETSLOT IMPORTING` or `NODE`, an atomic slot migration into it, a failover) keeps every key it still has: the run leaves that slot from then on, and ends `stopped`, saying so; what gives this node the slot does not delete them first, as it does the keys of a slot that left this node. The questions to each owner go over one connection per owner for the whole run. While it runs, `CLUSTER ORPHANSLOTS` and `INFO cluster` leave its slots out, kept keys included; they are counted again when it ends, and the kept keys are listed again. `STATUS` is kept in memory only: it is empty before the first run and after a restart, so a run cut short by a restart shows as no run at all; `CLUSTER ORPHANSLOTS` then lists the keys it had not deleted. In `@admin`, `@dangerous` and `@slow`; refused in scripts. Never run on its own. |
+
 ### Configuration flags
 
 | Flag | Default | Purpose |
@@ -1532,7 +1626,6 @@ names; with no session running the cost to a command is one atomic load.
 ### MEMORY
 
 - **`MEMORY USAGE` estimates are approximate.** Usage is computed by sampling up to `SAMPLES` elements (default 5) and extrapolating — it does not walk every element for large collections. Results will differ from Redis's estimates because Redis tracks allocator-level overhead per object (jemalloc metadata, sds header, dictEntry, etc.) which KiviDB does not model. Treat the output as an order-of-magnitude guide, not an exact byte count.
-- **`MEMORY USAGE` is not supported for `TimeSeries` and `VectorSet` keys via `DUMP`/`RESTORE`.** Usage estimation for these types is implemented but the underlying values cannot be serialised portably, so tools relying on DUMP+MEMORY USAGE combinations will not work for these types.
 - **`MEMORY STATS`: `used_memory` is what the process has allocated**, counted by the allocator on every platform. The resident-set figures come from `/proc/self/status` on Linux and the process counters on Windows. The allocator's own fragmentation fields are always `1.0`/`0`: KiviDB does not read them from the allocator (the system allocator, or mimalloc on Linux in the builds with Lua).
 - **`MEMORY PURGE` calls `malloc_trim(0)` on Linux only.** On other platforms it is a no-op that returns `OK`. Even on Linux, `malloc_trim` only works with glibc's allocator, so it has no effect on what the builds with Lua allocate through mimalloc.
 - **`MEMORY MALLOC-STATS` returns a minimal stub XML.** Full `malloc_info` output is not implemented. Tools that parse the detailed allocator statistics from Redis will receive an empty placeholder.
@@ -1542,16 +1635,15 @@ names; with no session running the cost to a command is one atomic load.
 
 | Command / Feature | Notes |
 |-------------------|-------|
-| `DUMP` / `RESTORE` for TimeSeries and VectorSet | Format not portable; returns ERR by design |
 | `XIDMPRECORD` | Redis 8.8 internal command for setting IDMP metadata on an existing stream message. Documented as internal, with no client-facing contract to implement against — omitted deliberately rather than guessed at. Every other Redis 8.8 command is supported; see [`docs/REDIS_8_8_COMMANDS.md`](docs/REDIS_8_8_COMMANDS.md). |
 
 | Compact hash encoding (Redis 8.10) | `HIMPORT` is implemented and creates ordinary hashes; there is no separate memory-saving encoding for hashes that share field names |
 | Stemming in Armenian, Basque, Catalan, Chinese, Hindi, Indonesian, Irish, Lithuanian, Malay, Nepali, Serbian, Tagalog and Yiddish; phonetic matching | These languages are accepted and their words are not stemmed (the other 18 Redis languages are stemmed); `PHONETIC` is accepted in a schema and changes nothing. `LANGUAGE_FIELD` is read from hashes, not JSON documents |
 | `GEO` and `GEOSHAPE` fields, `GEOFILTER`, `INFIELDS`, `EXPLAINSCORE` | Refused with an error — ignoring them would return the wrong documents. `SUMMARIZE` is accepted and returns fields whole |
 | `search-global-timeout` (Redis 8.10) | Not implemented. Query `TIMEOUT`, `search-timeout` and `search-on-timeout` cut a query short; `search-timeout` is `0`, no limit, by default (Redis: 500) |
-| `FT.HYBRID` shard ratio and `EXPLAINSCORE` (Redis 8.10) | Not implemented |
+| `FT.HYBRID` `EXPLAINSCORE` and `WITHCURSOR` (Redis 8.10) | Refused with an error. `SHARD_K_RATIO` is accepted and changes nothing on one node |
 | Per-client and server parse-batch metrics in `CLIENT LIST` / `INFO` (Redis 8.8) | Not reported |
-| `client-output-buffer-limit` | Not configurable. Pub/Sub subscribers are held to Redis's default (32 MB, or 8 MB for 60 s); replicas to `repl-replica-max-backlog-bytes`, and during a full sync to `repl-replica-sync-max-backlog-bytes` |
+| `client-output-buffer-limit` | Configurable, as in Redis, for `normal`, `pubsub` and `replica`. A replica's hard limit is `repl-replica-max-backlog-bytes` under another name, and during a full sync a replica is held to `repl-replica-sync-max-backlog-bytes` and not to the soft limit. A replica has no soft limit by default (Redis: 64 MB for 60 s); one that is set holds once the replica's queue has been under it after a full sync or partial resync. The limits count the bytes waiting, not the allocator's rounding of them: under the default 32 MB limit, Redis drops a subscriber for a 31 MB message and KiviDB delivers it |
 | A master's replication ID across a restart, without the AOF | A master restarted without the AOF has a new ID, so its replicas resync in full. With the AOF on, a master stopped cleanly keeps its ID and offset, and one restarted after a crash continues a replica that holds the same data. (A restarted *replica* continues by partial resync.) |
 
 The full account of Redis 8.4 – 8.10 is in

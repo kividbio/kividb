@@ -12,7 +12,6 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::{TsAggregation, TsInner};
-use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -564,7 +563,28 @@ pub(super) fn value_reply(resp: u8, value: f64) -> Vec<u8> {
     if resp >= 3 {
         resp_double_resp3(value)
     } else {
-        resp_simple(&value.to_string())
+        resp_simple(&resp2_value(value))
+    }
+}
+
+/// `value` as RedisTimeSeries writes it under RESP2, with dragonbox's
+/// `to_chars` (its `deps/dragonbox/dragonbox.cpp`): the fewest digits that
+/// read back the same, written out in full while dragonbox's decimal exponent
+/// is not positive, else as `1.5E-7`. That exponent is positive below 1, from
+/// 2^56, and from 2^52 where the digits end in a zero (`1E16`).
+fn resp2_value(value: f64) -> String {
+    let plain = value.to_string();
+    let magnitude = value.abs();
+    if value.is_infinite() {
+        format!("{}Infinity", if value < 0.0 { "-" } else { "" })
+    } else if value == 0.0
+        || value.is_nan()
+        || (1.0..2f64.powi(52)).contains(&magnitude)
+        || ((2f64.powi(52)..2f64.powi(56)).contains(&magnitude) && !plain.ends_with('0'))
+    {
+        plain
+    } else {
+        format!("{value:E}")
     }
 }
 
@@ -693,16 +713,15 @@ fn labels_reply(resp: u8, pairs: Vec<(String, Option<String>)>) -> Vec<u8> {
 
 fn selected_labels(
     selection: &LabelSelection,
-    labels: &AHashMap<String, String>,
+    labels: &crate::types::Labels,
 ) -> Vec<(String, Option<String>)> {
     match selection {
         LabelSelection::None => Vec::new(),
         LabelSelection::All => {
-            let mut pairs: Vec<_> = labels
+            let pairs: Vec<_> = labels
                 .iter()
                 .map(|(k, v)| (k.clone(), Some(v.clone())))
                 .collect();
-            pairs.sort();
             pairs
         }
         LabelSelection::Selected(names) => names
@@ -831,7 +850,7 @@ pub(super) fn ts_mrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
     keys.sort_unstable();
 
     // (key, labels, rows) per matching series, ascending.
-    let mut results: Vec<(String, AHashMap<String, String>, Vec<Row>)> = Vec::new();
+    let mut results: Vec<(String, crate::types::Labels, Vec<Row>)> = Vec::new();
     for key in keys {
         let Ok(Some(series)) = series_at(ctx, &crate::key_bytes::bytes_of(&key)) else {
             continue;

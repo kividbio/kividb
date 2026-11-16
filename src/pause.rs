@@ -156,6 +156,64 @@ fn set_pause_held(duration_ms: i64, write_only: bool) {
     PAUSE_UNTIL_MS.store(end, Ordering::Relaxed); // gate last
 }
 
+/// What [`set_pause_undoable`] found, and set: what [`undo_pause`] needs to
+/// take back that pause and that pause only.
+#[derive(Debug)]
+pub struct Undo {
+    /// The pause in force before: its end and whether it held only writers.
+    before: Option<(i64, bool)>,
+    /// [`PAUSE_GENERATION`] once this pause was set.
+    generation: u64,
+}
+
+/// [`set_pause`], for a pause that may have to be taken back (a shutdown
+/// that fails or is aborted): [`undo_pause`] then leaves what was in force
+/// before it, a `CLIENT PAUSE`, a failover's or a slot migration's hold of
+/// writes, as it was.
+pub fn set_pause_undoable(duration_ms: i64, write_only: bool) -> Undo {
+    let _flag = FLAG_LOCK.lock();
+    let before =
+        active().map(|was_write_only| (PAUSE_UNTIL_MS.load(Ordering::SeqCst), was_write_only));
+    set_pause_held(duration_ms, write_only);
+    Undo {
+        before,
+        generation: PAUSE_GENERATION.load(Ordering::SeqCst),
+    }
+}
+
+/// Take back the pause of [`set_pause_undoable`]: back to the pause that was
+/// in force before it, or to none. Only that pause: one ended since (by
+/// `CLIENT UNPAUSE`) stays ended, and the hold of a handoff or a
+/// `CLIENT PAUSE` set since stays until `clear_pause` lifts it, a hold of
+/// writers alone, as `hold_writes` holds them.
+pub fn undo_pause(undo: Undo) {
+    let _flag = FLAG_LOCK.lock();
+    if PAUSE_UNTIL_MS.load(Ordering::SeqCst) <= 0 {
+        // Ended meanwhile (`CLIENT UNPAUSE`), and stays so.
+        return;
+    }
+    let set_since = PAUSE_GENERATION.load(Ordering::SeqCst) != undo.generation;
+    if set_since {
+        // A handoff or a `CLIENT PAUSE` paused writes meanwhile, merged into
+        // ours. Whoever set it was told the writes are held, so they stay
+        // held: until the handoff's `clear_pause`, or `CLIENT UNPAUSE` (a
+        // `CLIENT PAUSE` set meanwhile no longer ends at its own time). Only
+        // the readers ours held go on.
+        PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let write_only = undo.before.is_none_or(|(_, was_write_only)| was_write_only);
+        PAUSE_MODE_WRITE_ONLY.store(write_only, Ordering::Relaxed);
+    } else if let Some((until, was_write_only)) = undo.before {
+        PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
+        PAUSE_MODE_WRITE_ONLY.store(was_write_only, Ordering::Relaxed);
+        PAUSE_UNTIL_MS.store(until, Ordering::SeqCst);
+    } else {
+        clear_pause_held();
+        return;
+    }
+    // The clients held may now go on (the readers, under a pause of writers).
+    CHANGED.notify_waiters();
+}
+
 /// How long `CLIENT PAUSE` waits at most for the writes that are in the
 /// write gate when it pauses clients: the default `busy-reply-threshold`,
 /// past which a command still running is taken to be stuck. They are
@@ -665,8 +723,7 @@ pub fn wait_out_handoff() {
 /// which Redis holds too: there, a pause of everything can only run out.
 /// With only writers paused, the commands that wait are the ones that may
 /// change the dataset or the replication stream: writes (not `SELECT`,
-/// which writes nothing and is held back from the stream meanwhile,
-/// `replication::replicate_one_write`: #411), `PFCOUNT` (which
+/// which writes nothing and is sent to nobody: #411), `PFCOUNT` (which
 /// may rewrite its key), `PUBLISH`, a script that has not declared itself
 /// free of writes, and an `EXEC` of a transaction holding any of those. A
 /// command that writes only with some of its arguments (`GEORADIUS …
@@ -684,10 +741,19 @@ pub fn holds<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>]) -> bool {
         return false;
     }
     if !write_only {
+        // `SHUTDOWN ABORT` too: a shutdown pauses every client while it
+        // waits for the replicas, and this is what ends that wait. And any
+        // `SHUTDOWN` while one is in progress: it waits with that one. Held
+        // until an abort, it would start a shutdown of its own after it.
         return !(name == "CLIENT"
             && cmd
                 .get(1)
-                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")));
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")))
+            && !(name == "SHUTDOWN"
+                && (crate::shutdown::in_progress()
+                    || cmd
+                        .get(1)
+                        .is_some_and(|sub| sub.eq_ignore_ascii_case(b"ABORT"))));
     }
     if name == "EXEC" {
         return queued.iter().any(|command| queued_may_replicate(command));
@@ -725,13 +791,12 @@ pub fn queued_may_replicate<Q: AsRef<[u8]>>(command: &[Q]) -> bool {
 /// a handoff, ran behind the handoff's back, and its write was lost with
 /// the slot (#407).
 ///
-/// `SCRIPT` is not one of them, though `SCRIPT LOAD` and `SCRIPT FLUSH` are
-/// propagated: they change the script cache, not the dataset, and Redis
-/// holds neither (`NOSCRIPT`, `STALE`; neither `WRITE` nor
-/// `MAY_REPLICATE`). Holding them stalled every client that loads its
-/// scripts on connect or on `NOSCRIPT` for the whole pause, the ones that
-/// only read too (#518). While writes are paused they are kept out of the
-/// replication stream and the AOF instead (`replication::held_back`).
+/// `SCRIPT` is not one of them: `SCRIPT LOAD` and `SCRIPT FLUSH` change
+/// the script cache, not the dataset, and Redis holds neither (`NOSCRIPT`,
+/// `STALE`; neither `WRITE` nor `MAY_REPLICATE`). Holding them stalled
+/// every client that loads its scripts on connect or on `NOSCRIPT` for the
+/// whole pause, the ones that only read too (#518). They are sent to nobody
+/// now (#705), so a pause has nothing of theirs to keep out of the stream.
 fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     #[cfg(feature = "lua")]
     let declared_read_only = |name: &str, first: &[u8]| match name {
@@ -743,8 +808,7 @@ fn may_replicate(name: &str, cmd: &[&[u8]]) -> bool {
     let declared_read_only = |_: &str, _: &[u8]| false;
     match name {
         "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
-        // Propagated, but writes nothing (#411), nor does anything in the
-        // dataset (#518).
+        // Writes nothing (#411), nor anything in the dataset (#518).
         "SELECT" | "SCRIPT" => false,
         "EVAL" | "EVALSHA" | "FCALL" => !cmd
             .get(1)
@@ -1052,5 +1116,67 @@ mod tests {
             started.elapsed()
         );
         assert!(!handoff());
+    }
+
+    /// A pause that is taken back (a shutdown that failed) leaves the pause
+    /// in force before it as it was: a `CLIENT PAUSE`, a handoff's hold. One
+    /// ended meanwhile stays ended, and a handoff's hold set meanwhile stays.
+    #[test]
+    fn an_undone_pause_leaves_the_one_before_it() {
+        let _pause = TEST_LOCK.lock();
+        const LONG: i64 = 100 * 365 * 24 * 3600 * 1000;
+        let none: &[Vec<Vec<u8>>] = &[];
+        let set: &[&[u8]] = &[b"SET", b"k", b"v"];
+        let get: &[&[u8]] = &[b"GET", b"k"];
+        clear_pause();
+
+        // Nothing before: nothing after.
+        let undo = set_pause_undoable(LONG, false);
+        assert_eq!(active(), Some(false));
+        undo_pause(undo);
+        assert_eq!(active(), None);
+
+        // A CLIENT PAUSE WRITE before: it holds the writes still, until its
+        // own end, and the reads go on.
+        pause_clients(60_000, true).unwrap();
+        let end = PAUSE_UNTIL_MS.load(Ordering::SeqCst);
+        let undo = set_pause_undoable(LONG, false);
+        assert!(holds(get, none));
+        undo_pause(undo);
+        assert_eq!(active(), Some(true));
+        assert_eq!(PAUSE_UNTIL_MS.load(Ordering::SeqCst), end);
+        assert!(holds(set, none) && !holds(get, none));
+        assert!(HANDOFF.load(Ordering::SeqCst) & CLIENT_PAUSE != 0);
+        clear_pause();
+
+        // A handoff's hold before: it is still a handoff.
+        hold_writes();
+        let undo = set_pause_undoable(LONG, false);
+        undo_pause(undo);
+        assert!(handoff() && holds(set, none) && !holds(get, none));
+        clear_pause();
+        assert!(!handoff());
+
+        // A handoff's hold set meanwhile: it stays, of writers alone.
+        let undo = set_pause_undoable(LONG, false);
+        hold_writes();
+        undo_pause(undo);
+        assert!(handoff() && holds(set, none) && !holds(get, none));
+        clear_pause();
+
+        // A CLIENT PAUSE set meanwhile: its client was told the writes are
+        // held, and they are, until CLIENT UNPAUSE.
+        let undo = set_pause_undoable(LONG, false);
+        pause_clients(60_000, true).unwrap();
+        undo_pause(undo);
+        assert!(holds(set, none) && !holds(get, none));
+        clear_pause();
+        assert_eq!(active(), None);
+
+        // Ended meanwhile (CLIENT UNPAUSE): it stays ended.
+        let undo = set_pause_undoable(LONG, false);
+        clear_pause();
+        undo_pause(undo);
+        assert_eq!(active(), None);
     }
 }

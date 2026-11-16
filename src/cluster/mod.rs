@@ -20,9 +20,11 @@
 
 pub mod bus;
 pub mod ddl;
+pub(crate) mod followed_imports;
 pub(crate) mod migrate_conns;
 pub mod migration;
 pub mod node;
+pub(crate) mod orphans;
 pub mod persist;
 pub mod routing;
 pub mod search;
@@ -286,6 +288,13 @@ pub struct ClusterState {
     /// `migrations`: a deletion begun before then leaves the slot's keys,
     /// which may be acknowledged writes from then on (#353).
     pub slot_deletions: std::sync::Arc<migration::SlotDeletions>,
+    /// The keys this master holds of slots it does not serve, as last
+    /// counted, and the thread that counts them (#517). See `orphans`.
+    pub(crate) orphans: std::sync::Arc<orphans::Orphans>,
+    /// The atomic slot imports of the master this node follows, or of its
+    /// old master once promoted, until what they brought is deleted (#741).
+    /// See `followed_imports`.
+    pub(crate) followed_imports: followed_imports::FollowedImports,
     /// Slots assigned with `SETSLOT NODE` or removed with `DELSLOTS` here,
     /// and when: for
     /// [`BY_HAND_GRACE`] a peer's claim does not change them (see
@@ -406,6 +415,8 @@ impl ClusterState {
             migrations: RwLock::new(AHashMap::new()),
             slot_migrations: migration::Registry::default(),
             slot_deletions: Default::default(),
+            orphans: Default::default(),
+            followed_imports: Default::default(),
             by_hand: parking_lot::Mutex::new(AHashMap::new()),
             forgotten: RwLock::new(AHashMap::new()),
             last_vote_for: parking_lot::Mutex::new(AHashMap::new()),
@@ -620,6 +631,7 @@ impl ClusterState {
                     .upgrade()
                     .is_some_and(|state| state.take_over_from(master, why))
             }),
+            slot_imports: followed_imports::hook(self),
         });
         // A replica that started on a saved resync point holds the stream of
         // the master nodes.conf names.
@@ -629,6 +641,12 @@ impl ClusterState {
         // The keys of an import this node was receiving when it went down,
         // which never completed (#108).
         migration::drop_unfinished_imports(self);
+        // Those of its master, or of its old master, that it knew of (#741).
+        followed_imports::start(self, &repl_state);
+        migration::save_imports(self);
+        // Keys of slots this node does not serve are reported, from a
+        // moment after startup on (#517).
+        orphans::start_watching(self);
         self.start_the_clock_on_peers();
         self.start_background_save();
         bus::start(
@@ -2586,12 +2604,34 @@ impl ClusterState {
         if !lost.is_empty() {
             migration::drop_lost_slots(self, lost);
         }
+        // Its old master may have handed slots over that it still has the
+        // keys of (#517): they are reported, never deleted on their own.
+        self.orphans.ask(Some("after its promotion"));
     }
 
     // ── Migration state (Step 7c) ─────────────────────────────────────────────
 
     pub fn migration_state(&self, slot: u16) -> Option<MigrationState> {
         self.migrations.read().get(&slot).copied()
+    }
+
+    /// `CLUSTER SETSLOT <slot> ...`: `f`, the change it makes, unless an
+    /// atomic slot migration of `slot` to or from this node is under way
+    /// (`migration::Registry::setslot_refusal`, #755). Done with the
+    /// migration tasks locked: no atomic one begins in between, as one does
+    /// not begin on a slot in a legacy migration. `f` takes no lock that
+    /// comes before them (see [`ClusterState`]).
+    pub fn setslot_unless_migrating<R>(
+        &self,
+        slot: u16,
+        f: impl FnOnce() -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.slot_migrations.with_tasks(|tasks| {
+            if let Some(why) = migration::Registry::setslot_refusal(tasks, slot) {
+                return Err(why);
+            }
+            f()
+        })
     }
 
     pub fn set_migrating(&self, slot: u16, dest_id: NodeId) -> Result<(), String> {

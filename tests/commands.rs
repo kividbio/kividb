@@ -2487,6 +2487,8 @@ fn cluster_commands_refuse_when_cluster_support_is_disabled() {
         &["CLUSTER", "MYID"][..],
         &["CLUSTER", "COUNTKEYSINSLOT", "0"],
         &["CLUSTER", "GETKEYSINSLOT", "0", "1"],
+        &["CLUSTER", "ORPHANSLOTS"],
+        &["CLUSTER", "DROPORPHANS"],
         &["READONLY"],
         &["READWRITE"],
         &["ASKING"],

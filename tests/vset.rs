@@ -360,15 +360,20 @@ fn test_vemb_raw() {
     let blob = pack_f32(&original);
     c.cmd(&[b"VADD", b"vs", b"FP32", &blob, b"elem"]);
 
-    // RAW: returns little-endian FP32 bytes
+    // RAW: type, unit vector bytes, then the norm.
     let r = c.cmds(&["VEMB", "vs", "elem", "RAW"]);
-    let bytes = match &r {
+    let parts = r.as_array();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0].as_str(), "f32");
+    let bytes = match &parts[1] {
         RespValue::Bulk(b) => b.clone(),
-        _ => panic!("expected bulk: {:?}", r),
+        other => panic!("expected bulk: {:?}", other),
     };
     assert_eq!(bytes.len(), 12); // 3 × 4 bytes
+    let norm = parts[2].as_f64();
+    assert!((norm - 14f64.sqrt()).abs() < 1e-5);
     let v0 = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    assert!((v0 - 1.0).abs() < 1e-6);
+    assert!((v0 as f64 * norm - 1.0).abs() < 1e-5);
 }
 
 #[test]
@@ -1301,9 +1306,7 @@ fn test_vlinks_missing_key() {
     assert!(c.cmds(&["VLINKS", "nokey", "a"]).is_nil());
 }
 
-/// `VSIM ... FILTER` keeps the elements whose attributes pass, as in Redis;
-/// it was taken and ignored. `REDUCE` is refused rather than ignored, and
-/// `VINFO` says the vectors are kept at full precision (#132).
+/// FILTER applies, REDUCE is refused, and VINFO shows the real quantization.
 #[test]
 fn test_vsim_filter_reduce_and_quantization() {
     let port = free_port();
@@ -1388,7 +1391,7 @@ fn test_vsim_filter_reduce_and_quantization() {
         .iter()
         .position(|v| matches!(v, RespValue::Bulk(b) if b == b"quant-type"))
         .expect("quant-type");
-    assert_eq!(info[at + 1].as_str(), "f32");
+    assert_eq!(info[at + 1].as_str(), "int8");
 }
 
 /// #235: `VADD` took a `DISTANCE` it did not know as COSINE and skipped any

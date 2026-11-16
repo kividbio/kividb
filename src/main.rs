@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 pub mod loglevel;
 mod acl;
 mod aof;
+mod cli_directives;
 pub mod client_registry;
 pub mod cluster;
 pub mod cmdstats;
@@ -24,6 +25,7 @@ mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+mod give_back;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
@@ -37,7 +39,9 @@ mod member_set;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
+pub mod output_limits;
 pub mod pause;
+mod ping;
 pub mod protected_mode;
 mod pubsub;
 pub mod redis_settings;
@@ -282,18 +286,88 @@ fn main() {
     }
 }
 
+/// Exit on a command line clap refused, as clap does (usage, exit 2), except
+/// under `--ping`: Docker reserves a health check's exit code 2, so the
+/// check fails with 1 like any other failure. `--help` and `--version` are
+/// left to clap.
+fn bad_arguments(e: clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    let shown = matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
+    if !shown && std::env::args_os().any(|a| a == "--ping") {
+        let _ = e.print();
+        std::process::exit(1);
+    }
+    e.exit()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parsed by hand rather than with `Config::parse()`, to keep the matches:
     // the config file must not override an option given on the command line,
     // and only the matches know which those are.
-    let matches = <Config as clap::CommandFactory>::command().get_matches();
-    let mut cfg =
-        <Config as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    //
+    // The flags KiviDB has go to clap; every other `--<directive> <values>`
+    // is held back and applied after the config file, as `redis-server` does
+    // (#390). See `src/cli_directives.rs`.
+    let command = <Config as clap::CommandFactory>::command();
+    let split =
+        cli_directives::split(&command, std::env::args_os().collect()).unwrap_or_else(|e| {
+            // As for clap's refusals: a health check fails with 1, not 2.
+            if std::env::args_os().any(|a| a == "--ping") {
+                eprintln!("kividb --ping: {e}");
+            } else {
+                log_fatal!("Bad command line: {e}");
+            }
+            std::process::exit(1)
+        });
+    let matches = command
+        .clone()
+        .try_get_matches_from(split.native.iter())
+        .unwrap_or_else(|e| bad_arguments(e));
+    let mut cfg = <Config as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|e| bad_arguments(e));
     let from_cli =
         |option: &str| matches.value_source(option) == Some(clap::parser::ValueSource::CommandLine);
     cfg.bind_explicit =
         matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
-    match cfg.apply_config_file(&from_cli) {
+    // Config file, then the text on standard input (`-`, as in Redis; not for
+    // a health check, which must not wait for it), then the directives of the
+    // command line: each over the one before, and none over a flag.
+    let mut config_file = cfg.apply_config_file(&from_cli);
+    if let Ok(warnings) = &mut config_file
+        && split.stdin
+        && !cfg.ping
+    {
+        let mut text = String::new();
+        let read = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text);
+        let applied = read
+            .map_err(|e| format!("can't read the config from standard input: {e}"))
+            .and_then(|_| {
+                cfg.apply_config_text(&text, &from_cli)
+                    .map_err(|e| format!("standard input: {e}"))
+            });
+        match applied {
+            Ok(more) => warnings.extend(more.into_iter().map(|w| format!("standard input: {w}"))),
+            Err(e) => config_file = Err(e),
+        }
+    }
+    if let Ok(warnings) = &mut config_file {
+        match cli_directives::apply(&mut cfg, &command, &split.directives, &from_cli) {
+            Ok(more) => warnings.extend(more),
+            Err(e) => config_file = Err(e),
+        }
+    }
+    // `--ping` is a client: it needs the ports, TLS files and password the
+    // command line and config file give, and nothing a server does after
+    // this. It prints no warnings about the file: health checks run every few
+    // seconds, and the server has already logged them.
+    if cfg.ping {
+        if let Err(e) = config_file {
+            eprintln!("kividb --ping: {e}");
+            std::process::exit(1);
+        }
+        std::process::exit(ping::run(&cfg));
+    }
+    match config_file {
         Ok(warnings) => {
             for w in warnings {
                 log_warn!("{w}");
@@ -351,6 +425,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
     eviction::configure(&config);
     compaction::configure(&config);
+    give_back::set_enabled(config.allocator_give_back);
     snapshot::SNAPSHOT_DATABASES.store(config.databases, std::sync::atomic::Ordering::Relaxed);
     snapshot::SNAPSHOT_CLUSTER.store(config.cluster_enabled, std::sync::atomic::Ordering::Relaxed);
     keyspace_events::KS_FLAGS.store(
@@ -633,6 +708,7 @@ fn run_tokio(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let threads = config.resolve_threads();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
+        .thread_keep_alive(commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()?
         .block_on(async_main_tokio(config, started_at))
@@ -749,7 +825,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     let shutdown = Arc::new(AtomicBool::new(false));
     let repl_state = Arc::new(ReplState::from_config(&config));
     let acl_store = acl::new_acl_store(&config.requirepass);
@@ -820,6 +896,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     if config.cluster_enabled {
         log_info!(
             "Cluster: Node ID        : {}",
@@ -951,18 +1028,32 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 // Wait for OS signal OR SHUTDOWN command (polled every 100ms).
                 // The poll arm is the only addition — OS signal behaviour is
                 // identical to before.
+                // Streams, made once: a signal that arrives while a shutdown
+                // runs is kept, and starts one when that shutdown is aborted
+                // or fails. A `ctrl_c()` made afresh each time round missed
+                // a SIGINT that came in between.
                 #[cfg(unix)]
-                {
+                let (mut sigterm, mut sigint) = {
                     use tokio::signal::unix::{SignalKind, signal};
-                    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+                    (
+                        signal(SignalKind::terminate()).unwrap(),
+                        signal(SignalKind::interrupt()).unwrap(),
+                    )
+                };
+                loop {
+                    // Whether it was a signal, and not a client's SHUTDOWN.
+                    let from_signal;
                     loop {
+                        #[cfg(unix)]
                         tokio::select! {
-                            _ = tokio::signal::ctrl_c() => {
+                            _ = sigint.recv() => {
                                 log_info!("SIGINT received — shutting down gracefully");
+                                from_signal = true;
                                 break;
                             }
                             _ = sigterm.recv() => {
                                 log_info!("SIGTERM received — shutting down gracefully");
+                                from_signal = true;
                                 break;
                             }
                             _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
@@ -970,123 +1061,60 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                                 // One atomic load per 100ms — negligible cost.
                                 if crate::shutdown::SHUTDOWN_PENDING.load(Ordering::Relaxed) {
                                     log_info!("SHUTDOWN command received — shutting down");
+                                    from_signal = false;
                                     break;
                                 }
                             }
                         }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    loop {
+                        #[cfg(not(unix))]
                         tokio::select! {
                             _ = tokio::signal::ctrl_c() => {
                                 log_info!("Ctrl+C received — shutting down gracefully");
+                                from_signal = true;
                                 break;
                             }
                             _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                                 if crate::shutdown::SHUTDOWN_PENDING.load(Ordering::Relaxed) {
                                     log_info!("SHUTDOWN command received — shutting down");
+                                    from_signal = false;
                                     break;
                                 }
                             }
                         }
                     }
+
+                    // Read the mode the SHUTDOWN command (or OS signal) requested.
+                    // OS signals leave SHUTDOWN_MODE at its default (SAVE), which is correct.
+                    let m = crate::shutdown::SHUTDOWN_MODE.load(Ordering::Relaxed);
+                    // A client's SHUTDOWN that fails is answered with an error
+                    // and the server runs on (as is an aborted one); from a
+                    // signal, or with FORCE, a failed save ends the process.
+                    let by_command =
+                        !from_signal && !crate::shutdown::SHUTDOWN_FORCE.load(Ordering::Relaxed);
+                    let ended = crate::shutdown::Final {
+                        store: &signal_snapshot_store,
+                        index_store: &signal_snapshot_index_store,
+                        repl_state: &signal_repl_state,
+                        hub_tx: &signal_hub_tx,
+                    }
+                    .run(m, by_command);
+                    if ended == crate::shutdown::Ended::KeepRunning {
+                        // Given up, and undone: back to waiting.
+                        continue;
+                    }
+
+                    // Only now, with the final save written: the connections
+                    // stay open, and so does the port, until here, so that a
+                    // client that asked is answered an error if it failed.
+                    // Signal the io_uring accept workers to stop their loop.
+                    shutdown_signal.store(true, Ordering::SeqCst);
+                    // And stop their ports, after the flag: the accept each
+                    // worker is waiting in ends, and the worker sees the flag.
+                    // Left listening, a port went on taking connections after
+                    // the process had exited (see `listen::stop_uring_ports`).
+                    crate::listen::stop_uring_ports();
+                    std::process::exit(0);
                 }
-
-                // Signal the io_uring accept workers to stop their loop.
-                shutdown_signal.store(true, Ordering::SeqCst);
-                // And stop their ports, after the flag: the accept each
-                // worker is waiting in ends, and the worker sees the flag.
-                // Left listening, a port went on taking connections after
-                // the process had exited (see `listen::stop_uring_ports`).
-                crate::listen::stop_uring_ports();
-
-                // Read the mode the SHUTDOWN command (or OS signal) requested.
-                // OS signals leave SHUTDOWN_MODE at its default (SAVE), which is correct.
-                let m = crate::shutdown::SHUTDOWN_MODE.load(Ordering::Relaxed);
-
-                if m != crate::shutdown::mode::NOSAVE {
-                    // Before the gate below: the clients are paused, the
-                    // write stream ends here, and the replicas are given the
-                    // time to receive all of it, so that the restart can
-                    // continue them from the offset saved below (#306). The
-                    // worker threads go on serving the replicas meanwhile.
-                    // `SHUTDOWN NOW` does not wait.
-                    let started = std::time::Instant::now();
-                    let deadline = if m != crate::shutdown::mode::NOW {
-                        crate::replication::drain_replicas_for_shutdown(
-                            &signal_repl_state,
-                            &signal_hub_tx,
-                        )
-                    } else {
-                        started
-                    };
-                    // No command runs from here to the exit: the snapshot is
-                    // cut at one moment (#148), and a write a connection
-                    // already open made after that moment was acknowledged
-                    // and then lost with the process. Taken alone, the gate
-                    // waits for the commands running now and lets no other
-                    // start; it is never let go. Forgotten, not kept in a
-                    // binding: one dropped at the end of this block opened
-                    // the gate again before `process::exit` below, and the
-                    // writes that ran in between were acknowledged and lost.
-                    // What the final save takes is taken before the gate:
-                    // a replica's applier holds it while it waits at the
-                    // gate (#308).
-                    let hold = match crate::replication::hold_for_final_save(&signal_repl_state) {
-                        Ok(hold) => hold,
-                        Err(e) => {
-                            log_error!("Final snapshot failed: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    crate::replication::end_stream_for_shutdown(&signal_repl_state);
-                    if m != crate::shutdown::mode::NOW {
-                        crate::replication::report_replicas_at_shutdown(
-                            &signal_repl_state,
-                            &signal_hub_tx,
-                            started,
-                            deadline,
-                        );
-                    }
-                    // Not over the last good dump with a dataset a full
-                    // sync is still replacing.
-                    let Some(_settled) =
-                        crate::replication::dataset_for_final_save(&signal_repl_state)
-                    else {
-                        log_warn!("{}", crate::replication::FINAL_SAVE_SKIPPED);
-                        std::process::exit(0);
-                    };
-                    log_info!("Writing final snapshot...");
-                    // With the replica's position in its master's stream
-                    // beside it, so that the restart can ask to continue.
-                    let result = crate::replication::save_dataset_held(
-                        &hold,
-                        &signal_snapshot_store,
-                        &signal_snapshot_index_store,
-                        &signal_repl_state,
-                    );
-                    if result.is_ok() {
-                        crate::replication::note_clean_exit();
-                    }
-                    if let Err(e) = result {
-                        // Not a clean exit: whatever restarts this node
-                        // should know its last writes are not on disk.
-                        log_error!(
-                            "Final snapshot failed: {e}. Writes since the last successful save \
-                             are not in dump.kdb (they are in the AOF, if appendonly is on). \
-                             Check free disk space and write permission on the data directory"
-                        );
-                        std::process::exit(1);
-                    }
-                    log_info!("Goodbye.");
-                    std::mem::forget(hold);
-                } else {
-                    log_info!("SHUTDOWN NOSAVE — skipping snapshot. Goodbye.");
-                }
-
-                std::process::exit(0);
             });
     });
 
@@ -1631,7 +1659,7 @@ async fn async_main_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = crate::pubsub::PubSubHub::new();
+    let pubsub = crate::pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be
@@ -1650,6 +1678,7 @@ async fn async_main_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();
@@ -2002,10 +2031,15 @@ async fn async_main_tokio(
 
     // Set up signal handlers before entering the accept loop.
     // Both SIGTERM (systemd/kill) and SIGINT (Ctrl+C) trigger shutdown.
+    // Streams, made once: a signal is kept until it is taken (see
+    // `signal_pending` below).
     #[cfg(unix)]
-    let mut sigterm = {
+    let (mut sigterm, mut sigint) = {
         use tokio::signal::unix::{SignalKind, signal};
-        signal(SignalKind::terminate())?
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
     };
 
     let snapshot_store = Arc::clone(&store);
@@ -2016,11 +2050,21 @@ async fn async_main_tokio(
     // inside select!, which resets every iteration and never fires if
     // listener.accept() always completes first.
     let mut shutdown_check = tokio::time::interval(tokio::time::Duration::from_millis(50));
+    // A shutdown is under way (see where the loop starts one).
+    let attempting = Arc::new(std::sync::atomic::AtomicBool::new(false));
     shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Consume the first tick which fires immediately.
     shutdown_check.tick().await;
+    // Not polled again once it has completed (that panics): made afresh
+    // instead.
+    #[cfg(not(unix))]
     let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(not(unix))]
     tokio::pin!(ctrl_c);
+    // A signal has asked for a shutdown that has not yet begun: one arrived
+    // while another shutdown was under way, which may still be aborted or
+    // fail. Taken when the next one begins.
+    let mut signal_pending = false;
     loop {
         #[cfg(unix)]
         let shutdown = tokio::select! {
@@ -2106,12 +2150,14 @@ async fn async_main_tokio(
                     }
                 }
             }
-            _ = &mut ctrl_c => {
+            _ = sigint.recv() => {
                 log_info!("SIGINT received — shutting down gracefully");
+                signal_pending = true;
                 true
             }
             _ = sigterm.recv() => {
                 log_info!("SIGTERM received — shutting down gracefully");
+                signal_pending = true;
                 true
             }
             // NEW: poll for command-issued SHUTDOWN every 50 ms.
@@ -2209,6 +2255,8 @@ async fn async_main_tokio(
             }
             _ = &mut ctrl_c => {
                 log_info!("Ctrl+C received — shutting down gracefully");
+                ctrl_c.set(tokio::signal::ctrl_c());
+                signal_pending = true;
                 true
             }
             _ = shutdown_check.tick() => {
@@ -2216,84 +2264,72 @@ async fn async_main_tokio(
             }
         };
 
-        if shutdown {
-            break;
+        // Not again while one is under way (the tick above sees the flag
+        // until the shutdown ends or fails), and not waited for here: the
+        // loop goes on accepting, so that a client can `SHUTDOWN ABORT` a
+        // shutdown that waits for the replicas.
+        // A signal that came while one was under way is not dropped: it is
+        // taken here once that one has been aborted or has failed (the tick
+        // comes round every 50 ms).
+        if (shutdown || signal_pending) && !attempting.swap(true, Relaxed) {
+            // The mode the SHUTDOWN command (or OS signal) requested. A
+            // client's SHUTDOWN that fails is answered with an error and the
+            // server runs on, as does an aborted one; from a signal, or with
+            // FORCE, a failed save ends the process.
+            let from_signal = std::mem::take(&mut signal_pending);
+            let m = SHUTDOWN_MODE.load(Relaxed);
+            let by_command = !from_signal
+                && SHUTDOWN_PENDING.load(Relaxed)
+                && !crate::shutdown::SHUTDOWN_FORCE.load(Relaxed);
+            let store_c = Arc::clone(&snapshot_store);
+            let index_c = Arc::clone(&snapshot_index_store);
+            let repl_c = Arc::clone(&snapshot_repl_state);
+            let hub_c = hub_tx.clone();
+            let attempting = Arc::clone(&attempting);
+            tokio::spawn(async move {
+                if m & mode::NOW == 0 {
+                    // Give the AOF writer a moment to flush pending entries.
+                    // SHUTDOWN NOW skips this wait.
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+                if m & mode::NOSAVE == 0 {
+                    log_info!("Stopping — writing final snapshot...");
+                }
+                // The same sequence as on io_uring (`shutdown::Final`): with
+                // the replica's position in its master's stream beside the
+                // dataset, so that the restart can ask to continue, and no
+                // command run from the clients' pause to the exit: the
+                // connections already open keep running, and a write one made
+                // after the snapshot's cut was acknowledged and then lost.
+                let ended = tokio::task::spawn_blocking(move || {
+                    crate::shutdown::Final {
+                        store: &store_c,
+                        index_store: &index_c,
+                        repl_state: &repl_c,
+                        hub_tx: &hub_c,
+                    }
+                    .run(m, by_command)
+                })
+                .await;
+                match ended {
+                    Ok(crate::shutdown::Ended::Exit) => unsafe { libc::_exit(0) },
+                    // Aborted, or failed at a client's request: undone, and
+                    // the server runs on.
+                    Ok(crate::shutdown::Ended::KeepRunning) => attempting.store(false, Relaxed),
+                    Err(e) => {
+                        log_error!("Snapshot task panicked: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            });
         }
     }
-    // After breaking out of the loop, read the mode to decide how to exit:
-    let m = SHUTDOWN_MODE.load(Relaxed);
-    drop(aof_tx);
-    if m != mode::NOW {
-        // Give the AOF writer a moment to flush pending entries.
-        // SHUTDOWN NOW skips this wait.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
 
-    if m != mode::NOSAVE {
-        log_info!("Stopping — writing final snapshot...");
-        let store_c = Arc::clone(&snapshot_store);
-        let index_c = Arc::clone(&snapshot_index_store);
-        let repl_c = Arc::clone(&snapshot_repl_state);
-        let hub_c = hub_tx.clone();
-        // With the replica's position in its master's stream beside it, so
-        // that the restart can ask to continue.
-        let result = tokio::task::spawn_blocking(move || {
-            // No command runs from here to the exit, as on io_uring above:
-            // the connections already open keep running, and a write one
-            // made after the snapshot's cut was acknowledged and then lost.
-            // The guard is this thread's, and is never let go.
-            // First the clients are paused, the stream ends and the
-            // replicas are given the time to receive it all, as on io_uring
-            // above (#306).
-            let started = std::time::Instant::now();
-            let deadline = if m != mode::NOW {
-                crate::replication::drain_replicas_for_shutdown(&repl_c, &hub_c)
-            } else {
-                started
-            };
-            // What the final save takes is taken before the gate, as on
-            // io_uring above (#308).
-            let hold = crate::replication::hold_for_final_save(&repl_c)?;
-            crate::replication::end_stream_for_shutdown(&repl_c);
-            if m != mode::NOW {
-                crate::replication::report_replicas_at_shutdown(&repl_c, &hub_c, started, deadline);
-            }
-            // Not over the last good dump with a dataset a full sync is
-            // still replacing.
-            let Some(_settled) = crate::replication::dataset_for_final_save(&repl_c) else {
-                log_warn!("{}", crate::replication::FINAL_SAVE_SKIPPED);
-                std::process::exit(0);
-            };
-            let saved = crate::replication::save_dataset_held(&hold, &store_c, &index_c, &repl_c);
-            std::mem::forget(hold);
-            saved
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {
-                crate::replication::note_clean_exit();
-                log_info!("Goodbye.");
-            }
-            // Not a clean exit: whatever restarts this node should know its
-            // last writes are not on disk.
-            Ok(Err(e)) => {
-                log_error!(
-                    "Final snapshot failed: {e}. Writes since the last successful save \
-                             are not in dump.kdb (they are in the AOF, if appendonly is on). \
-                             Check free disk space and write permission on the data directory"
-                );
-                std::process::exit(1);
-            }
-            Err(e) => {
-                log_error!("Snapshot task panicked: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        log_info!("SHUTDOWN NOSAVE — skipping snapshot. Goodbye.");
-    }
-
-    unsafe { libc::_exit(0) };
+    // Left only by the shutdown's own `_exit`, above.
+    #[allow(unreachable_code)]
+    unsafe {
+        libc::_exit(0)
+    };
     #[allow(unreachable_code)]
     Ok(())
 }

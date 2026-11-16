@@ -657,6 +657,11 @@ impl Entry {
     #[cold]
     #[inline(never)]
     fn left_held(self, bytes: bool) {
+        // A test that has a snapshot's hold counted, as before #284: memory
+        // evicting keys does not give back, for eviction to stop at.
+        if crate::aof::test_behaves_as_before("snapshot-held-counted") {
+            return;
+        }
         let bytes = bytes && self.string_bytes().is_some_and(SharedBytes::is_unique);
         crate::memory_use::not_counted_add(self.held_size(bytes));
         let flags = LEFT_HELD | if bytes { LEFT_HELD_BYTES } else { 0 };
@@ -870,6 +875,13 @@ impl Drop for EntryRef {
 pub struct Taken(Entry);
 
 impl Taken {
+    /// Whether the value is a string kept in the entry itself, freed with
+    /// it at once.
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        self.0.form() == INLINE
+    }
+
     /// # Safety
     /// The caller gives this the table's hold.
     pub(super) unsafe fn new(entry: Entry) -> Self {
@@ -984,11 +996,26 @@ impl Slot {
         Slot(self.0 & !ADDRESS | at)
     }
 
+    /// The slot's bits, for tests that check one is unchanged.
+    #[cfg(test)]
+    pub(super) fn raw(self) -> u64 {
+        self.0
+    }
+
     /// The fragment of this slot's key's hash, as a hash that has it: what
     /// a slot for another entry of the same key is made with.
     #[inline]
     pub(super) fn hash_part(self) -> u64 {
         (self.0 >> 52) << 32
+    }
+
+    /// Where this slot's key comes in a scan of its table: the fragment of
+    /// its hash, below `SCAN_POSITIONS`. Read from the slot alone, without
+    /// a visit to the entry, and the key's for as long as it is in the
+    /// table: the table growing or shrinking moves the slot, not this.
+    #[inline(always)]
+    pub(super) fn scan_position(self) -> usize {
+        (self.0 >> 52) as usize
     }
 
     #[inline(always)]

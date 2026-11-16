@@ -601,13 +601,36 @@ pub fn xadd(ctx: &mut Ctx) -> Vec<u8> {
     // A retry of a message this producer already delivered: reply with the
     // entry it produced the first time and add nothing. A replica does not
     // second-guess its master, which has already made this decision.
-    if let Some((producer, iid)) = &idmp
-        && !ctx.apply_replication
-        && !ctx.bypass_cluster_check
-        && let Some(existing) =
-            stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
-    {
-        return resp_bulk_str(&existing.to_string());
+    //
+    // The duplicate is propagated all the same, as Redis propagates it, so
+    // that replicas and an AOF replay count it in `iids-duplicates` too
+    // (#655): under the entry's own ID, which a replica or a replay takes
+    // for the duplicate it is rather than for a new entry. Only while that
+    // ID is not past the stream's last ID: after `XTRIM … MAXLEN 0` and an
+    // `XSETID` below it, a build that does not know duplicates would take
+    // it for a new entry, so then nothing is propagated, as before.
+    if let Some((producer, iid)) = &idmp {
+        if !ctx.apply_replication && !ctx.bypass_cluster_check {
+            if let Some(existing) =
+                stream_extra::idmp_lookup(&mut inner, producer, iid, now, idmp_defaults)
+            {
+                let reply = existing.to_string();
+                if existing <= inner.last_id {
+                    let mut parts: Vec<Vec<u8>> = ctx.cmd.iter().map(|b| b.to_vec()).collect();
+                    parts[id_index] = reply.clone().into_bytes();
+                    effect(parts);
+                }
+                return resp_bulk_str(&reply);
+            }
+        } else if let NewId::Explicit(id) = &new_id
+            && stream_extra::idmp_applied_duplicate(&mut inner, producer, iid, id)
+        {
+            // Into a replica's own AOF and to a backup tap, as it came: a
+            // replica restarted from its AOF, or promoted, keeps the count.
+            // An AOF replay records nothing.
+            effect(ctx.cmd.iter().map(|b| b.to_vec()).collect());
+            return resp_bulk_str(&id.to_string());
+        }
     }
 
     // The next ID is worked out without ever adding to a sequence number
@@ -1814,6 +1837,9 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // order they blocked — the entry goes to the one that has waited longest
     // — and each gives the turn to the one behind it once it has looked,
     // which may be reading for another group.
+    // One record for the whole command: the consumer the first look creates
+    // is propagated even when the command then parks (#654).
+    effects_begin();
     let gone = blocking::client_gone(ctx);
     let resumed = blocking::take_resume(ctx);
     let timed_out = matches!(resumed, Some(None));
@@ -1866,13 +1892,11 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // Stand in line on every key BEFORE the second check — closes the TOCTOU
     // gap. (A history read never gets here: its reply always names the
     // stream, so it is never empty.)
+    // One receiver for all of them, which the first to be written wakes.
     let rxs: Vec<(
         Vec<u8>,
         tokio::sync::oneshot::Receiver<crate::wait_table::Value>,
-    )> = keys
-        .iter()
-        .map(|k| (k.clone(), ctx.wait_table.enqueue_reader(k, &ticket)))
-        .collect();
+    )> = vec![(Vec::new(), ctx.wait_table.enqueue_readers(&keys, &ticket))];
     let leave = |ctx: &Ctx| {
         for key in &keys {
             ctx.wait_table.reader_done(key, &ticket);
@@ -1977,7 +2001,8 @@ fn next_claimable_in(
 ///
 /// Every pending-list change made here is recorded as an effect (see
 /// `script_feed::effects_begin`) and that record — not the command — is what
-/// replicas and the AOF receive.
+/// replicas and the AOF receive. The caller begins the record, once for the
+/// command: a second look before parking must not drop what the first did.
 fn run_xreadgroup_delivery(
     ctx: &mut Ctx,
     keys: &[Vec<u8>],
@@ -1988,7 +2013,6 @@ fn run_xreadgroup_delivery(
     // `stream_results_reply`, so both protocols share this code path.
     let resp = reply_resp(ctx);
     let now = now_ms();
-    effects_begin();
 
     // Find every stream and group before delivering from any of them, so a
     // missing key or group fails the command with nothing half-delivered.
@@ -2152,13 +2176,25 @@ fn run_xreadgroup_delivery(
                 if budget.exhausted() {
                     break;
                 }
-                let item = match entries.get(&id) {
+                let entry = entries.get(&id);
+                let item = match entry {
                     Some(entry) => format_entry(&id, entry),
                     // Still pending, but deleted from the stream since.
                     None => resp_array(vec![resp_bulk_str(&id.to_string()), resp_null_for(resp)]),
                 };
                 if !budget.admit(item.len()) {
                     break;
+                }
+                if entry.is_none() {
+                    // Reported, and left as it was: still pending, its
+                    // delivery count and time unchanged, and nothing sent,
+                    // as in Redis 8.10. It used to be counted as a delivery
+                    // and sent as the XCLAIM below, which drops an entry
+                    // that is gone: replicas and the AOF dropped what the
+                    // primary kept (#737). XCLAIM and XAUTOCLAIM drop it,
+                    // on every copy.
+                    items.push(item);
+                    continue;
                 }
                 if let Some(pending) = g.pel.get_mut(&id) {
                     pending.delivered_at = now;

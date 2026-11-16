@@ -1170,3 +1170,48 @@ class TestShutdownModes:
                 "NOSAVE must not persist writes after the last explicit SAVE"
         finally:
             _kill(proc2)
+
+    # redis-py's own `shutdown()` (#429). A shutdown that goes ahead is
+    # answered with nothing: the connection just closes, and redis-py takes
+    # any reply for a failure ("SHUTDOWN seems to have failed.").
+
+    def test_redis_py_shutdown_nosave_returns(self, tmp_path):
+        port = _free_port()
+        proc = _start(port, str(tmp_path))
+        try:
+            c = _client(port)
+            c.set("rp:k", "v")
+            assert c.shutdown(nosave=True) is None
+            assert _wait_gone(port)
+            proc.wait(timeout=10)
+        finally:
+            _kill(proc)
+
+    def test_redis_py_shutdown_save_persists(self, tmp_path):
+        port = _free_port()
+        proc = _start(port, str(tmp_path))
+        try:
+            c = _client(port)
+            c.set("rp:saved", "yes")
+            assert c.shutdown(save=True) is None
+            proc.wait(timeout=10)
+        finally:
+            _kill(proc)
+
+        port2 = _free_port()
+        proc2 = _start(port2, str(tmp_path))
+        try:
+            assert _client(port2).get("rp:saved") == "yes"
+        finally:
+            _kill(proc2)
+
+    def test_redis_py_shutdown_abort_with_none_in_progress(self, tmp_path):
+        port = _free_port()
+        proc = _start(port, str(tmp_path))
+        try:
+            c = _client(port)
+            with pytest.raises(redis.ResponseError, match="No shutdown in progress"):
+                c.shutdown(abort=True)
+            assert c.ping()
+        finally:
+            _kill(proc)

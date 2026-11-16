@@ -715,6 +715,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     }
     let deadline = crate::commands::search::search_deadline(timeout_ms);
+    // One moment for the whole query to judge field deadlines by.
+    let clock = crate::types::QueryClock::new();
+    let now = &clock;
 
     // ── Stage 0: Collect all matching rows ────────────────────────────────────
     //
@@ -736,6 +739,14 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         })
     };
     let json = matches!(def.on, crate::vector::IndexOn::Json);
+    // The rows of hashes the query does not see the KNN field of: one past
+    // its deadline, left out of what the first read of the hash shows. The
+    // KNN below skips these, as it skipped what a second read of each hash
+    // found hidden.
+    let mut unseen: ahash::AHashSet<String> = ahash::AHashSet::new();
+    // No field has a deadline anywhere: none is past it, as `field_hidden`
+    // knew.
+    let watching = crate::field_expiry::any_watched();
     let mut add_row = |key: &str,
                        inner: &crate::vector::Fields,
                        json_doc: Option<&serde_json::Value>| {
@@ -757,6 +768,13 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // Always include the key itself as a special field.
         // Prefixed with __ so it doesn't collide with user field names.
         row.insert("__key".to_string(), key.to_string());
+        if let Some(knn) = &knn
+            && watching
+            && !json
+            && inner.get(knn.field.as_str()).is_none()
+        {
+            unseen.insert(key.to_string());
+        }
         for (field, val) in inner.iter() {
             // Text only: a vector's bytes are not a value a row can show
             // or a pipeline can compute with.
@@ -776,7 +794,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     // From postings, if they narrow the filter (see `search::plan`); else
     // every document, the deadline kept between runs of them (`scan_docs`).
-    let timed_out_scan = match crate::commands::search::plan(ctx, &def, &filter, None) {
+    let timed_out_scan = match crate::commands::search::plan(ctx, &def, &filter, None, now) {
         Some(plan) => {
             let mut seen = 0u32;
             let mut cut = false;
@@ -788,7 +806,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 if not_served(&key) {
                     continue;
                 }
-                crate::commands::search::with_doc(db_ref, &def, &key, |inner, json| {
+                crate::commands::search::with_doc(db_ref, &def, &key, now, |inner, json| {
                     if plan.exact || crate::vector::filter::eval(&filter, inner) {
                         add_row(&key, inner, json);
                     }
@@ -803,7 +821,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if not_served(key) {
                 return;
             }
-            let Some(inner) = crate::vector::query_doc_fields(&def.on, &def.fields, value) else {
+            let Some(inner) = crate::vector::query_doc_fields(&def.on, &def.fields, value, now)
+            else {
                 return;
             };
             // The filter on the raw fields, before anything is turned into
@@ -835,7 +854,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         let candidates = rows
             .iter()
             .filter_map(|row| row.get("__key").map(String::as_str))
-            .filter(|key| !crate::commands::search::field_hidden(db_ref, key, &knn.field));
+            .filter(|key| !unseen.contains(*key));
         let (nearest, cut) = knn_filtered(live, &knn.vector, knn.k, metric, candidates, deadline);
         timed_out |= cut;
         let rank: ahash::AHashMap<String, (usize, f32)> = nearest
@@ -894,7 +913,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // ── Parse and execute pipeline clauses ────────────────────────────────────
     // To the same deadline: GROUPBY, APPLY, FILTER and SORTBY over a large
     // scan cost as much as the scan.
-    let (rows, cut) = crate::commands::aggregate_pipeline::run_within(rows, cmd, 3, deadline);
+    let (rows, cut, groups) =
+        crate::commands::aggregate_pipeline::run_counted(rows, cmd, 3, deadline);
     timed_out |= cut;
     if cut && crate::commands::search::on_timeout_fails() {
         return Some(resp_error("Timeout limit was reached"));
@@ -1016,17 +1036,21 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // `WITHCURSOR`: the first rows now, the rest as they are asked for.
     if let Some((count, max_idle)) = cursor {
         return Some(crate::commands::search_tools::open_cursor(
-            ctx.resp,
+            crate::commands::handler::effective_resp_for_reply(ctx),
             &index_name,
             rows_out,
             count,
             max_idle,
             timed_out,
+            groups,
         ));
     }
+    // A grouped aggregation reports how many groups there were, not how many
+    // are on this page; any other reports the page.
+    let total = groups.unwrap_or(rows_out.len());
     Some(crate::commands::search_tools::rows_reply(
-        ctx.resp,
-        rows_out.len(),
+        crate::commands::handler::effective_resp_for_reply(ctx),
+        total,
         &rows_out,
         timed_out,
     ))
@@ -1509,7 +1533,7 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // A suggestion's score is the share of the index's documents that hold
     // it (`spell_check.c`), best first, written as Redis writes a double; a
     // word only in an INCLUDE dictionary scores 0.
-    let resp3 = ctx.resp == 3;
+    let resp3 = crate::commands::handler::effective_resp_for_reply(ctx) == 3;
     let score = |docs: usize| -> Vec<u8> {
         let digits = crate::commands::helpers::format_score(docs as f64 / total_docs);
         if resp3 {
@@ -1583,6 +1607,7 @@ pub(crate) fn nearest_shown(
     db: &crate::store::Db,
     field: &str,
     k: usize,
+    now: &crate::types::QueryClock,
     mut search: impl FnMut(usize) -> Vec<crate::vector::KnnResult>,
 ) -> Vec<crate::vector::KnnResult> {
     let mut want = k;
@@ -1590,7 +1615,7 @@ pub(crate) fn nearest_shown(
         let mut found = search(want);
         let all = found.len() >= want;
         let before = found.len();
-        found.retain(|hit| !crate::commands::search::field_hidden(db, &hit.key, field));
+        found.retain(|hit| !crate::commands::search::field_hidden(db, &hit.key, field, now));
         let hidden = before - found.len();
         if hidden == 0 || found.len() >= k || !all {
             found.truncate(k);
@@ -1772,12 +1797,13 @@ pub(crate) fn knn_planned(
     knn: &crate::vector::filter::Knn,
     field: &crate::vector::SchemaField,
     deadline: Option<std::time::Instant>,
+    now: &crate::types::QueryClock,
 ) -> Option<(Vec<crate::vector::KnnResult>, bool)> {
     let FieldType::Vector { metric, algo, .. } = &field.field_type else {
         return None;
     };
     let live = def.indexes.get(&knn.field)?;
-    let mut plan = crate::commands::search::plan(ctx, def, filter, only)?;
+    let mut plan = crate::commands::search::plan(ctx, def, filter, only, now)?;
     if !plan.exact {
         return None;
     }
@@ -1810,7 +1836,7 @@ pub(crate) fn knn_planned(
         // query's plan, not out of the index.
         let hidden: Vec<String> = nearest
             .iter()
-            .filter(|r| crate::commands::search::field_hidden(db, &r.key, &knn.field))
+            .filter(|r| crate::commands::search::field_hidden(db, &r.key, &knn.field, now))
             .map(|r| r.key.clone())
             .collect();
         if (gone.is_empty() && hidden.is_empty()) || cut {

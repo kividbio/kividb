@@ -26,6 +26,7 @@ pub mod config;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod give_back;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod latency;
@@ -37,6 +38,7 @@ pub mod member_set;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
+pub mod output_limits;
 pub mod pause;
 pub mod protected_mode;
 pub mod pubsub;
@@ -82,6 +84,7 @@ static ALLOCATOR: memory_use::Counting = memory_use::Counting;
 
 pub static RUNTIME_MAXMEMORY: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
 /// Entry point for integration tests — starts a tokio server on the given
 /// config and blocks the calling thread. Meant to run inside a thread::spawn.
 pub fn run_for_test(config: config::Config) {
@@ -93,6 +96,7 @@ pub fn run_for_test(config: config::Config) {
     }
     crate::eviction::configure(&cfg);
     crate::compaction::configure(&cfg);
+    crate::give_back::set_enabled(cfg.allocator_give_back);
     // Only ever raised here, as the servers of one test process share it.
     crate::snapshot::SNAPSHOT_DATABASES
         .fetch_max(cfg.databases, std::sync::atomic::Ordering::Relaxed);
@@ -106,6 +110,7 @@ pub fn run_for_test(config: config::Config) {
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_keep_alive(crate::commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()
         .unwrap()
@@ -137,7 +142,7 @@ async fn server_tokio(
     let dict_store = vector::new_dict_store();
     vector::register_dict_store(&index_store, &dict_store);
     let ts_index = store::new_ts_index();
-    let pubsub = pubsub::PubSubHub::new();
+    let pubsub = pubsub::PubSubHub::with_limits(&config.client_output_buffer_limit);
     // Unbounded: a bounded AOF queue drops durability records under load.
     let (aof_tx, aof_rx) = mpsc::unbounded_channel();
     // Reachable from the replication applier, which is built too deep to be
@@ -156,6 +161,7 @@ async fn server_tokio(
         &hub_tx,
     );
     crate::compaction::spawn(Arc::clone(&store));
+    crate::give_back::start();
     let watch_registry = crate::watch::new_watch_registry();
     crate::watch::register_for(&store, &watch_registry);
     let client_registry = crate::client_registry::new_client_registry();

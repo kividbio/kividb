@@ -266,6 +266,10 @@ fn run_backup(handles: Handles, seq: u64, dir: PathBuf, tap: u64) {
         // Ends when the tap is detached and the channel has been drained.
         for payload in rx.iter() {
             incr.write_all(&payload)?;
+            // As in the AOF; taps also feed slot migration, so added here.
+            if crate::aof::needs_vset_quant_marker(&payload) {
+                incr.write_all(crate::aof::VSET_QUANT_MARKER)?;
+            }
         }
         incr.flush()?;
         incr.get_ref().sync_all()

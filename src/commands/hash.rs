@@ -699,11 +699,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let (cursor, options) =
-                match crate::commands::helpers::scan_arguments(cmd, 2, &["NOVALUES"]) {
-                    Ok(parsed) => parsed,
-                    Err(e) => return Some(e),
-                };
+            let cursor = match crate::commands::helpers::scan_cursor(cmd, 2) {
+                Ok(cursor) => cursor,
+                Err(e) => return Some(e),
+            };
 
             let now = expire_before(ctx, key);
             let db_ref = &ctx.store[*ctx.selected_db];
@@ -712,6 +711,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 Some(v) if matches!(v, ValueRef::Hash(_) | ValueRef::HashEx(_)) => {
+                    // The options are read once the key is known to be a
+                    // hash, as Redis does: a missing key is an empty scan
+                    // whatever they say.
+                    let options =
+                        match crate::commands::helpers::scan_options(cmd, 3, &["NOVALUES"]) {
+                            Ok(options) => options,
+                            Err(e) => return Some(e),
+                        };
                     // A hash Redis would encode compactly comes back whole.
                     let (cursor, count) = if crate::commands::generics::scans_whole(v) {
                         (0, usize::MAX)
@@ -750,12 +757,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         1024,
                     );
                     let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
+                    let pattern = options
+                        .pattern
+                        .as_deref()
+                        .map(crate::commands::glob_redis::Glob::new);
                     for (f, v) in page {
-                        if options.pattern.as_deref().is_some_and(|pat| {
-                            !crate::commands::helpers::glob_match_bytes(
-                                pat,
-                                &crate::commands::helpers::name_to_bytes(f),
-                            )
+                        if pattern.as_ref().is_some_and(|glob| {
+                            !glob.matches(&crate::commands::helpers::name_to_bytes(f))
                         }) {
                             continue;
                         }

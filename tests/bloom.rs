@@ -24,6 +24,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod common;
+use common::start_verified;
+
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -353,25 +356,28 @@ struct Child {
 
 impl Child {
     fn start(dir: &std::path::Path, extra: &[&str]) -> Child {
-        let port = free_port();
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
-            .current_dir(dir)
-            .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
-            .args([
-                "--io-model",
-                "tokio",
-                "--threads",
-                "2",
-                "--loglevel",
-                "warning",
-            ])
-            .args(["--configfile", "kividb.conf", "--dir"])
-            .arg(dir)
-            .args(extra)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("could not start kividb");
+        // Verified to be the process started (a port picked a moment ago can
+        // be another test's by the time this one binds): see tests/common/mod.rs.
+        let (child, port) = start_verified(|port| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+                .current_dir(dir)
+                .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+                .args([
+                    "--io-model",
+                    "tokio",
+                    "--threads",
+                    "2",
+                    "--loglevel",
+                    "warning",
+                ])
+                .args(["--configfile", "kividb.conf", "--dir"])
+                .arg(dir)
+                .args(extra)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("could not start kividb")
+        });
         let child = Child { port, child };
         wait_until("kividb to answer", || {
             TcpStream::connect(("127.0.0.1", port)).is_ok_and(|mut c| {
