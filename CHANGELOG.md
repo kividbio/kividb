@@ -332,8 +332,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the collections being freed at that moment (reckoned low: 32 bytes an
   element) bring memory use under `maxmemory` by themselves; otherwise, and
   under every `volatile-*` policy, it is refused as before. That lets
-  memory go over the limit by at most what the writes checked at that
-  moment add, and nothing waits. On a 4-vCPU VM (master and replica with
+  memory go over the limit by at most the bytes reckoned as being freed
+  and one command per thread, until the next write evicts the keys let in;
+  nothing waits. On a 4-vCPU VM (master and replica with
   AOF, memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists,
   sets and sorted sets, `maxmemory 512mb`, ~53M writes in ten minutes),
   master refused 2 writes under `allkeys-lfu` and 3 under `allkeys-lru`,

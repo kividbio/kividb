@@ -1023,7 +1023,8 @@ impl Drop for Freeing {
 /// through before it, is no more than the limit and the bytes on their way
 /// back. So at most the collections being freed at that moment, and what
 /// the writes checked at that same moment (one per thread) add; once they
-/// are freed, at most those writes. Nothing waits.
+/// are freed, at most those writes and the reckoned bytes not yet freed
+/// when they were let in, until the next write evicts them. Nothing waits.
 ///
 /// Redis has no such case: it frees an evicted key on the thread that
 /// evicts, before the next command. With `lazyfree-lazy-eviction`, when
