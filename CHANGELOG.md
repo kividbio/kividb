@@ -327,6 +327,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A master and its replica hold the same dataset digest while entries
+  `XNACK` released are pending (#856).** Each node that applied the
+  `XNACK` (a replica, an AOF replay) gave a released entry its own internal
+  mark for the time it was delivered, and the digest held that mark, so
+  `DEBUG DIGEST-VALUE` of the stream differed between a master and its
+  replica, and a master killed and started from its AOF no longer matched
+  the replica it had: the replica could not be continued and took a full
+  sync it did not need. No reply differed (`XPENDING` and `XINFO` showed
+  the same) and nothing was lost. The digest now holds the time as it is
+  shown, 0 for a released entry. A 1.2.2 node and a new one compute a
+  different digest for a dataset with released entries, so a replica of
+  one kind of a master of the other that comes back after the master was
+  killed takes a full sync, (two 1.2.2 nodes already did; it costs a sync,
+  not data); the stream, a clean restart and a full sync work as before.
+
 - **`ASKING` before `MULTI` covers the whole transaction on a node
   importing the slot (#698).** It was used up by the first queued command,
   so the next one, or the `EXEC`, was answered `MOVED`, and a transaction
