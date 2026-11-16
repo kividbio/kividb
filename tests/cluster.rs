@@ -2974,6 +2974,151 @@ fn asking_before_multi_covers_the_transaction() {
     );
 }
 
+/// The io models these tests run on: io_uring is Linux's.
+fn io_models() -> &'static [&'static str] {
+    if cfg!(target_os = "linux") {
+        &["tokio", "uring"]
+    } else {
+        &["tokio"]
+    }
+}
+
+/// Two masters on `model`, and node 1 importing a slot of node 0 that holds
+/// a key `prefix` finds: the nodes and that tag.
+fn importing_pair(model: &str, prefix: &str) -> (Vec<Node>, String) {
+    let (nodes, ranges) = form_cluster_of(
+        (0..2)
+            .map(|_| Node::start(&["--io-model", model]))
+            .collect(),
+    );
+    let tag = key_in(ranges[0].0..=ranges[0].1, prefix);
+    let slot = slot_of(&tag).to_string();
+    assert!(
+        nodes[1]
+            .conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &nodes[0].id()])
+            .is_ok()
+    );
+    (nodes, tag)
+}
+
+fn is_moved(reply: &Resp) -> bool {
+    reply.err().is_some_and(|e| e.starts_with("MOVED"))
+}
+
+/// An `EXEC` of several commands of different kinds uses ASKING up too
+/// (#698), as one of a single command does.
+#[test]
+fn asking_is_used_up_by_an_exec_that_runs_several_commands() {
+    for model in io_models() {
+        let (nodes, tag) = importing_pair(model, "ask-slow");
+        let mut c = nodes[1].conn();
+        let (k1, kl) = (format!("{{{tag}}}:1"), format!("{{{tag}}}:l"));
+        assert!(c.cmd(&["ASKING"]).is_ok());
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["INCR", &k1]).text(), "QUEUED", "{model}");
+        assert_eq!(c.cmd(&["LPUSH", &kl, "x"]).text(), "QUEUED", "{model}");
+        let exec = c.cmd(&["EXEC"]);
+        assert_eq!(
+            exec.array(),
+            [Resp::Int(1), Resp::Int(1)],
+            "{model}: {exec:?}"
+        );
+        let reply = c.cmd(&["GET", &k1]);
+        assert!(is_moved(&reply), "{model}: {reply:?}");
+    }
+}
+
+/// An `EXEC` that WATCH aborts ends the transaction too.
+#[test]
+fn asking_is_used_up_by_an_exec_that_a_watch_aborts() {
+    let (nodes, tag) = importing_pair("tokio", "ask-watch");
+    let mut c = nodes[1].conn();
+    let k1 = format!("{{{tag}}}:1");
+    assert!(c.cmd(&["ASKING"]).is_ok());
+    assert!(c.cmd(&["WATCH", &k1]).is_ok());
+    assert!(c.cmd(&["ASKING"]).is_ok());
+    assert!(c.cmd(&["MULTI"]).is_ok());
+    assert_eq!(c.cmd(&["SET", &k1, "mine"]).text(), "QUEUED");
+    let mut other = nodes[1].conn();
+    assert!(other.cmd(&["ASKING"]).is_ok());
+    assert!(other.cmd(&["SET", &k1, "theirs"]).is_ok());
+    let exec = c.cmd(&["EXEC"]);
+    assert!(matches!(exec, Resp::Nil), "{exec:?}");
+    let reply = c.cmd(&["GET", &k1]);
+    assert!(is_moved(&reply), "{reply:?}");
+}
+
+/// An `EXEC` refused for its arguments ends the transaction, so the client
+/// is out of `MULTI` and ASKING is gone, as in Redis.
+#[test]
+fn asking_is_used_up_by_an_exec_refused_for_its_arguments() {
+    for model in io_models() {
+        let (nodes, tag) = importing_pair(model, "ask-arity");
+        let mut c = nodes[1].conn();
+        let k = format!("{{{tag}}}k");
+        assert!(c.cmd(&["ASKING"]).is_ok());
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["SET", &k, "v"]).text(), "QUEUED", "{model}");
+        let exec = c.cmd(&["EXEC", "extra"]);
+        assert!(
+            exec.err().is_some_and(|e| e.starts_with("EXECABORT")),
+            "{model}: {exec:?}"
+        );
+        let reply = c.cmd(&["SET", &k, "v"]);
+        assert!(is_moved(&reply), "{model}: {reply:?}");
+    }
+}
+
+/// So does an `EXEC` that ACL denies.
+#[test]
+fn asking_is_used_up_by_an_exec_that_acl_denies() {
+    let (nodes, tag) = importing_pair("tokio", "ask-acl");
+    let mut c = nodes[1].conn();
+    let k = format!("{{{tag}}}k");
+    assert!(
+        c.cmd(&[
+            "ACL", "SETUSER", "lim", "on", "nopass", "~*", "+@all", "-exec"
+        ])
+        .is_ok()
+    );
+    assert!(c.cmd(&["AUTH", "lim", "x"]).is_ok());
+    assert!(c.cmd(&["ASKING"]).is_ok());
+    assert!(c.cmd(&["MULTI"]).is_ok());
+    assert_eq!(c.cmd(&["SET", &k, "v"]).text(), "QUEUED");
+    let exec = c.cmd(&["EXEC"]);
+    assert!(
+        exec.err().is_some_and(|e| e.starts_with("EXECABORT")),
+        "{exec:?}"
+    );
+    let reply = c.cmd(&["SET", &k, "v"]);
+    assert!(is_moved(&reply), "{reply:?}");
+}
+
+/// A command that ASKING covers uses it up: the next one is routed as any.
+#[test]
+fn asking_is_used_up_by_the_command_it_precedes() {
+    let (nodes, tag) = importing_pair("tokio", "ask-one");
+    let mut c = nodes[1].conn();
+    let (a, b) = (format!("{{{tag}}}a"), format!("{{{tag}}}b"));
+    assert!(c.cmd(&["ASKING"]).is_ok());
+    assert_eq!(c.cmd(&["DEL", &a, &b]).int(), 0);
+    let reply = c.cmd(&["GET", &a]);
+    assert!(is_moved(&reply), "{reply:?}");
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn asking_is_used_up_by_a_script() {
+    let (nodes, tag) = importing_pair("tokio", "ask-eval");
+    let mut c = nodes[1].conn();
+    let a = format!("{{{tag}}}a");
+    assert!(c.cmd(&["ASKING"]).is_ok());
+    assert_eq!(c.cmd(&["EVAL", "return 1", "1", &a]).int(), 1);
+    let reply = c.cmd(&["GET", &a]);
+    assert!(is_moved(&reply), "{reply:?}");
+}
+
 /// Vector sets of each quantization (the default one last) and a series.
 const MOVED_VSETS: [(&str, &str); 4] = [
     ("vq8", "Q8"),

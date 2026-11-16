@@ -323,7 +323,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so the next one, or the `EXEC`, was answered `MOVED`, and a transaction
   on a key moving in a reshard could not run. As in Redis, it now lasts
   until `EXEC` or `DISCARD` ends the transaction, and covers every command
-  `EXEC` runs. `RESET` clears it, as in Redis.
+  `EXEC` runs. An `EXEC` that is refused (wrong arguments, or denied by
+  ACL) ends the transaction too, so it clears it as well. `RESET` clears it,
+  as in Redis.
 
 - **Under an `allkeys-*` policy a write is no longer refused with OOM while
   eviction is working (#520).** Two things refused one. Eviction stopped

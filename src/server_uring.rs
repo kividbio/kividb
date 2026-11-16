@@ -1591,6 +1591,13 @@ pub async fn handle_client(
                         },
                         refusal,
                     );
+                    if cmd_name == "EXEC" {
+                        crate::cluster::routing::transaction_ended(
+                            &cluster_state,
+                            &client_registry,
+                            client_id,
+                        );
+                    }
                     out_buf.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
@@ -1703,6 +1710,13 @@ pub async fn handle_client(
                     },
                     wrong,
                 );
+                if cmd_name == "EXEC" {
+                    crate::cluster::routing::transaction_ended(
+                        &cluster_state,
+                        &client_registry,
+                        client_id,
+                    );
+                }
                 out_buf.extend_from_slice(&reply);
                 parse_offset += consumed;
                 continue;

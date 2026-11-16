@@ -1397,6 +1397,13 @@ where
                         },
                         refusal,
                     );
+                    if cmd_name == "EXEC" {
+                        crate::cluster::routing::transaction_ended(
+                            &cluster_state,
+                            &client_registry,
+                            client_id,
+                        );
+                    }
                     combined.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
@@ -1509,6 +1516,13 @@ where
                     },
                     wrong,
                 );
+                if cmd_name == "EXEC" {
+                    crate::cluster::routing::transaction_ended(
+                        &cluster_state,
+                        &client_registry,
+                        client_id,
+                    );
+                }
                 combined.extend_from_slice(&reply);
                 parse_offset += consumed;
                 continue;
