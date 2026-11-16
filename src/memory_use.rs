@@ -279,10 +279,12 @@ impl NotCounted {
     }
 
     /// Exactly `bytes` in all, whatever it was: for a buffer that grows.
+    /// Nothing is touched when it is what it was: a capture asks for every
+    /// key, with writes held, and the total is one cache line for all threads.
     pub fn set(&mut self, bytes: usize) {
-        if bytes >= self.0 {
+        if bytes > self.0 {
             self.add(bytes - self.0);
-        } else {
+        } else if bytes < self.0 {
             self.release(self.0 - bytes);
         }
     }
