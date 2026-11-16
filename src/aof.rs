@@ -69,6 +69,9 @@ const AOF_FLAG_PREAMBLE: u8 = 1;
 pub const AOF_DELTA_MAGIC: &[u8; 8] = b"KIVIDLT1";
 pub const AOF_DELTA_HEADER_LEN: usize = 16;
 pub const AOF_GEN_PATH: &str = "dump.kdb.gen";
+/// The snapshot a save writes and a start reads, in the data directory; what
+/// `CONFIG GET dbfilename` answers (#846).
+pub const SNAPSHOT_PATH: &str = "dump.kdb";
 
 // ── Rewrite telemetry ────────────────────────────────────────────────────────
 //

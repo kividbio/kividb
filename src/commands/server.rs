@@ -1192,10 +1192,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
-            | "appenddirname" | "aclfile" => {
-                let unchanged = config_rows(ctx)
-                    .iter()
-                    .any(|(name, current)| *name == param && current == value);
+            | "appenddirname" | "aclfile" | "dbfilename" => {
+                // `dump.rdb` is accepted as the configuration file accepts
+                // it: the snapshot is `dump.kdb` either way (#846).
+                let unchanged = (param == "dbfilename" && value == "dump.rdb")
+                    || config_rows(ctx)
+                        .iter()
+                        .any(|(name, current)| *name == param && current == value);
                 if unchanged {
                     Some(resp_simple("OK"))
                 } else {
@@ -2148,6 +2151,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         ),
+        // The file a save writes and a start reads, in `dir`: what is
+        // always used, whatever the configuration file or `--dbfilename`
+        // said (#846).
+        ("dbfilename", crate::aof::SNAPSHOT_PATH.to_string()),
         ("aclfile", ctx.config.aclfile.clone()),
         (
             "slowlog-log-slower-than",
