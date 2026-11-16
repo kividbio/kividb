@@ -194,8 +194,12 @@ Notes:
 
 Releases pending entries back to the group PEL without acknowledging them, so
 another consumer can claim them immediately instead of waiting out a
-`min-idle-time`. Released entries are marked unowned (empty consumer) and given a
-delivery time of 0; `XPENDING` reports their idle time as `-1`.
+`min-idle-time`. Released entries belong to no consumer and are given a
+delivery time of 0; `XPENDING` reports their idle time as `-1`, with an empty
+owner, as Redis does. They are not the entries of a consumer named `""`, which
+can exist too: `XPENDING key group - + n ""`, `XINFO CONSUMERS` and
+`XGROUP DELCONSUMER` of that consumer count and remove only its own, and
+`XINFO STREAM FULL` counts the released ones as `nacked-count`.
 
 - `SILENT` decrements the delivery counter, `FAIL` leaves it, `FATAL` pins it to
   `LLONG_MAX`. `RETRYCOUNT` overrides all three.

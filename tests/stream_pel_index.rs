@@ -277,7 +277,20 @@ fn view(c: &mut Conn, key: &str, group: &str) -> GroupView {
     for (_, owner, _) in &pending {
         *counts.entry(owner.clone()).or_default() += 1;
     }
+    // `XPENDING` shows an entry `XNACK` released with an empty owner, as
+    // Redis does, so those are told from a consumer named "" by asking for
+    // that consumer's own (#833).
+    let empty_named: Vec<String> = c
+        .ok(&["XPENDING", key, group, "-", "+", "1000000", ""])
+        .arr()
+        .iter()
+        .map(|r| r.arr()[0].str())
+        .collect();
+    let released = counts.get(&b""[..]).copied().unwrap_or(0) - empty_named.len() as i64;
     let owned_by = |name: &[u8]| -> Vec<String> {
+        if name.is_empty() {
+            return empty_named.clone();
+        }
         pending
             .iter()
             .filter(|(_, owner, _)| owner == name)
@@ -297,7 +310,20 @@ fn view(c: &mut Conn, key: &str, group: &str) -> GroupView {
         .iter()
         .map(|p| (p.arr()[0].bytes(), p.arr()[1].int()))
         .collect();
-    let want: Vec<(Vec<u8>, i64)> = counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let want: Vec<(Vec<u8>, i64)> = counts
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                if k.is_empty() {
+                    empty_named.len() as i64
+                } else {
+                    *v
+                },
+            )
+        })
+        .filter(|(_, v)| *v > 0)
+        .collect();
     assert_eq!(listed, want, "summary per consumer, by name");
 
     let consumers = c.ok(&["XINFO", "CONSUMERS", key, group]);
@@ -337,11 +363,7 @@ fn view(c: &mut Conn, key: &str, group: &str) -> GroupView {
         .expect("group in XINFO STREAM FULL")
         .clone();
     assert_eq!(g.field("pel-count").int(), pending.len() as i64);
-    assert_eq!(
-        g.field("nacked-count").int(),
-        counts.get(&b""[..]).copied().unwrap_or(0),
-        "released entries"
-    );
+    assert_eq!(g.field("nacked-count").int(), released, "released entries");
     for consumer in g.field("consumers").arr() {
         let name = consumer.field("name").bytes();
         let own = owned_by(&name);
@@ -1112,4 +1134,173 @@ fn a_history_read_sends_nothing_for_an_entry_gone_from_the_stream() {
     assert_eq!(occurrences(&aof, &claim("7001-0")), 2, "both deliveries");
     assert_eq!(occurrences(&aof, &claim("7002-0")), 1, "the first only");
     assert_eq!(occurrences(&aof, b"XACK"), 0);
+}
+
+/// What a group where a consumer named "" and `XNACK` both hold entries must
+/// answer (#833): entries 1-1 and 2-1 are the empty-named consumer's, 3-1
+/// and 4-1 were alice's and are released. Redis 8.10.2 gives each of these.
+fn the_empty_named_consumer_holds_two(c: &mut Conn, key: &str, what: &str, writable: bool) {
+    let ids = |reply: V| -> Vec<String> { reply.arr().iter().map(|r| r.arr()[0].str()).collect() };
+    let summary = c.ok(&["XPENDING", key, "g"]);
+    assert_eq!(summary.arr()[0].int(), 4, "{what}: pending");
+    let owners: Vec<(Vec<u8>, i64)> = summary.arr()[3]
+        .arr()
+        .iter()
+        .map(|p| (p.arr()[0].bytes(), p.arr()[1].int()))
+        .collect();
+    assert_eq!(owners, vec![(Vec::new(), 2)], "{what}: summary");
+    assert_eq!(
+        ids(c.ok(&["XPENDING", key, "g", "-", "+", "10", ""])),
+        ["1-1", "2-1"],
+        "{what}: XPENDING of the empty name"
+    );
+    assert!(
+        c.ok(&["XPENDING", key, "g", "-", "+", "10", "alice"])
+            .arr()
+            .is_empty(),
+        "{what}: alice owns none"
+    );
+    // The group's whole list still has all four, the released shown with
+    // no owner.
+    assert_eq!(
+        ids(c.ok(&["XPENDING", key, "g", "-", "+", "10"])),
+        ["1-1", "2-1", "3-1", "4-1"],
+        "{what}"
+    );
+    let consumers = c.ok(&["XINFO", "CONSUMERS", key, "g"]);
+    let pending: Vec<(Vec<u8>, i64)> = consumers
+        .arr()
+        .iter()
+        .map(|x| (x.field("name").bytes(), x.field("pending").int()))
+        .collect();
+    assert_eq!(
+        pending,
+        vec![(Vec::new(), 2), (b"alice".to_vec(), 0)],
+        "{what}: XINFO CONSUMERS"
+    );
+    // A history read of the empty name hands back its own two (a replica
+    // does not take a read that writes).
+    if writable {
+        let history = c.ok(&["XREADGROUP", "GROUP", "g", "", "STREAMS", key, "0"]);
+        let got: Vec<String> = history.arr()[0].arr()[1]
+            .arr()
+            .iter()
+            .map(|e| e.arr()[0].str())
+            .collect();
+        assert_eq!(got, ["1-1", "2-1"], "{what}: history of the empty name");
+    }
+    view(c, key, "g");
+}
+
+#[test]
+fn entries_xnack_released_are_not_the_empty_named_consumers() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    for ms in 1..=4 {
+        c.ok(&["XADD", "s", &format!("{ms}-1"), "f", "v"]);
+    }
+    c.ok(&["XGROUP", "CREATE", "s", "g", "0"]);
+    c.ok(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "",
+        "COUNT",
+        "2",
+        "STREAMS",
+        "s",
+        ">",
+    ]);
+    c.ok(&[
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "alice",
+        "COUNT",
+        "2",
+        "STREAMS",
+        "s",
+        ">",
+    ]);
+    assert_eq!(
+        c.ok(&["XNACK", "s", "g", "SILENT", "IDS", "2", "3-1", "4-1"]),
+        V::Int(2)
+    );
+    the_empty_named_consumer_holds_two(&mut c, "s", "master", true);
+
+    // DUMP and RESTORE.
+    let payload = c.ok(&["DUMP", "s"]).bytes();
+    c.ok(&[
+        b"RESTORE".to_vec(),
+        b"copy".to_vec(),
+        b"0".to_vec(),
+        payload,
+    ]);
+    the_empty_named_consumer_holds_two(&mut c, "copy", "RESTORE", true);
+
+    // A replica's full sync.
+    let rdir = tempfile::tempdir().unwrap();
+    let replica = Server::start(
+        rdir.path(),
+        &["--replicaof", "127.0.0.1", &server.port.to_string()],
+    );
+    let mut rc = replica.conn();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rc.cmd(&["EXISTS", "copy"]).int() != 1 {
+        assert!(Instant::now() < deadline, "the replica did not sync");
+        thread::sleep(Duration::from_millis(50));
+    }
+    the_empty_named_consumer_holds_two(&mut rc, "s", "replica full sync", false);
+
+    // The release a replica is sent as it happens.
+    for ms in 5..=6 {
+        c.ok(&["XADD", "s", &format!("{ms}-1"), "f", "v"]);
+    }
+    c.ok(&["XREADGROUP", "GROUP", "g", "bob", "STREAMS", "s", ">"]);
+    assert_eq!(
+        c.ok(&["XNACK", "s", "g", "FAIL", "IDS", "2", "5-1", "6-1"]),
+        V::Int(2)
+    );
+    c.ok(&["SET", "marker", "1"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rc.cmd(&["EXISTS", "marker"]).int() != 1 {
+        assert!(Instant::now() < deadline, "the replica did not catch up");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let want = view(&mut c, "s", "g");
+    assert_eq!(view(&mut rc, "s", "g"), want, "replica stream");
+    drop(rc);
+    replica.kill();
+
+    // The AOF, then a snapshot, after a restart each.
+    drop(c);
+    server.kill();
+    let server = Server::start(dir.path(), &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(view(&mut c, "s", "g"), want, "AOF");
+    the_empty_named_consumer_holds_two(&mut c, "copy", "AOF", true);
+    c.ok(&["SAVE"]);
+    drop(c);
+    server.kill();
+    std::fs::remove_file(dir.path().join("appendonly.aof")).ok();
+    let _ = std::fs::remove_dir_all(dir.path().join("appendonlydir"));
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    assert_eq!(view(&mut c, "s", "g"), want, "snapshot");
+    the_empty_named_consumer_holds_two(&mut c, "copy", "snapshot", true);
+
+    // Deleting the empty-named consumer takes its two and leaves what was
+    // released, which another consumer can still claim.
+    assert_eq!(c.ok(&["XGROUP", "DELCONSUMER", "copy", "g", ""]), V::Int(2));
+    let left: Vec<String> = c
+        .ok(&["XPENDING", "copy", "g", "-", "+", "10"])
+        .arr()
+        .iter()
+        .map(|r| r.arr()[0].str())
+        .collect();
+    assert_eq!(left, ["3-1", "4-1"]);
+    let claimed = c.ok(&["XCLAIM", "copy", "g", "bob", "0", "3-1", "JUSTID"]);
+    assert_eq!(claimed.arr()[0].str(), "3-1");
+    view(&mut c, "copy", "g");
 }

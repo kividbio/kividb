@@ -37,6 +37,16 @@ where numbers leave a script behave as Redis's do:
 - **A number returned from a script** is cut toward zero to an integer
   reply; one out of the integer range (`1e30`, `math.huge`) is
   `-9223372036854775808`, as Redis gives on x86-64.
+- **A vararg function has the implicit `arg` of Lua 5.1** (Redis builds its
+  Lua with `LUA_COMPAT_VARARG`): `function f(...) return #arg end` gives
+  the number of extra arguments, and `arg.n` is the count, nils included.
+  As in Lua 5.1, the function has `arg` only if its text says `arg`, it is
+  `nil` in a function whose body uses `...` itself, and in a function that is
+  not vararg (or the script's own body) there is no `arg`: the global is
+  refused. KiviDB adds it when the script is compiled, to the start of the
+  function, on the same line, so error line numbers do not move; a script
+  that does not say `arg` in a vararg function is compiled as it was written,
+  and nothing is added to what a call does. (Since 1.3.0.)
 - **`cjson.encode`** writes floats with 14 significant digits, and `10 / 2`
   as `5`; **`cmsgpack.pack`** writes a number with an integer value as an
   integer, and a float that a 32-bit float holds exactly as one.
@@ -55,7 +65,6 @@ What is still Lua 5.4, with the way to write it so that it works on both:
 | `string.format('%q', 1.5)` writes the float in hexadecimal (`0x1.8p+0`) | `"1.5"` | `string.format('%q', tostring(x))`, or `%s` |
 | `%05s`, `%#s` and `%+s` (flags other than `-` on `%s`) are errors | taken | leave the flag out |
 | `bit` returns unsigned 32-bit numbers (`bit.bnot(0)` is `4294967295`) and `bit.tohex` writes capitals | signed (`-1`), lower case | `bit.tobit(x)` on what you compare, `string.lower(bit.tohex(x))` |
-| A vararg function has no implicit `arg` table: `function f(...) return #arg end` fails with `nonexistent global variable 'arg'` (#820) | `arg` is the table of the extra arguments, with `n` (Lua 5.1 is built with `LUA_COMPAT_VARARG`) | `local arg = {...}`, or `select('#', ...)` for the count |
 
 Moving scripts to Lua 5.1 entirely, so that these go too, is tracked
 separately.

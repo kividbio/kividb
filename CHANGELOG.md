@@ -205,6 +205,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Active defrag's pass ends about twice as fast, at the same CPU cap
+  (#240, #291).** It slept after every batch of 128 buckets, and each sleep
+  overshot; it now sleeps once a millisecond of work is owed its rest, at
+  the same `active-defrag-cycle-max`, and between its holds hands a busy
+  shard to a waiting client. On Azure (5M keys, half deleted) a pass took
+  6 s instead of 13 s and gave memory back in 6 s instead of 12 s, with no
+  measurable change in `GET`/`SET` p99.9 during the pass.
+  Thanks @Parikalp-Bhardwaj.
+
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
   FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
@@ -335,6 +344,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as `d*` lists it. The name still cannot be changed: `CONFIG SET
   dbfilename` with another name is refused, as the same setting in the
   configuration file is.
+
+- **Entries `XNACK` released are no longer the entries of a consumer named
+  `""` (#833).** A released entry belongs to no consumer, but KiviDB kept
+  it under the empty name, so a real consumer named `""` was reported
+  as holding them: `XPENDING` with that consumer, `XINFO CONSUMERS`, the
+  `XPENDING` summary and a history read of it counted them, and `XGROUP
+  DELCONSUMER` deleted them. Released entries are now kept apart, as in
+  Redis 8.10.2. A snapshot keeps the two apart (a snapshot from an
+  earlier release still reads as it did, and tells them apart by the
+  delivery time `XNACK` gives), and an earlier release reads a new
+  snapshot as it read the old one. For that, `XCLAIM` for a consumer named
+  `""` with a `TIME` before 2004 (or an `IDLE` reaching back that far)
+  records that point in time instead.
+
 - **Under an `allkeys-*` policy a write is no longer refused with OOM while
   eviction is working (#520).** Two things refused one. Eviction stopped
   once it had evicted about 1 MB of keys with memory use no lower (the
@@ -398,6 +421,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FT.HYBRID` is unchanged (#779): Redis already answers it under
   `return-strict` with what was found.
 
+- **A vararg function in a script has Lua 5.1's implicit `arg` (#820).**
+  Redis builds its Lua with `LUA_COMPAT_VARARG`, so `function f(...)
+  for _, v in ipairs(arg) do ... end end` runs there; here it failed with
+  "Script attempted to access nonexistent global variable 'arg'" (older
+  scripts and sidekiq-unique-jobs' test fixtures use it). A vararg function
+  whose text says `arg` now starts with the local Lua 5.1 makes: the table
+  of its extra arguments with their count in `n`, or `nil` when its body
+  uses `...` itself, as in Redis. It is added once, when the script or
+  library is compiled, on the line of the function's parameters; a script
+  that does not say `arg` in a vararg function is compiled unchanged, and
+  no call does any more than it did.
 - **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
   scan whatever follows the cursor, and read their options as Redis does
   (#820).** `ZSCAN key 0 MATCH * COUNT 0` on a missing key answered `ERR

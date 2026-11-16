@@ -665,6 +665,7 @@ fn function_environment(lua: &Lua) -> LuaResult<(LuaTable, LuaTable, LuaTable)> 
 fn run_library_code(lua: &Lua, code: &str) -> LuaResult<()> {
     let (env, meta, loading) = function_environment(lua)?;
     meta.raw_set("__index", loading)?;
+    let code = &*super::lua_arg::with_implicit_arg(code);
     let result = table_errors(
         lua.load(code)
             .set_name("=library")
@@ -1310,6 +1311,7 @@ pub(crate) fn busy_reply() -> Vec<u8> {
 /// waited for. As `EVAL` runs it: an expression (`1 + 1`) is taken too.
 fn script_compiles(source: &str) -> Result<(), String> {
     let (body, _) = preprocess_eval_script(source).map_err(|e| format!("ERR {e}"))?;
+    let body = &*super::lua_arg::with_implicit_arg(body);
     let lua = Lua::new();
     if lua
         .load(format!("return {body}"))
@@ -4596,6 +4598,9 @@ fn compiled_script(lua: &Lua, source: &Arc<str>, body: &str) -> LuaResult<LuaFun
     {
         return Ok(function.clone());
     }
+    // The implicit `arg` of Lua 5.1's vararg functions, added to the text
+    // (here, once, and not at each call: the function is kept).
+    let body = &*super::lua_arg::with_implicit_arg(body);
     // As `eval` does: an expression if it is one (`1 + 1`), else a chunk.
     //
     // `=user_script` avoids mlua's default `[string "path/to/rust.rs:LINE"]` chunk labels.
