@@ -211,6 +211,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Active defrag's pass ends about twice as fast, at the same CPU cap
+  (#240, #291).** It slept after every batch of 128 buckets, and each sleep
+  overshot; it now sleeps once a millisecond of work is owed its rest, at
+  the same `active-defrag-cycle-max`, and between its holds hands a busy
+  shard to a waiting client. On Azure (5M keys, half deleted) a pass took
+  6 s instead of 13 s and gave memory back in 6 s instead of 12 s, with no
+  measurable change in `GET`/`SET` p99.9 during the pass.
+  Thanks @Parikalp-Bhardwaj.
+
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
   FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
@@ -335,6 +344,67 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   takes the id `+CONTINUE` announces and the place the stream is continued
   from, under the lock a promotion reads it in, and is dropped when the
   node had stopped being a replica before the reply arrived.
+
+- **`ASKING` before `MULTI` covers the whole transaction on a node
+  importing the slot (#698).** It was used up by the first queued command,
+  so the next one, or the `EXEC`, was answered `MOVED`, and a transaction
+  on a key moving in a reshard could not run. As in Redis, it now lasts
+  until `EXEC` or `DISCARD` ends the transaction, and covers every command
+  `EXEC` runs. An `EXEC` that is refused (wrong arguments, or denied by
+  ACL) ends the transaction too, so it clears it as well. `RESET` clears it,
+  as in Redis.
+
+- **Under an `allkeys-*` policy a write is no longer refused with OOM while
+  eviction is working (#520).** Two things refused one. Eviction stopped
+  once it had evicted about 1 MB of keys with memory use no lower (the
+  guard against evicting keys a snapshot still holds, #284), and with many
+  clients writing at once the other threads' writes kept memory use as high
+  while every key evicted was freed: the guard now asks what the evicting
+  thread itself gave back (what it freed, and what it counted as held by a
+  snapshot), and stops only when that is under a quarter of what it
+  evicted. And a write that found nothing left to evict while another
+  thread was still freeing a large collection it had evicted was refused.
+  Under an `allkeys-*` policy only, such a write is now let through when
+  the collections being freed at that moment (reckoned low: 32 bytes an
+  element) bring memory use under `maxmemory` by themselves; otherwise, and
+  under every `volatile-*` policy, it is refused as before. That lets
+  memory go over the limit by at most the bytes reckoned as being freed
+  and one command per thread, until the next write evicts the keys let in;
+  nothing waits. On a 4-vCPU VM (master and replica with
+  AOF, memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists,
+  sets and sorted sets, `maxmemory 512mb`, ~53M writes in ten minutes),
+  master refused 2 writes under `allkeys-lfu` and 3 under `allkeys-lru`,
+  the fix none; memory use was never over the limit by more than 0.23 MB
+  for 100 ms or longer (master: 0.18 MB). Keys that only a snapshot holds are
+  still not evicted for nothing. The soak is
+  `benchmarks/1.3.0/eviction-soak/soak.sh`.
+
+- **`SHUTDOWN` that goes ahead answers nothing, as Redis does, and one that
+  fails answers an error and keeps the server running (#429).** It
+  answered `+OK` and then closed the connection, so redis-py's
+  `shutdown()`, which takes any reply for a failure, raised "SHUTDOWN seems
+  to have failed" on every successful shutdown. The connection now stays
+  silent until the process exits, after the final save, and replies that
+  were owed before the `SHUTDOWN` (a pipelined `SET`) are sent first.
+  If the final save cannot be written, `SHUTDOWN` answers `-ERR Errors
+  trying to SHUTDOWN. Check logs.` and the server runs on: the shutdown's
+  own pause is lifted, and a pause in force before it (`CLIENT PAUSE`, a
+  failover's or a slot migration's hold of writes) stays. `SHUTDOWN FORCE`,
+  and a signal, still end the process with status 1. `SHUTDOWN ABORT`
+  cancels a shutdown that is waiting for lagging replicas, and answers
+  `-ERR No shutdown in progress.` when there is none, where it answered
+  `+OK`; a signal that came meanwhile still shuts the server down
+  afterwards, with its final save. `SHUTDOWN NOSAVE` now waits for lagging
+  replicas too, as in Redis, for at most `shutdown-timeout` (`NOW` skips
+  the wait), and writes and syncs the AOF before the process exits. While a
+  script has run past `lua-time-limit`, `SHUTDOWN NOSAVE` still ends the
+  process without waiting for the script, and a `SHUTDOWN` that would save
+  is answered `BUSY`, as in Redis, where it waited for the script for ever.
+  An unknown or conflicting modifier is `-ERR syntax error`, as in Redis.
+  Two differences from Redis remain: every client,
+  readers included, is paused while the shutdown waits for the replicas,
+  where Redis pauses writes only, and a SIGTERM whose final save fails
+  ends the process with status 1, where Redis keeps running.
 
 - **`ON_TIMEOUT return-strict` is accepted and `FT.SEARCH` / `FT.AGGREGATE`
   reply with what was found, as Redis does (#781).** Redis spells the

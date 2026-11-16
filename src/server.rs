@@ -152,6 +152,8 @@ fn needs_slow_path(cmd0: &[u8]) -> bool {
         || ascii_eq_ignore_case(cmd0, b"WAITAOF")
         || ascii_eq_ignore_case(cmd0, b"WAIT")
         || ascii_eq_ignore_case(cmd0, b"MONITOR")
+        // Answered with nothing when it goes ahead: see `shutdown`.
+        || ascii_eq_ignore_case(cmd0, b"SHUTDOWN")
 }
 
 /// Await a parked blocking command.
@@ -768,9 +770,13 @@ where
     let mut carried: Vec<u8> = Vec::new();
     let mut interrupted = crate::commands::blocking::Interrupted::default();
 
+    // After a `SHUTDOWN` that failed: what follows it in the buffer is read
+    // before anything more is, and was not answered before it.
+    let mut reparse = false;
     loop {
         let was_private_at_read = private_query_buffer;
-        if carried.is_empty() {
+        let skip_read = std::mem::take(&mut reparse);
+        if carried.is_empty() && !skip_read {
             // Redis reclaims private query buffers from its client cron, and the
             // maintenance step below is the equivalent. It can only do anything
             // when the buffer is private and has spare capacity to reclaim, so
@@ -880,6 +886,9 @@ where
         let commands_before = activity.commands_run();
         let mut connection_handoff: Option<ConnectionHandoff> = None;
         let mut quit_requested = false;
+        // A `SHUTDOWN` that went ahead: the shutdowns that had failed before
+        // it, and whether its reply is not wanted.
+        let mut shutdown_wait: Option<(u64, bool)> = None;
         // Outside the parse loop: a park in one turn hands its delivery to the
         // re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
@@ -1390,6 +1399,13 @@ where
                         },
                         refusal,
                     );
+                    if cmd_name == "EXEC" {
+                        crate::cluster::routing::transaction_ended(
+                            &cluster_state,
+                            &client_registry,
+                            client_id,
+                        );
+                    }
                     combined.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
@@ -1502,6 +1518,13 @@ where
                     },
                     wrong,
                 );
+                if cmd_name == "EXEC" {
+                    crate::cluster::routing::transaction_ended(
+                        &cluster_state,
+                        &client_registry,
+                        client_id,
+                    );
+                }
                 combined.extend_from_slice(&reply);
                 parse_offset += consumed;
                 continue;
@@ -1632,6 +1655,7 @@ where
                         info.tracking_prefixes.clear();
                         info.tracking_redirect = None;
                         info.tracking_redirect_broken = false;
+                        info.asking = false;
                         info.flags = "N".to_string();
                         info.user = "default".to_string();
                     });
@@ -2597,6 +2621,14 @@ where
                 redispatch = true;
                 continue;
             }
+            // `SHUTDOWN` that goes ahead is answered with nothing, and the
+            // commands after it are not run: the batch ends here, its
+            // replies are sent, and the connection waits (below).
+            if let Some(failed_before) = crate::shutdown::take_requested() {
+                shutdown_wait = Some((failed_before, reply_gate.drops_reply()));
+                parse_offset += consumed;
+                break;
+            }
             // The other commands answered here, and not by `execute_command`,
             // are counted as well (`HELLO` counts itself, as it replies in
             // several places).
@@ -2629,6 +2661,13 @@ where
                     &[word.as_slice()],
                     &response,
                     std::time::Duration::ZERO,
+                );
+            }
+            if matches!(cmd_name.as_str(), "EXEC" | "DISCARD") {
+                crate::cluster::routing::transaction_ended(
+                    &cluster_state,
+                    &client_registry,
+                    client_id,
                 );
             }
             combined.extend_from_slice(&response);
@@ -2749,6 +2788,22 @@ where
         // QUIT: the +OK is on the wire now, so drop the connection.
         if quit_requested {
             break;
+        }
+
+        // SHUTDOWN: what came before it is on the wire now. The connection
+        // stays open, and silent, until the process exits after its final
+        // save; if the shutdown fails or is aborted instead, that is the
+        // reply, and what was pipelined after it is read next.
+        if let Some((failed_before, silent)) = shutdown_wait {
+            // Boxed: a cold wait, kept out of the connection future.
+            Box::pin(crate::shutdown::failed_after(failed_before)).await;
+            if !silent {
+                combined.extend_from_slice(&crate::resp::write::resp_error(
+                    crate::shutdown::FAILED_REPLY,
+                ));
+            }
+            reparse = true;
+            continue;
         }
 
         match connection_handoff {

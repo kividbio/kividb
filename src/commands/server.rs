@@ -6494,70 +6494,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             Some(resp_simple("Background append only file rewriting started"))
         }
 
-        "SHUTDOWN" => {
-            // SHUTDOWN [NOSAVE | SAVE | NOW | FORCE | ABORT]
-            //
-            // We cannot write the snapshot here — execute_command is a plain fn
-            // with no async executor.  Instead we set two global atomics and
-            // return +OK.  The signal-watching thread in main.rs reads the flag
-            // and drives the real shutdown sequence (snapshot + process::exit).
-            //
-            // ABORT clears the pending flag and returns OK immediately so the
-            // caller knows the in-progress shutdown was cancelled.
-
-            use crate::shutdown::{SHUTDOWN_MODE, SHUTDOWN_PENDING, mode};
-            use std::sync::atomic::Ordering::Relaxed;
-
-            let modifier = ctx
-                .cmd
-                .get(1)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .map(|s| s.to_ascii_uppercase());
-
-            match modifier.as_deref() {
-                // SHUTDOWN ABORT — cancel a pending shutdown.
-                Some("ABORT") => {
-                    SHUTDOWN_PENDING.store(false, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN NOSAVE — exit without writing snapshot.
-                Some("NOSAVE") => {
-                    SHUTDOWN_MODE.store(mode::NOSAVE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    // Return OK before the process exits; the signal thread will
-                    // call process::exit shortly after, so the client may or may
-                    // not receive this response — that is Redis-compatible behaviour.
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN NOW — skip AOF flush wait, write snapshot immediately.
-                Some("NOW") => {
-                    SHUTDOWN_MODE.store(mode::NOW, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN FORCE — ignore replica/AOF checks.
-                Some("FORCE") => {
-                    SHUTDOWN_MODE.store(mode::FORCE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN / SHUTDOWN SAVE — default: write snapshot then exit.
-                None | Some("SAVE") => {
-                    SHUTDOWN_MODE.store(mode::SAVE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // Unknown modifier — match Redis's exact error.
-                Some(other) => Some(resp_error(&format!(
-                    "ERR SHUTDOWN requires NOSAVE, SAVE, NOW, FORCE, or ABORT, not '{other}'"
-                ))),
-            }
-        }
+        "SHUTDOWN" => Some(shutdown_command(&ctx.cmd)),
 
         // ── Tier 3 rejections — Lua / Functions / Modules ───────────────────
         //
@@ -6679,6 +6616,62 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 pub(crate) fn all_commands_for_test() -> &'static [&'static str] {
     ALL_COMMANDS
+}
+
+/// `SHUTDOWN [NOSAVE | SAVE] [NOW] [FORCE] | SHUTDOWN ABORT`
+///
+/// As in Redis, a shutdown that goes ahead is answered with nothing: the
+/// connection closes when the process exits, after the final save. We cannot
+/// write the snapshot here, and the connection must not be answered before it
+/// is known to have succeeded, so the handler only validates and asks for the
+/// shutdown (`shutdown::request`), and returns no reply. The connection loop
+/// flushes the replies that came before and waits for the signal-watching
+/// thread in main.rs, which drives the real sequence (`shutdown::Final`) and
+/// ends the process. A shutdown that fails or is aborted is answered with an
+/// error (`shutdown::FAILED_REPLY`) and the server runs on.
+///
+/// Out of line, so that the command dispatch is the same size as it was.
+#[cold]
+#[inline(never)]
+fn shutdown_command(cmd: &[&[u8]]) -> Vec<u8> {
+    use crate::shutdown::{self, mode};
+
+    let (mut nosave, mut save, mut now, mut force, mut abort) = (false, false, false, false, false);
+    for arg in cmd.iter().skip(1) {
+        if arg.eq_ignore_ascii_case(b"NOSAVE") {
+            nosave = true;
+        } else if arg.eq_ignore_ascii_case(b"SAVE") {
+            save = true;
+        } else if arg.eq_ignore_ascii_case(b"NOW") {
+            now = true;
+        } else if arg.eq_ignore_ascii_case(b"FORCE") {
+            force = true;
+        } else if arg.eq_ignore_ascii_case(b"ABORT") {
+            abort = true;
+        } else {
+            return resp_error("ERR syntax error");
+        }
+    }
+    if (nosave && save) || (abort && (nosave || save || now || force)) {
+        return resp_error("ERR syntax error");
+    }
+    if abort {
+        return if shutdown::abort() {
+            resp_simple("OK")
+        } else {
+            resp_error(shutdown::NO_SHUTDOWN_IN_PROGRESS)
+        };
+    }
+    // As in Redis: while a script runs past its time limit, only a shutdown
+    // that saves nothing may stop it. A save would wait for the script.
+    #[cfg(feature = "lua")]
+    if !nosave && shutdown::script_busy() {
+        return crate::commands::script_busy_reply();
+    }
+    let m = if nosave { mode::NOSAVE } else { mode::SAVE } | if now { mode::NOW } else { 0 };
+    shutdown::request(m, force);
+    // No reply: see above.
+    Vec::new()
 }
 
 pub fn acl_cat_commands_pub(category: &str) -> Vec<&'static str> {

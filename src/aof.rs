@@ -1780,6 +1780,14 @@ fn sync_before_reply(file: &std::fs::File) {
     }
 }
 
+/// Shutdown, with no snapshot to carry the writes (`SHUTDOWN NOSAVE`, or a
+/// final save that failed): the AOF is all the process leaves of them, so
+/// what is queued is written and the file synced before the process exits,
+/// as Redis flushes and syncs its AOF. Nothing with the AOF off.
+pub fn sync_for_shutdown() {
+    do_fsync();
+}
+
 /// Write what is queued and sync the file — on a handle of its own, outside
 /// the lock, so that connections writing their records do not wait out the
 /// disk.
@@ -3917,7 +3925,13 @@ fn failpoint_named(name: &str) -> bool {
 
 /// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
 /// [`failpoint`] is: whether it is to fail.
-fn injected_failure(name: &str) -> bool {
+pub(crate) fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// A fault a test injects, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to be.
+pub(crate) fn injected(name: &str) -> bool {
     failpoint_named(name)
 }
 

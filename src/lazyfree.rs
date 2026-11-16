@@ -37,6 +37,10 @@ fn worker() -> &'static Sender<Job> {
             .name("kividb-lazyfree".into())
             .spawn(move || {
                 for (what, objects) in rx {
+                    if crate::aof::injected("lazyfree-slowly") {
+                        // For a test: frees that fall behind.
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
                     drop(what);
                     done(objects);
                 }

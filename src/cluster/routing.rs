@@ -131,14 +131,24 @@ impl Caller<'_> {
         )
     }
 
-    /// The client's ASKING flag, cleared: it covers one command.
-    fn take_asking(&self) -> bool {
-        let asking = self.registry.get_asking(self.client_id);
-        if asking {
-            self.registry
-                .update(self.client_id, |info| info.asking = false);
-        }
-        asking
+    /// The client's ASKING flag. Inside a transaction it is kept until the
+    /// transaction ends ([`transaction_ended`]): it covers every command
+    /// queued after it and their `EXEC`, as in Redis (#698).
+    fn asking(&self) -> bool {
+        self.registry.get_asking(self.client_id)
+    }
+}
+
+/// `EXEC` or `DISCARD` ended the transaction, whatever came of it: the
+/// ASKING sent before it is used up, as Redis's `resetClient` clears it once
+/// the client is out of `MULTI`.
+pub fn transaction_ended(
+    cluster: &crate::cluster::ClusterState,
+    registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+) {
+    if cluster.enabled && registry.get_asking(client_id) {
+        registry.update(client_id, |info| info.asking = false);
     }
 }
 
@@ -152,7 +162,7 @@ pub fn queue_refusal(caller: &Caller, cmd: &[&[u8]]) -> Option<Vec<u8>> {
     if !caller.cluster.enabled || cmd.is_empty() {
         return None;
     }
-    let asking = caller.take_asking();
+    let asking = caller.asking();
     caller.route(cmd, asking).refusal()
 }
 
@@ -173,7 +183,7 @@ pub fn exec_refusal(
     if !caller.cluster.enabled {
         return None;
     }
-    let asking = caller.take_asking();
+    let asking = caller.asking();
     *routed = Routed::now(asking);
     if let Some(refusal) = route_queue(caller, queue, asking) {
         return Some(refusal);
