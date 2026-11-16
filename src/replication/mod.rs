@@ -3613,6 +3613,11 @@ pub struct FinalSaveHold<'a> {
 pub fn hold_for_final_save(state: &ReplState) -> std::io::Result<FinalSaveHold<'_>> {
     use std::time::{Duration, Instant};
     loop {
+        // `SHUTDOWN ABORT` ends the wait for a command that keeps the gate
+        // (a script that does not end): the caller then undoes the shutdown.
+        if crate::shutdown::abort_requested() {
+            return Err(std::io::Error::other("SHUTDOWN ABORT"));
+        }
         let turn = crate::aof::checkpoint_turn()?;
         let deadline = Instant::now() + Duration::from_millis(50);
         if let Some(alone) =

@@ -339,7 +339,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   script has run past `lua-time-limit`, `SHUTDOWN NOSAVE` still ends the
   process without waiting for the script, and a `SHUTDOWN` that would save
   is answered `BUSY`, as in Redis, where it waited for the script for ever.
-  An unknown or conflicting modifier is `-ERR syntax error`, as in Redis. Two differences from Redis remain: every client,
+  An unknown or conflicting modifier is `-ERR syntax error`, as in Redis.
+  Two differences from Redis remain: every client,
   readers included, is paused while the shutdown waits for the replicas,
   where Redis pauses writes only, and a SIGTERM whose final save fails
   ends the process with status 1, where Redis keeps running.

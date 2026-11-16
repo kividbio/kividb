@@ -183,9 +183,9 @@ pub fn set_pause_undoable(duration_ms: i64, write_only: bool) -> Undo {
 
 /// Take back the pause of [`set_pause_undoable`]: back to the pause that was
 /// in force before it, or to none. Only that pause: one ended since (by
-/// `CLIENT UNPAUSE`) stays ended, and the hold of a handoff set since stays
-/// until its own end lifts it, a hold of writers alone for ever after,
-/// as `hold_writes` holds them.
+/// `CLIENT UNPAUSE`) stays ended, and the hold of a handoff or a
+/// `CLIENT PAUSE` set since stays until `clear_pause` lifts it, a hold of
+/// writers alone, as `hold_writes` holds them.
 pub fn undo_pause(undo: Undo) {
     let _flag = FLAG_LOCK.lock();
     if PAUSE_UNTIL_MS.load(Ordering::SeqCst) <= 0 {
@@ -193,10 +193,12 @@ pub fn undo_pause(undo: Undo) {
         return;
     }
     let set_since = PAUSE_GENERATION.load(Ordering::SeqCst) != undo.generation;
-    if set_since && HANDOFF.load(Ordering::SeqCst) & HANDOFF_PAUSE != 0 {
-        // A handoff paused writes meanwhile, merged into ours: its pause has
-        // no end of its own, and its `clear_pause` ends it. Only the readers
-        // ours held go on.
+    if set_since {
+        // A handoff or a `CLIENT PAUSE` paused writes meanwhile, merged into
+        // ours. Whoever set it was told the writes are held, so they stay
+        // held: until the handoff's `clear_pause`, or `CLIENT UNPAUSE` (a
+        // `CLIENT PAUSE` set meanwhile no longer ends at its own time). Only
+        // the readers ours held go on.
         PAUSE_GENERATION.fetch_add(1, Ordering::SeqCst);
         let write_only = undo.before.is_none_or(|(_, was_write_only)| was_write_only);
         PAUSE_MODE_WRITE_ONLY.store(write_only, Ordering::Relaxed);
@@ -1161,6 +1163,15 @@ mod tests {
         undo_pause(undo);
         assert!(handoff() && holds(set, none) && !holds(get, none));
         clear_pause();
+
+        // A CLIENT PAUSE set meanwhile: its client was told the writes are
+        // held, and they are, until CLIENT UNPAUSE.
+        let undo = set_pause_undoable(LONG, false);
+        pause_clients(60_000, true).unwrap();
+        undo_pause(undo);
+        assert!(holds(set, none) && !holds(get, none));
+        clear_pause();
+        assert_eq!(active(), None);
 
         // Ended meanwhile (CLIENT UNPAUSE): it stays ended.
         let undo = set_pause_undoable(LONG, false);
