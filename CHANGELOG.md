@@ -336,6 +336,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ACL) ends the transaction too, so it clears it as well. `RESET` clears it,
   as in Redis.
 
+- **`CONFIG GET dbfilename` answers with the snapshot file's name (#846).**
+  It answered nothing, so a tool that takes a snapshot over the protocol
+  (`SAVE`, then `CONFIG GET dir` and `CONFIG GET dbfilename`) could not find
+  the file. It now answers `dump.kdb`, the file the server writes and loads
+  whatever `--dbfilename` or the configuration file said, and a pattern such
+  as `d*` lists it. The name still cannot be changed: `CONFIG SET
+  dbfilename` with another name is refused, as the same setting in the
+  configuration file is.
+
 - **Entries `XNACK` released are no longer the entries of a consumer named
   `""` (#833).** A released entry belongs to no consumer, but KiviDB kept
   it under the empty name, so a real consumer named `""` was reported

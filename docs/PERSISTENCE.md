@@ -19,7 +19,7 @@ top of it.
 | `appendonly yes` / `--aof` | Turns the AOF on. `CONFIG SET appendonly yes` works at runtime (see below). |
 | `appendfsync` / `--appendfsync` | `everysec` (the default): the AOF is synced to disk once a second. `always`: each write is synced before it is acknowledged, as in Redis (see below). `no` is taken as `everysec`, with a warning. `CONFIG SET appendfsync` works at runtime. |
 | `save <points>` | Accepted with a warning that it has no effect: KiviDB does not snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
-| `dbfilename` | Always `dump.kdb` (`dump.rdb` is accepted). Any other name is refused. |
+| `dbfilename` | Always `dump.kdb` (`dump.rdb` is accepted). Any other name is refused. `CONFIG GET dbfilename` answers `dump.kdb`, and `CONFIG GET dir` the directory it is in, so a tool that runs `SAVE` finds the file. |
 | `appendfilename` | Always `appendonly.aof`. Any other name is refused. |
 | `auto-aof-rewrite-percentage`, `auto-aof-rewrite-min-size` | When the AOF has grown by this percentage (default 100) over its size after the last checkpoint, and is at least this size (default 64 MB), a checkpoint runs. Checked every 10 seconds. `0` turns it off. Both can be changed with `CONFIG SET`. |
 | `hll-write-format` | `legacy` (the default) or `redis`. New HyperLogLog values use that format; existing values keep theirs. Per server, set in the config file or with `CONFIG SET`, and written by `CONFIG REWRITE`. See below before switching. |
