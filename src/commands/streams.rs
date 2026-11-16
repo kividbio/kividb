@@ -2527,6 +2527,14 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
             let now = now_ms();
             // TIME is an absolute delivery time; IDLE is relative to now.
             let delivered_at = time.unwrap_or_else(|| now.saturating_sub(idle.unwrap_or(0)));
+            // A consumer named "" is never given a delivery time below
+            // `XNACK`'s mark, which a snapshot reads as released (#833):
+            // here, so that every copy of the dataset holds the same time.
+            let delivered_at = if new_consumer.as_bytes().is_empty() {
+                delivered_at.max(stream_extra::NACKED_BELOW)
+            } else {
+                delivered_at
+            };
 
             let Some(g) = groups.get_mut(&group) else {
                 return resp_error_bytes(

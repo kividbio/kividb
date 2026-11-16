@@ -453,7 +453,13 @@ fn write_stream_groups(w: &mut impl Write, inner: &StreamInner) -> io::Result<()
                 Some(c) if c.as_bytes().is_empty() => pel
                     .delivered_at
                     .max(crate::commands::stream_extra::NACKED_BELOW),
-                _ => pel.delivered_at,
+                // A released entry with a later time (one a Redis RDB left
+                // with no consumer) is written below the mark, so that it
+                // reads back released and not as the empty name's.
+                None => pel
+                    .delivered_at
+                    .min(crate::commands::stream_extra::NACKED_BELOW - 1),
+                Some(_) => pel.delivered_at,
             };
             write_bytes(w, pel.shown_consumer())?;
             w.write_all(&delivered_at.to_le_bytes())?;

@@ -336,7 +336,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Redis 8.10.2. A snapshot keeps the two apart (a snapshot from an
   earlier release still reads as it did, and tells them apart by the
   delivery time `XNACK` gives), and an earlier release reads a new
-  snapshot as it read the old one.
+  snapshot as it read the old one. For that, `XCLAIM` for a consumer named
+  `""` with a `TIME` before 2004 (or an `IDLE` reaching back that far)
+  records that point in time instead.
+
 - **Under an `allkeys-*` policy a write is no longer refused with OOM while
   eviction is working (#520).** Two things refused one. Eviction stopped
   once it had evicted about 1 MB of keys with memory use no lower (the
