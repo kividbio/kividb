@@ -1803,10 +1803,9 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     let limit = c.limit_to(4 * MB);
     let mut builder = server.conn();
     // Lists are built until something has been refused: the background
-    // frees take 200 ms each, and what must pile up is a few lists waiting
-    // for them. On a loaded machine the builder is slower than that, and 30
-    // lists were over before the queue had grown (nothing refused, and
-    // nothing the server did wrong).
+    // frees are held (`lazyfree-held`), so every unlinked list waits to be
+    // freed and stays counted. A fixed number of lists against frees that
+    // were only slow depended on the builder outrunning them.
     let refusal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = std::sync::Arc::clone(&refusal_seen);
     let built = std::thread::spawn(move || {

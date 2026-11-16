@@ -813,7 +813,7 @@ fn shutdown_abort_ends_the_wait_for_a_lagging_replica() {
                 "the replica did not attach"
             );
         }
-        unsafe { libc::kill(replica2.child.id() as libc::pid_t, libc::SIGSTOP) };
+        replica2.stop();
         conn.write_all(&encode(&["SET", "lag", "1"])).unwrap();
         assert_eq!(read_len(&mut conn, 5, Duration::from_secs(10)), b"+OK\r\n");
         let mut asker = master.raw();
@@ -962,8 +962,13 @@ impl Srv {
         let tasks = format!("/proc/{}/task", self.child.id());
         let start = Instant::now();
         loop {
-            let running: Vec<String> = std::fs::read_dir(&tasks)
-                .unwrap()
+            // Where there is no /proc to ask (not Linux), a moment is given
+            // for the signal to take.
+            let Ok(listed) = std::fs::read_dir(&tasks) else {
+                thread::sleep(Duration::from_millis(200));
+                return;
+            };
+            let running: Vec<String> = listed
                 .filter_map(Result::ok)
                 .filter_map(|task| std::fs::read_to_string(task.path().join("stat")).ok())
                 // `pid (comm) S ...`: the state follows the last `)`.
