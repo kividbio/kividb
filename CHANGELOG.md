@@ -339,7 +339,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shown, 0 for a released entry. A 1.2.2 node and a new one compute a
   different digest for a dataset with released entries, so a replica of
   one kind of a master of the other that comes back after the master was
-  killed takes a full sync, (two 1.2.2 nodes already did; it costs a sync,
+  killed takes a full sync (two 1.2.2 nodes already did; it costs a sync,
   not data); the stream, a clean restart and a full sync work as before.
 
 - **`ASKING` before `MULTI` covers the whole transaction on a node
