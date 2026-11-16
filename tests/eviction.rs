@@ -1611,6 +1611,24 @@ impl Conn {
     fn counted(&mut self) -> i64 {
         self.used_memory() - self.not_counted()
     }
+
+    /// [`Conn::counted`] less what the clients' buffers hold
+    /// (`mem_clients_normal`), read at one moment: what writes let in
+    /// added, not the writes on their way in.
+    fn counted_less_clients(&mut self) -> i64 {
+        let reply = self.cmd(&["INFO", "memory"]);
+        let field = |name: &str| -> i64 {
+            reply
+                .s()
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("no {name} in INFO memory"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        field("used_memory") - field("mem_not_counted_for_evict") - field("mem_clients_normal")
+    }
 }
 
 /// Connections made and served before a test holds a thread of the server:
@@ -1717,7 +1735,7 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
         assert!(c.cmd(&["SET", &format!("user:{i}"), &value]).ok());
     }
     let conns = ready_conns(&server, 10);
-    let before = c.counted();
+    let before = c.counted_less_clients();
     let limit = c.used_memory() - 2 * MB;
     let lowered = lower_limit(&server, &mut c, limit);
     let writes: Vec<_> = conns
@@ -1745,7 +1763,7 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
         .collect();
     let mut peak = 0;
     while writes.iter().any(|w| !w.is_finished()) {
-        peak = peak.max(c.counted());
+        peak = peak.max(c.counted_less_clients());
         std::thread::sleep(Duration::from_millis(5));
     }
     let refused: i32 = writes.into_iter().map(|w| w.join().unwrap()).sum();
@@ -1753,8 +1771,10 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
     // Those that came while the list was still being freed, at least: what
     // came after it was freed found room.
     assert!(refused > 0, "no write was refused");
-    // Not a key without a time to live let in over the limit: memory use
-    // no higher than before the writes, and a write's worth.
+    // Not a key without a time to live let in over the limit: memory use,
+    // less the writes on their way in (ten of 8 KB at once, now that they
+    // all come while the list is being freed), no higher than before the
+    // writes, and a write's worth.
     assert!(
         peak <= before + 64 * KB,
         "{peak} counted at most, {before} before the writes"
