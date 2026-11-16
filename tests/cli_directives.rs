@@ -176,10 +176,10 @@ fn the_directives_of_the_issue() {
     );
     assert_eq!(server.config(None, "appendonly"), "no");
     assert_eq!(server.config(None, "appendfsync"), "everysec");
-    // `dbfilename` is accepted (the snapshot is always dump.kdb) and not reported.
+    // `dbfilename` is accepted, and reported as dump.kdb, which the snapshot always is.
     assert_eq!(server.config(None, "timeout"), "0");
     assert_eq!(server.config(None, "tcp-keepalive"), "300");
-    // `io-threads` is accepted and, like `dbfilename`, not reported by CONFIG GET.
+    // `io-threads` is accepted and not reported by CONFIG GET.
     assert_eq!(server.config(None, "protected-mode"), "no");
     assert_eq!(server.config(None, "databases"), "4");
     assert_eq!(server.config(None, "loglevel"), "warning");
