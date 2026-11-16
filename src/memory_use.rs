@@ -265,11 +265,68 @@ impl NotCounted {
         not_counted_add(bytes);
         self.0 += bytes;
     }
+
+    /// What is counted.
+    pub fn bytes(&self) -> usize {
+        self.0
+    }
+
+    /// `bytes` fewer: what was laid out has been freed.
+    pub fn release(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.0);
+        counted_again(bytes);
+        self.0 -= bytes;
+    }
+
+    /// Exactly `bytes` in all, whatever it was: for a buffer that grows.
+    pub fn set(&mut self, bytes: usize) {
+        if bytes >= self.0 {
+            self.add(bytes - self.0);
+        } else {
+            self.release(self.0 - bytes);
+        }
+    }
+
+    /// What `other` counts, taken over without a change in what is not
+    /// counted: `other` is gone, and its bytes are this one's to give back.
+    pub fn absorb(&mut self, mut other: NotCounted) {
+        self.0 += std::mem::take(&mut other.0);
+    }
 }
 
 impl Drop for NotCounted {
     fn drop(&mut self) {
         counted_again(self.0);
+    }
+}
+
+#[cfg(test)]
+mod not_counted_tests {
+    use super::NotCounted;
+
+    #[test]
+    fn a_count_that_grows_and_shrinks_is_what_it_was_last_set_to() {
+        let mut count = NotCounted::default();
+        count.set(100);
+        assert_eq!(count.bytes(), 100);
+        count.set(40);
+        assert_eq!(count.bytes(), 40);
+        count.add(10);
+        count.release(5);
+        assert_eq!(count.bytes(), 45);
+        // More than there is: all of it, and no more.
+        count.release(1000);
+        assert_eq!(count.bytes(), 0);
+    }
+
+    #[test]
+    fn a_count_taken_over_leaves_the_other_with_nothing() {
+        let mut one = NotCounted::default();
+        let mut other = NotCounted::default();
+        one.set(30);
+        other.set(12);
+        one.absorb(other);
+        assert_eq!(one.bytes(), 42);
     }
 }
 

@@ -5087,21 +5087,80 @@ pub struct FrozenDataset {
     score_section: Vec<u8>,
     /// What all of the above takes, which is no key's and which deleting
     /// keys does not give back: not counted against `maxmemory` while the
-    /// capture lives (#284). Its holds on strings are counted as the table
-    /// lets go of them (`store::entry`).
-    _not_counted: crate::memory_use::NotCounted,
+    /// capture lives (#284). Counted as it is laid out, not at the end
+    /// (#848), and given back as it is freed. Its holds on strings are
+    /// counted as the table lets go of them (`store::entry`).
+    not_counted: crate::memory_use::NotCounted,
+}
+
+/// A buffer the capture lays values out in, which counts what it holds as
+/// not to be evicted for as it grows, not when it is done (#848): a list
+/// of a gigabyte is a gigabyte in `used_memory` from the first element
+/// encoded, and `used_memory - mem_not_counted_for_evict` was read high by
+/// that much for as long as the capture took.
+#[derive(Default)]
+struct CapturedBuf {
+    buf: Vec<u8>,
+    counted: crate::memory_use::NotCounted,
+}
+
+impl CapturedBuf {
+    #[inline]
+    fn track(&mut self) {
+        let capacity = self.buf.capacity();
+        if capacity != self.counted.bytes() {
+            self.counted.set(capacity);
+        }
+    }
+
+    /// The bytes, and the count of them: the buffer is theirs now.
+    fn finish(self) -> (Vec<u8>, crate::memory_use::NotCounted) {
+        (self.buf, self.counted)
+    }
+}
+
+impl Write for CapturedBuf {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write_all(data)?;
+        Ok(data.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.buf.extend_from_slice(data);
+        self.track();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// What one thread of the capture took: a hold on each string's entry
 /// (its key, bytes and time to live, which do not change while held),
 /// everything else laid out but the probabilistic values, copies of those
-/// (see [`FrozenDb::sketches`]), and the times to live of everything else.
-type FrozenPart = (
-    Vec<store::EntryRef>,
-    Vec<u8>,
-    Vec<(Key, crate::sketch::Sketch)>,
-    Vec<(Key, u64)>,
-);
+/// (see [`FrozenDb::sketches`]), and the times to live of everything else;
+/// and the count of what those take, which is not to be evicted for.
+struct FrozenPart {
+    strings: Vec<store::EntryRef>,
+    encoded: Vec<u8>,
+    sketches: Vec<(Key, crate::sketch::Sketch)>,
+    timed: Vec<(Key, u64)>,
+    counted: crate::memory_use::NotCounted,
+}
+
+/// What the held entries, copies and times to live of a part take, as the
+/// vectors that hold them.
+fn part_bytes(
+    strings: &Vec<store::EntryRef>,
+    sketches: &Vec<(Key, crate::sketch::Sketch)>,
+    timed: &Vec<(Key, u64)>,
+) -> usize {
+    strings.capacity() * std::mem::size_of::<store::EntryRef>()
+        + sketches.capacity() * std::mem::size_of::<(Key, crate::sketch::Sketch)>()
+        + timed.capacity() * std::mem::size_of::<(Key, u64)>()
+}
 
 #[derive(Default)]
 struct FrozenDb {
@@ -5117,18 +5176,6 @@ struct FrozenDb {
     /// The non-string keys with a time to live, and when it ends (Unix
     /// milliseconds), likewise.
     timed: Vec<Vec<(Key, u64)>>,
-}
-
-impl FrozenDb {
-    /// What the capture of the database takes besides the entries it holds.
-    fn own_bytes(&self) -> usize {
-        let held = self.strings.iter().map(Vec::capacity).sum::<usize>()
-            * std::mem::size_of::<store::EntryRef>();
-        let encoded = self.encoded.iter().map(Vec::capacity).sum::<usize>();
-        let timed =
-            self.timed.iter().map(Vec::capacity).sum::<usize>() * std::mem::size_of::<(Key, u64)>();
-        held + encoded + timed
-    }
 }
 
 /// Capture the dataset. The caller is expected to hold the write gate
@@ -5164,6 +5211,8 @@ fn freeze(
         .unwrap_or(1)
         .clamp(1, 8);
     let mut dbs = Vec::with_capacity(store.len());
+    // What the capture lays out, counted as each thread makes it (#848).
+    let mut not_counted = crate::memory_use::NotCounted::default();
     for db in store.iter() {
         let shards: Vec<_> = db.iter().collect();
         let keys: usize = shards.iter().map(|shard| read_lock!(shard).len()).sum();
@@ -5178,12 +5227,16 @@ fn freeze(
                 .map(|run| {
                     scope.spawn(move || {
                         let mut strings = Vec::new();
-                        let mut encoded = Vec::new();
+                        let mut encoded = CapturedBuf::default();
                         let mut sketches = Vec::new();
                         let mut timed = Vec::new();
+                        let mut counted = crate::memory_use::NotCounted::default();
                         for shard in run {
                             let map = read_lock!(shard);
                             strings.reserve(map.len());
+                            // The strings' holds are all of a shard's keys
+                            // at most: counted here, not for each key.
+                            counted.set(part_bytes(&strings, &sketches, &timed));
                             for entry in map.entries() {
                                 match entry.value() {
                                     // Eight bytes and a count: no copy of
@@ -5196,17 +5249,27 @@ fn freeze(
                                         if let Some(at) = entry.expires() {
                                             timed.push((Key::from(entry.key()), at));
                                         }
+                                        counted.set(part_bytes(&strings, &sketches, &timed));
                                     }
                                     other => {
                                         write_kdb_entry(&mut encoded, entry.key(), other)?;
                                         if let Some(at) = entry.expires() {
                                             timed.push((Key::from(entry.key()), at));
+                                            counted.set(part_bytes(&strings, &sketches, &timed));
                                         }
                                     }
                                 }
                             }
                         }
-                        Ok((strings, encoded, sketches, timed))
+                        let (encoded, encoded_counted) = encoded.finish();
+                        counted.absorb(encoded_counted);
+                        Ok(FrozenPart {
+                            strings,
+                            encoded,
+                            sketches,
+                            timed,
+                            counted,
+                        })
                     })
                 })
                 .collect();
@@ -5220,36 +5283,43 @@ fn freeze(
         });
         let mut frozen = FrozenDb::default();
         for part in parts {
-            let (strings, encoded, sketches, timed) = part?;
-            frozen.strings.push(strings);
-            frozen.encoded.push(encoded);
-            frozen.sketches.push(sketches);
-            frozen.timed.push(timed);
+            let part = part?;
+            not_counted.absorb(part.counted);
+            frozen.strings.push(part.strings);
+            frozen.encoded.push(part.encoded);
+            frozen.sketches.push(part.sketches);
+            frozen.timed.push(part.timed);
         }
         dbs.push(frozen);
     }
 
     // For a replica, schemas only: HNSW graphs are large and a replica
     // rebuilds them from the values it has just been sent.
-    let mut index_section = Vec::new();
+    let mut index_section = CapturedBuf::default();
     if with_graphs {
         write_kdb_index_sections(&mut index_section, index_store)?;
     } else {
         write_kdb_index_schemas_only(&mut index_section, index_store)?;
     }
-    let mut alias_section = Vec::new();
+    let mut alias_section = CapturedBuf::default();
     write_kdb_alias_section(&mut alias_section, index_store)?;
-    let mut language_section = Vec::new();
+    let mut language_section = CapturedBuf::default();
     write_kdb_language_section(&mut language_section, index_store)?;
     let functions = function_libraries();
-    let mut score_section = Vec::new();
+    let mut score_section = CapturedBuf::default();
     write_kdb_score_section(&mut score_section, index_store)?;
-    let own = dbs.iter().map(FrozenDb::own_bytes).sum::<usize>()
-        + index_section.capacity()
-        + alias_section.capacity()
-        + language_section.capacity()
-        + functions.as_ref().map_or(0, |f| f.len())
-        + score_section.capacity();
+    not_counted.add(functions.as_ref().map_or(0, |f| f.len()));
+    let mut settle = |section: CapturedBuf| {
+        let (bytes, counted) = section.finish();
+        not_counted.absorb(counted);
+        bytes
+    };
+    let index_section = settle(index_section);
+    let alias_section = settle(alias_section);
+    let language_section = settle(language_section);
+    let score_section = settle(score_section);
+    // Everything is laid out, and counted: a test reads memory here.
+    crate::aof::failpoint("snapshot-captured");
 
     Ok(FrozenDataset {
         dbs,
@@ -5258,7 +5328,7 @@ fn freeze(
         functions,
         language_section,
         score_section,
-        _not_counted: crate::memory_use::NotCounted::new(own),
+        not_counted,
     })
 }
 
@@ -5342,15 +5412,26 @@ impl FrozenDataset {
         let mut timed_strings: Vec<Vec<(Key, u64)>> = Vec::with_capacity(self.dbs.len());
         for db in &mut self.dbs {
             let mut timed = Vec::new();
+            // What `timed` takes, counted as it grows: it is made here
+            // (#848), and freed with the capture.
+            let mut timed_counted = 0usize;
             for part in std::mem::take(&mut db.strings) {
+                let held = part.capacity() * std::mem::size_of::<store::EntryRef>();
                 for entry in part {
                     write_key(out, entry.key())?;
                     out.write_all(&[TAG_STRING])?;
                     write_bytes(out, frozen_string(&entry))?;
                     if let Some(at) = entry.expires() {
                         timed.push((Key::from(entry.key()), at));
+                        let now = timed.capacity() * std::mem::size_of::<(Key, u64)>();
+                        if now != timed_counted {
+                            self.not_counted.add(now - timed_counted);
+                            timed_counted = now;
+                        }
                     }
                 }
+                // The holds' vector is freed here: no longer counted.
+                self.not_counted.release(held);
             }
             timed_strings.push(timed);
             for encoded in &db.encoded {
@@ -5359,11 +5440,13 @@ impl FrozenDataset {
             // Each copy goes as soon as it is written, as each string's
             // hold does.
             for part in std::mem::take(&mut db.sketches) {
+                let copies = part.capacity() * std::mem::size_of::<(Key, crate::sketch::Sketch)>();
                 for (key, sketch) in part {
                     write_key(out, key.as_bytes())?;
                     out.write_all(&[crate::sketch::TAG_SKETCH])?;
                     crate::sketch::write_kdb(out, &sketch)?;
                 }
+                self.not_counted.release(copies);
             }
             write_kdb_db_end(out)?;
         }
