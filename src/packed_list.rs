@@ -1200,24 +1200,39 @@ impl PackedList {
             let past = i - run_end;
             return (hi + 1 + past / CHUNK_ENTRIES, past % CHUNK_ENTRIES);
         }
-        // In the run: counted from its nearer edge.
+        // In the run: counted from its nearer edge, over the deque's two
+        // halves as plain slices (a few instructions a chunk).
+        let (head, tail) = chunks.as_slices();
+        let split = head.len();
+        // The run's part in each half, with the index of its first chunk.
+        let parts = [
+            (lo.min(split), &head[lo.min(split)..(hi + 1).min(split)]),
+            (
+                lo.max(split),
+                &tail[lo.max(split) - split..(hi + 1).max(split) - split],
+            ),
+        ];
         if i - run_begin < run_end - i {
             let mut before = run_begin;
-            for (k, chunk) in chunks.range(lo..=hi).enumerate() {
-                let count = chunk.count();
-                if i < before + count {
-                    return (lo + k, i - before);
+            for (base, part) in parts {
+                for (k, chunk) in part.iter().enumerate() {
+                    let count = chunk.count();
+                    if i < before + count {
+                        return (base + k, i - before);
+                    }
+                    before += count;
                 }
-                before += count;
             }
         } else {
             let mut end = run_end;
-            for (k, chunk) in chunks.range(lo..=hi).enumerate().rev() {
-                let begin = end - chunk.count();
-                if i >= begin {
-                    return (lo + k, i - begin);
+            for (base, part) in parts.into_iter().rev() {
+                for (k, chunk) in part.iter().enumerate().rev() {
+                    let begin = end - chunk.count();
+                    if i >= begin {
+                        return (base + k, i - begin);
+                    }
+                    end = begin;
                 }
-                end = begin;
             }
         }
         unreachable!("element {i} of {} is in no chunk", m.len)
