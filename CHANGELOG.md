@@ -211,6 +211,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Small hashes take less than half the memory.** A hash of up to 512
+  fields, no field or value longer than 64 bytes, is kept in one block, each
+  field next to its value, where it was a table with two allocations for
+  every field: 14-byte fields with 32-byte values take 71.8 bytes a field at
+  10 fields (162.8 before; Redis 8.10.2 57.8) and 55.8 at 100 (129.2; Redis
+  51.7). Larger hashes are tables as before, at the same size.
+  - A field is found by scanning one byte a field (a fingerprint of it),
+    sixteen at a time (sixty-four a step past 16 fields), and compared in
+    full only where that byte matches; a random field is a random index.
+  - A hash moves to a table when a write would pass 512 fields or set a
+    field or a value longer than 64 bytes (or the block's 65,535 bytes), as
+    Redis moves a listpack to a hash table; never back. Clients see the same
+    fields, in the same order: the order they were first set in.
+  - `OBJECT ENCODING` reports the form a hash is kept in: `listpack`,
+    `listpackex` (a block with field TTLs) or `hashtable`, and `HSCAN`
+    returns a block whole, in order, with cursor 0, whatever `COUNT` says,
+    as Redis returns a listpack. A hash that became a table while small
+    used to be reported as `listpack`.
+  - `hash-max-listpack-entries` (default 512) and `hash-max-listpack-value`
+    (64), and their `hash-max-ziplist-*` names, now take effect, from the
+    configuration file or `CONFIG SET`; `0` entries turns blocks off. They
+    go no higher than 512 and 64, and `CONFIG GET` reports the value kept.
+    A lowered limit applies to a hash at its next write, as in Redis.
+  - Commands cost no more than on a table for a hash of 8 fields
+    (`HGET`, `HEXISTS`, `HMGET` within 0.3 % of 1.2's instructions) and fewer
+    for writes: `HSET` of a value again 3 % fewer, `HDEL` 9 %, `HINCRBY`
+    5.5 %; building a hash a field at a time costs 0.5 % fewer, though the
+    field that takes a block past 8 fields (its room doubles) costs 5 %
+    more. At 100 fields a lookup scans more: `HGET` 1 % more, a miss 2 %;
+    `HDEL` costs 24 % fewer. `HGETALL`, `HKEYS` and `HVALS` write each
+    length without the formatting machinery: `HGETALL` of 8 fields costs
+    29 % fewer instructions, of 100 fields 42 % and of a 1,000-field table
+    40 %. Tables are within 1 % of before.
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write fields and values as text, so their formats do not change: 1.2.2
+    reads what this release writes and the other way round. `MEMORY USAGE`,
+    eviction and lazy freeing count a block as the one allocation it is.
+
 - **Small sets take a half to a twelfth of the memory (#297).** A set of
   up to 128 members of up to 64 bytes is kept in one block, the members end
   to end, where it was a hash table with an allocation for every member: 14-byte

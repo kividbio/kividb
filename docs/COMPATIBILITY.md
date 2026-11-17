@@ -139,6 +139,25 @@ other files:
   128, an intset that passes it becomes a `listpack` where Redis makes a
   `hashtable`; at the defaults the two agree.
 
+**Hashes**
+- Small hashes are kept as Redis keeps them, and `OBJECT ENCODING` says so:
+  `listpack` for up to `hash-max-listpack-entries` (512) fields with no
+  field or value longer than `hash-max-listpack-value` (64) bytes,
+  `listpackex` for such a hash once a field has a TTL, `hashtable`
+  otherwise; a hash never goes back, and `HSCAN` returns a `listpack` whole,
+  with cursor 0. The two limits go no higher than 512 and 64 (the most one
+  block holds); a larger value is taken as those, and `CONFIG GET` says so
+  (Redis keeps what it is given). The `hash-max-ziplist-*` names set and
+  report the same two settings.
+- A hash whose fields and values pass 65,535 bytes together is a
+  `hashtable` even when it is within both limits (at most 511 fields of 64
+  bytes with 64-byte values fit one block); Redis's listpack holds more.
+- `HGETALL`, `HKEYS`, `HVALS`, `HSCAN` and `HRANDFIELD` give a hash's fields
+  in the order they were first set, field TTLs or not. Redis keeps a
+  `listpackex` in the order of its deadlines, the fields with one first,
+  soonest first; so once a field of a small hash has a TTL the two orders
+  differ. They agree for a `listpack`.
+
 **Durability**
 - With the AOF on, a write is acknowledged once its record is in the file,
   as in Redis: a hard kill (`kill -9`, the OOM killer) loses no acknowledged
