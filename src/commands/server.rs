@@ -4666,6 +4666,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "evicted_scripts:{}\r\n",
                     crate::stats::EVICTED_SCRIPTS.load(Ordering::Relaxed)
                 ));
+                // How scripts were run: beside others, or alone and why (#871).
+                #[cfg(feature = "lua")]
+                crate::stats::scripts::info(&mut out);
                 // Slowlog totals (Redis 8.8). Milliseconds to two places,
                 // as Redis writes them (`0.00`).
                 let (slow_count, slow_us_sum, slow_us_max) = ctx.slowlog.totals();
@@ -5430,6 +5433,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
                     crate::stats::LAST_SAMPLE_COMMANDS.store(0, Ordering::Relaxed);
                     crate::stats::reset_error_reply_stats();
+                    #[cfg(feature = "lua")]
+                    crate::stats::scripts::reset();
                     ctx.slowlog.reset_totals();
                     Some(resp_simple("OK"))
                 }

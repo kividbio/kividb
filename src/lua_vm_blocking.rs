@@ -479,6 +479,7 @@ pub(crate) async fn run_lua_vm_blocking(
                     key,
                 };
                 let (reply, done) = tokio::sync::oneshot::channel();
+                crate::stats::scripts::handed_to_runner();
                 runner().submit(job, reply);
                 done.await
                     .unwrap_or_else(|_| (resp_error("ERR the script could not be run"), sel, 0))
@@ -490,6 +491,10 @@ pub(crate) async fn run_lua_vm_blocking(
 
     let owned = owned();
     let env = env.clone();
+    // Not `FUNCTION LOAD`, which always goes there and is not a script run.
+    if key.is_some() {
+        crate::stats::scripts::offloaded_to_pool();
+    }
     let (resp, sel_out, elapsed_us, ran_us) = tokio::task::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
         let (r, db) = env.run_execute(owned, sel, aof_enabled, client_resp);

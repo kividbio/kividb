@@ -178,3 +178,44 @@ Queues with different tags then run on different cores.
   can observe.
 - Two tags can land on the same lock. They then wait for each other when
   they need not; nothing else follows from it.
+
+### Seeing how scripts run
+
+`INFO stats` counts every script run (`EVAL`, `EVALSHA`, their `_RO`
+forms, `FCALL`, `FCALL_RO`) from a client, once, by how it was run, so
+that a server running its scripts one at a time shows it without
+`top -H`:
+
+| Field | Counts a script that |
+|---|---|
+| `scripts_run_beside_others` | ran beside other commands, under its tag's lock |
+| `scripts_run_alone_parallel_off` | ran alone because `lua-parallel-scripts` is `no` |
+| `scripts_run_alone_in_transaction` | ran alone inside `MULTI`/`EXEC` |
+| `scripts_run_alone_function` | ran alone because it is a function |
+| `scripts_run_alone_no_keys` | ran alone because it has no `KEYS` |
+| `scripts_run_alone_no_tag` | ran alone because a key of its `KEYS` has no hash tag |
+| `scripts_run_alone_several_tags` | ran alone because its `KEYS` carry different hash tags |
+| `scripts_run_alone_not_quick` | ran alone because it has not (or not yet) been seen to be quick |
+| `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the script-runner thread |
+| `scripts_offloaded_to_pool` | (not yet seen to be quick, or seen to be slow) was run on a thread of the blocking pool |
+
+A script that runs alone is counted under the first reason in the table
+that applies. The `scripts_run_*` counts add up to the script calls that
+reached the point of running: a script refused there (`BUSY`, `NOSCRIPT`,
+`OOM`), or held back by a `CLIENT PAUSE` that started as it arrived and
+then run, is counted each time it got that far. `scripts_handed_to_runner`
+and `scripts_offloaded_to_pool` are a second view of the scripts counted as
+run alone (a script in one of them is also in a `scripts_run_alone_*`
+field): handed to the runner is a quick script that runs alone and came
+while another script was running; offloaded to the pool is one not yet
+known to be quick, or demoted as slow.
+Scripts applied by a replica from its master, or replayed from the AOF,
+are not counted. `CONFIG RESETSTAT` sets them all to 0. A build without
+Lua has none of these fields.
+
+A benchmark of a script that declares tagged keys and still shows
+`scripts_run_alone_several_tags` going up is sending keys of different
+tags: `memtier_benchmark` draws a new key for every `__key__` in a
+command, so `{__key__}:a {__key__}:b` names two tags unless the command
+is run with `--transaction`, or the second key is built from the first in
+the script.
