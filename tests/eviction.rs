@@ -1480,6 +1480,67 @@ fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
     c.snapshot_let_go(limit);
 }
 
+/// #848. A snapshot encodes every value that is not a string into buffers
+/// as it captures the dataset, with writes held. Those bytes are in
+/// `used_memory` from the first element encoded, and were counted as not
+/// to be evicted for only once the capture was done: for as long as it
+/// took, `used_memory - mem_not_counted_for_evict` (what `maxmemory` is
+/// measured against, and what monitoring and autoscalers read) was high by
+/// the size of the encoded collections. Here the capture is held once it
+/// has laid everything out (`snapshot-captured`), with a list of about
+/// 36 MB in the dataset: the two numbers have moved together, and once the
+/// snapshot is written nothing is left uncounted.
+#[test]
+fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(dir, &[], &[("KIVIDB_TEST_FAILPOINTS", "snapshot-captured")]);
+    let mut c = server.conn();
+    let element = "e".repeat(100);
+    for batch in 1..=300 {
+        let mut args = vec!["RPUSH", "big"];
+        args.extend(std::iter::repeat_n(element.as_str(), 1000));
+        assert_eq!(c.cmd(&args).i(), batch * 1000);
+    }
+    assert_eq!(c.not_counted(), 0);
+    let before = c.used_memory() - c.not_counted();
+
+    assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+    let held = server.dir.join("failpoint.snapshot-captured.1");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !held.exists() {
+        assert!(Instant::now() < deadline, "no capture reached {held:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let used = c.used_memory();
+    let not_counted = c.not_counted();
+    let counted = used - not_counted;
+    // What the capture holds is in `used_memory` and in the other number.
+    assert!(
+        not_counted > 30 * MB,
+        "the capture holds about 36 MB of the list: {not_counted} bytes are not counted"
+    );
+    // What is counted is what it was: the list, once, and no more than a
+    // little besides. Before, it read the encoded list over.
+    assert!(
+        counted < before + 4 * MB,
+        "counted {counted} bytes during the capture, {before} before; {used} used, \
+         {not_counted} not counted"
+    );
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.not_counted() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} bytes are still not counted",
+            c.not_counted()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(c.cmd(&["LLEN", "big"]).i(), 300_000);
+}
+
 /// Memory that evicting keys does not give back, here what a snapshot
 /// holds counted as it was before #284 (`snapshot-held-counted`), with the
 /// snapshot's keys the only ones to evict (`volatile-lru`, and only they
