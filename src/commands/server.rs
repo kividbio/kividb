@@ -4837,6 +4837,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         if sync_ip { 1 } else { 0 }
                     ));
                     out.push_str(&format!("slave_repl_offset:{offset}\r\n"));
+                    // The id of the stream `slave_repl_offset` counts in, as
+                    // Redis reports it on a replica: all zeros until a master
+                    // has answered a PSYNC.
+                    let replid = ctx
+                        .repl_state
+                        .resync_point
+                        .lock()
+                        .as_ref()
+                        .map_or_else(|| "0".repeat(40), |p| p.repl_id.clone());
+                    out.push_str(&format!("master_replid:{replid}\r\n"));
                     if let Some(down_for) = ctx.repl_state.master_link_down_since_seconds() {
                         out.push_str(&format!("master_link_down_since_seconds:{down_for}\r\n"));
                     }

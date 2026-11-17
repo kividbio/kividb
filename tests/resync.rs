@@ -569,6 +569,13 @@ fn assert_same_dataset(master: &mut Conn, replica: &mut Conn) {
             .parse::<u64>()
             .is_ok_and(|applied| applied >= offset)
     });
+    // Of the same stream: an offset counts in the stream a replica
+    // follows, and one still on an old stream could be far enough along it
+    // to satisfy the wait above while holding another stream's data.
+    assert_eq!(
+        master.info("replication", "master_replid"),
+        replica.info("replication", "master_replid"),
+    );
     for probe in [
         &["GET", "counter"][..],
         &["LLEN", "list"],
