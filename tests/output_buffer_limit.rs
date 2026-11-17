@@ -925,6 +925,37 @@ fn a_blocking_command_reads_ahead_while_it_writes_what_came_before() {
     }
 }
 
+/// What is read ahead runs in the order it was sent: 186 `GET`s of a
+/// 100 KB value, whose replies wait, then 400,000 `INCR`s of one counter,
+/// all sent before a reply is read, answer 1 to 400,000 in turn.
+#[test]
+fn what_was_read_ahead_runs_in_the_order_it_was_sent() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "b", &"b".repeat(MB / 10)]).ok());
+        let mut pipeline = b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n".repeat(186);
+        pipeline.extend_from_slice(&b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n".repeat(400_000));
+
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
+        for i in 0..186 {
+            match c.read() {
+                Some(V::Bulk(b)) => assert_eq!(b.len(), MB / 10, "{io_model} {i}"),
+                other => panic!("{io_model} {i}: {other:?}"),
+            }
+        }
+        for n in 1..=400_000 {
+            assert_eq!(c.read(), Some(V::Int(n)), "{io_model}");
+        }
+    }
+}
+
 /// `CLIENT KILL` ends a client whose replies wait while it is read: the
 /// write waiting and the reading both end, and so does the connection,
 /// with nothing said to it.

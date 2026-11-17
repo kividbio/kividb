@@ -1136,6 +1136,9 @@ pub async fn handle_client(
         // io_uring tradeoff for not racing the read (Redis shrinks such buffers
         // from its client cron instead).
         let (unparsed, n) = if std::mem::take(&mut reparse) {
+            // Only a `SHUTDOWN` that failed reparses, and its turn submitted
+            // no read with its write.
+            debug_assert!(early.is_none(), "a read in flight on a turn that reparses");
             (parse_buf.len(), 0)
         } else if let Some(read) = early.as_mut().as_pin_mut() {
             // The read submitted with the last write.
@@ -3190,8 +3193,10 @@ pub async fn handle_client(
                     }
                 }
                 // Read ahead still to run, from a write that waited: the client
-                // is read while this one is written too.
-                None if !carried.is_empty() => {
+                // is read while this one is written too. Not when this turn
+                // hands the connection on, whose bytes are the replication
+                // link's.
+                None if !carried.is_empty() && connection_handoff.is_none() => {
                     let limit = crate::server::HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
@@ -3248,7 +3253,11 @@ pub async fn handle_client(
             if spare_buf.capacity() > BIG_BUFFER {
                 spare_buf = Vec::with_capacity(65536);
             }
-            res?;
+            // Out of the loop rather than returned from, so that what the
+            // connection holds after it is let go of too.
+            if res.is_err() {
+                break;
+            }
         }
         // The replies to SUBSCRIBE are out: messages may follow them.
         if let Some(subs) = &subscriptions {
