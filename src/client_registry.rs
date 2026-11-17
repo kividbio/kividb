@@ -545,7 +545,7 @@ pub struct ClientInfo {
     /// `CLIENT NO-TOUCH`: this client's reads record no use of the keys
     /// they find (`T` in `CLIENT LIST`). This is the flag `CLIENT NO-TOUCH`
     /// and `RESET` write; the connection's loop keeps a copy of its own
-    /// the command dispatcher reads (`Ctx::no_touch`), synced back after
+    /// the command dispatcher reads (`Ctx::resp`'s `RESP_NO_TOUCH`), synced back after
     /// the commands that can change it (#566).
     pub no_touch: bool,
     /// Waiting in a blocking command: `b` in `CLIENT LIST`.

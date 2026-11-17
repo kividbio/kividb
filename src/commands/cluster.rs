@@ -3140,7 +3140,6 @@ mod tests {
             client_id: 0,
             client_registry: &client_registry,
             resp: 2,
-            no_touch: false,
             acl_store: &acl_store,
             acl_log: &acl_log,
             slowlog: &slowlog,

@@ -953,7 +953,7 @@ pub(crate) fn effective_resp_for_reply(ctx: &Ctx<'_>) -> u8 {
             return r;
         }
     }
-    ctx.resp
+    ctx.resp & crate::commands::ctx::RESP_VERSION
 }
 
 /// Negotiated wire protocol for the **connected client** (ignores `redis.setresp`).
@@ -1812,7 +1812,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // script that may write counts its declared keys the same, and `TOUCH`
     // still touches, as in Redis (#566).
     let (access, used_after) = if crate::eviction::recording()
-        && !(ctx.no_touch && no_touch_skips(name, &ctx.cmd, writes_operation))
+        && !(ctx.resp & crate::commands::ctx::RESP_NO_TOUCH != 0
+            && no_touch_skips(name, &ctx.cmd, writes_operation))
     {
         let (scope, after) = access_scope(name, started, &ctx.cmd);
         (Some(scope), after)
@@ -1882,7 +1883,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // Command handlers hardcode RESP2's legacy null encoding (`$-1`/`*-1`); rewrite it to the
     // RESP3 null type (`_`) here, once, for RESP3 connections — see `resp3_normalize_null`.
     // `ctx.resp` is per-connection local state, not a client_registry lookup — see Ctx::resp.
-    let result = if ctx.resp == 3 {
+    // The protocol is 2 or 3: bit 0 says RESP3, whatever `RESP_NO_TOUCH` is.
+    let result = if ctx.resp & 1 != 0 {
         crate::resp::write::resp3_normalize_null(result)
     } else {
         result
@@ -3424,7 +3426,6 @@ mod replica_loading_gate_tests {
             client_id: 0,
             client_registry: &client_registry,
             resp: 2,
-            no_touch: false,
             acl_store: &acl_store,
             acl_log: &acl_log,
             slowlog: &slowlog,

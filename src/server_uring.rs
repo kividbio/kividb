@@ -4,7 +4,7 @@ use crate::resp;
 use crate::store;
 use crate::vector;
 use crate::watch::WatchNotifier;
-use commands::ctx::Ctx;
+use commands::ctx::{Ctx, RESP_VERSION, with_no_touch};
 use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1090,10 +1090,10 @@ pub async fn handle_client(
     // per-command null-encoding check doesn't hit the shared client_registry lock
     // on every single command across every worker thread.
     let mut resp_version: u8 = 2;
-    // `CLIENT NO-TOUCH` on this connection, the same way: copied into each
-    // command's `Ctx::no_touch`, and read back from `client_registry` only
-    // after a `CLIENT` or `EXEC` — the commands that can change it (#566).
-    let mut no_touch = false;
+    // Its top bit is `CLIENT NO-TOUCH` (`RESP_NO_TOUCH`): it goes into each
+    // command's `Ctx::resp` with the protocol at no cost of its own, and is
+    // read back from `client_registry` only after a `CLIENT` (#566). The
+    // protocol is `resp_version & RESP_VERSION`.
 
     enum ConnectionHandoff {
         Replica {
@@ -1424,7 +1424,7 @@ pub async fn handle_client(
             let slowlog_enabled = slowlog.threshold_us() < u64::MAX;
             // A RESP2 connection with subscriptions may run next to nothing:
             // that is decided on the slow path.
-            let subscriber_only = resp_version == 2 && subscriptions.is_some();
+            let subscriber_only = subscriptions.is_some() && resp_version & RESP_VERSION == 2;
             if authenticated_user.is_some()
                 && !tx.active
                 && !subscriber_only
@@ -1439,7 +1439,9 @@ pub async fn handle_client(
                     // itself `CLIENT NO-TOUCH`, since (#566).
                     let user_now = authenticated_user.as_deref().unwrap_or("default");
                     if lua_env.as_ref().is_some_and(|env| {
-                        env.authenticated_user != user_now || env.no_touch != no_touch
+                        env.authenticated_user != user_now
+                            || env.no_touch
+                                != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
                     }) {
                         lua_env = None;
                     }
@@ -1469,7 +1471,7 @@ pub async fn handle_client(
                             &tracking_table,
                             &peer_addr,
                             client_id,
-                            no_touch,
+                            resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                             authenticated_user.as_deref().unwrap_or("default"),
                         )
                     });
@@ -1478,7 +1480,7 @@ pub async fn handle_client(
                         &mut selected_db,
                         env,
                         aof_enabled,
-                        resp_version,
+                        resp_version & RESP_VERSION,
                     )
                     .await;
                     // A script that got past a `CLIENT PAUSE` before it was
@@ -1521,7 +1523,6 @@ pub async fn handle_client(
                         client_id,
                         client_registry: &client_registry,
                         resp: resp_version,
-                        no_touch,
                         acl_store: &acl_store,
                         acl_log: &acl_log,
                         slowlog: &slowlog,
@@ -1617,7 +1618,6 @@ pub async fn handle_client(
                     client_id,
                     client_registry: &client_registry,
                     resp: resp_version,
-                    no_touch,
                     acl_store: &acl_store,
                     acl_log: &acl_log,
                     slowlog: &slowlog,
@@ -1801,14 +1801,14 @@ pub async fn handle_client(
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &stream, &write_guard)
                 });
-                out_buf.extend_from_slice(&subs.handle(&cmd, resp_version));
+                out_buf.extend_from_slice(&subs.handle(&cmd, resp_version & RESP_VERSION));
                 if subs.total() == 0 {
                     subscriptions = None;
                 }
                 parse_offset += consumed;
                 continue;
             }
-            if resp_version == 2
+            if resp_version & RESP_VERSION == 2
                 && subscriptions.is_some()
                 && let Some(reply) = crate::pubsub::resp2_subscriber_reply(cmd_name.as_str(), &cmd)
             {
@@ -2002,7 +2002,6 @@ pub async fn handle_client(
                     dirty_flag.store(false, std::sync::atomic::Ordering::Release);
                     selected_db = 0;
                     resp_version = 2;
-                    no_touch = false;
                     subscriptions = None;
                     if client_registry
                         .get(client_id)
@@ -2215,7 +2214,7 @@ pub async fn handle_client(
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
                             if let Some(refusal) = refused {
                                 refusal
-                            } else if resp_version == 3 {
+                            } else if resp_version & RESP_VERSION == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {
                                 crate::resp::write::resp_null_array()
@@ -2302,7 +2301,7 @@ pub async fn handle_client(
                                 );
                                 tx.reset();
                                 dirty_flag.store(false, AtomicOrdering::Release);
-                                if resp_version == 3 {
+                                if resp_version & RESP_VERSION == 3 {
                                     crate::resp::write::resp_null_resp3()
                                 } else {
                                     crate::resp::write::resp_null_array()
@@ -2368,7 +2367,6 @@ pub async fn handle_client(
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
-                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2437,7 +2435,9 @@ pub async fn handle_client(
                                             &write_guard,
                                         )
                                     });
-                                    exec_out.extend_from_slice(&subs.handle(&args, resp_version));
+                                    exec_out.extend_from_slice(
+                                        &subs.handle(&args, resp_version & RESP_VERSION),
+                                    );
                                     if subs.total() == 0 {
                                         subscriptions = None;
                                     }
@@ -2536,7 +2536,6 @@ pub async fn handle_client(
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
-                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2582,7 +2581,6 @@ pub async fn handle_client(
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
-                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2621,7 +2619,10 @@ pub async fn handle_client(
                                 // A queued `CLIENT NO-TOUCH` takes hold with
                                 // the command after it (#566).
                                 if queued_name == "CLIENT" {
-                                    no_touch = client_registry.get_no_touch(client_id);
+                                    resp_version = with_no_touch(
+                                        resp_version,
+                                        client_registry.get_no_touch(client_id),
+                                    );
                                 }
                             }
 
@@ -2857,7 +2858,9 @@ pub async fn handle_client(
                             // flagged itself `CLIENT NO-TOUCH`, since (#566).
                             let user_now = authenticated_user.as_deref().unwrap_or("default");
                             if lua_env.as_ref().is_some_and(|env| {
-                                env.authenticated_user != user_now || env.no_touch != no_touch
+                                env.authenticated_user != user_now
+                                    || env.no_touch
+                                        != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
                             }) {
                                 lua_env = None;
                             }
@@ -2887,7 +2890,7 @@ pub async fn handle_client(
                                     &tracking_table,
                                     &peer_addr,
                                     client_id,
-                                    no_touch,
+                                    resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                                     authenticated_user.as_deref().unwrap_or("default"),
                                 )
                             });
@@ -2896,7 +2899,7 @@ pub async fn handle_client(
                                 &mut selected_db,
                                 env,
                                 aof_enabled,
-                                resp_version,
+                                resp_version & RESP_VERSION,
                             )
                             .await
                         } else {
@@ -2921,7 +2924,6 @@ pub async fn handle_client(
                                 client_id,
                                 client_registry: &client_registry,
                                 resp: resp_version,
-                                no_touch,
                                 acl_store: &acl_store,
                                 acl_log: &acl_log,
                                 slowlog: &slowlog,
@@ -2965,7 +2967,6 @@ pub async fn handle_client(
                             client_id,
                             client_registry: &client_registry,
                             resp: resp_version,
-                            no_touch,
                             acl_store: &acl_store,
                             acl_log: &acl_log,
                             slowlog: &slowlog,
@@ -3058,7 +3059,7 @@ pub async fn handle_client(
             // in a transaction is read back as `EXEC` runs it, above, so an
             // `EXEC` does not pay for a registry lookup here.
             if cmd_name == "CLIENT" {
-                no_touch = client_registry.get_no_touch(client_id);
+                resp_version = with_no_touch(resp_version, client_registry.get_no_touch(client_id));
             }
             out_buf.extend_from_slice(&response);
             parse_offset += consumed;

@@ -6517,7 +6517,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // HELLO is intercepted in the server loops before reaching here.
             // If it arrives here something went wrong — return a minimal response
             // rather than an error, so clients don't break.
-            let proto = ctx.resp as i64;
+            let proto = (ctx.resp & crate::commands::ctx::RESP_VERSION) as i64;
             let fields = vec![
                 resp_bulk_str("server"),
                 resp_bulk_str("redis"),

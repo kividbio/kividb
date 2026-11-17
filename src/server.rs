@@ -4,7 +4,7 @@ use crate::resp;
 use crate::store;
 use crate::vector;
 use crate::watch::WatchNotifier;
-use commands::ctx::Ctx;
+use commands::ctx::{Ctx, RESP_VERSION, with_no_touch};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -877,10 +877,10 @@ where
     // per-command null-encoding check doesn't hit the shared client_registry lock
     // on every single command across every worker thread.
     let mut resp_version: u8 = 2;
-    // `CLIENT NO-TOUCH` on this connection, the same way: copied into each
-    // command's `Ctx::no_touch`, and read back from `client_registry` only
-    // after a `CLIENT` or `EXEC` — the commands that can change it (#566).
-    let mut no_touch = false;
+    // Its top bit is `CLIENT NO-TOUCH` (`RESP_NO_TOUCH`): it goes into each
+    // command's `Ctx::resp` with the protocol at no cost of its own, and is
+    // read back from `client_registry` only after a `CLIENT` (#566). The
+    // protocol is `resp_version & RESP_VERSION`.
 
     enum ConnectionHandoff {
         Replica {
@@ -1207,7 +1207,7 @@ where
             let slowlog_enabled = slowlog.threshold_us() < u64::MAX;
             // A RESP2 connection with subscriptions may run next to nothing:
             // that is decided on the slow path.
-            let subscriber_only = resp_version == 2 && subscriptions.is_some();
+            let subscriber_only = subscriptions.is_some() && resp_version & RESP_VERSION == 2;
             if authenticated_user.is_some()
                 && !tx.active
                 && !subscriber_only
@@ -1222,7 +1222,9 @@ where
                     // itself `CLIENT NO-TOUCH`, since (#566).
                     let user_now = authenticated_user.as_deref().unwrap_or("default");
                     if lua_env.as_ref().is_some_and(|env| {
-                        env.authenticated_user != user_now || env.no_touch != no_touch
+                        env.authenticated_user != user_now
+                            || env.no_touch
+                                != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
                     }) {
                         lua_env = None;
                     }
@@ -1252,7 +1254,7 @@ where
                             &tracking_table,
                             &peer_addr,
                             client_id,
-                            no_touch,
+                            resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                             authenticated_user.as_deref().unwrap_or("default"),
                         )
                     });
@@ -1261,7 +1263,7 @@ where
                         &mut selected_db,
                         env,
                         crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-                        resp_version,
+                        resp_version & RESP_VERSION,
                     )
                     .await;
                     // A script that got past a `CLIENT PAUSE` before it was
@@ -1305,7 +1307,6 @@ where
                         client_id,
                         client_registry: &client_registry,
                         resp: resp_version,
-                        no_touch,
                         acl_store: &acl_store,
                         acl_log: &acl_log,
                         slowlog: &slowlog,
@@ -1404,7 +1405,6 @@ where
                     client_id,
                     client_registry: &client_registry,
                     resp: resp_version,
-                    no_touch,
                     acl_store: &acl_store,
                     acl_log: &acl_log,
                     slowlog: &slowlog,
@@ -1590,14 +1590,14 @@ where
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &writer)
                 });
-                combined.extend_from_slice(&subs.handle(&cmd, resp_version));
+                combined.extend_from_slice(&subs.handle(&cmd, resp_version & RESP_VERSION));
                 if subs.total() == 0 {
                     subscriptions = None;
                 }
                 parse_offset += consumed;
                 continue;
             }
-            if resp_version == 2
+            if resp_version & RESP_VERSION == 2
                 && subscriptions.is_some()
                 && let Some(reply) = crate::pubsub::resp2_subscriber_reply(cmd_name.as_str(), &cmd)
             {
@@ -1791,7 +1791,6 @@ where
                     dirty_flag.store(false, std::sync::atomic::Ordering::Release);
                     selected_db = 0;
                     resp_version = 2;
-                    no_touch = false;
                     subscriptions = None;
                     if client_registry
                         .get(client_id)
@@ -2004,7 +2003,7 @@ where
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
                             if let Some(refusal) = refused {
                                 refusal
-                            } else if resp_version == 3 {
+                            } else if resp_version & RESP_VERSION == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {
                                 crate::resp::write::resp_null_array()
@@ -2089,7 +2088,7 @@ where
                                 );
                                 tx.reset();
                                 dirty_flag.store(false, Ordering::Release);
-                                if resp_version == 3 {
+                                if resp_version & RESP_VERSION == 3 {
                                     crate::resp::write::resp_null_resp3()
                                 } else {
                                     crate::resp::write::resp_null_array()
@@ -2156,7 +2155,6 @@ where
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
-                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2226,7 +2224,9 @@ where
                                             &writer,
                                         )
                                     });
-                                    exec_out.extend_from_slice(&subs.handle(&args, resp_version));
+                                    exec_out.extend_from_slice(
+                                        &subs.handle(&args, resp_version & RESP_VERSION),
+                                    );
                                     if subs.total() == 0 {
                                         subscriptions = None;
                                     }
@@ -2327,7 +2327,6 @@ where
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
-                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2372,7 +2371,6 @@ where
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
-                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2411,7 +2409,10 @@ where
                                 // A queued `CLIENT NO-TOUCH` takes hold with
                                 // the command after it (#566).
                                 if queued_name == "CLIENT" {
-                                    no_touch = client_registry.get_no_touch(client_id);
+                                    resp_version = with_no_touch(
+                                        resp_version,
+                                        client_registry.get_no_touch(client_id),
+                                    );
                                 }
                             }
 
@@ -2643,7 +2644,9 @@ where
                             // flagged itself `CLIENT NO-TOUCH`, since (#566).
                             let user_now = authenticated_user.as_deref().unwrap_or("default");
                             if lua_env.as_ref().is_some_and(|env| {
-                                env.authenticated_user != user_now || env.no_touch != no_touch
+                                env.authenticated_user != user_now
+                                    || env.no_touch
+                                        != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
                             }) {
                                 lua_env = None;
                             }
@@ -2673,7 +2676,7 @@ where
                                     &tracking_table,
                                     &peer_addr,
                                     client_id,
-                                    no_touch,
+                                    resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                                     authenticated_user.as_deref().unwrap_or("default"),
                                 )
                             });
@@ -2682,7 +2685,7 @@ where
                                 &mut selected_db,
                                 env,
                                 crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-                                resp_version,
+                                resp_version & RESP_VERSION,
                             )
                             .await
                         } else {
@@ -2708,7 +2711,6 @@ where
                                 client_id,
                                 client_registry: &client_registry,
                                 resp: resp_version,
-                                no_touch,
                                 acl_store: &acl_store,
                                 acl_log: &acl_log,
                                 slowlog: &slowlog,
@@ -2753,7 +2755,6 @@ where
                             client_id,
                             client_registry: &client_registry,
                             resp: resp_version,
-                            no_touch,
                             acl_store: &acl_store,
                             acl_log: &acl_log,
                             slowlog: &slowlog,
@@ -2846,7 +2847,7 @@ where
             // in a transaction is read back as `EXEC` runs it, above, so an
             // `EXEC` does not pay for a registry lookup here.
             if cmd_name == "CLIENT" {
-                no_touch = client_registry.get_no_touch(client_id);
+                resp_version = with_no_touch(resp_version, client_registry.get_no_touch(client_id));
             }
             combined.extend_from_slice(&response);
             parse_offset += consumed;
