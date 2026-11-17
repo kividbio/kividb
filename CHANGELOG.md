@@ -338,9 +338,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   AOF begins a new stream; a replica that proved its dataset was that
   stream's start (`+DIGEST`, then `+CONTINUE`) was continued but kept the
   dead stream's id — and one that had asked `PSYNC ? -1` kept no resync
-  point at all. Promoted, such a replica advertised a `repl_id2` that
-  never was, so its siblings could not continue under the id they knew;
-  restarted, it asked for a full resync it did not need. The point now
+  point at all. Promoted, such a replica could not continue its
+  siblings; restarted, it asked for a full resync it did not need. The
+  point now
   takes the id `+CONTINUE` announces and the place the stream is continued
   from, under the lock a promotion reads it in, and is dropped when the
   node had stopped being a replica before the reply arrived.
