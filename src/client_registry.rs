@@ -1051,7 +1051,7 @@ impl ClientRegistryInner {
     }
 
     /// Client `id` waits in a command that is no key's (`WAIT`): blocked,
-    /// counted in `blocked_clients`, and ended by `CLIENT UNBLOCK` through
+    /// listed as blocked, and ended by `CLIENT UNBLOCK` through
     /// `unblock`, until what this returns is dropped.
     pub fn blocked_in(
         &self,
@@ -1060,7 +1060,6 @@ impl ClientRegistryInner {
         with_timeout: bool,
     ) -> BlockedIn<'_> {
         self.set_blocked(id, Some(unblock), with_timeout);
-        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
         BlockedIn { registry: self, id }
     }
 
@@ -1375,7 +1374,6 @@ pub struct BlockedIn<'a> {
 impl Drop for BlockedIn<'_> {
     fn drop(&mut self) {
         self.registry.set_blocked(self.id, None, false);
-        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

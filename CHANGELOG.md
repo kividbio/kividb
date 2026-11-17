@@ -551,6 +551,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A client seen as no longer blocked has had its blocking command counted (#896).**
+  `INFO clients` could show `blocked_clients:0` before `INFO commandstats` had the
+  call of a blocking command (`BLPOP`, `XREAD BLOCK`, ...) that had just been
+  woken (seen on the io_uring loop under load, rarely on tokio). The client
+  now counts as blocked until its call has been counted, still once. A client
+  whose wait ended while a `CLIENT PAUSE` held it is counted once, not twice.
 - **A shard keeps its id across a failover (#563).** `CLUSTER MYSHARDID`
   answered the master's node id, so a shard's id changed when a replica
   took over. Each node now has a shard id of its own, as in Redis: random
