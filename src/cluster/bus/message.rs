@@ -101,6 +101,9 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// Its shard id (`CLUSTER MYSHARDID`), as a `shard=` token of its
+        /// flags string; `None` from a node of an earlier version (#563).
+        sender_shard_id: Option<NodeId>,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
     },
@@ -116,6 +119,9 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// Its shard id (`CLUSTER MYSHARDID`), as a `shard=` token of its
+        /// flags string; `None` from a node of an earlier version (#563).
+        sender_shard_id: Option<NodeId>,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
     },
@@ -232,6 +238,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_shard_id,
             gossip,
             slot_claims,
         } => resp_array(vec![
@@ -243,10 +250,13 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                 *sender_cluster_port,
                 *sender_config_epoch,
             )),
-            resp_bulk_str(&flags_with_host(
-                *sender_flags,
-                sender_hostname,
-                *sender_announced_client_port,
+            resp_bulk_str(&with_shard(
+                flags_with_host(
+                    *sender_flags,
+                    sender_hostname,
+                    *sender_announced_client_port,
+                ),
+                sender_shard_id.as_ref(),
             )),
             match sender_master_id {
                 Some(m) => resp_bulk(m),
@@ -265,6 +275,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_shard_id,
             gossip,
             slot_claims,
         } => resp_array(vec![
@@ -276,10 +287,13 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                 *sender_cluster_port,
                 *sender_config_epoch,
             )),
-            resp_bulk_str(&flags_with_host(
-                *sender_flags,
-                sender_hostname,
-                *sender_announced_client_port,
+            resp_bulk_str(&with_shard(
+                flags_with_host(
+                    *sender_flags,
+                    sender_hostname,
+                    *sender_announced_client_port,
+                ),
+                sender_shard_id.as_ref(),
             )),
             match sender_master_id {
                 Some(m) => resp_bulk(m),
@@ -453,6 +467,28 @@ fn flags_with_host(flags: NodeFlags, hostname: &str, client_port: u16) -> String
     s
 }
 
+/// `flags` with a `shard=<id>` token for the sender's shard id. A node of an
+/// earlier version ignores the token, as it does `host=` and `cport=`.
+fn with_shard(mut flags: String, shard_id: Option<&NodeId>) -> String {
+    if let Some(id) = shard_id {
+        if !flags.is_empty() {
+            flags.push(',');
+        }
+        flags.push_str("shard=");
+        flags.push_str(crate::cluster::node::node_id_str(id));
+    }
+    flags
+}
+
+/// The shard id in a flags string; `None` if there is none (a node of an
+/// earlier version), or it is not a node id.
+fn shard_of(flags: &str) -> Option<NodeId> {
+    flags
+        .split(',')
+        .find_map(|tok| tok.strip_prefix("shard="))
+        .and_then(|id| parse_node_id(id.as_bytes()))
+}
+
 /// The announced client port in a flags string; 0 if there is none.
 fn cport_of(flags: &str) -> u16 {
     flags
@@ -533,6 +569,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
             let sender_flags = parse_flags(flags_str);
             let sender_hostname = host_of(flags_str);
             let sender_announced_client_port = cport_of(flags_str);
+            let sender_shard_id = shard_of(flags_str);
             let sender_master_id = if parts[4].is_empty() {
                 None
             } else {
@@ -551,6 +588,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_shard_id,
                     gossip,
                     slot_claims,
                 }
@@ -565,6 +603,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_shard_id,
                     gossip,
                     slot_claims,
                 }
@@ -940,7 +979,7 @@ pub fn exceeds_buffer_limit(buf: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::node::generate_node_id;
+    use crate::cluster::node::{generate_node_id, node_id_str};
 
     #[test]
     fn meet_round_trip() {
@@ -984,6 +1023,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_shard_id: None,
         };
         let bytes = encode(&msg);
         let (decoded, consumed) = decode(&bytes).unwrap().unwrap();
@@ -1020,6 +1060,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_shard_id: None,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1050,6 +1091,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: "a.example".into(),
             sender_announced_client_port: 30001,
+            sender_shard_id: None,
             gossip: vec![GossipEntry {
                 id: other,
                 ip: "10.0.0.2".into(),
@@ -1090,6 +1132,53 @@ mod tests {
         assert_eq!(cport_of("master,cport=nonsense"), 0);
     }
 
+    /// The sender's shard id goes in its flags string, as `shard=<id>`
+    /// (#563): a node of an earlier version skips the token, and one sent
+    /// by such a node has none.
+    #[test]
+    fn shard_ids_travel_in_the_flags() {
+        let me = generate_node_id();
+        let shard = generate_node_id();
+        let pong = |sender_shard_id| BusMessage::Pong {
+            sender_id: me,
+            sender_ip: "10.0.0.1".into(),
+            sender_client_port: 6380,
+            sender_cluster_port: 16380,
+            sender_config_epoch: 3,
+            sender_flags: NodeFlags::REPLICA,
+            sender_master_id: Some(generate_node_id()),
+            sender_hostname: "a.example".into(),
+            sender_announced_client_port: 30001,
+            sender_shard_id,
+            gossip: vec![],
+            slot_claims: vec![],
+        };
+        for said in [Some(shard), None] {
+            let (decoded, _) = decode(&encode(&pong(said))).unwrap().unwrap();
+            match decoded {
+                BusMessage::Pong {
+                    sender_shard_id,
+                    sender_flags,
+                    sender_hostname,
+                    sender_announced_client_port,
+                    ..
+                } => {
+                    assert_eq!(sender_shard_id, said);
+                    assert_eq!(sender_flags, NodeFlags::REPLICA);
+                    assert_eq!(sender_hostname, "a.example");
+                    assert_eq!(sender_announced_client_port, 30001);
+                }
+                other => panic!("expected Pong, got {:?}", other),
+            }
+        }
+        // What an older node's parser makes of it: the flags, and nothing else.
+        let flags = format!("slave,host=a.example,shard={}", node_id_str(&shard));
+        assert_eq!(parse_flags(&flags), NodeFlags::REPLICA);
+        assert_eq!(host_of(&flags), "a.example");
+        assert_eq!(shard_of(&flags), Some(shard));
+        assert_eq!(shard_of("master,shard=nonsense"), None);
+    }
+
     /// Hostnames go in the flags strings, where a node that does not know
     /// them finds only a token it skips; and a field added after the ones a
     /// node knows does not make it drop the message.
@@ -1119,6 +1208,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: "shard-1a.db.example".into(),
             sender_announced_client_port: 0,
+            sender_shard_id: None,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1232,6 +1322,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_shard_id: None,
         };
         let bytes = encode(&msg);
         let (decoded, consumed) = decode(&bytes).unwrap().unwrap();
@@ -1281,6 +1372,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_shard_id: None,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
