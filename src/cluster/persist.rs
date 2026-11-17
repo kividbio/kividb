@@ -383,6 +383,10 @@ fn topology_fingerprint(
         // Saved too: a hostname learnt on its own used to wait for some other
         // change before it reached the file, and a restart forgot it.
         n.hostname.hash(&mut h);
+        // And a shard id taken from a master's heartbeat, for the same reason:
+        // a replica restarted before anything else changed came back in the
+        // shard it had made up for its master (#563).
+        n.shard_id.hash(&mut h);
     }
     slots.hash(&mut h);
     current_epoch.hash(&mut h);
@@ -779,6 +783,25 @@ mod tests {
         assert_eq!(loaded.nodes[&me].hostname, "a.example");
         assert_eq!(loaded.nodes[&replica].shard_id, shard);
         assert_eq!(loaded.nodes[&replica].hostname, "");
+    }
+
+    /// A shard id taken in on its own changes what is saved, so it reaches
+    /// the file without waiting for another change (#563).
+    #[test]
+    fn a_new_shard_id_is_a_change_to_save() {
+        let me = generate_node_id();
+        let mut node = ClusterNode::new(me, "127.0.0.1".into(), 6380, 16380);
+        node.flags = NodeFlags::MYSELF | NodeFlags::MASTER;
+        let mut nodes = AHashMap::new();
+        nodes.insert(me, node);
+        let slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        let before = topology_fingerprint(&nodes, &slots, 0, 0);
+        assert_eq!(topology_fingerprint(&nodes, &slots, 0, 0), before);
+        nodes.get_mut(&me).unwrap().shard_id = generate_node_id();
+        assert_ne!(topology_fingerprint(&nodes, &slots, 0, 0), before);
     }
 
     /// A file an earlier version wrote has no shard ids: a master gets a new

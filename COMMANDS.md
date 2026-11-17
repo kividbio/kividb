@@ -1111,7 +1111,7 @@ A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 | `CLUSTER MYSHARDID` | `CLUSTER MYSHARDID` | Returns this node's shard ID, as Redis keeps it: a replica has its master's, and a replica that takes over keeps it, so a shard's ID stays the same across failovers. |
 | `CLUSTER NODES` | `CLUSTER NODES` | Full node table as a bulk string. Format matches Redis. |
 | `CLUSTER SLOTS` | `CLUSTER SLOTS` | Slot-to-node mapping. Each entry: `[start, end, [master_ip, port, id], ...replicas]`. |
-| `CLUSTER SHARDS` | `CLUSTER SHARDS` | Per-shard summary including slots and node descriptions. |
+| `CLUSTER SHARDS` | `CLUSTER SHARDS` | Per-shard summary including slots and node descriptions. Every master that owns slots has an entry of its own; a failed master without slots is shown in the entry of the master of its shard that took over, as in Redis. |
 | `CLUSTER KEYSLOT` | `CLUSTER KEYSLOT key` | CRC16/XMODEM mod 16384 with `{tag}` extraction. |
 | `CLUSTER COUNTKEYSINSLOT` | `CLUSTER COUNTKEYSINSLOT slot` | Walks the current DB to count keys hashing to `slot`. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
 | `CLUSTER GETKEYSINSLOT` | `CLUSTER GETKEYSINSLOT slot count` | Returns up to `count` keys in `slot`; a `count` of 0 returns an empty array, a negative one is `ERR Invalid slot or number of keys`. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |

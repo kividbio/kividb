@@ -66,7 +66,7 @@ pub struct ClusterNode {
     /// random when the node is first known, its master's while it is a
     /// replica, and kept by a replica that is promoted, so that a shard keeps
     /// its id across a failover (#563). The node says its own in its
-    /// heartbeats; `ClusterState::update_shard_id` takes it in.
+    /// heartbeats; `ClusterState::take_shard_id` takes it in.
     pub shard_id: NodeId,
 }
 

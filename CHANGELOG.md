@@ -46,6 +46,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   An earlier release reading the file takes `<hostname>,shard-id=<id>` for
   the hostname, until each peer's next heartbeat says its own again; a
   cluster's shard ids converge on each master's as its nodes are upgraded.
+  After a rollback with `cluster-preferred-endpoint-type hostname`, a peer
+  that is down at that moment is handed out under that name in `MOVED` and
+  `CLUSTER SLOTS` until it comes back.
 
 ### Added
 
@@ -384,8 +387,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when it is first known, its master's while it is a replica, kept when a
   replica is promoted, and new after `CLUSTER RESET HARD`. Nodes say their
   own in their heartbeats (a token older nodes skip), and nodes.conf keeps
-  it. `CLUSTER SHARDS` groups nodes by it, so a failed master is shown in
-  the shard of the replica that took over from it.
+  it, saved as soon as a node learns a new one. In `CLUSTER SHARDS` a
+  failed master without slots is shown in the entry of its shard's master,
+  the replica that took over from it; every master that owns slots still
+  has an entry of its own.
 
 - **A pipeline sent before its replies are read no longer hangs its
   connection (#865).** A client that sends a whole pipeline and only then
