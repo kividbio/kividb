@@ -236,6 +236,40 @@ pub fn script_tags<'a>(cmd: &[&'a [u8]]) -> Option<ScriptTags<'a>> {
     Some(ScriptTags::Several(others))
 }
 
+/// What a script command's `KEYS` are, as far as running under a tag goes:
+/// for `INFO`'s counts of the scripts that ran alone, and why
+/// (`stats::scripts`). Asked only of a script that runs alone.
+#[cfg(feature = "lua")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptKeys {
+    /// None, or a count of them that is not one.
+    None,
+    /// At least one has no hash tag.
+    Untagged,
+    /// All have one.
+    Tagged,
+}
+
+/// See [`ScriptKeys`]. `cmd` is a script command with its arguments.
+#[cfg(feature = "lua")]
+pub fn script_keys(cmd: &[&[u8]]) -> ScriptKeys {
+    let keys = std::str::from_utf8(cmd.get(2).copied().unwrap_or_default())
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|n| cmd.get(3..3usize.checked_add(n)?));
+    let Some((first, rest)) = keys.and_then(|keys| keys.split_first()) else {
+        return ScriptKeys::None;
+    };
+    if std::iter::once(first)
+        .chain(rest)
+        .all(|key| tag_of(key).is_some())
+    {
+        ScriptKeys::Tagged
+    } else {
+        ScriptKeys::Untagged
+    }
+}
+
 /// Say that the script this thread runs next may run under its tag. Asked
 /// for by the caller that knows the script to be a quick one; taken by the
 /// command path, once.
@@ -385,7 +419,7 @@ pub fn in_script() -> bool {
 }
 
 /// Whether this thread is running a script beside the scripts of other
-/// threads, under its tag's lock.
+/// threads, under its tags' locks.
 #[inline]
 pub fn beside_others() -> bool {
     BESIDE_OTHERS.with(|beside| beside.get())
@@ -787,6 +821,38 @@ mod tests {
                     .unwrap();
             }
         });
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_scripts_keys_are_told_apart_for_the_counters() {
+        let kind = |cmd: &[&[u8]]| script_keys(cmd);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"x:{q}:b"]),
+            ScriptKeys::Tagged
+        );
+        assert_eq!(kind(&[b"EVALSHA", b"abc", b"0"]), ScriptKeys::None);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"3", b"{q}:a"]),
+            ScriptKeys::None
+        );
+        assert_eq!(kind(&[b"EVALSHA", b"abc", b"x"]), ScriptKeys::None);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"b"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"a", b"{q}:b"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"3", b"{q}:a", b"{r}:b", b"c"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"{r}:b"]),
+            ScriptKeys::Tagged
+        );
     }
 
     #[test]

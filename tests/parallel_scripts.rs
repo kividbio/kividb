@@ -124,13 +124,17 @@ fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
             &port.to_string(),
             "--bind",
             "127.0.0.1",
-            "--io-model",
-            "tokio",
             "--threads",
             "4",
             "--update-check",
             "no",
         ])
+        .args(
+            (!extra.iter().any(|a| a == "--io-model"))
+                .then_some(["--io-model", "tokio"])
+                .into_iter()
+                .flatten(),
+        )
         .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -830,6 +834,221 @@ fn a_script_beside_others_may_not_create_the_first_index() {
     assert!(second.ok(), "{second:?}");
 }
 
+// ── INFO: how scripts were run (#871) ───────────────────────────────────────
+
+/// The `scripts_*` counts of `INFO stats`.
+fn script_counts(c: &mut Conn) -> std::collections::BTreeMap<String, u64> {
+    c.cmd(&["INFO", "stats"])
+        .s()
+        .lines()
+        .filter(|line| line.starts_with("scripts_"))
+        .map(|line| {
+            let (name, n) = line.trim().split_once(':').unwrap();
+            (name.to_string(), n.parse().unwrap())
+        })
+        .collect()
+}
+
+/// The counts that `run` moved, and by how much.
+fn moved(c: &mut Conn, run: impl FnOnce(&mut Conn)) -> Vec<(String, u64)> {
+    let before = script_counts(c);
+    run(c);
+    let after = script_counts(c);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    after
+        .into_iter()
+        .filter_map(|(name, n)| {
+            let was = before[&name];
+            assert!(n >= was, "{name} went down");
+            (n > was).then(|| (name, n - was))
+        })
+        .collect()
+}
+
+fn one(names: &[&str]) -> Vec<(String, u64)> {
+    let mut all: Vec<(String, u64)> = names.iter().map(|n| (n.to_string(), 1)).collect();
+    all.sort();
+    all
+}
+
+/// `INFO stats` says how scripts were run: beside others, or alone and why,
+/// and which were handed to the script-runner thread or offloaded to the
+/// blocking pool. Each count moves in the case it names, and in no other;
+/// a command that is not a script moves none; `CONFIG RESETSTAT` sets them
+/// all to 0.
+#[test]
+fn info_counts_how_scripts_were_run() {
+    let server = Server::start(&["--lua-parallel-scripts", "true"]);
+    let mut c = server.conn();
+    let counts = script_counts(&mut c);
+    assert_eq!(
+        counts.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "scripts_handed_to_runner",
+            "scripts_offloaded_to_pool",
+            "scripts_run_alone_function",
+            "scripts_run_alone_in_transaction",
+            "scripts_run_alone_no_keys",
+            "scripts_run_alone_no_tag",
+            "scripts_run_alone_not_quick",
+            "scripts_run_alone_parallel_off",
+            "scripts_run_beside_others",
+        ]
+    );
+    assert!(counts.values().all(|n| *n == 0), "{counts:?}");
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", READS_A_KEY]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // Not scripts.
+    assert_eq!(
+        moved(&mut c, |c| {
+            assert!(c.cmd(&["SET", "{q}:a", "v"]).ok());
+            assert!(c.cmd(&["GET", "{q}:a"]).s() == "v");
+        }),
+        one(&[])
+    );
+
+    // Tagged, not yet seen to be quick: alone, on the pool.
+    let tagged = |c: &mut Conn| {
+        assert_eq!(
+            c.cmd(&["EVALSHA", &sha, "1", "{q}:a", "{q}:a"]),
+            V::Str("v".into())
+        )
+    };
+    assert_eq!(
+        moved(&mut c, tagged),
+        one(&["scripts_offloaded_to_pool", "scripts_run_alone_not_quick"])
+    );
+    // Seen to be quick: beside others, on the connection's own thread.
+    let mut runs = 0;
+    loop {
+        let counted = moved(&mut c, tagged);
+        if counted == one(&["scripts_run_beside_others"]) {
+            break;
+        }
+        assert_eq!(
+            counted,
+            one(&["scripts_offloaded_to_pool", "scripts_run_alone_not_quick"])
+        );
+        runs += 1;
+        assert!(runs < 20, "the script was never run beside others");
+    }
+
+    // No keys: alone (its first run on the pool, as every script's).
+    let no_keys = |c: &mut Conn| assert_eq!(c.cmd(&["EVAL", "return 7", "0"]), V::Int(7));
+    assert_eq!(
+        moved(&mut c, no_keys),
+        one(&["scripts_offloaded_to_pool", "scripts_run_alone_no_keys"])
+    );
+    let mut runs = 0;
+    while moved(&mut c, no_keys) != one(&["scripts_run_alone_no_keys"]) {
+        runs += 1;
+        assert!(runs < 20, "the script was never run inline");
+    }
+    // A key with no tag, and keys of two tags: alone.
+    assert_eq!(
+        moved(&mut c, |c| {
+            c.cmd(&["EVALSHA", &sha, "1", "plain", "{q}:a"]);
+        }),
+        one(&["scripts_run_alone_no_tag"])
+    );
+    assert_eq!(
+        moved(&mut c, |c| {
+            c.cmd(&["EVALSHA", &sha, "2", "{q}:a", "{r}:a", "{r}:a"]);
+        }),
+        one(&["scripts_run_beside_others"])
+    );
+    // Inside a transaction: alone.
+    assert_eq!(
+        moved(&mut c, |c| {
+            assert!(c.cmd(&["MULTI"]).ok());
+            assert_eq!(
+                c.cmd(&["EVALSHA", &sha, "1", "{q}:a", "{q}:a"]).s(),
+                "QUEUED"
+            );
+            assert!(matches!(c.cmd(&["EXEC"]), V::Arr(_)));
+        }),
+        one(&["scripts_run_alone_in_transaction"])
+    );
+    // A function: alone. Loading one is no script run.
+    assert_eq!(
+        moved(&mut c, |c| {
+            let loaded = c.cmd(&[
+                "FUNCTION",
+                "LOAD",
+                "#!lua name=counts\nredis.register_function('f', function(keys, args) \
+                 return 1 end)",
+            ]);
+            assert_eq!(loaded, V::Str("counts".into()));
+        }),
+        one(&[])
+    );
+    assert_eq!(
+        moved(&mut c, |c| assert_eq!(
+            c.cmd(&["FCALL", "f", "1", "{q}:a"]),
+            V::Int(1)
+        )),
+        one(&["scripts_offloaded_to_pool", "scripts_run_alone_function"])
+    );
+    // Switched off: alone, whatever its keys.
+    assert!(c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "no"]).ok());
+    assert_eq!(
+        moved(&mut c, tagged),
+        one(&["scripts_run_alone_parallel_off"])
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"])
+            .ok()
+    );
+
+    // A quick script that comes while another is running is handed to the
+    // runner thread: many at once, from several connections, until one is.
+    let port = server.port;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let before = script_counts(&mut c);
+    let mut sent = 0;
+    while script_counts(&mut c)["scripts_handed_to_runner"] == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no script was handed to the runner"
+        );
+        let clients: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    for _ in 0..500 {
+                        assert_eq!(c.cmd(&["EVAL", "return 7", "0"]), V::Int(7));
+                    }
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().unwrap();
+        }
+        sent += 8 * 500;
+    }
+    // Each of them counted once, as what it is, and nothing else.
+    let after = script_counts(&mut c);
+    for (name, n) in &after {
+        let was = before[name];
+        match name.as_str() {
+            "scripts_run_alone_no_keys" => assert_eq!(n - was, sent, "{name}"),
+            "scripts_handed_to_runner" => assert!(*n > 0 && n - was <= sent, "{name}"),
+            // A run stretched past the demotion limit on a busy machine is
+            // offloaded until it is seen to be quick again.
+            "scripts_offloaded_to_pool" => assert!(n - was <= sent, "{name}"),
+            _ => assert_eq!(*n, was, "{name}"),
+        }
+    }
+
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+    let counts = script_counts(&mut c);
+    assert!(counts.values().all(|n| *n == 0), "{counts:?}");
+}
+
 // ── Scripts of several hash tags (#871) ──────────────────────────────────────
 
 /// Counts to ARGV[1], then writes ARGV[2] to every key of `KEYS`.
@@ -1001,18 +1220,32 @@ else \
   redis.call('SET', KEYS[1], a) \
 end \
 for i, key in ipairs(KEYS) do \
-  redis.call('RPUSH', key .. ':log', ARGV[1] .. '@' .. a .. '/' .. b) \
+  redis.call('RPUSH', key .. ':log', ARGV[1] .. '@' .. a .. '/' .. b .. '#' .. \
+    (redis.call('GET', key .. ':x') or '')) \
 end \
 return a";
 
-/// Scripts of two tags, overlapping, from many clients at once: the master,
-/// its replica and the master's AOF replayed end with the same data, key by
-/// key. Each script holds its tags for the whole of its run, so the order
-/// in which their effects reach the stream is one in which the master could
-/// have run them one after another.
+/// Scripts of two tags, overlapping, from many clients at once, and a
+/// client's `MSET` of keys of two tags among them, which each script reads
+/// and logs: the master, its replica and the master's AOF replayed end with
+/// the same data, key by key. Each script holds its tags for the whole of its
+/// run, and the `MSET` takes the same tags' locks, so the order in which
+/// their effects reach the stream is one in which the master could have run
+/// them one after another. On both I/O loops.
 #[test]
 fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof() {
+    overlapping_tags_end_the_same("tokio");
+}
+
+#[test]
+fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof_uring() {
+    overlapping_tags_end_the_same("uring");
+}
+
+fn overlapping_tags_end_the_same(io: &str) {
     let mut master = Server::start(&[
+        "--io-model",
+        io,
         "--lua-parallel-scripts",
         "true",
         "--aof",
@@ -1020,7 +1253,7 @@ fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof() {
         "always",
     ]);
     let port = master.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let replica = Server::start(&["--io-model", io, "--replicaof", "127.0.0.1", &port]);
     let (mut m, mut r) = (master.conn(), replica.conn());
     wait_until("the replica's link to come up", 30, || {
         r.info("replication", "master_link_status") == "up"
@@ -1032,6 +1265,23 @@ fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof() {
     const TAGS: usize = 5;
     let key = |tag: usize| format!("{{acct{tag}}}:balance");
     let mp = master.port;
+    // A client's write of two tags at once, read by the scripts.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut c = Conn::connect(mp);
+            let mut n = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) || n < 200 {
+                let (i, j) = (n % TAGS, (n * 3 + 1) % TAGS);
+                let (ki, kj) = (format!("{}:x", key(i)), format!("{}:x", key(j)));
+                let v = format!("m{n}");
+                assert!(c.cmd(&["MSET", &ki, &v, &kj, &v]).ok());
+                n += 1;
+            }
+            n
+        })
+    };
     let clients: Vec<_> = (0..8)
         .map(|client| {
             let sha = sha.clone();
@@ -1064,10 +1314,12 @@ fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof() {
         .collect();
     let ran: usize = clients.into_iter().map(|c| c.join().unwrap()).sum();
     assert_eq!(ran, 8 * 400);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(writer.join().unwrap() >= 200);
     assert!(m.cmd(&["SET", "last", "1"]).ok());
 
     let keys: Vec<String> = (0..TAGS)
-        .flat_map(|tag| [key(tag), format!("{}:log", key(tag))])
+        .flat_map(|tag| [key(tag), format!("{}:log", key(tag)), format!("{}:x", key(tag))])
         .collect();
     let dump = |c: &mut Conn| -> Vec<V> {
         keys.iter()
@@ -1081,7 +1333,7 @@ fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof() {
     // Every unit moved is somewhere: the balances add up to 0.
     let total: i64 = before[..]
         .iter()
-        .step_by(2)
+        .step_by(3)
         .map(|v| v.s().parse::<i64>().unwrap())
         .sum();
     assert_eq!(total, 0);
