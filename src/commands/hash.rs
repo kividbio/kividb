@@ -629,7 +629,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // No count arg — return single random field name
                     let Some(count) = count else {
                         let idx = rand::random::<usize>() % inner.len();
-                        let field = inner.keys().nth(idx).unwrap();
+                        let (field, _) = inner.get_index(idx).unwrap();
                         return Some(resp_bulk(&crate::commands::helpers::name_to_bytes(field)));
                     };
                     let push = |result: &mut Vec<Vec<u8>>, f: &String, v: &Arc<[u8]>| {
@@ -646,32 +646,37 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                     };
 
-                    let fields: Vec<(&String, &Arc<[u8]>)> = inner.iter().collect();
-                    let len = fields.len();
+                    let len = inner.len();
 
                     // Positive count: unique fields up to count
                     // Negative count: allow repeats, abs(count) total
                     let mut result: Vec<Vec<u8>> = Vec::new();
 
-                    if count >= 0 {
-                        let take = (count as usize).min(len);
-                        // Shuffle via partial Fisher-Yates in index space
-                        let mut indices: Vec<usize> = (0..len).collect();
-                        for i in 0..take {
-                            let j = i + rand::random::<usize>() % (len - i);
-                            indices.swap(i, j);
-                        }
-                        for &idx in &indices[..take] {
-                            let (f, v) = fields[idx];
+                    if count >= 0 && (count as u64) >= len as u64 {
+                        // As many as there are, or more: all of them, in
+                        // the order `HGETALL` has, as Redis answers.
+                        for (f, v) in inner.iter() {
                             push(&mut result, f, v);
+                        }
+                    } else if count >= 0 {
+                        // Distinct positions, in random order, each read by
+                        // its index: the work is the count, not the size of
+                        // the hash.
+                        let picks =
+                            rand::seq::index::sample(&mut rand::thread_rng(), len, count as usize);
+                        for idx in picks {
+                            if let Some((f, v)) = inner.get_index(idx) {
+                                push(&mut result, f, v);
+                            }
                         }
                     } else {
                         // Negative count — sample with replacement
                         let take = count.unsigned_abs() as usize;
                         for _ in 0..take {
                             let idx = rand::random::<usize>() % len;
-                            let (f, v) = fields[idx];
-                            push(&mut result, f, v);
+                            if let Some((f, v)) = inner.get_index(idx) {
+                                push(&mut result, f, v);
+                            }
                         }
                     }
 

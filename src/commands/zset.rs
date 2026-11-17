@@ -2129,11 +2129,9 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
         }
         Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
-            // Collect into a Vec for index-based random access
-            let entries: Vec<(&ZMember, f64)> =
-                inner.members.iter().map(|(k, &v)| (k, v)).collect();
+            let len = inner.members.len();
 
-            if entries.is_empty() {
+            if len == 0 {
                 return if cmd.len() > 2 {
                     resp_array(vec![])
                 } else {
@@ -2143,36 +2141,43 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
 
             // No count argument → return single random member as bulk string
             if cmd.len() == 2 {
-                let idx = pseudo_rand(entries.len());
-                return resp_bulk(entries[idx].0.as_ref());
+                let at = pseudo_rand(len);
+                return match inner.members.keys().nth(at) {
+                    Some(member) => resp_bulk(member.as_ref()),
+                    None => resp_null_bulk(),
+                };
             }
 
             let count_arg = count_arg.unwrap_or(1);
 
             let mut result: Vec<Vec<u8>> = Vec::new();
-            if count_arg >= 0 {
-                // Distinct: Fisher-Yates partial shuffle
-                let n = (count_arg as usize).min(entries.len());
-                let mut indices: Vec<usize> = (0..entries.len()).collect();
-                for i in 0..n {
-                    let j = i + pseudo_rand(entries.len() - i);
-                    indices.swap(i, j);
-                }
-                for &i in &indices[..n] {
-                    let (member, score) = entries[i];
+            if count_arg >= 0 && (count_arg as u64) >= len as u64 {
+                // As many as there are, or more: all of them, as Redis
+                // answers, from the highest score down.
+                for ((OrderedFloat(score), member), ()) in inner.by_score.iter().rev() {
                     push_member_score(
                         &mut result,
                         resp,
                         member.as_ref(),
-                        with_scores.then_some(score),
+                        with_scores.then_some(*score),
                     );
                 }
             } else {
-                // Repetition allowed
-                let n = count_arg.unsigned_abs() as usize;
-                for _ in 0..n {
-                    let i = pseudo_rand(entries.len());
-                    let (member, score) = entries[i];
+                // The positions of the members to give, in the order to give
+                // them in: distinct ones for a positive count, any for a
+                // negative one. Found in one walk of the table, which, short
+                // of an index by position, is as little as it can be: no
+                // copy of the members, and no more of the table than the
+                // last position picked.
+                let picks: Vec<usize> = if count_arg >= 0 {
+                    rand::seq::index::sample(&mut rand::thread_rng(), len, count_arg as usize)
+                        .into_vec()
+                } else {
+                    (0..count_arg.unsigned_abs() as usize)
+                        .map(|_| pseudo_rand(len))
+                        .collect()
+                };
+                for (member, score) in members_at(&inner, &picks) {
                     push_member_score(
                         &mut result,
                         resp,
@@ -2186,6 +2191,32 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
+}
+
+/// The members at the given positions of the member table (any order, a
+/// position may repeat), with their scores, in the order the positions are
+/// given in. The table is walked once, to the highest position.
+fn members_at<'a>(inner: &'a SortedSetInner, picks: &[usize]) -> Vec<(&'a ZMember, f64)> {
+    let mut slots: Vec<usize> = (0..picks.len()).collect();
+    slots.sort_unstable_by_key(|&slot| picks[slot]);
+    let mut out: Vec<Option<(&ZMember, f64)>> = vec![None; picks.len()];
+    let mut walk = inner.members.iter();
+    // The table position of the last member read, and that member.
+    let mut at: Option<usize> = None;
+    let mut last: Option<(&ZMember, f64)> = None;
+    for slot in slots {
+        let want = picks[slot];
+        if at != Some(want) {
+            let skip = match at {
+                Some(at) => want - at - 1,
+                None => want,
+            };
+            last = walk.nth(skip).map(|(member, &score)| (member, score));
+            at = Some(want);
+        }
+        out[slot] = last;
+    }
+    out.into_iter().flatten().collect()
 }
 
 /// A random index below `n`, for ZRANDMEMBER. It used to be derived from
