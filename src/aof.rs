@@ -4741,6 +4741,65 @@ mod ts_option_replay_tests {
         assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
     }
 
+    /// A replica's own log of a `TS.INCRBY` its 1.2.0 master sent, whose
+    /// time above `i64::MAX` came as the negative number 1.2.0 replied: the
+    /// `TIMESTAMP` tail the feed did not see is read as the same 64 bits
+    /// the mark carries, not refused and the sample lost (#611). The
+    /// unsigned tail the feed writes now, and a label's value `TIMESTAMP`,
+    /// replay as they did.
+    #[test]
+    fn a_replicas_relog_of_a_1_2_0_incrby_time_replays() {
+        let max = u64::MAX.to_string();
+        let at_616 = (-616_i64 as u64).to_string();
+        let store = replayed(&[
+            vec![
+                "TS.INCRBY",
+                "bad",
+                "3",
+                "timestamp",
+                at_616.as_str(),
+                "TIMESTAMP",
+                "-616",
+            ],
+            vec![
+                "TS.INCRBY",
+                "good",
+                "3",
+                "timestamp",
+                at_616.as_str(),
+                "TIMESTAMP",
+                at_616.as_str(),
+            ],
+            vec![
+                "TS.INCRBY",
+                "lbl",
+                "3",
+                "timestamp",
+                max.as_str(),
+                "LABELS",
+                "x",
+                "TIMESTAMP",
+                "-1",
+            ],
+        ]);
+        let samples = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner
+                    .read()
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (*t, *v))
+                    .collect::<Vec<_>>(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert_eq!(samples("bad"), [(-616_i64 as u64, 3.0)]);
+        assert_eq!(samples("good"), [(-616_i64 as u64, 3.0)]);
+        assert_eq!(samples("lbl"), [(u64::MAX, 3.0)]);
+    }
+
     /// A compaction's destination past its time (its `DEL` not yet in the
     /// log), deleted, made again and given its source again; and a source
     /// renamed. Replayed, the links are as the master had them (#593).

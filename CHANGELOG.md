@@ -333,6 +333,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A replica of 1.2.0 no longer writes a `TS.INCRBY` its own AOF replay
+  refuses (#611).** A 1.2.0 master sends a time above `i64::MAX` as the
+  negative number it replied, and the replica's re-log kept that tail next
+  to the unsigned time of 1.2.1's mark — a record the replica's own replay
+  then refused, losing the sample. A `TIMESTAMP` as 1.2.0 sent one is now
+  read as the same 64 bits on replay, in an applied command as in a
+  `TS.ADD` or `TS.MADD`, so the re-logged record — and any such record an
+  earlier 1.2.1 already wrote — replays at the time 1.2.0 kept.
+
 - **A replica continued by a dataset digest keeps the new stream's id as
   its resync point (#402).** A master killed and started again from its
   AOF begins a new stream; a replica that proved its dataset was that
