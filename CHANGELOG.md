@@ -14,10 +14,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a replica of an earlier release cannot apply either.
 - **No downgrade once a Bloom filter exists.** A snapshot or an AOF
   checkpoint with a Bloom filter in it cannot be read by an earlier release.
-- **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
-  and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
   Delete the filters (or move them off with `DUMP`, which Redis restores)
   before going back.
+- **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
+  and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
   now propagates an `XADD … IDMP` that was a duplicate (#655), and a
   replica of an earlier release refuses it ("equal or smaller than the
