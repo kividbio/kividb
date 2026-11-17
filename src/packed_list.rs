@@ -1411,7 +1411,47 @@ impl PackedList {
             }
             Chunks::Many(m) => m,
         };
-        // One pass over the chunks from just before the first changed to
+        if to - from < 2 {
+            // One or two chunks changed (an `LREM` of a few): taken out or
+            // merged where they are.
+            m.widen(from, to);
+            let mut to = to;
+            let mut c = to + 1;
+            while c > from {
+                c -= 1;
+                if m.chunks[c].count() == 0 {
+                    m.chunks.remove(c);
+                    m.removed(c);
+                    to = to.saturating_sub(1);
+                }
+            }
+            let mut c = from.saturating_sub(1);
+            let mut end = (to + 1).min(m.chunks.len().saturating_sub(1));
+            while c < end && c + 1 < m.chunks.len() {
+                if m.chunks[c].count() + m.chunks[c + 1].count() <= CHUNK_ENTRIES {
+                    let next = m.chunks.remove(c + 1).unwrap_or_default();
+                    m.chunks[c].append(&next);
+                    m.removed(c + 1);
+                    m.widen(c, c);
+                    end -= 1;
+                } else {
+                    c += 1;
+                }
+            }
+            if !m.chunks.is_empty() {
+                let last = (to + 1).min(m.chunks.len() - 1);
+                for chunk in m.chunks.range_mut(from.saturating_sub(1).min(last)..=last) {
+                    chunk.shrink_if_slack();
+                }
+            }
+            if m.chunks.len() > 1 {
+                m.clamp();
+                m.tighten_run();
+            }
+            self.settle();
+            return;
+        }
+        // More: one pass over the chunks from just before the first changed to
         // just after the last: an emptied chunk is passed over, one that
         // fits into the chunk kept before it is appended to it, any other
         // is moved down into the next place; then the places left over go
