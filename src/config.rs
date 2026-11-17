@@ -2030,6 +2030,9 @@ impl Config {
                                 | "lazyfree-lazy-user-del"
                                 | "latency-tracking"
                                 | "latency-tracking-info-percentiles"
+                                | "set-max-intset-entries"
+                                | "set-max-listpack-entries"
+                                | "set-max-listpack-value"
                                 | "rdbchecksum"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),

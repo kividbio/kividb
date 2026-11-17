@@ -584,6 +584,72 @@ fn order_of_pairs_shared(ctx: &Ctx) -> crate::write_order::OrderGuard {
     crate::write_order::lock_keys_shared(*ctx.selected_db, ctx.cmd[1..].iter().step_by(2).copied())
 }
 
+/// How a script runs (`tag_locks`): the tags of its `KEYS`, if every one
+/// carries a tag, which it is held to; and whether it runs beside others,
+/// under those tags' locks, which it does once its caller has seen it to be
+/// quick
+/// (`tag_locks::allow_next_script`) — not inside a transaction or another
+/// script, which hold the gate alone already. `applied`: it comes from the
+/// master's stream.
+///
+/// Counted for `INFO` here, where it is decided (`stats::scripts`), unless it
+/// is applied from a master or replayed from the AOF. Only a script comes
+/// here: nothing is added to any other command's way.
+#[inline]
+fn script_mode<'a>(
+    cmd: &[&'a [u8]],
+    name: &str,
+    tag_locks: bool,
+    applied: bool,
+) -> (Option<crate::tag_locks::ScriptTags<'a>>, bool) {
+    let allowed_beside = crate::tag_locks::take_next_script_allowed();
+    let script_tags = if tag_locks {
+        crate::tag_locks::script_tags(cmd)
+    } else {
+        None
+    };
+    let in_another = crate::command_gate::alone_on_this_thread();
+    let beside_others = script_tags.is_some() && allowed_beside && !in_another;
+    #[cfg(feature = "lua")]
+    if !applied {
+        if beside_others {
+            crate::stats::scripts::ran_beside_others();
+        } else {
+            count_script_alone(cmd, name, tag_locks, in_another);
+        }
+    }
+    #[cfg(not(feature = "lua"))]
+    let _ = (name, applied);
+    (script_tags, beside_others)
+}
+
+/// Why a script runs alone, counted (`stats::scripts::Alone`): out of line,
+/// off the way of the scripts that run beside others.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn count_script_alone(cmd: &[&[u8]], name: &str, tag_locks: bool, in_another: bool) {
+    use crate::stats::scripts::Alone;
+    use crate::tag_locks::ScriptKeys;
+    if crate::expiry::replaying() {
+        return;
+    }
+    let why = if !tag_locks {
+        Alone::ParallelOff
+    } else if in_another {
+        Alone::InTransaction
+    } else if name.starts_with("FCALL") {
+        Alone::Function
+    } else {
+        match crate::tag_locks::script_keys(cmd) {
+            ScriptKeys::None => Alone::NoKeys,
+            ScriptKeys::Untagged => Alone::NoTag,
+            ScriptKeys::Tagged => Alone::NotQuick,
+        }
+    };
+    crate::stats::scripts::ran_alone(why);
+}
+
 /// For a script held to a hash tag: the refusal of a `SORT` or `SORT_RO`
 /// whose `BY` or `GET` pattern can name keys outside the tag
 /// (`generics::sort_pattern_outside`). Asked before the command runs, so
@@ -597,10 +663,10 @@ fn sort_pattern_outside_the_tag(name: &str, cmd: &[&[u8]]) -> Option<String> {
         crate::commands::generics::sort_pattern_outside(cmd, crate::tag_locks::script_may_touch)?;
     Some(format!(
         "ERR Script attempted to run '{}' with the pattern '{}', which looks at keys it does \
-         not name outside the hash tag '{}' of its KEYS (lua-parallel-scripts)",
+         not name outside the {} of its KEYS (lua-parallel-scripts)",
         name.to_ascii_lowercase(),
         String::from_utf8_lossy(pattern),
-        crate::tag_locks::script_tag_for_message()
+        crate::tag_locks::script_tags_for_message()
     ))
 }
 
@@ -629,14 +695,14 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         return resp_error("ERR SELECT is not allowed in cluster mode");
     }
 
-    // A script running under its tag's lock keeps to its tag (`tag_locks`).
+    // A script held to the tags of its KEYS keeps to them (`tag_locks`).
     if crate::tag_locks::in_script() {
         let outside = if crate::tag_locks::sees_the_whole_keyspace(name2) {
             Some(format!(
                 "ERR Script attempted to run '{}', which looks at keys it does not name, while \
-                 running under the hash tag '{}' of its KEYS (lua-parallel-scripts)",
+                 running under the {} of its KEYS (lua-parallel-scripts)",
                 name2.to_ascii_lowercase(),
-                crate::tag_locks::script_tag_for_message()
+                crate::tag_locks::script_tags_for_message()
             ))
         } else {
             crate::keyspec::key_positions(name2, &ctx.cmd)
@@ -645,10 +711,10 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
                 .find(|key| !crate::tag_locks::script_may_touch(key))
                 .map(|key| {
                     format!(
-                        "ERR Script attempted to access the key '{}', which is outside the hash \
-                         tag '{}' of its KEYS (lua-parallel-scripts)",
+                        "ERR Script attempted to access the key '{}', which is outside the {} \
+                         of its KEYS (lua-parallel-scripts)",
                         String::from_utf8_lossy(key),
-                        crate::tag_locks::script_tag_for_message()
+                        crate::tag_locks::script_tags_for_message()
                     )
                 })
                 .or_else(|| sort_pattern_outside_the_tag(name2, &ctx.cmd))
@@ -669,9 +735,9 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         {
             return resp_error(&format!(
                 "ERR Script attempted to SELECT {db}, the first database other than 0 \
-                 selected on this server, while running beside other scripts under the hash \
-                 tag '{}' of its KEYS (lua-parallel-scripts)",
-                crate::tag_locks::script_tag_for_message()
+                 selected on this server, while running beside other scripts under the {} \
+                 of its KEYS (lua-parallel-scripts)",
+                crate::tag_locks::script_tags_for_message()
             ));
         }
     }
@@ -1386,19 +1452,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     let overrun = || false;
     const SLICE: std::time::Duration = std::time::Duration::from_millis(10);
     // Scripts by hash tag, when that is switched on (`tag_locks`). A script
-    // whose keys share a tag is held to it, however it is run. One that its
-    // caller has seen to be a quick one also runs beside other scripts: it
-    // takes the gate as a command does, and its tag's lock below. Not inside
-    // a transaction or another script: those hold the gate alone already.
+    // whose keys all carry a tag — one, or several — is held to those tags,
+    // however it is run. One that its caller has seen to be a quick one also
+    // runs beside other scripts: it takes the gate as a command does, and
+    // its tags' locks below. Not inside a transaction or another script:
+    // those hold the gate alone already.
     let tag_locks = crate::tag_locks::enabled();
-    let allowed_beside = any_script && crate::tag_locks::take_next_script_allowed();
-    let script_tag: Option<&[u8]> = if tag_locks && any_script {
-        crate::tag_locks::script_tag(&ctx.cmd)
+    let (script_tags, beside_others) = if any_script {
+        script_mode(&ctx.cmd, name, tag_locks, ctx.apply_replication)
     } else {
-        None
+        (None, false)
     };
-    let beside_others =
-        script_tag.is_some() && allowed_beside && !crate::command_gate::alone_on_this_thread();
     // A command that looks at keys it does not name must not find a script
     // part-way through: it waits for all of them (`takes_the_gate_alone`).
     // On a thread that holds the gate already, what either takes of it is
@@ -1536,16 +1600,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         }
     }
 
-    // The tag's lock, for a script that runs under one; and for a command
-    // from a client, the lock of every tagged key it names, so that it finds
-    // those keys as they were before a script or as they are after it.
-    // Before the order of writes below, for both, so that the two are always
+    // The tags' locks, for a script that runs under its tags; and for a
+    // command from a client, the lock of every tagged key it names, so that
+    // it finds those keys as they were before a script or as they are after
+    // it. Both take several lowest first (`tag_locks`), inside the write
+    // gate, and before the order of writes below, so that they are always
     // taken the same way round.
-    let _script_tag = script_tag.map(|tag| {
+    let _script_tags = script_tags.map(|tags| {
         if beside_others {
-            crate::tag_locks::lock_for_script(tag)
+            crate::tag_locks::lock_for_script(&tags)
         } else {
-            crate::tag_locks::hold_script_to(tag)
+            crate::tag_locks::hold_script_to(&tags)
         }
     });
     let _key_tags = if tag_locks

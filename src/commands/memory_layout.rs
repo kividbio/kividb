@@ -290,10 +290,14 @@ mod tests {
                     }
                     set
                 });
-                let estimate = set.allocation_size()
-                    + sampled(set.len(), usize::MAX, || {
-                        set.iter().map(|m| arc_slice(m.len()))
-                    });
+                // A block (up to 128 members) is the one allocation; a
+                // table's members are blocks of their own.
+                let estimate = set.compact_bytes().unwrap_or_else(|| {
+                    set.allocation_size()
+                        + sampled(set.len(), usize::MAX, || {
+                            set.iter().map(|m| arc_slice(m.len()))
+                        })
+                });
                 assert_eq!(estimate, bytes, "{members} members");
             }
         });

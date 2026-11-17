@@ -12,12 +12,13 @@
 
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{lazy_expire_on_read, long_work, parse_utf8};
-use crate::member_set::MemberSet;
+use crate::member_set::{Member, MemberSet};
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use parking_lot::{RwLock, RwLockReadGuard};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 pub(super) type Set = Arc<RwLock<MemberSet>>;
@@ -124,12 +125,13 @@ fn read_all<'a>(sets: &[&'a Set]) -> Vec<RwLockReadGuard<'a, MemberSet>> {
 ///
 /// It walks the smallest set and looks each member up in the others, smallest
 /// first, so it costs O(smallest x number of sets) and never touches the rest
-/// of a big set (#759). A missing key is an empty set, and so is the result.
+/// of a big set (#759). Two arrays of integers (#297) are merged instead, as
+/// sorted lists are. A missing key is an empty set, and so is the result.
 /// The sets are read-locked together, so the answer is of one moment.
 pub(super) fn inter_each(
     sets: &[Option<Set>],
     limit: usize,
-    mut each: impl FnMut(&Arc<[u8]>),
+    mut each: impl FnMut(Member<'_>),
 ) -> usize {
     if sets.iter().any(Option::is_none) {
         return 0;
@@ -142,14 +144,29 @@ pub(super) fn inter_each(
     };
     let walk = || {
         let mut count = 0usize;
-        for member in smallest.iter() {
-            if others.iter().all(|other| other.contains(member)) {
-                each(member);
-                count += 1;
-                if limit > 0 && count >= limit {
-                    break;
-                }
+        let mut found = |member: Member<'_>| {
+            each(member);
+            count += 1;
+            if limit > 0 && count >= limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
+        };
+        let merged = match others {
+            [other] => smallest.try_each_against(other, true, &mut found),
+            _ => None,
+        };
+        if merged.is_none() {
+            // The form of each set is looked at once a lookup, the walked
+            // one's once in all.
+            let _ = smallest.try_each(|member| {
+                if others.iter().all(|other| other.contains_member(&member)) {
+                    found(member)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
         }
         count
     };
@@ -163,7 +180,7 @@ pub(super) fn inter_each(
 pub(super) fn diff_each(
     sets: &[Option<Set>],
     limit: usize,
-    mut each: impl FnMut(&Arc<[u8]>),
+    mut each: impl FnMut(Member<'_>),
 ) -> usize {
     let Some(Some(first)) = sets.first() else {
         return 0;
@@ -183,14 +200,29 @@ pub(super) fn diff_each(
     let others = guards;
     let walk = || {
         let mut count = 0usize;
-        for member in first.iter() {
-            if others.iter().all(|other| !other.contains(member)) {
-                each(member);
-                count += 1;
-                if limit > 0 && count >= limit {
-                    break;
-                }
+        let mut found = |member: Member<'_>| {
+            each(member);
+            count += 1;
+            if limit > 0 && count >= limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
+        };
+        // Two arrays, or two blocks (#297): merged, or looked up by the
+        // fingerprints the block has.
+        let paired = match others.as_slice() {
+            [other] => first.try_each_against(other, false, &mut found),
+            _ => None,
+        };
+        if paired.is_none() {
+            let _ = first.try_each(|member| {
+                if others.iter().all(|other| !other.contains_member(&member)) {
+                    found(member)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
         }
         count
     };
@@ -202,19 +234,46 @@ pub(super) fn diff_each(
 /// for the whole build would keep a writer of a small set waiting for the
 /// walk of a big one. A write of several keys still cannot land part-way: it
 /// takes the command gate alone (#729).
-pub(super) fn union_of(sets: &[Option<Set>]) -> Vec<Arc<[u8]>> {
+pub(super) fn union_of(sets: &[Option<Set>]) -> MemberSet {
     let handles = distinct(sets.iter().flatten());
     let sizes: Vec<usize> = handles.iter().map(|set| set.read().len()).collect();
     let total = sizes.iter().sum::<usize>();
     long_work(total, || {
+        // At least as big as the biggest: the table at once if that is.
         let mut result = MemberSet::with_capacity(sizes.iter().copied().max().unwrap_or(0));
         for set in &handles {
-            for member in set.read().iter() {
-                result.insert(Arc::clone(member));
-            }
+            // A table's member is shared as it is; another set's is copied
+            // only if it is new.
+            let _ = set.read().try_each(|member| {
+                result.insert_member(&member);
+                ControlFlow::<()>::Continue(())
+            });
         }
-        result.into_iter().collect()
+        result
     })
+}
+
+/// A set that is to be made of members `walk` hands over, no more than
+/// `bound` of them, all different: `SINTERSTORE` and `SDIFFSTORE`.
+///
+/// Built as members come when it may be an array or a block, so that it is
+/// what adding them one by one makes, as in Redis; built from all of them
+/// at once otherwise, so that a big one is not a block first.
+pub(super) fn collect_set(
+    bound: usize,
+    walk: impl FnOnce(&mut dyn FnMut(Member<'_>)),
+) -> MemberSet {
+    if bound <= crate::member_set::intset_max().max(crate::member_set::packed_entries()) {
+        let mut set = MemberSet::new();
+        walk(&mut |member| {
+            set.insert_member(&member);
+        });
+        set
+    } else {
+        let mut all = Vec::new();
+        walk(&mut |member| all.push(member.to_shared()));
+        MemberSet::from_shared(all)
+    }
 }
 
 fn union_card(sets: &[Option<Set>], limit: usize) -> usize {
@@ -226,12 +285,18 @@ fn union_card(sets: &[Option<Set>], limit: usize) -> usize {
         return if limit > 0 { len.min(limit) } else { len };
     }
 
-    let mut seen: crate::member_set::MemberSet = crate::member_set::MemberSet::new();
+    let biggest = sets.iter().map(|set| set.read().len()).max().unwrap_or(0);
+    let mut seen = MemberSet::with_capacity(biggest);
     for set in sets {
-        for member in set.read().iter() {
-            if seen.insert(Arc::clone(member)) && limit > 0 && seen.len() >= limit {
-                return limit;
+        let stopped = set.read().try_each(|member| {
+            if seen.insert_member(&member) && limit > 0 && seen.len() >= limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
+        });
+        if stopped.is_break() {
+            return limit;
         }
     }
     seen.len()
@@ -371,9 +436,7 @@ mod tests {
         let mut tail = vec![a.clone()];
         tail.extend((0..60_000).map(|i| [b.clone(), None][i % 2].clone()));
         assert_eq!(diff_each(&tail, 0, |_| {}), 1); // a - b = {1}
-        let mut union = union_of(&many);
-        union.sort();
-        assert_eq!(union.len(), 5);
+        assert_eq!(union_of(&many).len(), 5);
         assert_eq!(distinct(many.iter().flatten()).len(), 3);
     }
 

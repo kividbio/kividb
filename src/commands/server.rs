@@ -1342,6 +1342,42 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                                  9223372036854775807 inclusive",
                 )),
             },
+            // The most members a set of integers keeps as an array (#297).
+            // Read as Redis reads a number (`string2ll`): no `+`, no
+            // leading zero.
+            // The most members, and the longest member, a set keeps in one
+            // block: no more than a block holds, and `CONFIG GET` says what
+            // was kept.
+            "set-max-intset-entries" | "set-max-listpack-entries" | "set-max-listpack-value" => {
+                match crate::member_set::canonical_i64(value.as_bytes()) {
+                    Some(limit) if limit >= 0 => {
+                        let limit = limit as usize;
+                        let kept = match param.as_str() {
+                            "set-max-intset-entries" => {
+                                crate::member_set::set_intset_max(limit);
+                                limit
+                            }
+                            "set-max-listpack-entries" => {
+                                crate::member_set::set_packed_entries(limit)
+                            }
+                            _ => crate::member_set::set_packed_value(limit),
+                        };
+                        REMEMBERED_CONFIG
+                            .lock()
+                            .insert(param.clone(), kept.to_string());
+                        Some(resp_simple("OK"))
+                    }
+                    Some(_) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument must be between 0 and \
+                         9223372036854775807 inclusive",
+                    ))),
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument couldn't be parsed into an integer",
+                    ))),
+                }
+            }
             // When the AOF is synced (#513): under `always`, before each
             // reply to a write, as in Redis. `no` is taken as `everysec`.
             "appendfsync" => match value.to_ascii_lowercase().as_str() {
@@ -1363,6 +1399,8 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                      argument(s) must be one of the following: always, everysec, no",
                 )),
             },
+            // What the latency monitor records (#158): remembered too, for
+            // `CONFIG GET`.
             // Whether a reply to a write waits for its AOF record (#147).
             "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
                 "yes" | "no" => {
@@ -1992,9 +2030,6 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("list-max-listpack-size", "-2"),
             ("list-max-ziplist-size", "-2"),
             ("list-compress-depth", "0"),
-            ("set-max-intset-entries", "512"),
-            ("set-max-listpack-entries", "128"),
-            ("set-max-listpack-value", "64"),
             ("zset-max-listpack-entries", "128"),
             ("zset-max-listpack-value", "64"),
             ("zset-max-ziplist-entries", "128"),
@@ -2026,6 +2061,20 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
+        .chain([
+            (
+                "set-max-intset-entries".to_string(),
+                crate::member_set::DEFAULT_INTSET_MAX.to_string(),
+            ),
+            (
+                "set-max-listpack-entries".to_string(),
+                crate::member_set::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "set-max-listpack-value".to_string(),
+                crate::member_set::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+        ])
         .collect(),
     )
 });
@@ -4617,6 +4666,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "evicted_scripts:{}\r\n",
                     crate::stats::EVICTED_SCRIPTS.load(Ordering::Relaxed)
                 ));
+                // How scripts were run: beside others, or alone and why (#871).
+                #[cfg(feature = "lua")]
+                crate::stats::scripts::info(&mut out);
                 // Slowlog totals (Redis 8.8). Milliseconds to two places,
                 // as Redis writes them (`0.00`).
                 let (slow_count, slow_us_sum, slow_us_max) = ctx.slowlog.totals();
@@ -5381,6 +5433,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
                     crate::stats::LAST_SAMPLE_COMMANDS.store(0, Ordering::Relaxed);
                     crate::stats::reset_error_reply_stats();
+                    #[cfg(feature = "lua")]
+                    crate::stats::scripts::reset();
                     ctx.slowlog.reset_totals();
                     Some(resp_simple("OK"))
                 }

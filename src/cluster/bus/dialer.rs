@@ -67,7 +67,7 @@ pub async fn exchange(
 ) -> Result<Option<BusMessage>, String> {
     let mut sock = connect(state, addr, timeout).await?;
     match round_trip(state, &mut sock, addr, msg, timeout).await {
-        Answer::Reply(reply) => Ok(Some(reply)),
+        Answer::Reply(reply) => Ok(Some(*reply)),
         // Closed, or no reply in time.
         Answer::Closed | Answer::TimedOut => Ok(None),
         Answer::Failed(e) => Err(e),
@@ -76,7 +76,8 @@ pub async fn exchange(
 
 /// How a request on a connection ended.
 enum Answer {
-    Reply(BusMessage),
+    /// Boxed: a heartbeat is far larger than the other answers.
+    Reply(Box<BusMessage>),
     /// The peer closed the connection without answering.
     Closed,
     /// No answer in time.
@@ -124,7 +125,7 @@ async fn round_trip(
                 if consumed != buf.len() {
                     return Answer::Failed(format!("{addr} sent more than one reply"));
                 }
-                return Answer::Reply(reply);
+                return Answer::Reply(Box::new(reply));
             }
             Ok(None) => {
                 if crate::cluster::bus::message::exceeds_buffer_limit(&buf) {
@@ -171,7 +172,7 @@ async fn ping_on_link(
             return Err(format!("no connection to {addr}"));
         };
         match round_trip(state, sock, addr, ping, timeout).await {
-            Answer::Reply(reply) => return Ok(Some(reply)),
+            Answer::Reply(reply) => return Ok(Some(*reply)),
             Answer::Closed if reused && attempt == 0 => {
                 *held = None;
             }
@@ -308,6 +309,7 @@ pub(super) fn our_ping(state: &ClusterState) -> BusMessage {
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,
+        sender_shard_id: Some(me.shard_id),
         gossip,
         slot_claims: state.my_slot_claims(),
     }

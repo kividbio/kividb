@@ -124,13 +124,17 @@ fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
             &port.to_string(),
             "--bind",
             "127.0.0.1",
-            "--io-model",
-            "tokio",
             "--threads",
             "4",
             "--update-check",
             "no",
         ])
+        .args(
+            (!extra.iter().any(|a| a == "--io-model"))
+                .then_some(["--io-model", "tokio"])
+                .into_iter()
+                .flatten(),
+        )
         .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -278,7 +282,7 @@ fn a_tagged_script_is_held_to_its_tag() {
                 "run {run}: {refused:?}"
             );
         }
-        // No keys, an untagged key, two tags: not held to anything.
+        // No keys, an untagged key: not held to anything.
         assert_eq!(
             c.cmd(&["EVAL", READS_A_KEY, "0", "elsewhere"]),
             V::Str("v".into())
@@ -288,9 +292,30 @@ fn a_tagged_script_is_held_to_its_tag() {
             V::Str("theirs".into())
         );
         assert_eq!(
-            c.cmd(&["EVAL", READS_A_KEY, "2", "{q}:a", "{r}:a", "elsewhere"]),
+            c.cmd(&["EVAL", READS_A_KEY, "2", "{q}:a", "plain", "elsewhere"]),
             V::Str("v".into())
         );
+        // Keys of two tags: held to both (#871).
+        assert_eq!(
+            c.cmd(&["EVAL", READS_A_KEY, "2", "{r}:a", "{q}:a", "{q}:b"]),
+            V::Str("mine".into()),
+            "run {run}"
+        );
+        assert_eq!(
+            c.cmd(&["EVAL", READS_A_KEY, "2", "{r}:a", "{q}:a", "{r}:b"]),
+            V::Str("theirs".into()),
+            "run {run}"
+        );
+        for outside in ["elsewhere", "{s}:b"] {
+            let refused = c.cmd(&["EVAL", READS_A_KEY, "2", "{r}:a", "{q}:a", outside]);
+            assert!(
+                refused.is_err()
+                    && refused
+                        .s()
+                        .contains("outside the hash tags 'r', 'q' of its KEYS"),
+                "run {run}: {outside}: {refused:?}"
+            );
+        }
     }
 
     // Nor may it look at keys it does not name.
@@ -807,4 +832,570 @@ fn a_script_beside_others_may_not_create_the_first_index() {
     assert!(c.cmd(&["FT.CREATE", "outside", "SCHEMA", "f", "TEXT"]).ok());
     let second = c.cmd(&["EVALSHA", &sha, "1", "{q}:k", "second"]);
     assert!(second.ok(), "{second:?}");
+}
+
+// ── INFO: how scripts were run (#871) ───────────────────────────────────────
+
+/// The `scripts_*` counts of `INFO stats`.
+fn script_counts(c: &mut Conn) -> std::collections::BTreeMap<String, u64> {
+    c.cmd(&["INFO", "stats"])
+        .s()
+        .lines()
+        .filter(|line| line.starts_with("scripts_"))
+        .map(|line| {
+            let (name, n) = line.trim().split_once(':').unwrap();
+            (name.to_string(), n.parse().unwrap())
+        })
+        .collect()
+}
+
+/// The counts that `run` moved, and by how much.
+fn moved(c: &mut Conn, run: impl FnOnce(&mut Conn)) -> Vec<(String, u64)> {
+    let before = script_counts(c);
+    run(c);
+    let after = script_counts(c);
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    after
+        .into_iter()
+        .filter_map(|(name, n)| {
+            let was = before[&name];
+            assert!(n >= was, "{name} went down");
+            (n > was).then(|| (name, n - was))
+        })
+        .collect()
+}
+
+fn one(names: &[&str]) -> Vec<(String, u64)> {
+    let mut all: Vec<(String, u64)> = names.iter().map(|n| (n.to_string(), 1)).collect();
+    all.sort();
+    all
+}
+
+/// `INFO stats` says how scripts were run: beside others, or alone and why,
+/// and which were handed to the script-runner thread or offloaded to the
+/// blocking pool. Each count moves in the case it names, and in no other;
+/// a command that is not a script moves none; `CONFIG RESETSTAT` sets them
+/// all to 0.
+#[test]
+fn info_counts_how_scripts_were_run() {
+    let server = Server::start(&["--lua-parallel-scripts", "true"]);
+    let mut c = server.conn();
+    let counts = script_counts(&mut c);
+    assert_eq!(
+        counts.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "scripts_handed_to_runner",
+            "scripts_offloaded_to_pool",
+            "scripts_run_alone_function",
+            "scripts_run_alone_in_transaction",
+            "scripts_run_alone_no_keys",
+            "scripts_run_alone_no_tag",
+            "scripts_run_alone_not_quick",
+            "scripts_run_alone_parallel_off",
+            "scripts_run_beside_others",
+        ]
+    );
+    assert!(counts.values().all(|n| *n == 0), "{counts:?}");
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", READS_A_KEY]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // Not scripts.
+    assert_eq!(
+        moved(&mut c, |c| {
+            assert!(c.cmd(&["SET", "{q}:a", "v"]).ok());
+            assert!(c.cmd(&["GET", "{q}:a"]).s() == "v");
+        }),
+        one(&[])
+    );
+
+    // Tagged, not yet seen to be quick: alone, on the pool.
+    let tagged = |c: &mut Conn| {
+        assert_eq!(
+            c.cmd(&["EVALSHA", &sha, "1", "{q}:a", "{q}:a"]),
+            V::Str("v".into())
+        )
+    };
+    assert_eq!(
+        moved(&mut c, tagged),
+        one(&["scripts_offloaded_to_pool", "scripts_run_alone_not_quick"])
+    );
+    // Seen to be quick: beside others, on the connection's own thread.
+    let mut runs = 0;
+    loop {
+        let counted = moved(&mut c, tagged);
+        if counted == one(&["scripts_run_beside_others"]) {
+            break;
+        }
+        assert_eq!(
+            counted,
+            one(&["scripts_offloaded_to_pool", "scripts_run_alone_not_quick"])
+        );
+        runs += 1;
+        assert!(runs < 20, "the script was never run beside others");
+    }
+
+    // No keys: alone (its first run on the pool, as every script's).
+    let no_keys = |c: &mut Conn| assert_eq!(c.cmd(&["EVAL", "return 7", "0"]), V::Int(7));
+    assert_eq!(
+        moved(&mut c, no_keys),
+        one(&["scripts_offloaded_to_pool", "scripts_run_alone_no_keys"])
+    );
+    let mut runs = 0;
+    while moved(&mut c, no_keys) != one(&["scripts_run_alone_no_keys"]) {
+        runs += 1;
+        assert!(runs < 20, "the script was never run inline");
+    }
+    // A key with no tag, and keys of two tags: alone.
+    assert_eq!(
+        moved(&mut c, |c| {
+            c.cmd(&["EVALSHA", &sha, "1", "plain", "{q}:a"]);
+        }),
+        one(&["scripts_run_alone_no_tag"])
+    );
+    assert_eq!(
+        moved(&mut c, |c| {
+            c.cmd(&["EVALSHA", &sha, "2", "{q}:a", "{r}:a", "{r}:a"]);
+        }),
+        one(&["scripts_run_beside_others"])
+    );
+    // Inside a transaction: alone.
+    assert_eq!(
+        moved(&mut c, |c| {
+            assert!(c.cmd(&["MULTI"]).ok());
+            assert_eq!(
+                c.cmd(&["EVALSHA", &sha, "1", "{q}:a", "{q}:a"]).s(),
+                "QUEUED"
+            );
+            assert!(matches!(c.cmd(&["EXEC"]), V::Arr(_)));
+        }),
+        one(&["scripts_run_alone_in_transaction"])
+    );
+    // A function: alone. Loading one is no script run.
+    assert_eq!(
+        moved(&mut c, |c| {
+            let loaded = c.cmd(&[
+                "FUNCTION",
+                "LOAD",
+                "#!lua name=counts\nredis.register_function('f', function(keys, args) \
+                 return 1 end)",
+            ]);
+            assert_eq!(loaded, V::Str("counts".into()));
+        }),
+        one(&[])
+    );
+    assert_eq!(
+        moved(&mut c, |c| assert_eq!(
+            c.cmd(&["FCALL", "f", "1", "{q}:a"]),
+            V::Int(1)
+        )),
+        one(&["scripts_offloaded_to_pool", "scripts_run_alone_function"])
+    );
+    // Switched off: alone, whatever its keys.
+    assert!(c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "no"]).ok());
+    assert_eq!(
+        moved(&mut c, tagged),
+        one(&["scripts_run_alone_parallel_off"])
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"])
+            .ok()
+    );
+
+    // A quick script that comes while another is running is handed to the
+    // runner thread: many at once, from several connections, until one is.
+    let port = server.port;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let before = script_counts(&mut c);
+    let mut sent = 0;
+    while script_counts(&mut c)["scripts_handed_to_runner"] == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no script was handed to the runner"
+        );
+        let clients: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    for _ in 0..500 {
+                        assert_eq!(c.cmd(&["EVAL", "return 7", "0"]), V::Int(7));
+                    }
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().unwrap();
+        }
+        sent += 8 * 500;
+    }
+    // Each of them counted once, as what it is, and nothing else.
+    let after = script_counts(&mut c);
+    for (name, n) in &after {
+        let was = before[name];
+        match name.as_str() {
+            "scripts_run_alone_no_keys" => assert_eq!(n - was, sent, "{name}"),
+            "scripts_handed_to_runner" => assert!(*n > 0 && n - was <= sent, "{name}"),
+            // A run stretched past the demotion limit on a busy machine is
+            // offloaded until it is seen to be quick again.
+            "scripts_offloaded_to_pool" => assert!(n - was <= sent, "{name}"),
+            _ => assert_eq!(*n, was, "{name}"),
+        }
+    }
+
+    assert!(c.cmd(&["CONFIG", "RESETSTAT"]).ok());
+    let counts = script_counts(&mut c);
+    assert!(counts.values().all(|n| *n == 0), "{counts:?}");
+}
+
+// ── Scripts of several hash tags (#871) ──────────────────────────────────────
+
+/// Counts to ARGV[1], then writes ARGV[2] to every key of `KEYS`.
+const COUNTS_ALL: &str = "local n = 0 for i = 1, tonumber(ARGV[1]) do n = n + 1 end \
+                          for _, key in ipairs(KEYS) do redis.call('SET', key, ARGV[2]) end \
+                          return n";
+
+/// A script whose `KEYS` carry two tags runs beside others once it has been
+/// seen to be quick (#871): a script or a command on a third tag, or on a key
+/// with no tag, does not wait for it; a command on either of its tags does,
+/// and sees what it wrote; so does a script on one of them.
+#[test]
+fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
+    let server = Server::start(&["--lua-parallel-scripts", "true"]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", COUNTS_ALL]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // The probes' scripts are a copy under another digest: the slow run
+    // makes its own digest one that is offloaded from then on, and the
+    // probes must not be sent to the pool for that.
+    let probe_script = format!("{COUNTS_ALL} -- the probes");
+    let V::Str(probe_sha) = c.cmd(&["SCRIPT", "LOAD", &probe_script]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    for key in ["{a}:k", "{b}:k", "{c}:k"] {
+        assert!(c.cmd(&["SET", key, "before"]).ok());
+    }
+    assert!(c.cmd(&["SET", "{c}:still", "still"]).ok());
+    // Sized to last about a second, as in the test of one tag above, with a
+    // copy of the script on a tag of its own.
+    let steps = {
+        const MEASURE: u64 = 5_000_000;
+        let copy = format!("{COUNTS_ALL} -- timed once to size the slow run");
+        let timed = Instant::now();
+        let reply = c.cmd(&["EVAL", &copy, "1", "{z}:k", &MEASURE.to_string(), "x"]);
+        assert_eq!(reply, V::Int(MEASURE as i64));
+        let per_step = timed.elapsed().as_secs_f64() / MEASURE as f64;
+        ((1.0 / per_step) as u64).clamp(60_000_000, 2_000_000_000)
+    };
+
+    // On a busy machine a quick run can be stretched past the demotion limit
+    // and the script sent to the pool, where it runs alone and everything
+    // waits for it. An attempt in which any script went to the pool, or the
+    // machine was too slow to send the waiting commands while the script
+    // ran, proves nothing, and is made again.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // Seen to be quick, so that it is run beside others.
+        for _ in 0..4 {
+            assert_eq!(
+                c.cmd(&["EVALSHA", &sha, "2", "{a}:k", "{b}:k", "1", "before"]),
+                V::Int(1)
+            );
+            assert_eq!(
+                c.cmd(&["EVALSHA", &probe_sha, "1", "{c}:k", "1", "before"]),
+                V::Int(1)
+            );
+            assert_eq!(
+                c.cmd(&["EVALSHA", &probe_sha, "1", "{b}:k2", "1", "before"]),
+                V::Int(1)
+            );
+        }
+        let pooled_before = script_counts(&mut c)["scripts_offloaded_to_pool"];
+
+        let port = server.port;
+        let started = Instant::now();
+        let slow_sha = sha.clone();
+        let slow_steps = steps.to_string();
+        let slow = std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            let reply = c.cmd(&[
+                "EVALSHA",
+                &slow_sha,
+                "2",
+                "{a}:k",
+                "{b}:k",
+                &slow_steps,
+                "after",
+            ]);
+            (reply, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        let probe = |args: Vec<String>| {
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let reply = c.cmd(&args);
+                (reply, started.elapsed())
+            })
+        };
+        let words = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        // Several connections for what must not wait: one that lands on the
+        // slow script's thread waits for the thread, whatever its key.
+        let several = |args: Vec<String>| (0..6).map(|_| probe(args.clone())).collect::<Vec<_>>();
+        let earliest = |probes: Vec<std::thread::JoinHandle<(V, Duration)>>| {
+            let done: Vec<(V, Duration)> = probes.into_iter().map(|p| p.join().unwrap()).collect();
+            let reply = done[0].0.clone();
+            assert!(done.iter().all(|(r, _)| *r == reply), "{done:?}");
+            (reply, done.iter().map(|(_, at)| *at).min().unwrap())
+        };
+        let other_script = several(words(&["EVALSHA", &probe_sha, "1", "{c}:k", "1", "other"]));
+        let other_read = several(words(&["GET", "{c}:still"]));
+        let untagged = several(words(&["SET", "plain", "v"]));
+        let other_script = earliest(other_script);
+        let other_read = earliest(other_read);
+        let untagged = earliest(untagged);
+        // Then, while it still runs, what must wait for it. Sent only now:
+        // a command waiting for a tag's lock waits on its connection's
+        // thread, and with three of them on the other three threads of the
+        // server, nothing else could be answered until the script ended.
+        let sent = started.elapsed();
+        let first_tag = probe(words(&["GET", "{a}:k"]));
+        let second_tag = probe(words(&["GET", "{b}:k"]));
+        let both = probe(words(&["MGET", "{b}:k", "{a}:k"]));
+        // On another key of its second tag, so that the reads above find what
+        // the slow script wrote whichever of them goes first after it.
+        let script_on_second = probe(words(&["EVALSHA", &probe_sha, "1", "{b}:k2", "1", "later"]));
+
+        let (slow_reply, slow_done) = slow.join().unwrap();
+        let first_tag = first_tag.join().unwrap();
+        let second_tag = second_tag.join().unwrap();
+        let both = both.join().unwrap();
+        let script_on_second = script_on_second.join().unwrap();
+        let pooled = script_counts(&mut c)["scripts_offloaded_to_pool"] - pooled_before;
+        if pooled > 0 && attempt < 5 {
+            continue;
+        }
+        assert_eq!(pooled, 0, "a script went to the pool in every attempt");
+
+        assert_eq!(slow_reply, V::Int(steps as i64));
+        assert!(
+            slow_done > Duration::from_millis(400),
+            "the slow script took only {slow_done:?} for {steps} steps, sized to take about a \
+             second: the test proves nothing on this machine"
+        );
+
+        let margin = Duration::from_millis(100);
+        let (reply, done) = other_script;
+        assert_eq!(reply, V::Int(1));
+        assert!(
+            done + margin < slow_done,
+            "a script on a third tag waited: {done:?} of {slow_done:?}"
+        );
+        let (reply, done) = other_read;
+        assert_eq!(reply, V::Str("still".into()));
+        assert!(
+            done + margin < slow_done,
+            "a read on a third tag waited: {done:?} of {slow_done:?}"
+        );
+        let (reply, done) = untagged;
+        assert!(reply.ok());
+        assert!(
+            done + margin < slow_done,
+            "a key with no tag waited: {done:?} of {slow_done:?}"
+        );
+
+        // And the commands that must wait were sent well before it ended.
+        let late = sent + Duration::from_millis(200) > slow_done;
+        if late && attempt < 5 {
+            continue;
+        }
+        assert!(
+            !late,
+            "the waiting commands were sent too late in every attempt"
+        );
+
+        // Either of its tags: not before the script was done, and with what
+        // it wrote.
+        let waited = |what: &str, (reply, done): (V, Duration), want: V| {
+            assert_eq!(reply, want, "{what}");
+            assert!(
+                done + Duration::from_millis(20) >= slow_done,
+                "{what} did not wait: {done:?} of {slow_done:?}"
+            );
+        };
+        waited("a read of its first tag", first_tag, V::Str("after".into()));
+        waited(
+            "a read of its second tag",
+            second_tag,
+            V::Str("after".into()),
+        );
+        waited(
+            "a read of both",
+            both,
+            V::Arr(vec![V::Str("after".into()), V::Str("after".into())]),
+        );
+        waited("a script on its second tag", script_on_second, V::Int(1));
+        assert_eq!(c.cmd(&["GET", "{b}:k2"]), V::Str("later".into()));
+        break;
+    }
+}
+
+/// Moves one unit from the first tag's account to the second's (with one
+/// key, none) and logs the
+/// move on both, under a key built from each declared key (`..':log'`), with
+/// what it read: an order the replica or the AOF applied differently from
+/// the master would show in the logs and the balances.
+const TRANSFERS: &str = "\
+local a = tonumber(redis.call('GET', KEYS[1]) or '0') \
+local b = 0 \
+if #KEYS > 1 then \
+  b = tonumber(redis.call('GET', KEYS[2]) or '0') \
+  redis.call('SET', KEYS[1], a - 1) \
+  redis.call('SET', KEYS[2], b + 1) \
+else \
+  redis.call('SET', KEYS[1], a) \
+end \
+for i, key in ipairs(KEYS) do \
+  redis.call('RPUSH', key .. ':log', ARGV[1] .. '@' .. a .. '/' .. b .. '#' .. \
+    (redis.call('GET', key .. ':x') or '')) \
+end \
+return a";
+
+/// Scripts of two tags, overlapping, from many clients at once, and a
+/// client's `MSET` of keys of two tags among them, which each script reads
+/// and logs: the master, its replica and the master's AOF replayed end with
+/// the same data, key by key. Each script holds its tags for the whole of its
+/// run, and the `MSET` takes the same tags' locks, so the order in which
+/// their effects reach the stream is one in which the master could have run
+/// them one after another. On both I/O loops.
+#[test]
+fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof() {
+    overlapping_tags_end_the_same("tokio");
+}
+
+#[test]
+fn scripts_of_overlapping_tags_end_the_same_on_master_replica_and_aof_uring() {
+    overlapping_tags_end_the_same("uring");
+}
+
+fn overlapping_tags_end_the_same(io: &str) {
+    let mut master = Server::start(&[
+        "--io-model",
+        io,
+        "--lua-parallel-scripts",
+        "true",
+        "--aof",
+        "--appendfsync",
+        "always",
+    ]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--io-model", io, "--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_until("the replica's link to come up", 30, || {
+        r.info("replication", "master_link_status") == "up"
+    });
+    let V::Str(sha) = m.cmd(&["SCRIPT", "LOAD", TRANSFERS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+
+    const TAGS: usize = 5;
+    let key = |tag: usize| format!("{{acct{tag}}}:balance");
+    let mp = master.port;
+    // A client's write of two tags at once, read by the scripts.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut c = Conn::connect(mp);
+            let mut n = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) || n < 200 {
+                let (i, j) = (n % TAGS, (n * 3 + 1) % TAGS);
+                let (ki, kj) = (format!("{}:x", key(i)), format!("{}:x", key(j)));
+                let v = format!("m{n}");
+                assert!(c.cmd(&["MSET", &ki, &v, &kj, &v]).ok());
+                n += 1;
+            }
+            n
+        })
+    };
+    let clients: Vec<_> = (0..8)
+        .map(|client| {
+            let sha = sha.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(mp);
+                let mut ran = 0;
+                for i in 0..400 {
+                    // Every pair of tags, both ways round, and now and then
+                    // one tag alone or three.
+                    let from = (client + i) % TAGS;
+                    let to = (client * 3 + i * 7 + 1) % TAGS;
+                    let op = format!("c{client}.{i}");
+                    let keys: Vec<String> = match i % 10 {
+                        0 => vec![key(from)],
+                        1 => vec![key(from), key((from + 1) % TAGS), key((from + 2) % TAGS)],
+                        _ if from == to => vec![key(from)],
+                        _ => vec![key(from), key(to)],
+                    };
+                    let mut args = vec!["EVALSHA".to_string(), sha.clone(), keys.len().to_string()];
+                    args.extend(keys);
+                    args.push(op);
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let reply = c.cmd(&args);
+                    assert!(matches!(reply, V::Int(_)), "{reply:?}");
+                    ran += 1;
+                }
+                ran
+            })
+        })
+        .collect();
+    let ran: usize = clients.into_iter().map(|c| c.join().unwrap()).sum();
+    assert_eq!(ran, 8 * 400);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(writer.join().unwrap() >= 200);
+    assert!(m.cmd(&["SET", "last", "1"]).ok());
+
+    let keys: Vec<String> = (0..TAGS)
+        .flat_map(|tag| {
+            [
+                key(tag),
+                format!("{}:log", key(tag)),
+                format!("{}:x", key(tag)),
+            ]
+        })
+        .collect();
+    let dump = |c: &mut Conn| -> Vec<V> {
+        keys.iter()
+            .map(|k| match c.cmd(&["TYPE", k]).s() {
+                "list" => c.cmd(&["LRANGE", k, "0", "-1"]),
+                _ => c.cmd(&["GET", k]),
+            })
+            .collect()
+    };
+    let before = dump(&mut m);
+    // Every unit moved is somewhere: the balances add up to 0.
+    let total: i64 = before[..]
+        .iter()
+        .step_by(3)
+        .map(|v| v.s().parse::<i64>().unwrap())
+        .sum();
+    assert_eq!(total, 0);
+    wait_caught_up(&mut m, &mut r);
+    let on_replica = dump(&mut r);
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(on_replica[i], before[i], "replica: {k}");
+    }
+
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&master.aof(), b"$4\r\nlast\r\n") == 1
+    });
+    master.kill_and_restart();
+    let mut m = master.conn();
+    let replayed = dump(&mut m);
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(replayed[i], before[i], "AOF replay: {k}");
+    }
 }

@@ -60,7 +60,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import (Suite, Config, THROUGHPUT, MEMORY, EXACT, info, jitter, vs_redis, median, scaled)  # noqa: E402
 from rss import used_memory_mib  # noqa: E402
 
-S = Suite("17-mastodon-feed-fanout", [Config("default")])
+S = Suite("18-mastodon-feed-fanout", [Config("default")])
 FEEDS = 20_000
 FIRST_FEED = 10_000  # feed numbers have five digits
 MEMBERS = 800
