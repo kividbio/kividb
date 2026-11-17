@@ -1,3 +1,4 @@
+use crate::member_set::Member;
 pub use crate::shared_bytes::SharedBytes;
 use crate::vector::DistanceMetric;
 use ahash::AHashMap;
@@ -6,6 +7,7 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fmt;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 pub type Cmd<'a> = Vec<&'a [u8]>;
@@ -231,8 +233,8 @@ pub type ZMember = Arc<[u8]>;
 /// update both atomically (they live inside a single RwLock, so this is safe).
 #[derive(Clone)]
 pub struct SortedSetInner {
-    pub members: AHashMap<ZMember, f64>,
-    pub by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
+    members: AHashMap<ZMember, f64>,
+    by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
 }
 
 impl SortedSetInner {
@@ -277,6 +279,90 @@ impl SortedSetInner {
             }
             None => false,
         }
+    }
+
+    /// Removes and returns the member with the lowest score.
+    pub fn pop_min(&mut self) -> Option<(ZMember, f64)> {
+        let ((score, member), _) = self.by_score.pop_first()?;
+        self.members.remove(member.as_ref());
+        Some((member, score.0))
+    }
+
+    /// Removes and returns the member with the highest score.
+    pub fn pop_max(&mut self) -> Option<(ZMember, f64)> {
+        let ((score, member), _) = self.by_score.pop_last()?;
+        self.members.remove(member.as_ref());
+        Some((member, score.0))
+    }
+
+    pub fn score(&self, member: &[u8]) -> Option<f64> {
+        self.members.get(member).copied()
+    }
+
+    /// The member's 0-based rank by ascending score, and its score.
+    pub fn rank(&self, member: &[u8]) -> Option<(usize, f64)> {
+        let (stored, &score) = self.members.get_key_value(member)?;
+        let rank = self
+            .by_score
+            .range(..(OrderedFloat(score), Arc::clone(stored)))
+            .count();
+        Some((rank, score))
+    }
+
+    /// Members and scores, ordered by score, then by member.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)> {
+        self.by_score
+            .keys()
+            .map(|(score, member)| (Member::Shared(member), score.0))
+    }
+
+    /// Members and scores in no particular order.
+    pub fn iter_unordered(&self) -> impl Iterator<Item = (Member<'_>, f64)> {
+        self.members
+            .iter()
+            .map(|(member, &score)| (Member::Shared(member), score))
+    }
+
+    /// Like `iter`, limited to the given range of (score, member) keys.
+    pub fn range_by_score<R>(&self, range: R) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)>
+    where
+        R: RangeBounds<(OrderedFloat<f64>, ZMember)>,
+    {
+        self.by_score
+            .range(range)
+            .map(|((score, member), _)| (Member::Shared(member), score.0))
+    }
+
+    /// Members at positions of `iter_unordered`, in the order given; may repeat.
+    pub fn members_at(&self, picks: &[usize]) -> Vec<(Member<'_>, f64)> {
+        let mut slots: Vec<usize> = (0..picks.len()).collect();
+        slots.sort_unstable_by_key(|&slot| picks[slot]);
+        let mut out: Vec<Option<(&ZMember, f64)>> = vec![None; picks.len()];
+        // One walk, up to the highest position picked.
+        let mut walk = self.members.iter();
+        let mut at: Option<usize> = None;
+        let mut last: Option<(&ZMember, f64)> = None;
+        for slot in slots {
+            let want = picks[slot];
+            if at != Some(want) {
+                let skip = match at {
+                    Some(at) => want - at - 1,
+                    None => want,
+                };
+                last = walk.nth(skip).map(|(member, &score)| (member, score));
+                at = Some(want);
+            }
+            out[slot] = last;
+        }
+        out.into_iter()
+            .flatten()
+            .map(|(member, score)| (Member::Shared(member), score))
+            .collect()
+    }
+
+    /// Members the member table holds before it grows.
+    pub fn capacity(&self) -> usize {
+        self.members.capacity()
     }
 
     pub fn len(&self) -> usize {
