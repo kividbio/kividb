@@ -152,13 +152,18 @@ fn option_number(value: &[u8]) -> Option<u64> {
 /// a `long long`: a time above that was taken, and then replied, sent to
 /// replicas and logged as a negative number, which they refused: the
 /// sample lost there (#592). From the AOF or a master, any `u64`, which an
-/// older version took and kept.
+/// older version took and kept — or that negative number, which is the
+/// same 64 bits, as `written_by_1_2_0` reads one: a replica re-logs the
+/// `TS.INCRBY` of a 1.2.0 master with the time 1.2.0 sent, and its own
+/// replay refused it (#611).
 fn sample_time(word: &[u8], strict: bool) -> Option<u64> {
     let text = std::str::from_utf8(word).ok()?;
     if strict {
         text.parse::<i64>().ok().and_then(|t| u64::try_from(t).ok())
     } else {
-        text.parse().ok()
+        text.parse::<u64>()
+            .ok()
+            .or_else(|| text.parse::<i64>().ok().map(|t| t as u64))
     }
 }
 
