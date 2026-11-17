@@ -8,6 +8,7 @@
 
 - [Bare metal](#bare-metal)
 - [The full suite, on Azure VMs](#the-full-suite-on-azure-vms)
+- [Memory of small sets](#memory-of-small-sets)
 - [Earlier runs](#earlier-runs)
 - [Independent reviews](#independent-reviews)
 
@@ -100,6 +101,29 @@ cloud VMs, so absolute numbers are lower than on the [bare metal](#bare-metal) a
   <source media="(prefers-color-scheme: dark)" srcset="../assets/benchmarks/1.2.0/vector-ingest-dark.png">
   <img src="../assets/benchmarks/1.2.0/vector-ingest-light.png" alt="Vector ingest and index build" width="720">
 </picture>
+
+## Memory of small sets
+
+Since 1.3.0 a small set is kept in one block (`listpack` in `OBJECT ENCODING`:
+up to 128 members of up to 64 bytes) or, when its members are integers, as a
+sorted array (`intset`: up to 512), where 1.2 kept every set as a hash table
+with an allocation per member (#297). Bytes of `used_memory` a member, 3M
+members in sets of each size, 14-byte members (`membr:00000001`) or the
+integers 0 to n-1, on an Azure `Standard_D4s_v5`:
+
+| members a set | 1.2.2 strings | 1.3.0 strings | Redis 8.10.2 strings | 1.2.2 integers | 1.3.0 integers | Redis 8.10.2 integers |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 76.0 | 34.6 | 25.8 | 68.0 | 17.6 | 9.8 |
+| 100 | 55.5 | 20.4 | 18.5 | 47.5 | 3.8 | 2.8 |
+| 1,000 | 67.0 | 67.0 | 30.0 | 59.0 | 59.0 | 22.3 |
+| 100,000 | 54.3 | 54.3 | 36.8 | 46.3 | 46.3 | 28.8 |
+
+What is left over Redis at 10 members is mostly the key's own: an entry and
+the set's header, about 150 bytes a key. Sets of more
+than 128 members (512 integers) are tables as before; making those smaller is
+the next step of #297. Suite `17-set-memory` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+this table again and fails a build that loses it.
 
 ## Earlier runs
 

@@ -129,6 +129,16 @@ other files:
   start it with `--configfile` to rewrite the file. A future minor release
   will read only a named config file.
 
+**Sets**
+- Small sets are kept as Redis keeps them, and `OBJECT ENCODING` says so:
+  `intset` for up to `set-max-intset-entries` (512) integers, `listpack` for
+  up to `set-max-listpack-entries` (128) members of up to
+  `set-max-listpack-value` (64) bytes, `hashtable` otherwise. The two
+  `listpack` limits go no higher than 128 and 64; a larger value is taken as
+  those, and `CONFIG GET` says so. With `set-max-intset-entries` set under
+  128, an intset that passes it becomes a `listpack` where Redis makes a
+  `hashtable`; at the defaults the two agree.
+
 **Durability**
 - With the AOF on, a write is acknowledged once its record is in the file,
   as in Redis: a hard kill (`kill -9`, the OOM killer) loses no acknowledged

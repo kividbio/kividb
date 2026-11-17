@@ -131,7 +131,9 @@ pub fn effort(value: &KiviDBValue) -> u64 {
             serde_json::Value::Object(fields) => fields.len(),
             _ => 1,
         },
-        KiviDBValue::Set(set) => set.read().len(),
+        // An array or a block of members (#297) is one allocation, as
+        // Redis counts an intset or a listpack.
+        KiviDBValue::Set(set) => set.read().free_effort(),
         KiviDBValue::VectorSet(set) => set.read().entries.len(),
         KiviDBValue::SortedSet(zset) => zset.read().len(),
         KiviDBValue::Stream(stream) => {

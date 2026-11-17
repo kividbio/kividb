@@ -211,6 +211,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Small sets take a half to a twelfth of the memory (#297).** A set of
+  up to 128 members of up to 64 bytes is kept in one block, the members end
+  to end, where it was a hash table with an allocation for every member: 14-byte
+  members take 34.6 bytes a member at 10 members (76.0 before; Redis 8.10.2
+  25.8) and 20.4 at 100 (55.5; Redis 18.5). A set whose members are all the
+  canonical decimal text of an `i64` (no `+`, no leading zero, no `-0`), up to
+  512 of them, is a sorted array of 16-, 32- or 64-bit integers: 17.6 bytes a
+  member at 10 (68.0; Redis 9.8) and 3.8 at 100 (47.5; Redis 2.8). Larger
+  sets are tables as before, at the same size. Thanks @Parikalp-Bhardwaj for
+  the arrays (#309).
+  - A set moves from the array to the block when a member that is not such
+    an integer comes, and from either to the table
+    when the block would pass 128 members or a member is longer than 64
+    bytes, as Redis moves an intset to a listpack and either to a hash
+    table; never back. Clients see the same members as before: `01`, `+1`
+    and `-0` stay strings.
+  - `OBJECT ENCODING` reports the form a set is kept in, `intset`,
+    `listpack` or `hashtable`, and `SSCAN` returns an array or a block whole,
+    with cursor 0, whatever `COUNT` says, as Redis returns an intset or a
+    listpack. Both matched Redis 8.10.2 through every change of form in our
+    comparison, but one: with `set-max-intset-entries` under 128, an array
+    that passes it becomes a block (`listpack`) where Redis makes a
+    `hashtable`.
+  - `set-max-intset-entries` (default 512), `set-max-listpack-entries`
+    (128) and `set-max-listpack-value` (64) now take effect, from the
+    configuration file or `CONFIG SET`; `0` for an `entries` limit turns
+    its form off. The two
+    `listpack` limits go no higher than 128 and 64, and `CONFIG GET` reports
+    the value kept. A changed limit applies to a set at its next new member.
+  - `SMEMBERS`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` and `SRANDMEMBER` write
+    members into the reply without copying them first: `SMEMBERS` of a
+    100-member set costs about 40 % fewer instructions, `SINTER` of two
+    64-integer sets 42 % fewer and of two 64-member string sets 27 % fewer.
+    `SISMEMBER`, `SADD` and `SREM` on a set of 8 cost no more than on a
+    table, and up to 2 % more on a block of 100.
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write members as text, so their formats do not change: 1.2.2 reads what
+    this release writes and the other way round. `MEMORY USAGE`, eviction
+    and lazy freeing count a block or an array as the one allocation it is.
+
 - **Active defrag's pass ends about twice as fast, at the same CPU cap
   (#240, #291).** It slept after every batch of 128 buckets, and each sleep
   overshot; it now sleeps once a millisecond of work is owed its rest, at
