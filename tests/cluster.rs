@@ -2695,6 +2695,112 @@ fn a_master_told_it_has_been_failed_holds_writes_until_it_knows_its_slots() {
 
 // ── Resharding ────────────────────────────────────────────────────────────────
 
+/// Sets and hashes of every form a slot migration moves arrive whole, in the
+/// form they make there: a set's array of integers, its block and its table;
+/// a hash's block, its block with field TTLs, and its table.
+#[test]
+fn migrate_moves_sets_and_hashes_in_every_form() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "forms");
+    let slot = slot_of(&tag).to_string();
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+
+    let ints: Vec<String> = (0..100).map(|i| (i * 7 - 300).to_string()).collect();
+    let words: Vec<String> = (0..50).map(|i| format!("membr:{i:08}")).collect();
+    let many: Vec<String> = (0..300).map(|i| format!("membr:{i:08}")).collect();
+    let fields = |n: usize| -> Vec<String> {
+        (0..n)
+            .flat_map(|i| [format!("field:{i:08}"), format!("value:{i:026}")])
+            .collect()
+    };
+    let add = |s: &mut Conn, cmd: &str, key: &str, args: &[String]| {
+        let mut all = vec![cmd.to_string(), key.to_string()];
+        all.extend(args.iter().cloned());
+        let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        s.cmd(&refs);
+    };
+    add(&mut s, "SADD", &k("ints"), &ints);
+    add(&mut s, "SADD", &k("words"), &words);
+    add(&mut s, "SADD", &k("many"), &many);
+    add(&mut s, "HSET", &k("hsmall"), &fields(10));
+    add(&mut s, "HSET", &k("hex"), &fields(10));
+    s.cmd(&[
+        "HPEXPIREAT",
+        &k("hex"),
+        "4000000000000",
+        "FIELDS",
+        "1",
+        "field:00000003",
+    ]);
+    add(&mut s, "HSET", &k("hbig"), &fields(600));
+    let want = [
+        ("ints", "intset"),
+        ("words", "listpack"),
+        ("many", "hashtable"),
+        ("hsmall", "listpack"),
+        ("hex", "listpackex"),
+        ("hbig", "hashtable"),
+    ];
+    let mut before = Vec::new();
+    for (name, form) in want {
+        assert_eq!(
+            s.cmd(&["OBJECT", "ENCODING", &k(name)]).text(),
+            form,
+            "{name}"
+        );
+        before.push(s.cmd(&["DEBUG", "DIGEST-VALUE", &k(name)]));
+    }
+
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(want.iter().map(|(n, _)| k(n)));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let reply = s.cmd(&refs);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+
+    let mut d = dst.conn();
+    for ((name, form), digest) in want.iter().zip(&before) {
+        let key = k(name);
+        assert_eq!(d.cmd(&["OBJECT", "ENCODING", &key]).text(), *form, "{name}");
+        assert_eq!(d.cmd(&["DEBUG", "DIGEST-VALUE", &key]), *digest, "{name}");
+    }
+    assert_eq!(d.cmd(&["SCARD", &k("ints")]).int(), 100);
+    assert_eq!(
+        d.cmd(&["SISMEMBER", &k("words"), "membr:00000049"]).int(),
+        1
+    );
+    assert_eq!(d.cmd(&["SCARD", &k("many")]).int(), 300);
+    let all = d.cmd(&["HGETALL", &k("hsmall")]);
+    let got: Vec<String> = all.array().iter().map(Resp::text).collect();
+    assert_eq!(got, fields(10), "a block's fields in their order");
+    assert_eq!(d.cmd(&["HLEN", &k("hbig")]).int(), 600);
+    let at = d.cmd(&["HPEXPIRETIME", &k("hex"), "FIELDS", "1", "field:00000003"]);
+    assert_eq!(at.array()[0].int(), 4_000_000_000_000);
+}
+
 /// Move a slot between masters the way the resharding tools do: mark it
 /// migrating/importing, MIGRATE its keys in a batch, then assign it. Every
 /// value type must arrive, with its TTL.
