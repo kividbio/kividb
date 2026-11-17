@@ -45,7 +45,8 @@ ops/s at least 1.5x Redis at 200 connections and 1.7x at 500, the read p50 at
 most 0.6x Redis's; and THROUGHPUT / MEMORY against the recorded candidate. The
 p99 rows are shown, not gated (`jitter`: client and server share the VM).
 
-Needs memtier_benchmark 2.x with `--transaction`: `$MEMTIER`, else on PATH.
+Needs memtier_benchmark 2.6.1 or newer (`--transaction`, and the stderr line
+it logs for an error reply): `$MEMTIER`, else on PATH.
 """
 import json
 import os
