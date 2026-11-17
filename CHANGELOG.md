@@ -364,6 +364,71 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
+- **Lists take about half the memory (#297).** A list's elements are kept
+  end to end in chunks of up to 64, each element between two copies of its
+  length, where every element had an allocation, a shared header and a slot
+  of its own. Bytes of `used_memory` an element, 32-byte elements, 3M
+  elements in lists of each size:
+
+  | elements a list | 1.2.2 | now | Redis 8.10.2 |
+  |---:|---:|---:|---:|
+  | 10 | 76.0 | 48.8 | 45.0 |
+  | 100 | 65.2 | 38.4 | 36.4 |
+  | 1,000 | 64.1 | 36.7 | 34.6 |
+  | 100,000 | 68.5 | 36.7 | 34.3 |
+  | 3,000,000 | 69.8 | 36.7 | 34.3 |
+
+  Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
+  - A push or a pop at either end moves nothing in its chunk: each chunk
+    has room at both ends. Element `i` is found by arithmetic while the
+    chunks between the ends are full; an `LINSERT` or `LREM` in the middle
+    leaves a run of chunks that may not be, and only the chunks in that run
+    are counted (a Redis quicklist counts its nodes from the nearer end
+    always). Two neighbours that fit in one chunk after a removal become
+    one, and the run gives up full chunks at its edges.
+  - `LMOVE`/`RPOPLPUSH` on one key (a rotation) move the element within the
+    list; a chunk opened at an end next to a full one gets room for a
+    quarter of it, so a queue does not regrow its end chunk at every push.
+  - A list keeps its elements apart, as before, from the first time an
+    element longer than 1,024 bytes is pushed, set or inserted; never back,
+    until it is emptied and deleted.
+  - `LTRIM` and `LREM` give back a chunk's buffer when its elements take
+    less than a quarter of it; a dense `LREM` (every other element of a
+    long list) closes the chunks up in one pass.
+  - `OBJECT ENCODING` reports the form: `listpack` while a list is one
+    chunk, `quicklist` otherwise (several chunks, or elements kept apart).
+    Redis closes a node at `list-max-listpack-size` (8 kB) rather than at 64
+    elements, so the two differ in two ways: Redis says `listpack` and
+    KiviDB `quicklist` for lists of 65 to about 240 small elements and for
+    short lists that hold, or held, an element of 1,025 to 8,192 bytes;
+    Redis says `quicklist` and KiviDB `listpack` for up to 64 elements of
+    more than 8 kB in all (a few dozen elements of 1 kB).
+  - `list-max-listpack-size`, `list-max-ziplist-size` and
+    `list-compress-depth` are accepted and reported, as before, and change
+    nothing: a chunk holds 64 elements, and none is compressed.
+  - Instructions a command (one thread, pipeline 16, io_uring and Tokio):
+    `LRANGE` of 10 elements costs 19 % fewer and of 100 elements 45 %
+    fewer (lengths are written as digits, not formatted); `LMOVE` 3 to 4 %
+    fewer, `RPOPLPUSH` 3 %, `LPUSH` onto a list 2.5 to 3 %, `LPOP` and
+    `RPOP` 2 to 3 %, `RPUSH` 1 to 4 %, a push that makes a list 1 to 3 %,
+    `LREM` of one element 2 %; the capped list (`LPUSH` + `LTRIM`), `LPOS`,
+    `BLPOP`, `GET` and `SET` are unchanged. `LINDEX` at an end costs up to
+    2.6 % more; `LINDEX` and `LSET` in the middle of a chunk up to 8 % more
+    (up to 32 lengths stepped over), also on a list of 100,000 after an
+    `LINSERT` or an `LREM` in its middle; after removals spread over the
+    whole list (ten `LREM`s or more) they cost about twice as much, the
+    chunks between being counted. `LINSERT` costs 7 % more.
+  - Nothing changes on disk or on the wire: snapshots, the AOF,
+    replication, `DUMP`/`RESTORE` and `MIGRATE` still write a list's
+    elements as text, in order, so 1.2.2 reads what this release writes and
+    the other way round, and `DEBUG DIGEST-VALUE` of a list does not depend
+    on how it is kept. A snapshot of one
+    3,000,000-element list loads in 0.32 s (0.41 s before), of 300,000
+    ten-element lists in 0.62 s (0.63 s), into half and two thirds of the
+    memory. `MEMORY USAGE`
+    counts the chunks as allocated; eviction's estimate of what freeing a
+    list gives back is their bytes, and lazy freeing's effort their number.
+
 - **Active defrag's pass ends about twice as fast, at the same CPU cap
   (#240, #291).** It slept after every batch of 128 buckets, and each sleep
   overshot; it now sleeps once a millisecond of work is owed its rest, at

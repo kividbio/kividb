@@ -149,6 +149,30 @@ before. Suite `19-hash-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 this again (with and without field TTLs) and fails a build that loses it.
 
+## Memory of lists
+
+Since 1.3.0 a list's elements lie end to end in chunks of up to 64, each
+element between two copies of its length, where 1.2 kept a slot, a shared
+header and an allocation of its own for every element. Bytes of
+`used_memory` an element, 3M elements of 32 bytes in lists of each size, on
+an Azure `Standard_D4s_v5`:
+
+| elements a list | 1.2.2 | 1.3.0 | Redis 8.10.2 |
+|---:|---:|---:|---:|
+| 10 | 76.0 | 48.8 | 45.0 |
+| 100 | 65.2 | 38.4 | 36.4 |
+| 1,000 | 64.1 | 36.7 | 34.6 |
+| 100,000 | 68.5 | 36.7 | 34.3 |
+| 3,000,000 | 69.8 | 36.7 | 34.3 |
+
+At 10 elements most of what is left over Redis is the key's own: its entry
+and the list's header. A list that has had an element longer than 1,024
+bytes keeps its elements apart, as 1.2 did, and takes what 1.2 took. Suite
+`21-list-memory` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+this table again (1M elements, 10 to 100,000 a list) and fails a build that
+loses it.
+
 ## Earlier runs
 
 KiviDB 1.1 was also measured on AWS Graviton3 bare metal in October 2026, against

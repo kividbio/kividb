@@ -11,18 +11,19 @@
 use crate::commands::blocking;
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{lazy_expire_key, parse_utf8};
+use crate::commands::lists::Taken;
 use crate::keyspace_events::{KS_GENERIC, KS_LIST, notify};
+use crate::list_values::ListValues;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
-type Element = Arc<[u8]>;
-type List = Arc<RwLock<VecDeque<Element>>>;
+type Element = Taken;
+type List = Arc<RwLock<ListValues>>;
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
@@ -105,28 +106,46 @@ fn parse_spec(wherefrom: &[u8], whereto: &[u8], how_many: &[&[u8]]) -> Result<Mo
 /// `popped` is in pop order. `OBO` pushes them one at a time, so onto the left
 /// end each lands in front of the one before it. `BULK` moves the block as it
 /// stood in the source, whichever end it was taken from.
-fn destination_order(mut popped: Vec<Element>, spec: &MoveSpec) -> Vec<Element> {
-    let reverse = if spec.one_by_one {
-        spec.to_left
-    } else {
-        // Popping from the right yields the block back to front.
-        !spec.from_left
-    };
-    if reverse {
+fn destination_order<T>(mut popped: Vec<T>, spec: &MoveSpec) -> Vec<T> {
+    if reversed(spec) {
         popped.reverse();
     }
     popped
 }
 
+/// Whether [`destination_order`] turns the popped elements round.
+fn reversed(spec: &MoveSpec) -> bool {
+    if spec.one_by_one {
+        spec.to_left
+    } else {
+        // Popping from the right yields the block back to front.
+        !spec.from_left
+    }
+}
+
+/// Add `element` at one end of `list`: shared bytes as they are where the
+/// list keeps elements apart, else its bytes.
+fn push(list: &mut ListValues, element: &Element, to_left: bool) {
+    match (element, to_left) {
+        (Taken::Shared(bytes), true) => list.push_front_shared(Arc::clone(bytes)),
+        (Taken::Shared(bytes), false) => list.push_back_shared(Arc::clone(bytes)),
+        (bulk, true) => list.push_front(bulk.bytes()),
+        (bulk, false) => list.push_back(bulk.bytes()),
+    }
+}
+
 /// Lay `ordered` down at the chosen end of `list` so it reads, left to right,
 /// exactly as given.
-fn place(list: &mut VecDeque<Element>, ordered: &[Element], to_left: bool) {
+fn place(list: &mut ListValues, ordered: &[Element], to_left: bool) {
     if to_left {
         for el in ordered.iter().rev() {
-            list.push_front(Arc::clone(el));
+            push(list, el, true);
         }
     } else {
-        list.extend(ordered.iter().cloned());
+        list.reserve(ordered.len());
+        for el in ordered {
+            push(list, el, false);
+        }
     }
 }
 
@@ -139,13 +158,13 @@ fn take_count(len: usize, spec: &MoveSpec) -> Option<usize> {
     }
 }
 
-fn pop_n(list: &mut VecDeque<Element>, n: usize, from_left: bool) -> Vec<Element> {
+fn pop_n(list: &mut ListValues, n: usize, from_left: bool) -> Vec<Element> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let el = if from_left {
-            list.pop_front()
+            list.pop_front_with(Taken::of)
         } else {
-            list.pop_back()
+            list.pop_back_with(Taken::of)
         };
         match el {
             Some(el) => out.push(el),
@@ -219,7 +238,6 @@ pub(super) fn move_elements(
         };
         pop_n(&mut inner, n, spec.from_left)
     };
-    let pop_order = popped.clone();
     let ordered = destination_order(popped, spec);
 
     {
@@ -229,22 +247,22 @@ pub(super) fn move_elements(
         let mut map = write_lock!(shard);
         let dst_list = match map.get(dst) {
             None => {
-                let l: List = Arc::new(RwLock::new(VecDeque::new()));
+                let l: List = Arc::new(RwLock::new(ListValues::new()));
                 map.insert(dst, KiviDBValue::List(Arc::clone(&l)));
                 l
             }
             Some(ValueRef::List(l)) => Arc::clone(l),
             Some(_) => {
                 // The destination changed type after we checked it. Put the
-                // elements back where they came from rather than lose them.
+                // elements back where they came from rather than lose them,
+                // last popped first.
                 drop(map);
                 let mut inner = src_list.write();
-                for el in pop_order.into_iter().rev() {
-                    if spec.from_left {
-                        inner.push_front(el);
-                    } else {
-                        inner.push_back(el);
-                    }
+                let mut put_back = |el: &Element| push(&mut inner, el, spec.from_left);
+                if reversed(spec) {
+                    ordered.iter().for_each(&mut put_back);
+                } else {
+                    ordered.iter().rev().for_each(&mut put_back);
                 }
                 return Err(resp_error(WRONGTYPE));
             }
@@ -253,26 +271,30 @@ pub(super) fn move_elements(
     }
     ctx.wait_table.notify_signal(dst);
 
-    // A list that has been emptied is deleted, as in Redis.
-    let mut source_deleted = false;
-    if src_list.read().is_empty() {
-        let shard = store::get_shard(&ctx.store[db], src);
-        let mut map = write_lock!(shard);
-        let still_empty = matches!(
-            map.get(src),
-            Some(ValueRef::List(l)) if Arc::ptr_eq(l, &src_list) && l.read().is_empty()
-        );
-        if still_empty {
-            let removed = map.remove(src);
-            drop(map);
-            drop(removed);
-            source_deleted = true;
-        }
-    }
+    let source_deleted = delete_if_emptied(ctx, src, &src_list);
     Ok(Some(Moved {
         elements: ordered,
         source_deleted,
     }))
+}
+
+/// A list that has been emptied is deleted, as in Redis. Whether it was.
+fn delete_if_emptied(ctx: &Ctx, src: &[u8], src_list: &List) -> bool {
+    if !src_list.read().is_empty() {
+        return false;
+    }
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], src);
+    let mut map = write_lock!(shard);
+    let still_empty = matches!(
+        map.get(src),
+        Some(ValueRef::List(l)) if Arc::ptr_eq(l, src_list) && l.read().is_empty()
+    );
+    if still_empty {
+        let removed = map.remove(src);
+        drop(map);
+        drop(removed);
+    }
+    still_empty
 }
 
 /// The `del` event of a source a move emptied, after the move's own events.
@@ -287,8 +309,8 @@ pub(super) fn is_not_a_list(ctx: &Ctx, key: &[u8]) -> bool {
     list_at(ctx, key).is_err()
 }
 
-fn elements_reply(elements: &[Element]) -> Vec<u8> {
-    resp_array(elements.iter().map(|e| resp_bulk(e)).collect())
+fn elements_reply(elements: Vec<Element>) -> Vec<u8> {
+    resp_array(elements.into_iter().map(Taken::into_bulk).collect())
 }
 
 fn key_arg(arg: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
@@ -305,13 +327,62 @@ pub(super) fn move_one(
     from_left: bool,
     to_left: bool,
 ) -> Result<Option<Element>, Vec<u8>> {
-    let Some(mut moved) = move_elements(ctx, src, dst, &MoveSpec::single(from_left, to_left))?
-    else {
+    // One element, as `move_elements` moves a batch, without the vectors:
+    // these are the reliable-queue commands.
+    let db = *ctx.selected_db;
+    lazy_expire_key(ctx.store, db, src);
+    let Some(src_list) = list_at(ctx, src)? else {
         return Ok(None);
     };
-    let element = moved.elements.pop();
-    if element.is_some() {
-        let db = *ctx.selected_db;
+    let mut source_deleted = false;
+    let element = if src == dst {
+        // The rotation: within the list, under its one lock.
+        let rotated = src_list.write().rotate(from_left, to_left, Taken::of_value);
+        let Some(element) = rotated else {
+            return Ok(None);
+        };
+        ctx.wait_table.notify_signal(dst);
+        element
+    } else {
+        lazy_expire_key(ctx.store, db, dst);
+        // The destination's type is checked before anything leaves the source.
+        list_at(ctx, dst)?;
+        let popped = {
+            let mut inner = src_list.write();
+            if from_left {
+                inner.pop_front_with(Taken::of)
+            } else {
+                inner.pop_back_with(Taken::of)
+            }
+        };
+        let Some(element) = popped else {
+            return Ok(None);
+        };
+        {
+            // Held across the push, as in `move_elements`.
+            let shard = store::get_shard(&ctx.store[db], dst);
+            let mut map = write_lock!(shard);
+            let dst_list = match map.get(dst) {
+                None => {
+                    let l: List = Arc::new(RwLock::new(ListValues::new()));
+                    map.insert(dst, KiviDBValue::List(Arc::clone(&l)));
+                    l
+                }
+                Some(ValueRef::List(l)) => Arc::clone(l),
+                Some(_) => {
+                    // The destination changed type: the element goes back.
+                    drop(map);
+                    push(&mut src_list.write(), &element, from_left);
+                    return Err(resp_error(WRONGTYPE));
+                }
+            };
+            push(&mut dst_list.write(), &element, to_left);
+        }
+        ctx.wait_table.notify_signal(dst);
+        source_deleted = delete_if_emptied(ctx, src, &src_list);
+        element
+    };
+    {
         // As Redis (`lmoveGenericCommand`): the push to the destination, the
         // pop from the source, and then, if that emptied it, its delete. The
         // delete came first, and the pop before the push (#173).
@@ -329,9 +400,11 @@ pub(super) fn move_one(
             if from_left { "lpop" } else { "rpop" },
             src,
         );
-        tell_source_deleted(ctx, &moved, src);
+        if source_deleted {
+            notify(ctx.pubsub, db, KS_GENERIC, "del", src);
+        }
     }
-    Ok(element)
+    Ok(Some(element))
 }
 
 pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
@@ -360,7 +433,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     notify(ctx.pubsub, db, KS_LIST, "lmovem", &src);
                     notify(ctx.pubsub, db, KS_LIST, "lmovem", &dst);
                     tell_source_deleted(ctx, &moved, &src);
-                    elements_reply(&moved.elements)
+                    elements_reply(moved.elements)
                 }
                 Ok(None) if spec.exactly => resp_null_array(),
                 Ok(None) => resp_array(Vec::new()),
@@ -402,7 +475,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         notify(ctx.pubsub, db, KS_LIST, "lmovem", &dst);
                         tell_source_deleted(ctx, &moved, &src);
                         crate::stats::record_hit();
-                        Some(elements_reply(&moved.elements))
+                        Some(elements_reply(moved.elements))
                     }
                     Ok(None) => None,
                 },
@@ -418,11 +491,11 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn els(items: &[&str]) -> Vec<Element> {
+    fn els(items: &[&str]) -> Vec<Arc<[u8]>> {
         items.iter().map(|s| Arc::from(s.as_bytes())).collect()
     }
 
-    fn strs(items: &[Element]) -> Vec<String> {
+    fn strs(items: &[Arc<[u8]>]) -> Vec<String> {
         items
             .iter()
             .map(|e| String::from_utf8_lossy(e).into_owned())

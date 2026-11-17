@@ -973,7 +973,12 @@ fn freeing_at_least(value: crate::store::ValueRef<'_>) -> usize {
     const ELEMENT: usize = 32;
     match value {
         V::String(_) => 0,
-        V::List(list) => list.read().len() * ELEMENT,
+        // Chunks of packed elements are a few allocations, of sizes known
+        // exactly.
+        V::List(list) => {
+            let list = list.read();
+            list.packed_bytes().unwrap_or(list.len() * ELEMENT)
+        }
         // An array or a block of members (#297), or of a hash's fields, is
         // one allocation, of a size known exactly.
         V::Hash(hash) => hash.read().freeing_at_least(ELEMENT),

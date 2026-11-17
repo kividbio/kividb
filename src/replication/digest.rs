@@ -156,7 +156,7 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
             h.update(b"l");
             for item in list.read().iter() {
                 h.update(&(item.len() as u64).to_le_bytes());
-                h.update(item);
+                h.update(&item);
             }
         }
         ValueRef::Hash(hash) => {

@@ -1,3 +1,4 @@
+pub use crate::list_values::ListValues;
 pub use crate::shared_bytes::SharedBytes;
 use crate::vector::DistanceMetric;
 use ahash::AHashMap;
@@ -1465,7 +1466,7 @@ impl ArrayInner {
 #[derive(Clone)]
 pub enum KiviDBValue {
     String(SharedBytes),
-    List(Arc<RwLock<VecDeque<Arc<[u8]>>>>),
+    List(Arc<RwLock<ListValues>>),
     Hash(Arc<RwLock<HashFields>>),
     Json(Arc<RwLock<serde_json::Value>>),
     Set(Arc<RwLock<crate::member_set::MemberSet>>),
