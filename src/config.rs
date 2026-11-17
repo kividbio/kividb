@@ -756,13 +756,14 @@ impl Config {
         crate::cpus::available(&crate::cpus::detect()).threads
     }
 
-    /// How [`Config::resolve_threads`] came to its number, for the banner.
-    pub fn threads_reason(&self) -> String {
+    /// How [`Config::resolve_threads`] came to its number, for the banner,
+    /// whose CPUs line says what limited the CPUs available.
+    pub fn threads_reason(&self) -> &'static str {
         if self.threads > 0 {
-            return "--threads".into();
+            "--threads"
+        } else {
+            "auto: one per available CPU"
         }
-        let auto = crate::cpus::available(&crate::cpus::detect());
-        format!("auto: one per available CPU; {}", auto.reason)
     }
 
     pub fn addr(&self) -> String {
@@ -2350,6 +2351,24 @@ mod config_file_tests {
             let words = split_config_line(&format!("k {}", quote(value))).unwrap();
             assert_eq!(words, ["k", value]);
         }
+    }
+
+    /// `--threads N` is taken as it is, whatever the machine (#873); only
+    /// `0` asks src/cpus.rs, whose rule has tests of its own.
+    #[test]
+    fn threads_given_are_exact() {
+        for n in [1, 3, 64, 1000] {
+            let config = Config {
+                threads: n,
+                ..Config::default()
+            };
+            assert_eq!(config.resolve_threads(), n);
+            assert_eq!(config.threads_reason(), "--threads");
+        }
+        let auto = Config::default();
+        assert_eq!(auto.threads, 0);
+        assert!(auto.resolve_threads() >= 1);
+        assert_eq!(auto.threads_reason(), "auto: one per available CPU");
     }
 
     #[test]

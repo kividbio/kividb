@@ -6,10 +6,12 @@
 //! quota (Docker's `--cpus`, a Kubernetes CPU limit), at least one.
 //!
 //! Up to 1.2 auto was the CPUs minus two (all of them below four): two
-//! workers on a 4-CPU machine. Measured on a 4-vCPU allowance that gave up
-//! about 45% of the throughput and multiplied the p99 by five (#873), and no
-//! other thread of the server needs a CPU of its own: the AOF writer, the
-//! replication hub, expiry and a background save run beside the workers.
+//! workers on a 4-CPU machine. With the server on 4 vCPUs of 4 cores that
+//! served 30% less than four workers on io_uring and 44% less on tokio,
+//! whose p99 it multiplied by six (#873). No other thread of the server
+//! needs a CPU of its own: the AOF writer, the replication hub, expiry and a
+//! background save run beside the workers, and a worker fewer than the CPUs
+//! was not consistently better with any of them running.
 
 /// What the operating system says the process may run on.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,9 +33,12 @@ pub struct Auto {
 }
 
 /// The CPUs the process may use: the fewest of the CPUs online, the
-/// affinity mask and the quota. A fractional quota is rounded up (1.5 CPUs
-/// is two workers, which together may use the 1.5 CPUs; one could use only
-/// one), as Go, Java and .NET round it.
+/// affinity mask and the quota. A fractional quota is rounded down, as std
+/// rounds it: workers that together want more CPU time than the quota are
+/// throttled for the rest of each period. Measured in a container with
+/// `--cpus 1.5`, two workers served 45% more than one but had a p99 of
+/// 27 ms at 500 connections (one: 4.7 ms); with `--cpus 2.5`, three
+/// workers 3% more than two, at a p99 of 18 ms (two: 2.1 ms).
 pub fn available(cpus: &Cpus) -> Auto {
     let online = cpus.online.max(1);
     let mut threads = online;
@@ -43,7 +48,7 @@ pub fn available(cpus: &Cpus) -> Auto {
         reason = format!("{mask} of the {online} CPUs online in its affinity mask (cpuset)");
     }
     if let Some(quota) = cpus.quota.filter(|q| q.is_finite() && *q > 0.0) {
-        let whole = (quota.ceil() as usize).max(1);
+        let whole = (quota.floor() as usize).max(1);
         if whole < threads {
             threads = whole;
             reason = format!("a cgroup CPU quota of {} CPUs", trim(quota));
@@ -172,10 +177,11 @@ mod tests {
     }
 
     #[test]
-    fn the_quota_caps_it_rounded_up() {
+    fn the_quota_caps_it_rounded_down() {
         // docker run --cpus=2 on a 64-CPU host
         assert_eq!(auto(64, Some(64), Some(2.0)), 2);
-        assert_eq!(auto(16, None, Some(1.5)), 2);
+        assert_eq!(auto(16, None, Some(1.5)), 1);
+        assert_eq!(auto(16, None, Some(2.5)), 2);
         assert_eq!(auto(16, None, Some(0.5)), 1);
         assert_eq!(auto(16, None, Some(0.01)), 1);
         // A quota above the CPUs online does not add workers.
@@ -186,6 +192,7 @@ mod tests {
     fn the_lowest_of_mask_and_quota_wins() {
         assert_eq!(auto(64, Some(4), Some(2.0)), 2);
         assert_eq!(auto(64, Some(2), Some(6.0)), 2);
+        assert_eq!(auto(64, Some(4), Some(3.9)), 3);
     }
 
     #[test]
