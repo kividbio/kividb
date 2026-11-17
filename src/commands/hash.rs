@@ -51,7 +51,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if let Some(expiries) = expiries.as_deref_mut() {
                         expiries.remove(field);
                     }
-                    if fields.insert(field.clone(), Arc::clone(val)).is_none() {
+                    if fields.insert(field, val) {
                         new_count += 1;
                     }
                 }
@@ -85,7 +85,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let field = crate::commands::helpers::name_from_bytes(cmd[2]);
             let field: &str = &field;
 
-            match with_hash_fields(ctx, key, |inner| inner.get(field).map(|v| resp_bulk(v))) {
+            match with_hash_fields(ctx, key, |inner| inner.get(field).map(|v| resp_bulk(&v))) {
                 None => {
                     crate::stats::record_miss();
                     Some(resp_null_bulk())
@@ -125,12 +125,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 } else {
                     let count = inner.len() * 2;
                     let mut buf = Vec::with_capacity(16 + count * 32);
-                    buf.push(b'*');
-                    buf.extend_from_slice(count.to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
+                    push_array_len(&mut buf, count);
                     for (k, v) in inner.iter() {
-                        write_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
-                        write_bulk(&mut buf, v);
+                        push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
+                        push_bulk(&mut buf, &v);
                     }
                     Some(buf)
                 }
@@ -182,7 +180,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if let Some(expiries) = expiries.as_deref_mut() {
                         expiries.remove(field);
                     }
-                    fields.insert(field.clone(), Arc::clone(val));
+                    fields.insert(field, val);
                 }
             }) {
                 return Some(e);
@@ -224,7 +222,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         match inner.get(field.as_ref()) {
                             Some(v) => {
                                 crate::stats::record_hit();
-                                resp_bulk(v)
+                                resp_bulk(&v)
                             }
                             None => {
                                 crate::stats::record_miss();
@@ -264,7 +262,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let mut removed: Vec<&[u8]> = Vec::new();
                 for f in cmd[2..].iter() {
                     let field = crate::commands::helpers::name_from_bytes(f);
-                    if crate::types::hash_remove(fields, field.as_ref()).is_some() {
+                    if fields.remove(field.as_ref()) {
                         if let Some(exps) = expiries.as_mut() {
                             exps.remove(field.as_ref());
                         }
@@ -365,11 +363,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
-                buf.push(b'*');
-                buf.extend_from_slice(inner.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                push_array_len(&mut buf, inner.len());
                 for k in inner.keys() {
-                    write_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
+                    push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
                 }
                 Some(buf)
             }) {
@@ -400,11 +396,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
-                buf.push(b'*');
-                buf.extend_from_slice(inner.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                push_array_len(&mut buf, inner.len());
                 for v in inner.values() {
-                    write_bulk(&mut buf, v);
+                    push_bulk(&mut buf, &v);
                 }
                 Some(buf)
             }) {
@@ -448,7 +442,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let result = match write_hash(ctx, key, |fields, _expiries| {
                 let current: i64 = match fields.get(&field) {
                     None => 0,
-                    Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                    Some(v) => match std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()) {
                         Some(n) => n,
                         None => return Err(resp_error("ERR hash value is not an integer")),
                     },
@@ -458,7 +452,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let Some(next) = current.checked_add(incr) else {
                     return Err(resp_error("ERR increment or decrement would overflow"));
                 };
-                fields.insert(field.clone(), Arc::from(next.to_string().as_bytes()));
+                fields.insert_bytes(&field, next.to_string().as_bytes());
                 Ok(resp_integer(next))
             }) {
                 Err(e) | Ok(Err(e)) => Some(e),
@@ -500,7 +494,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let result = match write_hash(ctx, key, |fields, _expiries| {
                 let current = match fields.get(&field) {
                     None => long_double::ZERO,
-                    Some(v) => match LongDouble::parse(v) {
+                    Some(v) => match LongDouble::parse(&v) {
                         Some(n) => n,
                         None => return Err(resp_error("ERR hash value is not a float")),
                     },
@@ -511,7 +505,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         return Err(resp_error("ERR increment would produce NaN or Infinity"));
                     }
                 };
-                fields.insert(field.clone(), Arc::from(s.as_bytes()));
+                fields.insert_bytes(&field, s.as_bytes());
                 Ok(resp_bulk_str(&s))
             }) {
                 Err(e) | Ok(Err(e)) => Some(e),
@@ -545,7 +539,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 if fields.contains_key(&field) {
                     false
                 } else {
-                    fields.insert(field.clone(), Arc::clone(&val));
+                    fields.insert(&field, &val);
                     true
                 }
             }) {
@@ -632,19 +626,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         let (field, _) = inner.get_index(idx).unwrap();
                         return Some(resp_bulk(&crate::commands::helpers::name_to_bytes(field)));
                     };
-                    let push = |result: &mut Vec<Vec<u8>>, f: &String, v: &Arc<[u8]>| {
-                        if pairs {
-                            result.push(resp_array(vec![
-                                resp_bulk(&crate::commands::helpers::name_to_bytes(f)),
-                                resp_bulk(v),
-                            ]));
-                        } else {
-                            result.push(resp_bulk(&crate::commands::helpers::name_to_bytes(f)));
-                            if with_values {
-                                result.push(resp_bulk(v));
+                    let push =
+                        |result: &mut Vec<Vec<u8>>, f: &str, v: crate::hash_fields::Value<'_>| {
+                            if pairs {
+                                result.push(resp_array(vec![
+                                    resp_bulk(&crate::commands::helpers::name_to_bytes(f)),
+                                    resp_bulk(&v),
+                                ]));
+                            } else {
+                                result.push(resp_bulk(&crate::commands::helpers::name_to_bytes(f)));
+                                if with_values {
+                                    result.push(resp_bulk(&v));
+                                }
                             }
-                        }
-                    };
+                        };
 
                     let len = inner.len();
 
@@ -774,7 +769,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                         items.push(resp_bulk(&crate::commands::helpers::name_to_bytes(f)));
                         if !options.no_values {
-                            items.push(resp_bulk(v));
+                            items.push(resp_bulk(&v));
                         }
                     }
 
@@ -1050,6 +1045,26 @@ fn expire_before(ctx: &Ctx, key: &[u8]) -> FieldDeadline {
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 
+/// `*<n>\r\n` at the end of `buf`, the length written without the
+/// formatting machinery (`push_decimal`).
+#[inline]
+fn push_array_len(buf: &mut Vec<u8>, n: usize) {
+    buf.push(b'*');
+    push_decimal(buf, n as u64);
+    buf.extend_from_slice(b"\r\n");
+}
+
+/// [`write_bulk`] with its length written by `push_decimal`: `HGETALL`,
+/// `HKEYS` and `HVALS` write a bulk string for every field and value.
+#[inline]
+fn push_bulk(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.push(b'$');
+    push_decimal(buf, data.len() as u64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"\r\n");
+}
+
 /// The fields of the hash at `key` as a reader is shown them: the whole of
 /// them, those due and not to be seen left out ([`visible`]).
 fn with_hash_read<F, R>(ctx: &Ctx, key: &[u8], f: F) -> Option<Result<R, Vec<u8>>>
@@ -1086,7 +1101,7 @@ struct FieldsShown<'a> {
 }
 
 impl<'a> FieldsShown<'a> {
-    fn get(&self, field: &str) -> Option<&'a Arc<[u8]>> {
+    fn get(&self, field: &str) -> Option<crate::hash_fields::Value<'a>> {
         let value = self.fields.get(field)?;
         match self.hide {
             Some((times, now)) if times.get(field).is_some_and(|at| field_due(*at, now)) => None,
@@ -1883,10 +1898,10 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let mut deleted: Vec<&[u8]> = Vec::new();
             let out: Vec<Vec<u8>> = fields
                 .iter()
-                .map(|f| match crate::types::hash_remove(&mut inner, f) {
+                .map(|f| match inner.take_with(f, resp_bulk) {
                     Some(v) => {
                         deleted.push(f.as_bytes());
-                        resp_bulk(&v)
+                        v
                     }
                     None => resp_null_for(resp),
                 })
@@ -1906,10 +1921,10 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let mut deleted: Vec<&[u8]> = Vec::new();
             let out: Vec<Vec<u8>> = fields
                 .iter()
-                .map(|f| match inner.evict_field(f) {
+                .map(|f| match inner.take_field_with(f, resp_bulk) {
                     Some(v) => {
                         deleted.push(f.as_bytes());
-                        resp_bulk(&v)
+                        v
                     }
                     None => resp_null_for(resp),
                 })
@@ -2116,7 +2131,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let out: Vec<Vec<u8>> = fields
                     .iter()
                     .map(|f| match inner.get(f) {
-                        Some(v) => resp_bulk(v),
+                        Some(v) => resp_bulk(&v),
                         None => resp_null_for(resp),
                     })
                     .collect();
@@ -2164,8 +2179,9 @@ fn hgetex_apply(
 
     for f in fields {
         let due = hide && inner.expiries.get(f).is_some_and(|at| field_due(*at, now));
-        let value = match inner.fields.get(f).cloned() {
-            Some(v) if !due => v,
+        // The reply, written before the action may remove the field.
+        let value = match inner.fields.get(f) {
+            Some(v) if !due => resp_bulk(&v),
             _ => {
                 out.push(resp_null_for(resp));
                 continue;
@@ -2190,7 +2206,7 @@ fn hgetex_apply(
                 affected.push(f.as_bytes());
             }
         }
-        out.push(resp_bulk(&value));
+        out.push(value);
     }
     drop(inner);
 
@@ -2626,7 +2642,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // Apply all writes.
         let mut expiring: Vec<&[u8]> = Vec::new();
         for (f, v) in &pairs {
-            inner.fields.insert(f.clone(), Arc::clone(v));
+            inner.fields.insert(f, v);
             match ttl {
                 HsetexTtl::Clear => {
                     inner.expiries.remove(f);

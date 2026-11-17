@@ -2033,6 +2033,10 @@ impl Config {
                                 | "set-max-intset-entries"
                                 | "set-max-listpack-entries"
                                 | "set-max-listpack-value"
+                                | "hash-max-listpack-entries"
+                                | "hash-max-ziplist-entries"
+                                | "hash-max-listpack-value"
+                                | "hash-max-ziplist-value"
                                 | "rdbchecksum"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
@@ -2374,7 +2378,7 @@ mod config_file_tests {
         #[cfg(not(feature = "lua"))]
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let (_, warnings) = load(
-            "maxclients 10000\nlatency-tracking yes\nhash-max-listpack-entries 512\n\
+            "maxclients 10000\nlatency-tracking yes\nzset-max-listpack-entries 128\n\
              proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
         )
         .unwrap();
@@ -2383,7 +2387,7 @@ mod config_file_tests {
         // #232), and acllog-max-len, which the ACL log goes by.
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            warnings[0].contains("'hash-max-listpack-entries'"),
+            warnings[0].contains("'zset-max-listpack-entries'"),
             "{warnings:?}"
         );
         let err = load("maxclients 0\n").unwrap_err();

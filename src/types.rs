@@ -750,26 +750,7 @@ impl Default for TsInner {
 //
 // Expiry: `field_expiry::expire_due` is the one place a field past its
 //   deadline is removed, and its removal propagated.
-/// The fields of a hash, in the order they were first set — which is the
-/// order `HGETALL`, `HKEYS`, `HVALS` and `HSCAN` give them in. Redis keeps
-/// that order for a hash small enough for a listpack, and clients have come
-/// to rely on it (BullMQ's tests among them).
-pub type HashFields = indexmap::IndexMap<String, std::sync::Arc<[u8]>, ahash::RandomState>;
-
-/// Up to this many fields, removing one keeps the others in order, as in a
-/// Redis listpack (`hash-max-listpack-entries`). A larger hash is a hash
-/// table in Redis too, with no order to keep: there the last field takes the
-/// removed one's place, which costs nothing.
-pub const HASH_ORDERED_FIELDS: usize = 512;
-
-/// Remove `field` from `fields` (see `HASH_ORDERED_FIELDS`).
-pub fn hash_remove(fields: &mut HashFields, field: &str) -> Option<std::sync::Arc<[u8]>> {
-    if fields.len() <= HASH_ORDERED_FIELDS {
-        fields.shift_remove(field)
-    } else {
-        fields.swap_remove(field)
-    }
-}
+pub use crate::hash_fields::{HASH_ORDERED_FIELDS, HashFields};
 
 /// A hash field's deadline: milliseconds since the Unix epoch, by the wall
 /// clock, as Redis keeps it and as every file, payload and stream carries it.
@@ -1042,15 +1023,18 @@ impl HashInner {
     /// is shown of a hash whose due fields are left in place.
     #[cold]
     pub fn live_fields(&self, now: FieldDeadline) -> HashFields {
-        self.fields
-            .iter()
-            .filter(|(field, _)| {
-                self.expiries
-                    .get(*field)
-                    .is_none_or(|at| !field_due(*at, now))
-            })
-            .map(|(field, value)| (field.clone(), std::sync::Arc::clone(value)))
-            .collect()
+        // Room for them all: a table is made a table at once.
+        let mut live = HashFields::with_capacity(self.fields.len());
+        for (field, value) in self.fields.iter() {
+            if self
+                .expiries
+                .get(field)
+                .is_none_or(|at| !field_due(*at, now))
+            {
+                live.insert_bytes(field, &value);
+            }
+        }
+        live
     }
 
     /// The fields a reader is shown at `now`: those due left out, unless
@@ -1076,11 +1060,17 @@ impl HashInner {
                 .is_some_and(|at| field_due(*at, now))
     }
 
-    /// Remove a field's value AND its expiry entry. Returns the removed
-    /// value if the field existed.
-    pub fn evict_field(&mut self, field: &str) -> Option<std::sync::Arc<[u8]>> {
+    /// Remove a field's value AND its expiry entry. Whether the field
+    /// existed.
+    pub fn evict_field(&mut self, field: &str) -> bool {
         self.expiries.remove(field);
-        hash_remove(&mut self.fields, field)
+        self.fields.remove(field)
+    }
+
+    /// [`Self::evict_field`], handing the value to `f` on its way out.
+    pub fn take_field_with<R>(&mut self, field: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.expiries.remove(field);
+        self.fields.take_with(field, f)
     }
 
     /// Remove every field past its deadline, telling no one. For tests: a
