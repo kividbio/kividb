@@ -8249,6 +8249,173 @@
           "kind": "info"
         }
       ]
+    },
+    "22-scan-large-count/t4/dbsize": {
+      "suite": "22-scan-large-count",
+      "config": "t4",
+      "metric": "dbsize",
+      "unit": "keys",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 40000.0,
+        "candidate": 40000.0,
+        "redis": 40000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-17",
+        "commit": "0b5f4b1d",
+        "label": "pr-884-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "22-scan-large-count/t4/ping_max_ms": {
+      "suite": "22-scan-large-count",
+      "config": "t4",
+      "metric": "ping_max_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4.6516,
+        "candidate": 2.1884,
+        "redis": 5.3364,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-17",
+        "commit": "0b5f4b1d",
+        "label": "pr-884-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "22-scan-large-count/t4/ping_p99_ms": {
+      "suite": "22-scan-large-count",
+      "config": "t4",
+      "metric": "ping_p99_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.2575,
+        "candidate": 0.4345,
+        "redis": 2.731,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-17",
+        "commit": "0b5f4b1d",
+        "label": "pr-884-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 1,
+          "speed": false
+        }
+      ]
+    },
+    "22-scan-large-count/t4/scan_call_us": {
+      "suite": "22-scan-large-count",
+      "config": "t4",
+      "metric": "scan_call_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 672.3795,
+        "candidate": 121.6317,
+        "redis": 661.0238,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-17",
+        "commit": "0b5f4b1d",
+        "label": "pr-884-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 30
+        }
+      ]
+    },
+    "22-scan-large-count/t4/scan_calls": {
+      "suite": "22-scan-large-count",
+      "config": "t4",
+      "metric": "scan_calls",
+      "unit": "calls",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4.0,
+        "candidate": 4.0,
+        "redis": 4.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-17",
+        "commit": "0b5f4b1d",
+        "label": "pr-884-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "22-scan-large-count/t4/scan_returned": {
+      "suite": "22-scan-large-count",
+      "config": "t4",
+      "metric": "scan_returned",
+      "unit": "keys",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": 0.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-17",
+        "commit": "0b5f4b1d",
+        "label": "pr-884-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "22-scan-large-count/t4/scan_server_us": {
+      "suite": "22-scan-large-count",
+      "config": "t4",
+      "metric": "scan_server_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 603.425,
+        "candidate": 66.15,
+        "redis": 599.7,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-17",
+        "commit": "0b5f4b1d",
+        "label": "pr-884-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25,
+          "abs": 30
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
     }
   }
 }

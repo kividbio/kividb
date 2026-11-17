@@ -253,6 +253,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`SCAN` with a large `COUNT` takes 40-50 % less time, and holds up the
+  connections beside it that much less (#884).** Argo CD sends `SCAN 0 MATCH
+  revoked-token|* COUNT 10000` from every API server, over a keyspace
+  where no key matches. Each page of a shard took two passes over the
+  shard's table: the first counted the keys at each of the 4,096 positions
+  a scan goes through, a count cleared and summed again for every page
+  that cost more than the walk itself for shards of a few thousand keys.
+  The second read the entries of the page one after the other, each a
+  cache miss, with the shard locked for reading throughout. A page is now
+  one pass: the positions that hold `COUNT` keys are told from the shard's
+  length (a key's position is a fragment of its hash, so keys spread
+  evenly over them), and the walk asks for each entry's header and key as
+  it finds the entry and reads them a batch of 16 at a time. A key that
+  does not match is still neither copied nor told its type or time to
+  live, and values are never read: 50 KB values cost a scan nothing more
+  than 32-byte ones. A page now holds about `COUNT` keys, a few more or
+  fewer, where it held at least `COUNT` (it is a hint in Redis too); what
+  `SCAN` promises is unchanged: a key there for the whole scan is
+  returned, through growth and shrinking of the tables, with `TYPE`,
+  `MATCH` and keys past their time as before. On an Azure D4s_v5,
+  `--threads 4`, Valkey 8.1 with `--io-threads 4` and Redis 8.10.2 on the
+  same VM:
+
+  | | before | now | Valkey 8.1 | Redis 8.10.2 |
+  |---|---|---|---|---|
+  | 40,000 keys of 50 KB: instructions a key looked at | 141 | 94 | | |
+  | server time a call (`INFO commandstats`) | 173 us | 91 us | 136 us | 570 us |
+  | calls a second, 4 connections | 15.4k | 24.8k | 6.9k | 1.7k |
+  | calls a second, 48 connections | 19.2k | 30.8k | 4.5k | 1.8k |
+  | p99 of a `GET` stream on 16 other connections while 4 scan | 0.85 ms | 0.51 ms | 2.40 ms | 3.44 ms |
+  | 1,000,000 keys of 32 bytes: instructions a key looked at | 223 | 155 | | |
+  | server time a call | 519 us | 303 us | 284 us | 668 us |
+  | calls a second, 4 connections | 5.9k | 9.5k | 3.4k | 1.5k |
+  | p99 of the `GET` stream while 4 scan | 1.58 ms | 0.94 ms | 3.26 ms | 3.54 ms |
+
+  (The `GET` stream is 16,000 a second; it is 0.10 ms at p99 with no scan.
+  Valkey and Redis, which run commands on one thread, served it at 9,600
+  to 12,000 and 5,700 a second while the scans ran.) A connection served
+  by the same thread as a running `SCAN` still waits for it, as with any
+  command on the io_uring loop: a call is now 0.1 to 0.3 ms. With
+  `lua-parallel-scripts yes`, `SCAN` still takes the command gate alone
+  (#772): unlike Redis's, a call goes through the keyspace a shard at a
+  time, and without the gate it could find a script's keys halfway
+  through what the script does. Regression suite `22-scan-large-count`
+  measures it.
+
 - **Every command costs a little less (#867).** The parts of the command
   path that a plain command on a standalone master never runs (cluster
   routing, replica, ACL and memory-limit refusals, the write pause checks,
