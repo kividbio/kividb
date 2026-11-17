@@ -33,6 +33,7 @@ and why.
 | `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one; `SDIFFSTORE big small` as a cost guard; worst `SADD` to the small set during `SUNION big small` (Tokio, 1M) |
 | `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
+| `17-set-memory` | #297 (step 1) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000: 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly; the tables (1,000 and 100,000) as guard rows |
 
 ## Running it
 
@@ -835,6 +836,29 @@ also `ratio` (keep 60 % of the gain over v1.2.2, every row but `HRANDFIELD h`,
 which never copied) and, for the hash rows, at most 2x Redis. The sorted set's
 rows are not compared with Redis (see above). The figures are of the client's
 round trip as much as of the server: compare within a session, as the gates do.
+
+## Recorded run, suite 17
+
+Recorded 2026-11-17 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 17 --record`; the candidate is commit `5b4a04a4` (#297 step 1, built
+on #309), `cargo build --release`. Runs: `pr-packed-sets-5b4a04a4-d4s_v5`
+(recorded) and `pr-packed-sets-5b4a04a4-d4s_v5-rerun` (the noise check:
+every gate passed; the figures agree to 0.001 B). A run takes 71 s.
+
+Bytes of `used_memory` a member, 1,000,000 members in sets of each size
+(`OBJECT ENCODING` of the candidate's sets in brackets; Redis's are the same):
+
+| members a set | v1.2.2 strings | candidate strings | Redis 8.10.2 strings | v1.2.2 integers | candidate integers | Redis 8.10.2 integers |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 75.6 | 34.2 (listpack) | 24.8 | 67.6 | 17.2 (intset) | 8.8 |
+| 100 | 55.4 | 20.3 (listpack) | 18.5 | 47.4 | 3.7 (intset) | 2.8 |
+| 1,000 | 67.0 | 67.0 (hashtable) | 30.2 | 59.0 | 59.0 (hashtable) | 22.0 |
+| 100,000 | 54.3 | 54.3 (hashtable) | 36.8 | 46.3 | 46.3 (hashtable) | 28.8 |
+
+The 1,000 and 100,000 rows are guards: sets past the block's and the array's
+limits are tables, as in v1.2.2, and must not grow. Instructions per command
+are not measured here (the suite has no callgrind harness); #297's PR has
+them from `scripts/perf`-style runs.
 
 ## Not covered
 
