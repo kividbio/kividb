@@ -1983,7 +1983,7 @@ mod tests {
                 unreachable!()
             };
             let set = set.read();
-            (set.array_ptr(), set.array_bytes())
+            (set.array_ptr(), set.compact_bytes())
         };
         assert!(array.is_some(), "the test needs the array, not the table");
 
@@ -2007,7 +2007,7 @@ mod tests {
         assert_eq!(Arc::strong_count(set), 1);
         let set = set.read();
         assert_eq!(set.array_ptr(), array, "the array moved");
-        assert_eq!(set.array_bytes(), bytes);
+        assert_eq!(set.compact_bytes(), bytes);
         let mut got: Vec<Vec<u8>> = set.iter().map(|m| m.to_vec()).collect();
         got.sort();
         let mut want = members;

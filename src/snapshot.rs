@@ -2352,7 +2352,7 @@ fn read_image(
                     let mut hset = crate::member_set::MemberSet::with_capacity(hint(count));
                     for _ in 0..count {
                         let member = read_bytes(&mut r)?;
-                        hset.insert(Arc::from(member.as_slice()));
+                        hset.insert_bytes(&member);
                     }
                     KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(hset)))
                 }
@@ -3841,10 +3841,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         2 => {
             // Set (hashtable encoding)
             let (count, _) = rdb_read_length(r)?;
-            let mut set = crate::member_set::MemberSet::new();
+            let mut set = crate::member_set::MemberSet::with_capacity(hint(count as usize));
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
-                set.insert(Arc::from(member.as_slice()));
+                set.insert_bytes(&member);
             }
             Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
                 set,
@@ -3935,8 +3935,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                             8 => i64::from_le_bytes(data[start..end].try_into().unwrap_or([0; 8])),
                             _ => 0,
                         };
-                    let s = val.to_string();
-                    set.insert(Arc::from(s.as_bytes()));
+                    set.insert_bytes(crate::member_set::IntText::new(val).as_bytes());
                 }
             }
             Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
@@ -5949,10 +5948,10 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             }
             let count = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
             let mut pos = 4usize;
-            let mut set = crate::member_set::MemberSet::new();
+            let mut set = crate::member_set::MemberSet::with_capacity(hint(count));
             for _ in 0..count {
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
-                set.insert(Arc::from(bytes));
+                set.insert_bytes(bytes);
                 pos = next;
             }
             Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set))))

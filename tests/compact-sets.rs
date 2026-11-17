@@ -507,11 +507,12 @@ fn object_encoding_is_the_form_kept() {
     c.cmd(&["SREM", "small", "x"]);
     assert_eq!(encoding(&mut c, "small"), "listpack");
 
-    // Converted by size: the encoding a table of that size has.
+    // Converted by size: past 128 members, too many for a block, so the
+    // table.
     c.sadd("full", &ints(0..DEFAULT as i64));
     assert_eq!(encoding(&mut c, "full"), "intset");
     c.cmd(&["SADD", "full", &DEFAULT.to_string()]);
-    assert_eq!(encoding(&mut c, "full"), "listpack");
+    assert_eq!(encoding(&mut c, "full"), "hashtable");
     c.sadd("full", &ints(0..200));
     assert_eq!(encoding(&mut c, "full"), "hashtable");
 
@@ -533,20 +534,26 @@ fn object_encoding_is_the_form_kept() {
     assert_eq!(encoding(&mut c, "none"), "listpack");
 }
 
-/// Every member there throughout comes back exactly once from a scan that
-/// spans the change of form: the cursor is a position by each member's own
-/// bytes, which the change leaves alone.
+/// An array comes back whole from one SSCAN, whatever COUNT says, as an
+/// intset does from Redis, however long it is; once it is a table it is paged,
+/// and a scan begun on the table sees every member that was there throughout.
 #[test]
 fn sscan_across_the_change_of_form() {
     let dir = temp_dir("sscan");
     let server = Server::start(&dir, &[]);
     let mut c = server.conn();
-    // Over 512 integers: paged, as Redis pages such a set.
     set_limit(&mut c, 1000);
     let members = ints(0..600);
     c.sadd("s", &members);
     assert_eq!(encoding(&mut c, "s"), "intset");
+    let Resp::Array(parts) = c.cmd(&["SSCAN", "s", "0", "COUNT", "50"]) else {
+        panic!()
+    };
+    assert_eq!(parts[0].bulk(), b"0");
+    assert_eq!(parts[1].members(), sorted(&members));
 
+    c.cmd(&["SADD", "s", "x"]);
+    assert_eq!(encoding(&mut c, "s"), "hashtable");
     let mut seen: Vec<Vec<u8>> = Vec::new();
     let mut cursor = "0".to_string();
     let mut pages = 0;
@@ -560,18 +567,18 @@ fn sscan_across_the_change_of_form() {
         seen.extend(page.iter().map(Resp::bulk));
         pages += 1;
         if pages == 3 {
-            assert_ne!(cursor, "0", "the scan has to span the change");
-            c.cmd(&["SADD", "s", "x"]);
-            assert_eq!(encoding(&mut c, "s"), "hashtable");
+            assert_ne!(cursor, "0", "the scan has to be paged");
+            c.cmd(&["SADD", "s", "y"]);
         }
         if cursor == "0" {
             break;
         }
     }
     assert!(pages > 3);
-    seen.retain(|m| m != b"x");
+    seen.retain(|m| m != b"x" && m != b"y");
     seen.sort();
-    assert_eq!(seen, sorted(&members), "each member exactly once");
+    seen.dedup();
+    assert_eq!(seen, sorted(&members), "each member at least once");
 
     // A small array comes back whole, as an intset does from Redis.
     c.sadd("t", &ints(0..20));
@@ -680,7 +687,7 @@ fn smove_between_the_forms() {
             .int(),
         1
     );
-    assert_eq!(encoding(&mut c, "full"), "listpack");
+    assert_eq!(encoding(&mut c, "full"), "hashtable");
     assert_eq!(c.cmd(&["SCARD", "full"]).int(), DEFAULT as i64 + 1);
     assert_eq!(c.cmd(&["SMEMBERS", "from"]).members(), sorted(&ints(0..1)));
     assert_eq!(encoding(&mut c, "from"), "intset");

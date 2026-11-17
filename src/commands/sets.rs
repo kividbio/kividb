@@ -1,7 +1,8 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
-use crate::commands::set_card::{diff_each, inter_each, sets_at, union_of};
+use crate::commands::set_card::{collect_set, diff_each, inter_each, sets_at, union_of};
 use crate::keyspace_events::{KS_SET, notify};
+use crate::member_set::MemberSet;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
@@ -32,36 +33,64 @@ fn reply_resp(ctx: &Ctx) -> u8 {
 // to copy every set out of the store first, 20M members to intersect with
 // 4,096. SDIFF walks only the first set.
 
-/// Returns elements in the first set that are absent from all subsequent sets.
-fn set_diff(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
-    let sets = sets_at(ctx, key_args)?;
-    let mut result = Vec::new();
-    diff_each(&sets, 0, |member| result.push(member.to_shared()));
-    Ok(result)
+// The replies are written as the members are found, straight from the sets:
+// no member is copied into a shared block or a reply of its own first.
+
+/// A member as a bulk string, at the end of the reply being built.
+#[inline]
+fn push_bulk(buf: &mut Vec<u8>, member: &[u8]) {
+    push_header(buf, b'$', member.len());
+    buf.extend_from_slice(member);
+    buf.extend_from_slice(b"\r\n");
 }
 
-/// Returns only elements present in every set.
-fn set_inter(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
-    let sets = sets_at(ctx, key_args)?;
-    let mut result = Vec::new();
-    inter_each(&sets, 0, |member| result.push(member.to_shared()));
-    Ok(result)
+/// The reply of `count` members whose bulk strings are `body`: RESP3's set
+/// type (`~`), or RESP2's array.
+fn set_reply(resp: u8, count: usize, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 16);
+    push_header(&mut out, if resp >= 3 { b'~' } else { b'*' }, count);
+    out.extend_from_slice(body);
+    out
 }
 
-/// Returns all unique elements across every set.
-fn set_union(ctx: &Ctx, key_args: &[&[u8]]) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
+/// The members in the first set that are absent from all subsequent sets.
+fn set_diff(ctx: &Ctx, key_args: &[&[u8]]) -> Result<MemberSet, Vec<u8>> {
+    let sets = sets_at(ctx, key_args)?;
+    let bound = match sets.first() {
+        Some(Some(first)) => first.read().len(),
+        _ => 0,
+    };
+    Ok(collect_set(bound, |each| {
+        diff_each(&sets, 0, each);
+    }))
+}
+
+/// The members present in every set.
+fn set_inter(ctx: &Ctx, key_args: &[&[u8]]) -> Result<MemberSet, Vec<u8>> {
+    let sets = sets_at(ctx, key_args)?;
+    let bound = sets
+        .iter()
+        .map(|set| set.as_ref().map_or(0, |set| set.read().len()))
+        .min()
+        .unwrap_or(0);
+    Ok(collect_set(bound, |each| {
+        inter_each(&sets, 0, each);
+    }))
+}
+
+/// All the distinct members of every set.
+fn set_union(ctx: &Ctx, key_args: &[&[u8]]) -> Result<MemberSet, Vec<u8>> {
     let sets = sets_at(ctx, key_args)?;
     Ok(union_of(&sets))
 }
 
 // ── store_set ─────────────────────────────────────────────────────────────────
-// Writes a Vec<Arc<[u8]>> back into the store as a KiviDBValue::Set.
+// Writes a set made of others into the store as a KiviDBValue::Set.
 // Overwrites whatever was at dst_key — this is the correct behaviour for
 // SDIFFSTORE / SINTERSTORE / SUNIONSTORE which always replace the destination:
 // the value, and with it any TTL the old one had. (An empty result leaves no
 // key at all; the dispatcher removes it — see `settle_written_keys`.)
-fn store_set(ctx: &mut Ctx, dst_key: &[u8], members: Vec<Arc<[u8]>>) {
-    let set: crate::member_set::MemberSet = members.into_iter().collect();
+fn store_set(ctx: &mut Ctx, dst_key: &[u8], set: MemberSet) {
     let db = *ctx.selected_db;
     let db_ref = &ctx.store[db];
     let shard = store::get_shard(db_ref, dst_key);
@@ -263,10 +292,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // Identical payload, one byte of header difference — this
                     // keeps the single-pass build instead of collecting into a
                     // Vec just to re-encode it.
-                    buf.push(if reply_resp(ctx) >= 3 { b'~' } else { b'*' });
-                    buf.extend_from_slice(inner.len().to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-                    inner.for_each(|v| write_bulk(&mut buf, v));
+                    push_header(
+                        &mut buf,
+                        if reply_resp(ctx) >= 3 { b'~' } else { b'*' },
+                        inner.len(),
+                    );
+                    inner.for_each(|v| push_bulk(&mut buf, v));
                     crate::stats::record_hit();
                     Some(buf)
                 }
@@ -358,11 +389,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // see `MemberSet`.
                     let mut rng = rand::thread_rng();
                     let wanted = count.unwrap_or(1).min(inner.len());
-                    let mut popped: Vec<Arc<[u8]>> = Vec::with_capacity(wanted);
+                    // Each written into its reply as it goes: a member of a
+                    // block or an array is never copied out on its own.
+                    let mut popped: Vec<Vec<u8>> = Vec::with_capacity(wanted);
                     while popped.len() < wanted {
-                        match inner.pop_random(&mut rng) {
-                            Some(member) => popped.push(member),
-                            None => break,
+                        if !inner
+                            .pop_random_with(&mut rng, |member| popped.push(resp_bulk(&member)))
+                        {
+                            break;
                         }
                     }
                     drop(inner);
@@ -373,19 +407,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         notify(ctx.pubsub, *ctx.selected_db, KS_SET, "spop", key);
                     }
                     match count {
-                        None => Some(match popped.first() {
-                            Some(member) => resp_bulk(member),
-                            None => resp_null_bulk(),
-                        }),
+                        None => Some(popped.pop().unwrap_or_else(resp_null_bulk)),
                         // SPOP with a count replies with the RESP3 set type
                         // (`addReplySetLen` in spopWithCountCommand). Note
                         // SRANDMEMBER below deliberately stays an array: a
                         // negative count there may repeat members, which a
                         // set cannot represent.
-                        Some(_) => Some(resp_set_for(
-                            resp,
-                            popped.iter().map(|v| resp_bulk(v)).collect(),
-                        )),
+                        Some(_) => Some(resp_set_for(resp, popped)),
                     }
                 }
                 Some(_) => {
@@ -539,14 +567,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             crate::stats::record_hit();
             let resp = reply_resp(ctx);
-            let members = match set_diff(ctx, &cmd[1..]) {
-                Ok(members) => members,
+            let sets = match sets_at(ctx, &cmd[1..]) {
+                Ok(sets) => sets,
                 Err(e) => return Some(e),
             };
-            Some(resp_set_for(
-                resp,
-                members.into_iter().map(|v| resp_bulk(&v)).collect(),
-            ))
+            let mut body = Vec::new();
+            let count = diff_each(&sets, 0, |member| push_bulk(&mut body, &member));
+            Some(set_reply(resp, count, &body))
         }
 
         "SDIFFSTORE" => {
@@ -588,14 +615,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             crate::stats::record_hit();
             let resp = reply_resp(ctx);
-            let members = match set_inter(ctx, &cmd[1..]) {
-                Ok(members) => members,
+            let sets = match sets_at(ctx, &cmd[1..]) {
+                Ok(sets) => sets,
                 Err(e) => return Some(e),
             };
-            Some(resp_set_for(
-                resp,
-                members.into_iter().map(|v| resp_bulk(&v)).collect(),
-            ))
+            let mut body = Vec::new();
+            let count = inter_each(&sets, 0, |member| push_bulk(&mut body, &member));
+            Some(set_reply(resp, count, &body))
         }
 
         "SINTERSTORE" => {
@@ -677,14 +703,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             crate::stats::record_hit();
             let resp = reply_resp(ctx);
-            let members = match set_union(ctx, &cmd[1..]) {
-                Ok(members) => members,
+            let union = match set_union(ctx, &cmd[1..]) {
+                Ok(union) => union,
                 Err(e) => return Some(e),
             };
-            Some(resp_set_for(
-                resp,
-                members.into_iter().map(|v| resp_bulk(&v)).collect(),
-            ))
+            let mut body = Vec::new();
+            union.for_each(|member| push_bulk(&mut body, member));
+            Some(set_reply(resp, union.len(), &body))
         }
 
         "SUNIONSTORE" => {

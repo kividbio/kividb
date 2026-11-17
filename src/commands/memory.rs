@@ -149,10 +149,10 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::Set(arc) => {
             let inner = arc.read();
-            // An array of integers (#297) is one allocation, counted as
-            // allocated, room to spare included.
-            if let Some(array) = inner.array_bytes() {
-                entry() + layout::arc_of::<RwLock<MemberSet>>() + array
+            // An array of integers or a block of members (#297) is one
+            // allocation, counted as allocated, room to spare included.
+            if let Some(compact) = inner.compact_bytes() {
+                entry() + layout::arc_of::<RwLock<MemberSet>>() + compact
             } else {
                 // The table's one allocation is known from its buckets; each
                 // member is a block of its own, sampled as Redis samples

@@ -29,38 +29,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// set in one page.
 pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
     match value {
-        // By its members, not the form it is kept in (#297): paging stays as it was.
-        ValueRef::Set(set) => matches!(set_encoding_by_members(&set.read()), "intset" | "listpack"),
+        // By the form it is kept in (#297), as Redis goes by its encoding:
+        // an array or a block whole, a table a page at a time.
+        ValueRef::Set(set) => !set.read().is_table(),
         _ => matches!(encoding_of(value), "listpack" | "listpackex"),
     }
 }
 
-/// The encoding Redis, at its default limits, would give a set of these members.
-fn set_encoding_by_members(set: &crate::member_set::MemberSet) -> &'static str {
-    // The length first: a big set is never walked.
-    if set.len() <= 512
-        && set
-            .iter()
-            .all(|member| crate::member_set::canonical_i64(&member).is_some())
-    {
-        "intset"
-    } else {
-        table_set_encoding(set)
-    }
-}
-
-fn table_set_encoding(set: &crate::member_set::MemberSet) -> &'static str {
-    if set.len() <= 128 && set.iter().all(|member| member.len() <= SMALL) {
-        "listpack"
-    } else {
-        "hashtable"
-    }
-}
-
-/// An entry of a compact structure is at most this long.
-const SMALL: usize = 64;
-
 pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
+    // An entry of a compact structure is at most this long.
+    const SMALL: usize = 64;
     match value {
         ValueRef::String(bytes) => {
             let integer = bytes.len() <= 20
@@ -85,15 +63,8 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
                 "quicklist"
             }
         }
-        ValueRef::Set(set) => {
-            let set = set.read();
-            // The form it is really kept in (#297); a table is never `intset`.
-            if set.is_compact() {
-                "intset"
-            } else {
-                table_set_encoding(&set)
-            }
-        }
+        // The form it is really kept in (#297).
+        ValueRef::Set(set) => set.read().encoding().name(),
         ValueRef::SortedSet(zset) => {
             let zset = zset.read();
             if zset.members.len() <= 128 && zset.members.keys().all(|member| member.len() <= SMALL)
