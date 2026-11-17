@@ -112,7 +112,7 @@ the Redis binary, numpy (pinned in `requirements.txt`, for
 and a `redis-cli` 7.0.x for `13-cluster-reshard` (`$REDIS_CLI_7`, else
 `/usr/bin/redis-cli` if it is 7.0.x, as Ubuntu 24.04's `redis-tools` is, else
 built from Redis's 7.0.15 tag into `$REGRESS_CACHE`, which needs git, make
-and a C compiler). Suite 18 uses `memtier_benchmark` 2.6.1 or newer
+and a C compiler). Suites 18 and 20 use `memtier_benchmark` 2.6.1 or newer
 (`--transaction` and its error-reply lines; `$MEMTIER`, else on `PATH`).
 
 ## Method
