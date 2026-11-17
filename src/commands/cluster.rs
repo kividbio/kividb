@@ -623,31 +623,51 @@ fn slots_node_entry(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
 
 // ── CLUSTER SHARDS ───────────────────────────────────────────────────────────
 //
-// Redis 7+. Groups nodes by shard (master + its replicas) and returns the
-// slot ranges they cover. Each shard is a map: { slots: [...], nodes: [...] }.
+// Redis 7+. Groups nodes by shard and returns the slot ranges each covers.
+// Each shard is a map: { slots: [...], nodes: [...] }. A shard is its shard
+// id's masters and their replicas, as Redis groups them: after a failover the
+// failed master is in the shard of the replica that took over, not in one of
+// its own (#563).
 
 fn cmd_shards(state: &ClusterState) -> Vec<u8> {
     let nodes = state.nodes.read();
     let slots = state.slots.read();
 
-    let mut shards: Vec<Vec<u8>> = Vec::new();
+    // The shards, in the order their first master comes, each with its
+    // masters: the one that owns slots first.
+    let mut groups: Vec<(crate::cluster::NodeId, Vec<&crate::cluster::ClusterNode>)> = Vec::new();
     for master in nodes
         .values()
         .filter(|n| n.flags.contains(NodeFlags::MASTER))
     {
-        let mut slot_pairs: Vec<Vec<u8>> = Vec::new();
-        for (a, b) in compute_slot_ranges(&slots, master.id) {
-            slot_pairs.push(resp_integer(a as i64));
-            slot_pairs.push(resp_integer(b as i64));
-        }
-
-        let mut node_descs: Vec<Vec<u8>> = Vec::new();
-        node_descs.push(node_description(state, master));
-        for replica in nodes
-            .values()
-            .filter(|n| n.flags.contains(NodeFlags::REPLICA) && n.master_id == Some(master.id))
+        match groups
+            .iter_mut()
+            .find(|(shard, _)| *shard == master.shard_id)
         {
-            node_descs.push(node_description(state, replica));
+            Some((_, masters)) => masters.push(master),
+            None => groups.push((master.shard_id, vec![master])),
+        }
+    }
+
+    let mut shards: Vec<Vec<u8>> = Vec::new();
+    for (_, mut masters) in groups {
+        masters.sort_by_key(|m| compute_slot_ranges(&slots, m.id).is_empty());
+        let mut slot_pairs: Vec<Vec<u8>> = Vec::new();
+        let mut node_descs: Vec<Vec<u8>> = Vec::new();
+        for master in &masters {
+            for (a, b) in compute_slot_ranges(&slots, master.id) {
+                slot_pairs.push(resp_integer(a as i64));
+                slot_pairs.push(resp_integer(b as i64));
+            }
+            node_descs.push(node_description(state, master));
+        }
+        for master in &masters {
+            for replica in nodes
+                .values()
+                .filter(|n| n.flags.contains(NodeFlags::REPLICA) && n.master_id == Some(master.id))
+            {
+                node_descs.push(node_description(state, replica));
+            }
         }
 
         shards.push(resp_array(vec![
@@ -2732,18 +2752,15 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
 
 // ── CLUSTER MYSHARDID ────────────────────────────────────────────────────────
 //
-// Shard ID = master node's ID. For a master that's our own ID. For a replica
-// it's our master_id. Returns the 40-hex node ID as a bulk string.
+// This node's shard id, 40 hex characters, as Redis keeps it: its master's
+// while it is a replica, and kept when a replica is promoted, so a shard's id
+// is the same before and after a failover (#563). See `ClusterNode::shard_id`.
 
 fn cmd_myshardid(ctx: &mut Ctx) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(ctx.cluster) {
         return err;
     }
-    let shard_id = match ctx.cluster.my_master_id() {
-        Some(master_id) => master_id, // we're a replica
-        None => ctx.cluster.myself(), // we're a master
-    };
-    resp_bulk_str(crate::cluster::node_id_str(&shard_id))
+    resp_bulk_str(crate::cluster::node_id_str(&ctx.cluster.my_shard_id()))
 }
 
 // ── CLUSTER SLOT-STATS ───────────────────────────────────────────────────────

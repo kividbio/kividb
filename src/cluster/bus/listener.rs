@@ -230,6 +230,7 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_shard_id,
         } => {
             // A PING from a node we do not know is answered — so it can see
             // we are alive — but it does not get itself added by pinging.
@@ -247,6 +248,7 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_shard_id,
                     gossip,
                     &slot_claims,
                 );
@@ -265,6 +267,7 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_shard_id,
         } => {
             // A PONG is a reply to something we sent. From a stranger it is
             // only acceptable as the answer to our own MEET — which the
@@ -281,6 +284,7 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_shard_id,
                     gossip,
                     &slot_claims,
                 );
@@ -409,6 +413,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         sender_master_id,
         sender_hostname,
         sender_announced_client_port,
+        sender_shard_id,
     } = msg
     {
         state.forgotten.write().remove(&sender_id);
@@ -428,6 +433,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_shard_id,
             gossip,
             &slot_claims,
         );
@@ -448,6 +454,7 @@ fn apply_heartbeat(
     sender_master_id: Option<NodeId>,
     sender_hostname: String,
     sender_announced_client_port: u16,
+    sender_shard_id: Option<NodeId>,
     gossip: Vec<GossipEntry>,
     slot_claims: &[crate::cluster::bus::SlotClaim],
 ) {
@@ -480,6 +487,10 @@ fn apply_heartbeat(
     // What a node says of its own hostname stands, none included.
     state.set_peer_hostname(sender_id, &sender_hostname, true);
     state.set_peer_client_port(sender_id, sender_announced_client_port, true);
+    // Its shard: what a master says of its own is its shard's, replicas
+    // included (this node too, if it is one); a replica is in its master's
+    // (#563). A node of an earlier version says none.
+    state.take_shard_id(sender_id, sender_shard_id);
     // It reached us, so whatever we concluded about it deserves a second look.
     state.maybe_clear_fail_on_contact(sender_id);
 
@@ -676,6 +687,7 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,
+        sender_shard_id: Some(me.shard_id),
         gossip,
         slot_claims: state.my_slot_claims(),
     }
@@ -771,6 +783,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_shard_id: None,
             gossip,
             slot_claims: vec![],
         }
@@ -865,6 +878,7 @@ mod tests {
             None,
             String::new(),
             0,
+            None,
             vec![],
             &[SlotClaim {
                 start: 0,

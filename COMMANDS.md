@@ -1108,7 +1108,7 @@ A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 |---|---|---|
 | `CLUSTER INFO` | `CLUSTER INFO` | Cluster state, slot counts, known nodes, current/my epoch, gossip stats. |
 | `CLUSTER MYID` | `CLUSTER MYID` | Returns this node's 40-hex ID. Stable across restarts. Refused on a server that is not a cluster node (`ERR This instance has cluster support disabled`), as in Redis. |
-| `CLUSTER MYSHARDID` | `CLUSTER MYSHARDID` | Returns the shard ID — own ID for masters, master's ID for replicas. So it changes when a replica takes over; in Redis a shard has an ID of its own that stays the same across failovers. |
+| `CLUSTER MYSHARDID` | `CLUSTER MYSHARDID` | Returns this node's shard ID, as Redis keeps it: a replica has its master's, and a replica that takes over keeps it, so a shard's ID stays the same across failovers. |
 | `CLUSTER NODES` | `CLUSTER NODES` | Full node table as a bulk string. Format matches Redis. |
 | `CLUSTER SLOTS` | `CLUSTER SLOTS` | Slot-to-node mapping. Each entry: `[start, end, [master_ip, port, id], ...replicas]`. |
 | `CLUSTER SHARDS` | `CLUSTER SHARDS` | Per-shard summary including slots and node descriptions. |

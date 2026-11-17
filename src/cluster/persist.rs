@@ -23,7 +23,9 @@
 // rename. This is the standard way to avoid a half-written file if the
 // process crashes mid-save.
 
-use crate::cluster::node::{ClusterNode, NodeFlags, NodeId, node_id_str, parse_node_id};
+use crate::cluster::node::{
+    ClusterNode, NodeFlags, NodeId, generate_node_id, node_id_str, parse_node_id,
+};
 use crate::cluster::slot::CLUSTER_SLOTS;
 use ahash::AHashMap;
 use std::fs;
@@ -93,9 +95,14 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
         let id = parse_node_id(tokens[0].as_bytes())
             .ok_or_else(|| io_err(format!("invalid node id on line {}", lineno + 1)))?;
 
-        // `ip:port@cport`, then `,hostname` when the node announces one,
-        // as Redis writes it.
-        let (addr, hostname) = tokens[1].split_once(',').unwrap_or((tokens[1], ""));
+        // `ip:port@cport`, then `,hostname` (empty when the node announces
+        // none) and `,key=value` fields, as Redis writes them: `shard-id=`.
+        let mut fields = tokens[1].split(',');
+        let addr = fields.next().unwrap_or("");
+        let hostname = fields.next().unwrap_or("");
+        let shard_id = fields
+            .filter_map(|field| field.strip_prefix("shard-id="))
+            .find_map(|id| parse_node_id(id.as_bytes()));
         let (ip, client_port, cluster_port) = parse_addr(addr)
             .ok_or_else(|| io_err(format!("invalid address on line {}", lineno + 1)))?;
 
@@ -156,8 +163,27 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
                 hostname: hostname.to_string(),
                 // Not persisted: the peer says it again on its next heartbeat.
                 announced_client_port: 0,
+                // A file an earlier version wrote has none: a master gets a
+                // new one, as Redis gives it one, and its replicas take it
+                // below.
+                shard_id: shard_id.unwrap_or_else(generate_node_id),
             },
         );
+    }
+
+    // A replica is in its master's shard, whatever the file says of it (as
+    // Redis reads it: the master's line may come after the replica's).
+    let shard_of_master: Vec<(NodeId, NodeId)> = nodes
+        .values()
+        .filter_map(|n| {
+            let master = nodes.get(&n.master_id?)?;
+            Some((n.id, master.shard_id))
+        })
+        .collect();
+    for (id, shard_id) in shard_of_master {
+        if let Some(n) = nodes.get_mut(&id) {
+            n.shard_id = shard_id;
+        }
     }
 
     let myself = myself.ok_or_else(|| io_err("nodes.conf: no node has the 'myself' flag"))?;
@@ -200,14 +226,16 @@ pub fn save(
         out.extend_from_slice(node_id_str(&node.id).as_bytes());
         out.push(b' ');
 
-        // <ip:client_port@cluster_port>
+        // <ip:client_port@cluster_port>,<hostname>,shard-id=<id>: the
+        // hostname empty when the node announces none, as Redis writes it.
         write!(
             out,
-            "{}:{}@{}{} ",
+            "{}:{}@{},{},shard-id={} ",
             node.ip,
             node.client_port,
             node.cluster_port,
-            hostname_suffix(&node.hostname)
+            node.hostname,
+            node_id_str(&node.shard_id)
         )
         .unwrap();
 
@@ -620,7 +648,6 @@ pub fn hostname_suffix(hostname: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::node::generate_node_id;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -642,6 +669,7 @@ mod tests {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                shard_id: generate_node_id(),
             },
         );
         let slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
@@ -677,6 +705,7 @@ mod tests {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                shard_id: generate_node_id(),
             },
         );
         // Assign slots 0..=99, 200..=200, 5000..=5474 to me.
@@ -706,6 +735,71 @@ mod tests {
         }
         // Spot-check a non-owned slot
         assert_eq!(loaded.slots[100], None);
+    }
+
+    /// The shard id is kept, as Redis keeps it: `ip:port@cport,<hostname>,
+    /// shard-id=<id>`. A replica is in its master's shard whatever its line
+    /// says (#563).
+    #[test]
+    fn shard_ids_survive_a_restart() {
+        let (me, replica) = (generate_node_id(), generate_node_id());
+        let shard = generate_node_id();
+        let mut nodes = AHashMap::new();
+        let mut master = ClusterNode::new(me, "127.0.0.1".into(), 6380, 16380);
+        master.flags = NodeFlags::MYSELF | NodeFlags::MASTER;
+        master.hostname = "a.example".into();
+        master.shard_id = shard;
+        nodes.insert(me, master);
+        let mut r = ClusterNode::new(replica, "127.0.0.1".into(), 6381, 16381);
+        r.flags = NodeFlags::REPLICA;
+        r.master_id = Some(me);
+        nodes.insert(replica, r); // its own, random: not what is kept
+        let slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        save(tmp.path(), &nodes, &slots, 0, 0).unwrap();
+        let written = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(
+            written.contains(&format!(
+                "127.0.0.1:6380@16380,a.example,shard-id={} ",
+                node_id_str(&shard)
+            )),
+            "{written}"
+        );
+        assert!(
+            written.contains("127.0.0.1:6381@16381,,shard-id="),
+            "{written}"
+        );
+
+        let loaded = load(tmp.path()).unwrap().unwrap();
+        assert_eq!(loaded.nodes[&me].shard_id, shard);
+        assert_eq!(loaded.nodes[&me].hostname, "a.example");
+        assert_eq!(loaded.nodes[&replica].shard_id, shard);
+        assert_eq!(loaded.nodes[&replica].hostname, "");
+    }
+
+    /// A file an earlier version wrote has no shard ids: a master gets a new
+    /// one, and its replica takes it, whichever line comes first.
+    #[test]
+    fn a_file_without_shard_ids_puts_replicas_in_their_masters_shard() {
+        let (me, master) = (generate_node_id(), generate_node_id());
+        let file = format!(
+            "{me} 127.0.0.1:6381@16381 myself,slave {master} 0 0 0 connected\n\
+             {master} 127.0.0.1:6380@16380,a.example master - 0 0 1 connected 0-99\n\
+             vars currentEpoch 1 lastVoteEpoch 0\n",
+            me = node_id_str(&me),
+            master = node_id_str(&master),
+        );
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), file).unwrap();
+        let loaded = load(tmp.path()).unwrap().unwrap();
+        assert_eq!(loaded.nodes[&me].shard_id, loaded.nodes[&master].shard_id);
+        assert_ne!(loaded.nodes[&master].shard_id, master);
+        assert_eq!(loaded.nodes[&master].hostname, "a.example");
+        assert_eq!(loaded.slots[0], Some(master));
     }
 
     #[test]
