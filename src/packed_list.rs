@@ -713,19 +713,57 @@ impl PackedList {
 
     /// Add `element` after the last. `false`, and nothing changed, if it is
     /// longer than [`MAX_LEN`].
+    /// The first chunk, found once.
+    #[inline(always)]
+    fn first(&self) -> &Chunk {
+        match &self.chunks {
+            Chunks::One(chunk) => chunk,
+            Chunks::Many(chunks) => &chunks[0],
+        }
+    }
+
+    /// The last chunk, found once.
+    #[inline(always)]
+    fn last(&self) -> &Chunk {
+        match &self.chunks {
+            Chunks::One(chunk) => chunk,
+            Chunks::Many(chunks) => &chunks[chunks.len() - 1],
+        }
+    }
+
+    #[inline(always)]
+    fn first_mut(&mut self) -> &mut Chunk {
+        match &mut self.chunks {
+            Chunks::One(chunk) => chunk,
+            Chunks::Many(chunks) => &mut chunks[0],
+        }
+    }
+
+    #[inline(always)]
+    fn last_mut(&mut self) -> &mut Chunk {
+        match &mut self.chunks {
+            Chunks::One(chunk) => chunk,
+            Chunks::Many(chunks) => {
+                let last = chunks.len() - 1;
+                &mut chunks[last]
+            }
+        }
+    }
+
     pub fn push_back(&mut self, element: &[u8]) -> bool {
         if element.len() > MAX_LEN {
             return false;
         }
-        let last = self.chunk_count() - 1;
-        if self.chunk(last).count() < CHUNK_ENTRIES {
-            self.chunk_mut(last).push_back(element);
+        let last = self.last_mut();
+        if last.count() < CHUNK_ENTRIES {
+            last.push_back(element);
         } else {
             let chunks = self.many();
             // The chunk that was last has one on each side from now on,
             // unless it is also the first.
-            if chunks.len() > 1 {
-                chunks[last].tighten();
+            let n = chunks.len();
+            if n > 1 {
+                chunks[n - 1].tighten();
             }
             let mut chunk = Chunk::default();
             chunk.push_back(element);
@@ -741,8 +779,9 @@ impl PackedList {
         if element.len() > MAX_LEN {
             return false;
         }
-        if self.chunk(0).count() < CHUNK_ENTRIES {
-            self.chunk_mut(0).push_front(element);
+        let first = self.first_mut();
+        if first.count() < CHUNK_ENTRIES {
+            first.push_front(element);
         } else {
             let chunks = self.many();
             if chunks.len() > 1 {
@@ -758,12 +797,12 @@ impl PackedList {
 
     #[inline]
     pub fn front(&self) -> Option<&[u8]> {
-        self.chunk(0).front()
+        self.first().front()
     }
 
     #[inline]
     pub fn back(&self) -> Option<&[u8]> {
-        self.chunk(self.chunk_count() - 1).back()
+        self.last().back()
     }
 
     /// Take the first element off; nothing if the list is empty. Read it
@@ -772,9 +811,11 @@ impl PackedList {
         if self.len == 0 {
             return;
         }
-        self.chunk_mut(0).drop_front();
+        let first = self.first_mut();
+        first.drop_front();
+        let emptied = first.count() == 0;
         self.len -= 1;
-        if self.chunk(0).count() == 0 {
+        if emptied {
             self.chunk_emptied(0);
         }
     }
@@ -785,11 +826,12 @@ impl PackedList {
         if self.len == 0 {
             return;
         }
-        let last = self.chunk_count() - 1;
-        self.chunk_mut(last).drop_back();
+        let last = self.last_mut();
+        last.drop_back();
+        let emptied = last.count() == 0;
         self.len -= 1;
-        if self.chunk(last).count() == 0 {
-            self.chunk_emptied(last);
+        if emptied {
+            self.chunk_emptied(self.chunk_count() - 1);
         }
     }
 
