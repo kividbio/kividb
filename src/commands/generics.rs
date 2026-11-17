@@ -274,7 +274,7 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
             (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
             (Some(ValueRef::Hash(h)), Some(field)) => {
                 let name = crate::key_bytes::text_of(field);
-                h.read().get(&*name).map(|v| v.to_vec())
+                h.read().get_bytes(&name).map(|v| v.to_vec())
             }
             // A field past its deadline is what a hash command makes of it
             // (#415): removed first where this node removes fields, its
@@ -285,7 +285,7 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
             (Some(ValueRef::HashEx(h)), Some(field)) => {
                 let name = crate::key_bytes::text_of(field);
                 let inner = h.read();
-                let value = inner.fields.get(&*name)?;
+                let value = inner.fields.get_bytes(&name)?;
                 if inner
                     .expiries
                     .get(&*name)

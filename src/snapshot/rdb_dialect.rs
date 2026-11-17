@@ -188,7 +188,9 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         if let Some(at) = expires_at {
             inner.expiries.insert(field.clone(), field_deadline(at));
         }
-        inner.fields.insert(field, Arc::from(value.as_slice()));
+        inner
+            .fields
+            .insert_owned(field, Arc::from(value.as_slice()));
     }
     // Nothing there: no key, as Valkey loads none.
     if inner.fields.is_empty() {

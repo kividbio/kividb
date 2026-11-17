@@ -696,7 +696,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             w.write_all(&(inner.len() as u32).to_le_bytes())?;
             for (field, val) in inner.iter() {
                 write_bytes(w, field.as_bytes())?;
-                write_bytes(w, val)?;
+                write_bytes(w, &val)?;
             }
         }
 
@@ -873,7 +873,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             w.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
             for (field, val) in inner.fields.iter() {
                 write_bytes(w, field.as_bytes())?;
-                write_bytes(w, val)?;
+                write_bytes(w, &val)?;
             }
             // Expiries: u32 count followed by (field, unix_ms) pairs, the
             // deadlines as they are kept (#594).
@@ -2331,17 +2331,14 @@ fn read_image(
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
-                    let mut hmap = crate::types::HashFields::with_capacity_and_hasher(
-                        hint(count),
-                        Default::default(),
-                    );
+                    let mut hmap = crate::types::HashFields::with_capacity(hint(count));
                     for _ in 0..count {
                         let field_bytes = read_bytes(&mut r)?;
                         let field = String::from_utf8(field_bytes).map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
                         })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert(field, Arc::from(val.as_slice()));
+                        hmap.insert_owned(field, Arc::from(val.as_slice()));
                     }
                     KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(hmap)))
                 }
@@ -2594,17 +2591,14 @@ fn read_image(
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
-                    let mut hmap = crate::types::HashFields::with_capacity_and_hasher(
-                        hint(count),
-                        Default::default(),
-                    );
+                    let mut hmap = crate::types::HashFields::with_capacity(hint(count));
                     for _ in 0..count {
                         let field_bytes = read_bytes(&mut r)?;
                         let field = String::from_utf8(field_bytes).map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
                         })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert(field, Arc::from(val.as_slice()));
+                        hmap.insert_owned(field, Arc::from(val.as_slice()));
                     }
                     // Expiries: each persisted Unix ms kept as it is (#594). A
                     // field whose time has passed is dropped, unless fields
@@ -2629,7 +2623,7 @@ fn read_image(
                         {
                             exps.insert(field, abs_ms);
                         } else {
-                            crate::types::hash_remove(&mut hmap, &field);
+                            hmap.remove(&field);
                         }
                     }
                     let inner = crate::types::HashInner {
@@ -3871,7 +3865,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 let field_bytes = rdb_read_string(r)?;
                 let field = crate::key_bytes::text_of(&field_bytes).into_owned();
                 let val = rdb_read_string(r)?;
-                hmap.insert(field, Arc::from(val.as_slice()));
+                hmap.insert_owned(field, Arc::from(val.as_slice()));
             }
             Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
                 hmap,
@@ -3973,7 +3967,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut iter = deque.into_iter();
             while let (Some(field), Some(val)) = (iter.next(), iter.next()) {
                 let field_str = crate::key_bytes::text_of(&field).into_owned();
-                hmap.insert(field_str, val);
+                hmap.insert_owned(field_str, val);
             }
             Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
                 hmap,
@@ -4409,7 +4403,9 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         if expires_at != 0 {
             inner.expiries.insert(field.clone(), expires_at);
         }
-        inner.fields.insert(field, Arc::from(value.as_slice()));
+        inner
+            .fields
+            .insert_owned(field, Arc::from(value.as_slice()));
     }
     Ok(KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(
         inner,
@@ -5017,7 +5013,7 @@ fn rdb_decode_listpack_into_hash(
     let mut iter = elements.into_iter();
     while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
         let field = crate::key_bytes::text_of(&field).into_owned();
-        hmap.insert(field, Arc::from(value.as_slice()));
+        hmap.insert_owned(field, Arc::from(value.as_slice()));
     }
     Ok(())
 }
@@ -5791,7 +5787,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             out.write_all(&(inner.len() as u32).to_le_bytes())?;
             for (field, val) in inner.iter() {
                 write_bytes_vec(out, field.as_bytes())?;
-                write_bytes_vec(out, val)?;
+                write_bytes_vec(out, &val)?;
             }
         }
         KiviDBValue::Set(arc) => {
@@ -5856,7 +5852,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             out.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
             for (field, val) in inner.fields.iter() {
                 write_bytes_vec(out, field.as_bytes())?;
-                write_bytes_vec(out, val)?;
+                write_bytes_vec(out, &val)?;
             }
             out.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
             for (field, at) in inner.expiries.iter() {
@@ -5937,7 +5933,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = String::from_utf8(field_bytes.to_vec()).ok()?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert(field, Arc::from(val_bytes));
+                map.insert_owned(field, Arc::from(val_bytes));
                 pos = next2;
             }
             Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(map))))
@@ -6002,7 +5998,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = String::from_utf8(field_bytes.to_vec()).ok()?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert(field, Arc::from(val_bytes));
+                map.insert_owned(field, Arc::from(val_bytes));
                 pos = next2;
             }
             // Expiries
@@ -6553,7 +6549,7 @@ mod field_deadline_tests {
         let mut inner = crate::types::HashInner::new();
         for (i, at) in deadlines.iter().enumerate() {
             let field = format!("f{i}");
-            inner.fields.insert(field.clone(), Arc::from(&b"v"[..]));
+            inner.fields.insert_bytes(&field, b"v");
             inner.expiries.insert(field, *at);
         }
         KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)))
@@ -6759,8 +6755,7 @@ mod expiry_section_tests {
     #[test]
     fn an_expired_hash_drops_its_key_expiry() {
         let mut hash = crate::types::HashInner::new();
-        hash.fields
-            .insert("field".to_string(), Arc::from(&b"value"[..]));
+        hash.fields.insert_bytes("field", b"value");
         hash.expiries
             .insert("field".to_string(), crate::types::field_now() - 1_000);
         let db0 = HashMap::from([(
@@ -6785,8 +6780,8 @@ mod expiry_section_tests {
     fn a_past_field_is_kept_where_fields_are_held_and_by_restore() {
         let hash = || {
             let mut hash = crate::types::HashInner::new();
-            hash.fields.insert("gone".to_string(), Arc::from(&b"1"[..]));
-            hash.fields.insert("live".to_string(), Arc::from(&b"2"[..]));
+            hash.fields.insert_bytes("gone", b"1");
+            hash.fields.insert_bytes("live", b"2");
             hash.expiries
                 .insert("gone".to_string(), crate::types::field_now() - 1_000);
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash)))
@@ -6797,7 +6792,7 @@ mod expiry_section_tests {
                 let mut f: Vec<(String, bool)> = h
                     .fields
                     .keys()
-                    .map(|k| (k.clone(), h.expiries.contains_key(k)))
+                    .map(|k| (k.to_owned(), h.expiries.contains_key(k)))
                     .collect();
                 f.sort();
                 f
@@ -7702,8 +7697,8 @@ mod empty_key_tests {
     #[test]
     fn empty_fields_and_members_round_trip() {
         let mut fields = crate::types::HashFields::default();
-        fields.insert(String::new(), Arc::from(&b"v"[..]));
-        fields.insert("f".to_string(), Arc::from(&b""[..]));
+        fields.insert_bytes("", b"v");
+        fields.insert_bytes("f", b"");
         let mut members = crate::member_set::MemberSet::new();
         members.insert(Arc::from(&b""[..]));
         members.insert(Arc::from(&b"m"[..]));
@@ -7738,8 +7733,8 @@ mod empty_key_tests {
             Some(KiviDBValue::Hash(hash)) => {
                 let hash = hash.read();
                 assert_eq!(hash.len(), 2);
-                assert_eq!(hash.get("").map(|v| &v[..]), Some(&b"v"[..]));
-                assert_eq!(hash.get("f").map(|v| &v[..]), Some(&b""[..]));
+                assert_eq!(hash.get_bytes(""), Some(&b"v"[..]));
+                assert_eq!(hash.get_bytes("f"), Some(&b""[..]));
             }
             _ => panic!("the empty key is not a hash"),
         }
@@ -7810,7 +7805,7 @@ mod empty_key_tests {
 
     fn hash(field: &str, value: &str) -> KiviDBValue {
         let mut fields = crate::types::HashFields::default();
-        fields.insert(field.to_string(), Arc::from(value.as_bytes()));
+        fields.insert_bytes(field, value.as_bytes());
         KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(fields)))
     }
 

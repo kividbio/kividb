@@ -2422,7 +2422,7 @@ fn same_hash_but_for_expired_fields(value: &crate::types::KiviDBValue, payload: 
         a.fields.iter().all(|(field, val)| {
             let time = a.expiries.get(field);
             time.is_some_and(|time| *time <= soon)
-                || (b.fields.get(field.as_str()) == Some(val)
+                || (b.fields.get_bytes(field) == Some(val.bytes())
                     && same_time(time, b.expiries.get(field)))
         })
     };
@@ -2922,9 +2922,7 @@ mod tests {
     fn hash(fields: &[(&str, &str, Option<u64>)]) -> KiviDBValue {
         let mut inner = HashInner::new();
         for (field, value, time) in fields {
-            inner
-                .fields
-                .insert(field.to_string(), std::sync::Arc::from(value.as_bytes()));
+            inner.fields.insert_bytes(field, value.as_bytes());
             if let Some(time) = time {
                 inner.expiries.insert(field.to_string(), *time);
             }

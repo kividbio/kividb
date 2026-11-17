@@ -26,6 +26,7 @@ pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
 mod give_back;
+mod hash_fields;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
