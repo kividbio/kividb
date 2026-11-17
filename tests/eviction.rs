@@ -909,10 +909,17 @@ fn client_no_touch_leaves_a_keys_use_alone() {
         let mut c = server.conn();
         let mut other = server.conn();
         assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+        assert_eq!(c.cmd(&["RPUSH", "sorted", "2", "1"]).i(), 2);
         std::thread::sleep(Duration::from_millis(2100));
         assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2, "{model}");
 
         assert!(c.cmd(&["CLIENT", "NO-TOUCH", "ON"]).ok());
+        // A `SORT` that stores nothing is a read, as in Redis.
+        assert!(matches!(c.cmd(&["SORT", "sorted"]), V::Arr(_)));
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "sorted"]).i() >= 2,
+            "{model}: a no-touch SORT is no use"
+        );
         // What Redis calls the `T` flag, in `CLIENT INFO` and `CLIENT LIST`.
         assert!(c.cmd(&["CLIENT", "INFO"]).s().contains("flags=T"));
         assert!(c.cmd(&["CLIENT", "LIST"]).s().contains("flags=T"));
@@ -968,7 +975,17 @@ fn client_no_touch_leaves_a_keys_use_alone() {
             c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
             "{model}: a queued NO-TOUCH OFF takes hold mid-EXEC"
         );
-        assert!(c.cmd(&["CLIENT", "NO-TOUCH", "ON"]).ok());
+        // And one queued ON holds for the commands after the `EXEC`.
+        assert_eq!(c.cmd(&["MULTI"]).s(), "OK");
+        assert_eq!(c.cmd(&["CLIENT", "NO-TOUCH", "ON"]).s(), "QUEUED");
+        assert!(matches!(c.cmd(&["EXEC"]), V::Arr(_)));
+        // No `CLIENT` before the `GET`: that would read the flag back itself.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(c.cmd(&["GET", "foo"]).s(), "qux");
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2,
+            "{model}: a queued NO-TOUCH ON holds after the EXEC"
+        );
         assert!(c.cmd(&["CLIENT", "INFO"]).s().contains("flags=T"));
 
         // Under LFU its reads count nothing, while a key it makes is born
@@ -1004,6 +1021,17 @@ fn client_no_touch_leaves_a_keys_use_alone() {
             c.cmd(&["OBJECT", "FREQ", "counted2"]).i(),
             6,
             "{model}: and another client's reads still do"
+        );
+        // Under an LRU policy too, a key it makes is born used, not taken
+        // for the oldest key there is.
+        assert!(
+            c.cmd(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"])
+                .ok()
+        );
+        assert!(c.cmd(&["SET", "lru-made", "1"]).ok());
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "lru-made"]).i() < 2,
+            "{model}: a key it makes under allkeys-lru is born used"
         );
         assert!(
             c.cmd(&["CONFIG", "SET", "maxmemory-policy", "noeviction"])

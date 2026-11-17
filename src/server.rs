@@ -2842,8 +2842,10 @@ where
             }
             // `CLIENT NO-TOUCH` writes the flag in the registry; the loop's
             // copy — what each command's `Ctx` carries — is read back only
-            // after the commands that can change it (#566).
-            if matches!(cmd_name.as_str(), "CLIENT" | "EXEC") {
+            // after the command that can change it (#566). A `CLIENT` queued
+            // in a transaction is read back as `EXEC` runs it, above, so an
+            // `EXEC` does not pay for a registry lookup here.
+            if cmd_name == "CLIENT" {
                 no_touch = client_registry.get_no_touch(client_id);
             }
             combined.extend_from_slice(&response);

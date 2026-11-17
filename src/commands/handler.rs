@@ -1070,6 +1070,24 @@ fn is_script(name: &str) -> bool {
     )
 }
 
+/// Whether a `CLIENT NO-TOUCH` client's command `name` records no use of
+/// its keys: a read does not; `TOUCH`, a write and a script that may write
+/// do (#566). A `SORT` without `STORE` is a read here, as it is in Redis,
+/// though it counts as a write elsewhere. Out of line and cold: only such
+/// a client's commands, under a policy that records uses, ask, and the test
+/// on the way here is one byte.
+#[cold]
+#[inline(never)]
+fn no_touch_skips(name: &str, cmd: &[&[u8]], writes_operation: bool) -> bool {
+    let reads = !writes_operation
+        || (name == "SORT"
+            && !cmd
+                .iter()
+                .skip(2)
+                .any(|arg| arg.eq_ignore_ascii_case(b"STORE")));
+    reads && name != "TOUCH" && (!is_script(name) || name.ends_with("_RO"))
+}
+
 /// What the lookups of the command `name`, started at `now`, write to the
 /// keys they find: see `store::AccessScope`. And whether the keys have their
 /// use written after the command, by `eviction::used`: a script's declared
@@ -1794,10 +1812,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // script that may write counts its declared keys the same, and `TOUCH`
     // still touches, as in Redis (#566).
     let (access, used_after) = if crate::eviction::recording()
-        && !(ctx.no_touch
-            && !writes_operation
-            && name != "TOUCH"
-            && (!is_script(name) || name.ends_with("_RO")))
+        && !(ctx.no_touch && no_touch_skips(name, &ctx.cmd, writes_operation))
     {
         let (scope, after) = access_scope(name, started, &ctx.cmd);
         (Some(scope), after)
