@@ -120,9 +120,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Every element goes into the list; a client blocked on the key
             // is woken afterwards and pops for itself (see
             // `blocking::wait_for_keys`).
-            for value in &cmd[2..] {
-                inner.push_front(value);
-            }
+            inner.extend_front(&cmd[2..]);
             let len = inner.len();
             drop(inner);
             drop(map);
@@ -161,10 +159,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             let mut inner = list.write();
-            inner.reserve(cmd.len() - 2);
-            for value in &cmd[2..] {
-                inner.push_back(value);
-            }
+            inner.extend_back(&cmd[2..]);
             let len = inner.len();
             drop(inner);
             drop(map);
@@ -385,18 +380,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // Write directly into one pre-allocated buffer instead of
                     // collecting N separate Vec<u8> allocations and then
                     // concatenating them in resp_array. For LRANGE 100 this
-                    // cuts allocations from 101 down to 1.
-                    use crate::resp::write::write_bulk;
+                    // cuts allocations from 101 down to 1. Lengths are
+                    // written as digits, not through `write!` (about 200
+                    // instructions an element less).
+                    use crate::resp::write::push_header;
 
-                    // Array header: *count\r\n
                     let mut buf = Vec::with_capacity(16 + count * 24);
-                    buf.push(b'*');
-                    buf.extend_from_slice(count.to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-
-                    for v in inner.range(start, start + count) {
-                        write_bulk(&mut buf, &v);
-                    }
+                    push_header(&mut buf, b'*', count);
+                    inner.for_each_in(start, start + count, |v| {
+                        push_header(&mut buf, b'$', v.len());
+                        buf.extend_from_slice(v);
+                        buf.extend_from_slice(b"\r\n");
+                        true
+                    });
 
                     Some(buf)
                 }
@@ -579,41 +575,33 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
                     let mut matches: Vec<Vec<u8>> = Vec::new();
 
+                    // A match at `idx`: skipped, or taken; `false` once
+                    // there are enough.
+                    let mut take = |idx: usize| -> bool {
+                        if skips_left > 0 {
+                            skips_left -= 1;
+                            return true;
+                        }
+                        matches.push(resp_integer(idx as i64));
+                        matches.len() < max_matches
+                    };
                     if rank >= 0 {
                         // Forward scan: indices 0..scan_len
-                        for (idx, v) in inner.range(0, scan_len).enumerate() {
-                            if &*v == *element {
-                                if skips_left > 0 {
-                                    skips_left -= 1;
-                                } else {
-                                    matches.push(resp_integer(idx as i64));
-                                    if matches.len() >= max_matches {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        let mut idx = 0;
+                        inner.for_each_in(0, scan_len, |v| {
+                            let go_on = v != *element || take(idx);
+                            idx += 1;
+                            go_on
+                        });
                     } else {
-                        // Reverse scan: walk from tail, examine scan_len elements.
-                        // start is the first index to examine counting from the end.
-                        // Using saturating arithmetic — list_len and scan_len are both
-                        // already bounded so this won't underflow, but .saturating_sub
-                        // makes it explicit and panic-free.
+                        // Reverse scan: walk from tail, examine scan_len
+                        // elements; the index returned is the forward one.
                         let start = list_len.saturating_sub(scan_len);
-                        for (back, v) in inner.range_rev(start, list_len).enumerate() {
-                            let idx = list_len - 1 - back;
-                            if &*v == *element {
-                                if skips_left > 0 {
-                                    skips_left -= 1;
-                                } else {
-                                    // Index returned is always the real forward index
-                                    matches.push(resp_integer(idx as i64));
-                                    if matches.len() >= max_matches {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        let mut idx = list_len;
+                        inner.for_each_in_rev(start, list_len, |v| {
+                            idx -= 1;
+                            v != *element || take(idx)
+                        });
                     }
 
                     crate::stats::record_hit();
@@ -702,9 +690,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let list = Arc::clone(l);
                     drop(map); // release shard lock before locking inner list
                     let mut inner = list.write();
-                    for val in cmd.iter().skip(2) {
-                        inner.push_front(val);
-                    }
+                    inner.extend_front(&cmd[2..]);
                     crate::stats::record_hit();
                     let len = inner.len();
                     drop(inner);
@@ -737,9 +723,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let list = Arc::clone(l);
                     drop(map);
                     let mut inner = list.write();
-                    for val in cmd.iter().skip(2) {
-                        inner.push_back(val);
-                    }
+                    inner.extend_back(&cmd[2..]);
                     let len = inner.len();
                     drop(inner);
                     ctx.wait_table.notify_signal(key);

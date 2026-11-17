@@ -1,17 +1,29 @@
-//! The elements of a list (`LPUSH`, `RPUSH`), in order.
+//! The elements of a list (`LPUSH`, `RPUSH`), in order, kept in one of two
+//! forms:
 //!
-//! Callers see elements as [`Value`]s (bytes, whatever the list keeps them
-//! as) and change the list only through what is here: pushes and pops at
-//! either end, an element by its index, ranges read either way, an insert
-//! by a pivot, removal by value (`LREM`), a trim to a range (`LTRIM`).
-//! Elements popped are handed to the caller as [`Popped`] for as long as
-//! the call lasts. Snapshots, the AOF, replication and `DUMP` read elements
-//! as bytes, in order: none of them sees how they are kept.
+//! - **Packed.** Elements end to end in chunks of up to
+//!   [`packed_list::CHUNK_ENTRIES`] ([`PackedList`]): four bytes an element
+//!   besides its own, and one allocation a chunk. Every new list is packed.
+//! - **Plain.** Each element a block of its own (`Arc<[u8]>`) in a
+//!   `VecDeque`, as every list was before. A list becomes plain the first
+//!   time an element longer than [`packed_list::MAX_LEN`] is pushed, set or
+//!   inserted: its elements are moved over once, in order, and the write is
+//!   done there. It never goes back; an emptied list is deleted, and the
+//!   next is packed again.
+//!
+//! Callers see elements as [`Value`]s (bytes, whatever the form) and change
+//! the list only through what is here: pushes and pops at either end, an
+//! element by its index, ranges read either way, an insert by a pivot,
+//! removal by value (`LREM`), a trim to a range (`LTRIM`). Elements popped
+//! are handed to the caller as [`Popped`] for as long as the call lasts.
+//! Snapshots, the AOF, replication and `DUMP` read elements as bytes, in
+//! order: none of them sees the form, and none of their formats changed.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 pub use crate::element::{Popped, Value};
+use crate::packed_list::{self, PackedList};
 
 /// A list's elements.
 #[derive(Clone, Default)]
@@ -21,13 +33,32 @@ pub struct ListValues {
 
 #[derive(Clone)]
 enum Repr {
+    Packed(PackedList),
     /// Each element a block of its own.
     Plain(VecDeque<Arc<[u8]>>),
 }
 
 impl Default for Repr {
     fn default() -> Self {
-        Repr::Plain(VecDeque::new())
+        Repr::Packed(PackedList::new())
+    }
+}
+
+/// How a list is kept, by Redis's names for its encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    /// One chunk.
+    Listpack,
+    /// Several chunks, or elements kept apart.
+    Quicklist,
+}
+
+impl Encoding {
+    pub fn name(self) -> &'static str {
+        match self {
+            Encoding::Listpack => "listpack",
+            Encoding::Quicklist => "quicklist",
+        }
     }
 }
 
@@ -39,26 +70,85 @@ impl ListValues {
     #[inline]
     pub fn len(&self) -> usize {
         match &self.repr {
+            Repr::Packed(p) => p.len(),
             Repr::Plain(d) => d.len(),
         }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        match &self.repr {
+            Repr::Packed(p) => p.is_empty(),
+            Repr::Plain(d) => d.is_empty(),
+        }
+    }
+
+    /// Whether the elements are packed in chunks.
+    #[inline]
+    pub fn is_packed(&self) -> bool {
+        matches!(self.repr, Repr::Packed(_))
+    }
+
+    /// `OBJECT ENCODING`: `listpack` while the list is one chunk,
+    /// `quicklist` once it is more, or its elements are kept apart.
+    pub fn encoding(&self) -> Encoding {
+        match &self.repr {
+            Repr::Packed(p) if p.is_one_chunk() => Encoding::Listpack,
+            _ => Encoding::Quicklist,
+        }
+    }
+
+    /// The bytes of a packed list's allocations (its chunks, and the deque
+    /// that holds them); `None` for a plain one.
+    pub fn packed_bytes(&self) -> Option<usize> {
+        match &self.repr {
+            Repr::Packed(p) => Some(p.allocation_size()),
+            Repr::Plain(_) => None,
+        }
+    }
+
+    /// How much work freeing the list is, as Redis's
+    /// `lazyfreeGetFreeEffort` counts it: a quicklist's nodes, a plain
+    /// list's elements.
+    pub fn free_effort(&self) -> usize {
+        match &self.repr {
+            Repr::Packed(p) => p.chunk_count(),
+            Repr::Plain(d) => d.len(),
+        }
+    }
+
+    /// The elements, moved over once into blocks of their own; with room
+    /// for one more.
+    #[cold]
+    #[inline(never)]
+    fn make_plain(&mut self) -> &mut VecDeque<Arc<[u8]>> {
+        if let Repr::Packed(p) = &self.repr {
+            let mut plain = VecDeque::with_capacity(p.len() + 1);
+            plain.extend(p.iter().map(Arc::<[u8]>::from));
+            self.repr = Repr::Plain(plain);
+        }
+        match &mut self.repr {
+            Repr::Plain(d) => d,
+            Repr::Packed(_) => unreachable!(),
+        }
     }
 
     /// Room for `more` elements, where that means anything.
     #[inline]
     pub fn reserve(&mut self, more: usize) {
-        match &mut self.repr {
-            Repr::Plain(d) => d.reserve(more),
+        if let Repr::Plain(d) = &mut self.repr {
+            d.reserve(more);
         }
     }
 
     #[inline]
     pub fn push_back(&mut self, element: &[u8]) {
         match &mut self.repr {
+            Repr::Packed(p) => {
+                if !p.push_back(element) {
+                    self.make_plain().push_back(Arc::from(element));
+                }
+            }
             Repr::Plain(d) => d.push_back(Arc::from(element)),
         }
     }
@@ -66,15 +156,59 @@ impl ListValues {
     #[inline]
     pub fn push_front(&mut self, element: &[u8]) {
         match &mut self.repr {
+            Repr::Packed(p) => {
+                if !p.push_front(element) {
+                    self.make_plain().push_front(Arc::from(element));
+                }
+            }
             Repr::Plain(d) => d.push_front(Arc::from(element)),
         }
     }
 
+    /// `RPUSH`: `elements` after the last, in order.
+    pub fn extend_back(&mut self, elements: &[&[u8]]) {
+        if let [element] = elements {
+            return self.push_back(element);
+        }
+        let done = match &mut self.repr {
+            Repr::Packed(p) => p.extend_back(elements),
+            Repr::Plain(_) => 0,
+        };
+        if done < elements.len() {
+            let d = self.make_plain();
+            d.reserve(elements.len() - done);
+            d.extend(elements[done..].iter().map(|e| Arc::<[u8]>::from(*e)));
+        }
+    }
+
+    /// `LPUSH`: each of `elements` before the first, in turn, so the last
+    /// of them ends up first.
+    pub fn extend_front(&mut self, elements: &[&[u8]]) {
+        if let [element] = elements {
+            return self.push_front(element);
+        }
+        let done = match &mut self.repr {
+            Repr::Packed(p) => p.extend_front(elements),
+            Repr::Plain(_) => 0,
+        };
+        if done < elements.len() {
+            let d = self.make_plain();
+            for element in &elements[done..] {
+                d.push_front(Arc::from(*element));
+            }
+        }
+    }
+
     /// Add an element the caller holds as shared bytes: kept as they are
-    /// where elements are kept apart.
+    /// where elements are kept apart, else its bytes.
     #[inline]
     pub fn push_back_shared(&mut self, element: Arc<[u8]>) {
         match &mut self.repr {
+            Repr::Packed(p) => {
+                if !p.push_back(&element) {
+                    self.make_plain().push_back(element);
+                }
+            }
             Repr::Plain(d) => d.push_back(element),
         }
     }
@@ -82,6 +216,11 @@ impl ListValues {
     #[inline]
     pub fn push_front_shared(&mut self, element: Arc<[u8]>) {
         match &mut self.repr {
+            Repr::Packed(p) => {
+                if !p.push_front(&element) {
+                    self.make_plain().push_front(element);
+                }
+            }
             Repr::Plain(d) => d.push_front(element),
         }
     }
@@ -89,6 +228,7 @@ impl ListValues {
     #[inline]
     pub fn front(&self) -> Option<Value<'_>> {
         match &self.repr {
+            Repr::Packed(p) => p.front().map(Value::Bytes),
             Repr::Plain(d) => d.front().map(Value::Shared),
         }
     }
@@ -96,6 +236,7 @@ impl ListValues {
     #[inline]
     pub fn back(&self) -> Option<Value<'_>> {
         match &self.repr {
+            Repr::Packed(p) => p.back().map(Value::Bytes),
             Repr::Plain(d) => d.back().map(Value::Shared),
         }
     }
@@ -105,6 +246,11 @@ impl ListValues {
     #[inline]
     pub fn pop_front_with<R>(&mut self, take: impl FnOnce(Popped<'_>) -> R) -> Option<R> {
         match &mut self.repr {
+            Repr::Packed(p) => {
+                let taken = take(Popped::Bytes(p.front()?));
+                p.drop_front();
+                Some(taken)
+            }
             Repr::Plain(d) => d.pop_front().map(|e| take(Popped::Shared(e))),
         }
     }
@@ -113,6 +259,11 @@ impl ListValues {
     #[inline]
     pub fn pop_back_with<R>(&mut self, take: impl FnOnce(Popped<'_>) -> R) -> Option<R> {
         match &mut self.repr {
+            Repr::Packed(p) => {
+                let taken = take(Popped::Bytes(p.back()?));
+                p.drop_back();
+                Some(taken)
+            }
             Repr::Plain(d) => d.pop_back().map(|e| take(Popped::Shared(e))),
         }
     }
@@ -121,6 +272,7 @@ impl ListValues {
     #[inline]
     pub fn get(&self, i: usize) -> Option<Value<'_>> {
         match &self.repr {
+            Repr::Packed(p) => p.get(i).map(Value::Bytes),
             Repr::Plain(d) => d.get(i).map(Value::Shared),
         }
     }
@@ -128,26 +280,28 @@ impl ListValues {
     /// Put `element` in element `i`'s place. `false` if there is no
     /// element `i`.
     pub fn set(&mut self, i: usize, element: &[u8]) -> bool {
+        if i >= self.len() {
+            return false;
+        }
         match &mut self.repr {
-            Repr::Plain(d) => match d.get_mut(i) {
-                Some(slot) => {
-                    *slot = Arc::from(element);
-                    true
-                }
-                None => false,
-            },
+            Repr::Packed(p) if PackedList::takes(element) => p.set(i, element),
+            _ => {
+                self.make_plain()[i] = Arc::from(element);
+                true
+            }
         }
     }
 
     /// Put `element` before element `i`; after the last when `i == len()`.
     /// `false` if `i > len()`.
     pub fn insert(&mut self, i: usize, element: &[u8]) -> bool {
+        if i > self.len() {
+            return false;
+        }
         match &mut self.repr {
-            Repr::Plain(d) => {
-                if i > d.len() {
-                    return false;
-                }
-                d.insert(i, Arc::from(element));
+            Repr::Packed(p) if PackedList::takes(element) => p.insert(i, element),
+            _ => {
+                self.make_plain().insert(i, Arc::from(element));
                 true
             }
         }
@@ -156,6 +310,7 @@ impl ListValues {
     /// The index of the first element equal to `element`.
     pub fn position(&self, element: &[u8]) -> Option<usize> {
         match &self.repr {
+            Repr::Packed(p) => p.position(element),
             Repr::Plain(d) => d.iter().position(|v| v.as_ref() == element),
         }
     }
@@ -166,6 +321,7 @@ impl ListValues {
     pub fn remove_matching(&mut self, element: &[u8], count: i64) -> usize {
         let limit = count.unsigned_abs() as usize;
         match &mut self.repr {
+            Repr::Packed(p) => p.remove_matching(element, count),
             Repr::Plain(d) => {
                 let mut removed = 0usize;
                 if count == 0 {
@@ -207,6 +363,7 @@ impl ListValues {
     pub fn retain_range(&mut self, start: usize, end: usize) {
         debug_assert!(start <= end && end <= self.len());
         match &mut self.repr {
+            Repr::Packed(p) => p.keep_range(start, end),
             Repr::Plain(d) => {
                 // From the back first, then the front.
                 d.drain(end..);
@@ -217,7 +374,34 @@ impl ListValues {
 
     pub fn clear(&mut self) {
         match &mut self.repr {
+            Repr::Packed(p) => p.clear(),
             Repr::Plain(d) => d.clear(),
+        }
+    }
+
+    /// Hand `each` the elements from `from` up to, not including, `to`,
+    /// first to last, while it says to go on (`true`): cheaper than
+    /// [`range`](Self::range) where every element is read. `false` if it
+    /// said to stop. `from <= to <= len()`.
+    #[inline]
+    pub fn for_each_in(&self, from: usize, to: usize, mut each: impl FnMut(&[u8]) -> bool) -> bool {
+        match &self.repr {
+            Repr::Packed(p) => p.for_each_in(from, to, each),
+            Repr::Plain(d) => d.range(from..to).all(|e| each(e)),
+        }
+    }
+
+    /// As [`for_each_in`](Self::for_each_in), last to first.
+    #[inline]
+    pub fn for_each_in_rev(
+        &self,
+        from: usize,
+        to: usize,
+        mut each: impl FnMut(&[u8]) -> bool,
+    ) -> bool {
+        match &self.repr {
+            Repr::Packed(p) => p.for_each_in_rev(from, to, each),
+            Repr::Plain(d) => d.range(from..to).rev().all(|e| each(e)),
         }
     }
 
@@ -232,6 +416,7 @@ impl ListValues {
     #[inline]
     pub fn range(&self, from: usize, to: usize) -> Iter<'_> {
         match &self.repr {
+            Repr::Packed(p) => Iter::Packed(p.range(from, to)),
             Repr::Plain(d) => Iter::Plain(d.range(from..to)),
         }
     }
@@ -240,6 +425,7 @@ impl ListValues {
     #[inline]
     pub fn range_rev(&self, from: usize, to: usize) -> RevIter<'_> {
         match &self.repr {
+            Repr::Packed(p) => RevIter::Packed(p.range_rev(from, to)),
             Repr::Plain(d) => RevIter::Plain(d.range(from..to).rev()),
         }
     }
@@ -247,35 +433,77 @@ impl ListValues {
 
 /// A list's elements in order, as they are read: [`ListValues::builder`].
 /// Bulk loads (a snapshot, `RESTORE`, `SORT ... STORE`) lay elements down
-/// here one after another.
+/// here one after another: full chunks, each exactly as long as it needs,
+/// not as many pushes. The first element too long for a chunk moves what
+/// was laid down so far into blocks of their own, once, and the rest
+/// follow it there.
 pub struct Builder {
-    list: ListValues,
+    form: Form,
+    hint: usize,
+}
+
+enum Form {
+    Packed(packed_list::Builder),
+    Plain(VecDeque<Arc<[u8]>>),
 }
 
 impl ListValues {
     /// A list to be filled in order, about `hint` elements long.
     pub fn builder(hint: usize) -> Builder {
         Builder {
-            list: ListValues {
-                repr: Repr::Plain(VecDeque::with_capacity(hint)),
-            },
+            form: Form::Packed(packed_list::Builder::new()),
+            hint,
         }
     }
 }
 
 impl Builder {
+    #[cold]
+    #[inline(never)]
+    fn make_plain(&mut self) -> &mut VecDeque<Arc<[u8]>> {
+        if let Form::Packed(b) = &mut self.form {
+            let packed = std::mem::take(b).finish();
+            let mut plain = VecDeque::with_capacity(self.hint.max(packed.len() + 1));
+            plain.extend(packed.iter().map(Arc::<[u8]>::from));
+            self.form = Form::Plain(plain);
+        }
+        match &mut self.form {
+            Form::Plain(d) => d,
+            Form::Packed(_) => unreachable!(),
+        }
+    }
+
     #[inline]
     pub fn push(&mut self, element: &[u8]) {
-        self.list.push_back(element);
+        match &mut self.form {
+            Form::Packed(b) => {
+                if !b.push(element) {
+                    self.make_plain().push_back(Arc::from(element));
+                }
+            }
+            Form::Plain(d) => d.push_back(Arc::from(element)),
+        }
     }
 
     #[inline]
     pub fn push_shared(&mut self, element: Arc<[u8]>) {
-        self.list.push_back_shared(element);
+        match &mut self.form {
+            Form::Packed(b) => {
+                if !b.push(&element) {
+                    self.make_plain().push_back(element);
+                }
+            }
+            Form::Plain(d) => d.push_back(element),
+        }
     }
 
     pub fn finish(self) -> ListValues {
-        self.list
+        ListValues {
+            repr: match self.form {
+                Form::Packed(b) => Repr::Packed(b.finish()),
+                Form::Plain(d) => Repr::Plain(d),
+            },
+        }
     }
 }
 
@@ -309,6 +537,7 @@ impl std::fmt::Debug for ListValues {
 
 /// Elements first to last.
 pub enum Iter<'a> {
+    Packed(packed_list::Iter<'a>),
     Plain(std::collections::vec_deque::Iter<'a, Arc<[u8]>>),
 }
 
@@ -318,6 +547,7 @@ impl<'a> Iterator for Iter<'a> {
     #[inline]
     fn next(&mut self) -> Option<Value<'a>> {
         match self {
+            Iter::Packed(it) => it.next().map(Value::Bytes),
             Iter::Plain(it) => it.next().map(Value::Shared),
         }
     }
@@ -325,6 +555,7 @@ impl<'a> Iterator for Iter<'a> {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
+            Iter::Packed(it) => it.size_hint(),
             Iter::Plain(it) => it.size_hint(),
         }
     }
@@ -334,6 +565,7 @@ impl ExactSizeIterator for Iter<'_> {}
 
 /// Elements last to first.
 pub enum RevIter<'a> {
+    Packed(packed_list::RevIter<'a>),
     Plain(std::iter::Rev<std::collections::vec_deque::Iter<'a, Arc<[u8]>>>),
 }
 
@@ -343,6 +575,7 @@ impl<'a> Iterator for RevIter<'a> {
     #[inline]
     fn next(&mut self) -> Option<Value<'a>> {
         match self {
+            RevIter::Packed(it) => it.next().map(Value::Bytes),
             RevIter::Plain(it) => it.next().map(Value::Shared),
         }
     }
@@ -350,9 +583,429 @@ impl<'a> Iterator for RevIter<'a> {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
+            RevIter::Packed(it) => it.size_hint(),
             RevIter::Plain(it) => it.size_hint(),
         }
     }
 }
 
 impl ExactSizeIterator for RevIter<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packed_list::{CHUNK_ENTRIES, MAX_LEN};
+
+    /// The list holds exactly `model`, read every way it can be read.
+    fn assert_same(list: &ListValues, model: &VecDeque<Vec<u8>>, what: &str) {
+        assert_eq!(list.len(), model.len(), "{what}");
+        assert_eq!(list.is_empty(), model.is_empty(), "{what}");
+        let expected: Vec<&[u8]> = model.iter().map(Vec::as_slice).collect();
+        let forward: Vec<&[u8]> = list.iter().map(Value::bytes).collect();
+        assert_eq!(forward, expected, "{what}");
+        let mut backward: Vec<&[u8]> = list.range_rev(0, list.len()).map(Value::bytes).collect();
+        backward.reverse();
+        assert_eq!(backward, expected, "{what}");
+        assert_eq!(
+            list.front().map(Value::bytes),
+            expected.first().copied(),
+            "{what}"
+        );
+        assert_eq!(
+            list.back().map(Value::bytes),
+            expected.last().copied(),
+            "{what}"
+        );
+        let step = (model.len() / 41).max(1);
+        for i in (0..model.len()).step_by(step) {
+            assert_eq!(
+                list.get(i).map(Value::bytes),
+                Some(expected[i]),
+                "{what}: {i}"
+            );
+        }
+        assert!(list.get(model.len()).is_none(), "{what}");
+        if !list.is_packed() || model.len() > CHUNK_ENTRIES {
+            assert_eq!(list.encoding(), Encoding::Quicklist, "{what}");
+        }
+        assert_eq!(list.packed_bytes().is_some(), list.is_packed(), "{what}");
+    }
+
+    fn element(i: usize) -> Vec<u8> {
+        format!("element:{i:08}").into_bytes()
+    }
+
+    #[test]
+    fn a_new_list_is_packed_and_one_chunk() {
+        let mut list = ListValues::new();
+        assert!(list.is_packed());
+        assert_eq!(list.encoding(), Encoding::Listpack);
+        assert_eq!(list.packed_bytes(), Some(0));
+        for i in 0..CHUNK_ENTRIES {
+            list.push_back(&element(i));
+        }
+        assert_eq!(list.encoding(), Encoding::Listpack);
+        list.push_front(b"one more");
+        assert_eq!(list.encoding(), Encoding::Quicklist);
+        assert!(list.is_packed());
+        assert_eq!(list.free_effort(), 2);
+    }
+
+    #[test]
+    fn a_long_element_moves_the_list_to_blocks_of_their_own() {
+        let long = vec![b'L'; MAX_LEN + 1];
+        let longest = vec![b'l'; MAX_LEN];
+        for how in [
+            "push_back",
+            "push_front",
+            "set",
+            "insert",
+            "extend_back",
+            "extend_front",
+        ] {
+            let mut list = ListValues::new();
+            let mut model = VecDeque::new();
+            for i in 0..100 {
+                list.push_back(&element(i));
+                model.push_back(element(i));
+            }
+            list.push_back(&longest);
+            model.push_back(longest.clone());
+            assert!(list.is_packed(), "{how}");
+            match how {
+                "push_back" => {
+                    list.push_back(&long);
+                    model.push_back(long.clone());
+                }
+                "push_front" => {
+                    list.push_front(&long);
+                    model.push_front(long.clone());
+                }
+                "set" => {
+                    assert!(list.set(40, &long));
+                    model[40] = long.clone();
+                }
+                "insert" => {
+                    assert!(list.insert(70, &long));
+                    model.insert(70, long.clone());
+                }
+                "extend_back" => {
+                    list.extend_back(&[&b"a"[..], &long[..], &b"b"[..]]);
+                    model.extend([b"a".to_vec(), long.clone(), b"b".to_vec()]);
+                }
+                _ => {
+                    list.extend_front(&[&b"a"[..], &long[..], &b"b"[..]]);
+                    for e in [b"a".to_vec(), long.clone(), b"b".to_vec()] {
+                        model.push_front(e);
+                    }
+                }
+            }
+            assert!(!list.is_packed(), "{how}");
+            assert_same(&list, &model, how);
+            // And it stays so, short elements and all.
+            list.push_back(b"short");
+            model.push_back(b"short".to_vec());
+            assert!(!list.is_packed(), "{how}");
+            assert_same(&list, &model, how);
+        }
+    }
+
+    #[test]
+    fn a_set_or_insert_out_of_range_changes_nothing() {
+        let long = vec![b'L'; MAX_LEN + 1];
+        let mut list: ListValues = [&b"a"[..], b"b"].into_iter().collect();
+        assert!(!list.set(2, &long));
+        assert!(!list.insert(3, &long));
+        assert!(list.is_packed());
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn a_bulk_load_lays_down_full_chunks_and_falls_back_once() {
+        let elements: Vec<Vec<u8>> = (0..1000).map(element).collect();
+        let list: ListValues = elements.iter().map(Vec::as_slice).collect();
+        assert!(list.is_packed());
+        assert_eq!(list.free_effort(), 1000usize.div_ceil(CHUNK_ENTRIES));
+        // Exactly the frames, and the deque of chunks.
+        let frames: usize = elements.iter().map(|e| e.len() + 4).sum();
+        let bytes = list.packed_bytes().unwrap();
+        assert!(
+            bytes >= frames && bytes <= frames + 64 * 32,
+            "{bytes} {frames}"
+        );
+        let model: VecDeque<Vec<u8>> = elements.iter().cloned().collect();
+        assert_same(&list, &model, "bulk");
+        // A long element half way: what came before is moved over once.
+        let mut with_long = elements.clone();
+        with_long.insert(500, vec![b'L'; MAX_LEN + 1]);
+        let mut b = ListValues::builder(with_long.len());
+        for e in &with_long {
+            b.push(e);
+        }
+        let list = b.finish();
+        assert!(!list.is_packed());
+        assert_same(&list, &with_long.into_iter().collect(), "bulk with long");
+        // Shared elements likewise.
+        let shared: ListValues = elements.iter().map(|e| Arc::<[u8]>::from(&e[..])).collect();
+        assert_same(&shared, &model, "shared");
+        let empty: ListValues = std::iter::empty::<&[u8]>().collect();
+        assert!(empty.is_empty() && empty.is_packed());
+    }
+
+    #[test]
+    fn extend_lays_elements_down_as_pushes_would() {
+        for start in [0usize, 1, 63, 64, 65, 200] {
+            for n in [0usize, 1, 10, 63, 64, 65, 130, 500] {
+                let batch: Vec<Vec<u8>> = (0..n).map(|i| element(10_000 + i)).collect();
+                let refs: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
+                let mut back = ListValues::new();
+                let mut front = ListValues::new();
+                let mut model_back = VecDeque::new();
+                let mut model_front = VecDeque::new();
+                for i in 0..start {
+                    back.push_back(&element(i));
+                    front.push_back(&element(i));
+                    model_back.push_back(element(i));
+                    model_front.push_back(element(i));
+                }
+                back.extend_back(&refs);
+                front.extend_front(&refs);
+                for e in &batch {
+                    model_back.push_back(e.clone());
+                    model_front.push_front(e.clone());
+                }
+                assert_same(&back, &model_back, &format!("back {start} {n}"));
+                assert_same(&front, &model_front, &format!("front {start} {n}"));
+                // Exact buffers for a batch that fills its chunks.
+                if start == 0 && n == 64 {
+                    let frames: usize = batch.iter().map(|e| e.len() + 4).sum();
+                    assert_eq!(back.packed_bytes(), Some(frames));
+                    assert_eq!(front.packed_bytes(), Some(frames));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lrem_and_ltrim_in_every_shape() {
+        for packed in [true, false] {
+            for len in [1usize, 10, 64, 65, 200, 1000] {
+                for count in [0i64, 1, 2, 5, 1000, -1, -3, -1000] {
+                    let mut list = ListValues::new();
+                    let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+                    if !packed {
+                        list.push_back(&[b'L'; MAX_LEN + 1]);
+                        list.pop_front_with(|_| ());
+                    }
+                    for i in 0..len {
+                        let e = if i % 3 == 0 {
+                            b"x".to_vec()
+                        } else {
+                            element(i)
+                        };
+                        list.push_back(&e);
+                        model.push_back(e);
+                    }
+                    let removed = list.remove_matching(b"x", count);
+                    // The model, as Redis does it.
+                    let mut want = 0;
+                    let limit = if count == 0 {
+                        usize::MAX
+                    } else {
+                        count.unsigned_abs() as usize
+                    };
+                    if count >= 0 {
+                        let mut i = 0;
+                        while i < model.len() && want < limit {
+                            if model[i] == b"x" {
+                                model.remove(i);
+                                want += 1;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    } else {
+                        let mut i = model.len();
+                        while i > 0 && want < limit {
+                            i -= 1;
+                            if model[i] == b"x" {
+                                model.remove(i);
+                                want += 1;
+                            }
+                        }
+                    }
+                    let what = format!("lrem packed={packed} len={len} count={count}");
+                    assert_eq!(removed, want, "{what}");
+                    assert_same(&list, &model, &what);
+                    assert_eq!(list.is_packed(), packed);
+                    // Then trims of what is left.
+                    let n = model.len();
+                    for (from, to) in [
+                        (0, n),
+                        (1.min(n), n),
+                        (0, n.saturating_sub(1)),
+                        (n / 3, n / 2),
+                        (n / 2, n / 2),
+                    ] {
+                        let mut l = list.clone();
+                        l.retain_range(from, to);
+                        let m: VecDeque<Vec<u8>> = model.range(from..to).cloned().collect();
+                        assert_same(&l, &m, &format!("{what} trim {from}..{to}"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn it_matches_a_model_over_long_random_runs() {
+        for seed in 0..24u64 {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (seed * 0x1000_0001);
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut list = ListValues::new();
+            let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+            // Some runs meet a long element early, some late, some never.
+            let long_every = [0u64, 400, 2_500, 9_000][seed as usize % 4];
+            for step in 0..6_000u64 {
+                let r = next();
+                let mut value = vec![b'a' + (r >> 8) as u8 % 6; ((r >> 16) % 24) as usize];
+                if long_every > 0 && (r >> 40) % long_every == 0 {
+                    value = vec![b'L'; MAX_LEN + 1 + (r % 50) as usize];
+                }
+                // Phases: growing, shrinking, about level.
+                let bias = match (step / 700) % 3 {
+                    0 => 3,
+                    1 => 0,
+                    _ => 1,
+                };
+                let what = format!("seed {seed} step {step}");
+                match r % 20 {
+                    0..=2 => {
+                        list.push_back(&value);
+                        model.push_back(value);
+                    }
+                    3..=4 => {
+                        list.push_front(&value);
+                        model.push_front(value);
+                    }
+                    5 => {
+                        let batch: Vec<Vec<u8>> = (0..(r >> 24) % 90)
+                            .map(|i| vec![b'a' + (i % 5) as u8; (i % 13) as usize])
+                            .collect();
+                        let refs: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
+                        if r & 1 == 0 {
+                            list.extend_back(&refs);
+                            model.extend(batch);
+                        } else {
+                            list.extend_front(&refs);
+                            for e in batch {
+                                model.push_front(e);
+                            }
+                        }
+                    }
+                    6..=8 if bias < 3 => {
+                        let got = list.pop_front_with(|p| p.to_vec());
+                        assert_eq!(got, model.pop_front(), "{what}");
+                    }
+                    9..=11 if bias < 2 => {
+                        let got = list.pop_back_with(|p| p.to_vec());
+                        assert_eq!(got, model.pop_back(), "{what}");
+                    }
+                    12 if !model.is_empty() => {
+                        let i = (r >> 32) as usize % model.len();
+                        assert!(list.set(i, &value));
+                        model[i] = value;
+                    }
+                    13 => {
+                        let i = (r >> 32) as usize % (model.len() + 1);
+                        assert!(list.insert(i, &value));
+                        model.insert(i, value);
+                    }
+                    14 => {
+                        let count = ((r >> 32) % 7) as i64 - 3;
+                        let removed = list.remove_matching(&value, count);
+                        let limit = if count == 0 {
+                            usize::MAX
+                        } else {
+                            count.unsigned_abs() as usize
+                        };
+                        let mut want = 0;
+                        if count >= 0 {
+                            let mut i = 0;
+                            while i < model.len() && want < limit {
+                                if model[i] == value {
+                                    model.remove(i);
+                                    want += 1;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        } else {
+                            let mut i = model.len();
+                            while i > 0 && want < limit {
+                                i -= 1;
+                                if model[i] == value {
+                                    model.remove(i);
+                                    want += 1;
+                                }
+                            }
+                        }
+                        assert_eq!(removed, want, "{what}");
+                    }
+                    15 if !model.is_empty() && bias < 3 => {
+                        let n = model.len();
+                        let from = (r >> 32) as usize % (n / 8 + 1);
+                        let to = n - (r >> 48) as usize % (n / 8 + 1);
+                        let to = to.max(from);
+                        list.retain_range(from, to);
+                        model = model.range(from..to).cloned().collect();
+                    }
+                    16 => {
+                        assert_eq!(
+                            list.position(&value),
+                            model.iter().position(|e| *e == value),
+                            "{what}"
+                        );
+                    }
+                    17 if !model.is_empty() => {
+                        let n = model.len();
+                        let from = (r >> 32) as usize % n;
+                        let to = from + (r >> 48) as usize % (n - from + 1);
+                        let got: Vec<&[u8]> = list.range(from, to).map(Value::bytes).collect();
+                        let want: Vec<&[u8]> = model.range(from..to).map(Vec::as_slice).collect();
+                        assert_eq!(got, want, "{what}");
+                        assert_eq!(list.range(from, to).len(), to - from);
+                        let mut got: Vec<&[u8]> =
+                            list.range_rev(from, to).map(Value::bytes).collect();
+                        got.reverse();
+                        assert_eq!(got, want, "{what}");
+                    }
+                    _ => {
+                        if let Some(i) =
+                            (!model.is_empty()).then(|| (r >> 32) as usize % model.len())
+                        {
+                            assert_eq!(
+                                list.get(i).map(Value::bytes),
+                                Some(model[i].as_slice()),
+                                "{what}"
+                            );
+                        }
+                    }
+                }
+                // An emptied list is deleted, and the next one made new.
+                if model.is_empty() && list.is_empty() && r % 3 == 0 {
+                    list = ListValues::new();
+                }
+                if step % 97 == 0 {
+                    assert_same(&list, &model, &what);
+                }
+            }
+            assert_same(&list, &model, &format!("seed {seed} end"));
+        }
+    }
+}

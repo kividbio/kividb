@@ -54,15 +54,8 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
                 "raw"
             }
         }
-        ValueRef::List(list) => {
-            let list = list.read();
-            // One node of a quicklist holds 8 kB.
-            if list.iter().map(|element| element.len() + 11).sum::<usize>() <= 8192 {
-                "listpack"
-            } else {
-                "quicklist"
-            }
-        }
+        // The form it is really kept in: one chunk, or more.
+        ValueRef::List(list) => list.read().encoding().name(),
         // The form it is really kept in (#297).
         ValueRef::Set(set) => set.read().encoding().name(),
         ValueRef::SortedSet(zset) => {

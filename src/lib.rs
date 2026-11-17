@@ -41,6 +41,7 @@ pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
 pub mod output_limits;
+pub mod packed_list;
 pub mod packed_set;
 pub mod pause;
 pub mod protected_mode;

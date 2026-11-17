@@ -124,7 +124,9 @@ pub fn flush_counts() -> bool {
 pub fn effort(value: &KiviDBValue) -> u64 {
     let n = match value {
         KiviDBValue::String(_) => 1,
-        KiviDBValue::List(list) => list.read().len(),
+        // A quicklist's nodes, as Redis counts them: chunks, or plain
+        // elements.
+        KiviDBValue::List(list) => list.read().free_effort(),
         KiviDBValue::Hash(hash) => hash.read().len(),
         KiviDBValue::Json(json) => match &*json.read() {
             serde_json::Value::Array(items) => items.len(),

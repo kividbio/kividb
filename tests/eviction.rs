@@ -1654,17 +1654,23 @@ impl Server {
 }
 
 impl Conn {
-    /// A list `key` of 100,000 elements of 100 bytes: about 14 MB, freed
-    /// element by element once it is evicted, and at least 3.2 MB as
-    /// eviction reckons it before it frees it.
+    /// A list `key` of 100,000 elements of 100 bytes, each kept apart: about
+    /// 14 MB, freed element by element once it is evicted, and at least 3.2
+    /// MB as eviction reckons it before it frees it. (Its first element,
+    /// longer than a chunk of packed elements holds, keeps them apart; a
+    /// packed list is reckoned at what its chunks take, exactly.)
     fn big_list(&mut self, key: &str) {
         let element = "e".repeat(100);
+        let long = "L".repeat(1025);
+        self.cmd(&["RPUSH", key, &long]);
         let mut push = vec!["RPUSH", key];
         push.extend(std::iter::repeat_n(element.as_str(), 2000));
         for _ in 0..50 {
             self.cmd(&push);
         }
+        self.cmd(&["LPOP", key]);
         assert_eq!(self.cmd(&["LLEN", key]).i(), 100_000);
+        assert_eq!(self.cmd(&["OBJECT", "ENCODING", key]).s(), "quicklist");
     }
 
     /// `used_memory` less `mem_not_counted_for_evict`: what is measured
