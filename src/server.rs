@@ -1169,9 +1169,13 @@ where
                             + Send
                             + '_,
                     >,
-                > = Box::pin(crate::pause::gate(&cmd, &tx.queue, client_id, || {
-                    until_gone(&mut reader, &mut carried, &mut kill_rx, &activity)
-                }));
+                > = Box::pin(crate::pause::gate(
+                    &cmd,
+                    &tx.queue,
+                    client_id,
+                    blocking_slot.holds_count(),
+                    || until_gone(&mut reader, &mut carried, &mut kill_rx, &activity),
+                ));
                 match gated.await {
                     // See the matching arm in `server_uring`: the gate may
                     // have kept a woken resume waiting, and its client gone.
@@ -2549,6 +2553,14 @@ where
                             let _blocked = (wanted > 0).then(|| {
                                 client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
                             });
+                            // Counted in `blocked_clients` until the command
+                            // has been counted in `commandstats`, after this
+                            // arm (#896).
+                            if wanted > 0 {
+                                blocking_slot.hold_count(Some(
+                                    crate::commands::blocking::BlockedCount::enter(),
+                                ));
+                            }
                             let blocked_at = Instant::now();
                             let waited = tokio::select! {
                                 biased;
@@ -2798,6 +2810,8 @@ where
                     &response,
                     started.elapsed().saturating_sub(waited_for),
                 );
+                // A `WAIT` that was counted as blocked stops being, now it is.
+                blocking_slot.release_count();
             }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —
             // each shown as it was run — and then `EXEC`.

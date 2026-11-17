@@ -429,6 +429,11 @@ pub struct BlockingSlot {
 /// when this is dropped, so a reader that sees the client no longer blocked
 /// also sees the call (#896). A zero-sized token: the slot holds it between
 /// the end of the wait and the end of the resume dispatch.
+///
+/// `CLIENT LIST`'s `b` flag is not this: it clears at the end of the wait,
+/// while the count stays until the resumed command has been counted. The
+/// decrement is a release and `INFO` reads with acquire, so that on a
+/// weakly ordered CPU a reader that sees the count down also sees the call.
 pub struct BlockedCount;
 
 impl BlockedCount {
@@ -440,7 +445,7 @@ impl BlockedCount {
 
 impl Drop for BlockedCount {
     fn drop(&mut self) {
-        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -631,6 +636,12 @@ impl BlockingSlot {
         self.ctl.resume = None;
         // The call is counted by now: the client stops being blocked.
         self.held_count = None;
+    }
+
+    /// Whether the slot still counts its client as blocked (see
+    /// [`BlockedCount`]).
+    pub fn holds_count(&self) -> bool {
+        self.held_count.is_some()
     }
 
     /// The count the last wait left, for a wait that follows it (a resumed
