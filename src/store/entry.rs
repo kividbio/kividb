@@ -964,6 +964,10 @@ const HINT_LINES: [u8; 16] = [1, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48
 pub(super) const PREFETCH_LINES: usize = 8;
 
 impl Slot {
+    /// A slot that is no entry's: what an array of slots is filled with
+    /// before the places are taken. Never turned into an entry.
+    pub(super) const NONE: Slot = Slot(0);
+
     #[inline]
     fn fragment(hash: u64) -> u64 {
         // Bits hashbrown uses for neither the bucket (the low bits) nor its
