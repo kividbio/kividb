@@ -128,6 +128,8 @@ struct TsOptions {
     timestamp: Option<u64>,
     /// Where each `TIMESTAMP` option is among the options.
     timestamp_at: Vec<usize>,
+    /// `IGNORE max-time-diff max-val-diff`: suppresses duplicate or near-duplicate samples.
+    ignore: Option<(u64, f64)>,
 }
 
 /// RedisTimeSeries's error for a `CHUNK_SIZE` out of its bounds.
@@ -215,7 +217,7 @@ fn ends_labels(tokens: &[&[u8]], at: usize, of: OptionsOf) -> bool {
 }
 
 /// Whether the checks 1.2.0 did not make apply: `CHUNK_SIZE`'s bounds, an
-/// `ENCODING` value, `IGNORE`. Not to a command from a master, or replayed
+/// `ENCODING` value. Not to a command from a master, or replayed
 /// from the AOF: one an older version accepted is applied, rather than
 /// refused and the series it made lost.
 fn strict_options(ctx: &Ctx) -> bool {
@@ -241,8 +243,7 @@ fn second_word(tokens: &[&[u8]], at: usize, second: &[u8]) -> bool {
 /// parse goes on, as RedisTimeSeries, which looks for each option by name,
 /// passes it over. It used to end the parse, with no error, dropping the
 /// options after it: `CHUNK_SIZE`, unknown then, dropped `LABELS` (#565).
-/// `IGNORE` is not supported, and says so. Where a `LABELS` list ends is
-/// not as in RedisTimeSeries: see [`ends_labels`].
+/// Where a `LABELS` list ends is not as in RedisTimeSeries: see [`ends_labels`].
 fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsOptions, Vec<u8>> {
     let mut options = TsOptions::default();
     let mut i = 0;
@@ -323,8 +324,44 @@ fn parse_ts_options(tokens: &[&[u8]], of: OptionsOf, strict: bool) -> Result<TsO
                 }
                 options.labels = Some(labels);
             }
-            b"IGNORE" if strict => {
-                return Err(resp_error("TSDB: IGNORE is not supported"));
+            b"IGNORE" => {
+                let parse_ignore = || -> Result<(u64, f64), Vec<u8>> {
+                    let t_raw = tokens
+                        .get(i + 1)
+                        .ok_or_else(|| resp_error("TSDB: Couldn't parse IGNORE"))?;
+                    let v_raw = tokens
+                        .get(i + 2)
+                        .ok_or_else(|| resp_error("TSDB: Couldn't parse IGNORE"))?;
+                    let t_str = std::str::from_utf8(t_raw)
+                        .map_err(|_| resp_error("TSDB: Couldn't parse IGNORE"))?;
+                    let v_str = std::str::from_utf8(v_raw)
+                        .map_err(|_| resp_error("TSDB: Couldn't parse IGNORE"))?;
+                    if t_str.starts_with('-') || v_str.starts_with('-') {
+                        return Err(resp_error("TSDB: IGNORE arguments cannot be negative"));
+                    }
+                    let time_diff: u64 = t_str
+                        .parse()
+                        .map_err(|_| resp_error("TSDB: Couldn't parse IGNORE"))?;
+                    let val_diff: f64 = v_str
+                        .parse()
+                        .map_err(|_| resp_error("TSDB: Couldn't parse IGNORE"))?;
+                    if val_diff.is_nan() || val_diff < 0.0 {
+                        return Err(resp_error("TSDB: IGNORE arguments cannot be negative"));
+                    }
+                    Ok((time_diff, val_diff))
+                };
+                match parse_ignore() {
+                    Ok(pair) => {
+                        options.ignore = Some(pair);
+                        i += 3;
+                    }
+                    Err(e) if strict => {
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        i += 1;
+                    }
+                }
             }
             // Passed over, as RedisTimeSeries does.
             _ => i += 1,
@@ -344,9 +381,46 @@ fn configure_new(ts: &mut TsInner, options: &TsOptions) {
     if let Some(policy) = &options.duplicate_policy {
         ts.duplicate_policy = policy.clone();
     }
+    if let Some((time_diff, val_diff)) = options.ignore {
+        ts.ignore_max_time_diff = time_diff;
+        ts.ignore_max_val_diff = val_diff;
+    }
     for (lk, lv) in options.labels.iter().flatten() {
         ts.labels.insert(lk.clone(), lv.clone());
     }
+}
+
+// What the `TS.ADD` or `TS.MADD` that ran last on this thread left out
+// because of `IGNORE`: for the replication feed, `WATCH`, client tracking
+// and the dirty counter, which read it right after the command, on the same
+// thread (`handler::changed_nothing`, `script_feed::ts_add_feed`,
+// `script_feed::ts_madd_feed`). Each of the two clears it first thing, and
+// nothing else reads it: a mark an earlier command left must never be taken
+// for another command's, or that command's write would not be propagated.
+thread_local! {
+    static TS_CHANGED_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TS_MADD_IGNORED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn ts_changed_nothing() -> bool {
+    TS_CHANGED_NOTHING.get()
+}
+
+pub(crate) fn clear_ts_changed_nothing() {
+    TS_CHANGED_NOTHING.set(false);
+    TS_MADD_IGNORED.with_borrow_mut(|v| v.clear());
+}
+
+pub(crate) fn mark_ts_changed_nothing() {
+    TS_CHANGED_NOTHING.set(true);
+}
+
+pub(crate) fn mark_ts_madd_ignored(idx: usize) {
+    TS_MADD_IGNORED.with_borrow_mut(|v| v.push(idx));
+}
+
+pub(crate) fn ts_madd_ignored() -> Vec<usize> {
+    TS_MADD_IGNORED.with_borrow(|v| v.clone())
 }
 
 /// The word 1.2.1 puts right after the value of every `TS.INCRBY` and
@@ -834,6 +908,10 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
             if let Some(dp) = options.duplicate_policy {
                 ts.duplicate_policy = dp;
             }
+            if let Some((time_diff, val_diff)) = options.ignore {
+                ts.ignore_max_time_diff = time_diff;
+                ts.ignore_max_val_diff = val_diff;
+            }
 
             if let Some(new_labels) = options.labels {
                 let old_labels = std::mem::take(&mut ts.labels);
@@ -861,6 +939,7 @@ fn ts_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // we can't do read-check then write-upgrade because that's a TOCTOU race.
 
 fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    clear_ts_changed_nothing();
     let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 4 {
@@ -913,6 +992,10 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
         if policy == DuplicatePolicy::Block && ts.samples.contains_key(&timestamp) {
             return Some(resp_error(crate::types::BLOCKED_DUPLICATE));
         }
+        if !created && let Some(existing_ts) = ts.should_ignore(timestamp, value, &policy) {
+            mark_ts_changed_nothing();
+            return Some(resp_integer(existing_ts as i64));
+        }
         if created {
             configure_new(&mut ts, &options);
         } else {
@@ -940,9 +1023,13 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     match result {
-        Ok(stored_ts) => {
+        Ok(crate::types::AddResult::Added(stored_ts)) => {
             after_append(ctx, &key, &series, stored_ts);
             Some(resp_integer(stored_ts as i64))
+        }
+        Ok(crate::types::AddResult::Ignored(existing_ts)) => {
+            mark_ts_changed_nothing();
+            Some(resp_integer(existing_ts as i64))
         }
         Err(e) => Some(resp_error(e)),
     }
@@ -956,6 +1043,7 @@ fn ts_add(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // under one lock. We process sequentially — each triplet is one write lock.
 
 fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    clear_ts_changed_nothing();
     let strict = strict_options(ctx);
     let cmd = &ctx.cmd;
     if cmd.len() < 4 || !(cmd.len() - 1).is_multiple_of(3) {
@@ -964,9 +1052,10 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
 
+    let mut added_any = false;
     // One reply per sample: its timestamp, or the error for that sample alone.
     let mut results: Vec<Vec<u8>> = Vec::with_capacity((cmd.len() - 1) / 3);
-    for triple in cmd[1..].as_chunks::<3>().0 {
+    for (sample_idx, triple) in cmd[1..].as_chunks::<3>().0.iter().enumerate() {
         let key: &[u8] = triple[0];
         let timestamp: u64 = if triple[1] == b"*" {
             TsInner::now_ms()
@@ -1007,12 +1096,21 @@ fn ts_madd(ctx: &mut Ctx) -> Option<Vec<u8>> {
         };
         let added = series.write().add_sample(timestamp, value);
         results.push(match added {
-            Ok(stored_ts) => {
+            Ok(crate::types::AddResult::Added(stored_ts)) => {
+                added_any = true;
                 after_append(ctx, key, &series, stored_ts);
                 resp_integer(stored_ts as i64)
             }
+            Ok(crate::types::AddResult::Ignored(existing_ts)) => {
+                mark_ts_madd_ignored(sample_idx);
+                resp_integer(existing_ts as i64)
+            }
             Err(e) => resp_error(e),
         });
+    }
+
+    if !added_any {
+        mark_ts_changed_nothing();
     }
 
     Some(resp_array(results))
@@ -1088,7 +1186,7 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
         } else {
             ts.samples.insert(timestamp, last_val + delta);
             ts.last_ts = Some(timestamp);
-            Ok(timestamp)
+            Ok(crate::types::AddResult::Added(timestamp))
         }
     };
     if created {
@@ -1101,7 +1199,9 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
         );
     }
     match added {
-        Ok(stored_ts) => {
+        Ok(
+            crate::types::AddResult::Added(stored_ts) | crate::types::AddResult::Ignored(stored_ts),
+        ) => {
             after_append(ctx, &key, &series, stored_ts);
             Some(resp_integer(stored_ts as i64))
         }
@@ -1394,6 +1494,9 @@ fn ts_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 })
                 .collect();
             out.push(resp_array(rules_resp));
+
+            kv!("ignoreMaxTimeDiff", ts.ignore_max_time_diff);
+            kv!("ignoreMaxValDiff", ts.ignore_max_val_diff);
 
             Some(resp_array(out))
         }

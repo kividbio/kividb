@@ -42,7 +42,7 @@ pub trait Doc {
 
 impl Doc for crate::types::HashFields {
     fn field_bytes(&self, field: &str) -> Option<&[u8]> {
-        self.get(field).map(|v| &**v)
+        self.get_bytes(field)
     }
 }
 

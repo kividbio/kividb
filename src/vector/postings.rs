@@ -1832,7 +1832,7 @@ impl Postings {
         let id = self.ensure(key);
         let slots = self.keys.len();
         for field in &mut self.fields {
-            let value = doc.get(&field.name).map(|v| &**v);
+            let value = doc.get_bytes(&field.name);
             match &mut field.kind {
                 Kind::Tag(tags) => tags.set(id, value, slots),
                 Kind::Numeric(numbers) => numbers.set(id, value),

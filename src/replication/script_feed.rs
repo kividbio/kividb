@@ -373,6 +373,9 @@ fn array_header(resp: &[u8]) -> Option<(usize, usize)> {
 /// given is sent as the plain number every version reads, not as the
 /// client wrote it.
 fn ts_add_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    if crate::commands::ts::ts_changed_nothing() {
+        return Vec::new();
+    }
     let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
     if cmd.len() > 2
         && let Some(ts) = parse_resp_integer(resp)
@@ -400,12 +403,17 @@ fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     if resp.first() != Some(&b'*') || cmd.is_empty() {
         return vec![cmd.iter().map(|b| b.to_vec()).collect()];
     }
+    let ignored = crate::commands::ts::ts_madd_ignored();
     // The reply is an array with one element per sample: `:timestamp`, or an
     // error for a sample that was refused.
     let mut lines = resp.split(|b| *b == b'\n');
     lines.next(); // the array header
     let mut parts: Vec<Vec<u8>> = vec![cmd[0].to_vec()];
-    for (sample, line) in cmd[1..].chunks(3).zip(lines) {
+    for (i, (sample, line)) in cmd[1..].chunks(3).zip(lines).enumerate() {
+        // In order: `ts_madd` notes them as it goes.
+        if ignored.binary_search(&i).is_ok() {
+            continue;
+        }
         match line.first() {
             Some(b'-') => continue,
             Some(b':') if sample.len() == 3 => {

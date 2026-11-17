@@ -856,7 +856,7 @@ impl IndexDef {
         let Some(name) = &self.language.field else {
             return self.language.language;
         };
-        let language = self.language.of(doc.get(name.as_str()).map(|v| &**v));
+        let language = self.language.of(doc.get_bytes(name.as_str()));
         let mut languages = self.doc_languages.write();
         if language == self.language.language {
             languages.remove(key);
@@ -1281,7 +1281,10 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
         let language = def.language_of(key, &inner);
         let mut changes = Vec::new();
         for field in fields {
-            let Some(text) = inner.get(field).and_then(|b| std::str::from_utf8(b).ok()) else {
+            let Some(text) = inner
+                .get_bytes(field)
+                .and_then(|b| std::str::from_utf8(b).ok())
+            else {
                 continue;
             };
             let Some(schema) = def.fields.iter().find(|f| &f.name == field) else {
@@ -1516,11 +1519,11 @@ pub fn backfill_from_db_progress(
         };
 
         for w in &vec_work {
-            let raw_bytes = match inner.get(&w.name) {
-                Some(b) => b.clone(),
+            let raw_bytes = match inner.get_bytes(&w.name) {
+                Some(b) => b,
                 None => continue,
             };
-            let Some(vec) = w.data_type.decode(&raw_bytes, w.dim) else {
+            let Some(vec) = w.data_type.decode(raw_bytes, w.dim) else {
                 continue;
             };
             match &w.live {
@@ -1540,7 +1543,7 @@ pub fn backfill_from_db_progress(
         let language = def.language_of(key, &inner);
         let mut changes = Vec::new();
         for (number, field) in text_fields.iter().enumerate() {
-            if let Some(raw) = inner.get(&field.name)
+            if let Some(raw) = inner.get_bytes(&field.name)
                 && let Ok(s) = std::str::from_utf8(raw)
             {
                 changes.push((number as u16, stem::index_words(def, field, language, s)));
@@ -1568,7 +1571,7 @@ pub fn backfill_from_db_progress(
                     .and_then(|value| doc_fields(&def.on, &def.fields, value))
                     .and_then(|inner| {
                         inner
-                            .get(&w.name)
+                            .get_bytes(&w.name)
                             .map(|raw| w.data_type.decode(raw, w.dim).is_some())
                     })
                     .unwrap_or(false);
@@ -2177,14 +2180,16 @@ fn json_path(path: &str) -> Option<Arc<crate::commands::json_path::Query>> {
 /// What a JSON document holds for each field of `schema`, keyed by the
 /// field's path.
 pub fn project_json(schema: &[SchemaField], doc: &serde_json::Value) -> Fields {
-    let mut fields = Fields::with_capacity_and_hasher(schema.len(), Default::default());
+    // A table from the start: a vector field is longer than a block takes,
+    // and a block would be filled only to be moved.
+    let mut fields = Fields::table_with_capacity(schema.len());
     for field in schema {
         let Some(query) = json_path(&field.name) else {
             continue;
         };
         let values = query.values(doc);
         if let Some(bytes) = json_field_bytes(field, &values) {
-            fields.insert(field.name.clone(), bytes);
+            fields.insert_owned(field.name.clone(), bytes);
         }
     }
     fields
@@ -2381,7 +2386,7 @@ pub fn reindex_key(
                 let pairs: Vec<(String, Arc<[u8]>)> = hash
                     .read()
                     .iter()
-                    .map(|(field, value)| (field.to_string(), Arc::clone(value)))
+                    .map(|(field, value)| (field.to_string(), value.to_shared()))
                     .collect();
                 index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
@@ -2390,7 +2395,7 @@ pub fn reindex_key(
                     .read()
                     .fields
                     .iter()
-                    .map(|(field, value)| (field.to_string(), Arc::clone(value)))
+                    .map(|(field, value)| (field.to_string(), value.to_shared()))
                     .collect();
                 index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
@@ -4167,7 +4172,7 @@ pub fn compact_hnsw(
                 let Some(inner) = doc_fields(&doc_on, &doc_schema, value) else {
                     continue;
                 };
-                let raw = match inner.get(field_name) {
+                let raw = match inner.get_bytes(field_name) {
                     Some(b) => b,
                     None => continue,
                 };

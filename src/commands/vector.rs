@@ -778,14 +778,14 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         for (field, val) in inner.iter() {
             // Text only: a vector's bytes are not a value a row can show
             // or a pipeline can compute with.
-            let Ok(s) = std::str::from_utf8(val) else {
+            let Ok(s) = std::str::from_utf8(&val) else {
                 continue;
             };
             // A field of a JSON document goes by the name the schema
             // gives its path.
-            let shown = match def.fields.iter().find(|f| json && &f.name == field) {
+            let shown = match def.fields.iter().find(|f| json && f.name == field) {
                 Some(f) => f.attribute().to_string(),
-                None => field.clone(),
+                None => field.to_string(),
             };
             row.insert(shown, s.to_string());
         }
@@ -1157,7 +1157,7 @@ fn ft_tagvals(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 continue;
             };
             let Some(s) = inner
-                .get(&stored_as)
+                .get_bytes(&stored_as)
                 .and_then(|v| std::str::from_utf8(v).ok())
             else {
                 continue;
@@ -2090,7 +2090,7 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
             def.docs.add(key);
         }
         for w in &work {
-            let raw_bytes = match inner.get(&w.name) {
+            let raw_bytes = match inner.get_bytes(&w.name) {
                 Some(b) => b,
                 None => continue,
             };

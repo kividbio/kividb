@@ -577,10 +577,20 @@ fn hash_fields_expire_on_their_own() {
     expect_event(&mut sub, "__keyevent@0__:del", "hf:x");
     assert_eq!(c.cmd(&["EXISTS", "hf:x"]).i(), 0);
 
-    let after: u64 = info(&mut c, "stats", "expired_subkeys")
-        .unwrap()
-        .parse()
-        .unwrap();
+    // A field is counted after its event is sent: the count is waited for,
+    // not read once.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after = before;
+    while Instant::now() < deadline {
+        after = info(&mut c, "stats", "expired_subkeys")
+            .unwrap()
+            .parse()
+            .unwrap();
+        if after - before >= 5 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(after - before >= 5, "{before} -> {after}");
 }
 
