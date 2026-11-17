@@ -1071,22 +1071,6 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
         assert!(c.cmd(&["SET", key, "before"]).ok());
     }
     assert!(c.cmd(&["SET", "{c}:still", "still"]).ok());
-    // Seen to be quick, so that it is run beside others.
-    for _ in 0..4 {
-        assert_eq!(
-            c.cmd(&["EVALSHA", &sha, "2", "{a}:k", "{b}:k", "1", "before"]),
-            V::Int(1)
-        );
-        assert_eq!(
-            c.cmd(&["EVALSHA", &sha, "1", "{c}:k", "1", "before"]),
-            V::Int(1)
-        );
-        assert_eq!(
-            c.cmd(&["EVALSHA", &sha, "1", "{b}:k", "1", "before"]),
-            V::Int(1)
-        );
-    }
-
     // Sized to last about a second, as in the test of one tag above, with a
     // copy of the script on a tag of its own.
     let steps = {
@@ -1099,109 +1083,139 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
         ((1.0 / per_step) as u64).clamp(60_000_000, 2_000_000_000)
     };
 
-    let port = server.port;
-    let started = Instant::now();
-    let slow_sha = sha.clone();
-    let slow_steps = steps.to_string();
-    let slow = std::thread::spawn(move || {
-        let mut c = Conn::connect(port);
-        let reply = c.cmd(&[
-            "EVALSHA",
-            &slow_sha,
-            "2",
-            "{a}:k",
-            "{b}:k",
-            &slow_steps,
-            "after",
-        ]);
-        (reply, started.elapsed())
-    });
-    std::thread::sleep(Duration::from_millis(100));
+    // On a busy machine a quick run can be stretched past the demotion limit
+    // and the script sent to the pool, where it runs alone and everything
+    // waits for it. An attempt in which any script went to the pool proves
+    // nothing, and is made again.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // Seen to be quick, so that it is run beside others.
+        for _ in 0..4 {
+            assert_eq!(
+                c.cmd(&["EVALSHA", &sha, "2", "{a}:k", "{b}:k", "1", "before"]),
+                V::Int(1)
+            );
+            assert_eq!(
+                c.cmd(&["EVALSHA", &sha, "1", "{c}:k", "1", "before"]),
+                V::Int(1)
+            );
+            assert_eq!(
+                c.cmd(&["EVALSHA", &sha, "1", "{b}:k2", "1", "before"]),
+                V::Int(1)
+            );
+        }
+        let pooled_before = script_counts(&mut c)["scripts_offloaded_to_pool"];
 
-    let probe = |args: Vec<String>| {
-        std::thread::spawn(move || {
+        let port = server.port;
+        let started = Instant::now();
+        let slow_sha = sha.clone();
+        let slow_steps = steps.to_string();
+        let slow = std::thread::spawn(move || {
             let mut c = Conn::connect(port);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let reply = c.cmd(&args);
+            let reply = c.cmd(&[
+                "EVALSHA",
+                &slow_sha,
+                "2",
+                "{a}:k",
+                "{b}:k",
+                &slow_steps,
+                "after",
+            ]);
             (reply, started.elapsed())
-        })
-    };
-    let words = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
-    // Several connections for what must not wait: one that lands on the slow
-    // script's thread waits for the thread, whatever its key.
-    let several = |args: Vec<String>| (0..6).map(|_| probe(args.clone())).collect::<Vec<_>>();
-    let other_script = several(words(&["EVALSHA", &sha, "1", "{c}:k", "1", "other"]));
-    let other_read = several(words(&["GET", "{c}:still"]));
-    let untagged = several(words(&["SET", "plain", "v"]));
-    let first_tag = probe(words(&["GET", "{a}:k"]));
-    let second_tag = probe(words(&["GET", "{b}:k"]));
-    let both = probe(words(&["MGET", "{b}:k", "{a}:k"]));
-    let script_on_second = probe(words(&["EVALSHA", &sha, "1", "{b}:k", "1", "later"]));
-    let earliest = |probes: Vec<std::thread::JoinHandle<(V, Duration)>>| {
-        let done: Vec<(V, Duration)> = probes.into_iter().map(|p| p.join().unwrap()).collect();
-        let reply = done[0].0.clone();
-        assert!(done.iter().all(|(r, _)| *r == reply), "{done:?}");
-        (reply, done.iter().map(|(_, at)| *at).min().unwrap())
-    };
+        });
+        std::thread::sleep(Duration::from_millis(100));
 
-    let (slow_reply, slow_done) = slow.join().unwrap();
-    assert_eq!(slow_reply, V::Int(steps as i64));
-    assert!(
-        slow_done > Duration::from_millis(400),
-        "the slow script took only {slow_done:?} for {steps} steps, sized to take about a \
-         second: the test proves nothing on this machine"
-    );
+        let probe = |args: Vec<String>| {
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let reply = c.cmd(&args);
+                (reply, started.elapsed())
+            })
+        };
+        let words = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        // Several connections for what must not wait: one that lands on the
+        // slow script's thread waits for the thread, whatever its key.
+        let several = |args: Vec<String>| (0..6).map(|_| probe(args.clone())).collect::<Vec<_>>();
+        let other_script = several(words(&["EVALSHA", &sha, "1", "{c}:k", "1", "other"]));
+        let other_read = several(words(&["GET", "{c}:still"]));
+        let untagged = several(words(&["SET", "plain", "v"]));
+        let first_tag = probe(words(&["GET", "{a}:k"]));
+        let second_tag = probe(words(&["GET", "{b}:k"]));
+        let both = probe(words(&["MGET", "{b}:k", "{a}:k"]));
+        // On another key of its second tag, so that the reads above find what
+        // the slow script wrote whichever of them goes first after it.
+        let script_on_second = probe(words(&["EVALSHA", &sha, "1", "{b}:k2", "1", "later"]));
+        let earliest = |probes: Vec<std::thread::JoinHandle<(V, Duration)>>| {
+            let done: Vec<(V, Duration)> =
+                probes.into_iter().map(|p| p.join().unwrap()).collect();
+            let reply = done[0].0.clone();
+            assert!(done.iter().all(|(r, _)| *r == reply), "{done:?}");
+            (reply, done.iter().map(|(_, at)| *at).min().unwrap())
+        };
 
-    let margin = Duration::from_millis(100);
-    let (reply, done) = earliest(other_script);
-    assert_eq!(reply, V::Int(1));
-    assert!(
-        done + margin < slow_done,
-        "a script on a third tag waited: {done:?} of {slow_done:?}"
-    );
-    let (reply, done) = earliest(other_read);
-    assert_eq!(reply, V::Str("still".into()));
-    assert!(
-        done + margin < slow_done,
-        "a read on a third tag waited: {done:?} of {slow_done:?}"
-    );
-    let (reply, done) = earliest(untagged);
-    assert!(reply.ok());
-    assert!(
-        done + margin < slow_done,
-        "a key with no tag waited: {done:?} of {slow_done:?}"
-    );
+        let (slow_reply, slow_done) = slow.join().unwrap();
+        let other_script = earliest(other_script);
+        let other_read = earliest(other_read);
+        let untagged = earliest(untagged);
+        let first_tag = first_tag.join().unwrap();
+        let second_tag = second_tag.join().unwrap();
+        let both = both.join().unwrap();
+        let script_on_second = script_on_second.join().unwrap();
+        let pooled = script_counts(&mut c)["scripts_offloaded_to_pool"] - pooled_before;
+        if pooled > 0 && attempt < 5 {
+            continue;
+        }
+        assert_eq!(pooled, 0, "a script went to the pool in every attempt");
 
-    // Either of its tags: not before the script was done, and with what it
-    // wrote.
-    let waited = |what: &str, (reply, done): (V, Duration), want: V| {
-        assert_eq!(reply, want, "{what}");
+        assert_eq!(slow_reply, V::Int(steps as i64));
         assert!(
-            done + Duration::from_millis(20) >= slow_done,
-            "{what} did not wait: {done:?} of {slow_done:?}"
+            slow_done > Duration::from_millis(400),
+            "the slow script took only {slow_done:?} for {steps} steps, sized to take about a \
+             second: the test proves nothing on this machine"
         );
-    };
-    waited(
-        "a read of its first tag",
-        first_tag.join().unwrap(),
-        V::Str("after".into()),
-    );
-    waited(
-        "a read of its second tag",
-        second_tag.join().unwrap(),
-        V::Str("after".into()),
-    );
-    waited(
-        "a read of both",
-        both.join().unwrap(),
-        V::Arr(vec![V::Str("after".into()), V::Str("after".into())]),
-    );
-    waited(
-        "a script on its second tag",
-        script_on_second.join().unwrap(),
-        V::Int(1),
-    );
-    assert_eq!(c.cmd(&["GET", "{b}:k"]), V::Str("later".into()));
+
+        let margin = Duration::from_millis(100);
+        let (reply, done) = other_script;
+        assert_eq!(reply, V::Int(1));
+        assert!(
+            done + margin < slow_done,
+            "a script on a third tag waited: {done:?} of {slow_done:?}"
+        );
+        let (reply, done) = other_read;
+        assert_eq!(reply, V::Str("still".into()));
+        assert!(
+            done + margin < slow_done,
+            "a read on a third tag waited: {done:?} of {slow_done:?}"
+        );
+        let (reply, done) = untagged;
+        assert!(reply.ok());
+        assert!(
+            done + margin < slow_done,
+            "a key with no tag waited: {done:?} of {slow_done:?}"
+        );
+
+        // Either of its tags: not before the script was done, and with what
+        // it wrote.
+        let waited = |what: &str, (reply, done): (V, Duration), want: V| {
+            assert_eq!(reply, want, "{what}");
+            assert!(
+                done + Duration::from_millis(20) >= slow_done,
+                "{what} did not wait: {done:?} of {slow_done:?}"
+            );
+        };
+        waited("a read of its first tag", first_tag, V::Str("after".into()));
+        waited("a read of its second tag", second_tag, V::Str("after".into()));
+        waited(
+            "a read of both",
+            both,
+            V::Arr(vec![V::Str("after".into()), V::Str("after".into())]),
+        );
+        waited("a script on its second tag", script_on_second, V::Int(1));
+        assert_eq!(c.cmd(&["GET", "{b}:k2"]), V::Str("later".into()));
+        break;
+    }
 }
 
 /// Moves one unit from the first tag's account to the second's (with one
