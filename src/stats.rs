@@ -204,7 +204,7 @@ macro_rules! tl_bump {
 }
 
 /// How scripts were run (`lua-parallel-scripts`, #871): beside other
-/// commands under their tag's lock, or alone, and why; and, of those, how
+/// commands under their tags' locks, or alone, and why; and, of those, how
 /// many were handed to the script-runner thread or offloaded to the blocking
 /// pool. Counted where that is decided, and nowhere else: a command that is
 /// not a script counts nothing, and a build without Lua has none of this.
@@ -228,14 +228,12 @@ pub mod scripts {
         NoKeys,
         /// A key of its `KEYS` has no hash tag.
         NoTag,
-        /// Its `KEYS` carry different hash tags.
-        SeveralTags,
-        /// Its `KEYS` share a tag, and it has not (or not yet) been seen to
-        /// be quick.
+        /// Its `KEYS` all carry a tag, and it has not (or not yet) been seen
+        /// to be quick.
         NotQuick,
     }
 
-    const REASONS: usize = 7;
+    const REASONS: usize = 6;
     /// The `INFO` field of each [`Alone`], in its order.
     const NAMES: [&str; REASONS] = [
         "scripts_run_alone_parallel_off",
@@ -243,7 +241,6 @@ pub mod scripts {
         "scripts_run_alone_function",
         "scripts_run_alone_no_keys",
         "scripts_run_alone_no_tag",
-        "scripts_run_alone_several_tags",
         "scripts_run_alone_not_quick",
     ];
 
@@ -258,7 +255,7 @@ pub mod scripts {
         static TL_BESIDE: std::sync::Arc<Slot> = BESIDE_OTHERS.register();
     }
 
-    /// A script runs beside others, under its tag's lock.
+    /// A script runs beside others, under its tags' locks.
     #[inline]
     pub fn ran_beside_others() {
         TL_BESIDE.with(|mine| {
