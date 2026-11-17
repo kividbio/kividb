@@ -16,9 +16,17 @@
 # not depend on the default): GET and SET with 100 B and 1 KB values,
 # pipelined (-P 16) and not (-P 1); and pipelined INCR, HGET, LPUSH, LPOP and
 # a 16-key MGET. Labels end in -no / -yes.
+# CMP=plain preloads plaincmp.c's memcmp and bcmp into the server: counts
+# that do not move with where the stack and the string literals happen to
+# lie (see plaincmp.c). Compare two trees with the same CMP.
 set -u
 N=${N:-100000} P=${P:-16} MODEL=${MODEL:-tokio} PORT=6400
 mkdir -p /out
+CMP_PRELOAD=
+if [ "${CMP:-}" = plain ]; then
+  cc -O1 -fno-builtin -fno-tree-loop-distribute-patterns -shared -fPIC \
+    -o /tmp/plaincmp.so "$(dirname "$0")/plaincmp.c" && CMP_PRELOAD=/tmp/plaincmp.so
+fi
 
 # What the keys are loaded with before a workload: `-t set` by default, or
 # the command in PRELOAD (redis-benchmark's own arguments, __rand_int__ and
@@ -29,7 +37,7 @@ one() { # tag, label, redis-benchmark args...
   if [ -n "${ONLY:-}" ] && ! [[ $label =~ $ONLY ]]; then return; fi
   rm -rf /tmp/hp && mkdir -p /tmp/hp && cd /tmp/hp
   # shellcheck disable=SC2086
-  valgrind --tool=callgrind --instr-atstart=no --callgrind-out-file=/tmp/hp/out \
+  LD_PRELOAD=$CMP_PRELOAD valgrind --tool=callgrind --instr-atstart=no --callgrind-out-file=/tmp/hp/out \
     "/target/perf-$tag/release/kividb" --port $PORT --bind 127.0.0.1 --io-model "$MODEL" \
     --threads 1 --loglevel warning ${SERVER_EXTRA:-} > /tmp/hp/log 2>&1 &
   local vg=$!
@@ -55,6 +63,16 @@ one() { # tag, label, redis-benchmark args...
   f=$(ls -S /tmp/hp/out* 2>/dev/null | head -1)
   total=$(callgrind_annotate "$f" 2>/dev/null | grep -m1 "PROGRAM TOTALS" | tr -d "," | awk '{print $1}')
   echo "$label $tag $(( ${total:-0} / N ))"
+  # EXEC=1: also what `execute_command` costs a command, everything under it
+  # included: the command's own work, without the I/O loop around it, whose
+  # count moves with how many commands each wake-up finds (tens of
+  # instructions a command on io_uring between two runs of one binary).
+  if [ -n "${EXEC:-}" ]; then
+    local exec
+    exec=$(callgrind_annotate --inclusive=yes "$f" 2>/dev/null | tr -d "," |
+      awk '/handler::execute_command( |$)/ {print $1; exit}')
+    echo "$label-EXEC $tag $(( ${exec:-0} / N ))"
+  fi
   if [ "${PROFILE:-}" = "$tag" ]; then
     callgrind_annotate --inclusive=no "$f" 2>/dev/null | sed -n '1,70p' | cut -c1-200 > "/out/profile-$label.txt"
   fi
