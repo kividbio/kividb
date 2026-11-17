@@ -333,6 +333,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A pipeline sent before its replies are read no longer hangs its
+  connection (#865).** A client that sends a whole pipeline and only then
+  reads the replies, as redis-py's pipeline does, was still sending when
+  its first replies filled the socket; the server, waiting to write them,
+  stopped reading it, and neither went on: from about 170,000 `SET`s on
+  macOS. The tokio loop, which also serves TLS connections under io_uring,
+  now reads a client while its replies wait, and runs what it read after
+  them a read's worth at a time. What it reads counts against
+  `client-query-buffer-limit`, and, with the replies waiting, against the
+  class's hard `client-output-buffer-limit`: a client that never reads is
+  closed there, as Redis closes it once its replies reach that limit. The
+  same goes for the replies a blocking command writes before it waits; if
+  that write fails, the client is closed at once, and what it pipelined
+  after the blocking command is not run. Cleartext connections under
+  io_uring still stop reading, from about 940,000 `SET`s with Linux's
+  default socket buffers.
+
 - **A replica of 1.2.0 no longer writes a `TS.INCRBY` its own AOF replay
   refuses (#611).** A 1.2.0 master sends a time above `i64::MAX` as the
   negative number it replied, and the replica's re-log kept that tail next
