@@ -845,12 +845,12 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
                 for (name, value) in fields.iter() {
                     // Text only: a vector's bytes are not a value a row can
                     // show or a step can compute with.
-                    let Ok(value) = std::str::from_utf8(value) else {
+                    let Ok(value) = std::str::from_utf8(&value) else {
                         continue;
                     };
-                    let shown = match def.fields.iter().find(|f| json && &f.name == name) {
+                    let shown = match def.fields.iter().find(|f| json && f.name == name) {
                         Some(f) => f.attribute().to_string(),
-                        None => name.clone(),
+                        None => name.to_string(),
                     };
                     row.insert(shown, value.to_string());
                 }

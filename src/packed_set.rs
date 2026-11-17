@@ -54,7 +54,7 @@ pub struct PackedSet {
 /// `a == b` for two slices of one length, short ones (as members of a
 /// block are) by a word or two from each end rather than a call.
 #[inline(always)]
-fn same(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
     let n = a.len();
     debug_assert_eq!(n, b.len());
     let word = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
@@ -73,7 +73,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 /// members that differ only in a counter at their end, or only in a prefix,
 /// differ here.
 #[inline]
-fn fingerprint(member: &[u8]) -> u8 {
+pub(crate) fn fingerprint(member: &[u8]) -> u8 {
     let n = member.len();
     let x = if n >= 8 {
         let head = u64::from_le_bytes(member[..8].try_into().unwrap());

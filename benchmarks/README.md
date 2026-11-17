@@ -7,9 +7,12 @@ Redis, and its page in `docs/integrations/` says what passes.
 ## Compatibility harnesses in CI
 
 [`.github/workflows/compat.yml`](../.github/workflows/compat.yml) runs the harnesses that follow the
-contract below against KiviDB and Redis 8.10, one after another on one runner: weekly, on each release,
-and by hand. It fails only when a check passes on Redis and fails on KiviDB, and the job summary has a
-table per harness of the checks that differ. Nothing in it needs a secret or a model API key.
+contract below against KiviDB and Redis 8.10, one after another on one runner: on each release, and by
+hand (with a pre-release image before a release). It fails when a check passes on Redis and fails on
+KiviDB, when KiviDB stops passing a check its harness lists in `kividb-passes.txt`, or when a harness
+could not run (its setup failed, a server did not start, or a run left no results), and the job
+summary says which, with a table per harness of the checks that differ. Nothing in it needs a secret
+or a model API key.
 
 ### The contract
 
@@ -29,7 +32,12 @@ ci.sh run DIR PORT OUT.xml   run its tests against a server already listening on
 - **Results** are JUnit XML, which pytest (`--junitxml`), Maven's Surefire/Failsafe and most runners
   write. Each `<testcase>` is one check: a `<failure>` or `<error>` in it is a fail, `<skipped>` a skip,
   anything else a pass. [`ci/compare.py`](ci/compare.py) matches the two files by `classname::name`.
+  A harness that runs its own checks rather than a test suite writes them with
+  [`ci/compat_junit.py`](ci/compat_junit.py).
 - A harness whose tests expect a fixed port (6379, say) checks `PORT` and exits 2 on another.
+- **`kividb-passes.txt`**, optional, lists checks KiviDB passes, one `classname::name` a line (`#` for
+  comments), for a harness whose checks Redis largely fails, so that comparing with Redis alone would
+  miss most of them: the job fails if KiviDB stops passing one. Add a check to it once KiviDB passes it.
 - No secrets, no model API keys, no network access beyond fetching the framework, its packages and
   its test fixtures.
 
@@ -44,3 +52,7 @@ add a step for it to `compat.yml` with its own `timeout-minutes`.
 | `semantic-kernel` | semantic-kernel 1.47.0 | a few seconds, after a `uv sync` of several minutes |
 | `haystack-valkey` | valkey-haystack 1.0.0 | under 30 s |
 | `gptcache` | GPTCache 0.1.44 | 1 to 5 min (the first run downloads its ONNX model) |
+| `langchain` | langchain-redis 0.2.6, through this folder's own harness (33 checks) | under 10 s in all, the install included |
+| `langgraph` | langgraph-checkpoint-redis 0.6.0 with langgraph 1.2.19, through this folder's own harness (23 checks) | under 10 s in all, the install included |
+| `llamaindex` | llama-index-core 0.14.25 with its Redis stores, through this folder's own harness (54 checks) | under 10 s in all, the install included |
+| `mem0` | mem0ai 2.2.1, through this folder's own harness (24 checks) | under 10 s in all, the install included |

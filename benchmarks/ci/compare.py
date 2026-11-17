@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Compare one harness's results on Redis and on KiviDB, check by check.
 
-usage: compare.py NAME REDIS.xml KIVIDB.xml
+usage: compare.py NAME REDIS.xml KIVIDB.xml [KIVIDB-PASSES.txt]
 
 Each file is the JUnit XML a harness's `ci.sh run` wrote (see
 benchmarks/README.md). A check is a <testcase>, named classname::name: a
 <failure> or <error> in it is a fail, <skipped> a skip, anything else a pass.
+KIVIDB-PASSES.txt, when given, lists checks KiviDB passes (one
+classname::name a line, # for comments), for a harness whose checks Redis
+largely fails, so that comparing with Redis alone would miss most of them.
 
 Prints a Markdown section for the job summary. Exits 1 when a check passes
-on Redis and fails on KiviDB, the only thing that fails the job; a check
-Redis passes that KiviDB's results lack (its run stopped early) counts as
-failed there. Exits 0 otherwise, including when Redis's results are
-missing: then there is nothing to compare with, and the section says so.
+on Redis and fails on KiviDB, or a listed check does not pass on KiviDB; a
+check KiviDB's results lack (its run stopped early) counts as failed there.
+Exits 1 too when either file is missing: the harness could not run there,
+which the section says, rather than reading it as KiviDB failing.
 """
 import sys
 import xml.etree.ElementTree as ET
@@ -37,19 +40,23 @@ def results(path):
     return out
 
 
+def listed(path):
+    """The checks a KIVIDB-PASSES file lists, in its order."""
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip() and not line.lstrip().startswith("#")]
+
+
 def tally(res):
     return ", ".join(f"{sum(1 for s in res.values() if s == k)} {k}" for k in ("pass", "fail", "skip"))
 
 
-def main(name, redis_path, kividb_path):
+def main(name, redis_path, kividb_path, passes_path=None):
     redis, kividb = results(redis_path), results(kividb_path)
     print(f"### {name}\n")
-    if redis is None:
-        print("No results from the run against Redis, so nothing to compare with: see the step's log.\n")
-        return 0
-    if kividb is None:
-        kividb = {}
-        print("No results from the run against KiviDB: every check Redis passes counts as failed on KiviDB.\n")
+    missing = [side for side, res in (("Redis", redis), ("KiviDB", kividb)) if res is None]
+    if missing:
+        print(f"Could not run against {' or '.join(missing)}: no results, see the step's log.\n")
+        return 1
 
     regressions = [c for c, s in redis.items() if s == "pass" and kividb.get(c, "missing") in ("fail", "missing")]
     differ = sorted(c for c in set(redis) | set(kividb) if redis.get(c, "missing") != kividb.get(c, "missing"))
@@ -69,13 +76,23 @@ def main(name, redis_path, kividb_path):
     else:
         print("Same result for every check on both servers.\n")
 
+    lost = [c for c in listed(passes_path) if kividb.get(c, "missing") != "pass"] if passes_path else []
+    if lost:
+        print(f"**{len(lost)} check(s) listed as passing on KiviDB do not pass now:**\n")
+        print("| Check | Redis | KiviDB |")
+        print("| --- | --- | --- |")
+        for c in lost[:MAX_ROWS]:
+            print(f"| `{c}` | {redis.get(c, 'missing')} | **{kividb.get(c, 'missing')}** |")
+        if len(lost) > MAX_ROWS:
+            print(f"\n{len(lost) - MAX_ROWS} more; the full results are in the artifact.")
+        print()
+
     if regressions:
         print(f"**{len(regressions)} check(s) pass on Redis and fail on KiviDB.**\n")
-        return 1
-    return 0
+    return 1 if regressions or lost else 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         sys.exit(__doc__)
     sys.exit(main(*sys.argv[1:]))

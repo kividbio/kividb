@@ -4979,8 +4979,8 @@ mod past_deadline_replay_tests {
         let shard = crate::store::get_shard(&store[0], key);
         let map = shard.read();
         let mut fields: Vec<String> = match map.peek_expiring(key) {
-            Some((ValueRef::Hash(h), _)) => h.read().keys().cloned().collect(),
-            Some((ValueRef::HashEx(h), _)) => h.read().fields.keys().cloned().collect(),
+            Some((ValueRef::Hash(h), _)) => h.read().keys().map(str::to_owned).collect(),
+            Some((ValueRef::HashEx(h), _)) => h.read().fields.keys().map(str::to_owned).collect(),
             other => panic!(
                 "{key} is not a hash: {:?}",
                 other.map(|(v, _)| v.type_name())
@@ -5151,9 +5151,7 @@ mod past_deadline_replay_tests {
     #[test]
     fn outside_a_replay_a_field_deadline_that_has_passed_deletes_the_field() {
         let mut inner = crate::types::HashInner::new();
-        inner
-            .fields
-            .insert("g".to_string(), std::sync::Arc::from(&b"5"[..]));
+        inner.fields.insert_bytes("g", b"5");
         inner
             .expiries
             .insert("g".to_string(), crate::types::field_now() - 1);
