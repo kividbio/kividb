@@ -353,6 +353,16 @@ docker run -p 6380:6380 \
   ghcr.io/kividbio/kividb --aof --requirepass "change-me"
 ```
 
+**CPUs.** The server starts one worker thread per CPU the container may use: with
+`--cpus 2` or `--cpuset-cpus 0,1` it starts 2, whatever the host has. A fraction is rounded
+down, since more workers than the quota are throttled, which costs latency. Without a CPU
+limit it sees every CPU of the host: give it a limit, or `--threads N`, when it shares the
+host. See [Worker threads](CONFIGURATION.md#worker-threads).
+
+```bash
+docker run -d --cpus 4 -p 6380:6380 -v kividb-data:/home/kividb kividb/kividb
+```
+
 To keep the data in a host directory instead, create it owned by UID 1000 first
 (`mkdir -p data && sudo chown 1000:1000 data`, then `-v "$(pwd)/data:/home/kividb"`): a
 directory Docker creates for a bind mount belongs to root, and the server stops with

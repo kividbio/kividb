@@ -7,7 +7,7 @@
 //!
 //! Up to 1.2 auto was the CPUs minus two (all of them below four): two
 //! workers on a 4-CPU machine. With the server on 4 vCPUs of 4 cores that
-//! served 30% less than four workers on io_uring and 44% less on tokio,
+//! served 27% less than four workers on io_uring and 44% less on tokio,
 //! whose p99 it multiplied by six (#873). No other thread of the server
 //! needs a CPU of its own: the AOF writer, the replication hub, expiry and a
 //! background save run beside the workers, and a worker fewer than the CPUs
@@ -45,7 +45,7 @@ pub fn available(cpus: &Cpus) -> Auto {
     let mut reason = format!("{online} CPUs online");
     if let Some(mask) = cpus.affinity.filter(|&n| n > 0 && n < threads) {
         threads = mask;
-        reason = format!("{mask} of the {online} CPUs online in its affinity mask (cpuset)");
+        reason = "its affinity mask: a cpuset or taskset".to_string();
     }
     if let Some(quota) = cpus.quota.filter(|q| q.is_finite() && *q > 0.0) {
         let whole = (quota.floor() as usize).max(1);
@@ -106,7 +106,8 @@ fn online_cpus() -> Option<usize> {
 #[cfg(target_os = "linux")]
 fn affinity_cpus() -> Option<usize> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    let ok =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
     if ok != 0 {
         return None;
     }
@@ -214,7 +215,7 @@ mod tests {
         assert_eq!(available(&cpus(8, None, None)).reason, "8 CPUs online");
         assert_eq!(
             available(&cpus(64, Some(4), None)).reason,
-            "4 of the 64 CPUs online in its affinity mask (cpuset)"
+            "its affinity mask: a cpuset or taskset"
         );
         assert_eq!(
             available(&cpus(64, Some(64), Some(2.0))).reason,

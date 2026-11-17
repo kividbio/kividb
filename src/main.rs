@@ -215,7 +215,10 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
         println!("  * Node ID        : (printed after cluster init)");
     }
 
-    println!("  * Worker threads : {threads} ({})", config.threads_reason());
+    println!(
+        "  * Worker threads : {threads} ({})",
+        config.threads_reason()
+    );
     println!("  * AOF            : {aof_status}");
     // Name the source recovery will actually use. This line used to read
     // "KDB snapshot (SAVE / BGSAVE)" unconditionally, which was true even with
