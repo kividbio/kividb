@@ -171,13 +171,16 @@ other files:
   elements. A list that has had an element longer than 1,024 bytes keeps
   every element in a block of its own from then on, as 1.2 kept every list.
 - `OBJECT ENCODING` says `listpack` while a list is one chunk and
-  `quicklist` otherwise, so it differs from Redis for lists of 65 to about
-  240 small elements and for short lists with an element of 1,025 to 8,192
-  bytes (Redis: `listpack`, KiviDB: `quicklist`), and for up to 64 elements
-  of more than 8 kB in all (Redis: `quicklist`, KiviDB: `listpack`). Redis
-  goes back to `listpack` when a quicklist shrinks to one node of half the
-  limit; KiviDB when it is down to one chunk, and never once its elements
-  are kept apart.
+  `quicklist` otherwise, so it differs from Redis in two ways:
+  - Redis `listpack`, KiviDB `quicklist`: lists of 65 to about 240 small
+    elements (32 bytes each, say), and short lists that hold, or held, an
+    element of 1,025 to 8,192 bytes.
+  - Redis `quicklist`, KiviDB `listpack`: up to 64 elements of more than
+    8 kB in all, such as a few dozen elements of 1 kB.
+
+  Redis goes back to `listpack` when a quicklist shrinks to one node of
+  half the limit; KiviDB when it is down to one chunk, and never once its
+  elements are kept apart.
 - `list-max-listpack-size`, `list-max-ziplist-size` and
   `list-compress-depth` are accepted and reported, and change nothing: no
   chunk is compressed.

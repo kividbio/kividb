@@ -357,14 +357,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Lists take about half the memory.** A list's elements are kept end to
   end in chunks of up to 64, each element between two copies of its length,
   where every element had an allocation, a shared header and a slot of its
-  own: 32-byte elements take 50.4 bytes an element in lists of 10 (76.0
-  before; Redis 8.10.2 45.0), 38.1 in lists of 100 (65.2; Redis 36.4) and
+  own: 32-byte elements take 48.8 bytes an element in lists of 10 (76.0
+  before; Redis 8.10.2 45.0), 38.4 in lists of 100 (65.2; Redis 36.4) and
   36.7 from 1,000 elements up (64.1 to 69.8; Redis 34.3 to 34.6).
   - A push or a pop at either end moves nothing in its chunk: each chunk
-    has room at both ends. While a list is pushed to and popped from only
-    at its ends, element `i` is found by arithmetic; after an `LINSERT` or
-    `LREM` in the middle the list counts its chunks from the nearer end, as
-    a Redis quicklist always does.
+    has room at both ends. Element `i` is found by arithmetic while the
+    chunks between the ends are full; an `LINSERT` or `LREM` in the middle
+    leaves a run of chunks that may not be, and only the chunks in that run
+    are counted (a Redis quicklist counts its nodes from the nearer end
+    always). Two neighbours that fit in one chunk after a removal become
+    one, and the run gives up full chunks at its edges.
+  - `LMOVE`/`RPOPLPUSH` on one key (a rotation) move the element within the
+    list; a chunk opened at an end next to a full one gets room for a
+    quarter of it, so a queue does not regrow its end chunk at every push.
   - A list keeps its elements apart, as before, from the first time an
     element longer than 1,024 bytes is pushed, set or inserted; never back,
     until it is emptied and deleted.
@@ -376,22 +381,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     8 kB in all; `list-max-listpack-size` and `list-compress-depth` are
     accepted and change nothing, as before.
   - Instructions a command (one thread, pipeline 16, io_uring and Tokio):
-    `LRANGE` of 10 elements costs 18 % fewer and of 100 elements 45 %
-    fewer (lengths are written as digits, not formatted); `LPOP` and
-    `RPOP` 2 to 3 % fewer, a push that makes a list 2 % fewer, `RPUSH` 1 %
-    fewer; the capped list (`LPUSH` + `LTRIM`), `LPOS`, `BLPOP`, `GET` and
-    `SET` are unchanged. `LPUSH` onto a list costs up to 0.9 % more,
-    `LINDEX` at an end up to 2 %; `LMOVE` 4 % and `RPOPLPUSH` 6 to 7 % more
-    (the element is copied into the destination's chunk where its block
-    was handed over); `LINDEX` and `LSET` in the middle of a chunk up to
-    8.5 % more (up to 32 lengths stepped over), and about twice as much on
-    a list of 100,000 that an `LINSERT` made irregular (its chunks are
-    counted); `LINSERT` 7 % and `LREM` 11 % more.
+    `LRANGE` of 10 elements costs 19 % fewer and of 100 elements 45 %
+    fewer (lengths are written as digits, not formatted); `LMOVE` 3 to 4 %
+    fewer, `RPOPLPUSH` 3 %, `LPUSH` onto a list 2.5 to 3 %, `LPOP` and
+    `RPOP` 2 to 3 %, `RPUSH` 1 to 4 %, a push that makes a list 1 to 3 %,
+    `LREM` of one element 2 %; the capped list (`LPUSH` + `LTRIM`), `LPOS`,
+    `BLPOP`, `GET` and `SET` are unchanged. `LINDEX` at an end costs up to
+    2.6 % more; `LINDEX` and `LSET` in the middle of a chunk up to 8 % more
+    (up to 32 lengths stepped over), also on a list of 100,000 after an
+    `LINSERT` or an `LREM` in its middle; after removals spread over the
+    whole list (ten `LREM`s or more) they cost about twice as much, the
+    chunks between being counted. `LINSERT` costs 7 % more.
   - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
     write elements as text, so their formats do not change: 1.2.2 reads what
     this release writes and the other way round. A snapshot of one
-    3,000,000-element list loads in 0.31 s (0.42 s before), of 300,000
-    ten-element lists in 0.64 s (0.64 s), into half and two thirds of the
+    3,000,000-element list loads in 0.32 s (0.41 s before), of 300,000
+    ten-element lists in 0.62 s (0.63 s), into half and two thirds of the
     memory. `MEMORY USAGE`
     counts the chunks as allocated; eviction's estimate of what freeing a
     list gives back is their bytes, and lazy freeing's effort their number.

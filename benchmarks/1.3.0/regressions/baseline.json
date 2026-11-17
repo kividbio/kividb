@@ -7689,14 +7689,14 @@
       "unit": "B",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 75.5812,
-        "candidate": 49.9812,
-        "redis": 43.9582,
+        "v1_2_2": 75.5809,
+        "candidate": 48.381,
+        "redis": 43.9595,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7718,13 +7718,13 @@
       "better": "lower",
       "recorded": {
         "v1_2_2": 65.188,
-        "candidate": 38.068,
-        "redis": 36.4077,
+        "candidate": 38.388,
+        "redis": 36.4063,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7746,13 +7746,13 @@
       "better": "lower",
       "recorded": {
         "v1_2_2": 64.1224,
-        "candidate": 36.6584,
-        "redis": 34.6047,
+        "candidate": 36.6904,
+        "redis": 34.6061,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7774,13 +7774,13 @@
       "better": "lower",
       "recorded": {
         "v1_2_2": 68.481,
-        "candidate": 36.6566,
-        "redis": 34.3081,
+        "candidate": 36.657,
+        "redis": 34.3091,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7807,8 +7807,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7830,8 +7830,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7853,8 +7853,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7876,8 +7876,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7893,14 +7893,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1.0774,
-        "candidate": 1.0702,
-        "redis": 1.104,
+        "v1_2_2": 2.3283,
+        "candidate": 2.2674,
+        "redis": 2.4198,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7915,14 +7915,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1.0954,
-        "candidate": 1.0781,
-        "redis": 1.1015,
+        "v1_2_2": 2.3565,
+        "candidate": 2.3687,
+        "redis": 2.5059,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7937,14 +7937,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1.106,
-        "candidate": 1.0783,
-        "redis": 1.1293,
+        "v1_2_2": 2.3414,
+        "candidate": 2.6621,
+        "redis": 2.5298,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7959,14 +7959,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1.4859,
-        "candidate": 1.4904,
-        "redis": 1.5046,
+        "v1_2_2": 3.4256,
+        "candidate": 3.4438,
+        "redis": 3.4571,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -7981,14 +7981,14 @@
       "unit": "B",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 77.1812,
-        "candidate": 79.5814,
-        "redis": 43.9995,
+        "v1_2_2": 77.1815,
+        "candidate": 77.9814,
+        "redis": 43.9998,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8006,13 +8006,13 @@
       "better": "lower",
       "recorded": {
         "v1_2_2": 65.348,
-        "candidate": 65.588,
-        "redis": 36.4083,
+        "candidate": 65.428,
+        "redis": 36.4084,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8030,13 +8030,13 @@
       "better": "lower",
       "recorded": {
         "v1_2_2": 64.1544,
-        "candidate": 64.1784,
-        "redis": 34.6059,
+        "candidate": 64.1624,
+        "redis": 34.606,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8054,13 +8054,13 @@
       "better": "lower",
       "recorded": {
         "v1_2_2": 68.522,
-        "candidate": 68.5222,
+        "candidate": 68.5221,
         "redis": 34.3081,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8083,8 +8083,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8106,8 +8106,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8129,8 +8129,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8152,8 +8152,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8169,14 +8169,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1.0867,
-        "candidate": 1.0812,
-        "redis": 1.1113,
+        "v1_2_2": 2.4289,
+        "candidate": 2.6827,
+        "redis": 2.5108,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8191,14 +8191,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1.1095,
-        "candidate": 1.1214,
-        "redis": 1.1219,
+        "v1_2_2": 2.4307,
+        "candidate": 2.5153,
+        "redis": 2.5641,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8213,14 +8213,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 1.2111,
-        "candidate": 1.2045,
-        "redis": 1.2209,
+        "v1_2_2": 2.6126,
+        "candidate": 2.6482,
+        "redis": 2.8191,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
@@ -8235,14 +8235,14 @@
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2.7568,
-        "candidate": 2.7595,
-        "redis": 2.7603,
+        "v1_2_2": 6.341,
+        "candidate": 6.2231,
+        "redis": 6.2262,
         "vm": "Standard_D4s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-17",
-        "commit": "b5f0e655",
-        "label": "pr-packed-lists-d4s_v5"
+        "commit": "36771af1",
+        "label": "pr-packed-lists-r2-d4s_v5"
       },
       "gate": [
         {
