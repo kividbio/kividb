@@ -169,9 +169,10 @@ pub fn queue_refusal(caller: &Caller, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 /// The reply that refuses to run a queued transaction, or `None` when EXEC
 /// may go ahead.
 ///
-/// Slots can change hands between a command being queued and EXEC, so every
-/// command is routed again; and the commands of one transaction must all
-/// address one slot, as the keys of one command must.
+/// Slots can change hands between a command being queued and EXEC, so the
+/// queue is routed again, once, as one command (`route_queue`): the
+/// commands of one transaction must all address one slot, as the keys of
+/// one command must, and are not routed again one by one as they run.
 ///
 /// `routed` is set to when it was routed: inside its gates, `EXEC` asks
 /// [`exec_refusal_in_gate`] whether its keys have moved since.
@@ -254,31 +255,45 @@ fn exec_refusal_again(caller: &Caller, queue: &[Vec<Vec<u8>>], routed: Routed) -
     None
 }
 
-/// Route every command of `queue`, for a client that had sent `ASKING` or
-/// not: the refusal of the first that may not run here, or of commands that
-/// address more than one slot.
+/// Route `queue` as one command, for a client that had sent `ASKING` or
+/// not: the refusal for the transaction, or `None` when it may run here.
+///
+/// Its keys are taken together, as they are before any of it runs, as
+/// Redis's `getNodeByQuery` takes them for `EXEC`: on a slot being migrated
+/// away it runs here when all of them are here, gets `-ASK` when none of
+/// them is, and `-TRYAGAIN` when some are; on a slot being imported, with
+/// `ASKING`, `-TRYAGAIN` when some have arrived and others not. Its
+/// commands are not routed again as they run (#339): a key an earlier one
+/// deletes or makes must not send a later one away, half way through.
 fn route_queue(caller: &Caller, queue: &[Vec<Vec<u8>>], asking: bool) -> Option<Vec<u8>> {
-    let mut slot: Option<u16> = None;
+    let mut keys: Vec<&[u8]> = Vec::new();
+    let mut writes = false;
     for queued in queue {
         let cmd: Vec<&[u8]> = queued.iter().map(|arg| arg.as_slice()).collect();
         if cmd.is_empty() {
             continue;
         }
-        match caller.route(&cmd, asking) {
-            RouteDecision::OwnedSlot(this) => {
-                if slot.is_some_and(|seen| seen != this) {
-                    return Some(crossslot_error());
-                }
-                slot = Some(this);
-            }
-            other => {
-                if let Some(refusal) = other.refusal() {
-                    return Some(refusal);
-                }
-            }
-        }
+        let name_upper = cmd[0].to_ascii_uppercase();
+        let name = std::str::from_utf8(&name_upper).unwrap_or("");
+        keys.extend(
+            key_positions(name, &cmd)
+                .iter()
+                .map(|pos| queued[pos].as_slice()),
+        );
+        writes = writes || crate::replication::is_denied_on_readonly_replica(name, &cmd);
     }
-    None
+    route_keys(
+        false,
+        || keys.iter().copied(),
+        caller.cluster,
+        asking,
+        || !writes && caller.registry.get_readonly(caller.client_id),
+        |key| {
+            let shard = crate::store::get_shard(&caller.store[caller.db], key);
+            crate::read_lock!(shard).contains_key(key)
+        },
+    )
+    .refusal()
 }
 
 // ── For the tests of a command routed before its keys moved (#331) ──────────
@@ -373,15 +388,40 @@ pub fn route_named(
     }
 
     let keys = key_positions(name, cmd);
-    let mut positions = keys.iter();
-    let Some(first) = positions.next() else {
+    route_keys(
+        name == "MIGRATE",
+        || keys.iter().map(|pos| cmd[pos]),
+        cluster,
+        asking_flag,
+        || !crate::replication::is_denied_on_readonly_replica(name, cmd) && readonly_client(),
+        has_key_locally,
+    )
+}
+
+/// The decision for keys that must all be served together: one command's
+/// (`route_named`), or a whole transaction's (`route_queue`), as Redis's
+/// `getNodeByQuery` takes the keys of every command `EXEC` runs at once.
+///
+/// `migrate` says the keys are a `MIGRATE`'s. `reads_on_replica` says
+/// whether a client may read them here when this node replicates their
+/// owner: asked only then.
+fn route_keys<'k, I: Iterator<Item = &'k [u8]>>(
+    migrate: bool,
+    keys: impl Fn() -> I,
+    cluster: &crate::cluster::ClusterState,
+    asking_flag: bool,
+    reads_on_replica: impl Fn() -> bool,
+    has_key_locally: impl Fn(&[u8]) -> bool,
+) -> RouteDecision {
+    let mut all = keys();
+    let Some(first) = all.next() else {
         return RouteDecision::Passthrough;
     };
 
     // Every key must hash to the same slot.
-    let first_slot = key_hash_slot(cmd[first]);
-    for pos in positions {
-        if key_hash_slot(cmd[pos]) != first_slot {
+    let first_slot = key_hash_slot(first);
+    for key in all {
+        if key_hash_slot(key) != first_slot {
             return RouteDecision::CrossSlot;
         }
     }
@@ -417,9 +457,9 @@ pub fn route_named(
     // How many of the command's keys this node holds, and how many it names.
     let local_keys = || {
         let (mut present, mut total) = (0usize, 0usize);
-        for pos in keys.iter() {
+        for key in keys() {
             total += 1;
-            if has_key_locally(cmd[pos]) {
+            if has_key_locally(key) {
                 present += 1;
             }
         }
@@ -433,7 +473,7 @@ pub fn route_named(
             // MIGRATE runs here too, as in Redis while a slot is open:
             // `redis-cli --cluster fix` moves the keys of a node it set
             // importing back to the slot's owner with it (#295).
-            if name == "MIGRATE" {
+            if migrate {
                 return RouteDecision::OwnedSlot(first_slot);
             }
             if !asking_flag {
@@ -453,7 +493,7 @@ pub fn route_named(
         (Some(owner_id), Some(MigrationState::Migrating { dest_id })) if owner_id == me => {
             // MIGRATE is how the keys leave: it always runs here, whichever
             // of its keys are still present (the missing ones are skipped).
-            if name == "MIGRATE" {
+            if migrate {
                 return RouteDecision::OwnedSlot(first_slot);
             }
             let (present, total) = local_keys();
@@ -487,10 +527,7 @@ pub fn route_named(
             let i_replicate_owner = cluster.nodes.read().get(&me).is_some_and(|n| {
                 n.flags.contains(NodeFlags::REPLICA) && n.master_id == Some(owner_id)
             });
-            if i_replicate_owner
-                && !crate::replication::is_denied_on_readonly_replica(name, cmd)
-                && readonly_client()
-            {
+            if i_replicate_owner && reads_on_replica() {
                 RouteDecision::OwnedSlot(first_slot)
             } else {
                 moved_to(&owner_id)

@@ -1153,6 +1153,18 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             if name == "SELECT" && ctx.cmd.get(1).is_some_and(|db| *db != &b"0"[..]) {
                 return resp_error("ERR SELECT is not allowed in cluster mode");
             }
+        }
+        // A command `EXEC` runs was routed with the rest of its queue, once,
+        // before any of it ran (`routing::exec_refusal`), and leaves
+        // `ASKING` to the end of the transaction (`routing::transaction_ended`).
+        // Routed again here, it was judged on the keys the commands before
+        // it had made or deleted, and refused half way through (#339).
+        // Scripts' commands do not come here; a command of the client's
+        // takes the gate alone only after this.
+        if ctx.cluster.enabled
+            && !ctx.bypass_cluster_check
+            && !crate::command_gate::alone_on_this_thread()
+        {
             // Pull asking flag from client registry.
             let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
             // Before the keys are looked for: anything that moves them from
@@ -1176,9 +1188,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
                 has_key_locally,
             );
             // ASKING is single-shot: clear after this command regardless of
-            // outcome. A command `EXEC` runs leaves it to the end of the
-            // transaction (`routing::transaction_ended`), as in Redis (#698).
-            if asking_flag && !crate::command_gate::alone_on_this_thread() {
+            // outcome.
+            if asking_flag {
                 ctx.client_registry.update(ctx.client_id, |info| {
                     info.asking = false;
                 });

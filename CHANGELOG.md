@@ -412,6 +412,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ACL) ends the transaction too, so it clears it as well. `RESET` clears it,
   as in Redis.
 
+- **A transaction on a slot being moved runs whole or is refused whole
+  (#339).** `EXEC` routed its queue, then routed each command again as it
+  ran, with the keys the commands before it had made or deleted, so a
+  transaction could be left half applied: `DEL {t}b; RENAME {t}a {t}b` on
+  the importing node ran the `DEL` and answered the `RENAME` `TRYAGAIN`, and
+  `DEL {t}a; SET {t}a v` on the source ran the `DEL` and answered the `SET`
+  `ASK`. As in Redis, `EXEC` now routes the queue once, as one command, with
+  the keys as they are before any of it runs, and its commands are not
+  routed again. A queue whose keys are only partly here is refused whole
+  with `-TRYAGAIN`, and one none of whose keys is left on the source with
+  `-ASK`, where each command could be routed apart before.
+
 - **`CONFIG GET dbfilename` answers with the snapshot file's name (#846).**
   It answered nothing, so a tool that takes a snapshot over the protocol
   (`SAVE`, then `CONFIG GET dir` and `CONFIG GET dbfilename`) could not find

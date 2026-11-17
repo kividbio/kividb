@@ -3138,6 +3138,170 @@ fn asking_is_used_up_by_a_script() {
     assert!(is_moved(&reply), "{reply:?}");
 }
 
+/// Two masters on `model`, node 0 migrating a slot to node 1 (which
+/// imports it), with `keys` (names under the slot's tag) set on node 0
+/// first: the nodes and the tag.
+fn migrating_pair(model: &str, prefix: &str, keys: &[&str]) -> (Vec<Node>, String) {
+    let (nodes, ranges) = form_cluster_of(
+        (0..2)
+            .map(|_| Node::start(&["--io-model", model]))
+            .collect(),
+    );
+    let tag = key_in(ranges[0].0..=ranges[0].1, prefix);
+    let slot = slot_of(&tag).to_string();
+    let mut src = nodes[0].conn();
+    for key in keys {
+        assert!(src.cmd(&["SET", &format!("{{{tag}}}{key}"), "1"]).is_ok());
+    }
+    assert!(
+        nodes[1]
+            .conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &nodes[0].id()])
+            .is_ok()
+    );
+    assert!(
+        src.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &nodes[1].id()])
+            .is_ok()
+    );
+    (nodes, tag)
+}
+
+/// `MIGRATE` the keys `names` (under `tag`) from `nodes[0]` to `nodes[1]`.
+fn migrate_keys(nodes: &[Node], tag: &str, names: &[&str]) {
+    let port = nodes[1].port.to_string();
+    let keys: Vec<String> = names
+        .iter()
+        .map(|name| format!("{{{tag}}}{name}"))
+        .collect();
+    let mut args = vec!["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"];
+    args.extend(keys.iter().map(String::as_str));
+    let reply = nodes[0].conn().cmd(&args);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+}
+
+/// `EXEC` routes its queue once, as one command, with the keys as they are
+/// before any of it runs, and does not route its commands again as they
+/// run: one that deletes a key a later one needs does not send that one
+/// away half way through (#339). As in Redis 8, both run.
+#[test]
+fn exec_runs_a_queue_whose_commands_change_its_keys_while_a_slot_moves() {
+    for model in io_models() {
+        // On the importing node, with both keys arrived.
+        let (nodes, tag) = migrating_pair(model, "tx-imp", &["a", "b"]);
+        migrate_keys(&nodes, &tag, &["a", "b"]);
+        let (a, b) = (format!("{{{tag}}}a"), format!("{{{tag}}}b"));
+        let mut c = nodes[1].conn();
+        assert!(c.cmd(&["ASKING"]).is_ok());
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["DEL", &b]).text(), "QUEUED", "{model}");
+        assert_eq!(c.cmd(&["RENAME", &a, &b]).text(), "QUEUED", "{model}");
+        let exec = c.cmd(&["EXEC"]);
+        assert_eq!(
+            exec.array(),
+            [Resp::Int(1), Resp::Simple("OK".into())],
+            "{model}: {exec:?}"
+        );
+        assert!(c.cmd(&["ASKING"]).is_ok());
+        assert_eq!(c.cmd(&["GET", &b]).text(), "1", "{model}");
+
+        // On the migrating source, with the key still there.
+        let (nodes, tag) = migrating_pair(model, "tx-src", &["a"]);
+        let a = format!("{{{tag}}}a");
+        let mut c = nodes[0].conn();
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["DEL", &a]).text(), "QUEUED", "{model}");
+        assert_eq!(c.cmd(&["SET", &a, "v"]).text(), "QUEUED", "{model}");
+        let exec = c.cmd(&["EXEC"]);
+        assert_eq!(
+            exec.array(),
+            [Resp::Int(1), Resp::Simple("OK".into())],
+            "{model}: {exec:?}"
+        );
+        assert_eq!(c.cmd(&["GET", &a]).text(), "v", "{model}");
+    }
+}
+
+/// A queue whose keys are only partly on this node while their slot moves
+/// is refused whole, with the redirection itself, as Redis 8 refuses it:
+/// `-TRYAGAIN` when some of them are here, `-ASK` when none is. Nothing
+/// of it runs.
+#[test]
+fn exec_is_refused_whole_when_its_keys_are_split_by_a_slot_move() {
+    for model in io_models() {
+        // On the importing node: `a` has arrived, `b` has not. Each command
+        // alone could run here; the transaction cannot.
+        let (nodes, tag) = migrating_pair(model, "tx-split", &["a", "b"]);
+        migrate_keys(&nodes, &tag, &["a"]);
+        let (a, b) = (format!("{{{tag}}}a"), format!("{{{tag}}}b"));
+        let mut c = nodes[1].conn();
+        assert!(c.cmd(&["ASKING"]).is_ok());
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["SET", &a, "new"]).text(), "QUEUED", "{model}");
+        assert_eq!(c.cmd(&["GET", &b]).text(), "QUEUED", "{model}");
+        let exec = c.cmd(&["EXEC"]);
+        assert!(
+            exec.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+            "{model}: {exec:?}"
+        );
+        assert!(c.cmd(&["ASKING"]).is_ok());
+        assert_eq!(c.cmd(&["GET", &a]).text(), "1", "{model}: nothing ran");
+
+        // On the migrating source, `b` leaving between the queue and EXEC.
+        let (nodes, tag) = migrating_pair(model, "tx-left", &["a", "b"]);
+        let (a, b) = (format!("{{{tag}}}a"), format!("{{{tag}}}b"));
+        let mut c = nodes[0].conn();
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["SET", &a, "new"]).text(), "QUEUED", "{model}");
+        assert_eq!(c.cmd(&["GET", &b]).text(), "QUEUED", "{model}");
+        migrate_keys(&nodes, &tag, &["b"]);
+        let exec = c.cmd(&["EXEC"]);
+        assert!(
+            exec.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+            "{model}: {exec:?}"
+        );
+        assert_eq!(c.cmd(&["GET", &a]).text(), "1", "{model}: nothing ran");
+
+        // And both of them leaving: `-ASK`, to where they are now.
+        let (nodes, tag) = migrating_pair(model, "tx-gone", &["a", "b"]);
+        let (a, b) = (format!("{{{tag}}}a"), format!("{{{tag}}}b"));
+        let mut c = nodes[0].conn();
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["SET", &a, "new"]).text(), "QUEUED", "{model}");
+        assert_eq!(c.cmd(&["GET", &b]).text(), "QUEUED", "{model}");
+        migrate_keys(&nodes, &tag, &["a", "b"]);
+        let exec = c.cmd(&["EXEC"]);
+        assert!(
+            exec.err().is_some_and(|e| e.starts_with("ASK ")),
+            "{model}: {exec:?}"
+        );
+        let mut d = nodes[1].conn();
+        assert!(d.cmd(&["ASKING"]).is_ok());
+        assert_eq!(d.cmd(&["GET", &a]).text(), "1", "{model}: nothing ran");
+    }
+}
+
+/// A key the queue itself makes, on the importing node: routed as it is
+/// before the queue runs (not there), the transaction runs here, as in
+/// Redis 8.
+#[test]
+fn exec_on_an_importing_node_runs_a_queue_that_makes_its_key() {
+    for model in io_models() {
+        let (nodes, tag) = migrating_pair(model, "tx-make", &[]);
+        let n = format!("{{{tag}}}n");
+        let mut c = nodes[1].conn();
+        assert!(c.cmd(&["ASKING"]).is_ok());
+        assert!(c.cmd(&["MULTI"]).is_ok());
+        assert_eq!(c.cmd(&["SET", &n, "v"]).text(), "QUEUED", "{model}");
+        assert_eq!(c.cmd(&["GET", &n]).text(), "QUEUED", "{model}");
+        let exec = c.cmd(&["EXEC"]);
+        assert_eq!(
+            exec.array(),
+            [Resp::Simple("OK".into()), Resp::Bulk(b"v".to_vec())],
+            "{model}: {exec:?}"
+        );
+    }
+}
+
 /// Vector sets of each quantization (the default one last) and a series.
 const MOVED_VSETS: [(&str, &str); 4] = [
     ("vq8", "Q8"),
@@ -3548,6 +3712,53 @@ fn a_migrate_on_its_way_when_clients_are_paused_is_held() {
         dst.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
         1
     );
+}
+
+/// An `EXEC` that passed its pause check before a `CLIENT PAUSE WRITE`
+/// was set, and reached its gates after, is held, and dispatched again when
+/// the pause ends: its queue is routed again then, not let through on what
+/// it was routed to before the pause. Its slot changed hands meanwhile, so
+/// it is refused whole with `-MOVED` (#339).
+#[test]
+fn an_exec_held_by_a_pause_is_routed_again_when_dispatched_again() {
+    let env = [("KIVIDB_TEST_PRE_GATE_DELAY_MS", "1500")];
+    let (nodes, ranges) = form_cluster_with_env(2, &env);
+    let tag = key_in(ranges[0].0..=ranges[0].1, "tx-pause");
+    let slot = slot_of(&tag).to_string();
+    let key = format!("stalled:{{{tag}}}a");
+    let mut c = nodes[0].conn();
+    assert!(c.cmd(&["MULTI"]).is_ok());
+    assert_eq!(c.cmd(&["SET", &key, "1"]).text(), "QUEUED");
+    c.stream.write_all(b"*1\r\n$4\r\nEXEC\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut a = nodes[0].conn();
+    assert!(a.cmd(&["CLIENT", "PAUSE", "30000", "WRITE"]).is_ok());
+    for node in &nodes {
+        let reply = node
+            .conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &nodes[1].id()]);
+        assert!(reply.is_ok(), "SETSLOT NODE: {reply:?}");
+    }
+    // Past the end of the hold-up: the EXEC has reached its gates.
+    std::thread::sleep(Duration::from_millis(2000));
+    c.stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    assert!(
+        c.read().is_err(),
+        "EXEC was answered while writes were paused"
+    );
+    c.stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    assert!(a.cmd(&["CLIENT", "UNPAUSE"]).is_ok());
+    let exec = c.read().unwrap();
+    assert!(
+        exec.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{exec:?}"
+    );
+    assert_eq!(a.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
 }
 
 /// A write to a key while `MIGRATE` has it on the wire is not lost (#274),
