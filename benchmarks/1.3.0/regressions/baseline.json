@@ -7113,6 +7113,574 @@
           "kind": "info"
         }
       ]
+    },
+    "21-list-memory/packed/bytes_per_element_10": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "bytes_per_element_10",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 75.5812,
+        "candidate": 49.9812,
+        "redis": 43.9582,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "21-list-memory/packed/bytes_per_element_100": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "bytes_per_element_100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 65.188,
+        "candidate": 38.068,
+        "redis": 36.4077,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "21-list-memory/packed/bytes_per_element_1000": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "bytes_per_element_1000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 64.1224,
+        "candidate": 36.6584,
+        "redis": 34.6047,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "21-list-memory/packed/bytes_per_element_100000": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "bytes_per_element_100000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 68.481,
+        "candidate": 36.6566,
+        "redis": 34.3081,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "21-list-memory/packed/encoding_10": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "encoding_10",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/packed/encoding_100": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "encoding_100",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 5.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/packed/encoding_1000": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "encoding_1000",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/packed/encoding_100000": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "encoding_100000",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/packed/load_100000_s": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "load_100000_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0774,
+        "candidate": 1.0702,
+        "redis": 1.104,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "21-list-memory/packed/load_1000_s": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "load_1000_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0954,
+        "candidate": 1.0781,
+        "redis": 1.1015,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "21-list-memory/packed/load_100_s": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "load_100_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.106,
+        "candidate": 1.0783,
+        "redis": 1.1293,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "21-list-memory/packed/load_10_s": {
+      "suite": "21-list-memory",
+      "config": "packed",
+      "metric": "load_10_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.4859,
+        "candidate": 1.4904,
+        "redis": 1.5046,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "21-list-memory/plain/bytes_per_element_10": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "bytes_per_element_10",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 77.1812,
+        "candidate": 79.5814,
+        "redis": 43.9995,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "21-list-memory/plain/bytes_per_element_100": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "bytes_per_element_100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 65.348,
+        "candidate": 65.588,
+        "redis": 36.4083,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "21-list-memory/plain/bytes_per_element_1000": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "bytes_per_element_1000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 64.1544,
+        "candidate": 64.1784,
+        "redis": 34.6059,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "21-list-memory/plain/bytes_per_element_100000": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "bytes_per_element_100000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 68.522,
+        "candidate": 68.5222,
+        "redis": 34.3081,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "21-list-memory/plain/encoding_10": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "encoding_10",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 5.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/plain/encoding_100": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "encoding_100",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 5.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/plain/encoding_1000": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "encoding_1000",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/plain/encoding_100000": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "encoding_100000",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "21-list-memory/plain/load_100000_s": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "load_100000_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0867,
+        "candidate": 1.0812,
+        "redis": 1.1113,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "21-list-memory/plain/load_1000_s": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "load_1000_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.1095,
+        "candidate": 1.1214,
+        "redis": 1.1219,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "21-list-memory/plain/load_100_s": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "load_100_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.2111,
+        "candidate": 1.2045,
+        "redis": 1.2209,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "21-list-memory/plain/load_10_s": {
+      "suite": "21-list-memory",
+      "config": "plain",
+      "metric": "load_10_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.7568,
+        "candidate": 2.7595,
+        "redis": 2.7603,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-17",
+        "commit": "b5f0e655",
+        "label": "pr-packed-lists-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
     }
   }
 }
