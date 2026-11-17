@@ -1085,8 +1085,9 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
 
     // On a busy machine a quick run can be stretched past the demotion limit
     // and the script sent to the pool, where it runs alone and everything
-    // waits for it. An attempt in which any script went to the pool proves
-    // nothing, and is made again.
+    // waits for it. An attempt in which any script went to the pool, or the
+    // machine was too slow to send the waiting commands while the script
+    // ran, proves nothing, and is made again.
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -1138,36 +1139,46 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
         // Several connections for what must not wait: one that lands on the
         // slow script's thread waits for the thread, whatever its key.
         let several = |args: Vec<String>| (0..6).map(|_| probe(args.clone())).collect::<Vec<_>>();
+        let earliest = |probes: Vec<std::thread::JoinHandle<(V, Duration)>>| {
+            let done: Vec<(V, Duration)> = probes.into_iter().map(|p| p.join().unwrap()).collect();
+            let reply = done[0].0.clone();
+            assert!(done.iter().all(|(r, _)| *r == reply), "{done:?}");
+            (reply, done.iter().map(|(_, at)| *at).min().unwrap())
+        };
         let other_script = several(words(&["EVALSHA", &sha, "1", "{c}:k", "1", "other"]));
         let other_read = several(words(&["GET", "{c}:still"]));
         let untagged = several(words(&["SET", "plain", "v"]));
+        let other_script = earliest(other_script);
+        let other_read = earliest(other_read);
+        let untagged = earliest(untagged);
+        // Then, while it still runs, what must wait for it. Sent only now:
+        // a command waiting for a tag's lock waits on its connection's
+        // thread, and with three of them on the other three threads of the
+        // server, nothing else could be answered until the script ended.
+        let sent = started.elapsed();
         let first_tag = probe(words(&["GET", "{a}:k"]));
         let second_tag = probe(words(&["GET", "{b}:k"]));
         let both = probe(words(&["MGET", "{b}:k", "{a}:k"]));
         // On another key of its second tag, so that the reads above find what
         // the slow script wrote whichever of them goes first after it.
         let script_on_second = probe(words(&["EVALSHA", &sha, "1", "{b}:k2", "1", "later"]));
-        let earliest = |probes: Vec<std::thread::JoinHandle<(V, Duration)>>| {
-            let done: Vec<(V, Duration)> =
-                probes.into_iter().map(|p| p.join().unwrap()).collect();
-            let reply = done[0].0.clone();
-            assert!(done.iter().all(|(r, _)| *r == reply), "{done:?}");
-            (reply, done.iter().map(|(_, at)| *at).min().unwrap())
-        };
 
         let (slow_reply, slow_done) = slow.join().unwrap();
-        let other_script = earliest(other_script);
-        let other_read = earliest(other_read);
-        let untagged = earliest(untagged);
         let first_tag = first_tag.join().unwrap();
         let second_tag = second_tag.join().unwrap();
         let both = both.join().unwrap();
         let script_on_second = script_on_second.join().unwrap();
         let pooled = script_counts(&mut c)["scripts_offloaded_to_pool"] - pooled_before;
-        if pooled > 0 && attempt < 5 {
+        // And the waiting commands were sent well before it ended.
+        let late = sent + Duration::from_millis(200) > slow_done;
+        if (pooled > 0 || late) && attempt < 5 {
             continue;
         }
         assert_eq!(pooled, 0, "a script went to the pool in every attempt");
+        assert!(
+            !late,
+            "the waiting commands were sent too late in every attempt"
+        );
 
         assert_eq!(slow_reply, V::Int(steps as i64));
         assert!(
@@ -1206,7 +1217,11 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
             );
         };
         waited("a read of its first tag", first_tag, V::Str("after".into()));
-        waited("a read of its second tag", second_tag, V::Str("after".into()));
+        waited(
+            "a read of its second tag",
+            second_tag,
+            V::Str("after".into()),
+        );
         waited(
             "a read of both",
             both,
@@ -1333,7 +1348,13 @@ fn overlapping_tags_end_the_same(io: &str) {
     assert!(m.cmd(&["SET", "last", "1"]).ok());
 
     let keys: Vec<String> = (0..TAGS)
-        .flat_map(|tag| [key(tag), format!("{}:log", key(tag)), format!("{}:x", key(tag))])
+        .flat_map(|tag| {
+            [
+                key(tag),
+                format!("{}:log", key(tag)),
+                format!("{}:x", key(tag)),
+            ]
+        })
         .collect();
     let dump = |c: &mut Conn| -> Vec<V> {
         keys.iter()
