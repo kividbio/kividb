@@ -30,6 +30,16 @@ impl Taken {
         }
     }
 
+    /// An element read where it is: shared bytes kept, bytes of a chunk
+    /// written as the reply.
+    #[inline]
+    pub(super) fn of_value(value: crate::list_values::Value<'_>) -> Taken {
+        match value {
+            crate::list_values::Value::Shared(bytes) => Taken::Shared(Arc::clone(bytes)),
+            crate::list_values::Value::Bytes(bytes) => Taken::Bulk(resp_bulk(bytes)),
+        }
+    }
+
     /// The element as a RESP bulk string.
     #[inline]
     pub(super) fn into_bulk(self) -> Vec<u8> {

@@ -271,26 +271,30 @@ pub(super) fn move_elements(
     }
     ctx.wait_table.notify_signal(dst);
 
-    // A list that has been emptied is deleted, as in Redis.
-    let mut source_deleted = false;
-    if src_list.read().is_empty() {
-        let shard = store::get_shard(&ctx.store[db], src);
-        let mut map = write_lock!(shard);
-        let still_empty = matches!(
-            map.get(src),
-            Some(ValueRef::List(l)) if Arc::ptr_eq(l, &src_list) && l.read().is_empty()
-        );
-        if still_empty {
-            let removed = map.remove(src);
-            drop(map);
-            drop(removed);
-            source_deleted = true;
-        }
-    }
+    let source_deleted = delete_if_emptied(ctx, src, &src_list);
     Ok(Some(Moved {
         elements: ordered,
         source_deleted,
     }))
+}
+
+/// A list that has been emptied is deleted, as in Redis. Whether it was.
+fn delete_if_emptied(ctx: &Ctx, src: &[u8], src_list: &List) -> bool {
+    if !src_list.read().is_empty() {
+        return false;
+    }
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], src);
+    let mut map = write_lock!(shard);
+    let still_empty = matches!(
+        map.get(src),
+        Some(ValueRef::List(l)) if Arc::ptr_eq(l, src_list) && l.read().is_empty()
+    );
+    if still_empty {
+        let removed = map.remove(src);
+        drop(map);
+        drop(removed);
+    }
+    still_empty
 }
 
 /// The `del` event of a source a move emptied, after the move's own events.
@@ -323,13 +327,62 @@ pub(super) fn move_one(
     from_left: bool,
     to_left: bool,
 ) -> Result<Option<Element>, Vec<u8>> {
-    let Some(mut moved) = move_elements(ctx, src, dst, &MoveSpec::single(from_left, to_left))?
-    else {
+    // One element, as `move_elements` moves a batch, without the vectors:
+    // these are the reliable-queue commands.
+    let db = *ctx.selected_db;
+    lazy_expire_key(ctx.store, db, src);
+    let Some(src_list) = list_at(ctx, src)? else {
         return Ok(None);
     };
-    let element = moved.elements.pop();
-    if element.is_some() {
-        let db = *ctx.selected_db;
+    let mut source_deleted = false;
+    let element = if src == dst {
+        // The rotation: within the list, under its one lock.
+        let rotated = src_list.write().rotate(from_left, to_left, Taken::of_value);
+        let Some(element) = rotated else {
+            return Ok(None);
+        };
+        ctx.wait_table.notify_signal(dst);
+        element
+    } else {
+        lazy_expire_key(ctx.store, db, dst);
+        // The destination's type is checked before anything leaves the source.
+        list_at(ctx, dst)?;
+        let popped = {
+            let mut inner = src_list.write();
+            if from_left {
+                inner.pop_front_with(Taken::of)
+            } else {
+                inner.pop_back_with(Taken::of)
+            }
+        };
+        let Some(element) = popped else {
+            return Ok(None);
+        };
+        {
+            // Held across the push, as in `move_elements`.
+            let shard = store::get_shard(&ctx.store[db], dst);
+            let mut map = write_lock!(shard);
+            let dst_list = match map.get(dst) {
+                None => {
+                    let l: List = Arc::new(RwLock::new(ListValues::new()));
+                    map.insert(dst, KiviDBValue::List(Arc::clone(&l)));
+                    l
+                }
+                Some(ValueRef::List(l)) => Arc::clone(l),
+                Some(_) => {
+                    // The destination changed type: the element goes back.
+                    drop(map);
+                    push(&mut src_list.write(), &element, from_left);
+                    return Err(resp_error(WRONGTYPE));
+                }
+            };
+            push(&mut dst_list.write(), &element, to_left);
+        }
+        ctx.wait_table.notify_signal(dst);
+        source_deleted = delete_if_emptied(ctx, src, &src_list);
+        element
+    };
+    {
         // As Redis (`lmoveGenericCommand`): the push to the destination, the
         // pop from the source, and then, if that emptied it, its delete. The
         // delete came first, and the pop before the push (#173).
@@ -347,9 +400,11 @@ pub(super) fn move_one(
             if from_left { "lpop" } else { "rpop" },
             src,
         );
-        tell_source_deleted(ctx, &moved, src);
+        if source_deleted {
+            notify(ctx.pubsub, db, KS_GENERIC, "del", src);
+        }
     }
-    Ok(element)
+    Ok(Some(element))
 }
 
 pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {

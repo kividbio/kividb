@@ -96,8 +96,9 @@ impl Chunk {
         self.buf.len() - self.start as usize
     }
 
-    fn push_back(&mut self, element: &[u8]) {
-        let need = element.len() + FRAME;
+    /// At least `need` bytes of room behind the frames.
+    #[inline]
+    fn room_back(&mut self, need: usize) {
         if self.buf.capacity() - self.buf.len() < need {
             let start = self.start as usize;
             let live = self.live();
@@ -114,10 +115,98 @@ impl Chunk {
                 self.buf.reserve_exact(growth(need, live));
             }
         }
+    }
+
+    fn push_back(&mut self, element: &[u8]) {
+        let need = element.len() + FRAME;
+        self.room_back(need);
         let at = self.buf.len();
         self.buf.resize(at + need, 0);
         write_frame(&mut self.buf, at, element);
         self.count += 1;
+    }
+
+    /// The last element's frame moved to the front, within the buffer.
+    fn back_to_front(&mut self) {
+        if self.count <= 1 {
+            return;
+        }
+        let frame = read_len(&self.buf, self.buf.len() - 2) + FRAME;
+        if (self.start as usize) < frame {
+            self.grow_front(growth(frame, self.live()));
+        }
+        let end = self.buf.len();
+        let at = self.start as usize - frame;
+        self.buf.copy_within(end - frame..end, at);
+        self.buf.truncate(end - frame);
+        self.start = at as u32;
+    }
+
+    /// The first element's frame moved to the back, within the buffer.
+    fn front_to_back(&mut self) {
+        if self.count <= 1 {
+            return;
+        }
+        let frame = read_len(&self.buf, self.start as usize) + FRAME;
+        self.room_back(frame);
+        let start = self.start as usize;
+        self.buf.extend_from_within(start..start + frame);
+        self.start = (start + frame) as u32;
+    }
+
+    /// Take out the first element equal to `element` (from the back, the
+    /// last), where it is found: a move of what follows it, or nothing at
+    /// an end. `false` if there is none.
+    fn remove_one(&mut self, element: &[u8], from_back: bool) -> bool {
+        let want = element.len();
+        if from_back {
+            let mut end = self.buf.len();
+            for _ in 0..self.count() {
+                let len = read_len(&self.buf, end - 2);
+                let at = end - len - FRAME;
+                if len == want && &self.buf[at + 2..at + 2 + len] == element {
+                    self.cut(at, len + FRAME);
+                    return true;
+                }
+                end = at;
+            }
+        } else {
+            let mut at = self.start as usize;
+            for _ in 0..self.count() {
+                let len = read_len(&self.buf, at);
+                if len == want && &self.buf[at + 2..at + 2 + len] == element {
+                    self.cut(at, len + FRAME);
+                    return true;
+                }
+                at += len + FRAME;
+            }
+        }
+        false
+    }
+
+    /// Take out the frame of `frame` bytes at `at`.
+    fn cut(&mut self, at: usize, frame: usize) {
+        let end = self.buf.len();
+        if at == self.start as usize {
+            self.start = (at + frame) as u32;
+        } else if at + frame == end {
+            self.buf.truncate(at);
+        } else {
+            self.buf.copy_within(at + frame..end, at);
+            self.buf.truncate(end - frame);
+        }
+        self.count -= 1;
+        if self.count == 0 {
+            self.emptied();
+        }
+    }
+
+    /// `next`'s elements after this chunk's: two neighbours that fit in one.
+    fn append(&mut self, next: &Chunk) {
+        let frames = &next.buf[next.start as usize..];
+        self.reserve_back(frames.len());
+        self.buf.extend_from_slice(frames);
+        self.count += next.count;
     }
 
     fn push_front(&mut self, element: &[u8]) {
@@ -505,7 +594,7 @@ impl Chunk {
 #[derive(Clone)]
 enum Chunks {
     One(Chunk),
-    Many(VecDeque<Chunk>),
+    Many(Box<Many>),
 }
 
 impl Default for Chunks {
@@ -514,13 +603,138 @@ impl Default for Chunks {
     }
 }
 
+/// What a list of several chunks keeps besides its chunks, and a list of
+/// one does not need: behind a box, so that the list's own handle is no
+/// larger than one chunk's.
+#[derive(Clone)]
+struct Many {
+    chunks: VecDeque<Chunk>,
+    len: usize,
+    /// The run of chunks between the first and the last that may not be
+    /// full: `lo` to `hi`, both included; none while `lo > hi`. Every chunk
+    /// between the ends outside the run holds [`CHUNK_ENTRIES`], so an
+    /// element before or after it is found by arithmetic, and only the
+    /// chunks in it are counted.
+    lo: u32,
+    hi: u32,
+}
+
+impl Many {
+    fn new(chunks: VecDeque<Chunk>, len: usize) -> Box<Many> {
+        Box::new(Many {
+            chunks,
+            len,
+            lo: 1,
+            hi: 0,
+        })
+    }
+
+    /// Whether every chunk between the ends is full.
+    #[inline(always)]
+    fn regular(&self) -> bool {
+        self.lo > self.hi
+    }
+
+    /// Chunks `from` to `to` (both included) may no longer be full: into
+    /// the run, those of them between the ends.
+    fn widen(&mut self, from: usize, to: usize) {
+        let n = self.chunks.len();
+        if n < 3 {
+            return;
+        }
+        let from = from.max(1);
+        let to = to.min(n - 2);
+        if from > to {
+            return;
+        }
+        if self.regular() {
+            self.lo = from as u32;
+            self.hi = to as u32;
+        } else {
+            self.lo = self.lo.min(from as u32);
+            self.hi = self.hi.max(to as u32);
+        }
+    }
+
+    /// A chunk was put in at `at`: the chunks from there on move up one.
+    fn inserted(&mut self, at: usize) {
+        if self.regular() {
+            return;
+        }
+        let at = at as u32;
+        if self.lo >= at {
+            self.lo += 1;
+        }
+        if self.hi >= at {
+            self.hi += 1;
+        }
+    }
+
+    /// The chunk at `at` was taken out: the chunks after it move down one.
+    fn removed(&mut self, at: usize) {
+        if self.regular() {
+            return;
+        }
+        let at = at as u32;
+        if self.lo > at {
+            self.lo -= 1;
+        }
+        if self.hi >= at {
+            self.hi = self.hi.saturating_sub(1);
+        }
+        self.clamp();
+    }
+
+    /// The run kept between the ends (a chunk that became an end leaves it).
+    fn clamp(&mut self) {
+        if self.regular() {
+            return;
+        }
+        let last_middle = self.chunks.len().saturating_sub(2) as u32;
+        self.lo = self.lo.max(1);
+        self.hi = self.hi.min(last_middle);
+        if self.lo > self.hi {
+            self.lo = 1;
+            self.hi = 0;
+        }
+    }
+
+    /// Full chunks at the edges of the run leave it.
+    fn tighten_run(&mut self) {
+        while !self.regular() && self.chunks[self.lo as usize].count() == CHUNK_ENTRIES {
+            self.lo += 1;
+        }
+        while !self.regular() && self.chunks[self.hi as usize].count() == CHUNK_ENTRIES {
+            self.hi -= 1;
+        }
+        if self.regular() {
+            self.lo = 1;
+            self.hi = 0;
+        }
+    }
+
+    /// The run as the chunks are: from the first to the last that is not
+    /// full between the ends.
+    fn recompute(&mut self) {
+        self.lo = 1;
+        self.hi = 0;
+        let n = self.chunks.len();
+        let middle = self.chunks.range(1..n.saturating_sub(1).max(1));
+        for (k, chunk) in middle.enumerate() {
+            if chunk.count() != CHUNK_ENTRIES {
+                let c = k as u32 + 1;
+                if self.regular() {
+                    self.lo = c;
+                }
+                self.hi = c;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct PackedList {
     chunks: Chunks,
-    len: usize,
-    /// Whether some chunk between the first and the last is not full: the
-    /// list then counts its way to a chunk.
-    irregular: bool,
 }
 
 impl PackedList {
@@ -530,12 +744,15 @@ impl PackedList {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        match &self.chunks {
+            Chunks::One(chunk) => chunk.count(),
+            Chunks::Many(m) => m.len,
+        }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     /// Whether an element of this length may be held at all.
@@ -550,13 +767,23 @@ impl PackedList {
         matches!(self.chunks, Chunks::One(_))
     }
 
+    /// Whether some chunk between the first and the last may not be full.
+    #[cfg(test)]
+    pub fn irregular(&self) -> bool {
+        match &self.chunks {
+            Chunks::One(_) => false,
+            Chunks::Many(m) => !m.regular(),
+        }
+    }
+
     /// The bytes of the list's allocations.
     pub fn allocation_size(&self) -> usize {
         match &self.chunks {
             Chunks::One(chunk) => chunk.buf.capacity(),
-            Chunks::Many(chunks) => {
-                chunks.capacity() * std::mem::size_of::<Chunk>()
-                    + chunks.iter().map(|c| c.buf.capacity()).sum::<usize>()
+            Chunks::Many(m) => {
+                std::mem::size_of::<Many>()
+                    + m.chunks.capacity() * std::mem::size_of::<Chunk>()
+                    + m.chunks.iter().map(|c| c.buf.capacity()).sum::<usize>()
             }
         }
     }
@@ -566,7 +793,7 @@ impl PackedList {
     pub fn chunk_count(&self) -> usize {
         match &self.chunks {
             Chunks::One(_) => 1,
-            Chunks::Many(chunks) => chunks.len(),
+            Chunks::Many(m) => m.chunks.len(),
         }
     }
 
@@ -577,7 +804,7 @@ impl PackedList {
                 debug_assert_eq!(c, 0);
                 chunk
             }
-            Chunks::Many(chunks) => &chunks[c],
+            Chunks::Many(m) => &m.chunks[c],
         }
     }
 
@@ -588,22 +815,52 @@ impl PackedList {
                 debug_assert_eq!(c, 0);
                 chunk
             }
-            Chunks::Many(chunks) => &mut chunks[c],
+            Chunks::Many(m) => &mut m.chunks[c],
         }
     }
 
-    /// The deque of chunks, the single chunk made its first.
-    fn many(&mut self) -> &mut VecDeque<Chunk> {
+    /// `n` elements more: a single chunk counts its own.
+    #[inline(always)]
+    fn grew(&mut self, n: usize) {
+        if let Chunks::Many(m) = &mut self.chunks {
+            m.len += n;
+        }
+    }
+
+    #[inline(always)]
+    fn shrank(&mut self, n: usize) {
+        if let Chunks::Many(m) = &mut self.chunks {
+            m.len -= n;
+        }
+    }
+
+    /// The chunks, the single chunk made the first of several.
+    fn many(&mut self) -> &mut Many {
         if let Chunks::One(chunk) = &mut self.chunks {
             // Room for two: as many as a list of up to 128 elements laid
             // down in order needs; a third chunk doubles it.
             let mut chunks = VecDeque::with_capacity(2);
+            let len = chunk.count();
             chunks.push_back(std::mem::take(chunk));
-            self.chunks = Chunks::Many(chunks);
+            self.chunks = Chunks::Many(Many::new(chunks, len));
         }
         match &mut self.chunks {
-            Chunks::Many(chunks) => chunks,
+            Chunks::Many(m) => m,
             Chunks::One(_) => unreachable!(),
+        }
+    }
+
+    /// Back to a single chunk once a list of several is down to one.
+    fn settle(&mut self) {
+        if let Chunks::Many(m) = &mut self.chunks {
+            match m.chunks.len() {
+                0 => self.chunks = Chunks::default(),
+                1 => {
+                    let chunk = m.chunks.pop_front().unwrap_or_default();
+                    self.chunks = Chunks::One(chunk);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -611,12 +868,12 @@ impl PackedList {
     /// chunk that was last has one on each side from then on, unless it is
     /// also the first, and gives back its room.
     fn open_back(&mut self, bytes: usize) {
-        let chunks = self.many();
-        let last = chunks.len() - 1;
+        let m = self.many();
+        let last = m.chunks.len() - 1;
         if last > 0 {
-            chunks[last].tighten();
+            m.chunks[last].tighten();
         }
-        chunks.push_back(Chunk {
+        m.chunks.push_back(Chunk {
             buf: Vec::with_capacity(bytes),
             start: 0,
             count: 0,
@@ -626,15 +883,16 @@ impl PackedList {
     /// A new chunk before the first, with room for `bytes` of frames in
     /// front.
     fn open_front(&mut self, bytes: usize) {
-        let chunks = self.many();
-        if chunks.len() > 1 {
-            chunks[0].tighten();
+        let m = self.many();
+        if m.chunks.len() > 1 {
+            m.chunks[0].tighten();
         }
-        chunks.push_front(Chunk {
+        m.chunks.push_front(Chunk {
             buf: vec![0; bytes],
             start: bytes as u32,
             count: 0,
         });
+        m.inserted(0);
     }
 
     /// The frames' bytes of the elements of `elements` up to the first
@@ -657,7 +915,7 @@ impl PackedList {
     pub fn extend_back(&mut self, elements: &[&[u8]]) -> usize {
         let mut done = 0;
         while done < elements.len() {
-            let room = CHUNK_ENTRIES - self.chunk(self.chunk_count() - 1).count();
+            let room = CHUNK_ENTRIES - self.last().count();
             let most = if room == 0 { CHUNK_ENTRIES } else { room };
             let (n, bytes) = Self::batch(&elements[done..], most);
             if n == 0 {
@@ -666,13 +924,12 @@ impl PackedList {
             if room == 0 {
                 self.open_back(bytes);
             }
-            let last = self.chunk_count() - 1;
-            let chunk = self.chunk_mut(last);
+            let chunk = self.last_mut();
             chunk.reserve_back(bytes);
             for element in &elements[done..done + n] {
                 chunk.push_back(element);
             }
-            self.len += n;
+            self.grew(n);
             done += n;
             if n < most {
                 // The elements ran out, or the next is too long.
@@ -688,7 +945,7 @@ impl PackedList {
     pub fn extend_front(&mut self, elements: &[&[u8]]) -> usize {
         let mut done = 0;
         while done < elements.len() {
-            let room = CHUNK_ENTRIES - self.chunk(0).count();
+            let room = CHUNK_ENTRIES - self.first().count();
             let most = if room == 0 { CHUNK_ENTRIES } else { room };
             let (n, bytes) = Self::batch(&elements[done..], most);
             if n == 0 {
@@ -697,12 +954,12 @@ impl PackedList {
             if room == 0 {
                 self.open_front(bytes);
             }
-            let chunk = self.chunk_mut(0);
+            let chunk = self.first_mut();
             chunk.reserve_front(bytes);
             for element in &elements[done..done + n] {
                 chunk.push_front(element);
             }
-            self.len += n;
+            self.grew(n);
             done += n;
             if n < most {
                 break;
@@ -711,14 +968,12 @@ impl PackedList {
         done
     }
 
-    /// Add `element` after the last. `false`, and nothing changed, if it is
-    /// longer than [`MAX_LEN`].
     /// The first chunk, found once.
     #[inline(always)]
     fn first(&self) -> &Chunk {
         match &self.chunks {
             Chunks::One(chunk) => chunk,
-            Chunks::Many(chunks) => &chunks[0],
+            Chunks::Many(m) => &m.chunks[0],
         }
     }
 
@@ -727,7 +982,7 @@ impl PackedList {
     fn last(&self) -> &Chunk {
         match &self.chunks {
             Chunks::One(chunk) => chunk,
-            Chunks::Many(chunks) => &chunks[chunks.len() - 1],
+            Chunks::Many(m) => &m.chunks[m.chunks.len() - 1],
         }
     }
 
@@ -735,7 +990,7 @@ impl PackedList {
     fn first_mut(&mut self) -> &mut Chunk {
         match &mut self.chunks {
             Chunks::One(chunk) => chunk,
-            Chunks::Many(chunks) => &mut chunks[0],
+            Chunks::Many(m) => &mut m.chunks[0],
         }
     }
 
@@ -743,13 +998,15 @@ impl PackedList {
     fn last_mut(&mut self) -> &mut Chunk {
         match &mut self.chunks {
             Chunks::One(chunk) => chunk,
-            Chunks::Many(chunks) => {
-                let last = chunks.len() - 1;
-                &mut chunks[last]
+            Chunks::Many(m) => {
+                let last = m.chunks.len() - 1;
+                &mut m.chunks[last]
             }
         }
     }
 
+    /// Add `element` after the last. `false`, and nothing changed, if it is
+    /// longer than [`MAX_LEN`].
     pub fn push_back(&mut self, element: &[u8]) -> bool {
         if element.len() > MAX_LEN {
             return false;
@@ -758,18 +1015,14 @@ impl PackedList {
         if last.count() < CHUNK_ENTRIES {
             last.push_back(element);
         } else {
-            let chunks = self.many();
-            // The chunk that was last has one on each side from now on,
-            // unless it is also the first.
-            let n = chunks.len();
-            if n > 1 {
-                chunks[n - 1].tighten();
-            }
-            let mut chunk = Chunk::default();
-            chunk.push_back(element);
-            chunks.push_back(chunk);
+            // A list that filled a chunk at this end is growing here: the
+            // new chunk gets room for a quarter of the full one, so that a
+            // steady queue does not regrow it at every push.
+            let room = (element.len() + FRAME).max(last.live() / 4);
+            self.open_back(room);
+            self.last_mut().push_back(element);
         }
-        self.len += 1;
+        self.grew(1);
         true
     }
 
@@ -783,15 +1036,11 @@ impl PackedList {
         if first.count() < CHUNK_ENTRIES {
             first.push_front(element);
         } else {
-            let chunks = self.many();
-            if chunks.len() > 1 {
-                chunks[0].tighten();
-            }
-            let mut chunk = Chunk::default();
-            chunk.push_front(element);
-            chunks.push_front(chunk);
+            let room = (element.len() + FRAME).max(first.live() / 4);
+            self.open_front(room);
+            self.first_mut().push_front(element);
         }
-        self.len += 1;
+        self.grew(1);
         true
     }
 
@@ -808,13 +1057,13 @@ impl PackedList {
     /// Take the first element off; nothing if the list is empty. Read it
     /// with [`front`](Self::front) first.
     pub fn drop_front(&mut self) {
-        if self.len == 0 {
+        if self.is_empty() {
             return;
         }
         let first = self.first_mut();
         first.drop_front();
         let emptied = first.count() == 0;
-        self.len -= 1;
+        self.shrank(1);
         if emptied {
             self.chunk_emptied(0);
         }
@@ -823,104 +1072,168 @@ impl PackedList {
     /// Take the last element off; nothing if the list is empty. Read it
     /// with [`back`](Self::back) first.
     pub fn drop_back(&mut self) {
-        if self.len == 0 {
+        if self.is_empty() {
             return;
         }
         let last = self.last_mut();
         last.drop_back();
         let emptied = last.count() == 0;
-        self.len -= 1;
+        self.shrank(1);
         if emptied {
             self.chunk_emptied(self.chunk_count() - 1);
         }
     }
 
-    /// Chunk `c` holds nothing: among others it goes, and a deque left with
-    /// one chunk is that chunk again. A single chunk stays, empty.
-    fn chunk_emptied(&mut self, c: usize) {
-        let Chunks::Many(chunks) = &mut self.chunks else {
-            return;
+    /// Move the last element to the front (`from_back`), or the first to
+    /// the back, handing it to `take` before it moves: `RPOPLPUSH k k`. A
+    /// frame goes from one end of a chunk to the other, or from one end
+    /// chunk into the other, copied once. `None` if the list is empty.
+    pub fn rotate<R>(&mut self, from_back: bool, take: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let (taken, emptied) = match &mut self.chunks {
+            Chunks::One(chunk) => {
+                let element = if from_back {
+                    chunk.back()?
+                } else {
+                    chunk.front()?
+                };
+                let taken = take(element);
+                if from_back {
+                    chunk.back_to_front();
+                } else {
+                    chunk.front_to_back();
+                }
+                return Some(taken);
+            }
+            Chunks::Many(m) => {
+                let n = m.chunks.len();
+                let mut ends = m.chunks.iter_mut();
+                let (Some(first), Some(last)) = (ends.next(), ends.next_back()) else {
+                    unreachable!("a list of several chunks has two ends")
+                };
+                let (from, to) = if from_back {
+                    (last, first)
+                } else {
+                    (first, last)
+                };
+                let element = if from_back {
+                    from.back()?
+                } else {
+                    from.front()?
+                };
+                let taken = take(element);
+                if to.count() == CHUNK_ENTRIES {
+                    // The other end is full: by way of a copy, rarely.
+                    let element = element.to_vec();
+                    if from_back {
+                        self.drop_back();
+                        self.push_front(&element);
+                    } else {
+                        self.drop_front();
+                        self.push_back(&element);
+                    }
+                    return Some(taken);
+                }
+                if from_back {
+                    to.push_front(element);
+                    from.drop_back();
+                } else {
+                    to.push_back(element);
+                    from.drop_front();
+                }
+                let emptied = (from.count() == 0).then_some(if from_back { n - 1 } else { 0 });
+                (taken, emptied)
+            }
         };
-        chunks.remove(c);
-        if chunks.len() == 1 {
-            let chunk = chunks.pop_front().unwrap_or_default();
-            self.chunks = Chunks::One(chunk);
-            self.irregular = false;
-        } else if self.irregular {
-            self.note_shape();
+        if let Some(c) = emptied {
+            self.chunk_emptied(c);
         }
+        Some(taken)
     }
 
-    /// Set `irregular` from the chunks as they are.
-    fn note_shape(&mut self) {
-        self.irregular = match &self.chunks {
-            Chunks::One(_) => false,
-            Chunks::Many(chunks) => chunks
-                .iter()
-                .skip(1)
-                .take(chunks.len().saturating_sub(2))
-                .any(|c| c.count() != CHUNK_ENTRIES),
+    /// Chunk `c`, at an end, holds nothing: among others it goes, and a
+    /// list left with one chunk is that chunk again. A single chunk stays,
+    /// empty.
+    fn chunk_emptied(&mut self, c: usize) {
+        let Chunks::Many(m) = &mut self.chunks else {
+            return;
         };
+        m.chunks.remove(c);
+        m.removed(c);
+        self.settle();
     }
 
     /// The chunk element `i` is in, and its place in that chunk.
     /// `i < len()`.
     #[inline]
     fn locate(&self, i: usize) -> (usize, usize) {
-        debug_assert!(i < self.len);
-        let chunks = match &self.chunks {
+        let m = match &self.chunks {
             Chunks::One(_) => return (0, i),
-            Chunks::Many(chunks) => chunks,
+            Chunks::Many(m) => m,
         };
+        debug_assert!(i < m.len);
+        let chunks = &m.chunks;
         let first = chunks[0].count();
         if i < first {
             return (0, i);
         }
-        if !self.irregular {
+        if m.regular() {
             // Every chunk after the first holds `CHUNK_ENTRIES` but the
             // last, which holds the rest.
             let past = i - first;
             return (1 + past / CHUNK_ENTRIES, past % CHUNK_ENTRIES);
         }
-        // The deque's two halves, walked as plain slices: a few
-        // instructions a chunk.
-        let (head, tail) = chunks.as_slices();
-        if i < self.len / 2 {
-            let mut before = 0;
-            for (base, half) in [(0, head), (head.len(), tail)] {
-                for (k, chunk) in half.iter().enumerate() {
-                    let n = chunk.count();
-                    if i < before + n {
-                        return (base + k, i - before);
-                    }
-                    before += n;
+        let (lo, hi) = (m.lo as usize, m.hi as usize);
+        // Before the run: full chunks from the second on.
+        let run_begin = first + (lo - 1) * CHUNK_ENTRIES;
+        if i < run_begin {
+            let past = i - first;
+            return (1 + past / CHUNK_ENTRIES, past % CHUNK_ENTRIES);
+        }
+        // The last chunk, and the full chunks before it, after the run.
+        let n = chunks.len();
+        let tail_begin = m.len - chunks[n - 1].count();
+        if i >= tail_begin {
+            return (n - 1, i - tail_begin);
+        }
+        let run_end = tail_begin - (n - 2 - hi) * CHUNK_ENTRIES;
+        if i >= run_end {
+            let past = i - run_end;
+            return (hi + 1 + past / CHUNK_ENTRIES, past % CHUNK_ENTRIES);
+        }
+        // In the run: counted from its nearer edge.
+        if i - run_begin < run_end - i {
+            let mut before = run_begin;
+            for (k, chunk) in chunks.range(lo..=hi).enumerate() {
+                let count = chunk.count();
+                if i < before + count {
+                    return (lo + k, i - before);
                 }
+                before += count;
             }
         } else {
-            let mut end = self.len;
-            for (base, half) in [(head.len(), tail), (0, head)] {
-                for (k, chunk) in half.iter().enumerate().rev() {
-                    let begin = end - chunk.count();
-                    if i >= begin {
-                        return (base + k, i - begin);
-                    }
-                    end = begin;
+            let mut end = run_end;
+            for (k, chunk) in chunks.range(lo..=hi).enumerate().rev() {
+                let begin = end - chunk.count();
+                if i >= begin {
+                    return (lo + k, i - begin);
                 }
+                end = begin;
             }
         }
-        unreachable!("element {i} of {} is in no chunk", self.len)
+        unreachable!("element {i} of {} is in no chunk", m.len)
     }
 
     /// Element `i`, if there is one.
     #[inline]
     pub fn get(&self, i: usize) -> Option<&[u8]> {
-        if i >= self.len {
+        let len = self.len();
+        if i >= len {
             return None;
         }
         if i == 0 {
             return self.front();
         }
-        if i + 1 == self.len {
+        if i + 1 == len {
             return self.back();
         }
         let (c, j) = self.locate(i);
@@ -930,7 +1243,7 @@ impl PackedList {
     /// Put `element` in element `i`'s place. `false`, and nothing changed,
     /// if there is no element `i` or `element` is longer than [`MAX_LEN`].
     pub fn set(&mut self, i: usize, element: &[u8]) -> bool {
-        if i >= self.len || element.len() > MAX_LEN {
+        if i >= self.len() || element.len() > MAX_LEN {
             return false;
         }
         let (c, j) = self.locate(i);
@@ -942,13 +1255,14 @@ impl PackedList {
     /// `false`, and nothing changed, if `i > len()` or `element` is longer
     /// than [`MAX_LEN`].
     pub fn insert(&mut self, i: usize, element: &[u8]) -> bool {
-        if i > self.len {
+        let len = self.len();
+        if i > len {
             return false;
         }
         if i == 0 {
             return self.push_front(element);
         }
-        if i == self.len {
+        if i == len {
             return self.push_back(element);
         }
         if element.len() > MAX_LEN {
@@ -958,33 +1272,37 @@ impl PackedList {
         if self.chunk(c).count() == CHUNK_ENTRIES {
             // Full: its second half goes into a chunk of its own, after it.
             let rest = self.chunk_mut(c).split_off(CHUNK_ENTRIES / 2);
-            self.many().insert(c + 1, rest);
+            let m = self.many();
+            m.chunks.insert(c + 1, rest);
+            m.inserted(c + 1);
             if j <= CHUNK_ENTRIES / 2 {
-                self.chunk_mut(c).insert(j, element);
+                m.chunks[c].insert(j, element);
             } else {
-                self.chunk_mut(c + 1).insert(j - CHUNK_ENTRIES / 2, element);
+                m.chunks[c + 1].insert(j - CHUNK_ENTRIES / 2, element);
             }
+            // Counted from before the split: a single chunk counted its own.
+            m.len = len + 1;
+            m.widen(c, c + 1);
         } else {
             self.chunk_mut(c).insert(j, element);
+            self.grew(1);
+            if let Chunks::Many(m) = &mut self.chunks {
+                m.widen(c, c);
+            }
         }
-        self.len += 1;
-        self.note_shape();
         true
     }
 
     /// Take element `i` out. `false` if there is none.
     #[allow(dead_code)] // the server takes elements out by value (`remove_matching`)
     pub fn remove(&mut self, i: usize) -> bool {
-        if i >= self.len {
+        if i >= self.len() {
             return false;
         }
         let (c, j) = self.locate(i);
         self.chunk_mut(c).remove(j);
-        self.len -= 1;
-        if self.chunk(c).count() == 0 {
-            self.chunk_emptied(c);
-        }
-        self.note_shape();
+        self.shrank(1);
+        self.repair(c, c);
         true
     }
 
@@ -995,7 +1313,8 @@ impl PackedList {
     /// `LREM`: take out the elements equal to `element`, `count` of them at
     /// most from the first on (`count > 0`), from the last back (`count <
     /// 0`), or all (`0`). Each chunk is gone through once and closed up
-    /// once. Returns how many went.
+    /// once; the last one to take is taken where it is found. Returns how
+    /// many went.
     pub fn remove_matching(&mut self, element: &[u8], count: i64) -> usize {
         if element.len() > MAX_LEN {
             return 0;
@@ -1007,65 +1326,103 @@ impl PackedList {
         };
         let chunks = self.chunk_count();
         let mut removed = 0;
+        // The chunks something was taken from.
+        let (mut touched_lo, mut touched_hi) = (usize::MAX, 0);
         for step in 0..chunks {
             if left == 0 {
                 break;
             }
             let c = if count < 0 { chunks - 1 - step } else { step };
             let chunk = self.chunk_mut(c);
-            let mask = chunk.matches(element, left, count < 0);
-            if mask == 0 {
-                continue;
+            let k = if left == 1 {
+                usize::from(chunk.remove_one(element, count < 0))
+            } else {
+                let mask = chunk.matches(element, left, count < 0);
+                if mask != 0 {
+                    chunk.remove_mask(mask);
+                }
+                mask.count_ones() as usize
+            };
+            if k > 0 {
+                removed += k;
+                left -= k;
+                touched_lo = touched_lo.min(c);
+                touched_hi = touched_hi.max(c);
             }
-            let k = mask.count_ones() as usize;
-            chunk.remove_mask(mask);
-            removed += k;
-            left -= k;
         }
         if removed > 0 {
-            self.len -= removed;
-            self.drop_empty_chunks();
+            self.shrank(removed);
+            self.repair(touched_lo, touched_hi);
         }
         removed
     }
 
-    /// Chunks emptied in the middle go; the shape is noted again.
-    fn drop_empty_chunks(&mut self) {
-        let Chunks::Many(chunks) = &mut self.chunks else {
+    /// Chunks `from` to `to` lost elements: those emptied go, a chunk that
+    /// fits into its neighbour with it is merged into it, and the run of
+    /// chunks that may not be full takes in what changed and gives up
+    /// full chunks at its edges.
+    fn repair(&mut self, from: usize, to: usize) {
+        let Chunks::Many(m) = &mut self.chunks else {
             return;
         };
-        chunks.retain(|c| c.count() > 0);
-        match chunks.len() {
-            0 => self.chunks = Chunks::default(),
-            1 => {
-                let chunk = chunks.pop_front().unwrap_or_default();
-                self.chunks = Chunks::One(chunk);
+        m.widen(from, to);
+        let mut to = to;
+        // Emptied chunks go.
+        let mut c = to + 1;
+        while c > from {
+            c -= 1;
+            if m.chunks[c].count() == 0 {
+                m.chunks.remove(c);
+                m.removed(c);
+                to = to.saturating_sub(1);
             }
-            _ => {}
+            if c == 0 {
+                break;
+            }
         }
-        self.note_shape();
+        // Neighbours that fit in one chunk become one, from just before the
+        // first changed to just after the last.
+        let mut c = from.saturating_sub(1);
+        let mut end = (to + 1).min(m.chunks.len().saturating_sub(1));
+        while c < end && c + 1 < m.chunks.len() {
+            if m.chunks[c].count() + m.chunks[c + 1].count() <= CHUNK_ENTRIES {
+                let next = m.chunks.remove(c + 1).unwrap_or_default();
+                m.chunks[c].append(&next);
+                m.removed(c + 1);
+                m.widen(c, c);
+                end -= 1;
+            } else {
+                c += 1;
+            }
+        }
+        if m.chunks.len() > 1 {
+            m.clamp();
+            m.tighten_run();
+        }
+        self.settle();
     }
 
     /// `LTRIM`: keep elements `from` up to, not including, `to`, and
     /// nothing else: whole chunks dropped, the two at the ends cut. `from <=
     /// to <= len()`.
     pub fn keep_range(&mut self, from: usize, to: usize) {
-        debug_assert!(from <= to && to <= self.len);
+        let len = self.len();
+        debug_assert!(from <= to && to <= len);
         if from >= to {
             self.clear();
             return;
         }
-        if from == 0 && to == self.len {
+        if from == 0 && to == len {
             return;
         }
         // A few off one end (a capped list's trim): popped there.
-        if from == 0 && self.len - to <= CHUNK_ENTRIES {
-            for _ in to..self.len {
+        if from == 0 && len - to <= CHUNK_ENTRIES {
+            for _ in to..len {
                 self.drop_back();
             }
             return;
         }
-        if to == self.len && from <= CHUNK_ENTRIES {
+        if to == len && from <= CHUNK_ENTRIES {
             for _ in 0..from {
                 self.drop_front();
             }
@@ -1075,25 +1432,24 @@ impl PackedList {
         let (first, first_from) = self.locate(from);
         match &mut self.chunks {
             Chunks::One(chunk) => chunk.keep(first_from, last_to + 1),
-            Chunks::Many(chunks) => {
-                chunks.truncate(last + 1);
-                chunks.drain(..first);
-                if chunks.len() == 1 {
-                    let mut chunk = chunks.pop_front().unwrap_or_default();
-                    chunk.keep(first_from, last_to + 1);
-                    self.chunks = Chunks::One(chunk);
+            Chunks::Many(m) => {
+                m.chunks.truncate(last + 1);
+                m.chunks.drain(..first);
+                m.len = to - from;
+                if m.chunks.len() == 1 {
+                    m.chunks[0].keep(first_from, last_to + 1);
                 } else {
-                    let back = chunks.len() - 1;
-                    chunks[back].keep(0, last_to + 1);
-                    let n = chunks[0].count();
-                    chunks[0].keep(first_from, n);
+                    let back = m.chunks.len() - 1;
+                    m.chunks[back].keep(0, last_to + 1);
+                    let n = m.chunks[0].count();
+                    m.chunks[0].keep(first_from, n);
+                    if !m.regular() {
+                        m.recompute();
+                    }
                 }
             }
         }
-        self.len = to - from;
-        if self.irregular {
-            self.note_shape();
-        }
+        self.settle();
     }
 
     /// Hand `each` the elements from `from` up to, not including, `to`,
@@ -1102,7 +1458,7 @@ impl PackedList {
     /// to <= len()`.
     #[inline]
     pub fn for_each_in(&self, from: usize, to: usize, mut each: impl FnMut(&[u8]) -> bool) -> bool {
-        debug_assert!(from <= to && to <= self.len);
+        debug_assert!(from <= to && to <= self.len());
         if from >= to {
             return true;
         }
@@ -1134,7 +1490,7 @@ impl PackedList {
         to: usize,
         mut each: impl FnMut(&[u8]) -> bool,
     ) -> bool {
-        debug_assert!(from <= to && to <= self.len);
+        debug_assert!(from <= to && to <= self.len());
         if from >= to {
             return true;
         }
@@ -1160,7 +1516,7 @@ impl PackedList {
     /// The index of the first element equal to `element`.
     pub fn position(&self, element: &[u8]) -> Option<usize> {
         let mut i = 0;
-        let found = !self.for_each_in(0, self.len, |e| {
+        let found = !self.for_each_in(0, self.len(), |e| {
             if e == element {
                 return false;
             }
@@ -1173,7 +1529,7 @@ impl PackedList {
     /// The elements from `from` up to, not including, `to`, first to last.
     /// `from <= to <= len()`.
     pub fn range(&self, from: usize, to: usize) -> Iter<'_> {
-        debug_assert!(from <= to && to <= self.len);
+        debug_assert!(from <= to && to <= self.len());
         if from >= to {
             return Iter {
                 list: self,
@@ -1197,13 +1553,13 @@ impl PackedList {
     /// Every element, first to last.
     #[inline]
     pub fn iter(&self) -> Iter<'_> {
-        self.range(0, self.len)
+        self.range(0, self.len())
     }
 
     /// The elements from `from` up to, not including, `to`, last to first.
     /// `from <= to <= len()`.
     pub fn range_rev(&self, from: usize, to: usize) -> RevIter<'_> {
-        debug_assert!(from <= to && to <= self.len);
+        debug_assert!(from <= to && to <= self.len());
         if from >= to {
             return RevIter {
                 list: self,
@@ -1223,13 +1579,78 @@ impl PackedList {
             left: to - from,
         }
     }
+
+    /// The run of chunks that may not be full, for tests.
+    #[cfg(test)]
+    fn run(&self) -> Option<(usize, usize)> {
+        match &self.chunks {
+            Chunks::Many(m) if !m.regular() => Some((m.lo as usize, m.hi as usize)),
+            _ => None,
+        }
+    }
+
+    /// Checks of the list's shape against its chunks, for tests: the
+    /// counts add up, no chunk is empty or over full, every chunk between
+    /// the ends outside the run is full, and `locate` finds the first and
+    /// the last element of every chunk where a plain walk finds them.
+    #[cfg(test)]
+    pub(crate) fn check_shape(&self) {
+        let Chunks::Many(m) = &self.chunks else {
+            return;
+        };
+        let n = m.chunks.len();
+        assert!(n >= 2, "a list of several chunks with {n}");
+        assert_eq!(m.chunks.iter().map(Chunk::count).sum::<usize>(), m.len);
+        assert!(
+            m.chunks
+                .iter()
+                .all(|c| c.count() > 0 && c.count() <= CHUNK_ENTRIES),
+            "an empty or over-full chunk"
+        );
+        if !m.regular() {
+            assert!(
+                m.lo >= 1 && (m.hi as usize) <= n - 2,
+                "run {}..={} of {n}",
+                m.lo,
+                m.hi
+            );
+        }
+        for c in 1..n - 1 {
+            if m.chunks[c].count() != CHUNK_ENTRIES {
+                assert!(
+                    !m.regular() && (m.lo as usize) <= c && c <= m.hi as usize,
+                    "chunk {c} of {n} holds {} outside the run {}..={}",
+                    m.chunks[c].count(),
+                    m.lo,
+                    m.hi
+                );
+            }
+        }
+        let mut begin = 0;
+        for (c, chunk) in m.chunks.iter().enumerate() {
+            let count = chunk.count();
+            assert_eq!(self.locate(begin), (c, 0), "first of chunk {c}");
+            assert_eq!(
+                self.locate(begin + count - 1),
+                (c, count - 1),
+                "last of chunk {c}"
+            );
+            if count > 2 {
+                let mid = count / 2;
+                assert_eq!(self.locate(begin + mid), (c, mid), "middle of chunk {c}");
+            }
+            begin += count;
+        }
+    }
 }
 
 /// A list laid down from its elements in order: full chunks, each buffer
 /// exactly as long as its frames. For loads, where a list of millions of
 /// elements would otherwise be that many pushes.
+#[derive(Default)]
 pub struct Builder {
-    list: PackedList,
+    chunks: VecDeque<Chunk>,
+    len: usize,
     /// The frames of the chunk being filled.
     frames: Vec<u8>,
     count: u16,
@@ -1237,11 +1658,7 @@ pub struct Builder {
 
 impl Builder {
     pub fn new() -> Self {
-        Builder {
-            list: PackedList::new(),
-            frames: Vec::new(),
-            count: 0,
-        }
+        Self::default()
     }
 
     /// Add `element` after the last. `false`, and nothing changed, if it is
@@ -1265,30 +1682,23 @@ impl Builder {
         if self.count == 0 {
             return;
         }
-        let chunk = Chunk {
+        self.chunks.push_back(Chunk {
             buf: self.frames.as_slice().to_vec(),
             start: 0,
             count: self.count,
-        };
-        self.list.len += self.count as usize;
+        });
+        self.len += self.count as usize;
         self.frames.clear();
         self.count = 0;
-        if self.list.len == chunk.count() {
-            self.list.chunks = Chunks::One(chunk);
-        } else {
-            self.list.many().push_back(chunk);
-        }
     }
 
     pub fn finish(mut self) -> PackedList {
         self.close_chunk();
-        self.list
-    }
-}
-
-impl Default for Builder {
-    fn default() -> Self {
-        Self::new()
+        let mut list = PackedList {
+            chunks: Chunks::Many(Many::new(self.chunks, self.len)),
+        };
+        list.settle();
+        list
     }
 }
 
@@ -1415,7 +1825,8 @@ mod tests {
         assert_eq!(counted, list.len());
         let middle_not_full = (1..list.chunk_count().saturating_sub(1))
             .any(|c| list.chunk(c).count() != CHUNK_ENTRIES);
-        assert_eq!(list.irregular, middle_not_full);
+        assert!(!middle_not_full || list.irregular());
+        list.check_shape();
         for c in 0..list.chunk_count() {
             let chunk = list.chunk(c);
             assert!(chunk.count() <= CHUNK_ENTRIES);
@@ -1487,13 +1898,13 @@ mod tests {
             }
         }
         assert_eq!(list.chunk_count(), 6);
-        assert!(!list.irregular && !list.is_one_chunk());
+        assert!(!list.irregular() && !list.is_one_chunk());
         for i in 0..CHUNK_ENTRIES * 3 + 5 {
             assert!(list.push_front(&element(10_000 + i)));
             model.push_front(element(10_000 + i));
         }
         assert_same(&list, &model);
-        assert!(!list.irregular);
+        assert!(!list.irregular());
         while model.len() > 3 {
             if model.len() % 3 == 0 {
                 list.drop_front();
@@ -1572,12 +1983,12 @@ mod tests {
             model[i] = value.to_vec();
             assert_same(&list, &model);
         }
-        assert!(!list.irregular);
+        assert!(!list.irregular());
         // Insert into a full chunk in the middle: it splits.
         assert!(list.insert(CHUNK_ENTRIES + 3, b"inserted"));
         model.insert(CHUNK_ENTRIES + 3, b"inserted".to_vec());
         assert_same(&list, &model);
-        assert!(list.irregular);
+        assert!(list.irregular());
         assert!(list.insert(CHUNK_ENTRIES * 2 + 60, b"inserted again"));
         model.insert(CHUNK_ENTRIES * 2 + 60, b"inserted again".to_vec());
         assert_same(&list, &model);
@@ -1727,5 +2138,91 @@ mod tests {
             "{}",
             list.allocation_size()
         );
+    }
+
+    #[test]
+    fn a_rotation_moves_an_element_between_the_ends() {
+        for n in [1usize, 2, 10, 64, 65, 128, 129, 300] {
+            let mut list = PackedList::new();
+            let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+            for i in 0..n {
+                list.push_back(&element(i));
+                model.push_back(element(i));
+            }
+            for step in 0..300 {
+                let from_back = step % 3 != 0;
+                let got = list.rotate(from_back, |e| e.to_vec());
+                let e = if from_back {
+                    model.pop_back()
+                } else {
+                    model.pop_front()
+                };
+                assert_eq!(got, e, "{n} {step}");
+                let e = e.unwrap();
+                if from_back {
+                    model.push_front(e);
+                } else {
+                    model.push_back(e);
+                }
+                if step % 37 == 0 {
+                    assert_same(&list, &model);
+                }
+            }
+            assert_same(&list, &model);
+        }
+        assert_eq!(PackedList::new().rotate(true, |e| e.len()), None);
+    }
+
+    #[test]
+    fn the_run_of_chunks_not_full_widens_and_shrinks() {
+        let n = CHUNK_ENTRIES * 100;
+        let mut list = PackedList::new();
+        let mut model = VecDeque::new();
+        for i in 0..n {
+            list.push_back(&element(i));
+            model.push_back(element(i));
+        }
+        assert_eq!(list.run(), None);
+        let take = |list: &mut PackedList, model: &mut VecDeque<Vec<u8>>, i: usize| {
+            assert_eq!(list.remove_matching(&element(i), 1), 1);
+            let at = model.iter().position(|e| *e == element(i)).unwrap();
+            model.remove(at);
+        };
+        // One removal in the middle: the run is its chunk.
+        take(&mut list, &mut model, n / 2 + 5);
+        assert_eq!(list.run(), Some((50, 50)));
+        assert_same(&list, &model);
+        // Removals spread over the list: from the first to the last.
+        for k in 1..10 {
+            take(&mut list, &mut model, k * n / 10 + 3);
+        }
+        let (lo, hi) = list.run().unwrap();
+        assert!(lo == 10 && hi == 90, "{lo}..={hi}");
+        assert_same(&list, &model);
+        // Two neighbours taken down to half each become one full chunk, and
+        // the run gives it up when it is at its edge.
+        let mut list = PackedList::new();
+        let mut model = VecDeque::new();
+        for i in 0..CHUNK_ENTRIES * 10 {
+            list.push_back(&element(i));
+            model.push_back(element(i));
+        }
+        for i in 0..CHUNK_ENTRIES / 2 {
+            take(&mut list, &mut model, 5 * CHUNK_ENTRIES + i);
+        }
+        assert_eq!(list.run(), Some((5, 5)));
+        for i in 0..CHUNK_ENTRIES / 2 {
+            take(&mut list, &mut model, 6 * CHUNK_ENTRIES + i);
+        }
+        assert_eq!(list.chunk_count(), 9);
+        assert_eq!(list.run(), None);
+        assert_same(&list, &model);
+        // Removals that empty chunks at the ends and in the middle.
+        for i in 0..CHUNK_ENTRIES * 10 {
+            if i % 3 != 0 && model.iter().any(|e| *e == element(i)) {
+                take(&mut list, &mut model, i);
+            }
+        }
+        assert_same(&list, &model);
     }
 }

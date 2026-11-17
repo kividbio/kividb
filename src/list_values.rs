@@ -268,6 +268,54 @@ impl ListValues {
         }
     }
 
+    /// `LMOVE k k` / `RPOPLPUSH k k`: the element at one end moved to the
+    /// other (`from_left` to `to_left`; the same end changes nothing),
+    /// handed to `take` first. In a packed list its frame is moved within
+    /// the list, copied once; in a plain one its block is. `None` if the
+    /// list is empty.
+    pub fn rotate<R>(
+        &mut self,
+        from_left: bool,
+        to_left: bool,
+        take: impl FnOnce(Value<'_>) -> R,
+    ) -> Option<R> {
+        match &mut self.repr {
+            Repr::Packed(p) => {
+                if from_left == to_left {
+                    let element = if from_left { p.front() } else { p.back() };
+                    return element.map(|e| take(Value::Bytes(e)));
+                }
+                p.rotate(!from_left, |e| take(Value::Bytes(e)))
+            }
+            Repr::Plain(d) => {
+                if from_left == to_left {
+                    let element = if from_left { d.front() } else { d.back() };
+                    return element.map(|e| take(Value::Shared(e)));
+                }
+                let element = if from_left {
+                    d.pop_front()?
+                } else {
+                    d.pop_back()?
+                };
+                let taken = take(Value::Shared(&element));
+                if to_left {
+                    d.push_front(element);
+                } else {
+                    d.push_back(element);
+                }
+                Some(taken)
+            }
+        }
+    }
+
+    /// The packed list's shape checked against its chunks (tests).
+    #[cfg(test)]
+    fn check_shape(&self) {
+        if let Repr::Packed(p) = &self.repr {
+            p.check_shape();
+        }
+    }
+
     /// Element `i`, if there is one.
     #[inline]
     pub fn get(&self, i: usize) -> Option<Value<'_>> {
@@ -594,7 +642,7 @@ impl ExactSizeIterator for RevIter<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packed_list::{CHUNK_ENTRIES, MAX_LEN};
+    use crate::packed_list::{CHUNK_ENTRIES, MAX_LEN, PackedList};
 
     /// The list holds exactly `model`, read every way it can be read.
     fn assert_same(list: &ListValues, model: &VecDeque<Vec<u8>>, what: &str) {
@@ -633,6 +681,14 @@ mod tests {
 
     fn element(i: usize) -> Vec<u8> {
         format!("element:{i:08}").into_bytes()
+    }
+
+    #[test]
+    fn the_handle_is_no_bigger_than_a_chunk_and_a_tag() {
+        // A list of several chunks keeps its length and its run behind a
+        // box: the list is one chunk's size, and the two forms one word more.
+        assert_eq!(std::mem::size_of::<PackedList>(), 32);
+        assert!(std::mem::size_of::<ListValues>() <= 40);
     }
 
     #[test]
@@ -985,6 +1041,24 @@ mod tests {
                         got.reverse();
                         assert_eq!(got, want, "{what}");
                     }
+                    18 => {
+                        // A rotation, as `RPOPLPUSH k k` and `LMOVE k k`.
+                        let (from_left, to_left) = ((r >> 33) & 1 == 1, (r >> 34) & 1 == 1);
+                        let got = list.rotate(from_left, to_left, |v| v.to_vec());
+                        let want = if from_left {
+                            model.pop_front()
+                        } else {
+                            model.pop_back()
+                        };
+                        assert_eq!(got, want, "{what}");
+                        if let Some(e) = want {
+                            if to_left {
+                                model.push_front(e);
+                            } else {
+                                model.push_back(e);
+                            }
+                        }
+                    }
                     _ => {
                         if let Some(i) =
                             (!model.is_empty()).then(|| (r >> 32) as usize % model.len())
@@ -1001,6 +1075,8 @@ mod tests {
                 if model.is_empty() && list.is_empty() && r % 3 == 0 {
                     list = ListValues::new();
                 }
+                // `locate` against a plain walk, at every step.
+                list.check_shape();
                 if step % 97 == 0 {
                     assert_same(&list, &model, &what);
                 }
