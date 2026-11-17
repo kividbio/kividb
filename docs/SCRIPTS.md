@@ -200,8 +200,15 @@ that a server running its scripts one at a time shows it without
 | `scripts_offloaded_to_pool` | (not yet seen to be quick, or seen to be slow) was run on a thread of the blocking pool |
 
 A script that runs alone is counted under the first reason in the table
-that applies. The `scripts_run_*` counts add up to the scripts run; the
-last two count, of those, where the ones that ran alone were run.
+that applies. The `scripts_run_*` counts add up to the script calls that
+reached the point of running: a script refused there (`BUSY`, `NOSCRIPT`,
+`OOM`), or held back by a `CLIENT PAUSE` that started as it arrived and
+then run, is counted each time it got that far. `scripts_handed_to_runner`
+and `scripts_offloaded_to_pool` are a second view of the scripts counted as
+run alone (a script in one of them is also in a `scripts_run_alone_*`
+field): handed to the runner is a quick script that runs alone and came
+while another script was running; offloaded to the pool is one not yet
+known to be quick, or demoted as slow.
 Scripts applied by a replica from its master, or replayed from the AOF,
 are not counted. `CONFIG RESETSTAT` sets them all to 0. A build without
 Lua has none of these fields.

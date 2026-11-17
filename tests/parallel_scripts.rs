@@ -1013,6 +1013,9 @@ fn info_counts_how_scripts_were_run() {
         match name.as_str() {
             "scripts_run_alone_no_keys" => assert_eq!(n - was, sent, "{name}"),
             "scripts_handed_to_runner" => assert!(*n > 0 && n - was <= sent, "{name}"),
+            // A run stretched past the demotion limit on a busy machine is
+            // offloaded until it is seen to be quick again.
+            "scripts_offloaded_to_pool" => assert!(n - was <= sent, "{name}"),
             _ => assert_eq!(*n, was, "{name}"),
         }
     }
