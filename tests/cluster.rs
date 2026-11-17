@@ -1096,6 +1096,59 @@ fn a_script_uses_only_keys_this_node_serves() {
     assert!(here.conn().cmd(&["FCALL", "loose", "1", &mine]).is_ok());
 }
 
+/// A script whose `KEYS` carry several hash tags (#871): on a cluster node,
+/// tags of different slots are refused with `CROSSSLOT` before the script
+/// runs, as any command's keys are; tags of one slot are let through, run
+/// beside others once the script has been seen to be quick, and hold the
+/// script to them.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_of_several_tags_runs_when_they_share_a_slot() {
+    let (nodes, ranges) = form_cluster(2);
+    let here = &nodes[0];
+    let mine = ranges[0].0..=ranges[0].1;
+    // Two tags of one slot of this node, and a third of another slot here.
+    let mut seen = std::collections::HashMap::new();
+    let (a, b) = (0..1_000_000)
+        .map(|i| format!("t{i}"))
+        .filter(|tag| mine.contains(&slot_of(tag)))
+        .find_map(|tag| {
+            seen.insert(slot_of(&tag), tag.clone())
+                .map(|earlier| (earlier, tag))
+        })
+        .expect("two tags of one slot");
+    let c = (0..100_000)
+        .map(|i| format!("u{i}"))
+        .find(|tag| mine.contains(&slot_of(tag)) && slot_of(tag) != slot_of(&a))
+        .unwrap();
+    let (ka, kb, kc) = (
+        format!("{{{a}}}:k"),
+        format!("{{{b}}}:k"),
+        format!("{{{c}}}:k"),
+    );
+    const BOTH: &str = "redis.call('SET', KEYS[1], ARGV[1]) redis.call('SET', KEYS[2], ARGV[1]) \
+                        return redis.call('GET', ARGV[2])";
+    let mut conn = here.conn();
+    for run in 0..6 {
+        let r = conn.cmd(&["EVAL", BOTH, "2", &ka, &kc, "v", &ka]);
+        assert!(
+            r.err().is_some_and(|e| e.starts_with("CROSSSLOT")),
+            "run {run}: {r:?}"
+        );
+        assert_eq!(conn.cmd(&["EXISTS", &kc]).int(), 0, "run {run}");
+        let derived = format!("{{{b}}}:derived");
+        assert!(conn.cmd(&["SET", &derived, "d"]).is_ok());
+        let r = conn.cmd(&["EVAL", BOTH, "2", &ka, &kb, "v", &derived]);
+        assert_eq!(r, Resp::Bulk(b"d".to_vec()), "run {run}");
+        let r = conn.cmd(&["EVAL", BOTH, "2", &ka, &kb, "v", "plain"]);
+        assert!(
+            r.err().is_some_and(|e| e.contains("outside the hash tags")),
+            "run {run}: a key outside its tags was read: {r:?}"
+        );
+    }
+    assert_eq!(conn.cmd(&["GET", &kb]), Resp::Bulk(b"v".to_vec()));
+}
+
 /// Six masters, introduced only to the first: each has to learn of the other
 /// four through gossip. (They did not, where the clock was coarse: gossip
 /// kept mentioning the same three nodes.)
@@ -1504,7 +1557,8 @@ fn nodes_announce_hostnames_and_clients_can_be_sent_by_them() {
         Duration::from_secs(15),
         || {
             let saved = std::fs::read_to_string(&conf).unwrap_or_default();
-            (0..2).all(|i| saved.contains(&format!(",{} ", host(i))))
+            // `,<hostname>,shard-id=<id>`, as Redis writes it (#563).
+            (0..2).all(|i| saved.contains(&format!(",{},shard-id=", host(i))))
         },
     );
     nodes[2].restart();
@@ -2424,6 +2478,160 @@ fn manual_failover_swaps_roles_without_losing_acknowledged_writes() {
     assert!(reply.err().is_some_and(|e| e.contains("replica")));
 }
 
+/// A shard keeps its id across a failover and a restart (#563): the replica
+/// is in its master's shard, keeps its id when it takes over, and so does
+/// the old master once it follows it; `CLUSTER SHARDS` shows the two in one
+/// shard. The id used to be the master's node id, so it changed when a
+/// replica was promoted.
+#[test]
+fn a_shard_keeps_its_id_across_a_failover_and_a_restart() {
+    let (nodes, _) = form_cluster(3);
+    let mut replica = add_replica(&nodes, &nodes[0]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let shard_of = |node: &Node| node.conn().cmd(&["CLUSTER", "MYSHARDID"]).text();
+    let shard = shard_of(&nodes[0]);
+    assert_eq!(shard.len(), 40, "{shard}");
+    assert_ne!(
+        shard,
+        nodes[0].id(),
+        "a shard id is not its master's node id"
+    );
+    assert_ne!(shard_of(&nodes[1]), shard);
+    wait_until(
+        "the replica in its master's shard",
+        Duration::from_secs(15),
+        || shard_of(&replica) == shard,
+    );
+
+    let mut promoted = false;
+    for attempt in 1..=3 {
+        let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+        assert!(reply.is_ok(), "CLUSTER FAILOVER {attempt}: {reply:?}");
+        promoted = (0..150).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            replica.is_master()
+        });
+        if promoted {
+            break;
+        }
+    }
+    assert!(promoted, "the replica was not promoted\n{}", replica.log());
+    wait_until(
+        "the old master to follow the new one",
+        Duration::from_secs(30),
+        || nodes[0].repl_info("master_link_status").as_deref() == Some("up"),
+    );
+    assert_eq!(shard_of(&replica), shard, "the new master's shard");
+    assert_eq!(shard_of(&nodes[0]), shard, "the old master's shard");
+
+    // Seen from another node: one shard of the two, the new master first.
+    let ids_of = |desc: &Resp| desc.array()[1].text();
+    wait_until(
+        "CLUSTER SHARDS to show the failover",
+        Duration::from_secs(15),
+        || {
+            let shards = nodes[1].conn().cmd(&["CLUSTER", "SHARDS"]);
+            shards.array().iter().any(|s| {
+                let ids: Vec<String> = s.array()[3].array().iter().map(ids_of).collect();
+                ids == [replica.id(), nodes[0].id()]
+            })
+        },
+    );
+
+    replica.restart();
+    assert_eq!(shard_of(&replica), shard, "after a restart");
+}
+
+/// A shard id a replica learns from its master's heartbeats is saved, so a
+/// replica restarted while its master is down, with nobody to tell it again,
+/// keeps it (#563). Here it comes back with an id made up for its master's
+/// shard, as a replica upgraded before its master makes one up, and learns
+/// the master's own. It used to be saved only if something else changed:
+/// restarted then, it came back with the made-up one, and a failover would
+/// have changed the shard's id.
+#[test]
+fn a_replica_restarted_while_its_master_is_down_keeps_the_shard_id_it_learnt() {
+    let (mut nodes, _) = form_cluster(3);
+    let mut replica = add_replica(&nodes, &nodes[0]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let shard_of = |node: &Node| node.conn().cmd(&["CLUSTER", "MYSHARDID"]).text();
+    let shard = shard_of(&nodes[0]);
+    wait_until(
+        "the replica in its master's shard",
+        Duration::from_secs(15),
+        || shard_of(&replica) == shard,
+    );
+
+    replica.kill();
+    let conf = replica.dir.join("nodes.conf");
+    let made_up = "0123456789abcdef0123456789abcdef01234567";
+    let text = std::fs::read_to_string(&conf).unwrap();
+    assert!(text.contains(&shard), "{text}");
+    std::fs::write(&conf, text.replace(&shard, made_up)).unwrap();
+    replica.spawn();
+    wait_until(
+        "the replica to learn its master's shard id",
+        Duration::from_secs(15),
+        || shard_of(&replica) == shard,
+    );
+    wait_until("the replica to save it", Duration::from_secs(15), || {
+        let saved = std::fs::read_to_string(&conf).unwrap_or_default();
+        saved.contains(&format!("shard-id={shard}")) && !saved.contains(made_up)
+    });
+
+    nodes[0].kill();
+    replica.restart();
+    assert_eq!(shard_of(&replica), shard);
+}
+
+/// An automatic failover keeps the shard's id too, and another node's
+/// `CLUSTER SHARDS` shows the failed master in the shard of the replica
+/// that took over from it (#563).
+#[test]
+fn a_shard_keeps_its_id_across_an_automatic_failover() {
+    let (mut nodes, _) = form_cluster(3);
+    let replica = add_replica(&nodes, &nodes[0]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let shard_of = |node: &Node| node.conn().cmd(&["CLUSTER", "MYSHARDID"]).text();
+    let shard = shard_of(&nodes[0]);
+    wait_until(
+        "the replica in its master's shard",
+        Duration::from_secs(15),
+        || shard_of(&replica) == shard,
+    );
+
+    let old_master = nodes[0].id();
+    nodes[0].kill();
+    wait_until(
+        "the replica to be promoted",
+        Duration::from_secs(30),
+        || replica.is_master(),
+    );
+    assert_eq!(shard_of(&replica), shard);
+
+    let ids_of = |desc: &Resp| desc.array()[1].text();
+    let mut last = String::new();
+    let shown = (0..150).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        let shards = nodes[1].conn().cmd(&["CLUSTER", "SHARDS"]);
+        last = format!("{shards:?}");
+        shards.array().iter().any(|s| {
+            let ids: Vec<String> = s.array()[3].array().iter().map(ids_of).collect();
+            ids == [replica.id(), old_master.clone()]
+        })
+    });
+    assert!(shown, "CLUSTER SHARDS on another node: {last}");
+}
+
 /// A writer that INCRs `key` until `stop`, follows redirects between the two
 /// `ports`, and counts only the INCRs acknowledged.
 ///
@@ -2694,6 +2902,112 @@ fn a_master_told_it_has_been_failed_holds_writes_until_it_knows_its_slots() {
 }
 
 // ── Resharding ────────────────────────────────────────────────────────────────
+
+/// Sets and hashes of every form a slot migration moves arrive whole, in the
+/// form they make there: a set's array of integers, its block and its table;
+/// a hash's block, its block with field TTLs, and its table.
+#[test]
+fn migrate_moves_sets_and_hashes_in_every_form() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "forms");
+    let slot = slot_of(&tag).to_string();
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+
+    let ints: Vec<String> = (0..100).map(|i| (i * 7 - 300).to_string()).collect();
+    let words: Vec<String> = (0..50).map(|i| format!("membr:{i:08}")).collect();
+    let many: Vec<String> = (0..300).map(|i| format!("membr:{i:08}")).collect();
+    let fields = |n: usize| -> Vec<String> {
+        (0..n)
+            .flat_map(|i| [format!("field:{i:08}"), format!("value:{i:026}")])
+            .collect()
+    };
+    let add = |s: &mut Conn, cmd: &str, key: &str, args: &[String]| {
+        let mut all = vec![cmd.to_string(), key.to_string()];
+        all.extend(args.iter().cloned());
+        let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        s.cmd(&refs);
+    };
+    add(&mut s, "SADD", &k("ints"), &ints);
+    add(&mut s, "SADD", &k("words"), &words);
+    add(&mut s, "SADD", &k("many"), &many);
+    add(&mut s, "HSET", &k("hsmall"), &fields(10));
+    add(&mut s, "HSET", &k("hex"), &fields(10));
+    s.cmd(&[
+        "HPEXPIREAT",
+        &k("hex"),
+        "4000000000000",
+        "FIELDS",
+        "1",
+        "field:00000003",
+    ]);
+    add(&mut s, "HSET", &k("hbig"), &fields(600));
+    let want = [
+        ("ints", "intset"),
+        ("words", "listpack"),
+        ("many", "hashtable"),
+        ("hsmall", "listpack"),
+        ("hex", "listpackex"),
+        ("hbig", "hashtable"),
+    ];
+    let mut before = Vec::new();
+    for (name, form) in want {
+        assert_eq!(
+            s.cmd(&["OBJECT", "ENCODING", &k(name)]).text(),
+            form,
+            "{name}"
+        );
+        before.push(s.cmd(&["DEBUG", "DIGEST-VALUE", &k(name)]));
+    }
+
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(want.iter().map(|(n, _)| k(n)));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let reply = s.cmd(&refs);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+
+    let mut d = dst.conn();
+    for ((name, form), digest) in want.iter().zip(&before) {
+        let key = k(name);
+        assert_eq!(d.cmd(&["OBJECT", "ENCODING", &key]).text(), *form, "{name}");
+        assert_eq!(d.cmd(&["DEBUG", "DIGEST-VALUE", &key]), *digest, "{name}");
+    }
+    assert_eq!(d.cmd(&["SCARD", &k("ints")]).int(), 100);
+    assert_eq!(
+        d.cmd(&["SISMEMBER", &k("words"), "membr:00000049"]).int(),
+        1
+    );
+    assert_eq!(d.cmd(&["SCARD", &k("many")]).int(), 300);
+    let all = d.cmd(&["HGETALL", &k("hsmall")]);
+    let got: Vec<String> = all.array().iter().map(Resp::text).collect();
+    assert_eq!(got, fields(10), "a block's fields in their order");
+    assert_eq!(d.cmd(&["HLEN", &k("hbig")]).int(), 600);
+    let at = d.cmd(&["HPEXPIRETIME", &k("hex"), "FIELDS", "1", "field:00000003"]);
+    assert_eq!(at.array()[0].int(), 4_000_000_000_000);
+}
 
 /// Move a slot between masters the way the resharding tools do: mark it
 /// migrating/importing, MIGRATE its keys in a batch, then assign it. Every

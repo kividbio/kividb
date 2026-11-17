@@ -93,7 +93,7 @@ fn socket_says_gone(_fd: Option<i32>) -> bool {
 /// closed, as Redis closes one whose query buffer reaches the limit.
 /// Otherwise a client that kept sending while it waited — in a blocking
 /// command, a pause, `WAIT` — would be read into memory without end.
-fn carried_too_much(carried: &[u8]) -> bool {
+pub(crate) fn carried_too_much(carried: &[u8]) -> bool {
     // Only past a megabyte, the least the limit can be set to, is the
     // setting looked up.
     if carried.len() <= 1 << 20 {
@@ -455,13 +455,7 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
                         if carried_too_much(carried) {
                             return Err(std::io::Error::other("client-query-buffer-limit"));
                         }
-                        limit.owed += n;
-                        if limit.bytes != 0 && limit.owed as u64 >= limit.bytes {
-                            crate::output_limits::note_disconnect(
-                                limit.client_id,
-                                limit.class,
-                                limit.owed as u64,
-                            );
+                        if limit.over_after(n) {
                             return Err(std::io::Error::other("client-output-buffer-limit"));
                         }
                     }
@@ -475,12 +469,13 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
     })
 }
 
-/// The hard output limit [`read_while_writing`] holds a client to: Redis
-/// runs what it reads, so a client that sends and never reads has replies
-/// over that limit, and is closed, long before its query buffer reaches
+/// The hard output limit a connection reading ahead (`read_while_writing`
+/// here, and `server_uring`'s) holds a client to: Redis runs what it reads,
+/// so a client that sends and never reads has replies over that limit, and
+/// is closed, long before its query buffer reaches
 /// `client-query-buffer-limit`. Here what is read ahead is not run yet, and
 /// counts against the limit as it is read.
-struct HardLimit {
+pub(crate) struct HardLimit {
     class: crate::output_limits::Class,
     /// `client-output-buffer-limit`'s hard limit for `class`; 0 for none.
     bytes: u64,
@@ -491,7 +486,7 @@ struct HardLimit {
 }
 
 impl HardLimit {
-    fn new(
+    pub(crate) fn new(
         limits: &crate::output_limits::OutputLimits,
         subscribed: bool,
         owed: usize,
@@ -509,6 +504,17 @@ impl HardLimit {
             owed,
             client_id,
         }
+    }
+
+    /// Whether `n` more bytes read ahead take the client to the limit: it is
+    /// then counted as closed for it, and is to be closed.
+    pub(crate) fn over_after(&mut self, n: usize) -> bool {
+        self.owed += n;
+        if self.bytes == 0 || (self.owed as u64) < self.bytes {
+            return false;
+        }
+        crate::output_limits::note_disconnect(self.client_id, self.class, self.owed as u64);
+        true
     }
 }
 

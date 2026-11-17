@@ -177,7 +177,8 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         fields.push((field, value, expires_at));
     }
 
-    let mut inner = crate::types::HashInner::new();
+    let mut inner =
+        crate::types::HashInner::from_fields(crate::types::HashFields::with_capacity(fields.len()));
     // One named twice is a corrupt file.
     let mut names = std::collections::HashSet::with_capacity(fields.len());
     for (field, value, expires_at) in fields {
@@ -188,7 +189,7 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         if let Some(at) = expires_at {
             inner.expiries.insert(field.clone(), field_deadline(at));
         }
-        inner.fields.insert(field, Arc::from(value.as_slice()));
+        inner.fields.insert_loaded(field, &value);
     }
     // Nothing there: no key, as Valkey loads none.
     if inner.fields.is_empty() {

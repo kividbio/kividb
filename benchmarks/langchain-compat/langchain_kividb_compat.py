@@ -10,8 +10,11 @@ model, so no real API keys or spend are involved.
   python langchain_kividb_compat.py --url redis://HOST:6380 --label kividb
   python langchain_kividb_compat.py --url redis://HOST:6379 --label redis8
 
-Writes results-<label>.json next to the script. Run the same command against stock
-Redis (for example the `redis:8` image) with a different --label to get a comparison.
+Writes results-<label>.json next to the script (--json PATH puts it elsewhere). Run the
+same command against stock Redis (for example the `redis:8` image) with a different
+--label to get a comparison. --junitxml PATH also writes the checks as JUnit XML, one
+<testcase> per check, which is what benchmarks/ci/compare.py reads in the compat workflow
+(ci.sh).
 
 What it covers, from `langchain-redis`:
   * RedisVectorStore: add, similarity search, scores, metadata filters (tag, numeric),
@@ -335,7 +338,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="redis://localhost:6380")
     ap.add_argument("--label", default="kividb")
+    ap.add_argument("--json", metavar="PATH",
+                    help="where to write the JSON results (default: results-<label>.json "
+                         "next to this script)")
+    ap.add_argument("--junitxml", metavar="PATH",
+                    help="also write the checks as JUnit XML, for benchmarks/ci/compare.py")
     args = ap.parse_args()
+    started = time.time()
 
     r = redis.Redis.from_url(args.url)
     info = r.info("server")
@@ -358,12 +367,17 @@ def main():
     counts = {s: sum(1 for x in results if x["status"] == s) for s in ("PASS", "WARN", "FAIL")}
     print(f"\n{args.label}: {counts['PASS']} PASS, {counts['WARN']} WARN, {counts['FAIL']} FAIL "
           f"of {len(results)} checks")
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results-{args.label}.json")
+    out = args.json or os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results-{args.label}.json")
     with open(out, "w") as f:
         json.dump({"label": args.label, "url": args.url, "redis_version": version,
                    "langchain_redis": __import__("importlib.metadata", fromlist=["version"]).version("langchain-redis"),
                    "counts": counts, "checks": results}, f, indent=2)
     print(f"wrote {out}")
+    if args.junitxml:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ci"))
+        from compat_junit import write_junit
+        write_junit(args.junitxml, "langchain", results, time.time() - started)
+        print(f"wrote {args.junitxml}")
     return 1 if counts["FAIL"] else 0
 
 
