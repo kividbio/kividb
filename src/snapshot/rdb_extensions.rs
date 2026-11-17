@@ -249,9 +249,7 @@ fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Op
         if let Some(at) = expires_at {
             inner.expiries.insert(field.clone(), field_deadline(at));
         }
-        inner
-            .fields
-            .insert_owned(field, Arc::from(value.as_slice()));
+        inner.fields.insert_loaded(field, &value);
     }
     if inner.fields.is_empty() {
         return Ok(None);

@@ -2338,7 +2338,7 @@ fn read_image(
                             io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
                         })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert_owned(field, Arc::from(val.as_slice()));
+                        hmap.insert_loaded(field, &val);
                     }
                     KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(hmap)))
                 }
@@ -2598,7 +2598,7 @@ fn read_image(
                             io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
                         })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert_owned(field, Arc::from(val.as_slice()));
+                        hmap.insert_loaded(field, &val);
                     }
                     // Expiries: each persisted Unix ms kept as it is (#594). A
                     // field whose time has passed is dropped, unless fields
@@ -3860,12 +3860,12 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         4 => {
             // Hash (hashtable encoding)
             let (count, _) = rdb_read_length(r)?;
-            let mut hmap = crate::types::HashFields::default();
+            let mut hmap = crate::types::HashFields::with_capacity(hint(count as usize));
             for _ in 0..count {
                 let field_bytes = rdb_read_string(r)?;
                 let field = crate::key_bytes::text_of(&field_bytes).into_owned();
                 let val = rdb_read_string(r)?;
-                hmap.insert_owned(field, Arc::from(val.as_slice()));
+                hmap.insert_loaded(field, &val);
             }
             Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
                 hmap,
@@ -4403,9 +4403,7 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
         if expires_at != 0 {
             inner.expiries.insert(field.clone(), expires_at);
         }
-        inner
-            .fields
-            .insert_owned(field, Arc::from(value.as_slice()));
+        inner.fields.insert_loaded(field, &value);
     }
     Ok(KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(
         inner,
@@ -5013,7 +5011,7 @@ fn rdb_decode_listpack_into_hash(
     let mut iter = elements.into_iter();
     while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
         let field = crate::key_bytes::text_of(&field).into_owned();
-        hmap.insert_owned(field, Arc::from(value.as_slice()));
+        hmap.insert_loaded(field, &value);
     }
     Ok(())
 }
@@ -5933,7 +5931,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = String::from_utf8(field_bytes.to_vec()).ok()?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert_owned(field, Arc::from(val_bytes));
+                map.insert_loaded(field, val_bytes);
                 pos = next2;
             }
             Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(map))))
@@ -5998,7 +5996,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = String::from_utf8(field_bytes.to_vec()).ok()?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert_owned(field, Arc::from(val_bytes));
+                map.insert_loaded(field, val_bytes);
                 pos = next2;
             }
             // Expiries

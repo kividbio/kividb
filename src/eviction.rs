@@ -974,10 +974,10 @@ fn freeing_at_least(value: crate::store::ValueRef<'_>) -> usize {
     match value {
         V::String(_) => 0,
         V::List(list) => list.read().len() * ELEMENT,
-        V::Hash(hash) => hash.read().len() * ELEMENT,
-        V::HashEx(hash) => hash.read().len() * ELEMENT,
-        // An array or a block of members (#297) is one allocation, of a
-        // size known exactly.
+        // An array or a block of members (#297), or of a hash's fields, is
+        // one allocation, of a size known exactly.
+        V::Hash(hash) => hash.read().freeing_at_least(ELEMENT),
+        V::HashEx(hash) => hash.read().fields.freeing_at_least(ELEMENT),
         V::Set(set) => set.read().freeing_at_least(ELEMENT),
         V::SortedSet(zset) => zset.read().len() * ELEMENT,
         V::VectorSet(set) => set.read().entries.len() * ELEMENT,

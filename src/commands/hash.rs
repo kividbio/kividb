@@ -125,12 +125,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 } else {
                     let count = inner.len() * 2;
                     let mut buf = Vec::with_capacity(16 + count * 32);
-                    buf.push(b'*');
-                    buf.extend_from_slice(count.to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
+                    push_array_len(&mut buf, count);
                     for (k, v) in inner.iter() {
-                        write_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
-                        write_bulk(&mut buf, &v);
+                        push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
+                        push_bulk(&mut buf, &v);
                     }
                     Some(buf)
                 }
@@ -365,11 +363,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
-                buf.push(b'*');
-                buf.extend_from_slice(inner.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                push_array_len(&mut buf, inner.len());
                 for k in inner.keys() {
-                    write_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
+                    push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
                 }
                 Some(buf)
             }) {
@@ -400,11 +396,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
-                buf.push(b'*');
-                buf.extend_from_slice(inner.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                push_array_len(&mut buf, inner.len());
                 for v in inner.values() {
-                    write_bulk(&mut buf, &v);
+                    push_bulk(&mut buf, &v);
                 }
                 Some(buf)
             }) {
@@ -1050,6 +1044,26 @@ fn expire_before(ctx: &Ctx, key: &[u8]) -> FieldDeadline {
 }
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
+/// `*<n>\r\n` at the end of `buf`, the length written without the
+/// formatting machinery (`push_decimal`).
+#[inline]
+fn push_array_len(buf: &mut Vec<u8>, n: usize) {
+    buf.push(b'*');
+    push_decimal(buf, n as u64);
+    buf.extend_from_slice(b"\r\n");
+}
+
+/// [`write_bulk`] with its length written by `push_decimal`: `HGETALL`,
+/// `HKEYS` and `HVALS` write a bulk string for every field and value.
+#[inline]
+fn push_bulk(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.push(b'$');
+    push_decimal(buf, data.len() as u64);
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"\r\n");
+}
 
 /// The fields of the hash at `key` as a reader is shown them: the whole of
 /// them, those due and not to be seen left out ([`visible`]).
@@ -1884,10 +1898,10 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let mut deleted: Vec<&[u8]> = Vec::new();
             let out: Vec<Vec<u8>> = fields
                 .iter()
-                .map(|f| match inner.take(f) {
+                .map(|f| match inner.take_with(f, resp_bulk) {
                     Some(v) => {
                         deleted.push(f.as_bytes());
-                        resp_bulk(&v)
+                        v
                     }
                     None => resp_null_for(resp),
                 })
@@ -1907,10 +1921,10 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let mut deleted: Vec<&[u8]> = Vec::new();
             let out: Vec<Vec<u8>> = fields
                 .iter()
-                .map(|f| match inner.evict_field(f) {
+                .map(|f| match inner.take_field_with(f, resp_bulk) {
                     Some(v) => {
                         deleted.push(f.as_bytes());
-                        resp_bulk(&v)
+                        v
                     }
                     None => resp_null_for(resp),
                 })

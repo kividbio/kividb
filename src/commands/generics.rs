@@ -32,6 +32,8 @@ pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
         // By the form it is kept in (#297), as Redis goes by its encoding:
         // an array or a block whole, a table a page at a time.
         ValueRef::Set(set) => !set.read().is_table(),
+        ValueRef::Hash(hash) => !hash.read().is_table(),
+        ValueRef::HashEx(hash) => !hash.read().fields.is_table(),
         _ => matches!(encoding_of(value), "listpack" | "listpackex"),
     }
 }
@@ -74,23 +76,16 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
                 "skiplist"
             }
         }
-        ValueRef::Hash(hash) => {
-            let hash = hash.read();
-            let small = hash.len() <= 512
-                && hash
-                    .iter()
-                    .all(|(field, value)| field.len() <= SMALL && value.len() <= SMALL);
-            if small { "listpack" } else { "hashtable" }
-        }
-        ValueRef::HashEx(hash) => {
-            let hash = hash.read();
-            let small = hash.fields.len() <= 512
-                && hash
-                    .fields
-                    .iter()
-                    .all(|(field, value)| field.len() <= SMALL && value.len() <= SMALL);
-            if small { "listpackex" } else { "hashtable" }
-        }
+        // The form it is really kept in: a block, or a table. With a field
+        // TTL a block is a `listpackex`, as Redis names it.
+        ValueRef::Hash(hash) => match hash.read().encoding() {
+            crate::hash_fields::Encoding::Listpack => "listpack",
+            crate::hash_fields::Encoding::Hashtable => "hashtable",
+        },
+        ValueRef::HashEx(hash) => match hash.read().fields.encoding() {
+            crate::hash_fields::Encoding::Listpack => "listpackex",
+            crate::hash_fields::Encoding::Hashtable => "hashtable",
+        },
         ValueRef::Stream(_) => "stream",
         ValueRef::Array(_) => "sliced-array",
         _ => "raw",
