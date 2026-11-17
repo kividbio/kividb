@@ -100,13 +100,19 @@ know" below.
 Scripts are sorted by the **hash tag** of their keys: the part of a key
 between the first `{` and the next `}`, as in `{orders}:waiting`.
 
-- **A script whose `KEYS` all carry the same hash tag is held to that tag.**
-  Every key it touches, declared or not, must carry it. A `redis.call` on
-  any other key fails:
+- **A script whose `KEYS` all carry a hash tag is held to those tags.**
+  That is one tag (`{orders}:waiting {orders}:active`) or several
+  (`{api_key:k1}:window {team:t1}:window`). Every key it touches, declared
+  or not, must carry one of them; a key built from a declared one that
+  keeps its tag (`KEYS[1] .. ':log'`) does. A `redis.call` on any other key
+  fails:
 
   ```
   ERR Script attempted to access the key 'other', which is outside the hash tag 'orders' of its KEYS (lua-parallel-scripts)
+  ERR Script attempted to access the key 'other', which is outside the hash tags 'api_key:k1', 'team:t1' of its KEYS (lua-parallel-scripts)
   ```
+
+  (The first key's tag comes first, the others in byte order.)
 
   So does a command that looks at keys it does not name (`KEYS`, `SCAN`,
   `DBSIZE`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB`, `SWAPDB`), with its own
@@ -137,20 +143,23 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   These two are the only things a script may do without the setting that
   it may not do with it.
 
-- **Such scripts run beside each other.** Two scripts on different tags run
-  at the same time, on different cores. Two on the same tag run one after
-  the other. A script starts running this way once the server has seen it
-  to be quick (under a millisecond in the VM); its first run, and any
-  script that turns out slow (over five milliseconds), runs alone as
-  before.
+- **Such scripts run beside each other.** Two scripts that share no tag
+  run at the same time, on different cores. Two that share a tag run one
+  after the other. A script of several tags holds all of them for the whole
+  of its run, so a script of `{a}` and `{b}` waits for one on `{a}` and for
+  one on `{b}`, and runs beside one on `{c}`. A script starts running this
+  way once the server has seen it to be quick (under a millisecond in the
+  VM); its first run, and any script that turns out slow (over five
+  milliseconds), runs alone as before.
 
-- **Every other script is as before.** A script with no keys, with a key
-  that has no tag, or with keys of two tags runs alone and may touch what
-  it likes. So do functions (`FCALL`).
+- **Every other script is as before.** A script with no keys, or with a key
+  that has no tag, runs alone and may touch what it likes. So do functions
+  (`FCALL`), and scripts inside `MULTI`/`EXEC`.
 
 - **A command from a client waits for a script on its tag.** `GET
   {orders}:waiting` sent while a script on `orders` is running is answered
-  when the script has finished. Keys without a tag are never waited for.
+  when the script has finished; so is a command naming a key of any of the
+  tags of a script of several. Keys without a tag are never waited for.
   `MULTI`/`EXEC`, and the commands that look at the whole keyspace, wait
   for every running script.
 
@@ -165,12 +174,33 @@ new Queue("orders", { prefix: "{orders}" })
 
 Queues with different tags then run on different cores.
 
+A script that works on keys of several tags — a rate limiter that checks a
+key's limit and its team's in one call — runs beside others too, as long
+as every key it declares carries a tag:
+
+```
+EVALSHA <sha> 4 {api_key:k1}:window {api_key:k1}:requests {team:t1}:window {team:t1}:requests 1700000000 60
+```
+
+On a cluster, keys of several tags must still hash to one slot, as for
+any command: tags of different slots are refused with `CROSSSLOT` first.
+
+Several tags are locked in one fixed order (the order of the lock table,
+as a client's command naming keys of several tags locks them), so two
+scripts, or a script and a command, that need the same tags never wait for
+each other in a cycle. Each tag is held for the whole script, and a
+script's writes reach replicas and the AOF as one group while it holds
+them: replicas and a replay of the AOF apply scripts in an order the
+master could have run them one after another.
+
 ### What to know
 
-- A script that declares tagged keys and also uses a key outside the tag —
-  a global counter, a lock under another name — will fail where it used to
-  work. Either give that key the tag, or declare a key without a tag so
-  that the script runs alone.
+- A script that declares tagged keys and also uses a key outside their
+  tags — a global counter, a lock under another name — will fail where it
+  used to work. Either give that key one of the tags (or declare it), or
+  declare a key without a tag so that the script runs alone. Up to 1.2.2 a
+  script whose `KEYS` carried two different tags was not held to them; it
+  is now.
 - `SCRIPT KILL` stops every running script that has not yet written, not
   one of them: with several running there is no saying which was meant.
 - Each thread that runs scripts this way keeps a Lua VM of its own. Scripts

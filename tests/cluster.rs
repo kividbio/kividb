@@ -1096,6 +1096,59 @@ fn a_script_uses_only_keys_this_node_serves() {
     assert!(here.conn().cmd(&["FCALL", "loose", "1", &mine]).is_ok());
 }
 
+/// A script whose `KEYS` carry several hash tags (#871): on a cluster node,
+/// tags of different slots are refused with `CROSSSLOT` before the script
+/// runs, as any command's keys are; tags of one slot are let through, run
+/// beside others once the script has been seen to be quick, and hold the
+/// script to them.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_of_several_tags_runs_when_they_share_a_slot() {
+    let (nodes, ranges) = form_cluster(2);
+    let here = &nodes[0];
+    let mine = ranges[0].0..=ranges[0].1;
+    // Two tags of one slot of this node, and a third of another slot here.
+    let mut seen = std::collections::HashMap::new();
+    let (a, b) = (0..1_000_000)
+        .map(|i| format!("t{i}"))
+        .filter(|tag| mine.contains(&slot_of(tag)))
+        .find_map(|tag| {
+            seen.insert(slot_of(&tag), tag.clone())
+                .map(|earlier| (earlier, tag))
+        })
+        .expect("two tags of one slot");
+    let c = (0..100_000)
+        .map(|i| format!("u{i}"))
+        .find(|tag| mine.contains(&slot_of(tag)) && slot_of(tag) != slot_of(&a))
+        .unwrap();
+    let (ka, kb, kc) = (
+        format!("{{{a}}}:k"),
+        format!("{{{b}}}:k"),
+        format!("{{{c}}}:k"),
+    );
+    const BOTH: &str = "redis.call('SET', KEYS[1], ARGV[1]) redis.call('SET', KEYS[2], ARGV[1]) \
+                        return redis.call('GET', ARGV[2])";
+    let mut conn = here.conn();
+    for run in 0..6 {
+        let r = conn.cmd(&["EVAL", BOTH, "2", &ka, &kc, "v", &ka]);
+        assert!(
+            r.err().is_some_and(|e| e.starts_with("CROSSSLOT")),
+            "run {run}: {r:?}"
+        );
+        assert_eq!(conn.cmd(&["EXISTS", &kc]).int(), 0, "run {run}");
+        let derived = format!("{{{b}}}:derived");
+        assert!(conn.cmd(&["SET", &derived, "d"]).is_ok());
+        let r = conn.cmd(&["EVAL", BOTH, "2", &ka, &kb, "v", &derived]);
+        assert_eq!(r, Resp::Bulk(b"d".to_vec()), "run {run}");
+        let r = conn.cmd(&["EVAL", BOTH, "2", &ka, &kb, "v", "plain"]);
+        assert!(
+            r.err().is_some(),
+            "run {run}: a key outside its tags was read: {r:?}"
+        );
+    }
+    assert_eq!(conn.cmd(&["GET", &kb]), Resp::Bulk(b"v".to_vec()));
+}
+
 /// Six masters, introduced only to the first: each has to learn of the other
 /// four through gossip. (They did not, where the clock was coarse: gossip
 /// kept mentioning the same three nodes.)
