@@ -1042,3 +1042,65 @@ fn memory_usage_is_what_the_chunks_take() {
         );
     }
 }
+
+/// Pushes, a pop and rotations inside `MULTI`/`EXEC`, on a packed list.
+#[test]
+fn a_transaction_pushes_and_pops_on_a_packed_list() {
+    let dir = temp_dir("multi");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    c.push("RPUSH", "q", &els(0..100));
+    assert!(c.cmd(&["MULTI"]).ok());
+    let queued: [&[&str]; 5] = [
+        &["RPUSH", "q", "a", "b"],
+        &["LPOP", "q"],
+        &["RPOPLPUSH", "q", "q"],
+        &["LMOVE", "q", "q", "LEFT", "RIGHT"],
+        &["LRANGE", "q", "0", "2"],
+    ];
+    for cmd in queued {
+        assert_eq!(c.cmd(cmd), Resp::Simple("QUEUED".into()));
+    }
+    let replies = c.cmd(&["EXEC"]);
+    let replies = replies.items();
+    assert_eq!(replies[0], Resp::Int(102));
+    assert_eq!(replies[1], Resp::Bulk(el(0)));
+    assert_eq!(replies[2], Resp::Bulk(b"b".to_vec()));
+    assert_eq!(replies[3], Resp::Bulk(b"b".to_vec()));
+    assert_eq!(
+        replies[4],
+        Resp::Array(vec![
+            Resp::Bulk(el(1)),
+            Resp::Bulk(el(2)),
+            Resp::Bulk(el(3))
+        ])
+    );
+    let mut m: Model = els(1..100).into();
+    m.push_back(b"a".to_vec());
+    m.push_back(b"b".to_vec());
+    check(&mut c, "q", &m, "after EXEC");
+    assert_eq!(c.encoding("q"), "quicklist");
+}
+
+/// A script that pushes and pops on a packed list.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_pushes_and_pops_on_a_packed_list() {
+    let dir = temp_dir("script");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    c.push("RPUSH", "s", &els(0..70));
+    let reply = c.cmd(&[
+        "EVAL",
+        "redis.call('RPUSH', KEYS[1], 'x', 'y') redis.call('LPOP', KEYS[1]) \
+         return redis.call('RPOPLPUSH', KEYS[1], KEYS[1])",
+        "1",
+        "s",
+    ]);
+    assert_eq!(reply, Resp::Bulk(b"y".to_vec()));
+    let mut m: Model = Model::new();
+    m.push_back(b"y".to_vec());
+    m.extend(els(1..70));
+    m.push_back(b"x".to_vec());
+    check(&mut c, "s", &m, "after the script");
+}

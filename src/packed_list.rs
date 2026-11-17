@@ -75,7 +75,7 @@ fn write_frame(buf: &mut [u8], at: usize, element: &[u8]) {
 }
 
 /// Up to [`CHUNK_ENTRIES`] elements in one buffer.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Chunk {
     buf: Vec<u8>,
     /// Where the first element's frame begins in `buf`.
@@ -84,7 +84,34 @@ struct Chunk {
     count: u16,
 }
 
+/// A copy holds the frames, not the room before them (`COPY` of a queue
+/// that has had much popped in front).
+impl Clone for Chunk {
+    fn clone(&self) -> Self {
+        Chunk {
+            buf: self.buf[self.start as usize..].to_vec(),
+            start: 0,
+            count: self.count,
+        }
+    }
+}
+
+/// A buffer is given back down to its frames when they take less than a
+/// quarter of it and it has at least this much to give back.
+const SHRINK_SLACK: usize = 1024;
+
 impl Chunk {
+    /// Give back the room of a buffer its frames take less than a quarter
+    /// of: what `LTRIM` and `LREM` leave. Pops never do this, so a queue that
+    /// fills and empties keeps its buffer.
+    fn shrink_if_slack(&mut self) {
+        let live = self.live();
+        let capacity = self.buf.capacity();
+        if capacity >= 4 * live && capacity - live >= SHRINK_SLACK {
+            self.tighten();
+        }
+    }
+
     #[inline]
     fn count(&self) -> usize {
         self.count as usize
@@ -1377,38 +1404,62 @@ impl PackedList {
     /// chunks that may not be full takes in what changed and gives up
     /// full chunks at its edges.
     fn repair(&mut self, from: usize, to: usize) {
-        let Chunks::Many(m) = &mut self.chunks else {
-            return;
+        let m = match &mut self.chunks {
+            Chunks::One(chunk) => {
+                chunk.shrink_if_slack();
+                return;
+            }
+            Chunks::Many(m) => m,
         };
-        m.widen(from, to);
-        let mut to = to;
-        // Emptied chunks go.
-        let mut c = to + 1;
-        while c > from {
-            c -= 1;
-            if m.chunks[c].count() == 0 {
-                m.chunks.remove(c);
-                m.removed(c);
-                to = to.saturating_sub(1);
+        // One pass over the chunks from just before the first changed to
+        // just after the last: an emptied chunk is passed over, one that
+        // fits into the chunk kept before it is appended to it, any other
+        // is moved down into the next place; then the places left over go
+        // at once. Linear in the chunks, however many changed (a dense
+        // `LREM` over the whole list), where a removal from the deque at a
+        // time was quadratic.
+        let n = m.chunks.len();
+        let first = from.saturating_sub(1);
+        let last = (to + 1).min(n - 1);
+        let mut write = first;
+        for read in first..=last {
+            let chunk = std::mem::take(&mut m.chunks[read]);
+            if chunk.count() == 0 {
+                continue;
             }
-            if c == 0 {
-                break;
+            if write > first && m.chunks[write - 1].count() + chunk.count() <= CHUNK_ENTRIES {
+                m.chunks[write - 1].append(&chunk);
+                continue;
             }
+            m.chunks[write] = chunk;
+            write += 1;
         }
-        // Neighbours that fit in one chunk become one, from just before the
-        // first changed to just after the last.
-        let mut c = from.saturating_sub(1);
-        let mut end = (to + 1).min(m.chunks.len().saturating_sub(1));
-        while c < end && c + 1 < m.chunks.len() {
-            if m.chunks[c].count() + m.chunks[c + 1].count() <= CHUNK_ENTRIES {
-                let next = m.chunks.remove(c + 1).unwrap_or_default();
-                m.chunks[c].append(&next);
-                m.removed(c + 1);
-                m.widen(c, c);
-                end -= 1;
-            } else {
-                c += 1;
-            }
+        let gone = last + 1 - write;
+        if gone > 0 {
+            m.chunks.drain(write..=last);
+        }
+        for chunk in m.chunks.range_mut(first..write) {
+            chunk.shrink_if_slack();
+        }
+        // The run, on the chunks as they are now: what was after the window
+        // moved down by `gone`; the window's chunks may not be full.
+        if !m.regular() {
+            let to_now = |c: u32| -> u32 {
+                let c = c as usize;
+                let now = if c > last {
+                    c - gone
+                } else if c >= write {
+                    write.saturating_sub(1)
+                } else {
+                    c
+                };
+                now as u32
+            };
+            m.lo = to_now(m.lo);
+            m.hi = to_now(m.hi);
+        }
+        if write > first {
+            m.widen(first, write - 1);
         }
         if m.chunks.len() > 1 {
             m.clamp();
@@ -1435,12 +1486,14 @@ impl PackedList {
             for _ in to..len {
                 self.drop_back();
             }
+            self.last_mut().shrink_if_slack();
             return;
         }
         if to == len && from <= CHUNK_ENTRIES {
             for _ in 0..from {
                 self.drop_front();
             }
+            self.first_mut().shrink_if_slack();
             return;
         }
         let (last, last_to) = self.locate(to - 1);
@@ -1465,6 +1518,8 @@ impl PackedList {
             }
         }
         self.settle();
+        self.first_mut().shrink_if_slack();
+        self.last_mut().shrink_if_slack();
     }
 
     /// Hand `each` the elements from `from` up to, not including, `to`,
@@ -2119,6 +2174,67 @@ mod tests {
                     assert!(list.remove(i));
                     model.remove(i);
                 }
+                15 if (r >> 40) % 4 == 1 && !model.is_empty() => {
+                    // LREM of an element there, with a count of either sign.
+                    let target = model[(r >> 32) as usize % model.len()].clone();
+                    let count = ((r >> 44) % 5) as i64 - 2;
+                    let removed = list.remove_matching(&target, count);
+                    let limit = if count == 0 {
+                        usize::MAX
+                    } else {
+                        count.unsigned_abs() as usize
+                    };
+                    let mut want = 0;
+                    if count >= 0 {
+                        let mut i = 0;
+                        while i < model.len() && want < limit {
+                            if model[i] == target {
+                                model.remove(i);
+                                want += 1;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    } else {
+                        let mut i = model.len();
+                        while i > 0 && want < limit {
+                            i -= 1;
+                            if model[i] == target {
+                                model.remove(i);
+                                want += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(removed, want, "step {step}");
+                    list.check_shape();
+                }
+                15 if (r >> 40) % 4 == 2 && !model.is_empty() && bias < 3 => {
+                    // LTRIM of a little at either end, or of much.
+                    let n = model.len();
+                    let from = (r >> 44) as usize % (n / 8 + 1);
+                    let to = (n - (r >> 52) as usize % (n / 8 + 1)).max(from);
+                    list.keep_range(from, to);
+                    model = model.range(from..to).cloned().collect();
+                    list.check_shape();
+                }
+                15 if (r >> 40) % 4 == 3 => {
+                    // A rotation either way.
+                    let from_back = (r >> 44) & 1 == 1;
+                    let got = list.rotate(from_back, |e| e.to_vec());
+                    let e = if from_back {
+                        model.pop_back()
+                    } else {
+                        model.pop_front()
+                    };
+                    assert_eq!(got, e, "step {step}");
+                    if let Some(e) = e {
+                        if from_back {
+                            model.push_front(e);
+                        } else {
+                            model.push_back(e);
+                        }
+                    }
+                }
                 _ => {
                     if let Some(i) = (!model.is_empty()).then(|| (r >> 32) as usize % model.len()) {
                         assert_eq!(list.get(i), Some(model[i].as_slice()), "step {step}");
@@ -2239,5 +2355,38 @@ mod tests {
             }
         }
         assert_same(&list, &model);
+    }
+
+    #[test]
+    fn a_dense_lrem_is_one_pass_over_the_list() {
+        // Every other element of 20,000,000 taken out: every chunk falls to
+        // half, and neighbours merge. Timed against one pass reading the
+        // whole list, in the same build: removing emptied and merged chunks
+        // from the deque one at a time was quadratic in the chunks.
+        let n = 20_000_000;
+        let mut builder = Builder::new();
+        for i in 0..n {
+            builder.push(if i % 2 == 0 { b"x" } else { b"y" });
+        }
+        let mut list = builder.finish();
+        let start = std::time::Instant::now();
+        let mut seen = 0usize;
+        list.for_each_in(0, list.len(), |e| {
+            seen += e.len();
+            true
+        });
+        let pass = start.elapsed();
+        assert_eq!(seen, n);
+        let start = std::time::Instant::now();
+        assert_eq!(list.remove_matching(b"x", 0), n / 2);
+        let lrem = start.elapsed();
+        eprintln!("dense LREM {lrem:?}, one pass {pass:?}");
+        assert_eq!(list.len(), n / 2);
+        assert_eq!(list.chunk_count(), n / 2 / CHUNK_ENTRIES);
+        list.check_shape();
+        assert!(
+            lrem < pass * 5 / 2,
+            "LREM {lrem:?} against a pass of {pass:?}"
+        );
     }
 }

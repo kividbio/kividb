@@ -1673,6 +1673,24 @@ impl Conn {
         assert_eq!(self.cmd(&["OBJECT", "ENCODING", key]).s(), "quicklist");
     }
 
+    /// The same 100,000 elements of 100 bytes in a packed list: about
+    /// 10.4 MB of chunks, which eviction reckons at exactly that before it
+    /// frees them.
+    fn big_packed_list(&mut self, key: &str) {
+        let element = "e".repeat(100);
+        let mut push = vec!["RPUSH", key];
+        push.extend(std::iter::repeat_n(element.as_str(), 2000));
+        for _ in 0..50 {
+            self.cmd(&push);
+        }
+        assert_eq!(self.cmd(&["LLEN", key]).i(), 100_000);
+        let usage = self.cmd(&["MEMORY", "USAGE", key]).i();
+        assert!(
+            (10_000_000..11_000_000).contains(&usage),
+            "a packed list of 100,000 elements of 100 bytes takes {usage}"
+        );
+    }
+
     /// `used_memory` less `mem_not_counted_for_evict`: what is measured
     /// against `maxmemory`.
     fn counted(&mut self) -> i64 {
@@ -1722,6 +1740,31 @@ fn lower_limit(server: &Server, c: &mut Conn, limit: i64) -> std::thread::JoinHa
         std::thread::sleep(Duration::from_millis(10));
     }
     lowered
+}
+
+/// A packed list of more than 64 KB goes through the freeing path too, and
+/// is reckoned at what its chunks take: with a limit 8 MB under what is used
+/// (more than the 3.2 MB a plain list of as many elements is reckoned at, less
+/// than the 10.4 MB these chunks take), what is being freed makes the room,
+/// so a write meanwhile is let through, and memory is under the limit once
+/// the list is freed.
+#[test]
+fn a_packed_list_being_freed_is_reckoned_at_its_chunks() {
+    let server = Server::start_freeing_slowly("allkeys-lru");
+    let mut c = server.conn();
+    c.big_packed_list("big");
+    let mut conn = ready_conns(&server, 1).pop().unwrap();
+    let limit = c.used_memory() - 8 * MB;
+    let lowered = lower_limit(&server, &mut c, limit);
+    let reply = conn.cmd(&["SET", "w", &big_value('v')]);
+    assert!(reply.ok(), "a write meanwhile: {reply:?}");
+    assert!(lowered.join().unwrap().ok());
+    assert_eq!(c.cmd(&["EXISTS", "big"]).i(), 0);
+    let counted = c.counted();
+    assert!(
+        counted <= limit,
+        "{counted} counted once freed, limit {limit}"
+    );
 }
 
 /// The last key evicted, a list of 100,000 elements, and still being freed
