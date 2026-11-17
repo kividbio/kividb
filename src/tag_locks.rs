@@ -286,15 +286,24 @@ pub fn take_next_script_allowed() -> bool {
 /// Held by a tagged script for as long as it runs: the note that this
 /// thread's commands are that script's and keep to its tags, and — for a
 /// script running beside others — its tags' locks.
+///
+/// What it holds is let go of out of line ([`Drop`]): the guard is an
+/// `Option` in the way of every command (`handler::run_command`), and the
+/// code to let go of several stripes has no business there.
 pub struct ScriptGuard {
-    _stripes: Stripes,
-    /// Entered before the stripes are taken, and let go of after them: a
-    /// read-only script (`EVAL_RO`) holds no write gate otherwise.
-    _gate: Option<crate::write_gate::WriteGuard>,
+    held: std::mem::ManuallyDrop<Held>,
     /// Whether this guard is the one that set the tag: a tagged script
     /// called by a tagged script leaves the outer one's in place.
     outermost: bool,
     _not_send: PhantomData<*const ()>,
+}
+
+/// What a [`ScriptGuard`] holds, let go of in this order.
+struct Held {
+    _stripes: Stripes,
+    /// Entered before the stripes are taken, and let go of after them: a
+    /// read-only script (`EVAL_RO`) holds no write gate otherwise.
+    _gate: Option<crate::write_gate::WriteGuard>,
 }
 
 /// The stripes a script holds: none (it runs alone), its one, or its
@@ -306,11 +315,14 @@ enum Stripes {
 }
 
 impl Drop for ScriptGuard {
+    #[inline(never)]
     fn drop(&mut self) {
         if self.outermost {
             SCRIPT_TAGS.with(|tags| tags.borrow_mut().clear());
             BESIDE_OTHERS.with(|beside| beside.set(false));
         }
+        // SAFETY: dropped here once; the field is not used again.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.held) }
     }
 }
 
@@ -332,8 +344,10 @@ fn hold(
         BESIDE_OTHERS.with(|beside| beside.set(gate.is_some()));
     }
     ScriptGuard {
-        _stripes: stripes,
-        _gate: gate,
+        held: std::mem::ManuallyDrop::new(Held {
+            _stripes: stripes,
+            _gate: gate,
+        }),
         outermost,
         _not_send: PhantomData,
     }
