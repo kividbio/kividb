@@ -5,8 +5,8 @@
 //! header before the member's own bytes) and a slot for it, and at ten
 //! members that is several times the members themselves. Here the members
 //! lie end to end in one buffer, and a member is found by scanning one byte
-//! a member: a *fingerprint* of it, kept together at the front, eight
-//! compared at a time. Only a member whose fingerprint matches is compared
+//! a member: a *fingerprint* of it, kept together at the front, eight or
+//! sixteen compared at a time. Only a member whose fingerprint matches is compared
 //! in full, so a lookup that misses reads `len` bytes and nothing else, and
 //! one that hits reads them and the member.
 //!
@@ -51,6 +51,22 @@ pub struct PackedSet {
     cap: u8,
 }
 
+/// `a == b` for two slices of one length, short ones (as members of a
+/// block are) by a word or two from each end rather than a call.
+#[inline(always)]
+fn same(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
+    let word = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().unwrap());
+    let half = |s: &[u8], at: usize| u32::from_le_bytes(s[at..at + 4].try_into().unwrap());
+    match n {
+        16.. => word(a, 0) == word(b, 0) && a[8..] == b[8..],
+        8.. => word(a, 0) == word(b, 0) && word(a, n - 8) == word(b, n - 8),
+        4.. => half(a, 0) == half(b, 0) && half(a, n - 4) == half(b, n - 4),
+        _ => a == b,
+    }
+}
+
 /// One byte of a member, for the scan: equal members have equal
 /// fingerprints, and different ones seldom do. The first and the last eight
 /// bytes take part (the whole member when it is shorter), with its length:
@@ -93,6 +109,7 @@ impl PackedSet {
     }
 
     /// Whether a member of this length may be held at all.
+    #[allow(dead_code)] // The server binary has no caller; the library's API keeps it.
     #[inline]
     pub fn takes(member: &[u8]) -> bool {
         member.len() <= MAX_LEN
@@ -105,7 +122,7 @@ impl PackedSet {
         cap + 2 * (cap + 1)
     }
 
-    #[inline]
+    #[inline(always)]
     fn offset(&self, i: usize) -> usize {
         let at = self.cap as usize + 2 * i;
         u16::from_le_bytes([self.buf[at], self.buf[at + 1]]) as usize
@@ -128,38 +145,108 @@ impl PackedSet {
     /// Where `member` is, if it is a member.
     #[inline]
     pub fn find(&self, member: &[u8]) -> Option<usize> {
-        let n = self.len();
-        if n == 0 || member.len() > MAX_LEN {
+        if self.len == 0 || member.len() > MAX_LEN {
             return None;
         }
-        let f = fingerprint(member);
-        let fingerprints = &self.buf[..n];
-        const LOW: u64 = 0x0101_0101_0101_0101;
-        const HIGH: u64 = 0x8080_8080_8080_8080;
-        let pattern = LOW.wrapping_mul(f as u64);
-        let mut i = 0;
-        while i + 8 <= n {
-            // A byte of `word` is zero where a fingerprint equals `f`. The
-            // test below marks every zero byte, and may mark a byte above
-            // one that is not: the full comparison settles it.
-            let word = u64::from_le_bytes(fingerprints[i..i + 8].try_into().unwrap()) ^ pattern;
-            let mut marks = word.wrapping_sub(LOW) & !word & HIGH;
-            while marks != 0 {
-                let at = i + (marks.trailing_zeros() as usize >> 3);
-                if self.get(at) == member {
-                    return Some(at);
+        self.find_by(member, fingerprint(member))
+    }
+
+    /// The fingerprint member `i` was filed under. `i < len()`.
+    #[inline]
+    pub fn fingerprint_at(&self, i: usize) -> u8 {
+        self.buf[i]
+    }
+
+    /// [`find`](Self::find) of a member of another block, whose fingerprint
+    /// is known already ([`fingerprint_at`](Self::fingerprint_at)): the
+    /// intersection of two blocks computes none.
+    #[inline]
+    pub fn find_fingerprinted(&self, member: &[u8], f: u8) -> Option<usize> {
+        if self.len == 0 || member.len() > MAX_LEN {
+            return None;
+        }
+        self.find_by(member, f)
+    }
+
+    /// The scan. The fingerprints take `cap` bytes, a multiple of eight,
+    /// and the offsets follow them, so a whole word (or vector) is always
+    /// there to be read; the places past the members are masked off, and
+    /// there is no byte-at-a-time tail. Sixteen fingerprints at a time with
+    /// SSE2 (every x86-64 has it), eight a word elsewhere.
+    #[inline(always)]
+    fn find_by(&self, member: &[u8], f: u8) -> Option<usize> {
+        let n = self.len();
+        let cap = self.cap as usize;
+        debug_assert!(n <= cap && cap.is_multiple_of(8));
+        let start = self.data_start();
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{
+                __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+            };
+            // The block is at least `3 * cap + 2` bytes (fingerprints and
+            // offsets), so 16 bytes from any `i < n <= cap` are in it.
+            assert!(self.buf.len() >= cap + 16);
+            let base = self.buf.as_ptr();
+            let mut i = 0;
+            while i < n {
+                // SAFETY: SSE2 is part of x86-64; `i + 16 <= cap + 16 <=
+                // buf.len()` (asserted above), and an unaligned load is
+                // what `loadu` is for.
+                let mut marks = unsafe {
+                    let needle = _mm_set1_epi8(f as i8);
+                    let chunk = _mm_loadu_si128(base.add(i).cast::<__m128i>());
+                    _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, needle)) as u32
+                };
+                // Past the members, nothing: no branch, `1 << 16` fits.
+                marks &= (1u32 << (n - i).min(16)).wrapping_sub(1);
+                while marks != 0 {
+                    let at = i + marks.trailing_zeros() as usize;
+                    if self.is_at(at, start, member) {
+                        return Some(at);
+                    }
+                    marks &= marks - 1;
                 }
-                marks &= marks - 1;
+                i += 16;
             }
-            i += 8;
+            None
         }
-        while i < n {
-            if fingerprints[i] == f && self.get(i) == member {
-                return Some(i);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            const LOW: u64 = 0x0101_0101_0101_0101;
+            const HIGH: u64 = 0x8080_8080_8080_8080;
+            let pattern = LOW.wrapping_mul(f as u64);
+            let mut i = 0;
+            while i < n {
+                // A byte of `word` is zero where a fingerprint equals `f`.
+                // The test below marks every zero byte, and may mark a byte
+                // above one that is not: the full comparison settles it.
+                let word = u64::from_le_bytes(self.buf[i..i + 8].try_into().unwrap()) ^ pattern;
+                let mut marks = word.wrapping_sub(LOW) & !word & HIGH;
+                if n - i < 8 {
+                    marks &= (1u64 << ((n - i) * 8)) - 1;
+                }
+                while marks != 0 {
+                    let at = i + (marks.trailing_zeros() as usize >> 3);
+                    if self.is_at(at, start, member) {
+                        return Some(at);
+                    }
+                    marks &= marks - 1;
+                }
+                i += 8;
             }
-            i += 1;
+            None
         }
-        None
+    }
+
+    /// Whether member `at` is `member`: the length first, from the two
+    /// offsets read as one word, then the bytes.
+    #[inline(always)]
+    fn is_at(&self, at: usize, start: usize, member: &[u8]) -> bool {
+        let o = self.cap as usize + 2 * at;
+        let both = u32::from_le_bytes(self.buf[o..o + 4].try_into().unwrap());
+        let (from, to) = ((both & 0xffff) as usize, (both >> 16) as usize);
+        to.wrapping_sub(from) == member.len() && same(&self.buf[start + from..start + to], member)
     }
 
     #[inline]
@@ -211,18 +298,13 @@ impl PackedSet {
         let old_cap = self.cap as usize;
         let cap = if old_cap == 0 { 8 } else { old_cap * 2 };
         debug_assert!(cap <= MAX_ENTRIES);
-        let data = if old_cap == 0 {
-            0
-        } else {
-            self.offset(n)
-        };
+        let data = if old_cap == 0 { 0 } else { self.offset(n) };
         let head = cap + 2 * (cap + 1);
         let mut buf = Vec::with_capacity(head + data + (data / 4).max(32));
         buf.resize(head, 0);
         if old_cap != 0 {
             buf[..n].copy_from_slice(&self.buf[..n]);
-            buf[cap..cap + 2 * (n + 1)]
-                .copy_from_slice(&self.buf[old_cap..old_cap + 2 * (n + 1)]);
+            buf[cap..cap + 2 * (n + 1)].copy_from_slice(&self.buf[old_cap..old_cap + 2 * (n + 1)]);
             let start = self.data_start();
             buf.extend_from_slice(&self.buf[start..start + data]);
         }
@@ -464,6 +546,25 @@ mod tests {
                 assert_eq!(held, model, "step {step}");
             }
         }
+    }
+
+    #[test]
+    fn a_member_of_another_block_is_found_by_its_fingerprint() {
+        let mut a = PackedSet::new();
+        let mut b = PackedSet::new();
+        for i in 0..100 {
+            a.insert(&member(i));
+            b.insert(&member(i + 50));
+        }
+        for i in 0..a.len() {
+            let f = a.fingerprint_at(i);
+            assert_eq!(f, fingerprint(a.get(i)));
+            assert_eq!(b.find_fingerprinted(a.get(i), f), b.find(a.get(i)));
+        }
+        assert_eq!(
+            PackedSet::new().find_fingerprinted(b"x", fingerprint(b"x")),
+            None
+        );
     }
 
     #[test]
