@@ -876,6 +876,40 @@ fn what_was_read_ahead_runs_a_read_at_a_time() {
     server.config_set("normal 0 0 0");
 }
 
+/// A large argument leaves a large buffer, but the reads after it still
+/// bring no more than a read's worth a turn.
+#[test]
+fn after_a_large_argument_a_turn_is_still_one_read() {
+    let _turn = serial();
+    // The io_uring loop reads into all of a large buffer.
+    let server = Server::start("tokio");
+    let small = "s".repeat(1000);
+    assert!(server.conn().cmd(&["SET", "s", &small]).ok());
+    server.config_set("normal 3mb 0 0");
+
+    // A 1 MB `SET`, then 20,000 `GET s`: 20 MB of replies in all, and
+    // 1.7 MB to a 32 KiB read.
+    let big = "b".repeat(MB);
+    let mut pipeline = format!("*3\r\n$3\r\nSET\r\n$1\r\nb\r\n${MB}\r\n{big}\r\n").into_bytes();
+    pipeline.extend_from_slice(&b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n".repeat(20_000));
+    let mut c = server.conn();
+    c.writer
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    c.writer
+        .write_all(&pipeline)
+        .expect("the server stopped reading");
+    assert!(c.read().unwrap().ok());
+    for i in 0..20_000 {
+        assert_eq!(c.read(), Some(V::Bulk(small.clone().into_bytes())), "{i}");
+    }
+    assert_eq!(
+        server.info_field("client_output_buffer_limit_disconnections"),
+        "0"
+    );
+    server.config_set("normal 0 0 0");
+}
+
 /// A blocking command writes the replies to what came before it as it
 /// parks, and the server reads the client while that write waits too.
 #[test]

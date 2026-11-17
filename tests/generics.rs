@@ -1485,6 +1485,49 @@ fn test_client_list_reserves_query_buffer_for_declared_large_argument() {
     );
 }
 
+#[test]
+fn test_large_pipeline_is_read_in_larger_reads_until_idle() {
+    // Another test's pause would hold a SET and read the rest uncounted.
+    let _lock = pause_lock();
+    let port = free_port();
+    start_server(port);
+    let mut client = Conn::connect(port);
+    let value = "v".repeat(994);
+    // Each SET is 1 KiB on the wire, so a 4 KiB read ends between commands.
+    let pipeline: String = (0..20)
+        .map(|i| format!("*3\r\n$3\r\nSET\r\n$3\r\nk{i:02}\r\n$994\r\n{value}\r\n"))
+        .collect();
+    assert_eq!(pipeline.len(), 20 * 1024);
+    let read_events = |client: &mut Conn| -> u64 {
+        let info = client.cmds(&["CLIENT", "INFO"]);
+        client_list_field(info.as_str(), "read-events=")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    // The reads a pipeline takes when all of it is waiting.
+    let reads_for_pipeline = |client: &mut Conn| -> u64 {
+        let before = read_events(client);
+        client
+            .stream
+            .write_all(b"*3\r\n$5\r\nDEBUG\r\n$5\r\nSLEEP\r\n$4\r\n0.05\r\n")
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        client.stream.write_all(pipeline.as_bytes()).unwrap();
+        for _ in 0..21 {
+            assert_eq!(client.read_value().as_str(), "OK");
+        }
+        // Less the reads of DEBUG SLEEP and CLIENT INFO.
+        read_events(client) - before - 2
+    };
+
+    assert_eq!(reads_for_pipeline(&mut client), 2, "4 KiB, then the rest");
+    assert_eq!(reads_for_pipeline(&mut client), 1, "room kept while busy");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(reads_for_pipeline(&mut client), 2, "given back when idle");
+    assert_eq!(client.cmds(&["GET", "k19"]).as_str(), value);
+}
+
 // CLIENT NO-EVICT is accepted
 #[test]
 fn test_client_no_evict() {

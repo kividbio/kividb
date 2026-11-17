@@ -211,6 +211,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Improved Tokio pipelined request throughput by reading directly into an
+  adaptive query buffer, reducing unnecessary copies and idle connection
+  memory (#432).**
 - **Small sets take a half to a twelfth of the memory (#297).** A set of
   up to 128 members of up to 64 bytes is kept in one block, the members end
   to end, where it was a hash table with an allocation for every member: 14-byte
