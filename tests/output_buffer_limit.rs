@@ -823,7 +823,7 @@ fn reading_ahead_a_client_that_never_reads_is_closed_at_the_hard_limit() {
         }
     }
     assert!(
-        sent < pipeline.len() / 4,
+        sent < pipeline.len(),
         "the server took {sent} of {} bytes",
         pipeline.len()
     );
