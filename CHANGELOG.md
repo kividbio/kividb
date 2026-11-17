@@ -251,8 +251,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keyspace-event watches, `MONITOR`) are now out of line, so the code every
   command runs is smaller. Measured in instructions per command, pipelined:
   `GET` about 40 fewer and `SET` about 80 fewer (1-2% of the whole server's
-  work for one), and about 100 fewer for each with Lua built in (3%); a `MULTI`/`EXEC` of two `SET`s about 90 fewer
-  (160 with Lua). Nothing a command does or answers has changed.
+  work for one), and about 100 fewer for each with Lua built in (3%); a
+  `MULTI`/`EXEC` of two `SET`s about 90 fewer (160 with Lua). Nothing a
+  command does or answers has changed.
 - **Scripts whose keys carry several hash tags run beside other commands
   (#871).** With `lua-parallel-scripts yes`, a script ran beside others only
   when all its `KEYS` shared one hash tag; one whose keys carried two, as

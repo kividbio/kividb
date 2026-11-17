@@ -41,6 +41,9 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 TAG=${1:?usage: stability.sh <tag>}
+# results.txt keeps every run: this run's rows carry a tag of their own, so
+# that a row left from an earlier run is never read as this one's.
+TAG="$TAG-$(date +%Y%m%d-%H%M%S)"
 LIMIT=${LIMIT:-3}
 export CMP=${CMP-plain} EXEC=1
 OUT="$(git rev-parse --show-toplevel)/target/perf"
@@ -48,14 +51,19 @@ status=0
 for model in ${MODELS:-uring tokio}; do
   MODEL=$model bash "$HERE/run.sh" "$TAG-$model" > /dev/null
   MODEL=$model NOOP=1 bash "$HERE/run.sh" "$TAG-$model-noop" > /dev/null
-  echo "== $model: $TAG -> $TAG-noop"
+  echo "== $model: $TAG-$model -> $TAG-$model-noop (in $OUT/results.txt)"
   awk -v a="$TAG-$model" -v b="$TAG-$model-noop" -v limit="$LIMIT" '
     $2 == a { if (!($1 in base)) order[++n] = $1; base[$1] = $3 }
     $2 == b { noop[$1] = $3 }
     END {
       bad = 0
+      # No -EXEC row at all (a build or a run that failed) is no verdict.
+      exec = 0
+      for (i = 1; i <= n; i++) if (order[i] ~ /-EXEC$/) exec++
+      if (exec == 0) { print "no -EXEC rows for " a; exit 1 }
       for (i = 1; i <= n; i++) {
-        w = order[i]; if (!(w in noop)) continue
+        w = order[i]
+        if (!(w in noop)) { printf "%-16s %8d  (no row for %s)  MISSING\n", w, base[w], b; bad = 1; continue }
         d = noop[w] - base[w]; flag = ""
         if (w ~ /-EXEC$/ && (d > limit || d < -limit)) { flag = "  MOVED"; bad = 1 }
         printf "%-16s %8d %8d %+6d%s\n", w, base[w], noop[w], d, flag

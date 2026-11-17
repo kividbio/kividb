@@ -1810,8 +1810,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // times as it is named, as when its use was written after the command,
         // a lookup for each place it is named. Its own lookups count up to that
         // many; these make up the rest.
-        if scope.is_counting() {
-            use_keys_named_more_than_once(ctx);
+        if scope.is_counting()
+            && let Some(named) = crate::store::AccessScope::named_more_than_once()
+        {
+            use_keys_named_more_than_once(ctx, named);
         }
         drop(scope);
     }
@@ -1917,9 +1919,11 @@ fn key_exists(ctx: &Ctx, key: &[u8]) -> bool {
 }
 
 /// What `notify-keyspace-events` needs to know of the keys before a command
-/// runs, to announce afterwards what it did to them. Boxed and built out of
-/// line: `run_command` keeps one pointer across the command, not three
-/// vectors, when it is on, and nothing but a load when it is off (#867).
+/// runs, to announce afterwards what it did to them. Built only when one
+/// of those classes is on: off, it costs `run_command` a load and a branch,
+/// and one value kept across the command instead of three (#867). Nothing
+/// is allocated for it beyond what the vectors hold, and nothing at all
+/// when there is nothing to watch.
 struct KeyspaceWatch {
     /// `n`: the places of the keys a write names that are not there now,
     /// to see afterwards which of them it created.
@@ -1938,55 +1942,64 @@ impl KeyspaceWatch {
         | crate::keyspace_events::KS_TYPE_CHANGED;
 
     /// The watch of the command `name`, if any of those classes is on and
-    /// there is something to watch.
-    #[cold]
-    #[inline(never)]
-    fn begin(ctx: &Ctx, name: &str, writes_operation: bool) -> Option<Box<KeyspaceWatch>> {
+    /// there is something to watch. Inline, as is `end`: with `m` on every
+    /// read comes here, with `o` or `c` every write, and out of line (cold
+    /// or not) the calls and the moves of the watch cost a read that
+    /// missed 70 instructions and a write 50 more than the same code inline
+    /// in `run_command`. Behind the one test of the flags in `run_command`,
+    /// they cost a command nothing while the events are off.
+    #[inline(always)]
+    fn begin(ctx: &Ctx, name: &str, writes_operation: bool) -> Option<KeyspaceWatch> {
         let flags = || crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
-        let absent = if writes_operation && flags() & crate::keyspace_events::KS_NEW != 0 {
+        if !writes_operation {
+            // A read has only `m` to watch. It never fired (#160). `EXISTS`
+            // and `TYPE` only ask, as in Redis.
+            if flags() & crate::keyspace_events::KS_KEY_MISS == 0
+                || matches!(name, "EXISTS" | "TYPE" | "TOUCH" | "OBJECT")
+            {
+                return None;
+            }
+            let missed = named_keys_absent(ctx, name);
+            if missed.is_empty() {
+                return None;
+            }
+            return Some(KeyspaceWatch {
+                absent: Vec::new(),
+                missed,
+                replacing: None,
+            });
+        }
+        let absent = if flags() & crate::keyspace_events::KS_NEW != 0 {
             named_keys_absent(ctx, name)
         } else {
             Vec::new()
         };
-        // It never fired (#160). `EXISTS` and `TYPE` only ask, as in Redis.
-        let missed = if !writes_operation
-            && flags() & crate::keyspace_events::KS_KEY_MISS != 0
-            && !matches!(name, "EXISTS" | "TYPE" | "TOUCH" | "OBJECT")
-        {
-            named_keys_absent(ctx, name)
-        } else {
-            Vec::new()
-        };
-        let replacing = if writes_operation
-            && flags()
-                & (crate::keyspace_events::KS_OVERWRITTEN | crate::keyspace_events::KS_TYPE_CHANGED)
-                != 0
+        let replacing = if flags()
+            & (crate::keyspace_events::KS_OVERWRITTEN | crate::keyspace_events::KS_TYPE_CHANGED)
+            != 0
         {
             replace_watch_begin(ctx, name)
         } else {
             None
         };
-        if absent.is_empty() && missed.is_empty() && replacing.is_none() {
+        if absent.is_empty() && replacing.is_none() {
             return None;
         }
-        Some(Box::new(KeyspaceWatch {
+        Some(KeyspaceWatch {
             absent,
-            missed,
+            missed: Vec::new(),
             replacing,
-        }))
+        })
     }
 
     /// After the command: `overwritten` / `type_changed`, `new`, `keymiss`.
-    /// Takes the box, so that it is freed here, out of `run_command`.
-    #[cold]
-    #[inline(never)]
-    #[allow(clippy::boxed_local)]
-    fn end(self: Box<Self>, ctx: &Ctx) {
+    #[inline(always)]
+    fn end(self, ctx: &Ctx) {
         let KeyspaceWatch {
             absent,
             missed,
             replacing,
-        } = *self;
+        } = self;
         if let Some(watch) = replacing {
             replace_watch_end(ctx, watch);
         }
@@ -2000,9 +2013,9 @@ impl KeyspaceWatch {
 }
 
 /// The places of the keys the command names that are not there now: for
-/// `notify-keyspace-events` `n` and `m`. See `run_command`.
-#[cold]
-#[inline(never)]
+/// `notify-keyspace-events` `n` and `m`. See `KeyspaceWatch`. Inline,
+/// as the code it replaces was.
+#[inline(always)]
 fn named_keys_absent(ctx: &Ctx, name: &str) -> Vec<usize> {
     crate::keyspec::key_positions(name, &ctx.cmd)
         .iter()
@@ -2012,8 +2025,7 @@ fn named_keys_absent(ctx: &Ctx, name: &str) -> Vec<usize> {
 
 /// `new` for each key at the places `absent` (absent before the command)
 /// that is there now.
-#[cold]
-#[inline(never)]
+#[inline]
 fn announce_new_keys(ctx: &Ctx, absent: Vec<usize>) {
     for pos in absent {
         let key = ctx.cmd[pos];
@@ -2030,8 +2042,7 @@ fn announce_new_keys(ctx: &Ctx, absent: Vec<usize>) {
 }
 
 /// `keymiss` for each key at the places `missed`.
-#[cold]
-#[inline(never)]
+#[inline]
 fn announce_missed_keys(ctx: &Ctx, missed: Vec<usize>) {
     for pos in missed {
         crate::keyspace_events::notify(
@@ -2046,8 +2057,8 @@ fn announce_missed_keys(ctx: &Ctx, missed: Vec<usize>) {
 
 /// With keyspace events on, after a write: the events of the commands
 /// that announce none of their own (#160), unless it failed or parked.
-#[cold]
-#[inline(never)]
+/// Inline, as it was: with any class of events on, every write comes here.
+#[inline(always)]
 fn announce_command_events(ctx: &Ctx, name: &str, result: &[u8]) {
     if result.starts_with(b"-") || crate::commands::blocking::parked(ctx) {
         return;
@@ -2065,14 +2076,12 @@ fn announce_command_events(ctx: &Ctx, name: &str, result: &[u8]) {
     }
 }
 
-/// Under LFU: the keys the command named more than once used as many more
-/// times as its own lookups did not count. See `run_command`.
+/// Under LFU: the keys the command named more than once (`named`, with how
+/// many times) used as many more times as its own lookups did not count.
+/// See `run_command`, which asks whether there are any.
 #[cold]
 #[inline(never)]
-fn use_keys_named_more_than_once(ctx: &Ctx) {
-    let Some(named) = crate::store::AccessScope::named_more_than_once() else {
-        return;
-    };
+fn use_keys_named_more_than_once(ctx: &Ctx, named: Vec<(Box<[u8]>, u8)>) {
     let db = *ctx.selected_db;
     for (key, times) in named {
         let map = crate::read_lock!(crate::store::get_shard_of_bytes(&ctx.store[db], &key));
@@ -2093,8 +2102,8 @@ fn use_named_keys(ctx: &Ctx, name: &str, wrote: bool) {
 }
 
 /// A command no handler of `dispatch_command_handlers` knows: a script's,
-/// or there is no such command.
-#[cold]
+/// or there is no such command. Out of line, but not cold: every `EVAL`,
+/// `EVALSHA` and `FCALL` comes this way.
 #[inline(never)]
 fn not_dispatched(ctx: &mut Ctx, name: &str) -> Vec<u8> {
     lua::handle(ctx, name).unwrap_or_else(|| unknown_command(&ctx.cmd))
