@@ -17,12 +17,16 @@ memtier draws a new key for each). Checked with MONITOR on memtier 2.6.1:
   "INCRBY" "rl:74738" "1"
   "EXPIRE" "rl:74738" "60"
 
-(12,754 pairs in a one-second run, every EXPIRE on its INCRBY's key.)
+(12,754 pairs in a one-second run, every EXPIRE on its INCRBY's key.) The
+suite checks it each time, before anything is measured: a one-second run
+under MONITOR, which fails the suite if any pair is on two keys.
 
 Each connection count: one warm-up run, then RUNS runs of SECONDS; the metric
 is the median. Rows per connection count: ops/s, and p99 shown beside it.
 `keys_without_ttl`, counted over every key after the runs, must be 0: a key
 the INCRBY made and no EXPIRE reached would be a counter that never resets.
+The suite fails if the scan sees under 90 % of the keys, or a run does no
+work, rather than count nothing and pass.
 
 CPU: on Linux the server's threads (all of them, `/proc/<pid>/task`) are
 pinned to the first half of the CPUs this process may use and memtier to the
@@ -40,10 +44,14 @@ it logs for an error reply): `$MEMTIER`, else on PATH.
 """
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from suite import (Suite, Config, THROUGHPUT, bound, info, jitter, vs_redis, median, scaled)  # noqa: E402
@@ -103,12 +111,12 @@ def memtier_bin():
     raise RuntimeError("memtier_benchmark not found ($MEMTIER or PATH)")
 
 
-def memtier(memtier_path, port, conns, seconds, keys):
+def memtier(memtier_path, port, conns, seconds, keys, threads=THREADS):
     """One run -> (ops/s, p99 ms)."""
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "out.json")
         cmd = [memtier_path, "-s", "127.0.0.1", "-p", str(port), "--protocol=redis",
-               "-t", str(THREADS), "-c", str(conns // THREADS), "--test-time", str(seconds),
+               "-t", str(threads), "-c", str(max(1, conns // threads)), "--test-time", str(seconds),
                "--pipeline", "2", "--transaction", "--key-prefix=rl:",
                "--key-minimum=1", "--key-maximum=%d" % keys,
                "--distinct-client-seed", "--hide-histogram", "--json-out-file", out]
@@ -128,11 +136,64 @@ def memtier(memtier_path, port, conns, seconds, keys):
                                % (len(errors), "\n".join(errors[:5])))
         with open(out) as f:
             total = json.load(f)["ALL STATS"]["Totals"]
+    if not total["Ops/sec"] > 0:
+        raise RuntimeError("memtier_benchmark did no work: %r" % total)
     return total["Ops/sec"], total["Percentile Latencies"]["p99.00"]
 
 
+MONITOR_LINE = re.compile(r'\[\d+ ([^\]]+)\] "(INCRBY|EXPIRE)" "([^"]*)"')
+
+
+def check_one_key(memtier_path, port, keys):
+    """A one-second run under MONITOR: every EXPIRE is on the key of the
+    INCRBY its connection sent before it. -> (pairs, pairs on two keys).
+    Raises if there were none, or any was on two keys: a memtier whose
+    `--transaction` no longer keeps one key a pass would otherwise measure
+    another workload, and leave counters that never reset."""
+    sock = socket.create_connection(("127.0.0.1", port))
+    sock.sendall(b"MONITOR\r\n")
+    chunks, stop = [], threading.Event()
+
+    def read():
+        sock.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                data = sock.recv(1 << 16)
+            except socket.timeout:
+                continue
+            if not data:
+                return
+            chunks.append(data)
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    try:
+        time.sleep(0.2)
+        memtier(memtier_path, port, 4, 1, keys, threads=1)
+        time.sleep(0.5)
+    finally:
+        stop.set()
+        reader.join()
+        sock.close()
+    last, pairs, apart = {}, 0, 0
+    for line in b"".join(chunks).decode("utf-8", "replace").splitlines():
+        m = MONITOR_LINE.search(line)
+        if not m:
+            continue
+        client, command, key = m.groups()
+        if command == "INCRBY":
+            last[client] = key
+        else:
+            pairs += 1
+            apart += last.get(client) != key
+    if pairs == 0 or apart:
+        raise RuntimeError("MONITOR: %d of %d INCRBY + EXPIRE pairs on two keys" % (apart, pairs))
+    return pairs, apart
+
+
 def keys_without_ttl(c):
-    """Keys with no time to live: an INCRBY that no EXPIRE reached."""
+    """Keys with no time to live: an INCRBY that no EXPIRE reached. -> (keys
+    without one, keys seen)."""
     missing, seen = 0, 0
     cursor = 0
     while True:
@@ -159,6 +220,8 @@ def run(ctx):
         pin_server(ctx.pid)
     ctx.raw["cpus"] = {"pinned": pinned, "server": SERVER_CPUS, "client": CLIENT_CPUS,
                        "os_cpus": os.cpu_count()}
+    pairs, _ = check_one_key(memtier_path, ctx.port, keys)
+    ctx.raw["monitor_pairs"] = pairs
     ctx.raw["runs"] = {}
     for conns, floor in CONNS.items():
         memtier(memtier_path, ctx.port, conns, WARMUP_SECONDS, keys)
@@ -171,6 +234,10 @@ def run(ctx):
         ctx.emit("p99_ms_c%d" % conns, median(p99), "ms", "lower", gate=jitter(info()), samples=p99)
     missing, seen = keys_without_ttl(c)
     ctx.raw["keys_seen"] = seen
+    # Counted over the keys the runs made, or it says nothing: a wrong
+    # prefix, or runs that did no work, would leave none to count.
+    if seen < 0.9 * keys:
+        raise RuntimeError("the scan saw %d rl:* keys of %d" % (seen, keys))
     ctx.emit("keys_without_ttl", missing, "keys", "lower", gate=bound(max=0))
 
 
