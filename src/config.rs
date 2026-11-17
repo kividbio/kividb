@@ -746,13 +746,23 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The worker threads to start: `--threads`, or with `0` (auto) one per
+    /// CPU the process may run on, its affinity mask and cgroup CPU quota
+    /// counted (src/cpus.rs).
     pub fn resolve_threads(&self) -> usize {
         if self.threads > 0 {
             return self.threads;
         }
-        std::thread::available_parallelism()
-            .map(|n| if n.get() < 4 { n.get() } else { n.get() - 2 })
-            .unwrap_or(12)
+        crate::cpus::available(&crate::cpus::detect()).threads
+    }
+
+    /// How [`Config::resolve_threads`] came to its number, for the banner.
+    pub fn threads_reason(&self) -> String {
+        if self.threads > 0 {
+            return "--threads".into();
+        }
+        let auto = crate::cpus::available(&crate::cpus::detect());
+        format!("auto: one per available CPU; {}", auto.reason)
     }
 
     pub fn addr(&self) -> String {
