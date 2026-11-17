@@ -2535,6 +2535,10 @@ fn a_replica_restarted_while_its_master_is_down_keeps_the_shard_id_it_learnt() {
     nodes[0].kill();
     replica.restart();
     assert_eq!(shard_of(&replica), shard);
+    wait_until("the replica to be promoted", Duration::from_secs(30), || {
+        replica.is_master()
+    });
+    assert_eq!(shard_of(&replica), shard);
 }
 
 /// An automatic failover keeps the shard's id too, and another node's

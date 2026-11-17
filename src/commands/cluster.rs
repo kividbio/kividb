@@ -663,8 +663,11 @@ fn cmd_shards(state: &ClusterState) -> Vec<u8> {
 /// shard id: two can share one, an old master back for a moment before it
 /// says it is a replica, or a replica reset into an empty master that keeps
 /// its id and is given slots. A master that owns none joins the entry of a
-/// slot owner of its shard only when it has failed (`FAIL` or `PFAIL`): the
-/// master a replica took over from, which Redis shows in that shard (#563).
+/// slot owner of its shard only when it has failed (`FAIL`): the master a
+/// replica took over from, which Redis shows in that shard (#563). One
+/// only suspected (`PFAIL`) still reads `online` in its description, and a
+/// client that takes an entry's last online master would send it the
+/// owner's slots.
 /// Any other master has an entry of its own.
 fn shard_entries(
     nodes: &ahash::AHashMap<crate::cluster::NodeId, crate::cluster::ClusterNode>,
@@ -681,7 +684,7 @@ fn shard_entries(
         .map(|m| vec![*m])
         .collect();
     for master in masters.iter().filter(|m| !owners.contains(&m.id)) {
-        let failed = master.flags.intersects(NodeFlags::PFAIL | NodeFlags::FAIL);
+        let failed = master.flags.contains(NodeFlags::FAIL);
         match entries
             .iter_mut()
             .find(|e| failed && owners.contains(&e[0].id) && e[0].shard_id == master.shard_id)
@@ -2994,7 +2997,7 @@ mod tests {
         let [a, b, failed, suspect, empty, replica] = ids;
 
         let entries = shard_entries(&nodes, &slots);
-        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries.len(), 4, "{entries:?}");
         let of = |id| {
             entries
                 .iter()
@@ -3010,12 +3013,9 @@ mod tests {
         assert_eq!(folded.len(), 1, "{entries:?}");
         let folded = folded[0];
         assert!(folded[0] == a || folded[0] == b);
-        assert_eq!(
-            folded.len(),
-            4,
-            "the failed and the suspect master, and a replica"
-        );
-        assert!(folded.contains(&failed) && folded.contains(&suspect));
+        assert_eq!(folded.len(), 3, "the failed master and its replica");
+        assert!(folded.contains(&failed) && !folded.contains(&suspect));
+        assert_eq!(of(suspect), vec![suspect], "a suspected master is apart");
         assert_eq!(
             *folded.last().unwrap(),
             replica,
