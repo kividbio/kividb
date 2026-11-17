@@ -306,6 +306,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
+- **Lists take about half the memory.** A list's elements are kept end to
+  end in chunks of up to 64, each element between two copies of its length,
+  where every element had an allocation, a shared header and a slot of its
+  own: 32-byte elements take 50.4 bytes an element in lists of 10 (76.0
+  before; Redis 8.10.2 45.0), 38.1 in lists of 100 (65.2; Redis 36.4) and
+  36.7 from 1,000 elements up (64.1 to 69.8; Redis 34.3 to 34.6).
+  - A push or a pop at either end moves nothing in its chunk: each chunk
+    has room at both ends. While a list is pushed to and popped from only
+    at its ends, element `i` is found by arithmetic; after an `LINSERT` or
+    `LREM` in the middle the list counts its chunks from the nearer end, as
+    a Redis quicklist always does.
+  - A list keeps its elements apart, as before, from the first time an
+    element longer than 1,024 bytes is pushed, set or inserted; never back,
+    until it is emptied and deleted.
+  - `OBJECT ENCODING` reports the form: `listpack` while a list is one
+    chunk, `quicklist` otherwise. Redis closes a node at
+    `list-max-listpack-size` (8 kB) rather than at 64 elements, so the two
+    differ for lists of 65 to about 240 small elements, short lists with an
+    element of 1,025 to 8,192 bytes, and up to 64 elements of more than
+    8 kB in all; `list-max-listpack-size` and `list-compress-depth` are
+    accepted and change nothing, as before.
+  - Instructions a command (one thread, pipeline 16, io_uring and Tokio):
+    `LRANGE` of 10 elements costs 18 % fewer and of 100 elements 45 %
+    fewer (lengths are written as digits, not formatted); `LPOP` and
+    `RPOP` 2 to 3 % fewer, a push that makes a list 2 % fewer, `RPUSH` 1 %
+    fewer; the capped list (`LPUSH` + `LTRIM`), `LPOS`, `BLPOP`, `GET` and
+    `SET` are unchanged. `LPUSH` onto a list costs up to 0.9 % more,
+    `LINDEX` at an end up to 2 %; `LMOVE` 4 % and `RPOPLPUSH` 6 to 7 % more
+    (the element is copied into the destination's chunk where its block
+    was handed over); `LINDEX` and `LSET` in the middle of a chunk up to
+    8.5 % more (up to 32 lengths stepped over), and about twice as much on
+    a list of 100,000 that an `LINSERT` made irregular (its chunks are
+    counted); `LINSERT` 7 % and `LREM` 11 % more.
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write elements as text, so their formats do not change: 1.2.2 reads what
+    this release writes and the other way round. A snapshot of one
+    3,000,000-element list loads in 0.31 s (0.42 s before), of 300,000
+    ten-element lists in 0.64 s (0.64 s), into half and two thirds of the
+    memory. `MEMORY USAGE`
+    counts the chunks as allocated; eviction's estimate of what freeing a
+    list gives back is their bytes, and lazy freeing's effort their number.
+
 - **Active defrag's pass ends about twice as fast, at the same CPU cap
   (#240, #291).** It slept after every batch of 128 buckets, and each sleep
   overshot; it now sleeps once a millisecond of work is owed its rest, at

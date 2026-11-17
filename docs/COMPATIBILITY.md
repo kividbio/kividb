@@ -139,6 +139,24 @@ other files:
   128, an intset that passes it becomes a `listpack` where Redis makes a
   `hashtable`; at the defaults the two agree.
 
+**Lists**
+- A list's elements are kept end to end in chunks of up to 64, as Redis
+  keeps a quicklist of listpacks, but the size of a chunk is fixed: Redis
+  closes a node at `list-max-listpack-size` (8 kB by default), KiviDB at 64
+  elements. A list that has had an element longer than 1,024 bytes keeps
+  every element in a block of its own from then on, as 1.2 kept every list.
+- `OBJECT ENCODING` says `listpack` while a list is one chunk and
+  `quicklist` otherwise, so it differs from Redis for lists of 65 to about
+  240 small elements and for short lists with an element of 1,025 to 8,192
+  bytes (Redis: `listpack`, KiviDB: `quicklist`), and for up to 64 elements
+  of more than 8 kB in all (Redis: `quicklist`, KiviDB: `listpack`). Redis
+  goes back to `listpack` when a quicklist shrinks to one node of half the
+  limit; KiviDB when it is down to one chunk, and never once its elements
+  are kept apart.
+- `list-max-listpack-size`, `list-max-ziplist-size` and
+  `list-compress-depth` are accepted and reported, and change nothing: no
+  chunk is compressed.
+
 **Durability**
 - With the AOF on, a write is acknowledged once its record is in the file,
   as in Redis: a hard kill (`kill -9`, the OOM killer) loses no acknowledged
