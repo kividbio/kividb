@@ -190,6 +190,7 @@ where
         // A resumed handler parked again — it forgot its resume check. Reply
         // as if the wait timed out rather than looping forever.
         slot.clear_resume();
+        slot.release_count();
         return Err(crate::resp::write::resp_null_array());
     }
 
@@ -221,6 +222,7 @@ where
         // to write to it goes with it.
         combined.clear();
         waiter.interrupted.gone = true;
+        slot.release_count();
         return Err(Vec::new());
     }
     if let Some(subs) = subscriptions {
@@ -234,6 +236,10 @@ where
     if let Some(delay) = crate::commands::blocking::test_park_delay() {
         tokio::time::sleep(delay).await;
     }
+    // Counted as blocked until the dispatch that resumes it has been counted
+    // in `commandstats`: a resumed command that parks again goes on with
+    // the count it has (#896).
+    let mut counted = slot.take_count();
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     waiter
         .client_registry
@@ -248,6 +254,7 @@ where
         waiter.interrupted.role_changed = true;
         None
     } else {
+        counted.get_or_insert_with(crate::commands::blocking::BlockedCount::enter);
         let waiting = wait.wait();
         tokio::pin!(waiting);
         let mut temp = [0u8; 4096];
@@ -313,6 +320,7 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, None, false);
+    slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
     if !waiter.interrupted.gone

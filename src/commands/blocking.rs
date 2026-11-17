@@ -418,6 +418,30 @@ pub struct BlockingSlot {
     owner: u64,
     /// Whether the dispatch under way collects the clients it wakes.
     collecting: bool,
+    /// The client's count in `blocked_clients` from the end of its wait to
+    /// the end of the dispatch that resumes it. See [`BlockedCount`].
+    held_count: Option<BlockedCount>,
+}
+
+/// One client's place in `blocked_clients`, for as long as its blocking
+/// command is not done: from the moment it parks until the dispatch that
+/// resumes it has run and been counted in `INFO commandstats`. Counted off
+/// when this is dropped, so a reader that sees the client no longer blocked
+/// also sees the call (#896). A zero-sized token: the slot holds it between
+/// the end of the wait and the end of the resume dispatch.
+pub struct BlockedCount;
+
+impl BlockedCount {
+    pub fn enter() -> Self {
+        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        BlockedCount
+    }
+}
+
+impl Drop for BlockedCount {
+    fn drop(&mut self) {
+        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Drop for BlockingSlot {
@@ -605,6 +629,24 @@ impl BlockingSlot {
     fn resume_over(&mut self) {
         self.ctl.state = None;
         self.ctl.resume = None;
+        // The call is counted by now: the client stops being blocked.
+        self.held_count = None;
+    }
+
+    /// The count the last wait left, for a wait that follows it (a resumed
+    /// command that parks again) to go on with.
+    pub fn take_count(&mut self) -> Option<BlockedCount> {
+        self.held_count.take()
+    }
+
+    /// Keep the client counted as blocked until its resume dispatch is over.
+    pub fn hold_count(&mut self, count: Option<BlockedCount>) {
+        self.held_count = count;
+    }
+
+    /// The client is not going to be resumed: stop counting it.
+    pub fn release_count(&mut self) {
+        self.held_count = None;
     }
 
     /// Whether the dispatch just completed was a resume.
@@ -1116,18 +1158,10 @@ impl BlockingWait {
     /// receiver is raced in its own task and the first to fire wins. Keeping the
     /// mechanism identical is deliberate — the change being made here is *where*
     /// the wait happens, not how it resolves.
+    ///
+    /// Not counted in `blocked_clients` here: the connection loop holds a
+    /// [`BlockedCount`] across the wait and the resume dispatch.
     pub async fn wait(self) -> Delivery {
-        // Counted for as long as this future lives, and uncounted when it is
-        // dropped — which it is, without finishing, when the client goes
-        // away or is unblocked while it waits.
-        struct Counted;
-        impl Drop for Counted {
-            fn drop(&mut self) {
-                crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
-        let _counted = Counted;
         self.race().await
     }
 

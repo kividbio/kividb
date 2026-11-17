@@ -383,6 +383,7 @@ async fn park_blocking_uring(
         // A resumed handler parked again — it forgot its resume check. Reply as
         // if the wait timed out rather than looping forever.
         slot.clear_resume();
+        slot.release_count();
         return Err(crate::resp::write::resp_null_array());
     }
 
@@ -406,6 +407,7 @@ async fn park_blocking_uring(
             // Socket is gone, or shut down for a limit — don't park on a dead
             // connection.
             interrupted.gone = true;
+            slot.release_count();
             return Err(Vec::new());
         }
     }
@@ -422,6 +424,9 @@ async fn park_blocking_uring(
         tokio::time::sleep(delay).await;
     }
     let (client_registry, client_id) = client;
+    // Counted as blocked until the dispatch that resumes it has been counted
+    // in `commandstats` (see `server::park_blocking`, #896).
+    let mut counted = slot.take_count();
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = watch.fd;
@@ -435,6 +440,7 @@ async fn park_blocking_uring(
         interrupted.role_changed = true;
         None
     } else {
+        counted.get_or_insert_with(crate::commands::blocking::BlockedCount::enter);
         let waiting = wait.wait();
         tokio::pin!(waiting);
         // Whether the client is still there. A read cannot be raced against
@@ -476,6 +482,7 @@ async fn park_blocking_uring(
         }
     };
     client_registry.set_blocked(client_id, None, false);
+    slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
     if !interrupted.gone
