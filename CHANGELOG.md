@@ -399,6 +399,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TS.ADD` or `TS.MADD`, so the re-logged record — and any such record an
   earlier 1.2.1 already wrote — replays at the time 1.2.0 kept.
 
+- **`TS.ADD` and `TS.INCRBY` send the time they replied with to replicas
+  and the AOF.** `TS.ADD` sends the time of the sample it added as the
+  number it replied, as `TS.MADD`, `TS.INCRBY` and `TS.DECRBY` do, in place
+  of the time as the client wrote it (`+5`, `007`): the plain number every
+  version reads. A time of `-0` is refused by every command that takes a
+  sample's time, as RedisTimeSeries and 1.2.0 refuse it. And a
+  `TS.INCRBY` or `TS.DECRBY` record written by 1.2.0, which a replica
+  applies as 1.2.0 read it, is logged again as 1.2.0 wrote it: the
+  replica's AOF and its own replicas read it as the replica did.
+
 - **A replica continued by a dataset digest keeps the new stream's id as
   its resync point (#402).** A master killed and started again from its
   AOF begins a new stream; a replica that proved its dataset was that
