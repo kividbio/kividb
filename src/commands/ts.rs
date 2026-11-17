@@ -153,14 +153,22 @@ fn option_number(value: &[u8]) -> Option<u64> {
 /// From a client, `0` to `i64::MAX`, as RedisTimeSeries, which reads it as
 /// a `long long`: a time above that was taken, and then replied, sent to
 /// replicas and logged as a negative number, which they refused: the
-/// sample lost there (#592). From the AOF or a master, any `u64`, which an
-/// older version took and kept.
+/// sample lost there (#592). Not even `-0`, which is refused, as
+/// RedisTimeSeries and 1.2.0 refuse it. From the AOF or a master, any
+/// `u64`, which an older version took and kept — or that negative number,
+/// which is the same 64 bits, as `written_by_1_2_0` reads one: a replica
+/// re-logs the `TS.INCRBY` of a 1.2.0 master with the time 1.2.0 sent, and
+/// its own replay refused it (#611).
 fn sample_time(word: &[u8], strict: bool) -> Option<u64> {
     let text = std::str::from_utf8(word).ok()?;
     if strict {
-        text.parse::<i64>().ok().and_then(|t| u64::try_from(t).ok())
+        text.parse::<u64>()
+            .ok()
+            .filter(|&t| i64::try_from(t).is_ok())
     } else {
-        text.parse().ok()
+        text.parse::<u64>()
+            .ok()
+            .or_else(|| text.parse::<i64>().ok().map(|t| t as u64))
     }
 }
 
@@ -448,6 +456,26 @@ fn written_by_1_2_0(tokens: &[&[u8]]) -> Option<TsOptions> {
         timestamp: Some(at),
         ..Default::default()
     })
+}
+
+/// A `TS.INCRBY` or `TS.DECRBY` (the whole command) that is read as 1.2.0
+/// read it: from the AOF or a master, without 1.2.1's mark, and ending
+/// `TIMESTAMP <time>` (`written_by_1_2_0`). Its options, `None` for any
+/// other command.
+fn record_of_1_2_0(ctx: &Ctx, cmd: &[&[u8]]) -> Option<TsOptions> {
+    if strict_options(ctx) || cmd.get(3).is_some_and(|word| *word == INCRBY_MARK) {
+        return None;
+    }
+    written_by_1_2_0(cmd.get(3..)?)
+}
+
+/// Whether the `TS.INCRBY` or `TS.DECRBY` `cmd` was applied as 1.2.0's
+/// record: for the replication feed, which then logs it (a replica to its
+/// AOF, and so to a backup taken from it) as 1.2.0 wrote it, so that it is
+/// read again as it was here. Sent in 1.2.1's form, behind the mark, it was read
+/// with its options, which 1.2.0 passed over.
+pub(crate) fn applied_as_1_2_0(ctx: &Ctx, cmd: &[&[u8]]) -> bool {
+    record_of_1_2_0(ctx, cmd).is_some()
 }
 
 /// Where a `TS.INCRBY` or `TS.DECRBY` (the whole command) has its
@@ -1110,11 +1138,7 @@ fn ts_incrby(ctx: &mut Ctx, sign: f64) -> Option<Vec<u8>> {
     //
     // From the AOF or a master, a record without 1.2.1's mark is one 1.2.0
     // sent, and is read as 1.2.0 read it (`written_by_1_2_0`).
-    let of_1_2_0 = if !strict && cmd.get(3).is_none_or(|word| *word != INCRBY_MARK) {
-        written_by_1_2_0(&cmd[3..])
-    } else {
-        None
-    };
+    let of_1_2_0 = record_of_1_2_0(ctx, cmd);
     let trim = of_1_2_0.is_none();
     let options = match of_1_2_0 {
         Some(v) => v,

@@ -914,18 +914,32 @@ async fn run_replication_session(
             len
         };
         offset = point.offset + prelude_len as u64;
-        // A master that was this one's sibling, promoted since, continues the
-        // old stream under its own id: follow that id from here on (#109).
-        if let Some(id) = tok
-            .get(1)
-            .filter(|id| id.len() == 40 && **id != point.repl_id)
-            && let Some(current) = repl_state.resync_point.lock().as_mut()
-        {
-            log_info!(
-                "Replication: The master continues {} as {id}",
-                current.repl_id
-            );
-            current.repl_id = id.to_string();
+        // A master that was this one's sibling, promoted since, continues
+        // the old stream under its own id; so does one a dataset digest
+        // says this node is at the start of, under the id it announces —
+        // the id a replica that asked `PSYNC ? -1` had nothing kept of at
+        // all. Either way, what is kept as where this dataset stands is
+        // that stream's id, and the place it is continued from (#109).
+        //
+        // Under the lock `become_master` takes to read where the stream
+        // stood, the generation checked in it: the reply can have arrived
+        // after this node stopped being a replica (`REPLICAOF NO ONE`, a
+        // failover), `guarded` having last looked before the await. Then
+        // the point this would write is not this node's to keep.
+        if let Some(id) = tok.get(1).filter(|id| id.len() == 40) {
+            let _applying = repl_state.apply_lock.lock();
+            if repl_state.generation() != my_generation {
+                return Ok(SessionEnd::Superseded);
+            }
+            let old = repl_state.resync_point.lock().clone();
+            if let Some(old) = old.as_ref().filter(|p| p.repl_id != *id) {
+                log_info!("Replication: The master continues {} as {id}", old.repl_id);
+            }
+            repl_state.set_resync_point(Some(crate::replication::ResyncPoint {
+                repl_id: id.to_string(),
+                offset: point.offset,
+                db: point.db,
+            }));
         }
         repl_state.set_stream_origin(repl_state.cluster_master_node());
         log_info!(

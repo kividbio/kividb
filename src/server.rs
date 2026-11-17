@@ -93,7 +93,7 @@ fn socket_says_gone(_fd: Option<i32>) -> bool {
 /// closed, as Redis closes one whose query buffer reaches the limit.
 /// Otherwise a client that kept sending while it waited — in a blocking
 /// command, a pause, `WAIT` — would be read into memory without end.
-fn carried_too_much(carried: &[u8]) -> bool {
+pub(crate) fn carried_too_much(carried: &[u8]) -> bool {
     // Only past a megabyte, the least the limit can be set to, is the
     // setting looked up.
     if carried.len() <= 1 << 20 {
@@ -152,6 +152,8 @@ fn needs_slow_path(cmd0: &[u8]) -> bool {
         || ascii_eq_ignore_case(cmd0, b"WAITAOF")
         || ascii_eq_ignore_case(cmd0, b"WAIT")
         || ascii_eq_ignore_case(cmd0, b"MONITOR")
+        // Answered with nothing when it goes ahead: see `shutdown`.
+        || ascii_eq_ignore_case(cmd0, b"SHUTDOWN")
 }
 
 /// Await a parked blocking command.
@@ -172,10 +174,11 @@ async fn park_blocking<S, R>(
     combined: &mut Vec<u8>,
     subscriptions: Option<&crate::pubsub::Subscriptions>,
     waiter: &mut Waiter<'_, R>,
+    limit: HardLimit,
 ) -> Result<(), Vec<u8>>
 where
     S: AsyncWrite + Unpin + Send,
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Send,
 {
     // No wait: a write that got past a `CLIENT PAUSE` before it was set
     // (`blocking::hold_for_pause`). Read again, and held by the pause check.
@@ -193,9 +196,31 @@ where
     // Flush replies to anything pipelined ahead of this command before we go to
     // sleep. Without this a client sending `SET a 1` and `BLPOP k 0` in one
     // packet would not see the `+OK` until the BLPOP finally returned.
-    if write_tcp_batch(writer, combined).await.is_err() {
-        // Socket is gone. Don't park on a dead connection — return nothing and
-        // let the batch write at the end of the loop tear it down.
+    // Polled once here, as the connection's own write is: the client is read
+    // meanwhile only if it does not finish at once.
+    let flushed = {
+        let mut flush = std::pin::pin!(write_tcp_batch(writer, combined));
+        match std::future::poll_fn(|cx| std::task::Poll::Ready(flush.as_mut().poll(cx))).await {
+            std::task::Poll::Ready(flushed) => flushed,
+            std::task::Poll::Pending => {
+                read_while_writing(
+                    flush,
+                    waiter.reader,
+                    waiter.carried,
+                    waiter.kill_rx,
+                    waiter.activity,
+                    limit,
+                )
+                .await
+            }
+        }
+    };
+    if flushed.is_err() {
+        // Socket is gone, or the client went past a limit or was killed while
+        // it was written. Don't park: the client has gone, and what was left
+        // to write to it goes with it.
+        combined.clear();
+        waiter.interrupted.gone = true;
         return Err(Vec::new());
     }
     if let Some(subs) = subscriptions {
@@ -392,6 +417,105 @@ fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
             }
         }
     })
+}
+
+/// `write`, a batch of replies being written, with what the client sends
+/// meanwhile read into `carried`, to be run after it (#865). A client that
+/// sends a whole pipeline before it reads a reply (redis-py's pipeline does)
+/// is still sending when its first replies fill the socket: if the
+/// connection stopped reading until they were written, each side would wait
+/// for the other for good. An error, which closes the client, past
+/// `client-query-buffer-limit` or `limit`, or on a `CLIENT KILL`.
+///
+/// Boxed, so that it is polled out of line, as `until_gone` is: the
+/// connection's own write goes here only once it has not finished at once.
+fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
+    mut write: std::pin::Pin<
+        &'a mut (dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a),
+    >,
+    reader: &'a mut R,
+    carried: &'a mut Vec<u8>,
+    kill_rx: &'a mut crate::client_registry::KillRx,
+    activity: &'a crate::client_registry::Activity,
+    mut limit: HardLimit,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut temp = [0u8; 4096];
+        let mut reading = true;
+        loop {
+            tokio::select! {
+                written = &mut write => return written,
+                read = reader.read(&mut temp), if reading => match read {
+                    Ok(n) if n > 0 => {
+                        crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        crate::stats::record_read();
+                        carried.extend_from_slice(&temp[..n]);
+                        activity.touch();
+                        activity.note_read(n);
+                        if carried_too_much(carried) {
+                            return Err(std::io::Error::other("client-query-buffer-limit"));
+                        }
+                        if limit.over_after(n) {
+                            return Err(std::io::Error::other("client-output-buffer-limit"));
+                        }
+                    }
+                    // The client's end, or an error: the next read after the
+                    // write sees it again.
+                    _ => reading = false,
+                },
+                _ = &mut *kill_rx => return Err(std::io::Error::other("CLIENT KILL")),
+            }
+        }
+    })
+}
+
+/// The hard output limit a connection reading ahead (`read_while_writing`
+/// here, and `server_uring`'s) holds a client to: Redis runs what it reads,
+/// so a client that sends and never reads has replies over that limit, and
+/// is closed, long before its query buffer reaches
+/// `client-query-buffer-limit`. Here what is read ahead is not run yet, and
+/// counts against the limit as it is read.
+pub(crate) struct HardLimit {
+    class: crate::output_limits::Class,
+    /// `client-output-buffer-limit`'s hard limit for `class`; 0 for none.
+    bytes: u64,
+    /// The replies waiting to be written, and what was read ahead before
+    /// and has not run yet.
+    owed: usize,
+    client_id: u64,
+}
+
+impl HardLimit {
+    pub(crate) fn new(
+        limits: &crate::output_limits::OutputLimits,
+        subscribed: bool,
+        owed: usize,
+        client_id: u64,
+    ) -> HardLimit {
+        use crate::output_limits::Class;
+        let class = if subscribed {
+            Class::PubSub
+        } else {
+            Class::Normal
+        };
+        HardLimit {
+            class,
+            bytes: limits.get(class).hard,
+            owed,
+            client_id,
+        }
+    }
+
+    /// Whether `n` more bytes read ahead take the client to the limit: it is
+    /// then counted as closed for it, and is to be closed.
+    pub(crate) fn over_after(&mut self, n: usize) -> bool {
+        self.owed += n;
+        if self.bytes == 0 || (self.owed as u64) < self.bytes {
+            return false;
+        }
+        crate::output_limits::note_disconnect(self.client_id, self.class, self.owed as u64);
+        true
+    }
 }
 
 /// What a connection lends its parked command: the means of noticing that
@@ -763,14 +887,21 @@ where
     #[cfg(feature = "lua")]
     let mut lua_env: Option<crate::lua_vm_blocking::ClientExecEnv> = None;
 
-    // What arrived while a blocking command of this connection waited, and
-    // how such a wait was cut short. See `park_blocking`.
+    // What arrived while this connection waited, on a blocking command
+    // (`park_blocking`) or for its replies to be written
+    // (`read_while_writing`), with how much of it has been parsed; and how
+    // a blocking command's wait was cut short.
     let mut carried: Vec<u8> = Vec::new();
+    let mut carried_from = 0usize;
     let mut interrupted = crate::commands::blocking::Interrupted::default();
 
+    // After a `SHUTDOWN` that failed: what follows it in the buffer is read
+    // before anything more is, and was not answered before it.
+    let mut reparse = false;
     loop {
         let was_private_at_read = private_query_buffer;
-        if carried.is_empty() {
+        let skip_read = std::mem::take(&mut reparse);
+        if carried.is_empty() && !skip_read {
             // Redis reclaims private query buffers from its client cron, and the
             // maintenance step below is the equivalent. It can only do anything
             // when the buffer is private and has spare capacity to reclaim, so
@@ -866,12 +997,24 @@ where
             crate::stats::record_read();
             activity.note_read(n);
             buffer.extend_from_slice(&temp[..n]);
-        } else {
-            buffer.append(&mut carried);
+        } else if !carried.is_empty() {
+            // A read's worth a turn, as the socket would have given it: what
+            // one turn runs, and so the replies the output limit looks at
+            // after it, is no more than a read brings (#865).
+            let to = carried.len().min(carried_from + temp.len());
+            buffer.extend_from_slice(&carried[carried_from..to]);
+            carried_from = to;
+            if carried_from == carried.len() {
+                carried = Vec::new();
+                carried_from = 0;
+            } else if carried_from > carried.len() / 2 {
+                carried.drain(0..carried_from);
+                carried_from = 0;
+            }
         }
         query_buffer_peak = query_buffer_peak.max(buffer.len().saturating_sub(read_start));
         query_buffer.update(
-            buffer.len().saturating_sub(read_start),
+            buffer.len().saturating_sub(read_start) + carried.len() - carried_from,
             buffer.capacity().saturating_sub(buffer.len()),
             private_query_buffer,
         );
@@ -880,6 +1023,9 @@ where
         let commands_before = activity.commands_run();
         let mut connection_handoff: Option<ConnectionHandoff> = None;
         let mut quit_requested = false;
+        // A `SHUTDOWN` that went ahead: the shutdowns that had failed before
+        // it, and whether its reply is not wanted.
+        let mut shutdown_wait: Option<(u64, bool)> = None;
         // Outside the parse loop: a park in one turn hands its delivery to the
         // re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
@@ -890,7 +1036,8 @@ where
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
-        let query_buffer_bytes = buffer.len();
+        // With what was read while the connection waited and is still to run.
+        let query_buffer_bytes = buffer.len() + carried.len() - carried_from;
         let query_buffer_free = buffer.capacity().saturating_sub(buffer.len());
         let was_private_query_buffer = private_query_buffer;
         while let Some((consumed, cmd)) =
@@ -917,6 +1064,14 @@ where
                 query_buffer_free,
                 private_query_buffer,
             );
+            // The clients the commands before this one woke have looked, if
+            // this one reads: it sees what they took (#42). A write does not
+            // wait for them, and nor do the replies.
+            if blocking_slot.settles_before(cmd[0])
+                && let Some(settling) = blocking_slot.settle()
+            {
+                settling.await;
+            }
             // ── QUIT ─────────────────────────────────────────────────────────
             // Reply +OK and close the connection. Handled in the connection
             // loop rather than the dispatch table because closing the socket
@@ -1160,6 +1315,12 @@ where
                         if std::mem::take(&mut aof_wait) {
                             crate::aof::written(&aof_tx).await;
                         }
+                        let limit = HardLimit::new(
+                            pubsub.limits(),
+                            subscriptions.is_some(),
+                            combined.len() + carried.len() - carried_from,
+                            client_id,
+                        );
                         // Boxed, and so polled out of line: the wait is cold, and the
                         // connection's own future stays the size it is without it.
                         match Box::pin(park_blocking(
@@ -1179,6 +1340,7 @@ where
                                 socket_fd,
                                 repl_state: &repl_state,
                             },
+                            limit,
                         ))
                         .await
                         {
@@ -1252,6 +1414,12 @@ where
                     if std::mem::take(&mut aof_wait) {
                         crate::aof::written(&aof_tx).await;
                     }
+                    let limit = HardLimit::new(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        combined.len() + carried.len() - carried_from,
+                        client_id,
+                    );
                     // Boxed, and so polled out of line: the wait is cold, and the
                     // connection's own future stays the size it is without it.
                     match Box::pin(park_blocking(
@@ -1271,6 +1439,7 @@ where
                             socket_fd,
                             repl_state: &repl_state,
                         },
+                        limit,
                     ))
                     .await
                     {
@@ -1380,6 +1549,13 @@ where
                         },
                         refusal,
                     );
+                    if cmd_name == "EXEC" {
+                        crate::cluster::routing::transaction_ended(
+                            &cluster_state,
+                            &client_registry,
+                            client_id,
+                        );
+                    }
                     combined.extend_from_slice(&reply);
                     parse_offset += consumed;
                     continue;
@@ -1492,6 +1668,13 @@ where
                     },
                     wrong,
                 );
+                if cmd_name == "EXEC" {
+                    crate::cluster::routing::transaction_ended(
+                        &cluster_state,
+                        &client_registry,
+                        client_id,
+                    );
+                }
                 combined.extend_from_slice(&reply);
                 parse_offset += consumed;
                 continue;
@@ -1622,6 +1805,7 @@ where
                         info.tracking_prefixes.clear();
                         info.tracking_redirect = None;
                         info.tracking_redirect_broken = false;
+                        info.asking = false;
                         info.flags = "N".to_string();
                         info.user = "default".to_string();
                     });
@@ -2582,6 +2766,14 @@ where
                 redispatch = true;
                 continue;
             }
+            // `SHUTDOWN` that goes ahead is answered with nothing, and the
+            // commands after it are not run: the batch ends here, its
+            // replies are sent, and the connection waits (below).
+            if let Some(failed_before) = crate::shutdown::take_requested() {
+                shutdown_wait = Some((failed_before, reply_gate.drops_reply()));
+                parse_offset += consumed;
+                break;
+            }
             // The other commands answered here, and not by `execute_command`,
             // are counted as well (`HELLO` counts itself, as it replies in
             // several places).
@@ -2614,6 +2806,13 @@ where
                     &[word.as_slice()],
                     &response,
                     std::time::Duration::ZERO,
+                );
+            }
+            if matches!(cmd_name.as_str(), "EXEC" | "DISCARD") {
+                crate::cluster::routing::transaction_ended(
+                    &cluster_state,
+                    &client_registry,
+                    client_id,
                 );
             }
             combined.extend_from_slice(&response);
@@ -2667,7 +2866,7 @@ where
         // A buffer that grew to hold one large request is not kept at that
         // size for the life of the connection.
         query_buffer.update(
-            buffer.len().saturating_sub(read_start),
+            buffer.len().saturating_sub(read_start) + carried.len() - carried_from,
             buffer.capacity().saturating_sub(buffer.len()),
             private_query_buffer,
         );
@@ -2679,6 +2878,9 @@ where
         if std::mem::take(&mut aof_wait) {
             crate::aof::written(&aof_tx).await;
         }
+        // What its commands woke and nothing has waited for yet stays for
+        // the next command that reads; looks done by now are forgotten.
+        blocking_slot.forget_looked();
         // `client-output-buffer-limit` (#774): replies over the hard limit,
         // or over the soft limit for longer than its seconds, end the
         // connection unwritten, as Redis drops such a client and its output.
@@ -2703,14 +2905,55 @@ where
         if shown {
             activity.set_reply_output(combined.len());
         }
+        let waiting = combined.len();
         let written = match write_within {
-            None => write_tcp_batch(&writer, &mut combined).await,
+            // Polled once here, where nearly every write finishes: the
+            // client is read meanwhile only if it does not.
+            None => {
+                let mut write = std::pin::pin!(write_tcp_batch(&writer, &mut combined));
+                match std::future::poll_fn(|cx| std::task::Poll::Ready(write.as_mut().poll(cx)))
+                    .await
+                {
+                    std::task::Poll::Ready(written) => written,
+                    std::task::Poll::Pending => {
+                        let limit = HardLimit::new(
+                            pubsub.limits(),
+                            subscriptions.is_some(),
+                            waiting + carried.len() - carried_from,
+                            client_id,
+                        );
+                        read_while_writing(
+                            write,
+                            &mut reader,
+                            &mut carried,
+                            &mut kill_rx,
+                            &activity,
+                            limit,
+                        )
+                        .await
+                    }
+                }
+            }
             Some((time, class)) => {
-                let waiting = combined.len() as u64;
-                match tokio::time::timeout(time, write_tcp_batch(&writer, &mut combined)).await {
+                let limit = HardLimit::new(
+                    pubsub.limits(),
+                    subscriptions.is_some(),
+                    waiting + carried.len() - carried_from,
+                    client_id,
+                );
+                let write = std::pin::pin!(write_tcp_batch(&writer, &mut combined));
+                let write = read_while_writing(
+                    write,
+                    &mut reader,
+                    &mut carried,
+                    &mut kill_rx,
+                    &activity,
+                    limit,
+                );
+                match tokio::time::timeout(time, write).await {
                     Ok(written) => written,
                     Err(_) => {
-                        crate::output_limits::note_disconnect(client_id, class, waiting);
+                        crate::output_limits::note_disconnect(client_id, class, waiting as u64);
                         break;
                     }
                 }
@@ -2733,6 +2976,22 @@ where
             break;
         }
 
+        // SHUTDOWN: what came before it is on the wire now. The connection
+        // stays open, and silent, until the process exits after its final
+        // save; if the shutdown fails or is aborted instead, that is the
+        // reply, and what was pipelined after it is read next.
+        if let Some((failed_before, silent)) = shutdown_wait {
+            // Boxed: a cold wait, kept out of the connection future.
+            Box::pin(crate::shutdown::failed_after(failed_before)).await;
+            if !silent {
+                combined.extend_from_slice(&crate::resp::write::resp_error(
+                    crate::shutdown::FAILED_REPLY,
+                ));
+            }
+            reparse = true;
+            continue;
+        }
+
         match connection_handoff {
             None => {}
             Some(ConnectionHandoff::Replica { legacy_sync, psync }) => {
@@ -2742,6 +3001,7 @@ where
                 let write_task = spawn_mux_to_socket(Arc::clone(&writer), resp_rx);
 
                 buffer.drain(0..read_start);
+                buffer.extend_from_slice(&carried[carried_from..]);
 
                 let listening_port = client_registry
                     .get(client_id)

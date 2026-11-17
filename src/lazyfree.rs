@@ -37,6 +37,13 @@ fn worker() -> &'static Sender<Job> {
             .name("kividb-lazyfree".into())
             .spawn(move || {
                 for (what, objects) in rx {
+                    // For a test: frees that fall behind. Each one waits
+                    // for its `failpoint.lazyfree-held.<n>` file to be
+                    // removed, so that what is handed over piles up for
+                    // as long as the test likes, however fast the machine
+                    // builds what is handed over (a fixed delay for each
+                    // free was outrun only when the machine was quick).
+                    crate::aof::failpoint("lazyfree-held");
                     drop(what);
                     done(objects);
                 }
@@ -124,7 +131,9 @@ pub fn effort(value: &KiviDBValue) -> u64 {
             serde_json::Value::Object(fields) => fields.len(),
             _ => 1,
         },
-        KiviDBValue::Set(set) => set.read().len(),
+        // An array or a block of members (#297) is one allocation, as
+        // Redis counts an intset or a listpack.
+        KiviDBValue::Set(set) => set.read().free_effort(),
         KiviDBValue::VectorSet(set) => set.read().entries.len(),
         KiviDBValue::SortedSet(zset) => zset.read().len(),
         KiviDBValue::Stream(stream) => {

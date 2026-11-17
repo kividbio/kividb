@@ -1953,6 +1953,32 @@ fn test_ts_time_above_i64_max_is_refused() {
     assert_eq!(c.cmds(&["TS.RANGE", "big", "-", "+"]).as_array().len(), 3);
 }
 
+/// A time of `-0` is refused, as RedisTimeSeries refuses it, by every
+/// command that takes a sample's time; nothing is made.
+#[test]
+fn test_ts_time_minus_zero_is_refused() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["TS.ADD", "z", "-0", "1"]).is_error());
+    assert!(
+        c.cmds(&["TS.INCRBY", "z", "1", "TIMESTAMP", "-0"])
+            .is_error()
+    );
+    assert!(
+        c.cmds(&["TS.DECRBY", "z", "1", "TIMESTAMP", "-0"])
+            .is_error()
+    );
+    assert_eq!(c.cmds(&["EXISTS", "z"]).as_int(), 0);
+    assert!(c.cmds(&["TS.CREATE", "m"]).is_ok());
+    let replies = c.cmds(&["TS.MADD", "m", "-0", "1", "m", "0", "2"]);
+    let replies = replies.as_array();
+    assert!(replies[0].is_error(), "{replies:?}");
+    assert_eq!(replies[1].as_int(), 0);
+    assert_eq!(c.cmds(&["TS.RANGE", "m", "-", "+"]).as_array().len(), 1);
+}
+
 /// `DUMP` and `RESTORE` carry a series: its samples, retention, chunk size,
 /// duplicate policy and labels, and the label index finds the restored key.
 /// Not its compaction rules, nor the series it is a compaction of: as in

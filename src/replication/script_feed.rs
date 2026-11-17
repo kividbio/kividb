@@ -192,12 +192,6 @@ pub fn commands_for_propagation(
         // as DELs, then the drop without `DD` (`vector::ft_dropindex`); by a
         // replica to its own AOF too.
         "FT.DROPINDEX" => Vec::new(),
-        // Run, not held, while writes are paused, as in Redis, but kept out
-        // of the stream meanwhile (`replication::held_back`, #518): a
-        // replica, or the AOF replayed, goes without the script, and a
-        // client that runs it there gets `NOSCRIPT` and loads it again, as
-        // it would from Redis, which never propagates the script cache.
-        "SCRIPT" if super::held_back(ctx) => Vec::new(),
         // Sent by the command itself, as one `DEL` of the keys it deleted
         // (`cluster::delete_moved`): which they are, its reply does not say.
         "MIGRATE" => Vec::new(),
@@ -207,7 +201,9 @@ pub fn commands_for_propagation(
         // a setting of this node's: see `commands::bf`.
         "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.RESERVE" => crate::commands::bf::propagation(cmd),
         "TS.MADD" => ts_madd_feed(cmd, resp),
-        "TS.INCRBY" | "TS.DECRBY" => ts_incrby_feed(cmd, resp),
+        "TS.INCRBY" | "TS.DECRBY" => {
+            ts_incrby_feed(cmd, resp, crate::commands::ts::applied_as_1_2_0(ctx, cmd))
+        }
         // The fieldset lives in the client's session, which no replica (and no
         // AOF replay) has: send the hash it produced instead.
         "HIMPORT" => crate::commands::hash_import::propagation(ctx.client_id, cmd),
@@ -371,16 +367,17 @@ fn array_header(resp: &[u8]) -> Option<(usize, usize)> {
     Some((count, line_end + 2))
 }
 
-/// `TS.ADD key * value`: the `*` is the master's clock at the moment it ran.
-/// A replica (or the AOF, replayed later) would stamp the sample with its own,
-/// so the timestamp the master assigned is sent in its place.
+/// `TS.ADD key time value`: sent with the time it replied, in place of the
+/// one given. `*` is the master's clock at the moment it ran, which a
+/// replica (or the AOF, replayed later) would read as its own. A time
+/// given is sent as the plain number every version reads, not as the
+/// client wrote it.
 fn ts_add_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     if crate::commands::ts::ts_changed_nothing() {
         return Vec::new();
     }
     let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
     if cmd.len() > 2
-        && cmd[2] == b"*"
         && let Some(ts) = parse_resp_integer(resp)
     {
         parts[2] = sample_time(ts);
@@ -439,11 +436,22 @@ fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
 }
 
 /// `TS.INCRBY` / `TS.DECRBY` default to "now" too; pin the timestamp used.
-fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
+///
+/// `of_1_2_0`: the command was a record of 1.2.0, applied as 1.2.0 read it
+/// (`ts::applied_as_1_2_0`). It is sent as 1.2.0 wrote it, its time at the
+/// end, given the time it replied, so that it is read again as it was here.
+fn ts_incrby_feed(cmd: &[&[u8]], resp: &[u8], of_1_2_0: bool) -> Vec<Vec<Vec<u8>>> {
     let verbatim = || vec![cmd.iter().map(|b| b.to_vec()).collect::<Vec<Vec<u8>>>()];
     let Some(ts) = parse_resp_integer(resp) else {
         return verbatim();
     };
+    if of_1_2_0 {
+        let mut parts: Vec<Vec<u8>> = cmd.iter().map(|b| b.to_vec()).collect();
+        if let Some(at) = parts.last_mut() {
+            *at = sample_time(ts);
+        }
+        return vec![parts];
+    }
     // Each `TIMESTAMP` option the command read is given the time it used, in
     // its place, so every other word is where it was and reads as it did; a
     // word `TIMESTAMP` that is a label's value is left alone. And the time
@@ -961,6 +969,15 @@ mod tests {
             ts_add_feed(&refs(&explicit), b":5\r\n"),
             vec![explicit.clone()]
         );
+        // A time given is sent as the number it replied.
+        for given in ["+5", "005", "+005"] {
+            let c = cmd(&["TS.ADD", "k", given, "1.5"]);
+            assert_eq!(
+                ts_add_feed(&refs(&c), b":5\r\n"),
+                vec![explicit.clone()],
+                "{given}"
+            );
+        }
 
         let c = cmd(&["TS.MADD", "a", "*", "1", "b", "7", "2", "c", "*", "3"]);
         assert_eq!(
@@ -972,12 +989,12 @@ mod tests {
 
         let c = cmd(&["TS.INCRBY", "k", "2"]);
         assert_eq!(
-            ts_incrby_feed(&refs(&c), b":42\r\n"),
+            ts_incrby_feed(&refs(&c), b":42\r\n", false),
             vec![cmd(&["TS.INCRBY", "k", "2", "timestamp", "42"])]
         );
         let c = cmd(&["TS.DECRBY", "k", "2", "TIMESTAMP", "*", "RETENTION", "9"]);
         assert_eq!(
-            ts_incrby_feed(&refs(&c), b":42\r\n"),
+            ts_incrby_feed(&refs(&c), b":42\r\n", false),
             vec![cmd(&[
                 "TS.DECRBY",
                 "k",
@@ -1006,7 +1023,7 @@ mod tests {
         );
         let c = cmd(&["TS.INCRBY", "a", "1", "TIMESTAMP", &max]);
         assert_eq!(
-            ts_incrby_feed(&refs(&c), b":-1\r\n"),
+            ts_incrby_feed(&refs(&c), b":-1\r\n", false),
             vec![cmd(&[
                 "TS.INCRBY",
                 "a",
@@ -1017,6 +1034,49 @@ mod tests {
                 &max
             ])]
         );
+    }
+
+    /// A record of 1.2.0 ends `TIMESTAMP <time>` with the time as it was
+    /// replied: one above `i64::MAX` as a negative number. Applied as
+    /// 1.2.0's, it is logged again by a replica (its AOF, and its own
+    /// replicas) as 1.2.0 wrote it, every word where it was, with the time
+    /// at the end as the `u64` the series holds (#611).
+    #[test]
+    fn ts_incrby_feed_logs_a_1_2_0_record_as_1_2_0_wrote_it() {
+        let max = u64::MAX.to_string();
+        let c = cmd(&["TS.INCRBY", "a", "1", "TIMESTAMP", "-1"]);
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":-1\r\n", true),
+            vec![cmd(&["TS.INCRBY", "a", "1", "TIMESTAMP", &max])]
+        );
+        let c = cmd(&["TS.DECRBY", "a", "2", "TIMESTAMP", "-616"]);
+        let at_616 = (-616_i64 as u64).to_string();
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":-616\r\n", true),
+            vec![cmd(&["TS.DECRBY", "a", "2", "TIMESTAMP", &at_616])]
+        );
+        for given in [
+            &["TS.INCRBY", "c", "1", "TIMESTAMP", "1000"][..],
+            &[
+                "TS.INCRBY",
+                "bad",
+                "1",
+                "RETENTION",
+                "abc",
+                "TIMESTAMP",
+                "5",
+            ],
+            &["TS.INCRBY", "l", "1", "LABELS", "x", "TIMESTAMP", "50"],
+            &["TS.DECRBY", "r", "1", "RETENTION", "10", "TIMESTAMP", "7"],
+        ] {
+            let c = cmd(given);
+            let at = given[given.len() - 1];
+            assert_eq!(
+                ts_incrby_feed(&refs(&c), format!(":{at}\r\n").as_bytes(), true),
+                vec![c.clone()],
+                "{given:?}"
+            );
+        }
     }
 
     #[test]
@@ -1119,7 +1179,7 @@ mod tests {
         for (given, sent) in cases {
             let c = cmd(given);
             assert_eq!(
-                ts_incrby_feed(&refs(&c), b":42\r\n"),
+                ts_incrby_feed(&refs(&c), b":42\r\n", false),
                 vec![cmd(sent)],
                 "{given:?}"
             );

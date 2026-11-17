@@ -3171,6 +3171,33 @@ fn a_query_is_cut_short_when_it_runs_out_of_time() {
         "{reply:?}"
     );
 
+    // `return-strict` (Redis spelling; `return_strict` is the same alias):
+    // SEARCH and AGGREGATE reply like `return`, not like `fail`.
+    assert!(
+        c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return-strict"])
+            .ok()
+    );
+    let reply = c.cmd(&[
+        "FT.SEARCH",
+        "to",
+        "*",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "0",
+        "TIMEOUT",
+        "1",
+    ]);
+    assert!(warned(&reply), "{reply:?}");
+    assert!(reply.get("total_results").i() < n as i64, "{reply:?}");
+    let reply = count(&mut c, "1");
+    assert!(warned(&reply), "{reply:?}");
+    assert!(
+        first_row(&reply, "c").parse::<usize>().unwrap() < n,
+        "{reply:?}"
+    );
+    assert!(c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return"]).ok());
+
     // A cursor over a partial result says so on every page, not only the
     // first.
     let reply = c.cmd(&[

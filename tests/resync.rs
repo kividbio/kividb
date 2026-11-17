@@ -569,6 +569,13 @@ fn assert_same_dataset(master: &mut Conn, replica: &mut Conn) {
             .parse::<u64>()
             .is_ok_and(|applied| applied >= offset)
     });
+    // Of the same stream: an offset counts in the stream a replica
+    // follows, and one still on an old stream could be far enough along it
+    // to satisfy the wait above while holding another stream's data.
+    assert_eq!(
+        master.info("replication", "master_replid"),
+        replica.info("replication", "master_replid"),
+    );
     for probe in [
         &["GET", "counter"][..],
         &["LLEN", "list"],
@@ -2512,6 +2519,27 @@ fn dataset_of_dbs(server: &Server) -> Vec<(String, String, String)> {
     all
 }
 
+/// `dataset_of_dbs` for data that is not all strings: every key with its
+/// type's contents. `GET` on a list answers `WRONGTYPE`, which compares
+/// equal whatever the list holds.
+#[cfg(feature = "lua")]
+fn dataset_of_dbs_typed(server: &Server) -> Vec<(String, String, V)> {
+    let mut all = Vec::new();
+    for db in 0..7 {
+        let mut c = server.conn();
+        for key in keys_of_db(&mut c, &db.to_string()) {
+            let kind = c.cmd(&["TYPE", &key]).s().to_string();
+            let contents = match kind.as_str() {
+                "string" => c.cmd(&["GET", &key]),
+                "list" => c.cmd(&["LRANGE", &key, "0", "-1"]),
+                other => panic!("dataset_of_dbs_typed: a {other} key {key}"),
+            };
+            all.push((db.to_string(), key, contents));
+        }
+    }
+    all
+}
+
 /// A read-only script, a script that only selects a database, a client's
 /// `SELECT` and `SCRIPT LOAD` / `SCRIPT FLUSH` send nothing to the replica
 /// and the AOF, and the master's offset stays where it is, as in Redis
@@ -2666,6 +2694,187 @@ fn scripts_writing_in_several_databases_replicate_and_replay_with_their_own_sele
     master.kill();
     master.restart_master(&mut []);
     assert_eq!(dataset_of_dbs(&master), expected, "{}", master.log());
+}
+
+/// A `WATCH` + `MULTI` of plain `SET`s in database 2, run right after a
+/// script that only `SELECT`s: the script sends nothing, so every write of
+/// the transaction belongs to the database the connection has — checked
+/// key by key on the replica, and on the master replayed from its AOF
+/// (#831).
+#[cfg(feature = "lua")]
+#[test]
+fn a_watch_multi_after_a_select_only_script_writes_in_its_own_db() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    wait_link_up(&mut replica.conn());
+
+    // A client of database 2, after a script that only selects database 5.
+    let mut c = master.conn();
+    assert!(c.cmd(&["SELECT", "2"]).ok());
+    let select_only = "redis.call('SELECT', 5) redis.call('GET', 'x') return 1";
+    assert_eq!(c.cmd(&["EVAL", select_only, "0"]), V::Int(1));
+    assert!(c.cmd(&["WATCH", "watched"]).ok());
+    assert!(c.cmd(&["MULTI"]).ok());
+    c.cmd(&["SET", "watched", "1"]);
+    c.cmd(&["SET", "sibling", "2"]);
+    assert_eq!(c.cmd(&["EXEC"]).arr().len(), 2);
+    assert!(c.cmd(&["SET", "after-exec", "3"]).ok());
+
+    // A write of another connection still in database 0.
+    let mut other = master.conn();
+    assert!(other.cmd(&["SET", "zero", "0"]).ok());
+
+    let at = master_offset(&mut m);
+    wait_replica_at(&replica, at);
+    let expected = dataset_of_dbs(&master);
+    for key in ["watched", "sibling", "after-exec"] {
+        assert!(
+            expected
+                .iter()
+                .any(|(db, k, _)| (db.as_str(), k.as_str()) == ("2", key)),
+            "{key} not in database 2 on the master: {expected:?}"
+        );
+    }
+    assert_eq!(dataset_of_dbs(&replica), expected, "{}", replica.log());
+
+    // From the AOF alone.
+    assert_eq!(other.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, c, other));
+    master.kill();
+    master.restart_master(&mut []);
+    assert_eq!(dataset_of_dbs(&master), expected, "{}", master.log());
+}
+
+/// A `BRPOP` blocked in database 2, woken by a push from another connection
+/// whose last write was in database 0: the push that wakes it and the pop
+/// it is answered with are writes of database 2 — checked key by key on the
+/// replica, and on the master replayed from its AOF (#831).
+#[cfg(feature = "lua")]
+#[test]
+fn a_blocked_pop_woken_across_databases_pops_in_its_own_db() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut m = master.conn();
+    wait_link_up(&mut replica.conn());
+
+    // The pusher's last write is in database 0, before any client has left
+    // it: it goes out with no `SELECT`.
+    let mut pusher = master.conn();
+    assert!(pusher.cmd(&["SET", "zero", "0"]).ok());
+
+    // A client of database 2 blocked on an empty list.
+    let mut blocked = master.conn();
+    assert!(blocked.cmd(&["SELECT", "2"]).ok());
+    send_only(&mut blocked, &["BRPOP", "queue", "0"]);
+    wait_until("the client to be blocked", || {
+        m.info("clients", "blocked_clients") == "1"
+    });
+
+    // Its push writes in database 2, though the stream was left in 0.
+    assert!(pusher.cmd(&["SELECT", "2"]).ok());
+    assert_eq!(pusher.cmd(&["LPUSH", "queue", "job"]).i(), 1);
+    assert_eq!(
+        blocked.read(),
+        V::Arr(vec![V::Str("queue".into()), V::Str("job".into())])
+    );
+    // The next element stays in the list.
+    assert_eq!(pusher.cmd(&["LPUSH", "queue", "next"]).i(), 1);
+
+    let at = master_offset(&mut m);
+    wait_replica_at(&replica, at);
+    let expected = dataset_of_dbs_typed(&master);
+    assert_eq!(
+        dataset_of_dbs_typed(&replica),
+        expected,
+        "{}",
+        replica.log()
+    );
+
+    // From the AOF alone.
+    assert_eq!(pusher.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, blocked, pusher));
+    master.kill();
+    master.restart_master(&mut []);
+    assert_eq!(dataset_of_dbs_typed(&master), expected, "{}", master.log());
+}
+
+/// Writes made on a promoted replica after a script that only `SELECT`s: a
+/// second replica continued from it — a partial resync, then the live
+/// stream — must hold them in the databases they were made in, and the
+/// promoted node replayed from its AOF must hold the same (#831).
+#[cfg(feature = "lua")]
+#[test]
+fn writes_on_a_promoted_replica_after_a_select_only_script_reach_its_replica() {
+    let mut master = Server::start(&[]);
+    let master_port = master.port.to_string();
+    let mut promoted = Server::start(&[
+        "--replicaof",
+        "127.0.0.1",
+        &master_port,
+        "--aof",
+        "--repl-backlog-size",
+        "16777216",
+    ]);
+    let follower = Server::start(&["--replicaof", "127.0.0.1", &master_port]);
+    let (mut m, mut p, mut f) = (master.conn(), promoted.conn(), follower.conn());
+    wait_link_up(&mut p);
+    wait_link_up(&mut f);
+    assert!(m.cmd(&["SET", "base", "0"]).ok());
+    let at = master_offset(&mut m);
+    wait_replica_at(&promoted, at);
+    wait_replica_at(&follower, at);
+
+    // Promoted, with a client of database 3 whose script only selects.
+    assert!(p.cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+    let mut c = promoted.conn();
+    assert!(c.cmd(&["SELECT", "3"]).ok());
+    let select_only = "redis.call('SELECT', 5) redis.call('GET', 'x') return 1";
+    assert_eq!(c.cmd(&["EVAL", select_only, "0"]), V::Int(1));
+    assert!(c.cmd(&["SET", "three", "3"]).ok());
+    assert!(p.cmd(&["SET", "zero", "0"]).ok());
+
+    // The second replica continues from the promoted node.
+    assert!(
+        f.cmd(&["REPLICAOF", "127.0.0.1", &promoted.port.to_string()])
+            .ok()
+    );
+    wait_link_up(&mut f);
+    let at: u64 = p.info("replication", "master_repl_offset").parse().unwrap();
+    wait_until("the follower to catch the promoted node", || {
+        f.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|o| o >= at)
+    });
+    assert_eq!(p.stat("sync_partial_ok"), 1, "{}", promoted.log());
+    assert_eq!(
+        dataset_of_dbs(&follower),
+        dataset_of_dbs(&promoted),
+        "{}",
+        follower.log()
+    );
+
+    // And the writes that follow, in either database.
+    assert!(c.cmd(&["SET", "three-more", "4"]).ok());
+    assert!(p.cmd(&["SET", "zero-more", "0"]).ok());
+    let at: u64 = p.info("replication", "master_repl_offset").parse().unwrap();
+    wait_until("the follower to take the later writes", || {
+        f.info("replication", "slave_repl_offset")
+            .parse::<u64>()
+            .is_ok_and(|o| o >= at)
+    });
+    let expected = dataset_of_dbs(&promoted);
+    assert_eq!(dataset_of_dbs(&follower), expected, "{}", follower.log());
+
+    // The promoted node replayed from its AOF holds the same.
+    assert_eq!(p.cmd(&["WAITAOF", "1", "0", "5000"]).arr()[0].i(), 1);
+    drop((m, c, p, f));
+    master.kill();
+    promoted.kill();
+    promoted.restart();
+    assert_eq!(dataset_of_dbs(&promoted), expected, "{}", promoted.log());
 }
 
 /// Milliseconds since the Unix epoch, now.
@@ -3372,4 +3581,120 @@ fn migrate_keeps_the_order_of_a_series_labels() {
         assert!(reply.ok(), "MIGRATE {key}: {reply:?}");
     }
     assert_labels(&mut t, &series, Some(&digests), "after MIGRATE");
+}
+
+// ── Entries `XNACK` released (#856) ──────────────────────────────────────────
+
+/// A stream `key` with three entries, all delivered to a consumer and two of
+/// them released by `XNACK`: pending entries that are no one's.
+fn stream_with_released_entries(c: &mut Conn, key: &str) {
+    assert!(c.cmd(&["XGROUP", "CREATE", key, "g", "$", "MKSTREAM"]).ok());
+    for id in ["1-1", "2-1", "3-1"] {
+        assert_eq!(c.cmd(&["XADD", key, id, "f", "v"]).s(), id);
+    }
+    assert_eq!(
+        c.cmd(&["XREADGROUP", "GROUP", "g", "c1", "STREAMS", key, ">"])
+            .arr()
+            .len(),
+        1
+    );
+    assert_eq!(
+        c.cmd(&["XNACK", key, "g", "FAIL", "IDS", "2", "1-1", "2-1"])
+            .i(),
+        2
+    );
+}
+
+/// What a client sees of the pending entries: the same everywhere, but for
+/// the idle time of a delivered one, which is each node's own clock.
+fn pending_of(c: &mut Conn, key: &str) -> Vec<(String, String, i64)> {
+    c.cmd(&["XPENDING", key, "g", "-", "+", "10"])
+        .arr()
+        .iter()
+        .map(|row| {
+            let row = row.arr();
+            (row[0].s().to_string(), row[1].s().to_string(), row[3].i())
+        })
+        .collect()
+}
+
+/// `XNACK` is propagated as the command, and each node that applies it gives
+/// a released entry a mark of its own for the time it was delivered, from a
+/// counter of its process. The dataset's digest held the mark, so a master and
+/// its replica had two digests for one dataset, and a master that was killed
+/// and started from its append-only file (which applies the `XNACK` again)
+/// differed from the replica it had: the replica could not be continued, and
+/// was sent everything (#856). Nothing was lost; the sync was not needed.
+#[test]
+fn entries_xnack_released_do_not_make_a_master_and_its_replica_differ() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let mut m = master.conn();
+    // An XNACK before the replica is there: this process's counter is ahead
+    // of the replica's when it applies the next one.
+    stream_with_released_entries(&mut m, "warm");
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    // Applied from the stream, as it is made.
+    stream_with_released_entries(&mut m, "s");
+    assert_same_dataset(&mut m, &mut r);
+    for key in ["warm", "s"] {
+        assert_eq!(digest_of(&mut m, key), digest_of(&mut r, key), "{key}");
+        assert_eq!(pending_of(&mut m, key), pending_of(&mut r, key), "{key}");
+    }
+    let digests = [digest_of(&mut m, "warm"), digest_of(&mut m, "s")];
+
+    // The master killed and started from its AOF: the XNACKs are applied
+    // again, by a new process. Same dataset, same digests, and the replica
+    // that holds it is continued, not sent it again.
+    drop((m, r));
+    std::thread::sleep(Duration::from_millis(1500));
+    master.kill();
+    master.restart_master(&mut [&mut replica]);
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    for (key, digest) in ["warm", "s"].into_iter().zip(&digests) {
+        assert_eq!(&digest_of(&mut m, key), digest, "{key} after replay");
+        assert_eq!(&digest_of(&mut r, key), digest, "{key} on the replica");
+    }
+    write_batch(&mut m, 0, 5);
+    assert_same_dataset(&mut m, &mut r);
+    assert_eq!(
+        m.stat("sync_full"),
+        0,
+        "{}
+{}",
+        master.log(),
+        replica.log()
+    );
+    assert_eq!(m.stat("sync_partial_ok"), 1);
+
+    // A replica that is sent the dataset holds the same: it loads the marks
+    // the snapshot has, which are not its own.
+    let late = Server::start(&["--replicaof", "127.0.0.1", &master.port.to_string()]);
+    let mut l = late.conn();
+    wait_link_up(&mut l);
+    assert_same_dataset(&mut m, &mut l);
+    for (key, digest) in ["warm", "s"].into_iter().zip(&digests) {
+        assert_eq!(&digest_of(&mut l, key), digest, "{key} after a full sync");
+    }
+}
+
+/// An entry that is released and one a consumer holds are two things,
+/// whatever the time: the digest still tells them apart (a replica that held
+/// the wrong one would be continued with the wrong data).
+#[test]
+fn a_released_entry_and_a_delivered_one_digest_apart() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    stream_with_released_entries(&mut c, "b");
+    // Claiming a released entry makes it a consumer's.
+    let before = digest_of(&mut c, "b");
+    assert_eq!(
+        c.cmd(&["XCLAIM", "b", "g", "c2", "0", "1-1"]).arr().len(),
+        1
+    );
+    assert_ne!(digest_of(&mut c, "b"), before);
 }

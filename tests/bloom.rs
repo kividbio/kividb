@@ -692,6 +692,13 @@ fn the_aof_and_replicas_get_the_filter_the_master_made() {
         wait_until("the replica to have every filter", || {
             r.cmd(&["BF.CARD", "p:reserved"]) == m.cmd(&["BF.CARD", "p:reserved"])
         });
+        // The master is killed when this block ends, and its AOF is
+        // written a moment after the write: read below. A write after all
+        // the others is in the file only once they are.
+        assert_eq!(m.cmd(&["SET", "last", "1"]), b"+OK\r\n");
+        wait_until("the AOF to hold the last write", || {
+            aof_text(&dir).contains("\r\nlast\r\n")
+        });
         let on_replica: Vec<_> = keys.iter().map(|k| scandump(&mut r, k)).collect();
         assert_eq!(on_replica, on_master);
         on_master
@@ -995,6 +1002,15 @@ fn writes_past_an_item_reach_replicas_and_the_aof_with_what_they_took() {
         wait_until("the replica to have every filter", || {
             r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
         });
+        // Both servers are killed when this block ends, and an AOF is
+        // written a moment after the dataset has the write: the files are
+        // read below. `last` is the last write of both, so once it is in a
+        // file, everything before it is.
+        for at in [&dir, &replica_dir] {
+            wait_until("the AOF to hold the last write", || {
+                aof_text(at).contains("\r\nlast\r\n")
+            });
+        }
         let on_master: Vec<_> = keys.iter().map(|k| scandump(&mut m, k)).collect();
         let on_replica: Vec<_> = keys.iter().map(|k| scandump(&mut r, k)).collect();
         assert_eq!(on_replica, on_master);
@@ -1122,6 +1138,15 @@ fn bloom_max_filter_bytes_holds_clients_not_replication() {
         wait_until("the replica to have every filter", || {
             r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
         });
+        // Both servers are killed when this block ends, and an AOF is
+        // written a moment after the dataset has the write: the files are
+        // read below. `last` is the last write of both, so once it is in a
+        // file, everything before it is.
+        for at in [&dir, &replica_dir] {
+            wait_until("the AOF to hold the last write", || {
+                aof_text(at).contains("\r\nlast\r\n")
+            });
+        }
         let on_master: Vec<_> = keys.iter().map(|k| scandump(&mut m, k)).collect();
         let on_replica: Vec<_> = keys.iter().map(|k| scandump(&mut r, k)).collect();
         assert_eq!(on_replica, on_master);

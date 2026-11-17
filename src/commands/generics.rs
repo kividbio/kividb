@@ -28,7 +28,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// say. Clients rely on it — BullMQ's dependency pagination expects a small
 /// set in one page.
 pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
-    matches!(encoding_of(value), "intset" | "listpack" | "listpackex")
+    match value {
+        // By the form it is kept in (#297), as Redis goes by its encoding:
+        // an array or a block whole, a table a page at a time.
+        ValueRef::Set(set) => !set.read().is_table(),
+        _ => matches!(encoding_of(value), "listpack" | "listpackex"),
+    }
 }
 
 pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
@@ -58,22 +63,8 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
                 "quicklist"
             }
         }
-        ValueRef::Set(set) => {
-            let set = set.read();
-            let integers = set.iter().all(|member| {
-                std::str::from_utf8(member)
-                    .ok()
-                    .and_then(|text| text.parse::<i64>().ok())
-                    .is_some_and(|n| n.to_string().as_bytes() == &member[..])
-            });
-            if integers && set.len() <= 512 {
-                "intset"
-            } else if set.len() <= 128 && set.iter().all(|member| member.len() <= SMALL) {
-                "listpack"
-            } else {
-                "hashtable"
-            }
-        }
+        // The form it is really kept in (#297).
+        ValueRef::Set(set) => set.read().encoding().name(),
         ValueRef::SortedSet(zset) => {
             let zset = zset.read();
             if zset.members.len() <= 128 && zset.members.keys().all(|member| member.len() <= SMALL)
@@ -1553,7 +1544,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
                 Some(ValueRef::List(l)) => l.read().iter().cloned().collect(),
-                Some(ValueRef::Set(s)) => s.read().iter().cloned().collect(),
+                Some(ValueRef::Set(s)) => s.read().iter().map(|m| m.to_shared()).collect(),
                 Some(ValueRef::SortedSet(z)) => {
                     z.read().by_score.keys().map(|(_, m)| m.clone()).collect()
                 }

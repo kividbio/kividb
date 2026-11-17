@@ -584,6 +584,72 @@ fn order_of_pairs_shared(ctx: &Ctx) -> crate::write_order::OrderGuard {
     crate::write_order::lock_keys_shared(*ctx.selected_db, ctx.cmd[1..].iter().step_by(2).copied())
 }
 
+/// How a script runs (`tag_locks`): the tags of its `KEYS`, if every one
+/// carries a tag, which it is held to; and whether it runs beside others,
+/// under those tags' locks, which it does once its caller has seen it to be
+/// quick
+/// (`tag_locks::allow_next_script`) — not inside a transaction or another
+/// script, which hold the gate alone already. `applied`: it comes from the
+/// master's stream.
+///
+/// Counted for `INFO` here, where it is decided (`stats::scripts`), unless it
+/// is applied from a master or replayed from the AOF. Only a script comes
+/// here: nothing is added to any other command's way.
+#[inline]
+fn script_mode<'a>(
+    cmd: &[&'a [u8]],
+    name: &str,
+    tag_locks: bool,
+    applied: bool,
+) -> (Option<crate::tag_locks::ScriptTags<'a>>, bool) {
+    let allowed_beside = crate::tag_locks::take_next_script_allowed();
+    let script_tags = if tag_locks {
+        crate::tag_locks::script_tags(cmd)
+    } else {
+        None
+    };
+    let in_another = crate::command_gate::alone_on_this_thread();
+    let beside_others = script_tags.is_some() && allowed_beside && !in_another;
+    #[cfg(feature = "lua")]
+    if !applied {
+        if beside_others {
+            crate::stats::scripts::ran_beside_others();
+        } else {
+            count_script_alone(cmd, name, tag_locks, in_another);
+        }
+    }
+    #[cfg(not(feature = "lua"))]
+    let _ = (name, applied);
+    (script_tags, beside_others)
+}
+
+/// Why a script runs alone, counted (`stats::scripts::Alone`): out of line,
+/// off the way of the scripts that run beside others.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn count_script_alone(cmd: &[&[u8]], name: &str, tag_locks: bool, in_another: bool) {
+    use crate::stats::scripts::Alone;
+    use crate::tag_locks::ScriptKeys;
+    if crate::expiry::replaying() {
+        return;
+    }
+    let why = if !tag_locks {
+        Alone::ParallelOff
+    } else if in_another {
+        Alone::InTransaction
+    } else if name.starts_with("FCALL") {
+        Alone::Function
+    } else {
+        match crate::tag_locks::script_keys(cmd) {
+            ScriptKeys::None => Alone::NoKeys,
+            ScriptKeys::Untagged => Alone::NoTag,
+            ScriptKeys::Tagged => Alone::NotQuick,
+        }
+    };
+    crate::stats::scripts::ran_alone(why);
+}
+
 /// For a script held to a hash tag: the refusal of a `SORT` or `SORT_RO`
 /// whose `BY` or `GET` pattern can name keys outside the tag
 /// (`generics::sort_pattern_outside`). Asked before the command runs, so
@@ -597,10 +663,10 @@ fn sort_pattern_outside_the_tag(name: &str, cmd: &[&[u8]]) -> Option<String> {
         crate::commands::generics::sort_pattern_outside(cmd, crate::tag_locks::script_may_touch)?;
     Some(format!(
         "ERR Script attempted to run '{}' with the pattern '{}', which looks at keys it does \
-         not name outside the hash tag '{}' of its KEYS (lua-parallel-scripts)",
+         not name outside the {} of its KEYS (lua-parallel-scripts)",
         name.to_ascii_lowercase(),
         String::from_utf8_lossy(pattern),
-        crate::tag_locks::script_tag_for_message()
+        crate::tag_locks::script_tags_for_message()
     ))
 }
 
@@ -629,14 +695,14 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         return resp_error("ERR SELECT is not allowed in cluster mode");
     }
 
-    // A script running under its tag's lock keeps to its tag (`tag_locks`).
+    // A script held to the tags of its KEYS keeps to them (`tag_locks`).
     if crate::tag_locks::in_script() {
         let outside = if crate::tag_locks::sees_the_whole_keyspace(name2) {
             Some(format!(
                 "ERR Script attempted to run '{}', which looks at keys it does not name, while \
-                 running under the hash tag '{}' of its KEYS (lua-parallel-scripts)",
+                 running under the {} of its KEYS (lua-parallel-scripts)",
                 name2.to_ascii_lowercase(),
-                crate::tag_locks::script_tag_for_message()
+                crate::tag_locks::script_tags_for_message()
             ))
         } else {
             crate::keyspec::key_positions(name2, &ctx.cmd)
@@ -645,10 +711,10 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
                 .find(|key| !crate::tag_locks::script_may_touch(key))
                 .map(|key| {
                     format!(
-                        "ERR Script attempted to access the key '{}', which is outside the hash \
-                         tag '{}' of its KEYS (lua-parallel-scripts)",
+                        "ERR Script attempted to access the key '{}', which is outside the {} \
+                         of its KEYS (lua-parallel-scripts)",
                         String::from_utf8_lossy(key),
-                        crate::tag_locks::script_tag_for_message()
+                        crate::tag_locks::script_tags_for_message()
                     )
                 })
                 .or_else(|| sort_pattern_outside_the_tag(name2, &ctx.cmd))
@@ -669,9 +735,9 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         {
             return resp_error(&format!(
                 "ERR Script attempted to SELECT {db}, the first database other than 0 \
-                 selected on this server, while running beside other scripts under the hash \
-                 tag '{}' of its KEYS (lua-parallel-scripts)",
-                crate::tag_locks::script_tag_for_message()
+                 selected on this server, while running beside other scripts under the {} \
+                 of its KEYS (lua-parallel-scripts)",
+                crate::tag_locks::script_tags_for_message()
             ));
         }
     }
@@ -784,8 +850,8 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // client tracking that key is not told. Judged by the arguments, as the
     // propagation below judges it (`command_mutates_for_replication`).
     let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
-    // A `SELECT` is propagated, but writes nothing: a script that has only
-    // selected a database can still be killed (#424).
+    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`):
+    // a script that has only selected a database can still be killed (#424).
     #[cfg(feature = "lua")]
     if !result.starts_with(b"-")
         && inner_write
@@ -1153,38 +1219,48 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             if name == "SELECT" && ctx.cmd.get(1).is_some_and(|db| *db != &b"0"[..]) {
                 return resp_error("ERR SELECT is not allowed in cluster mode");
             }
-            // Pull asking flag from client registry.
-            let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
-            // Before the keys are looked for: anything that moves them from
-            // here after this, the write sees in the gate.
-            routed = crate::cluster::routing::Routed::now(asking_flag);
-            // has_key_locally: bind to the store/db combination via closure.
-            let store_for_check = ctx.store;
-            let db = *ctx.selected_db;
-            let has_key_locally = |key: &[u8]| -> bool {
-                let shard = crate::store::get_shard(&store_for_check[db], key);
-                crate::read_lock!(shard).contains_key(key)
-            };
-            let registry = ctx.client_registry;
-            let client_id = ctx.client_id;
-            let decision = route_named(
-                name,
-                ctx.cmd.as_slice(),
-                ctx.cluster,
-                asking_flag,
-                || registry.get_readonly(client_id),
-                has_key_locally,
-            );
-            // ASKING is single-shot: clear after this command regardless of outcome.
-            if asking_flag {
-                ctx.client_registry.update(ctx.client_id, |info| {
-                    info.asking = false;
-                });
+            // A command `EXEC` runs was routed with the rest of its queue, once,
+            // before any of it ran (`routing::exec_refusal`), and leaves
+            // `ASKING` to the end of the transaction (`routing::transaction_ended`).
+            // Routed again here, it was judged on the keys the commands before
+            // it had made or deleted, and refused half way through (#339).
+            // Scripts' commands do not come here; a command of the client's
+            // takes the gate alone only after this.
+            if !crate::command_gate::alone_on_this_thread() {
+                // Pull asking flag from client registry.
+                let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
+                // Before the keys are looked for: anything that moves them from
+                // here after this, the write sees in the gate.
+                routed = crate::cluster::routing::Routed::now(asking_flag);
+                // has_key_locally: bind to the store/db combination via closure.
+                let store_for_check = ctx.store;
+                let db = *ctx.selected_db;
+                let has_key_locally = |key: &[u8]| -> bool {
+                    let shard = crate::store::get_shard(&store_for_check[db], key);
+                    crate::read_lock!(shard).contains_key(key)
+                };
+                let registry = ctx.client_registry;
+                let client_id = ctx.client_id;
+                let decision = route_named(
+                    name,
+                    ctx.cmd.as_slice(),
+                    ctx.cluster,
+                    asking_flag,
+                    || registry.get_readonly(client_id),
+                    has_key_locally,
+                );
+                // ASKING is single-shot: clear after this command regardless of
+                // outcome.
+                if asking_flag {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.asking = false;
+                    });
+                }
+                if let Some(refusal) = decision.refusal() {
+                    return refusal;
+                }
+                crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
             }
-            if let Some(refusal) = decision.refusal() {
-                return refusal;
-            }
-            crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
         }
     }
 
@@ -1376,19 +1452,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     let overrun = || false;
     const SLICE: std::time::Duration = std::time::Duration::from_millis(10);
     // Scripts by hash tag, when that is switched on (`tag_locks`). A script
-    // whose keys share a tag is held to it, however it is run. One that its
-    // caller has seen to be a quick one also runs beside other scripts: it
-    // takes the gate as a command does, and its tag's lock below. Not inside
-    // a transaction or another script: those hold the gate alone already.
+    // whose keys all carry a tag — one, or several — is held to those tags,
+    // however it is run. One that its caller has seen to be a quick one also
+    // runs beside other scripts: it takes the gate as a command does, and
+    // its tags' locks below. Not inside a transaction or another script:
+    // those hold the gate alone already.
     let tag_locks = crate::tag_locks::enabled();
-    let allowed_beside = any_script && crate::tag_locks::take_next_script_allowed();
-    let script_tag: Option<&[u8]> = if tag_locks && any_script {
-        crate::tag_locks::script_tag(&ctx.cmd)
+    let (script_tags, beside_others) = if any_script {
+        script_mode(&ctx.cmd, name, tag_locks, ctx.apply_replication)
     } else {
-        None
+        (None, false)
     };
-    let beside_others =
-        script_tag.is_some() && allowed_beside && !crate::command_gate::alone_on_this_thread();
     // A command that looks at keys it does not name must not find a script
     // part-way through: it waits for all of them (`takes_the_gate_alone`).
     // On a thread that holds the gate already, what either takes of it is
@@ -1440,9 +1514,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
     {
         // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
-        // cache, not the dataset, and while writes are paused they are kept
-        // out of the replication stream and the AOF
-        // (`replication::held_back`), so a handoff misses nothing of them.
+        // cache, not the dataset, and are sent to nobody (#705), so a
+        // handoff misses nothing of them.
         // The pause does not hold them (#518), and they used to wait the
         // handoff out here instead, asleep on their worker thread, with
         // every other connection of that thread (#528).
@@ -1527,16 +1600,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         }
     }
 
-    // The tag's lock, for a script that runs under one; and for a command
-    // from a client, the lock of every tagged key it names, so that it finds
-    // those keys as they were before a script or as they are after it.
-    // Before the order of writes below, for both, so that the two are always
+    // The tags' locks, for a script that runs under its tags; and for a
+    // command from a client, the lock of every tagged key it names, so that
+    // it finds those keys as they were before a script or as they are after
+    // it. Both take several lowest first (`tag_locks`), inside the write
+    // gate, and before the order of writes below, so that they are always
     // taken the same way round.
-    let _script_tag = script_tag.map(|tag| {
+    let _script_tags = script_tags.map(|tags| {
         if beside_others {
-            crate::tag_locks::lock_for_script(tag)
+            crate::tag_locks::lock_for_script(&tags)
         } else {
-            crate::tag_locks::hold_script_to(tag)
+            crate::tag_locks::hold_script_to(&tags)
         }
     });
     let _key_tags = if tag_locks
@@ -2601,15 +2675,38 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
         return;
     }
     let db = *ctx.selected_db;
+    // A blocking pop's own keys gained nothing from it: what it wakes there
+    // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
+    // destination) its handler wakes, and that is waited for.
+    let quiet = waiters && pops_blocking(name);
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {
             continue;
         }
-        if waiters {
+        if quiet {
+            crate::wait_table::without_collecting(|| ctx.wait_table.notify_signal(key));
+        } else if waiters {
             ctx.wait_table.notify_signal(key);
         }
     }
+}
+
+/// The commands that wait for elements and take them.
+#[cold]
+fn pops_blocking(name: &str) -> bool {
+    matches!(
+        name,
+        "BLPOP"
+            | "BRPOP"
+            | "BRPOPLPUSH"
+            | "BLMOVE"
+            | "BLMPOP"
+            | "BZPOPMIN"
+            | "BZPOPMAX"
+            | "BZMPOP"
+            | "XREADGROUP"
+    )
 }
 
 /// [`apply_write_side_effects`] for a caller that has already classified the

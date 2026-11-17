@@ -262,7 +262,15 @@ fn search_timeout_is_the_limit_of_a_query_that_names_none() {
             .is_ok()
     );
     assert_eq!(c.config("search-on-timeout"), "return_strict");
-    assert!(search(&mut c).is_err());
+    let reply = search(&mut c);
+    assert!(reply.warned(), "{reply:?}");
+    assert!(
+        c.cmd(&["FT.CONFIG", "SET", "ON_TIMEOUT", "return-strict"])
+            .is_ok()
+    );
+    assert_eq!(c.config("search-on-timeout"), "return-strict");
+    let reply = search(&mut c);
+    assert!(reply.warned(), "{reply:?}");
     assert!(
         c.cmd(&["CONFIG", "SET", "search-on-timeout", "return"])
             .is_ok()
@@ -296,6 +304,16 @@ fn search_timeout_is_the_limit_of_a_query_that_names_none() {
         kividb::config::Config::default()
             .apply_config_text("search-timeout soon\n", &|_| false)
             .is_err()
+    );
+    assert!(
+        kividb::config::Config::default()
+            .apply_config_text("search-on-timeout return-strict\n", &|_| false)
+            .is_ok()
+    );
+    assert!(
+        kividb::config::Config::default()
+            .apply_config_text("search-on-timeout return_strict\n", &|_| false)
+            .is_ok()
     );
 
     // `0`: no limit.

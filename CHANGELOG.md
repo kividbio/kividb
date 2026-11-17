@@ -12,6 +12,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrade replicas before their master for time series `IGNORE`.** A 1.2
   replica passes `IGNORE` over, and cannot read a snapshot or `DUMP` holding
   a series that has it (tag 17).
+- **A script whose `KEYS` carry several hash tags is held to them (#871).**
+  With `lua-parallel-scripts yes` (the default), such a script now runs
+  beside other commands, and a key it touches that carries none of its
+  tags is refused (`... outside the hash tags 'a', 'b' of its KEYS`), as a
+  script of one tag's always was. Up to 1.2.2 it ran alone and could touch
+  any key. The refusal comes at the call that touches the key, so writes
+  the script made before it stay, as with any error in a script. Give such a key one of the script's tags, or declare a key
+  without a tag so that the script runs alone; or set
+  `lua-parallel-scripts no`.
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
@@ -19,6 +28,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint with a Bloom filter in it cannot be read by an earlier release.
   Delete the filters (or move them off with `DUMP`, which Redis restores)
   before going back.
+- **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
+  and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
   now propagates an `XADD … IDMP` that was a duplicate (#655), and a
   replica of an earlier release refuses it ("equal or smaller than the
@@ -44,6 +55,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   In a cluster of more than one master, `FT.HYBRID` is now refused, where
   1.2.x answered from the one node's slots without saying so.
+- **nodes.conf keeps each node's shard id (#563)**, after its address and
+  hostname as Redis writes it: `ip:port@cport,<hostname>,shard-id=<id>`.
+  An earlier release reading the file takes `<hostname>,shard-id=<id>` for
+  the hostname, until each peer's next heartbeat says its own again; a
+  cluster's shard ids converge on each master's as its nodes are upgraded.
+  After a rollback with `cluster-preferred-endpoint-type hostname`, a peer
+  that is down at that moment is handed out under that name in `MOVED` and
+  `CLUSTER SLOTS` until it comes back.
 
 ### Added
 
@@ -52,6 +71,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deltas are within the specified thresholds when the duplicate policy is `LAST`.
   Ignored samples are not stored, do not replicate or log to AOF, and reply with
   the series' last timestamp.
+- **`INFO stats` says how scripts were run (#871).** With
+  `lua-parallel-scripts yes`, a script runs beside other commands only when
+  its `KEYS` share a hash tag and it has been seen to be quick; any other
+  runs alone, and holds up every other command while it does. Nothing
+  showed which: a benchmark could run every script alone without anyone
+  seeing it but in `top -H`. `scripts_run_beside_others` and
+  `scripts_run_alone_*` now count each script run by how it ran and why
+  (parallel scripts off, inside a transaction, a function, no keys, a key
+  without a tag, not yet seen to be quick), and
+  `scripts_handed_to_runner` and `scripts_offloaded_to_pool` count where
+  the ones run alone ran. They are counted only where a script's way of
+  running is decided: nothing is added to other commands, and a build
+  without Lua has none of them. `CONFIG RESETSTAT` resets them. See
+  docs/SCRIPTS.md.
+
 - **Redis-style command-line directives: `kividb --appendonly yes --save 900 1
   --maxmemory 256mb ...` (#390).** Every directive a config file or `CONFIG
   SET` takes is now taken on the command line, in the form `redis-server`
@@ -211,7 +245,83 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     replica without `vset-quant`, which logs why, instead of sending
     snapshots 1.2 refuses. **Upgrade replicas before masters.**
 
+- **A replica's `INFO replication` reports `master_replid`, as Redis's
+  does (#402).** It is the id of the stream `slave_repl_offset` counts in:
+  all zeros until a master has answered a `PSYNC`, the followed stream's
+  id after — including the new id a restarted master announces when a
+  dataset digest lets the replica continue without a full sync.
+
 ### Changed
+
+- **Scripts whose keys carry several hash tags run beside other commands
+  (#871).** With `lua-parallel-scripts yes`, a script ran beside others only
+  when all its `KEYS` shared one hash tag; one whose keys carried two, as
+  LiteLLM's rate limiter does for a key and its team in one `EVALSHA`, ran
+  alone, and every other command on the server waited for it. A script
+  now runs beside others when every one of its `KEYS` carries a tag, one or
+  several: it takes the lock of each of its tags, in one fixed order (the
+  one a client's command naming several tags uses), holds them for its
+  whole run, and may touch only keys of those tags (the error names them:
+  `outside the hash tags 'a', 'b' of its KEYS`). A script of several tags
+  that touched a key outside all of them used to work and now fails: give
+  the key a tag of the script, or declare a key without a tag so that the
+  script runs alone. Scripts with no keys or an untagged key, functions,
+  scripts inside `MULTI` and `lua-parallel-scripts no` are as before.
+  On one 8-vCPU VM, the server on 4 cores, LiteLLM's `BATCH_RATE_LIMITER`
+  called for a key and its team went from 55k to 134k calls a second at 500
+  connections (Redis 8.10.2: 64k), p99 11.4 to 5.0 ms; LiteLLM's whole
+  per-request mix of scripts, spend counters and cache from 89k to 226k
+  commands a second, p99 19.8 to 3.8 ms (Redis: 104k, 9.5 ms). Scripts of
+  one tag and commands that are not scripts are unchanged.
+
+- **Small sets take a half to a twelfth of the memory (#297).** A set of
+  up to 128 members of up to 64 bytes is kept in one block, the members end
+  to end, where it was a hash table with an allocation for every member: 14-byte
+  members take 34.6 bytes a member at 10 members (76.0 before; Redis 8.10.2
+  25.8) and 20.4 at 100 (55.5; Redis 18.5). A set whose members are all the
+  canonical decimal text of an `i64` (no `+`, no leading zero, no `-0`), up to
+  512 of them, is a sorted array of 16-, 32- or 64-bit integers: 17.6 bytes a
+  member at 10 (68.0; Redis 9.8) and 3.8 at 100 (47.5; Redis 2.8). Larger
+  sets are tables as before, at the same size. Thanks @Parikalp-Bhardwaj for
+  the arrays (#309).
+  - A set moves from the array to the block when a member that is not such
+    an integer comes, and from either to the table
+    when the block would pass 128 members or a member is longer than 64
+    bytes, as Redis moves an intset to a listpack and either to a hash
+    table; never back. Clients see the same members as before: `01`, `+1`
+    and `-0` stay strings.
+  - `OBJECT ENCODING` reports the form a set is kept in, `intset`,
+    `listpack` or `hashtable`, and `SSCAN` returns an array or a block whole,
+    with cursor 0, whatever `COUNT` says, as Redis returns an intset or a
+    listpack. Both matched Redis 8.10.2 through every change of form in our
+    comparison, but one: with `set-max-intset-entries` under 128, an array
+    that passes it becomes a block (`listpack`) where Redis makes a
+    `hashtable`.
+  - `set-max-intset-entries` (default 512), `set-max-listpack-entries`
+    (128) and `set-max-listpack-value` (64) now take effect, from the
+    configuration file or `CONFIG SET`; `0` for an `entries` limit turns
+    its form off. The two
+    `listpack` limits go no higher than 128 and 64, and `CONFIG GET` reports
+    the value kept. A changed limit applies to a set at its next new member.
+  - `SMEMBERS`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` and `SRANDMEMBER` write
+    members into the reply without copying them first: `SMEMBERS` of a
+    100-member set costs about 40 % fewer instructions, `SINTER` of two
+    64-integer sets 42 % fewer and of two 64-member string sets 27 % fewer.
+    `SISMEMBER`, `SADD` and `SREM` on a set of 8 cost no more than on a
+    table, and up to 2 % more on a block of 100.
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write members as text, so their formats do not change: 1.2.2 reads what
+    this release writes and the other way round. `MEMORY USAGE`, eviction
+    and lazy freeing count a block or an array as the one allocation it is.
+
+- **Active defrag's pass ends about twice as fast, at the same CPU cap
+  (#240, #291).** It slept after every batch of 128 buckets, and each sleep
+  overshot; it now sleeps once a millisecond of work is owed its rest, at
+  the same `active-defrag-cycle-max`, and between its holds hands a busy
+  shard to a waiting client. On Azure (5M keys, half deleted) a pass took
+  6 s instead of 13 s and gave memory back in 6 s instead of 12 s, with no
+  measurable change in `GET`/`SET` p99.9 during the pass.
+  Thanks @Parikalp-Bhardwaj.
 
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
@@ -326,6 +436,230 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A shard keeps its id across a failover (#563).** `CLUSTER MYSHARDID`
+  answered the master's node id, so a shard's id changed when a replica
+  took over. Each node now has a shard id of its own, as in Redis: random
+  when it is first known, its master's while it is a replica, kept when a
+  replica is promoted, and new after `CLUSTER RESET HARD`. Nodes say their
+  own in their heartbeats (a token older nodes skip), and nodes.conf keeps
+  it, saved as soon as a node learns a new one. In `CLUSTER SHARDS` a
+  failed master without slots is shown in the entry of its shard's master,
+  the replica that took over from it; every master that owns slots still
+  has an entry of its own.
+
+- **A pipeline sent before its replies are read no longer hangs its
+  connection (#865).** A client that sends a whole pipeline and only then
+  reads the replies, as redis-py's pipeline does, was still sending when
+  its first replies filled the socket; the server, waiting to write them,
+  stopped reading it, and neither went on: from about 170,000 `SET`s on
+  macOS, and 940,000 under io_uring with Linux's default socket buffers.
+  Both I/O loops now read a client while its replies wait, and run what
+  they read after them a read's worth at a time; TLS connections, which
+  the tokio loop serves under either, are covered as well. What is read
+  counts against `client-query-buffer-limit`, and, with the replies
+  waiting, against the class's hard `client-output-buffer-limit`: a client
+  that never reads is closed there, as Redis closes it once its replies
+  reach that limit. The same goes for the replies a blocking command
+  writes before it waits; if that write fails, the client is closed at
+  once, and what it pipelined after the blocking command is not run.
+
+- **A replica of 1.2.0 no longer writes a `TS.INCRBY` its own AOF replay
+  refuses (#611).** A 1.2.0 master sends a time above `i64::MAX` as the
+  negative number it replied, and the replica's re-log kept that tail next
+  to the unsigned time of 1.2.1's mark — a record the replica's own replay
+  then refused, losing the sample. A `TIMESTAMP` as 1.2.0 sent one is now
+  read as the same 64 bits on replay, in an applied command as in a
+  `TS.ADD` or `TS.MADD`, so the re-logged record — and any such record an
+  earlier 1.2.1 already wrote — replays at the time 1.2.0 kept.
+
+- **`TS.ADD` and `TS.INCRBY` send the time they replied with to replicas
+  and the AOF.** `TS.ADD` sends the time of the sample it added as the
+  number it replied, as `TS.MADD`, `TS.INCRBY` and `TS.DECRBY` do, in place
+  of the time as the client wrote it (`+5`, `007`): the plain number every
+  version reads. A time of `-0` is refused by every command that takes a
+  sample's time, as RedisTimeSeries and 1.2.0 refuse it. And a
+  `TS.INCRBY` or `TS.DECRBY` record written by 1.2.0, which a replica
+  applies as 1.2.0 read it, is logged again as 1.2.0 wrote it: the
+  replica's AOF, and a backup taken from it, read it as the replica did.
+
+- **A replica continued by a dataset digest keeps the new stream's id as
+  its resync point (#402).** A master killed and started again from its
+  AOF begins a new stream; a replica that proved its dataset was that
+  stream's start (`+DIGEST`, then `+CONTINUE`) was continued but kept the
+  dead stream's id — and one that had asked `PSYNC ? -1` kept no resync
+  point at all. Promoted, such a replica could not continue its
+  siblings; restarted, it asked for a full resync it did not need. The
+  point now
+  takes the id `+CONTINUE` announces and the place the stream is continued
+  from, under the lock a promotion reads it in, and is dropped when the
+  node had stopped being a replica before the reply arrived.
+
+- **`INFO` no longer reads over `maxmemory` for a moment while a snapshot is
+  prepared (#848).** A snapshot encodes every value that is not a string
+  into buffers as it captures the dataset, and counted them as not to be
+  evicted for only when it was done, so for that long `used_memory -
+  mem_not_counted_for_evict` read high by the size of the encoded
+  collections (72 to 173 MB in one soak). Nothing was evicted or refused
+  because of it, but monitoring and autoscalers that read `INFO` saw it. The
+  buffers are now counted as they are made, and given back as the snapshot
+  writes them out; the times to live of the strings it writes are counted
+  too. The snapshot's content and its timing are the same.
+
+- **`HRANDFIELD` and `ZRANDMEMBER` no longer copy the whole collection to
+  pick a few members (#839).** `HRANDFIELD key count` built a vector of
+  every field and one of every index, and `ZRANDMEMBER` collected every
+  member, before choosing; one `ZRANDMEMBER` over a million members took
+  5.6 ms where Redis 8.10.2 takes 0.05 ms. A hash is now read by position,
+  so `HRANDFIELD` costs the count, not the size: with a million fields a
+  count of 10 takes 63 us instead of 1,049 us (Redis: 80 us; each figure
+  includes about 50 us of client round trip). A sorted set has no index by
+  position, so `ZRANDMEMBER` still walks its member table up to the last
+  member it picks, without copying anything: over a million members one
+  member takes 1.1 ms instead of 5.6 ms and ten take 1.9 ms instead of
+  6.4 ms, and the cost still grows with the set until its storage can be
+  indexed by position. A count of the collection's size or more now returns
+  the whole collection in its order (a hash as `HGETALL` has it, a sorted
+  set from the highest score down), as Redis does, instead of in a random
+  order; every other sample is in random order, each member as likely as
+  any other.
+
+- **`CONFIG GET appendfilename` answers `appendonly.aof`, and `CONFIG SET
+  appendfilename appendonly.aof` is accepted (#855).** It answered an empty
+  list, and the set was refused although the configuration file takes the
+  same value. Any other name is still refused: the log has one name.
+
+- **A master and its replica hold the same dataset digest while entries
+  `XNACK` released are pending (#856).** Each node that applied the
+  `XNACK` (a replica, an AOF replay) gave a released entry its own internal
+  mark for the time it was delivered, and the digest held that mark, so
+  `DEBUG DIGEST-VALUE` of the stream differed between a master and its
+  replica, and a master killed and started from its AOF no longer matched
+  the replica it had: the replica could not be continued and took a full
+  sync it did not need. No reply differed (`XPENDING` and `XINFO` showed
+  the same) and nothing was lost. The digest now holds the time as it is
+  shown, 0 for a released entry. A 1.2.2 node and a new one compute a
+  different digest for a dataset with released entries, so a replica of
+  one kind of a master of the other that comes back after the master was
+  killed takes a full sync (two 1.2.2 nodes already did; it costs a sync,
+  not data); the stream, a clean restart and a full sync work as before.
+
+- **`ASKING` before `MULTI` covers the whole transaction on a node
+  importing the slot (#698).** It was used up by the first queued command,
+  so the next one, or the `EXEC`, was answered `MOVED`, and a transaction
+  on a key moving in a reshard could not run. As in Redis, it now lasts
+  until `EXEC` or `DISCARD` ends the transaction, and covers every command
+  `EXEC` runs. An `EXEC` that is refused (wrong arguments, or denied by
+  ACL) ends the transaction too, so it clears it as well. `RESET` clears it,
+  as in Redis.
+
+- **A transaction on a slot being moved runs whole or is refused whole
+  (#339).** `EXEC` routed its queue, then routed each command again as it
+  ran, with the keys the commands before it had made or deleted, so a
+  transaction could be left half applied: `DEL {t}b; RENAME {t}a {t}b` on
+  the importing node ran the `DEL` and answered the `RENAME` `TRYAGAIN`, and
+  `DEL {t}a; SET {t}a v` on the source ran the `DEL` and answered the `SET`
+  `ASK`. As in Redis, `EXEC` now routes the queue once, as one command, with
+  the keys as they are before any of it runs, and its commands are not
+  routed again. A queue whose keys are only partly here is refused whole
+  with `-TRYAGAIN`, and one none of whose keys is left on the source with
+  `-ASK`, where each command could be routed apart before.
+
+- **`CONFIG GET dbfilename` answers with the snapshot file's name (#846).**
+  It answered nothing, so a tool that takes a snapshot over the protocol
+  (`SAVE`, then `CONFIG GET dir` and `CONFIG GET dbfilename`) could not find
+  the file. It now answers `dump.kdb`, the file the server writes and loads
+  whatever `--dbfilename` or the configuration file said, and a pattern such
+  as `d*` lists it. The name still cannot be changed: `CONFIG SET
+  dbfilename` with another name is refused, as the same setting in the
+  configuration file is.
+
+- **Entries `XNACK` released are no longer the entries of a consumer named
+  `""` (#833).** A released entry belongs to no consumer, but KiviDB kept
+  it under the empty name, so a real consumer named `""` was reported
+  as holding them: `XPENDING` with that consumer, `XINFO CONSUMERS`, the
+  `XPENDING` summary and a history read of it counted them, and `XGROUP
+  DELCONSUMER` deleted them. Released entries are now kept apart, as in
+  Redis 8.10.2. A snapshot keeps the two apart (a snapshot from an
+  earlier release still reads as it did, and tells them apart by the
+  delivery time `XNACK` gives), and an earlier release reads a new
+  snapshot as it read the old one. For that, `XCLAIM` for a consumer named
+  `""` with a `TIME` before 2004 (or an `IDLE` reaching back that far)
+  records that point in time instead.
+
+- **Under an `allkeys-*` policy a write is no longer refused with OOM while
+  eviction is working (#520).** Two things refused one. Eviction stopped
+  once it had evicted about 1 MB of keys with memory use no lower (the
+  guard against evicting keys a snapshot still holds, #284), and with many
+  clients writing at once the other threads' writes kept memory use as high
+  while every key evicted was freed: the guard now asks what the evicting
+  thread itself gave back (what it freed, and what it counted as held by a
+  snapshot), and stops only when that is under a quarter of what it
+  evicted. And a write that found nothing left to evict while another
+  thread was still freeing a large collection it had evicted was refused.
+  Under an `allkeys-*` policy only, such a write is now let through when
+  the collections being freed at that moment (reckoned low: 32 bytes an
+  element) bring memory use under `maxmemory` by themselves; otherwise, and
+  under every `volatile-*` policy, it is refused as before. That lets
+  memory go over the limit by at most the bytes reckoned as being freed
+  and one command per thread, until the next write evicts the keys let in;
+  nothing waits. On a 4-vCPU VM (master and replica with
+  AOF, memtier `SET`/`GET` pipelined and not, `HSET`/`HEXPIRE`, lists,
+  sets and sorted sets, `maxmemory 512mb`, ~53M writes in ten minutes),
+  master refused 2 writes under `allkeys-lfu` and 3 under `allkeys-lru`,
+  the fix none; memory use was never over the limit by more than 0.23 MB
+  for 100 ms or longer (master: 0.18 MB). Keys that only a snapshot holds are
+  still not evicted for nothing. The soak is
+  `benchmarks/1.3.0/eviction-soak/soak.sh`.
+
+- **`SHUTDOWN` that goes ahead answers nothing, as Redis does, and one that
+  fails answers an error and keeps the server running (#429).** It
+  answered `+OK` and then closed the connection, so redis-py's
+  `shutdown()`, which takes any reply for a failure, raised "SHUTDOWN seems
+  to have failed" on every successful shutdown. The connection now stays
+  silent until the process exits, after the final save, and replies that
+  were owed before the `SHUTDOWN` (a pipelined `SET`) are sent first.
+  If the final save cannot be written, `SHUTDOWN` answers `-ERR Errors
+  trying to SHUTDOWN. Check logs.` and the server runs on: the shutdown's
+  own pause is lifted, and a pause in force before it (`CLIENT PAUSE`, a
+  failover's or a slot migration's hold of writes) stays. `SHUTDOWN FORCE`,
+  and a signal, still end the process with status 1. `SHUTDOWN ABORT`
+  cancels a shutdown that is waiting for lagging replicas, and answers
+  `-ERR No shutdown in progress.` when there is none, where it answered
+  `+OK`; a signal that came meanwhile still shuts the server down
+  afterwards, with its final save. `SHUTDOWN NOSAVE` now waits for lagging
+  replicas too, as in Redis, for at most `shutdown-timeout` (`NOW` skips
+  the wait), and writes and syncs the AOF before the process exits. While a
+  script has run past `lua-time-limit`, `SHUTDOWN NOSAVE` still ends the
+  process without waiting for the script, and a `SHUTDOWN` that would save
+  is answered `BUSY`, as in Redis, where it waited for the script for ever.
+  An unknown or conflicting modifier is `-ERR syntax error`, as in Redis.
+  Two differences from Redis remain: every client,
+  readers included, is paused while the shutdown waits for the replicas,
+  where Redis pauses writes only, and a SIGTERM whose final save fails
+  ends the process with status 1, where Redis keeps running.
+
+- **`ON_TIMEOUT return-strict` is accepted and `FT.SEARCH` / `FT.AGGREGATE`
+  reply with what was found, as Redis does (#781).** Redis spells the
+  policy `return-strict` (hyphen). This build only took `return_strict`
+  (underscore) and treated it as `fail`: a query cut short was an error
+  instead of a partial reply and a RESP3 warning. Both spellings are
+  taken (`FT.CONFIG SET ON_TIMEOUT`, `CONFIG SET search-on-timeout`, the
+  config file). `return-strict` and `return_strict` now match `return`
+  for `FT.SEARCH` and `FT.AGGREGATE`; only `fail` is an error.
+  `FT.HYBRID` is unchanged (#779): Redis already answers it under
+  `return-strict` with what was found.
+
+- **A vararg function in a script has Lua 5.1's implicit `arg` (#820).**
+  Redis builds its Lua with `LUA_COMPAT_VARARG`, so `function f(...)
+  for _, v in ipairs(arg) do ... end end` runs there; here it failed with
+  "Script attempted to access nonexistent global variable 'arg'" (older
+  scripts and sidekiq-unique-jobs' test fixtures use it). A vararg function
+  whose text says `arg` now starts with the local Lua 5.1 makes: the table
+  of its extra arguments with their count in `n`, or `nil` when its body
+  uses `...` itself, as in Redis. It is added once, when the script or
+  library is compiled, on the line of the function's parameters; a script
+  that does not say `arg` in a vararg function is compiled unchanged, and
+  no call does any more than it did.
 - **`SSCAN`, `HSCAN` and `ZSCAN` on a key that is not there are an empty
   scan whatever follows the cursor, and read their options as Redis does
   (#820).** `ZSCAN key 0 MATCH * COUNT 0` on a missing key answered `ERR
@@ -434,6 +768,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `replica`, as in Redis (`ROLE` and `INFO` still say `slave`), and the
   fallback `HELLO` in the command table has the `id` field and the
   connection's protocol too. Thanks to @matheussilvano.
+
+- **What a client reads after a push that woke a blocked client includes
+  that client's pop (#42).** The woken client was answered on its own
+  task, so its `BLPOP` could land after the `LPUSH` that woke it had
+  replied: `INFO` or `LLEN` sent right behind the push could see one change
+  fewer and the element still there, which made Redis's `BLPOP/BLMOVE
+  should increase dirty` and `Circular BRPOPLPUSH` fail now and then. Now
+  a command that reads runs only once the clients woken by the commands
+  before it on the same connection have looked at their keys, for a chain
+  of them too (waiting at most 100 ms for a client that cannot look at
+  once: paused, killed), so what a client reads after its own push is what
+  Redis shows. Writes and replies are not held: a producer pipelining
+  pushes to queues with blocked workers keeps its rate (holding replies
+  until the workers had popped cost 30-40 % of the jobs per second in
+  suite 15). What still differs from Redis, as it did before: a write
+  pipelined right behind the push that woke a client acts on the list
+  before that client's pop. A second push's reply may count the element
+  the woken client has yet to take; `LPUSHX` or `LSET` find the list
+  there; `LPOP`, `LMOVE`, `LTRIM`, `DEL` or `RENAME` may take the element
+  first, and the client then waits on. Nothing is lost or delivered
+  twice, and a replica applies the same order. In builds with Lua, a
+  push made by a script is not waited for by the reads that follow it.
+  Thanks to @willgitdata for the fix.
 
 - **A tiny non-zero blocking timeout waits 1 ms and replies nil, as in Redis
   (#704).** `BLPOP key 1e-343` read the timeout as 0 and waited for ever,

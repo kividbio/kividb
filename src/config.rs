@@ -1866,9 +1866,10 @@ impl Config {
             }
             "dbfilename" => {
                 if !matches!(one()?, "dump.kdb" | "dump.rdb") {
-                    return Err(
-                        "'dbfilename' cannot be changed: the snapshot is always 'dump.kdb'".into(),
-                    );
+                    return Err(format!(
+                        "'dbfilename' cannot be changed: the snapshot is always '{}'",
+                        crate::aof::SNAPSHOT_PATH
+                    ));
                 }
             }
             "daemonize" => {
@@ -2029,6 +2030,9 @@ impl Config {
                                 | "lazyfree-lazy-user-del"
                                 | "latency-tracking"
                                 | "latency-tracking-info-percentiles"
+                                | "set-max-intset-entries"
+                                | "set-max-listpack-entries"
+                                | "set-max-listpack-value"
                                 | "rdbchecksum"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),

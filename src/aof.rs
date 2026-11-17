@@ -69,6 +69,9 @@ const AOF_FLAG_PREAMBLE: u8 = 1;
 pub const AOF_DELTA_MAGIC: &[u8; 8] = b"KIVIDLT1";
 pub const AOF_DELTA_HEADER_LEN: usize = 16;
 pub const AOF_GEN_PATH: &str = "dump.kdb.gen";
+/// The snapshot a save writes and a start reads, in the data directory; what
+/// `CONFIG GET dbfilename` answers (#846).
+pub const SNAPSHOT_PATH: &str = "dump.kdb";
 
 // ── Rewrite telemetry ────────────────────────────────────────────────────────
 //
@@ -1778,6 +1781,14 @@ fn sync_before_reply(file: &std::fs::File) {
     if let Err(e) = synced {
         sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
     }
+}
+
+/// Shutdown, with no snapshot to carry the writes (`SHUTDOWN NOSAVE`, or a
+/// final save that failed): the AOF is all the process leaves of them, so
+/// what is queued is written and the file synced before the process exits,
+/// as Redis flushes and syncs its AOF. Nothing with the AOF off.
+pub fn sync_for_shutdown() {
+    do_fsync();
 }
 
 /// Write what is queued and sync the file — on a handle of its own, outside
@@ -3916,7 +3927,13 @@ fn failpoint_named(name: &str) -> bool {
 
 /// A step a test makes fail, named in `KIVIDB_TEST_FAILPOINTS` as a
 /// [`failpoint`] is: whether it is to fail.
-fn injected_failure(name: &str) -> bool {
+pub(crate) fn injected_failure(name: &str) -> bool {
+    failpoint_named(name)
+}
+
+/// A fault a test injects, named in `KIVIDB_TEST_FAILPOINTS` as a
+/// [`failpoint`] is: whether it is to be.
+pub(crate) fn injected(name: &str) -> bool {
     failpoint_named(name)
 }
 
@@ -4722,6 +4739,65 @@ mod ts_option_replay_tests {
         };
         assert_eq!(samples("h"), [(u64::MAX - 1, 1.0), (u64::MAX, 2.0)]);
         assert_eq!(samples("i"), [(u64::MAX, 1.0)]);
+    }
+
+    /// A replica's own log of a `TS.INCRBY` its 1.2.0 master sent, whose
+    /// time above `i64::MAX` came as the negative number 1.2.0 replied: the
+    /// `TIMESTAMP` tail the feed did not see is read as the same 64 bits
+    /// the mark carries, not refused and the sample lost (#611). The
+    /// unsigned tail the feed writes now, and a label's value `TIMESTAMP`,
+    /// replay as they did.
+    #[test]
+    fn a_replicas_relog_of_a_1_2_0_incrby_time_replays() {
+        let max = u64::MAX.to_string();
+        let at_616 = (-616_i64 as u64).to_string();
+        let store = replayed(&[
+            vec![
+                "TS.INCRBY",
+                "bad",
+                "3",
+                "timestamp",
+                at_616.as_str(),
+                "TIMESTAMP",
+                "-616",
+            ],
+            vec![
+                "TS.INCRBY",
+                "good",
+                "3",
+                "timestamp",
+                at_616.as_str(),
+                "TIMESTAMP",
+                at_616.as_str(),
+            ],
+            vec![
+                "TS.INCRBY",
+                "lbl",
+                "3",
+                "timestamp",
+                max.as_str(),
+                "LABELS",
+                "x",
+                "TIMESTAMP",
+                "-1",
+            ],
+        ]);
+        let samples = |key: &str| {
+            let shard = crate::store::get_shard(&store[0], key);
+            let map = shard.read();
+            match map.get(key.as_bytes()) {
+                Some(ValueRef::TimeSeries(inner)) => inner
+                    .read()
+                    .samples
+                    .iter()
+                    .map(|(t, v)| (*t, *v))
+                    .collect::<Vec<_>>(),
+                _ => panic!("{key} is not a series"),
+            }
+        };
+        assert_eq!(samples("bad"), [(-616_i64 as u64, 3.0)]);
+        assert_eq!(samples("good"), [(-616_i64 as u64, 3.0)]);
+        assert_eq!(samples("lbl"), [(u64::MAX, 3.0)]);
     }
 
     /// A compaction's destination past its time (its `DEL` not yet in the

@@ -623,33 +623,26 @@ fn slots_node_entry(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
 
 // ── CLUSTER SHARDS ───────────────────────────────────────────────────────────
 //
-// Redis 7+. Groups nodes by shard (master + its replicas) and returns the
-// slot ranges they cover. Each shard is a map: { slots: [...], nodes: [...] }.
+// Redis 7+. Groups nodes by shard and returns the slot ranges each covers.
+// Each shard is a map: { slots: [...], nodes: [...] }. See `shard_entries`
+// for which nodes share an entry.
 
 fn cmd_shards(state: &ClusterState) -> Vec<u8> {
     let nodes = state.nodes.read();
     let slots = state.slots.read();
 
     let mut shards: Vec<Vec<u8>> = Vec::new();
-    for master in nodes
-        .values()
-        .filter(|n| n.flags.contains(NodeFlags::MASTER))
-    {
+    for entry in shard_entries(&nodes, &slots[..]) {
         let mut slot_pairs: Vec<Vec<u8>> = Vec::new();
-        for (a, b) in compute_slot_ranges(&slots, master.id) {
+        for (a, b) in compute_slot_ranges(&slots, entry[0]) {
             slot_pairs.push(resp_integer(a as i64));
             slot_pairs.push(resp_integer(b as i64));
         }
-
-        let mut node_descs: Vec<Vec<u8>> = Vec::new();
-        node_descs.push(node_description(state, master));
-        for replica in nodes
-            .values()
-            .filter(|n| n.flags.contains(NodeFlags::REPLICA) && n.master_id == Some(master.id))
-        {
-            node_descs.push(node_description(state, replica));
-        }
-
+        let node_descs: Vec<Vec<u8>> = entry
+            .iter()
+            .filter_map(|id| nodes.get(id))
+            .map(|n| node_description(state, n))
+            .collect();
         shards.push(resp_array(vec![
             resp_bulk_str("slots"),
             resp_array(slot_pairs),
@@ -659,6 +652,64 @@ fn cmd_shards(state: &ClusterState) -> Vec<u8> {
     }
 
     resp_array(shards)
+}
+
+/// The entries of `CLUSTER SHARDS`: in each, its master, then any failed
+/// master folded into it, then their replicas. Its slots are the first
+/// master's.
+///
+/// A client takes one master for an entry and sends it the entry's slots,
+/// so every master that owns slots has an entry of its own, whatever its
+/// shard id: two can share one, an old master back for a moment before it
+/// says it is a replica, or a replica reset into an empty master that keeps
+/// its id and is given slots. A master that owns none joins the entry of a
+/// slot owner of its shard only when it has failed (`FAIL`): the master a
+/// replica took over from, which Redis shows in that shard (#563). One
+/// only suspected (`PFAIL`) still reads `online` in its description, and a
+/// client that takes an entry's last online master would send it the
+/// owner's slots.
+/// Any other master has an entry of its own.
+fn shard_entries(
+    nodes: &ahash::AHashMap<crate::cluster::NodeId, crate::cluster::ClusterNode>,
+    slots: &[Option<crate::cluster::NodeId>],
+) -> Vec<Vec<crate::cluster::NodeId>> {
+    let owners: ahash::AHashSet<crate::cluster::NodeId> = slots.iter().flatten().copied().collect();
+    let masters: Vec<&crate::cluster::ClusterNode> = nodes
+        .values()
+        .filter(|n| n.flags.contains(NodeFlags::MASTER))
+        .collect();
+    let mut entries: Vec<Vec<&crate::cluster::ClusterNode>> = masters
+        .iter()
+        .filter(|m| owners.contains(&m.id))
+        .map(|m| vec![*m])
+        .collect();
+    for master in masters.iter().filter(|m| !owners.contains(&m.id)) {
+        let failed = master.flags.contains(NodeFlags::FAIL);
+        match entries
+            .iter_mut()
+            .find(|e| failed && owners.contains(&e[0].id) && e[0].shard_id == master.shard_id)
+        {
+            Some(entry) => entry.push(master),
+            None => entries.push(vec![master]),
+        }
+    }
+    entries
+        .into_iter()
+        .map(|entry| {
+            let mut ids: Vec<crate::cluster::NodeId> = entry.iter().map(|m| m.id).collect();
+            for master in &entry {
+                ids.extend(
+                    nodes
+                        .values()
+                        .filter(|n| {
+                            n.flags.contains(NodeFlags::REPLICA) && n.master_id == Some(master.id)
+                        })
+                        .map(|n| n.id),
+                );
+            }
+            ids
+        })
+        .collect()
 }
 
 /// The link-state column of `CLUSTER NODES`: whether we can currently reach
@@ -2732,18 +2783,15 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
 
 // ── CLUSTER MYSHARDID ────────────────────────────────────────────────────────
 //
-// Shard ID = master node's ID. For a master that's our own ID. For a replica
-// it's our master_id. Returns the 40-hex node ID as a bulk string.
+// This node's shard id, 40 hex characters, as Redis keeps it: its master's
+// while it is a replica, and kept when a replica is promoted, so a shard's id
+// is the same before and after a failover (#563). See `ClusterNode::shard_id`.
 
 fn cmd_myshardid(ctx: &mut Ctx) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(ctx.cluster) {
         return err;
     }
-    let shard_id = match ctx.cluster.my_master_id() {
-        Some(master_id) => master_id, // we're a replica
-        None => ctx.cluster.myself(), // we're a master
-    };
-    resp_bulk_str(crate::cluster::node_id_str(&shard_id))
+    resp_bulk_str(crate::cluster::node_id_str(&ctx.cluster.my_shard_id()))
 }
 
 // ── CLUSTER SLOT-STATS ───────────────────────────────────────────────────────
@@ -2917,6 +2965,68 @@ mod tests {
     use super::*;
     use crate::types::{HashInner, KiviDBValue};
     use std::time::Instant;
+
+    /// `CLUSTER SHARDS`: a master that owns slots has an entry of its own,
+    /// even beside another of its shard id; a failed master without slots
+    /// joins its shard's slot owner, one that has not failed does not (#563).
+    #[test]
+    fn every_slot_owner_has_a_shard_entry_of_its_own() {
+        use crate::cluster::{ClusterNode, generate_node_id};
+        let shard = generate_node_id();
+        let master = |flags: NodeFlags| {
+            let mut n = ClusterNode::new(generate_node_id(), "127.0.0.1".into(), 7000, 17000);
+            n.flags = NodeFlags::MASTER | flags;
+            n.shard_id = shard;
+            n
+        };
+        let (a, b) = (master(NodeFlags::empty()), master(NodeFlags::empty()));
+        let failed = master(NodeFlags::FAIL);
+        let suspect = master(NodeFlags::PFAIL);
+        let empty = master(NodeFlags::empty());
+        let mut replica = ClusterNode::new(generate_node_id(), "127.0.0.1".into(), 7001, 17001);
+        replica.flags = NodeFlags::REPLICA;
+        replica.master_id = Some(failed.id);
+        let mut slots = vec![None; crate::cluster::slot::CLUSTER_SLOTS];
+        slots[0] = Some(a.id);
+        slots[1] = Some(b.id);
+        let ids = [a.id, b.id, failed.id, suspect.id, empty.id, replica.id];
+        let nodes: ahash::AHashMap<_, _> = [a, b, failed, suspect, empty, replica]
+            .into_iter()
+            .map(|n| (n.id, n))
+            .collect();
+        let [a, b, failed, suspect, empty, replica] = ids;
+
+        let entries = shard_entries(&nodes, &slots);
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        let of = |id| {
+            entries
+                .iter()
+                .find(|e| e[0] == id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(
+            of(b).len() == 1 || of(a).len() == 1,
+            "a and b each lead an entry"
+        );
+        let folded: Vec<_> = entries.iter().filter(|e| e.len() > 1).collect();
+        assert_eq!(folded.len(), 1, "{entries:?}");
+        let folded = folded[0];
+        assert!(folded[0] == a || folded[0] == b);
+        assert_eq!(folded.len(), 3, "the failed master and its replica");
+        assert!(folded.contains(&failed) && !folded.contains(&suspect));
+        assert_eq!(of(suspect), vec![suspect], "a suspected master is apart");
+        assert_eq!(
+            *folded.last().unwrap(),
+            replica,
+            "replicas come after the masters"
+        );
+        assert_eq!(
+            of(empty),
+            vec![empty],
+            "a master that has not failed stays apart"
+        );
+    }
 
     /// A hash of `(field, value, time)`.
     fn hash(fields: &[(&str, &str, Option<u64>)]) -> KiviDBValue {

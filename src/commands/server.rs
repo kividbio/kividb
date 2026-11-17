@@ -1192,10 +1192,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
-            | "appenddirname" | "aclfile" => {
-                let unchanged = config_rows(ctx)
-                    .iter()
-                    .any(|(name, current)| *name == param && current == value);
+            | "appenddirname" | "aclfile" | "dbfilename" => {
+                // `dump.rdb` is accepted as the configuration file accepts
+                // it: the snapshot is `dump.kdb` either way (#846).
+                let unchanged = (param == "dbfilename" && value == "dump.rdb")
+                    || config_rows(ctx)
+                        .iter()
+                        .any(|(name, current)| *name == param && current == value);
                 if unchanged {
                     Some(resp_simple("OK"))
                 } else {
@@ -1339,6 +1342,42 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                                  9223372036854775807 inclusive",
                 )),
             },
+            // The most members a set of integers keeps as an array (#297).
+            // Read as Redis reads a number (`string2ll`): no `+`, no
+            // leading zero.
+            // The most members, and the longest member, a set keeps in one
+            // block: no more than a block holds, and `CONFIG GET` says what
+            // was kept.
+            "set-max-intset-entries" | "set-max-listpack-entries" | "set-max-listpack-value" => {
+                match crate::member_set::canonical_i64(value.as_bytes()) {
+                    Some(limit) if limit >= 0 => {
+                        let limit = limit as usize;
+                        let kept = match param.as_str() {
+                            "set-max-intset-entries" => {
+                                crate::member_set::set_intset_max(limit);
+                                limit
+                            }
+                            "set-max-listpack-entries" => {
+                                crate::member_set::set_packed_entries(limit)
+                            }
+                            _ => crate::member_set::set_packed_value(limit),
+                        };
+                        REMEMBERED_CONFIG
+                            .lock()
+                            .insert(param.clone(), kept.to_string());
+                        Some(resp_simple("OK"))
+                    }
+                    Some(_) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument must be between 0 and \
+                         9223372036854775807 inclusive",
+                    ))),
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument couldn't be parsed into an integer",
+                    ))),
+                }
+            }
             // When the AOF is synced (#513): under `always`, before each
             // reply to a write, as in Redis. `no` is taken as `everysec`.
             "appendfsync" => match value.to_ascii_lowercase().as_str() {
@@ -1360,6 +1399,8 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                      argument(s) must be one of the following: always, everysec, no",
                 )),
             },
+            // What the latency monitor records (#158): remembered too, for
+            // `CONFIG GET`.
             // Whether a reply to a write waits for its AOF record (#147).
             "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
                 "yes" | "no" => {
@@ -1449,14 +1490,16 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
-                if matches!(policy.as_str(), "return" | "fail" | "return_strict")
-                    && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
+                if matches!(
+                    policy.as_str(),
+                    "return" | "fail" | "return-strict" | "return_strict"
+                ) && crate::commands::search_tools::set_config("ON_TIMEOUT", &policy)
                 {
                     Some(resp_simple("OK"))
                 } else {
                     Some(resp_error(
                         "ERR CONFIG SET failed (possibly related to argument 'search-on-timeout') \
-                         - argument(s) must be one of the following: return, fail, return_strict",
+                         - argument(s) must be one of the following: return, fail, return-strict, return_strict",
                     ))
                 }
             }
@@ -1987,9 +2030,6 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("list-max-listpack-size", "-2"),
             ("list-max-ziplist-size", "-2"),
             ("list-compress-depth", "0"),
-            ("set-max-intset-entries", "512"),
-            ("set-max-listpack-entries", "128"),
-            ("set-max-listpack-value", "64"),
             ("zset-max-listpack-entries", "128"),
             ("zset-max-listpack-value", "64"),
             ("zset-max-ziplist-entries", "128"),
@@ -2021,6 +2061,20 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
+        .chain([
+            (
+                "set-max-intset-entries".to_string(),
+                crate::member_set::DEFAULT_INTSET_MAX.to_string(),
+            ),
+            (
+                "set-max-listpack-entries".to_string(),
+                crate::member_set::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "set-max-listpack-value".to_string(),
+                crate::member_set::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+        ])
         .collect(),
     )
 });
@@ -2146,6 +2200,13 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         ),
+        // The file a save writes and a start reads, in `dir`: what is
+        // always used, whatever the configuration file or `--dbfilename`
+        // said (#846).
+        ("dbfilename", crate::aof::SNAPSHOT_PATH.to_string()),
+        // The file the append-only log is written to, in `dir`: always this
+        // one, whatever the configuration file said (#855).
+        ("appendfilename", crate::aof::AOF_PATH.to_string()),
         ("aclfile", ctx.config.aclfile.clone()),
         (
             "slowlog-log-slower-than",
@@ -3083,10 +3144,8 @@ const FAST_COMMANDS: &[&str] = &[
 ];
 
 /// Whether `name` (upper case) is in `@write`, and flagged `write` by
-/// `COMMAND`. That is what is sent to replicas
-/// ([`crate::replication::is_write_command`]) but `SELECT`: replicas are
-/// sent it to follow the database, and Redis has it in `@fast @connection`
-/// only (#392).
+/// `COMMAND`. That is [`crate::replication::is_write_command`] but
+/// `SELECT`, which Redis has in `@fast @connection` only (#392).
 fn is_acl_write(name: &str) -> bool {
     (crate::replication::is_write_command(name) && name != "SELECT")
         || WRITES_BY_ARGUMENT.contains(&name)
@@ -4607,6 +4666,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "evicted_scripts:{}\r\n",
                     crate::stats::EVICTED_SCRIPTS.load(Ordering::Relaxed)
                 ));
+                // How scripts were run: beside others, or alone and why (#871).
+                #[cfg(feature = "lua")]
+                crate::stats::scripts::info(&mut out);
                 // Slowlog totals (Redis 8.8). Milliseconds to two places,
                 // as Redis writes them (`0.00`).
                 let (slow_count, slow_us_sum, slow_us_max) = ctx.slowlog.totals();
@@ -4827,6 +4889,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         if sync_ip { 1 } else { 0 }
                     ));
                     out.push_str(&format!("slave_repl_offset:{offset}\r\n"));
+                    // The id of the stream `slave_repl_offset` counts in, as
+                    // Redis reports it on a replica: all zeros until a master
+                    // has answered a PSYNC.
+                    let replid = ctx
+                        .repl_state
+                        .resync_point
+                        .lock()
+                        .as_ref()
+                        .map_or_else(|| "0".repeat(40), |p| p.repl_id.clone());
+                    out.push_str(&format!("master_replid:{replid}\r\n"));
                     if let Some(down_for) = ctx.repl_state.master_link_down_since_seconds() {
                         out.push_str(&format!("master_link_down_since_seconds:{down_for}\r\n"));
                     }
@@ -5361,6 +5433,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
                     crate::stats::LAST_SAMPLE_COMMANDS.store(0, Ordering::Relaxed);
                     crate::stats::reset_error_reply_stats();
+                    #[cfg(feature = "lua")]
+                    crate::stats::scripts::reset();
                     ctx.slowlog.reset_totals();
                     Some(resp_simple("OK"))
                 }
@@ -6484,70 +6558,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             Some(resp_simple("Background append only file rewriting started"))
         }
 
-        "SHUTDOWN" => {
-            // SHUTDOWN [NOSAVE | SAVE | NOW | FORCE | ABORT]
-            //
-            // We cannot write the snapshot here — execute_command is a plain fn
-            // with no async executor.  Instead we set two global atomics and
-            // return +OK.  The signal-watching thread in main.rs reads the flag
-            // and drives the real shutdown sequence (snapshot + process::exit).
-            //
-            // ABORT clears the pending flag and returns OK immediately so the
-            // caller knows the in-progress shutdown was cancelled.
-
-            use crate::shutdown::{SHUTDOWN_MODE, SHUTDOWN_PENDING, mode};
-            use std::sync::atomic::Ordering::Relaxed;
-
-            let modifier = ctx
-                .cmd
-                .get(1)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .map(|s| s.to_ascii_uppercase());
-
-            match modifier.as_deref() {
-                // SHUTDOWN ABORT — cancel a pending shutdown.
-                Some("ABORT") => {
-                    SHUTDOWN_PENDING.store(false, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN NOSAVE — exit without writing snapshot.
-                Some("NOSAVE") => {
-                    SHUTDOWN_MODE.store(mode::NOSAVE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    // Return OK before the process exits; the signal thread will
-                    // call process::exit shortly after, so the client may or may
-                    // not receive this response — that is Redis-compatible behaviour.
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN NOW — skip AOF flush wait, write snapshot immediately.
-                Some("NOW") => {
-                    SHUTDOWN_MODE.store(mode::NOW, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN FORCE — ignore replica/AOF checks.
-                Some("FORCE") => {
-                    SHUTDOWN_MODE.store(mode::FORCE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // SHUTDOWN / SHUTDOWN SAVE — default: write snapshot then exit.
-                None | Some("SAVE") => {
-                    SHUTDOWN_MODE.store(mode::SAVE, Relaxed);
-                    SHUTDOWN_PENDING.store(true, Relaxed);
-                    Some(resp_simple("OK"))
-                }
-
-                // Unknown modifier — match Redis's exact error.
-                Some(other) => Some(resp_error(&format!(
-                    "ERR SHUTDOWN requires NOSAVE, SAVE, NOW, FORCE, or ABORT, not '{other}'"
-                ))),
-            }
-        }
+        "SHUTDOWN" => Some(shutdown_command(&ctx.cmd)),
 
         // ── Tier 3 rejections — Lua / Functions / Modules ───────────────────
         //
@@ -6669,6 +6680,62 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 pub(crate) fn all_commands_for_test() -> &'static [&'static str] {
     ALL_COMMANDS
+}
+
+/// `SHUTDOWN [NOSAVE | SAVE] [NOW] [FORCE] | SHUTDOWN ABORT`
+///
+/// As in Redis, a shutdown that goes ahead is answered with nothing: the
+/// connection closes when the process exits, after the final save. We cannot
+/// write the snapshot here, and the connection must not be answered before it
+/// is known to have succeeded, so the handler only validates and asks for the
+/// shutdown (`shutdown::request`), and returns no reply. The connection loop
+/// flushes the replies that came before and waits for the signal-watching
+/// thread in main.rs, which drives the real sequence (`shutdown::Final`) and
+/// ends the process. A shutdown that fails or is aborted is answered with an
+/// error (`shutdown::FAILED_REPLY`) and the server runs on.
+///
+/// Out of line, so that the command dispatch is the same size as it was.
+#[cold]
+#[inline(never)]
+fn shutdown_command(cmd: &[&[u8]]) -> Vec<u8> {
+    use crate::shutdown::{self, mode};
+
+    let (mut nosave, mut save, mut now, mut force, mut abort) = (false, false, false, false, false);
+    for arg in cmd.iter().skip(1) {
+        if arg.eq_ignore_ascii_case(b"NOSAVE") {
+            nosave = true;
+        } else if arg.eq_ignore_ascii_case(b"SAVE") {
+            save = true;
+        } else if arg.eq_ignore_ascii_case(b"NOW") {
+            now = true;
+        } else if arg.eq_ignore_ascii_case(b"FORCE") {
+            force = true;
+        } else if arg.eq_ignore_ascii_case(b"ABORT") {
+            abort = true;
+        } else {
+            return resp_error("ERR syntax error");
+        }
+    }
+    if (nosave && save) || (abort && (nosave || save || now || force)) {
+        return resp_error("ERR syntax error");
+    }
+    if abort {
+        return if shutdown::abort() {
+            resp_simple("OK")
+        } else {
+            resp_error(shutdown::NO_SHUTDOWN_IN_PROGRESS)
+        };
+    }
+    // As in Redis: while a script runs past its time limit, only a shutdown
+    // that saves nothing may stop it. A save would wait for the script.
+    #[cfg(feature = "lua")]
+    if !nosave && shutdown::script_busy() {
+        return crate::commands::script_busy_reply();
+    }
+    let m = if nosave { mode::NOSAVE } else { mode::SAVE } | if now { mode::NOW } else { 0 };
+    shutdown::request(m, force);
+    // No reply: see above.
+    Vec::new()
 }
 
 pub fn acl_cat_commands_pub(category: &str) -> Vec<&'static str> {

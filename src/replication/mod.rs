@@ -61,8 +61,11 @@ pub struct ReplState {
     /// Replica-only: KV / aux structures are swapped in from staging during bulk full-sync (RDB).
     /// Mirrors Redis-style `LOADING`; INFO sets `master_sync_in_progress`.
     pub slave_sync_in_progress: AtomicBool,
-    /// Last logical DB index written to the replication backlog (`usize::MAX` = never emitted).
-    /// Drives implicit `SELECT` lines so replicas stay aligned with per-client `selected_db`.
+    /// The database the emitted write stream is in (`u64::MAX` before the
+    /// first). Whether the next write needs a `SELECT` in front of it is
+    /// read from here (`encode_for_stream`), and it moves only with a write
+    /// (`advance_stream_db`): a client's own `SELECT` no longer enters the
+    /// stream.
     pub repl_stream_last_db: AtomicU64,
     /// Set, and never cleared, once a client has selected a database other
     /// than 0. From then on every write travels with its own `SELECT`; see
@@ -687,9 +690,8 @@ impl ReplState {
     }
 
     /// [`note_local_write`](Self::note_local_write) for the command `name`
-    /// a client sent, which is propagated: not for a `SELECT` or a `SCRIPT`,
-    /// which change no data (`writes_the_dataset`). Looked at only when
-    /// there is a point to lose.
+    /// a client sent: not for a `SELECT` or a `SCRIPT`, which change no data
+    /// (`writes_the_dataset`). Looked at only when there is a point to lose.
     #[inline]
     pub fn note_local_write_of(&self, name: &str) {
         if self.has_resync_point.load(Ordering::Relaxed) && !matches!(name, "SELECT" | "SCRIPT") {
@@ -3611,6 +3613,11 @@ pub struct FinalSaveHold<'a> {
 pub fn hold_for_final_save(state: &ReplState) -> std::io::Result<FinalSaveHold<'_>> {
     use std::time::{Duration, Instant};
     loop {
+        // `SHUTDOWN ABORT` ends the wait for a command that keeps the gate
+        // (a script that does not end): the caller then undoes the shutdown.
+        if crate::shutdown::abort_requested() {
+            return Err(std::io::Error::other("SHUTDOWN ABORT"));
+        }
         let turn = crate::aof::checkpoint_turn()?;
         let deadline = Instant::now() + Duration::from_millis(50);
         if let Some(alone) =
@@ -3661,14 +3668,35 @@ const SHUTDOWN_PAUSE_MS: i64 = 100 * 365 * 24 * 3600 * 1000;
 /// its clients while a shutdown waits for the replicas. No command starts
 /// again before the exit: the pause has no end, and the caller then holds the
 /// command gate alone. Blocking: called from the thread that then saves.
-pub fn drain_replicas_for_shutdown(state: &ReplState, hub_tx: &HubTx) -> std::time::Instant {
-    crate::pause::set_pause(SHUTDOWN_PAUSE_MS, false);
-    end_stream_for_shutdown(state);
+///
+/// Returns the pause, for a shutdown that does not go ahead to take back
+/// (`pause::undo_pause`), and when the wait ends. The wait for the writes in
+/// flight ends early once `give_up` says so: the shutdown was aborted (the
+/// caller sees it), or a script has run past its time limit, which holds the
+/// write gate for as long as it runs, and `SHUTDOWN NOSAVE` is the way to
+/// stop it. The replicas are then waited for all the same, as in Redis.
+pub fn drain_replicas_for_shutdown(
+    state: &ReplState,
+    hub_tx: &HubTx,
+    give_up: &dyn Fn() -> bool,
+) -> (crate::pause::Undo, std::time::Instant) {
+    let paused = crate::pause::set_pause_undoable(SHUTDOWN_PAUSE_MS, false);
+    // `end_stream_for_shutdown`, with a wait that can be given up.
+    state.stream_closed.store(true, Ordering::SeqCst);
+    let never = std::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600);
+    crate::write_gate::wait_out_writes(never, || !give_up());
     let timeout =
         std::time::Duration::from_secs(state.shutdown_timeout_secs.load(Ordering::Relaxed));
+    if !timeout.is_zero() && !state.is_slave() && !state.replica_progress.lock().is_empty() {
+        // As Redis says it.
+        log_info!(
+            "Waiting for replicas before shutting down (shutdown-timeout {} s)",
+            timeout.as_secs()
+        );
+    }
     let deadline = std::time::Instant::now() + timeout;
     wait_for_replicas_until(state, hub_tx, deadline);
-    deadline
+    (paused, deadline)
 }
 
 /// Shutdown, with the command gate held alone, just before the save: wait
@@ -3738,11 +3766,13 @@ fn wait_for_replicas_until(state: &ReplState, hub_tx: &HubTx, deadline: std::tim
             done_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ) && std::time::Instant::now() < deadline
+            && !crate::shutdown::abort_requested()
         {
             std::thread::sleep(pause);
         }
     }
     while std::time::Instant::now() < deadline
+        && !crate::shutdown::abort_requested()
         && replicas_at_shutdown(state).iter().any(|(_, p)| {
             p.state() == ReplicaState::Online && p.delivered() < p.sent.load(Ordering::Relaxed)
         })
@@ -3806,34 +3836,8 @@ pub fn write_is_observed(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
         || ctx.repl_state.stream_taps.load(Ordering::Relaxed) > 0
 }
 
-/// Whether a command that `CLIENT PAUSE WRITE` lets run although it is
-/// propagated (`SELECT`, `SCRIPT LOAD`, `SCRIPT FLUSH`: see
-/// `pause::may_replicate`) is to be kept out of the replication stream and
-/// the AOF: while writes are paused on a master. Nothing may be added to
-/// the stream then: a failover waits for its replica to reach the master's
-/// offset, and takes that offset to stay put (#411, #518). Not on a
-/// replica, whose offset is its master's, nor for what its master sent.
-pub(crate) fn held_back(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
-    !ctx.apply_replication && !ctx.repl_state.is_slave() && crate::pause::active().is_some()
-}
-
 pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) {
-    let cmd0 = parts.first().map(|v| v.as_slice()).unwrap_or_default();
-    let payloads: Vec<Vec<u8>> = if cmd0.eq_ignore_ascii_case(b"SELECT") && parts.len() >= 2 {
-        // `CLIENT PAUSE WRITE` lets a `SELECT` run (it writes nothing), but
-        // nothing may be added to the stream while writes are paused: a
-        // failover waits for its replica to reach the master's offset, and
-        // takes that offset to stay put. A `SELECT` sent now is not needed
-        // there either: the next write in another database carries its own
-        // (`encode_for_stream`), since the stream's database is not moved.
-        // Not on a replica, whose offset is its master's.
-        if held_back(ctx) {
-            return;
-        }
-        vec![crate::resp::write::encode_resp_command(parts)]
-    } else {
-        in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0
-    };
+    let payloads: Vec<Vec<u8>> = in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0;
 
     // Two cases end at this node's own AOF and go no further:
     //
@@ -3858,9 +3862,9 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
             // Part of a transaction its master sent, applied as one: see
             // `PropagationGroup`.
             note_group_write(true);
-            append_to_own_aof(ctx, cmd0, parts, payloads);
+            append_to_own_aof(ctx, parts, payloads);
         } else if tapped {
-            advance_stream_db(ctx, cmd0, parts);
+            advance_stream_db(ctx);
         }
         return;
     }
@@ -3920,7 +3924,7 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
     }
     // Only advance after bytes are emitted: writes that ran with no replicas must not
     // consume the implicit `SELECT`, or the first observer would miss `{select *}` on stream.
-    advance_stream_db(ctx, cmd0, parts);
+    advance_stream_db(ctx);
 }
 
 /// Hand something other than a write — a `PUBLISH` — to replicas: now, or,
@@ -4230,7 +4234,6 @@ fn in_db_for_stream(repl_state: &ReplState, db: usize, parts: &[Vec<u8>]) -> (Ve
 /// to *the AOF*, since that is the only stream this node emits.
 fn append_to_own_aof(
     ctx: &crate::commands::ctx::Ctx<'_>,
-    cmd0: &[u8],
     parts: &[Vec<u8>],
     payloads: Vec<Vec<u8>>,
 ) {
@@ -4247,33 +4250,22 @@ fn append_to_own_aof(
     }
     crate::aof::AOF_WRITTEN.fetch_add(combined.len() as u64, Ordering::Relaxed);
     crate::aof::queue_record(ctx.aof_tx, combined);
-    advance_stream_db(ctx, cmd0, parts);
+    advance_stream_db(ctx);
 }
 
 /// Record which db the emitted stream is now positioned on, so the next write
 /// only pays for a `SELECT` when it actually changes.
-fn advance_stream_db(ctx: &crate::commands::ctx::Ctx<'_>, cmd0: &[u8], parts: &[Vec<u8>]) {
-    if cmd0.eq_ignore_ascii_case(b"SELECT") && parts.len() >= 2 {
-        if let Ok(db_s) = std::str::from_utf8(&parts[1])
-            && let Ok(db) = db_s.parse::<u64>()
-        {
-            ctx.repl_state
-                .repl_stream_last_db
-                .store(db, Ordering::Relaxed);
-        }
+fn advance_stream_db(ctx: &crate::commands::ctx::Ctx<'_>) {
+    // Before any client has left database 0, a write of another went in
+    // one piece that goes back to 0 (`in_db_for_stream`).
+    let db = if *ctx.selected_db != 0 && !ctx.repl_state.several_databases.load(Ordering::Relaxed) {
+        0
     } else {
-        // Before any client has left database 0, a write of another went in
-        // one piece that goes back to 0 (`in_db_for_stream`).
-        let db =
-            if *ctx.selected_db != 0 && !ctx.repl_state.several_databases.load(Ordering::Relaxed) {
-                0
-            } else {
-                *ctx.selected_db
-            };
-        ctx.repl_state
-            .repl_stream_last_db
-            .store(db as u64, Ordering::Relaxed);
-    }
+        *ctx.selected_db
+    };
+    ctx.repl_state
+        .repl_stream_last_db
+        .store(db as u64, Ordering::Relaxed);
 }
 
 /// Returns true if this command name mutates state and must be
@@ -4879,9 +4871,11 @@ pub async fn wait_for_replicas(
 #[inline]
 pub fn is_denied_on_readonly_replica(name: &str, cmd: &[&[u8]]) -> bool {
     match name {
-        // `SELECT` is in `is_write_command` because the replication stream and
-        // the AOF both need it propagated, not because it writes anything — it
-        // changes per-connection state only. Conflating "must be propagated"
+        // `SELECT` is in `is_write_command` so that it takes the write gate
+        // like a write — the switch to writes that carry their own `SELECT`
+        // is only race-free inside it (`note_database_selected`) — not
+        // because it writes anything: it changes per-connection state only,
+        // and is propagated to nobody (#705). Conflating "flagged a write"
         // with "a read-only replica must reject it" made every database except
         // 0 unreachable on a replica: any client configured with `db=N` sends
         // SELECT on connect and got
@@ -5651,18 +5645,21 @@ mod replication_invariants_tests {
     /// The length-bucketed `is_write_command` must be *exactly* equivalent to the
     /// flat list it was generated from.
     ///
-    /// `SELECT` must stay propagated *and* stay allowed on a read-only replica.
+    /// `SELECT` must stay flagged a write *and* stay allowed on a read-only
+    /// replica.
     ///
-    /// It is in `is_write_command` so the replication stream and the AOF carry
-    /// the db switch, but it mutates nothing. Denying it made every database
-    /// except 0 unreachable on a replica — a client configured with `db=N`
-    /// sends SELECT on connect and could not even read. The two predicates have
+    /// It is in `is_write_command` so it takes the write gate like a write:
+    /// the switch to writes that carry their own `SELECT` is only race-free
+    /// inside it (`note_database_selected`). But it mutates nothing and is
+    /// propagated to nobody. Denying it made every database except 0
+    /// unreachable on a replica — a client configured with `db=N` sends
+    /// SELECT on connect and could not even read. The two predicates have
     /// to disagree about this one command, so pin both sides.
     #[test]
-    fn select_is_propagated_but_allowed_on_a_replica() {
+    fn select_is_a_write_but_allowed_on_a_replica() {
         assert!(
             super::is_write_command("SELECT"),
-            "SELECT must still be propagated, or a replica applies writes to the wrong db"
+            "SELECT must stay flagged a write, or it stops taking the write gate"
         );
         assert!(
             !super::is_denied_on_readonly_replica("SELECT", &[b"SELECT", b"3"]),
