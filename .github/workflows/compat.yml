@@ -72,6 +72,26 @@ jobs:
         timeout-minutes: 15
         run: benchmarks/ci/run-harness.sh gptcache
 
+      - name: langchain
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh langchain
+
+      - name: langgraph
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh langgraph
+
+      - name: llamaindex
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh llamaindex
+
+      - name: mem0
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh mem0
+
       - name: Keep the results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
