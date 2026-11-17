@@ -9,6 +9,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **A server on `--threads 0` (auto, the default) starts more worker
+  threads (#873).** Auto is now one per CPU the process may use, where it
+  was the CPUs minus 2: 4 workers on 4 CPUs (was 2), 8 on 8 (was 6), 32 on
+  32 (was 30). The server uses more CPU under load, as it can now serve
+  more. To keep the old count, pass it: `--threads 2` on 4 CPUs,
+  `--threads 6` on 8, the CPUs minus 2 from 4 CPUs up. A container with a
+  CPU limit (`--cpus`, a Kubernetes limit) or a cpuset starts one worker per
+  CPU of that limit, not of the host.
+
 - **Upgrade replicas before their master for time series `IGNORE`.** A 1.2
   replica passes `IGNORE` over, and cannot read a snapshot or `DUMP` holding
   a series that has it (tag 17).
@@ -252,6 +261,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataset digest lets the replica continue without a full sync.
 
 ### Changed
+
+- **Auto worker threads: one per available CPU (#873).** `--threads 0`
+  started the CPUs minus 2 (all of them below 4), so a 4-vCPU machine or
+  container got 2 workers. Measured with the server confined to 4 vCPUs and
+  memtier on 4 others, 2 workers served 2-22% fewer unpipelined commands
+  than 4 (at 4 the load generator was the limit) and, on the tokio I/O
+  model, had a p99 of 9.7-10.4 ms where 4 workers had 2.0-3.4 ms; on 2
+  vCPUs, where the server was the limit, one worker served 24-41% less
+  than two. Auto now counts the CPUs online, cut down to the process's affinity
+  mask (`taskset`, a cpuset, `docker --cpuset-cpus`) and its cgroup CPU
+  quota (`docker --cpus`, a Kubernetes CPU limit, rounded down), at least
+  one; `std`'s count is used where the cgroup v1 files are the limit. More
+  workers than CPUs is avoided: on 2 vCPUs a third worker multiplied the p99
+  by up to 12, and in a container with `--cpus 1.5` two workers had a p99
+  of 27 ms where one had 4.7. The startup banner says what limited the count
+  (`CPUs : 8 online, 2 available (a cgroup CPU quota of 2 CPUs)`) and
+  whether the worker count was given or auto. `--threads N` starts exactly
+  `N`, as before. [PERFORMANCE.md](docs/PERFORMANCE.md#worker-threads) has
+  the measurements.
 
 - **Every command costs a little less (#867).** The parts of the command
   path that a plain command on a standalone master never runs (cluster
