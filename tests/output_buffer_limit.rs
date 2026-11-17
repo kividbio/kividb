@@ -719,26 +719,27 @@ fn gets_then_sets(gets: usize, sets: usize) -> Vec<u8> {
 #[test]
 fn a_pipeline_sent_before_reading_is_answered() {
     let _turn = serial();
-    // The io_uring loop does not read ahead yet.
-    let server = Server::start("tokio");
-    let value = "v".repeat(MB);
-    assert!(server.conn().cmd(&["SET", "big", &value]).ok());
-    let mut pipeline = b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(10);
-    let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
-    pipeline.extend_from_slice(set.repeat(16).as_bytes());
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let value = "v".repeat(MB);
+        assert!(server.conn().cmd(&["SET", "big", &value]).ok());
+        let mut pipeline = b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(10);
+        let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
+        pipeline.extend_from_slice(set.repeat(16).as_bytes());
 
-    let mut c = server.conn();
-    c.writer
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    c.writer
-        .write_all(&pipeline)
-        .expect("the server stopped reading");
-    for _ in 0..10 {
-        assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
-    }
-    for _ in 0..16 {
-        assert!(c.read().unwrap().ok());
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
+        for _ in 0..10 {
+            assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
+        }
+        for _ in 0..16 {
+            assert!(c.read().unwrap().ok());
+        }
     }
 }
 
@@ -748,26 +749,27 @@ fn a_pipeline_sent_before_reading_is_answered() {
 #[test]
 fn reading_ahead_past_the_query_buffer_limit_closes_the_client() {
     let _turn = serial();
-    // The io_uring loop does not read ahead yet.
-    let server = Server::start("tokio");
-    assert!(server.conn().cmd(&["SET", "big", &"v".repeat(MB)]).ok());
-    let limit = server
-        .conn()
-        .cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]);
-    assert!(limit.ok(), "{limit:?}");
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "big", &"v".repeat(MB)]).ok());
+        let limit = server
+            .conn()
+            .cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]);
+        assert!(limit.ok(), "{limit:?}");
 
-    // About 10 MB of replies the client does not read, while it sends about
-    // 6 MB of commands.
-    let mut c = server.conn();
-    c.writer
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let _ = c.writer.write_all(&gets_then_sets(10, 200_000));
-    assert!(
-        c.closed_within(Duration::from_secs(10)),
-        "the client was not closed"
-    );
-    assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
+        // About 10 MB of replies the client does not read, while it sends about
+        // 6 MB of commands.
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let _ = c.writer.write_all(&gets_then_sets(10, 200_000));
+        assert!(
+            c.closed_within(Duration::from_secs(10)),
+            "{io_model}: the client was not closed"
+        );
+        assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
+    }
 }
 
 /// The replies still count against `client-output-buffer-limit` while the
@@ -776,26 +778,30 @@ fn reading_ahead_past_the_query_buffer_limit_closes_the_client() {
 #[test]
 fn reading_ahead_a_client_over_the_soft_limit_too_long_is_disconnected() {
     let _turn = serial();
-    // The io_uring loop does not read ahead yet.
-    let server = Server::start("tokio");
-    let big = "b".repeat(24 * MB);
-    assert!(server.conn().cmd(&["SET", "big", &big]).ok());
-    drop(big);
-    server.config_set("normal 0 1mb 1");
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let big = "b".repeat(24 * MB);
+        assert!(server.conn().cmd(&["SET", "big", &big]).ok());
+        drop(big);
+        server.config_set("normal 0 1mb 1");
 
-    let mut c = server.conn();
-    c.writer
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let _ = c.writer.write_all(&gets_then_sets(1, 200_000));
-    // Not read: closed once over the soft limit for longer than its second.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while server.info_field("client_output_buffer_limit_disconnections") != "1" {
-        assert!(Instant::now() < deadline, "the client was not closed");
-        std::thread::sleep(Duration::from_millis(50));
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let _ = c.writer.write_all(&gets_then_sets(1, 200_000));
+        // Not read: closed once over the soft limit for longer than its second.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while server.info_field("client_output_buffer_limit_disconnections") != "1" {
+            assert!(
+                Instant::now() < deadline,
+                "{io_model}: the client was not closed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(c.closed_within(Duration::from_secs(10)), "{io_model}");
+        server.config_set("normal 0 0 0");
     }
-    assert!(c.closed_within(Duration::from_secs(10)));
-    server.config_set("normal 0 0 0");
 }
 
 /// A client that sends and never reads is closed at its class's hard
@@ -805,33 +811,35 @@ fn reading_ahead_a_client_over_the_soft_limit_too_long_is_disconnected() {
 #[test]
 fn reading_ahead_a_client_that_never_reads_is_closed_at_the_hard_limit() {
     let _turn = serial();
-    // The io_uring loop does not read ahead yet.
-    let server = Server::start("tokio");
-    server.config_set("normal 1mb 0 0");
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        server.config_set("normal 1mb 0 0");
 
-    // About 70 MB of `SET`s, and not a reply read.
-    let pipeline = gets_then_sets(0, 2_000_000);
-    let mut c = server.conn();
-    c.writer
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut sent = 0;
-    while sent < pipeline.len() {
-        match c.writer.write(&pipeline[sent..]) {
-            Ok(n) => sent += n,
-            Err(_) => break,
+        // About 70 MB of `SET`s, and not a reply read.
+        let pipeline = gets_then_sets(0, 2_000_000);
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut sent = 0;
+        while sent < pipeline.len() {
+            match c.writer.write(&pipeline[sent..]) {
+                Ok(n) => sent += n,
+                Err(_) => break,
+            }
         }
+        assert!(
+            sent < pipeline.len(),
+            "{io_model}: the server took {sent} of {} bytes",
+            pipeline.len()
+        );
+        assert_eq!(
+            server.info_field("client_output_buffer_limit_disconnections"),
+            "1",
+            "{io_model}"
+        );
+        server.config_set("normal 0 0 0");
     }
-    assert!(
-        sent < pipeline.len(),
-        "the server took {sent} of {} bytes",
-        pipeline.len()
-    );
-    assert_eq!(
-        server.info_field("client_output_buffer_limit_disconnections"),
-        "1"
-    );
-    server.config_set("normal 0 0 0");
 }
 
 /// What was read ahead runs a read's worth a turn, as it would have been
@@ -842,38 +850,48 @@ fn reading_ahead_a_client_that_never_reads_is_closed_at_the_hard_limit() {
 #[test]
 fn what_was_read_ahead_runs_a_read_at_a_time() {
     let _turn = serial();
-    // The io_uring loop does not read ahead yet.
-    let server = Server::start("tokio");
-    let big = "b".repeat(MB / 10);
-    let small = "s".repeat(100);
-    assert!(server.conn().cmd(&["SET", "b", &big]).ok());
-    assert!(server.conn().cmd(&["SET", "s", &small]).ok());
-    server.config_set("normal 32mb 0 0");
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let big = "b".repeat(MB / 10);
+        let small = "s".repeat(100);
+        assert!(server.conn().cmd(&["SET", "b", &big]).ok());
+        assert!(server.conn().cmd(&["SET", "s", &small]).ok());
+        server.config_set("normal 32mb 0 0");
 
-    // The replies to the first read, about 19 MB to 186 `GET b`, are more
-    // than the sockets hold, so the server reads the rest while they wait:
-    // 400,000 `GET s`, 9 MB, whose replies come to 44 MB in all and to 20 KB
-    // a read.
-    let mut pipeline = b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n".repeat(186);
-    pipeline.extend_from_slice(&b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n".repeat(400_000));
-    let mut c = server.conn();
-    c.writer
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    c.writer
-        .write_all(&pipeline)
-        .expect("the server stopped reading");
-    for i in 0..186 {
-        assert_eq!(c.read(), Some(V::Bulk(big.clone().into_bytes())), "{i}");
+        // The replies to the first read, about 19 MB to 186 `GET b`, are more
+        // than the sockets hold, so the server reads the rest while they wait:
+        // 400,000 `GET s`, 9 MB, whose replies come to 44 MB in all and to 20 KB
+        // a read.
+        let mut pipeline = b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n".repeat(186);
+        pipeline.extend_from_slice(&b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n".repeat(400_000));
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
+        for i in 0..186 {
+            assert_eq!(
+                c.read(),
+                Some(V::Bulk(big.clone().into_bytes())),
+                "{io_model} {i}"
+            );
+        }
+        for i in 0..400_000 {
+            assert_eq!(
+                c.read(),
+                Some(V::Bulk(small.clone().into_bytes())),
+                "{io_model} {i}"
+            );
+        }
+        assert_eq!(
+            server.info_field("client_output_buffer_limit_disconnections"),
+            "0",
+            "{io_model}"
+        );
+        server.config_set("normal 0 0 0");
     }
-    for i in 0..400_000 {
-        assert_eq!(c.read(), Some(V::Bulk(small.clone().into_bytes())), "{i}");
-    }
-    assert_eq!(
-        server.info_field("client_output_buffer_limit_disconnections"),
-        "0"
-    );
-    server.config_set("normal 0 0 0");
 }
 
 /// A blocking command writes the replies to what came before it as it
@@ -881,28 +899,62 @@ fn what_was_read_ahead_runs_a_read_at_a_time() {
 #[test]
 fn a_blocking_command_reads_ahead_while_it_writes_what_came_before() {
     let _turn = serial();
-    // The io_uring loop does not read ahead yet.
-    let server = Server::start("tokio");
-    let value = "v".repeat(MB);
-    assert!(server.conn().cmd(&["SET", "big", &value]).ok());
-    let mut pipeline = b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(10);
-    pipeline.extend_from_slice(b"*3\r\n$5\r\nBLPOP\r\n$6\r\nnolist\r\n$1\r\n1\r\n");
-    let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
-    pipeline.extend_from_slice(set.repeat(16).as_bytes());
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let value = "v".repeat(MB);
+        assert!(server.conn().cmd(&["SET", "big", &value]).ok());
+        let mut pipeline = b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(10);
+        pipeline.extend_from_slice(b"*3\r\n$5\r\nBLPOP\r\n$6\r\nnolist\r\n$1\r\n1\r\n");
+        let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
+        pipeline.extend_from_slice(set.repeat(16).as_bytes());
 
-    let mut c = server.conn();
-    c.writer
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    c.writer
-        .write_all(&pipeline)
-        .expect("the server stopped reading");
-    for _ in 0..10 {
-        assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
+        for _ in 0..10 {
+            assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
+        }
+        assert_eq!(c.read(), Some(V::Nil), "{io_model}: BLPOP");
+        for _ in 0..16 {
+            assert!(c.read().unwrap().ok());
+        }
     }
-    assert_eq!(c.read(), Some(V::Nil), "BLPOP");
-    for _ in 0..16 {
-        assert!(c.read().unwrap().ok());
+}
+
+/// `CLIENT KILL` ends a client whose replies wait while it is read: the
+/// write waiting and the reading both end, and so does the connection,
+/// with nothing said to it.
+#[test]
+fn a_client_killed_while_its_replies_wait_is_closed() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "big", &"v".repeat(MB)]).ok());
+        let mut c = server.conn();
+        let id = c.cmd(&["CLIENT", "ID"]).i().to_string();
+        // About 10 MB of replies the client does not read, while it sends
+        // about 6 MB of commands.
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        c.writer
+            .write_all(&gets_then_sets(10, 200_000))
+            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
+        assert_eq!(
+            server.conn().cmd(&["CLIENT", "KILL", "ID", &id]),
+            V::Int(1),
+            "{io_model}"
+        );
+        assert!(
+            c.closed_within(Duration::from_secs(10)),
+            "{io_model}: the client was not closed"
+        );
+        let list = server.conn().cmd(&["CLIENT", "LIST"]).text();
+        assert!(!list.contains(&format!("id={id} ")), "{io_model}: {list}");
     }
 }
 
