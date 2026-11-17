@@ -253,6 +253,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Every command costs a little less (#867).** The parts of the command
+  path that a plain command on a standalone master never runs (cluster
+  routing, replica, ACL and memory-limit refusals, the write pause checks,
+  keyspace-event watches, `MONITOR`) are now out of line, so the code every
+  command runs is smaller. Measured in instructions per command, pipelined:
+  `GET` about 40 fewer and `SET` about 80 fewer (1-2% of the whole server's
+  work for one), and about 100 fewer for each with Lua built in (3%); a
+  `MULTI`/`EXEC` of two `SET`s about 90 fewer (160 with Lua). Nothing a
+  command does or answers has changed.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for
