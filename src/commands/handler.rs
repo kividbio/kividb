@@ -1961,9 +1961,6 @@ fn makes_the_switch(ctx: &Ctx) -> Option<usize> {
 /// where the sweep's `DEL` then deleted nothing, and the key stayed in the
 /// other database for good.
 fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
-    if crate::commands::ts::ts_changed_nothing() {
-        return true;
-    }
     let nil = result == b"$-1\r\n" || result == b"_\r\n";
     let zero = result == b":0\r\n";
     match name {
@@ -1976,6 +1973,9 @@ fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
         | "UNLINK" | "COPY" | "MOVE" | "SMOVE" | "LPUSHX" | "RPUSHX" => zero,
         // No list (0), or no such pivot (-1).
         "LINSERT" => zero || result == b":-1\r\n",
+        // A sample `IGNORE` left out, or a `TS.MADD` that added none: the
+        // reply is a timestamp (an array of them), which does not say so.
+        "TS.ADD" | "TS.MADD" => crate::commands::ts::ts_changed_nothing(),
         _ => popped_nothing(name, result),
     }
 }
@@ -2076,12 +2076,27 @@ fn set_has_a_condition(cmd: &[&[u8]]) -> bool {
 /// `+OK` or a value, is passed over without looking at the command.
 #[inline]
 fn propagates_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
-    if crate::commands::ts::ts_changed_nothing() {
-        return true;
+    match result.first() {
+        Some(b':' | b'$' | b'_' | b'*' | b'~') if result.len() <= 5 => {
+            changed_nothing(name, cmd, result)
+        }
+        // A longer number or array: only a time series sample `IGNORE`
+        // left out says it changed nothing that way.
+        Some(b':' | b'*') => ts_added_nothing(name),
+        _ => false,
     }
-    result.len() <= 5
-        && matches!(result.first(), Some(b':' | b'$' | b'_' | b'*' | b'~'))
-        && changed_nothing(name, cmd, result)
+}
+
+/// Whether `name` is a `TS.ADD` or `TS.MADD` that added no sample
+/// ([`crate::commands::ts::ts_changed_nothing`]). The mark is read for those
+/// two alone: it is set by the command that just ran on this thread, and
+/// cleared when the next of them starts, so for any other command it may be
+/// one an earlier command left.
+#[inline]
+fn ts_added_nothing(name: &str) -> bool {
+    name.as_bytes().first() == Some(&b'T')
+        && matches!(name, "TS.ADD" | "TS.MADD")
+        && crate::commands::ts::ts_changed_nothing()
 }
 
 /// Whether a pop answered that it took nothing: a null (a `BLPOP` that

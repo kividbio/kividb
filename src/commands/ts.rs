@@ -390,6 +390,13 @@ fn configure_new(ts: &mut TsInner, options: &TsOptions) {
     }
 }
 
+// What the `TS.ADD` or `TS.MADD` that ran last on this thread left out
+// because of `IGNORE`: for the replication feed, `WATCH`, client tracking
+// and the dirty counter, which read it right after the command, on the same
+// thread (`handler::changed_nothing`, `script_feed::ts_add_feed`,
+// `script_feed::ts_madd_feed`). Each of the two clears it first thing, and
+// nothing else reads it: a mark an earlier command left must never be taken
+// for another command's, or that command's write would not be propagated.
 thread_local! {
     static TS_CHANGED_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TS_MADD_IGNORED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };

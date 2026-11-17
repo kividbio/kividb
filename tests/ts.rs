@@ -2829,3 +2829,92 @@ fn test_ts_ignore_persistence_across_restart() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Through the AOF: a sample `IGNORE` left out is not logged, a write after
+/// it (on the same thread: one worker) is, and the settings come back from
+/// the log and from a rewrite of it. The server's own I/O loop, so io_uring
+/// on Linux.
+#[test]
+fn test_ts_ignore_through_the_aof_and_its_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let start = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(dir.path())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--dir",
+                dir.path().to_str().unwrap(),
+                "--threads",
+                "1",
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "always",
+            ])
+            .spawn()
+            .unwrap()
+    };
+    let ignore_settings = |c: &mut Conn| {
+        let info = c.cmds(&["TS.INFO", "s"]);
+        let arr = info.as_array();
+        let at = |name: &[u8]| {
+            arr.iter()
+                .position(|item| matches!(item, RespValue::Bulk(b) if b == name))
+                .unwrap()
+        };
+        (
+            arr[at(b"ignoreMaxTimeDiff") + 1].as_int(),
+            arr[at(b"ignoreMaxValDiff") + 1].as_f64(),
+        )
+    };
+
+    let mut child = start();
+    let mut c = Conn::connect(port);
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "s", "IGNORE", "1000", "1.0"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(c.cmds(&["TS.ADD", "s", "1000", "10"]).as_int(), 1000);
+    assert_eq!(c.cmds(&["TS.ADD", "s", "1500", "10.5"]).as_int(), 1000);
+    assert_eq!(c.cmds(&["SET", "after", "v"]).as_str(), "OK");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut child = start();
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmds(&["GET", "after"]).as_str(), "v");
+    let range = c.cmds(&["TS.RANGE", "s", "-", "+"]);
+    assert_eq!(range.as_array().len(), 1, "{range:?}");
+    assert_eq!(ignore_settings(&mut c), (1000, 1.0));
+
+    // A rewrite writes the series whole, with its settings.
+    assert_eq!(
+        c.cmds(&["TS.ALTER", "s", "IGNORE", "2000", "2.5"]).as_str(),
+        "OK"
+    );
+    c.cmds(&["BGREWRITEAOF"]);
+    for _ in 0..200 {
+        let info = c.cmds(&["INFO", "persistence"]);
+        if info.as_str().contains("aof_rewrite_in_progress:0")
+            && !info.as_str().contains("aof_rewrite_scheduled:1")
+        {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut child = start();
+    let mut c = Conn::connect(port);
+    assert_eq!(ignore_settings(&mut c), (2000, 2.5));
+    assert_eq!(c.cmds(&["TS.ADD", "s", "2500", "12"]).as_int(), 1000);
+    assert_eq!(c.cmds(&["GET", "after"]).as_str(), "v");
+    let _ = child.kill();
+    let _ = child.wait();
+}

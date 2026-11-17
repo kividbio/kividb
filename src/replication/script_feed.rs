@@ -410,7 +410,8 @@ fn ts_madd_feed(cmd: &[&[u8]], resp: &[u8]) -> Vec<Vec<Vec<u8>>> {
     lines.next(); // the array header
     let mut parts: Vec<Vec<u8>> = vec![cmd[0].to_vec()];
     for (i, (sample, line)) in cmd[1..].chunks(3).zip(lines).enumerate() {
-        if ignored.contains(&i) {
+        // In order: `ts_madd` notes them as it goes.
+        if ignored.binary_search(&i).is_ok() {
             continue;
         }
         match line.first() {
