@@ -236,7 +236,7 @@ Set values are unordered collections of unique byte strings, reported as type `s
 | `HINCRBY` | `HINCRBY key field increment` | Increment an integer field; initialises to 0 if absent |
 | `HINCRBYFLOAT` | `HINCRBYFLOAT key field increment` | Increment a float field; initialises to 0 if absent |
 | `HSETNX` | `HSETNX key field value` | Set a field only if it does not already exist; returns 1 if set |
-| `HRANDFIELD` | `HRANDFIELD key [count [WITHVALUES]]` | Return random field(s); negative count allows repeats |
+| `HRANDFIELD` | `HRANDFIELD key [count [WITHVALUES]]` | Return random field(s); negative count allows repeats; a count of the size or more returns all fields, in `HGETALL` order. Reads the fields it picks: O(count) |
 | `HSCAN` | `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]` | Incrementally iterate fields and values; `NOVALUES` returns field names only. Cursors are stable positions, as for `SCAN` |
 | `HEXPIRE` | `HEXPIRE key seconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | Set per-field TTLs in seconds; per-field returns: `-2`=no such field, `0`=condition not met, `1`=TTL set, `2`=field deleted (past time) |
 | `HPEXPIRE` | `HPEXPIRE key milliseconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | Same as `HEXPIRE` but TTL in milliseconds |
@@ -518,7 +518,7 @@ Sorted set commands operate on sets of unique strings ordered by a floating-poin
 | `BZPOPMAX` | `BZPOPMAX key [key ...] timeout` | Blocking ZPOPMAX; blocks until a member is available |
 | `ZMPOP` | `ZMPOP numkeys key [key ...] MIN\|MAX [COUNT count]` | Pop from first non-empty sorted set |
 | `BZMPOP` | `BZMPOP timeout numkeys key [key ...] MIN\|MAX [COUNT count]` | Blocking ZMPOP |
-| `ZRANDMEMBER` | `ZRANDMEMBER key [count [WITHSCORES]]` | Return random members; positive count = distinct, negative = with repetition |
+| `ZRANDMEMBER` | `ZRANDMEMBER key [count [WITHSCORES]]` | Return random members; positive count = distinct, negative = with repetition; a count of the size or more returns all members, highest score first. Walks the member table up to the last member it picks (no index by position yet), so it costs more the bigger the set |
 | `ZSCAN` | `ZSCAN key cursor [MATCH pattern] [COUNT count] [NOSCORES]` | Cursor-based iteration over members and scores; `NOSCORES` returns members only. Cursors are stable positions, as for `SCAN` |
 | `ZDIFF` | `ZDIFF numkeys key [key ...] [WITHSCORES]` | Return members in first set not in subsequent sets |
 | `ZDIFFSTORE` | `ZDIFFSTORE destination numkeys key [key ...]` | Store ZDIFF result |

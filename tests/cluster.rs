@@ -454,6 +454,25 @@ fn wait_until(what: &str, timeout: Duration, mut pred: impl FnMut() -> bool) {
     panic!("timed out after {timeout:?} waiting for: {what}");
 }
 
+/// `args` on `conn`, sent again for as long as the node answers
+/// `CLUSTERDOWN`: a node that has just seen another die, or one die and
+/// another be promoted, is down for a moment, whatever `cluster_state`
+/// said a moment before. The first answer that is anything else is returned.
+fn cmd_when_serving(conn: &mut Conn, args: &[&str]) -> Resp {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let reply = conn.cmd(args);
+        if !reply.err().is_some_and(|e| e.starts_with("CLUSTERDOWN")) {
+            return reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{args:?} still answered CLUSTERDOWN after 60 s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// CRC16/XMODEM, as used for hash slots.
 fn slot_of(key: &str) -> u16 {
     let mut crc: u16 = 0;
@@ -6025,8 +6044,21 @@ fn set_all(conn: &mut Conn, keys: &[String], value: &str) {
 fn not_as_written(node: &Node, keys: &[String], value: &str) -> Vec<String> {
     let mut c = node.conn();
     let gets: Vec<Vec<&str>> = keys.iter().map(|k| vec!["GET", k.as_str()]).collect();
+    // A node that is down for a moment answers CLUSTERDOWN: not a value,
+    // and not a key lost. Asked again until it serves.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let replies = loop {
+        let replies = c.pipeline(&gets);
+        let down = replies
+            .iter()
+            .any(|r| r.err().is_some_and(|e| e.starts_with("CLUSTERDOWN")));
+        if !down || Instant::now() > deadline {
+            break replies;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     keys.iter()
-        .zip(c.pipeline(&gets))
+        .zip(replies)
         .filter(|(_, got)| !matches!(got, Resp::Bulk(v) if v == value.as_bytes()))
         .map(|(k, _)| k.clone())
         .collect()
@@ -7037,11 +7069,20 @@ impl CutShort {
                 // A master by its own account, but its view of the cluster may
                 // still be down for a moment: a key command then gets
                 // CLUSTERDOWN. Wait until it serves.
-                let node = &self.replicas[promoted];
+                // And so may the others': the source, above all, is down
+                // until it has heard of the promotion. The state is only a
+                // first check: a node that does not know of the failure
+                // yet says ok, and drops once it does, which is why what
+                // is asked of them after this waits for a node that
+                // serves ([`cmd_when_serving`]).
+                let live: Vec<&Node> = [&self.nodes[0], &self.nodes[2]]
+                    .into_iter()
+                    .chain(&self.replicas)
+                    .collect();
                 wait_until(
-                    "the promoted replica's cluster to be ok",
+                    "the live nodes' cluster to be ok",
                     Duration::from_secs(60),
-                    || node.cluster_info("cluster_state") == "ok",
+                    || live.iter().all(|n| n.cluster_info("cluster_state") == "ok"),
                 );
                 return promoted;
             }
@@ -7203,7 +7244,7 @@ fn import_again_from(cut: &CutShort, node: &Node) {
     let stale = [cut.brought[0].clone(), cut.brought2[0].clone()];
     let mut src = cut.nodes[0].conn();
     for key in &stale {
-        assert_eq!(src.cmd(&["DEL", key]).int(), 1);
+        assert_eq!(cmd_when_serving(&mut src, &["DEL", key]).int(), 1);
     }
     let mut c = node.conn();
     let mut again = None;
@@ -7213,7 +7254,7 @@ fn import_again_from(cut: &CutShort, node: &Node) {
         "the import to be taken again",
         Duration::from_secs(60),
         || {
-            let r = c.cmd(&cut.import_args());
+            let r = cmd_when_serving(&mut c, &cut.import_args());
             match r.err() {
                 Some(e) => {
                     assert!(e.contains("still to be deleted"), "{e}");

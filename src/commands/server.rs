@@ -2155,6 +2155,9 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         // always used, whatever the configuration file or `--dbfilename`
         // said (#846).
         ("dbfilename", crate::aof::SNAPSHOT_PATH.to_string()),
+        // The file the append-only log is written to, in `dir`: always this
+        // one, whatever the configuration file said (#855).
+        ("appendfilename", crate::aof::AOF_PATH.to_string()),
         ("aclfile", ctx.config.aclfile.clone()),
         (
             "slowlog-log-slower-than",
