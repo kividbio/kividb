@@ -40,7 +40,6 @@
 //! and every entry somebody else holds (a snapshot being written), gets a
 //! new entry, as before.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -133,7 +132,7 @@ impl AsRef<[u8]> for StrRef<'_> {
 #[derive(Clone, Copy)]
 pub enum ValueRef<'a> {
     String(StrRef<'a>),
-    List(&'a Arc<RwLock<VecDeque<Arc<[u8]>>>>),
+    List(&'a Arc<RwLock<crate::list_values::ListValues>>),
     Hash(&'a Arc<RwLock<HashFields>>),
     Json(&'a Arc<RwLock<serde_json::Value>>),
     Set(&'a Arc<RwLock<crate::member_set::MemberSet>>),

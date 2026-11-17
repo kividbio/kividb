@@ -22,6 +22,7 @@ pub mod command_gate;
 mod commands;
 mod compaction;
 mod config;
+mod element;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
@@ -32,6 +33,7 @@ pub mod keyspace_events;
 pub mod keyspec;
 pub mod latency;
 pub mod lazyfree;
+mod list_values;
 pub mod listen;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;

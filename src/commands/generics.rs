@@ -1543,7 +1543,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
-                Some(ValueRef::List(l)) => l.read().iter().cloned().collect(),
+                Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
                 Some(ValueRef::Set(s)) => s.read().iter().map(|m| m.to_shared()).collect(),
                 Some(ValueRef::SortedSet(z)) => {
                     z.read().by_score.keys().map(|(_, m)| m.clone()).collect()
@@ -1712,9 +1712,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // ── STORE → write result as List, return count ─────────────────────
             if let Some(ref dst) = store_dst {
-                let new_list: std::collections::VecDeque<Arc<[u8]>> = raw_output
+                let new_list: crate::types::ListValues = raw_output
                     .iter()
-                    .map(|v| Arc::from(v.as_deref().unwrap_or_default()))
+                    .map(|v| v.as_deref().unwrap_or_default())
                     .collect();
                 let count = new_list.len() as i64;
                 let db_idx = *ctx.selected_db;

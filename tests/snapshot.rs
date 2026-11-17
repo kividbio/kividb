@@ -151,14 +151,17 @@ fn kdb_list_basic() {
         Arc::from(b"gamma".as_slice()),
     ]
     .into();
-    let v = roundtrip_one("lst", KiviDBValue::List(Arc::new(RwLock::new(deque))));
+    let v = roundtrip_one(
+        "lst",
+        KiviDBValue::List(Arc::new(RwLock::new(deque.into_iter().collect()))),
+    );
     match v {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(inner[0].as_ref(), b"alpha");
-            assert_eq!(inner[1].as_ref(), b"beta");
-            assert_eq!(inner[2].as_ref(), b"gamma");
+            assert_eq!(&*inner.get(0).unwrap(), b"alpha");
+            assert_eq!(&*inner.get(1).unwrap(), b"beta");
+            assert_eq!(&*inner.get(2).unwrap(), b"gamma");
         }
         _ => panic!("wrong type"),
     }
@@ -171,13 +174,16 @@ fn kdb_list_order_preserved() {
         .map(|i| Arc::from(i.to_string().as_bytes()))
         .collect();
     let deque: VecDeque<Arc<[u8]>> = items.clone().into();
-    let v = roundtrip_one("ordered", KiviDBValue::List(Arc::new(RwLock::new(deque))));
+    let v = roundtrip_one(
+        "ordered",
+        KiviDBValue::List(Arc::new(RwLock::new(deque.into_iter().collect()))),
+    );
     match v {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 100);
             for (i, item) in inner.iter().enumerate() {
-                assert_eq!(item.as_ref(), i.to_string().as_bytes());
+                assert_eq!(&*item, i.to_string().as_bytes());
             }
         }
         _ => panic!("wrong type"),
@@ -188,7 +194,7 @@ fn kdb_list_order_preserved() {
 fn kdb_list_empty() {
     let v = roundtrip_one(
         "empty_list",
-        KiviDBValue::List(Arc::new(RwLock::new(VecDeque::new()))),
+        KiviDBValue::List(Arc::new(RwLock::new(Default::default()))),
     );
     match v {
         KiviDBValue::List(l) => assert!(l.read().is_empty()),
@@ -1221,7 +1227,12 @@ fn kdb_all_types_together() {
     map.insert(
         "list".to_string(),
         KiviDBValue::List(Arc::new(RwLock::new(
-            vec![Arc::from(b"a".as_slice()), Arc::from(b"b".as_slice())].into(),
+            vec![
+                Arc::<[u8]>::from(b"a".as_slice()),
+                Arc::from(b"b".as_slice()),
+            ]
+            .into_iter()
+            .collect(),
         ))),
     );
 
@@ -1534,9 +1545,9 @@ fn rdb_list_basic() {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(inner[0].as_ref(), b"alpha");
-            assert_eq!(inner[1].as_ref(), b"beta");
-            assert_eq!(inner[2].as_ref(), b"gamma");
+            assert_eq!(&*inner.get(0).unwrap(), b"alpha");
+            assert_eq!(&*inner.get(1).unwrap(), b"beta");
+            assert_eq!(&*inner.get(2).unwrap(), b"gamma");
         }
         _ => panic!("wrong type"),
     }

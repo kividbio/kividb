@@ -9,7 +9,6 @@
 // own, which let go of their slabs when they end.
 // Run with: cargo test --test entry_table
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -57,7 +56,7 @@ fn list(items: &[&[u8]]) -> KiviDBValue {
         items
             .iter()
             .map(|i| Arc::<[u8]>::from(*i))
-            .collect::<VecDeque<_>>(),
+            .collect::<kividb::types::ListValues>(),
     )))
 }
 
@@ -149,7 +148,7 @@ fn collections_are_kept_whole_and_dropped_once() {
         match map.get("l") {
             Some(ValueRef::List(l)) => {
                 assert!(Arc::ptr_eq(l, &arc));
-                l.write().push_back(Arc::from(&b"c"[..]));
+                l.write().push_back(b"c");
             }
             _ => panic!("not a list"),
         }
