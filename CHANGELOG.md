@@ -9,6 +9,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **A script whose `KEYS` carry several hash tags is held to them (#871).**
+  With `lua-parallel-scripts yes` (the default), such a script now runs
+  beside other commands, and a key it touches that carries none of its
+  tags is refused (`... outside the hash tags 'a', 'b' of its KEYS`), as a
+  script of one tag's always was. Up to 1.2.2 it ran alone and could touch
+  any key. The refusal comes at the call that touches the key, so writes
+  the script made before it stay, as with any error in a script. Give such a key one of the script's tags, or declare a key
+  without a tag so that the script runs alone; or set
+  `lua-parallel-scripts no`.
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
@@ -16,6 +25,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint with a Bloom filter in it cannot be read by an earlier release.
   Delete the filters (or move them off with `DUMP`, which Redis restores)
   before going back.
+- **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
+  and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
   now propagates an `XADD … IDMP` that was a duplicate (#655), and a
   replica of an earlier release refuses it ("equal or smaller than the
@@ -41,8 +52,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   In a cluster of more than one master, `FT.HYBRID` is now refused, where
   1.2.x answered from the one node's slots without saying so.
+- **nodes.conf keeps each node's shard id (#563)**, after its address and
+  hostname as Redis writes it: `ip:port@cport,<hostname>,shard-id=<id>`.
+  An earlier release reading the file takes `<hostname>,shard-id=<id>` for
+  the hostname, until each peer's next heartbeat says its own again; a
+  cluster's shard ids converge on each master's as its nodes are upgraded.
+  After a rollback with `cluster-preferred-endpoint-type hostname`, a peer
+  that is down at that moment is handed out under that name in `MOVED` and
+  `CLUSTER SLOTS` until it comes back.
 
 ### Added
+
+- **`INFO stats` says how scripts were run (#871).** With
+  `lua-parallel-scripts yes`, a script runs beside other commands only when
+  its `KEYS` share a hash tag and it has been seen to be quick; any other
+  runs alone, and holds up every other command while it does. Nothing
+  showed which: a benchmark could run every script alone without anyone
+  seeing it but in `top -H`. `scripts_run_beside_others` and
+  `scripts_run_alone_*` now count each script run by how it ran and why
+  (parallel scripts off, inside a transaction, a function, no keys, a key
+  without a tag, not yet seen to be quick), and
+  `scripts_handed_to_runner` and `scripts_offloaded_to_pool` count where
+  the ones run alone ran. They are counted only where a script's way of
+  running is decided: nothing is added to other commands, and a build
+  without Lua has none of them. `CONFIG RESETSTAT` resets them. See
+  docs/SCRIPTS.md.
 
 - **Redis-style command-line directives: `kividb --appendonly yes --save 900 1
   --maxmemory 256mb ...` (#390).** Every directive a config file or `CONFIG
@@ -251,6 +285,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     reads what this release writes and the other way round. `MEMORY USAGE`,
     eviction and lazy freeing count a block as the one allocation it is.
 
+- **Scripts whose keys carry several hash tags run beside other commands
+  (#871).** With `lua-parallel-scripts yes`, a script ran beside others only
+  when all its `KEYS` shared one hash tag; one whose keys carried two, as
+  LiteLLM's rate limiter does for a key and its team in one `EVALSHA`, ran
+  alone, and every other command on the server waited for it. A script
+  now runs beside others when every one of its `KEYS` carries a tag, one or
+  several: it takes the lock of each of its tags, in one fixed order (the
+  one a client's command naming several tags uses), holds them for its
+  whole run, and may touch only keys of those tags (the error names them:
+  `outside the hash tags 'a', 'b' of its KEYS`). A script of several tags
+  that touched a key outside all of them used to work and now fails: give
+  the key a tag of the script, or declare a key without a tag so that the
+  script runs alone. Scripts with no keys or an untagged key, functions,
+  scripts inside `MULTI` and `lua-parallel-scripts no` are as before.
+  On one 8-vCPU VM, the server on 4 cores, LiteLLM's `BATCH_RATE_LIMITER`
+  called for a key and its team went from 55k to 134k calls a second at 500
+  connections (Redis 8.10.2: 64k), p99 11.4 to 5.0 ms; LiteLLM's whole
+  per-request mix of scripts, spend counters and cache from 89k to 226k
+  commands a second, p99 19.8 to 3.8 ms (Redis: 104k, 9.5 ms). Scripts of
+  one tag and commands that are not scripts are unchanged.
+
 - **Small sets take a half to a twelfth of the memory (#297).** A set of
   up to 128 members of up to 64 bytes is kept in one block, the members end
   to end, where it was a hash table with an allocation for every member: 14-byte
@@ -413,22 +468,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A shard keeps its id across a failover (#563).** `CLUSTER MYSHARDID`
+  answered the master's node id, so a shard's id changed when a replica
+  took over. Each node now has a shard id of its own, as in Redis: random
+  when it is first known, its master's while it is a replica, kept when a
+  replica is promoted, and new after `CLUSTER RESET HARD`. Nodes say their
+  own in their heartbeats (a token older nodes skip), and nodes.conf keeps
+  it, saved as soon as a node learns a new one. In `CLUSTER SHARDS` a
+  failed master without slots is shown in the entry of its shard's master,
+  the replica that took over from it; every master that owns slots still
+  has an entry of its own.
+
 - **A pipeline sent before its replies are read no longer hangs its
   connection (#865).** A client that sends a whole pipeline and only then
   reads the replies, as redis-py's pipeline does, was still sending when
   its first replies filled the socket; the server, waiting to write them,
   stopped reading it, and neither went on: from about 170,000 `SET`s on
-  macOS. The tokio loop, which also serves TLS connections under io_uring,
-  now reads a client while its replies wait, and runs what it read after
-  them a read's worth at a time. What it reads counts against
-  `client-query-buffer-limit`, and, with the replies waiting, against the
-  class's hard `client-output-buffer-limit`: a client that never reads is
-  closed there, as Redis closes it once its replies reach that limit. The
-  same goes for the replies a blocking command writes before it waits; if
-  that write fails, the client is closed at once, and what it pipelined
-  after the blocking command is not run. Cleartext connections under
-  io_uring still stop reading, from about 940,000 `SET`s with Linux's
-  default socket buffers.
+  macOS, and 940,000 under io_uring with Linux's default socket buffers.
+  Both I/O loops now read a client while its replies wait, and run what
+  they read after them a read's worth at a time; TLS connections, which
+  the tokio loop serves under either, are covered as well. What is read
+  counts against `client-query-buffer-limit`, and, with the replies
+  waiting, against the class's hard `client-output-buffer-limit`: a client
+  that never reads is closed there, as Redis closes it once its replies
+  reach that limit. The same goes for the replies a blocking command
+  writes before it waits; if that write fails, the client is closed at
+  once, and what it pipelined after the blocking command is not run.
 
 - **A replica of 1.2.0 no longer writes a `TS.INCRBY` its own AOF replay
   refuses (#611).** A 1.2.0 master sends a time above `i64::MAX` as the
@@ -438,6 +503,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read as the same 64 bits on replay, in an applied command as in a
   `TS.ADD` or `TS.MADD`, so the re-logged record — and any such record an
   earlier 1.2.1 already wrote — replays at the time 1.2.0 kept.
+
+- **`TS.ADD` and `TS.INCRBY` send the time they replied with to replicas
+  and the AOF.** `TS.ADD` sends the time of the sample it added as the
+  number it replied, as `TS.MADD`, `TS.INCRBY` and `TS.DECRBY` do, in place
+  of the time as the client wrote it (`+5`, `007`): the plain number every
+  version reads. A time of `-0` is refused by every command that takes a
+  sample's time, as RedisTimeSeries and 1.2.0 refuse it. And a
+  `TS.INCRBY` or `TS.DECRBY` record written by 1.2.0, which a replica
+  applies as 1.2.0 read it, is logged again as 1.2.0 wrote it: the
+  replica's AOF, and a backup taken from it, read it as the replica did.
 
 - **A replica continued by a dataset digest keeps the new stream's id as
   its resync point (#402).** A master killed and started again from its

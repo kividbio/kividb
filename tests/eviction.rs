@@ -1848,18 +1848,27 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
 /// past the limit: once nothing is left to evict, they are refused with
 /// OOM, the list being built too, and memory use stays within a few
 /// megabytes of the limit however many lists wait to be freed.
+///
+/// Under `volatile-lru`, with a time to live on every other key: a list is
+/// never evicted while it is built (evicted, it is freed in place, and
+/// under `allkeys-lru` enough of them were, on a fast machine, that the
+/// unlinked ones never added up and nothing was refused), so every list is
+/// unlinked and waits to be freed.
 #[test]
 fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     let dir = tempfile::tempdir().unwrap().keep();
     let server = Server::start_in_env(
         dir,
-        &["--maxmemory-policy", "allkeys-lru"],
+        &["--maxmemory-policy", "volatile-lru"],
         &[("KIVIDB_TEST_FAILPOINTS", "lazyfree-held")],
     );
     let mut c = server.conn();
     let value = big_value('k');
     for i in 0..500 {
-        assert!(c.cmd(&["SET", &format!("k{i}"), &value]).ok());
+        assert!(
+            c.cmd(&["SET", &format!("k{i}"), &value, "EX", "100000"])
+                .ok()
+        );
     }
     let limit = c.limit_to(4 * MB);
     let mut builder = server.conn();
@@ -1894,7 +1903,10 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     let mut refused = 0;
     let mut n = 0;
     while !built.is_finished() {
-        if writer.cmd(&["SET", &format!("w{n}"), &value]).is_err() {
+        if writer
+            .cmd(&["SET", &format!("w{n}"), &value, "EX", "100000"])
+            .is_err()
+        {
             refused += 1;
             refusal_seen.store(true, std::sync::atomic::Ordering::SeqCst);
         }
