@@ -34,6 +34,7 @@ and why.
 | `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
 | `17-set-memory` | #297 (step 1) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000: 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly; the tables (1,000 and 100,000) as guard rows |
+| `20-envoy-ratelimit` | #849 | envoyproxy/ratelimit's pipelined `INCRBY` + `EXPIRE` pair on one key (memtier_benchmark, `--pipeline 2 --transaction`, 100,000 keys) at 200 and 500 connections: ops/s against Redis, p99 shown beside it, and keys left without a TTL (must be 0); on Linux the server and the client are pinned to separate halves of the CPUs |
 
 ## Running it
 
@@ -111,7 +112,8 @@ the Redis binary, numpy (pinned in `requirements.txt`, for
 and a `redis-cli` 7.0.x for `13-cluster-reshard` (`$REDIS_CLI_7`, else
 `/usr/bin/redis-cli` if it is 7.0.x, as Ubuntu 24.04's `redis-tools` is, else
 built from Redis's 7.0.15 tag into `$REGRESS_CACHE`, which needs git, make
-and a C compiler).
+and a C compiler). Suite 20 uses `memtier_benchmark` 2.6.1 or newer
+(`--transaction` and its error-reply lines; `$MEMTIER`, else on `PATH`).
 
 ## Method
 
@@ -859,6 +861,25 @@ The 1,000 and 100,000 rows are guards: sets past the block's and the array's
 limits are tables, as in v1.2.2, and must not grow. Instructions per command
 are not measured here (the suite has no callgrind harness); #297's PR has
 them from `scripts/perf`-style runs.
+
+## Suite 20, measured off the gate VM
+
+Not a recording: the baseline is recorded on the benchmark VM. Measured
+2026-11-17 on an Apple M3 Pro (11 cores, macOS 26.3.1), client and server on
+the same machine. macOS cannot pin threads to CPUs, so nothing was pinned
+(`raw` says `"pinned": false`) and KiviDB ran with its default 9 worker
+threads, Redis with its defaults. Candidate: master `83b4460b`, `cargo build
+--release`; Redis 8.6.1 (Homebrew); memtier_benchmark 2.6.1; one server at
+a time, median of 3 runs of 20 s after a 10 s warm-up.
+
+| connections | KiviDB ops/s | Redis ops/s | KiviDB / Redis | KiviDB p99 | Redis p99 |
+|---:|---:|---:|---:|---:|---:|
+| 200 | 376,412 | 332,559 | 1.13x | 1.62 ms | 1.77 ms |
+| 500 | 373,705 | 344,930 | 1.08x | 3.92 ms | 4.22 ms |
+
+`keys_without_ttl` was 0 on both. Both servers sit near the same rate,
+which suggests memtier's four threads, unpinned beside them, are the limit
+here; the floors (1.5x and 1.7x) are for the pinned run on the VM.
 
 ## Not covered
 
