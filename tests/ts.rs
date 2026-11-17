@@ -17,11 +17,17 @@ struct Conn {
 
 impl Conn {
     fn connect(port: u16) -> Self {
-        // Retry up to 40 times (2 seconds total) for the server to start
-        for _ in 0..40 {
-            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
-                let reader = BufReader::new(s.try_clone().unwrap());
-                return Conn { stream: s, reader };
+        for _ in 0..100 {
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+                if s.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
+                    let mut reader = BufReader::new(s.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() && line.starts_with("+PONG") {
+                        let _ = s.set_read_timeout(None);
+                        return Conn { stream: s, reader };
+                    }
+                }
             }
             thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2546,12 +2552,12 @@ fn test_ts_add_auto_create_with_ignore_and_override() {
         1000
     );
 
-    // Per-command override threshold allows wider delta
-    // Normal threshold would ignore delta_v = 0.5, but with IGNORE 500 0.1, delta_t 2000 > 500 -> stored!
+    // IGNORE on TS.ADD to an existing series is not a per-sample override.
+    // The series keeps its configured thresholds (3000, 1.0), so delta_t=2000 <= 3000 and delta_v=0.5 <= 1.0 is ignored -> returns 1000!
     assert_eq!(
         c.cmds(&["TS.ADD", "ts:auto", "3000", "20.5", "IGNORE", "500", "0.1"])
             .as_int(),
-        3000
+        1000
     );
 }
 
@@ -2578,8 +2584,222 @@ fn test_ts_ignore_malformed_syntax() {
         c.cmds(&["TS.CREATE", "ts:bad", "IGNORE", "5000", "xyz"]),
         RespValue::Error(err_msg.to_string())
     );
+    let neg_msg = "TSDB: IGNORE arguments cannot be negative";
     assert_eq!(
         c.cmds(&["TS.CREATE", "ts:bad", "IGNORE", "5000", "-0.5"]),
-        RespValue::Error(err_msg.to_string())
+        RespValue::Error(neg_msg.to_string())
     );
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:bad", "IGNORE", "-5000", "0.5"]),
+        RespValue::Error(neg_msg.to_string())
+    );
+}
+
+#[test]
+fn test_ts_ignore_exact_boundaries() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:bound", "IGNORE", "100", "2.0"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:bound", "1000", "10.0"]).as_int(),
+        1000
+    );
+
+    // Exact limits (delta_t == 100, delta_v == 2.0) -> IGNORED
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:bound", "1100", "12.0"]).as_int(),
+        1000
+    );
+
+    // delta_t == 101 > 100 -> ADDED
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:bound", "1101", "12.0"]).as_int(),
+        1101
+    );
+
+    // Now last sample is 1101: 12.0.
+    // delta_v == 2.001 > 2.0 -> ADDED
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:bound", "1201", "14.001"]).as_int(),
+        1201
+    );
+}
+
+#[test]
+fn test_ts_ignore_timestamp_before_last_never_ignored() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:ooo", "IGNORE", "1000", "5.0"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(c.cmds(&["TS.ADD", "ts:ooo", "2000", "10.0"]).as_int(), 2000);
+
+    // Timestamp before last (1999 < 2000) is never ignored even if within threshold
+    assert_eq!(c.cmds(&["TS.ADD", "ts:ooo", "1999", "10.0"]).as_int(), 1999);
+}
+
+#[test]
+fn test_ts_ignore_duplicate_policy_handling() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // Series whose policy is SUM is never ignored
+    assert_eq!(
+        c.cmds(&[
+            "TS.CREATE",
+            "ts:sum",
+            "DUPLICATE_POLICY",
+            "SUM",
+            "IGNORE",
+            "1000",
+            "5.0"
+        ])
+        .as_str(),
+        "OK"
+    );
+    assert_eq!(c.cmds(&["TS.ADD", "ts:sum", "1000", "10.0"]).as_int(), 1000);
+    // Duplicate at same timestamp with policy SUM -> not ignored, sums value
+    assert_eq!(c.cmds(&["TS.ADD", "ts:sum", "1000", "5.0"]).as_int(), 1000);
+    let get = c.cmds(&["TS.GET", "ts:sum"]);
+    assert_eq!(get.as_array()[1].as_str(), "15");
+
+    // ON_DUPLICATE LAST turns ignore filter on for this sample
+    assert_eq!(
+        c.cmds(&[
+            "TS.CREATE",
+            "ts:on_dup",
+            "DUPLICATE_POLICY",
+            "BLOCK",
+            "IGNORE",
+            "1000",
+            "5.0"
+        ])
+        .as_str(),
+        "OK"
+    );
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:on_dup", "1000", "10.0"]).as_int(),
+        1000
+    );
+    // With ON_DUPLICATE LAST, ignore check runs and suppresses the duplicate
+    assert_eq!(
+        c.cmds(&[
+            "TS.ADD",
+            "ts:on_dup",
+            "1000",
+            "10.0",
+            "ON_DUPLICATE",
+            "LAST"
+        ])
+        .as_int(),
+        1000
+    );
+}
+
+#[test]
+fn test_ts_madd_with_ignore() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:m1", "IGNORE", "1000", "1.0"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(c.cmds(&["TS.CREATE", "ts:m2"]).as_str(), "OK");
+
+    assert_eq!(c.cmds(&["TS.ADD", "ts:m1", "1000", "10.0"]).as_int(), 1000);
+    assert_eq!(c.cmds(&["TS.ADD", "ts:m2", "1000", "10.0"]).as_int(), 1000);
+
+    // TS.MADD: ts:m1 within ignore limits (delta_t=500, delta_v=0.5) -> ignored, replies 1000
+    // ts:m2 has no ignore -> added, replies 1500
+    let res = c.cmds(&["TS.MADD", "ts:m1", "1500", "10.5", "ts:m2", "1500", "10.5"]);
+    assert_eq!(res.as_array()[0].as_int(), 1000);
+    assert_eq!(res.as_array()[1].as_int(), 1500);
+
+    // Check sample counts via TS.RANGE
+    let r1 = c.cmds(&["TS.RANGE", "ts:m1", "-", "+"]);
+    assert_eq!(r1.as_array().len(), 1);
+    let r2 = c.cmds(&["TS.RANGE", "ts:m2", "-", "+"]);
+    assert_eq!(r2.as_array().len(), 2);
+}
+
+#[test]
+fn test_ts_ignore_persistence_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(dir.path())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+
+    let mut c = Conn::connect(port);
+    assert_eq!(
+        c.cmds(&["TS.CREATE", "ts:restart", "IGNORE", "5000", "2.5"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:restart", "1000", "10.0"]).as_int(),
+        1000
+    );
+    assert_eq!(c.cmds(&["SAVE"]).as_str(), "OK");
+    drop(c);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(dir.path())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+
+    let mut c = Conn::connect(port);
+    let info = c.cmds(&["TS.INFO", "ts:restart"]);
+    let arr = info.as_array();
+    let time_diff_idx = arr
+        .iter()
+        .position(|item| matches!(item, RespValue::Bulk(b) if b == b"ignoreMaxTimeDiff"))
+        .unwrap();
+    assert_eq!(arr[time_diff_idx + 1].as_int(), 5000);
+    let val_diff_idx = arr
+        .iter()
+        .position(|item| matches!(item, RespValue::Bulk(b) if b == b"ignoreMaxValDiff"))
+        .unwrap();
+    assert_eq!(arr[val_diff_idx + 1].as_f64(), 2.5);
+
+    // Ignored sample after restart
+    assert_eq!(
+        c.cmds(&["TS.ADD", "ts:restart", "2000", "11.0"]).as_int(),
+        1000
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }

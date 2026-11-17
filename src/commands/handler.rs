@@ -1887,6 +1887,9 @@ fn makes_the_switch(ctx: &Ctx) -> Option<usize> {
 /// where the sweep's `DEL` then deleted nothing, and the key stayed in the
 /// other database for good.
 fn changed_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
+    if crate::commands::ts::ts_changed_nothing() {
+        return true;
+    }
     let nil = result == b"$-1\r\n" || result == b"_\r\n";
     let zero = result == b":0\r\n";
     match name {
@@ -1999,6 +2002,9 @@ fn set_has_a_condition(cmd: &[&[u8]]) -> bool {
 /// `+OK` or a value, is passed over without looking at the command.
 #[inline]
 fn propagates_nothing(name: &str, cmd: &[&[u8]], result: &[u8]) -> bool {
+    if crate::commands::ts::ts_changed_nothing() {
+        return true;
+    }
     result.len() <= 5
         && matches!(result.first(), Some(b':' | b'$' | b'_' | b'*' | b'~'))
         && changed_nothing(name, cmd, result)

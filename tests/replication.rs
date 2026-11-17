@@ -3441,3 +3441,86 @@ fn test_a_redis_payload_that_does_not_read_is_a_broken_link_not_a_refusal() {
     thread::sleep(Duration::from_secs(2));
     assert_eq!(repl_info(&mut c, "replica_last_sync_refusal"), None);
 }
+
+#[test]
+fn test_ts_ignore_does_not_propagate_or_advance_repl_offset() {
+    let master_port = free_port();
+    let replica_port = free_port();
+    start_server(master_port);
+    start_server(replica_port);
+    let _shutdown = ShutdownServers(vec![master_port, replica_port]);
+
+    let mut master = Conn::connect(master_port);
+    let mut replica = Conn::connect(replica_port);
+
+    assert!(
+        replica
+            .cmds(&["REPLICAOF", "127.0.0.1", &master_port.to_string()])
+            .is_ok()
+    );
+
+    // Initial setup on master
+    assert_eq!(
+        master
+            .cmds(&["TS.CREATE", "ts:ignore", "IGNORE", "1000", "1.0"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(
+        master
+            .cmds(&["TS.ADD", "ts:ignore", "1000", "10.0"])
+            .as_int(),
+        1000
+    );
+
+    // Wait for replica to catch up with initial setup
+    wait_until(
+        "replica to sync initial series",
+        Duration::from_secs(5),
+        || {
+            let res = replica.cmds(&["TS.GET", "ts:ignore"]);
+            matches!(&res, RespValue::Array(arr) if arr.len() == 2 && arr[0].as_int() == 1000)
+        },
+    );
+
+    let offset_before: u64 = repl_info(&mut master, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Ignored TS.ADD: delta_t = 500 <= 1000, delta_v = 0.5 <= 1.0 -> ignored!
+    assert_eq!(
+        master
+            .cmds(&["TS.ADD", "ts:ignore", "1500", "10.5"])
+            .as_int(),
+        1000
+    );
+
+    let offset_after_add: u64 = repl_info(&mut master, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        offset_before, offset_after_add,
+        "master_repl_offset must not move on ignored TS.ADD"
+    );
+
+    // Ignored TS.MADD: all samples ignored -> must not move offset
+    let madd_res = master.cmds(&["TS.MADD", "ts:ignore", "1600", "10.6"]);
+    assert_eq!(madd_res.as_array()[0].as_int(), 1000);
+
+    let offset_after_madd: u64 = repl_info(&mut master, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        offset_before, offset_after_madd,
+        "master_repl_offset must not move on ignored TS.MADD"
+    );
+
+    // Give replica a moment and ensure replica value is unchanged (timestamp 1000, value 10)
+    thread::sleep(Duration::from_millis(100));
+    let rep_get = replica.cmds(&["TS.GET", "ts:ignore"]);
+    assert_eq!(rep_get.as_array()[0].as_int(), 1000);
+    assert_eq!(rep_get.as_array()[1].as_str(), "10");
+}

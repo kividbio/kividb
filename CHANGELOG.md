@@ -9,6 +9,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **Upgrade replicas before their master for time series `IGNORE`.** A 1.2
+  replica passes `IGNORE` over, and cannot read a snapshot or `DUMP` holding
+  a series that has it (tag 17).
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
@@ -44,6 +47,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`TS.CREATE`, `TS.ALTER`, and `TS.ADD` support `IGNORE maxTimeDiff maxValDiff` (#841).**
+  Suppresses duplicate or near-duplicate samples whose timestamp and value
+  deltas are within the specified thresholds when the duplicate policy is `LAST`.
+  Ignored samples are not stored, do not replicate or log to AOF, and reply with
+  the series' last timestamp.
 - **Redis-style command-line directives: `kividb --appendonly yes --save 900 1
   --maxmemory 256mb ...` (#390).** Every directive a config file or `CONFIG
   SET` takes is now taken on the command line, in the form `redis-server`
