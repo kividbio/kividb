@@ -44,6 +44,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`INFO stats` says how scripts were run (#871).** With
+  `lua-parallel-scripts yes`, a script runs beside other commands only when
+  its `KEYS` share a hash tag and it has been seen to be quick; any other
+  runs alone, and holds up every other command while it does. Nothing
+  showed which: a benchmark could run every script alone without anyone
+  seeing it but in `top -H`. `scripts_run_beside_others` and
+  `scripts_run_alone_*` now count each script run by how it ran and why
+  (parallel scripts off, inside a transaction, a function, no keys, a key
+  without a tag, keys of several tags, not yet seen to be quick), and
+  `scripts_handed_to_runner` and `scripts_offloaded_to_pool` count where
+  the ones run alone ran. They are counted only where a script's way of
+  running is decided: nothing is added to other commands, and a build
+  without Lua has none of them. `CONFIG RESETSTAT` resets them. See
+  docs/SCRIPTS.md.
+
 - **Redis-style command-line directives: `kividb --appendonly yes --save 900 1
   --maxmemory 256mb ...` (#390).** Every directive a config file or `CONFIG
   SET` takes is now taken on the command line, in the form `redis-server`
