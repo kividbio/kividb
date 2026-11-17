@@ -297,7 +297,8 @@ impl PackedSet {
         let n = self.len();
         let old_cap = self.cap as usize;
         let cap = if old_cap == 0 { 8 } else { old_cap * 2 };
-        debug_assert!(cap <= MAX_ENTRIES);
+        // `cap` is a `u8`: past the limit it would wrap, and the block with it.
+        assert!(cap <= MAX_ENTRIES);
         let data = if old_cap == 0 { 0 } else { self.offset(n) };
         let head = cap + 2 * (cap + 1);
         let mut buf = Vec::with_capacity(head + data + (data / 4).max(32));

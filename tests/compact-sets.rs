@@ -577,8 +577,7 @@ fn sscan_across_the_change_of_form() {
     assert!(pages > 3);
     seen.retain(|m| m != b"x" && m != b"y");
     seen.sort();
-    seen.dedup();
-    assert_eq!(seen, sorted(&members), "each member at least once");
+    assert_eq!(seen, sorted(&members), "each member exactly once");
 
     // A small array comes back whole, as an intset does from Redis.
     c.sadd("t", &ints(0..20));

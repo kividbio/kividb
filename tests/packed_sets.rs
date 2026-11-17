@@ -643,8 +643,7 @@ fn sscan_of_each_form() {
     }
     seen.retain(|m| m != b"added-meanwhile");
     seen.sort();
-    seen.dedup();
-    assert_eq!(seen, sorted(&words));
+    assert_eq!(seen, sorted(&words), "each member exactly once");
 }
 
 fn persisted_forms_match(c: &mut Conn, forms: &[(&str, Vec<Vec<u8>>, &str)], what: &str) {

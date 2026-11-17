@@ -222,7 +222,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sets are tables as before, at the same size. Thanks @Parikalp-Bhardwaj for
   the arrays (#309).
   - A set moves from the array to the block when a member that is not such
-    an integer comes (or a member past 512), and from either to the table
+    an integer comes, and from either to the table
     when the block would pass 128 members or a member is longer than 64
     bytes, as Redis moves an intset to a listpack and either to a hash
     table; never back. Clients see the same members as before: `01`, `+1`
@@ -236,7 +236,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `hashtable`.
   - `set-max-intset-entries` (default 512), `set-max-listpack-entries`
     (128) and `set-max-listpack-value` (64) now take effect, from the
-    configuration file or `CONFIG SET`; `0` turns the form off. The two
+    configuration file or `CONFIG SET`; `0` for an `entries` limit turns
+    its form off. The two
     `listpack` limits go no higher than 128 and 64, and `CONFIG GET` reports
     the value kept. A changed limit applies to a set at its next new member.
   - `SMEMBERS`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` and `SRANDMEMBER` write
