@@ -140,7 +140,7 @@ The startup banner says how the number was chosen:
 The server's other threads (the AOF writer, the replication hub, expiry, a background save,
 the accept and timer threads) run beside the workers; none is given a CPU of its own.
 Measured with the server confined to 2 and 4 vCPUs, one worker per CPU was the fastest
-setting or within 10% of it, with AOF, a replica or a `BGSAVE` running too; a worker fewer
+setting or within about 10% of it, with AOF or a replica too (during `BGSAVE` on 2 vCPUs a third worker served 22% more); a worker fewer
 cost up to 41% on 2 vCPUs, and more workers than the CPUs (or than the quota) multiplied the
 p99. [PERFORMANCE.md](PERFORMANCE.md#worker-threads) has the numbers.
 

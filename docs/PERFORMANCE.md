@@ -199,8 +199,8 @@ Unpipelined, 500 connections, ops/s and p99:
   worker served 0-10% less (22% more during `BGSAVE`) and multiplied the p99 by 2 to 12
   (by 1.1 during `BGSAVE`).
 - On 4 vCPUs the load generator, at about 340k unpipelined and 2.4M pipelined, is the
-  limit from 3 workers up, so 3, 4 and 5 workers are within 10% of each other. 2 workers
-  served 2-22% less than 4 on io_uring, and 20-33% less on 4 cores; on tokio 37-46% less,
+  limit from 3 workers up, so 3, 4 and 5 workers are within about 10% of each other. 2 workers
+  served 2-22% less than 4 on io_uring, and 20-33% less on 4 cores; on tokio 23% less on 4 vCPUs and 37-46% less on 4 cores,
   at 3.5 to 6.6 times the p99.
 - During back-to-back `BGSAVE`s of 4 GB, on 4 vCPUs, 3 workers had a lower p99 than 4
   (3.0 against 5.5 ms on io_uring, at the same throughput), and with a replica 2.3 against
