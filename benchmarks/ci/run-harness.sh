@@ -9,10 +9,11 @@
 #
 # Each server starts fresh, with host networking, on 127.0.0.1:PORT. The
 # comparison goes to $GITHUB_STEP_SUMMARY when set, else to stdout. Exits 1
-# only when a check passes on Redis and fails on KiviDB. A harness that
-# cannot set itself up, or whose run against Redis gives no results, is
-# reported as a warning: that is not KiviDB's failure, and it says nothing
-# about KiviDB either.
+# when a check passes on Redis and fails on KiviDB, when a check the
+# harness's kividb-passes.txt lists does not pass on KiviDB, or when the
+# harness could not run: its setup failed, a server did not start, or a run
+# left no results. The summary says which, so that a broken install is seen
+# and is not read as KiviDB failing.
 set -uo pipefail
 NAME=$1
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -49,15 +50,16 @@ start_server() {
 echo "::group::$NAME: setup"
 if ! bash "$HARNESS" setup "$WORK"; then
   echo "::endgroup::"
-  echo "::warning title=$NAME::setup failed, not compared"
-  printf '### %s\n\nSetup failed, so it was not compared: see the step log.\n\n' "$NAME" | summary
-  exit 0
+  echo "::error title=$NAME::could not run: setup failed"
+  printf '### %s\n\nCould not run: setup failed, see the step log.\n\n' "$NAME" | summary
+  exit 1
 fi
 echo "::endgroup::"
 
+down=()
 for side in redis kividb; do
-  image=$REDIS_IMAGE
-  [ "$side" = kividb ] && image=$KIVIDB_IMAGE
+  image=$REDIS_IMAGE label=Redis
+  [ "$side" = kividb ] && image=$KIVIDB_IMAGE label=KiviDB
   result=$OUT/$NAME-$side.xml
   rm -f "$result"
   echo "::group::$NAME: against $side ($image)"
@@ -65,12 +67,28 @@ for side in redis kividb; do
     bash "$HARNESS" run "$WORK" "$PORT" "$result" || echo "$NAME: no results against $side"
   else
     echo "$NAME: $side did not answer PING on port $PORT"
+    down+=("$label")
   fi
   docker logs "$CONTAINER" >"$OUT/$NAME-$side-server.log" 2>&1
   docker rm -f "$CONTAINER" >/dev/null 2>&1
   echo "::endgroup::"
 done
 
-[ -s "$OUT/$NAME-redis.xml" ] || echo "::warning title=$NAME::no results from the run against Redis, not compared"
-python3 "$HERE/compare.py" "$NAME" "$OUT/$NAME-redis.xml" "$OUT/$NAME-kividb.xml" | summary
-exit "${PIPESTATUS[0]}"
+# A server that did not start: Redis's is this harness's problem, KiviDB's
+# is KiviDB's; either way there is nothing to compare.
+if [ ${#down[@]} -gt 0 ]; then
+  who=${down[0]}
+  [ ${#down[@]} -gt 1 ] && who="${down[0]} and ${down[1]}"
+  echo "::error title=$NAME::$who did not start: no answer to PING on port $PORT"
+  printf '### %s\n\n%s did not start: no answer to PING on port %s, see the step log and the server log.\n\n' \
+    "$NAME" "$who" "$PORT" | summary
+  exit 1
+fi
+
+passes=$(cd "$HERE/.." && pwd)/$NAME-compat/kividb-passes.txt
+args=("$NAME" "$OUT/$NAME-redis.xml" "$OUT/$NAME-kividb.xml")
+[ -f "$passes" ] && args+=("$passes")
+python3 "$HERE/compare.py" "${args[@]}" | summary
+status=${PIPESTATUS[0]}
+[ "$status" = 0 ] || echo "::error title=$NAME::see the job summary"
+exit "$status"

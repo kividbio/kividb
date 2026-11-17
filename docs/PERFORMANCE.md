@@ -9,6 +9,7 @@
 - [Bare metal](#bare-metal)
 - [The full suite, on Azure VMs](#the-full-suite-on-azure-vms)
 - [Memory of small sets](#memory-of-small-sets)
+- [Memory of small hashes](#memory-of-small-hashes)
 - [Earlier runs](#earlier-runs)
 - [Independent reviews](#independent-reviews)
 
@@ -124,6 +125,29 @@ than 128 members (512 integers) are tables as before; making those smaller is
 the next step of #297. Suite `17-set-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 this table again and fails a build that loses it.
+
+## Memory of small hashes
+
+Since 1.3.0 a small hash is kept in one block, its fields and values end to
+end (`listpack` in `OBJECT ENCODING`, `listpackex` once a field has a TTL: up
+to 512 fields, no field or value longer than 64 bytes), where 1.2 kept every
+hash as a table with two allocations per field. Bytes of `used_memory` a
+field, 3M fields in hashes of each size, 14-byte fields (`field:00000001`)
+with 32-byte values, on an Azure `Standard_D4s_v5`:
+
+| fields a hash | 1.2.2 | 1.3.0 | Redis 8.10.2 |
+|---:|---:|---:|---:|
+| 10 | 162.8 | 71.8 | 57.8 |
+| 100 | 129.2 | 55.8 | 51.7 |
+| 1,000 | 166.6 | 166.6 | 70.1 |
+| 100,000 | 128.8 | 128.8 | 76.8 |
+| 3,000,000 | 133.3 | 133.3 | 77.9 |
+
+As for sets, what is left over Redis at 10 fields is mostly the key's own
+entry and the hash's header. Hashes past the block's limits are tables as
+before. Suite `19-hash-memory` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+this again (with and without field TTLs) and fails a build that loses it.
 
 ## Memory of lists
 
