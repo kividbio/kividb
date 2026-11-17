@@ -177,7 +177,8 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         fields.push((field, value, expires_at));
     }
 
-    let mut inner = crate::types::HashInner::new();
+    let mut inner =
+        crate::types::HashInner::from_fields(crate::types::HashFields::with_capacity(fields.len()));
     // One named twice is a corrupt file.
     let mut names = std::collections::HashSet::with_capacity(fields.len());
     for (field, value, expires_at) in fields {

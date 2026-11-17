@@ -194,6 +194,15 @@ impl HashFields {
         }
     }
 
+    /// An empty table with room for `fields`, whatever the limits: for a
+    /// hash that would only be moved to one (a JSON document's projection
+    /// for its index holds vectors, longer than a block takes).
+    pub fn table_with_capacity(fields: usize) -> Self {
+        Self {
+            repr: Repr::Table(Table::with_capacity_and_hasher(fields, Default::default())),
+        }
+    }
+
     /// An empty hash that is to hold about `fields`: the table at once if
     /// that is more than a block would hold.
     pub fn with_capacity(fields: usize) -> Self {
@@ -881,6 +890,36 @@ mod tests {
                 assert_same(&hash, &model, step);
             }
         }
+    }
+
+    /// A field loaded twice (a file or a payload that names it twice) keeps
+    /// its first place and its last value, in a block and in a table, as
+    /// the `IndexMap` always did.
+    #[test]
+    fn a_field_loaded_twice_keeps_its_first_place_and_last_value() {
+        for (n, table) in [(3usize, false), (600, true)] {
+            let mut pairs: Vec<(String, Arc<[u8]>)> = (0..n)
+                .map(|i| (format!("f{i}"), Arc::from(format!("v{i}").as_bytes())))
+                .collect();
+            pairs.push(("f1".to_string(), Arc::from(&b"again"[..])));
+            let collected: HashFields = pairs.iter().cloned().collect();
+            let mut loaded = HashFields::with_capacity(pairs.len());
+            for (field, value) in &pairs {
+                loaded.insert_loaded(field.clone(), value);
+            }
+            for hash in [&collected, &loaded] {
+                assert_eq!(hash.is_table(), table, "{n}");
+                assert_eq!(hash.len(), n, "{n}");
+                assert_eq!(
+                    hash.get_index(1).map(|(f, v)| (f, v.to_vec())),
+                    Some(("f1", b"again".to_vec()))
+                );
+                assert_eq!(hash.get_bytes("f1"), Some(&b"again"[..]));
+                let fields: Vec<&str> = hash.keys().take(3).collect();
+                assert_eq!(fields, ["f0", "f1", "f2"][..n.min(3)]);
+            }
+        }
+        assert!(HashFields::table_with_capacity(2).is_table());
     }
 
     #[test]

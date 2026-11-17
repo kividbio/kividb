@@ -2180,7 +2180,9 @@ fn json_path(path: &str) -> Option<Arc<crate::commands::json_path::Query>> {
 /// What a JSON document holds for each field of `schema`, keyed by the
 /// field's path.
 pub fn project_json(schema: &[SchemaField], doc: &serde_json::Value) -> Fields {
-    let mut fields = Fields::with_capacity(schema.len());
+    // A table from the start: a vector field is longer than a block takes,
+    // and a block would be filled only to be moved.
+    let mut fields = Fields::table_with_capacity(schema.len());
     for field in schema {
         let Some(query) = json_path(&field.name) else {
             continue;

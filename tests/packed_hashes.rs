@@ -524,6 +524,17 @@ fn every_hash_command_in_each_form() {
                 }
             }
             assert_eq!(sorted(&seen), sorted(&form.pairs), "{what}");
+            // A block with field TTLs is scanned whole too, in order.
+            if form.form == "listpackex" {
+                let reply = c.cmd(&["HSCAN", key, "0", "COUNT", "1"]);
+                assert_eq!(reply.items()[0].text(), "0", "{what}");
+                let page: Pairs = reply.items()[1]
+                    .items()
+                    .chunks(2)
+                    .map(|p| (p[0].bulk(), p[1].bulk()))
+                    .collect();
+                assert_eq!(page, form.pairs, "{what}");
+            }
             assert!(c.cmd(&["MEMORY", "USAGE", key]).int() > 0);
             // COPY keeps the form; RENAME, DEL and UNLINK take it whole.
             assert_eq!(c.cmd(&["COPY", key, "copy"]).int(), 1);
@@ -583,6 +594,19 @@ fn every_hash_command_in_each_form() {
                 assert_eq!(sorted(&got), sorted(&model), "{what}: writes");
             }
             assert!(c.cmd(&["HTTL", "w", "FIELDS", "1", "ex"]).items()[0].int() > 0);
+            // HPERSIST takes a field's TTL away and leaves the form: other
+            // fields still have one (HGETEX gave model[1] one).
+            let reply = c.cmd(&["HPERSIST", "w", "FIELDS", "2", "ex", "absent"]);
+            assert_eq!(
+                reply,
+                Resp::Array(vec![Resp::Int(1), Resp::Int(-2)]),
+                "{what}"
+            );
+            assert_eq!(
+                c.cmd(&["HTTL", "w", "FIELDS", "1", "ex"]).items()[0].int(),
+                -1
+            );
+            assert_eq!(c.cmd(&["HGET", "w", "ex"]).text(), "1", "{what}");
             // A field TTL makes a block a listpackex; a table stays one.
             let want = if block { "listpackex" } else { "hashtable" };
             assert_eq!(c.encoding("w"), want, "{what}");
