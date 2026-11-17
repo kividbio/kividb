@@ -345,6 +345,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from, under the lock a promotion reads it in, and is dropped when the
   node had stopped being a replica before the reply arrived.
 
+- **`INFO` no longer reads over `maxmemory` for a moment while a snapshot is
+  prepared (#848).** A snapshot encodes every value that is not a string
+  into buffers as it captures the dataset, and counted them as not to be
+  evicted for only when it was done, so for that long `used_memory -
+  mem_not_counted_for_evict` read high by the size of the encoded
+  collections (72 to 173 MB in one soak). Nothing was evicted or refused
+  because of it, but monitoring and autoscalers that read `INFO` saw it. The
+  buffers are now counted as they are made, and given back as the snapshot
+  writes them out; the times to live of the strings it writes are counted
+  too. The snapshot's content and its timing are the same.
+
 - **`HRANDFIELD` and `ZRANDMEMBER` no longer copy the whole collection to
   pick a few members (#839).** `HRANDFIELD key count` built a vector of
   every field and one of every index, and `ZRANDMEMBER` collected every
